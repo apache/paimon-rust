@@ -21,7 +21,7 @@ use super::bucket_filter::split_partition_and_data_predicates;
 use super::global_index_scanner::unindexed_ranges_for_global_index_entries;
 use super::global_index_types::normalize_queryable_global_index_type;
 use super::row_id_predicate::intersect_sorted_ranges;
-use super::vector_search_common::raw_vector_index_type;
+use super::vector_search_common::resolve_vector_search_options;
 use super::{find_field_id_by_name, merge_row_ranges, DataSplit, RowRange, Table};
 use crate::spec::{
     CoreOptions, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifestEntry, Predicate,
@@ -213,7 +213,15 @@ pub(super) async fn global_search_splits(
             Some(kind) => Some(kind),
             None if full_text => None,
             None => {
-                raw_vector_index_type(table.schema().options(), options, column, vector_index_type)?
+                resolve_vector_search_options(
+                    table.schema().options(),
+                    options,
+                    column,
+                    vector_index_type,
+                    false,
+                )?
+                .resolved
+                .index_type
             }
         };
         result.push(SearchScanSplit::Raw {

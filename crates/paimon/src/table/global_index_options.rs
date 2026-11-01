@@ -41,7 +41,7 @@ impl Definition {
 }
 
 /// Ownership is shared by maintenance and both table modes' read paths.
-pub(super) fn declarations(options: &HashMap<String, String>) -> Result<Vec<(String, String)>> {
+pub(super) fn declarations(options: &HashMap<String, String>) -> Result<Vec<Definition>> {
     declarations_impl(options, true)
 }
 
@@ -50,13 +50,13 @@ pub(super) fn declarations(options: &HashMap<String, String>) -> Result<Vec<(Str
 pub(super) fn declarations_for_read(
     options: &HashMap<String, String>,
 ) -> Result<Vec<(String, String)>> {
-    declarations_impl(options, false)
+    Ok(declarations_impl(options, false)?
+        .into_iter()
+        .map(|definition| (definition.column, definition.index_type))
+        .collect())
 }
 
-fn declarations_impl(
-    options: &HashMap<String, String>,
-    strict: bool,
-) -> Result<Vec<(String, String)>> {
+fn declarations_impl(options: &HashMap<String, String>, strict: bool) -> Result<Vec<Definition>> {
     let core = CoreOptions::new(options);
     for kind in core.global_index_types() {
         if strict && kind != "vector" && normalize_global_index_type(&kind).is_none() {
@@ -84,12 +84,39 @@ fn declarations_impl(
             if !owners.insert(column.clone()) {
                 return Err(crate::Error::ConfigInvalid { message: format!("Column '{column}' can own at most one primary-key index or automatically maintained global index") });
             }
-            let kind = if family == "vector" && strict {
-                vector_index_type(options, &column)?.ok_or_else(|| crate::Error::ConfigInvalid { message: format!("fields.{column}.global-index.vector.index-type must specify a supported vector index type") })?
+            let (kind, resolved) = if family == "vector" && strict {
+                let resolved = core.vector_index_options(None, &column, true)?;
+                let kind = resolved
+                    .index_type
+                    .ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Vector index implementation is not configured for '{column}'"
+                        ),
+                    })?;
+                let kind = normalize_global_index_type(&kind)
+                    .filter(|kind| crate::vindex::is_vindex_index_type(kind))
+                    .ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: format!("Unsupported vector index type for {column}: {kind}"),
+                    })?;
+                (kind, resolved.options)
             } else {
-                family
+                (
+                    family,
+                    if strict {
+                        core.global_index_options(family, &column)?
+                    } else {
+                        HashMap::new()
+                    },
+                )
             };
-            result.push((column, kind.into()));
+            result.push(Definition {
+                column,
+                index_type: kind.into(),
+                options: resolved
+                    .into_iter()
+                    .filter(|(key, value)| options.get(key) != Some(value))
+                    .collect(),
+            });
         }
     }
     Ok(result)
@@ -99,6 +126,7 @@ pub(super) fn definitions(table: &Table) -> Result<Vec<Definition>> {
     let options = table.schema().options();
     let owners = declarations(options)?
         .into_iter()
+        .map(|definition| (definition.column.clone(), definition))
         .collect::<HashMap<_, _>>();
     for column in owners.keys() {
         if !table.schema().fields().iter().any(|f| f.name() == column) {
@@ -109,18 +137,13 @@ pub(super) fn definitions(table: &Table) -> Result<Vec<Definition>> {
     }
     let mut result = Vec::with_capacity(owners.len());
     for field in table.schema().fields() {
-        let Some(kind) = owners.get(field.name()) else {
+        let Some(definition) = owners.get(field.name()) else {
             continue;
-        };
-        let family = if crate::vindex::is_vindex_index_type(kind) {
-            "vector"
-        } else {
-            kind
         };
         let definition = Definition {
             column: field.name().into(),
-            index_type: kind.clone(),
-            options: field_index_options(options, field.name(), family, kind)?,
+            index_type: definition.index_type.clone(),
+            options: definition.options.clone(),
         };
         let mut merged = options.clone();
         merged.extend(definition.options.clone());
@@ -142,7 +165,8 @@ pub(super) fn field_index_options(
 ) -> Result<HashMap<String, String>> {
     let core = CoreOptions::new(table_options);
     let resolved = if crate::vindex::is_vindex_index_type(index_type) {
-        core.vector_index_options(index_type, column, true)?
+        core.vector_index_options(Some(index_type), column, true)?
+            .options
     } else {
         core.global_index_options(index_type, column)?
     };
@@ -150,21 +174,6 @@ pub(super) fn field_index_options(
         .into_iter()
         .filter(|(key, value)| table_options.get(key) != Some(value))
         .collect())
-}
-
-pub(super) fn vector_index_type(
-    options: &HashMap<String, String>,
-    column: &str,
-) -> Result<Option<&'static str>> {
-    let Some(kind) = CoreOptions::new(options).vector_index_type(column)? else {
-        return Ok(None);
-    };
-    normalize_global_index_type(&kind)
-        .filter(|kind| crate::vindex::is_vindex_index_type(kind))
-        .map(Some)
-        .ok_or_else(|| crate::Error::ConfigInvalid {
-            message: format!("Unsupported vector index type for {column}: {kind}"),
-        })
 }
 
 pub(super) fn declares_column(

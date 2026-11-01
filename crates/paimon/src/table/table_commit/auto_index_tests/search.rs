@@ -514,6 +514,7 @@ async fn full_and_detail_vector_fallback_share_declared_metrics_with_indexes() {
             // A declared metric (including its default) has the same build-over-table
             // precedence as explicit native builder options.
             ("fields.embedding.distance.metric", "l2"),
+            ("ivf-flat.metric", "l2"),
             ("fields.embedding.index-type", "diskann"),
         ];
         if let Some(metric) = metric {

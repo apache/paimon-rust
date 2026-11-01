@@ -267,7 +267,7 @@ impl VectorScan {
         let context = PlanContext::new(table, column, filter, include_row_ids, prepared)?;
         let core = CoreOptions::new(table.schema().options());
         let scan = if targets_primary_key_column(table, column) {
-            let column = core.primary_key_vector_index_column()?;
+            let column = core.single_vector_index_column()?;
             let field_id =
                 find_field_id_by_name(table.schema().fields(), &column).ok_or_else(|| {
                     crate::Error::DataInvalid {
@@ -278,8 +278,6 @@ impl VectorScan {
             VectorScanKind::PrimaryKey(Box::new(PkVectorScan::new(
                 table,
                 field_id,
-                super::pk_index_options::vector_index_type(table.schema().options(), &column)?
-                    .to_string(),
                 filter.cloned(),
             )))
         } else {

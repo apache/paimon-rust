@@ -869,13 +869,13 @@ fn assert_not_updating_primary_key_index_column(
     if schema.primary_keys().is_empty() || core_options.data_evolution_enabled() {
         return Ok(());
     }
-    let is_vector_index_column = core_options.primary_key_vector_index_enabled()
+    let is_vector_index_column = core_options.vector_index_enabled()
         && core_options
-            .primary_key_vector_index_columns()?
+            .vector_index_columns()
             .iter()
             .any(|column| column == field_name);
     let is_full_text_index_column = core_options
-        .primary_key_full_text_index_columns()
+        .full_text_index_columns()
         .iter()
         .any(|column| column == field_name);
 
@@ -2301,17 +2301,36 @@ impl Schema {
         options: &HashMap<String, String>,
     ) -> crate::Result<()> {
         let core = CoreOptions::new(options);
-        if !core.primary_key_vector_index_enabled() {
+        if !core.vector_index_enabled() {
             return Ok(());
         }
 
-        let column = core.primary_key_vector_index_column()?;
+        let column = core.single_vector_index_column()?;
         if column.is_empty() {
             return Err(crate::Error::ConfigInvalid {
                 message: "pk-vector.index.columns must name a non-empty column".to_string(),
             });
         }
-        core.primary_key_vector_index_type(&column)?;
+        let declared = core.global_index_types().iter().any(|kind| {
+            !matches!(
+                kind.as_str(),
+                "vector" | "btree" | "bitmap" | "multivalue" | "fm" | "full-text"
+            ) && core.global_index_columns(kind).contains(&column)
+        });
+        let legacy_type = options
+            .get(&format!("fields.{column}.global-index.vector.index-type"))
+            .is_some_and(|kind| !kind.trim().is_empty())
+            || (options
+                .get("pk-vector.index.columns")
+                .is_some_and(|columns| columns.split(',').any(|c| c.trim() == column))
+                && options
+                    .get(&format!("fields.{column}.pk-vector.index.type"))
+                    .is_some_and(|kind| !kind.trim().is_empty()));
+        if !declared && !legacy_type {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Vector index implementation is not configured".into(),
+            });
+        }
         Self::validate_primary_key_index_prerequisites("vector", primary_keys, &core)?;
 
         let field = fields
@@ -2335,7 +2354,11 @@ impl Schema {
             });
         }
 
-        core.legacy_primary_key_vector_distance_metric(&column)
+        let metric = options
+            .get(&format!("fields.{column}.pk-vector.distance.metric"))
+            .map(String::as_str)
+            .unwrap_or("inner_product");
+        crate::vindex::pkvector::metric::VectorSearchMetric::parse(metric)
             .map(|_| ())
             .map_err(Self::options_error_to_config_invalid)
     }
@@ -2346,11 +2369,11 @@ impl Schema {
         options: &HashMap<String, String>,
     ) -> crate::Result<()> {
         let core = CoreOptions::new(options);
-        if !core.primary_key_full_text_index_enabled() {
+        if !core.full_text_index_enabled() {
             return Ok(());
         }
 
-        let columns = core.primary_key_full_text_index_columns();
+        let columns = core.full_text_index_columns();
         if columns.len() != 1 {
             return Err(crate::Error::ConfigInvalid {
                 message: format!(
@@ -2367,9 +2390,7 @@ impl Schema {
         }
 
         Self::validate_primary_key_index_prerequisites("full-text", primary_keys, &core)?;
-        if core.primary_key_vector_index_enabled()
-            && core.primary_key_vector_index_column()? == *column
-        {
+        if core.vector_index_enabled() && core.single_vector_index_column()? == *column {
             return Err(crate::Error::ConfigInvalid {
                 message: format!(
                     "Primary-key vector and full-text indexes cannot reference the same column: '{column}'."
@@ -5426,7 +5447,7 @@ mod tests {
             build_vector_index_test_schema(vector_4f(), &["id"], |options| {
                 options.remove("fields.embedding.pk-vector.index.type");
             }),
-            "index.type is required",
+            "Vector index implementation is not configured",
         );
         assert_config_invalid(
             build_vector_index_test_schema(vector_4f(), &["id"], |options| {
@@ -5458,6 +5479,52 @@ mod tests {
             }),
             "merge-on-read = false",
         );
+    }
+
+    #[test]
+    fn pk_vector_family_declaration_still_requires_an_implementation() {
+        assert_config_invalid(
+            build_vector_index_test_schema(vector_4f(), &["id"], |options| {
+                options.remove("pk-vector.index.columns");
+                options.insert(
+                    "global-index.vector.index-columns".into(),
+                    "embedding".into(),
+                );
+            }),
+            "Vector index implementation is not configured",
+        );
+        for field_type in [None, Some("ivf-flat")] {
+            let result = build_vector_index_test_schema(vector_4f(), &["id"], |options| {
+                options.remove("pk-vector.index.columns");
+                options.remove("fields.embedding.pk-vector.index.type");
+                options.insert(
+                    "global-index.vector.index-columns".into(),
+                    "embedding".into(),
+                );
+                if let Some(kind) = field_type {
+                    options.insert(
+                        "fields.embedding.global-index.vector.index-type".into(),
+                        kind.into(),
+                    );
+                }
+            });
+            if field_type.is_some() {
+                result.unwrap();
+            } else {
+                assert_config_invalid(result, "Vector index implementation is not configured");
+            }
+        }
+        build_vector_index_test_schema(vector_4f(), &["id"], |options| {
+            options.remove("pk-vector.index.columns");
+            options.remove("fields.embedding.pk-vector.index.type");
+            options.insert(
+                "global-index.ivf-flat.index-columns".into(),
+                "embedding".into(),
+            );
+            // Preserve deferred parameter validation; creation checks schema shape.
+            options.insert("fields.embedding.index-options".into(), "bad-json".into());
+        })
+        .unwrap();
     }
 
     #[test]

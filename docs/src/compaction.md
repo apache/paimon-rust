@@ -161,7 +161,12 @@ precedence; the hint selects the implementation for raw fallback when no vector
 index metadata is available. Captured scans, readers, hybrid routes and worker
 transport retain it. Ordinary parameters still use `with_options`, and readers
 leave an unspecified metric unset so global index metadata can supply it. PK
-readers retain Java's table metric validation.
+readers retain Java's table metric validation. PK scans collect supported vector
+payloads for the column and discard stale source-file sets before readers select
+the algorithm. All valid payloads, including completed empty segments, must use
+one algorithm. With none left, readers use the configured declaration or Native
+hint. Type, parameters and metric come from one captured resolver result, reused
+for raw fallback, refinement and distributed index tasks.
 
 The option aliases `index_type`, `index-type`, `vector.index-type` and
 `fields.<column>.index-type` no longer select vector implementations. Use the

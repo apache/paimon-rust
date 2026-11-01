@@ -41,6 +41,15 @@ fn invalid(message: impl Into<String>) -> Error {
     }
 }
 
+/// One captured vector configuration. A supplied metadata implementation wins
+/// over declarations; readers can leave an unspecified metric out of `options`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VectorIndexOptions {
+    pub index_type: Option<String>,
+    pub options: HashMap<String, String>,
+    pub metric: String,
+}
+
 impl CoreOptions<'_> {
     /// Declared implementation identifiers, in deterministic order.
     pub fn global_index_types(&self) -> Vec<String> {
@@ -102,43 +111,66 @@ impl CoreOptions<'_> {
         }
     }
 
-    /// Concrete declarations select the implementation. Legacy PK field types
-    /// apply only to columns listed by the legacy PK declaration; they are not
-    /// standalone implementation hints. Query hints belong to the builder API.
-    pub fn vector_index_type(&self, column: &str) -> Result<Option<String>> {
-        let declared = self
-            .global_index_types()
-            .into_iter()
-            .filter(|kind| {
-                vector(kind)
-                    && kind != "vector"
-                    && self.global_index_columns(kind).iter().any(|c| c == column)
-            })
-            .collect::<Vec<_>>();
-        if declared.len() > 1 {
-            return Err(invalid(format!(
-                "Multiple vector index types declared for '{column}'"
-            )));
-        }
-        if let Some(kind) = declared.into_iter().next() {
-            return Ok(Some(kind));
-        }
-        let legacy_pk = columns(self.options.get("pk-vector.index.columns"))
-            .iter()
-            .any(|declared| declared == column);
-        Ok(self
-            .options
-            .get(&format!("fields.{column}.global-index.vector.index-type"))
-            .or_else(|| {
-                legacy_pk
-                    .then(|| {
-                        self.options
-                            .get(&format!("fields.{column}.pk-vector.index.type"))
+    /// Resolve the implementation and its parameters together. Explicit types
+    /// from captured metadata take precedence without consulting declarations.
+    pub fn vector_index_options(
+        &self,
+        kind: Option<&str>,
+        column: &str,
+        default_metric: bool,
+    ) -> Result<VectorIndexOptions> {
+        let selected = if let Some(kind) = kind {
+            Some(kind.trim().to_ascii_lowercase())
+        } else {
+            let declared = self
+                .global_index_types()
+                .into_iter()
+                .filter(|kind| {
+                    vector(kind)
+                        && kind != "vector"
+                        && self.global_index_columns(kind).iter().any(|c| c == column)
+                })
+                .collect::<Vec<_>>();
+            if declared.len() > 1 {
+                return Err(invalid(format!(
+                    "Multiple vector index types declared for '{column}'"
+                )));
+            }
+            if let Some(kind) = declared.into_iter().next() {
+                Some(kind)
+            } else {
+                let legacy_pk = columns(self.options.get("pk-vector.index.columns"))
+                    .iter()
+                    .any(|declared| declared == column);
+                self.options
+                    .get(&format!("fields.{column}.global-index.vector.index-type"))
+                    .or_else(|| {
+                        legacy_pk
+                            .then(|| {
+                                self.options
+                                    .get(&format!("fields.{column}.pk-vector.index.type"))
+                            })
+                            .flatten()
                     })
-                    .flatten()
-            })
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty()))
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+            }
+        };
+        let Some(kind) = selected else {
+            let metric = normalize_metric(
+                self.options
+                    .get(&format!("fields.{column}.pk-vector.distance.metric"))
+                    .map(String::as_str)
+                    .unwrap_or("inner_product"),
+            );
+            crate::vindex::pkvector::metric::VectorSearchMetric::parse(&metric)?;
+            return Ok(VectorIndexOptions {
+                index_type: None,
+                options: self.options.clone(),
+                metric,
+            });
+        };
+        self.resolve_vector_parameters(kind, column, default_metric)
     }
 
     /// Resolve implementation defaults and one field's JSON without mutating
@@ -230,7 +262,7 @@ impl CoreOptions<'_> {
                     )));
                 }
                 resolved.insert(qualified.clone(), value.clone());
-                if shared && is_vector {
+                if is_vector {
                     if let Some(short) = qualified.strip_prefix(&prefix) {
                         resolved.insert(format!("{field}{short}"), value);
                     }
@@ -240,15 +272,14 @@ impl CoreOptions<'_> {
         Ok(resolved)
     }
 
-    /// Merge vector field parameters before normalizing metric aliases, like
-    /// Java VectorIndexOptions. Readers can retain an unspecified metric.
-    pub fn vector_index_options(
+    /// Merge parameters only after the implementation has been selected.
+    fn resolve_vector_parameters(
         &self,
-        kind: &str,
+        kind: String,
         column: &str,
         default_metric: bool,
-    ) -> Result<HashMap<String, String>> {
-        if !vector(kind) {
+    ) -> Result<VectorIndexOptions> {
+        if !vector(&kind) {
             return Err(invalid(format!("Unsupported vector index type: {kind}")));
         }
         let field = format!("fields.{column}.");
@@ -275,7 +306,7 @@ impl CoreOptions<'_> {
         for key in &aliases {
             defaults.remove(key);
         }
-        let mut resolved = CoreOptions::new(&defaults).global_index_options(kind, column)?;
+        let mut resolved = CoreOptions::new(&defaults).global_index_options(&kind, column)?;
         metric = aliases
             .iter()
             .find_map(|key| resolved.get(key).cloned())
@@ -292,13 +323,14 @@ impl CoreOptions<'_> {
                 .global_index_types()
                 .iter()
                 .any(|kind| vector(kind) && kind != "vector");
-        if legacy_rust && default_metric {
-            metric = Some(
-                self.options
-                    .get(&format!("{field}global-index.vector.distance-metric"))
-                    .cloned()
-                    .unwrap_or_else(|| "inner_product".into()),
-            );
+        let legacy_metric = legacy_rust.then(|| {
+            self.options
+                .get(&format!("{field}global-index.vector.distance-metric"))
+                .cloned()
+                .unwrap_or_else(|| "inner_product".into())
+        });
+        if default_metric && legacy_rust {
+            metric = legacy_metric.clone();
         }
         if metric.is_some() || default_metric {
             let metric = normalize_metric(metric.as_deref().unwrap_or("inner_product"));
@@ -307,7 +339,16 @@ impl CoreOptions<'_> {
                 resolved.insert(key, metric.clone());
             }
         }
-        Ok(resolved)
+        Ok(VectorIndexOptions {
+            index_type: Some(kind),
+            options: resolved,
+            metric: normalize_metric(
+                legacy_metric
+                    .as_deref()
+                    .or(metric.as_deref())
+                    .unwrap_or("inner_product"),
+            ),
+        })
     }
 }
 
@@ -320,6 +361,99 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn vector_resolution_captures_type_options_and_metric_atomically() {
+        let values = map(&[
+            ("global-index.ivf-pq.index-columns", "embedding"),
+            ("ivf-pq.dimension", "16"),
+            ("ivf-pq.nlist", "8"),
+            ("ivf-pq.metric", "l2"),
+            (
+                "fields.embedding.pk-vector.index.options",
+                r#"{"dimension": 99, "m": 4}"#,
+            ),
+            (
+                "fields.embedding.index-options",
+                r#"{"dimension": 2, "nlist": 1, "metric": "COSINE"}"#,
+            ),
+        ]);
+        let before = values.clone();
+        let resolved = CoreOptions::new(&values)
+            .vector_index_options(None, "embedding", true)
+            .unwrap();
+        assert_eq!(resolved.index_type.as_deref(), Some("ivf-pq"));
+        assert_eq!(resolved.metric, "cosine");
+        assert_eq!(resolved.options["ivf-pq.dimension"], "2");
+        assert_eq!(resolved.options["ivf-pq.nlist"], "1");
+        assert_eq!(resolved.options["ivf-pq.metric"], "cosine");
+        assert!(
+            !resolved.options.contains_key("ivf-pq.m"),
+            "new JSON replaces the whole legacy JSON"
+        );
+        let restored: VectorIndexOptions =
+            serde_json::from_str(&serde_json::to_string(&resolved).unwrap()).unwrap();
+        assert_eq!(restored, resolved);
+        assert_eq!(values, before);
+    }
+
+    #[test]
+    fn captured_format_ignores_declaration_changes_without_injecting_query_metric() {
+        let values = map(&[
+            ("global-index.ivf-pq.index-columns", "embedding"),
+            ("global-index.diskann.index-columns", "embedding"),
+            ("diskann.metric", "invalid"),
+            ("ivf-flat.nlist", "3"),
+            ("fields.embedding.index-options", r#"{"nlist": 1}"#),
+        ]);
+        assert!(CoreOptions::new(&values)
+            .vector_index_options(None, "embedding", false)
+            .is_err());
+        let resolved = CoreOptions::new(&values)
+            .vector_index_options(Some("ivf-flat"), "embedding", false)
+            .unwrap();
+        assert_eq!(resolved.index_type.as_deref(), Some("ivf-flat"));
+        assert_eq!(resolved.options["ivf-flat.nlist"], "1");
+        assert_eq!(resolved.metric, "inner_product");
+        for key in [
+            "ivf-flat.metric",
+            "ivf-flat.distance.metric",
+            "fields.embedding.metric",
+            "fields.embedding.distance.metric",
+        ] {
+            assert!(!resolved.options.contains_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn legacy_rust_result_preserves_build_metric_without_query_defaults() {
+        let mut values = map(&[
+            ("global-index.vector.index-columns", "embedding"),
+            (
+                "fields.embedding.global-index.vector.index-type",
+                "ivf-flat",
+            ),
+            ("ivf-flat.metric", "l2"),
+        ]);
+        let read = CoreOptions::new(&values)
+            .vector_index_options(None, "embedding", false)
+            .unwrap();
+        let build = CoreOptions::new(&values)
+            .vector_index_options(None, "embedding", true)
+            .unwrap();
+        assert_eq!(read.metric, build.metric);
+        assert_eq!(read.metric, "inner_product");
+        assert_eq!(
+            read.options["ivf-flat.metric"], "l2",
+            "retain explicit read parameters"
+        );
+        values.remove("ivf-flat.metric");
+        let query = CoreOptions::new(&values)
+            .vector_index_options(None, "embedding", false)
+            .unwrap();
+        assert!(!query.options.contains_key("ivf-flat.metric"));
+        assert_eq!(query.metric, "inner_product");
     }
 
     #[test]
@@ -444,11 +578,18 @@ mod tests {
             );
             if vector(kind) {
                 let core = CoreOptions::new(&values);
+                assert_eq!(core.vector_index_columns(), vec!["first", "second"]);
                 assert_eq!(
-                    core.primary_key_vector_index_columns().unwrap(),
-                    vec!["first", "second"]
+                    core.vector_index_options(None, "first", false)
+                        .map(|resolved| resolved.index_type.ok_or_else(|| {
+                            crate::Error::ConfigInvalid {
+                                message: "Vector index implementation is not configured".into(),
+                            }
+                        }))
+                        .and_then(|kind| kind)
+                        .unwrap(),
+                    kind
                 );
-                assert_eq!(core.primary_key_vector_index_type("first").unwrap(), kind);
             }
             values.insert(format!("global-index.{kind}.index-columns"), "".into());
             assert_eq!(
@@ -466,7 +607,8 @@ mod tests {
                 ("fields.embedding.pk-vector.index.type", kind),
             ]);
             assert!(CoreOptions::new(&values)
-                .primary_key_vector_distance_metric("embedding")
+                .vector_index_options(None, "embedding", true)
+                .map(|resolved| resolved.metric)
                 .unwrap_err()
                 .to_string()
                 .contains("Unsupported vector index type"));
@@ -507,8 +649,9 @@ mod tests {
                     (&format!("fields.embedding.{suffix}"), json),
                 ]);
                 let resolved = CoreOptions::new(&values)
-                    .vector_index_options("ivf-pq", "embedding", true)
-                    .unwrap();
+                    .vector_index_options(Some("ivf-pq"), "embedding", true)
+                    .unwrap()
+                    .options;
                 for key in [
                     "fields.embedding.distance.metric",
                     "fields.embedding.metric",
@@ -519,8 +662,9 @@ mod tests {
                 }
                 assert_eq!(
                     CoreOptions::new(&resolved)
-                        .vector_index_options("ivf-pq", "embedding", true)
-                        .unwrap(),
+                        .vector_index_options(Some("ivf-pq"), "embedding", true)
+                        .unwrap()
+                        .options,
                     resolved
                 );
             }
@@ -579,7 +723,8 @@ mod tests {
         ]);
         assert_eq!(
             CoreOptions::new(&values)
-                .primary_key_vector_distance_metric("embedding")
+                .vector_index_options(None, "embedding", true)
+                .map(|resolved| resolved.metric)
                 .unwrap(),
             "cosine"
         );
@@ -588,8 +733,9 @@ mod tests {
             r#"{"nlist":64,"distance.metric":"Inner-Product"}"#.into(),
         );
         let resolved = CoreOptions::new(&values)
-            .vector_index_options("ivf-pq", "embedding", true)
-            .unwrap();
+            .vector_index_options(Some("ivf-pq"), "embedding", true)
+            .unwrap()
+            .options;
         for key in [
             "ivf-pq.metric",
             "ivf-pq.distance.metric",
@@ -603,7 +749,8 @@ mod tests {
         assert_eq!(resolved["fields.embedding.nlist"], "64");
         assert_eq!(
             CoreOptions::new(&values)
-                .primary_key_vector_distance_metric("embedding")
+                .vector_index_options(None, "embedding", true)
+                .map(|resolved| resolved.metric)
                 .unwrap(),
             "inner_product"
         );
@@ -630,15 +777,16 @@ mod tests {
                 ("fields.embedding.pk-vector.index.options", r#"{"nlist":1}"#),
             ]);
             assert!(CoreOptions::new(&values)
-                .vector_index_options("ivf-flat", "embedding", true)
+                .vector_index_options(Some("ivf-flat"), "embedding", true)
                 .unwrap_err()
                 .to_string()
                 .contains("fields.embedding.index-options"));
         }
         let values = map(&[("fields.embedding.index-options", r#"{"nlist":64}"#)]);
         let resolved = CoreOptions::new(&values)
-            .vector_index_options("ivf-pq", "embedding", false)
-            .unwrap();
+            .vector_index_options(Some("ivf-pq"), "embedding", false)
+            .unwrap()
+            .options;
         assert!(!resolved.contains_key("ivf-pq.metric"));
     }
 
@@ -668,12 +816,20 @@ mod tests {
         ]);
         let core = CoreOptions::new(&values);
         assert_eq!(
-            core.primary_key_vector_index_type("embedding").unwrap(),
+            core.vector_index_options(None, "embedding", false)
+                .map(|resolved| resolved
+                    .index_type
+                    .ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: "Vector index implementation is not configured".into()
+                    }))
+                .and_then(|kind| kind)
+                .unwrap(),
             "ivf-flat"
         );
         let resolved = core
-            .vector_index_options("ivf-flat", "embedding", true)
-            .unwrap();
+            .vector_index_options(Some("ivf-flat"), "embedding", true)
+            .unwrap()
+            .options;
         assert_eq!(resolved["ivf-flat.dimension"], "2");
         assert_eq!(resolved["ivf-flat.metric"], "l2");
     }
@@ -689,7 +845,8 @@ mod tests {
             let mut values = map(&[(key, "diskann")]);
             assert_eq!(
                 CoreOptions::new(&values)
-                    .vector_index_type("embedding")
+                    .vector_index_options(None, "embedding", false)
+                    .map(|resolved| resolved.index_type)
                     .unwrap(),
                 None
             );
@@ -699,7 +856,8 @@ mod tests {
             );
             assert_eq!(
                 CoreOptions::new(&values)
-                    .vector_index_type("embedding")
+                    .vector_index_options(None, "embedding", false)
+                    .map(|resolved| resolved.index_type)
                     .unwrap()
                     .as_deref(),
                 Some("ivf-flat")
@@ -718,7 +876,8 @@ mod tests {
             }
             assert_eq!(
                 CoreOptions::new(&values)
-                    .vector_index_type("embedding")
+                    .vector_index_options(None, "embedding", false)
+                    .map(|resolved| resolved.index_type)
                     .unwrap(),
                 None
             );
@@ -729,7 +888,8 @@ mod tests {
         );
         assert_eq!(
             CoreOptions::new(&values)
-                .vector_index_type("embedding")
+                .vector_index_options(None, "embedding", false)
+                .map(|resolved| resolved.index_type)
                 .unwrap()
                 .as_deref(),
             Some("ivf-flat")
@@ -737,7 +897,8 @@ mod tests {
         values.remove("fields.embedding.pk-vector.index.type");
         assert_eq!(
             CoreOptions::new(&values)
-                .vector_index_type("embedding")
+                .vector_index_options(None, "embedding", false)
+                .map(|resolved| resolved.index_type)
                 .unwrap(),
             None
         );
@@ -749,7 +910,8 @@ mod tests {
             values.insert(format!("global-index.ivf-pq.{suffix}"), "embedding".into());
             assert_eq!(
                 CoreOptions::new(&values)
-                    .vector_index_type("embedding")
+                    .vector_index_options(None, "embedding", false)
+                    .map(|resolved| resolved.index_type)
                     .unwrap()
                     .as_deref(),
                 Some("ivf-pq")
@@ -775,16 +937,18 @@ mod tests {
             ),
         ]);
         let resolved = CoreOptions::new(&values)
-            .vector_index_options("ivf-pq", "embedding", false)
-            .unwrap();
+            .vector_index_options(Some("ivf-pq"), "embedding", false)
+            .unwrap()
+            .options;
         assert_eq!(resolved["ivf-pq.nlist"], "1");
         assert_eq!(resolved["fields.embedding.dimension"], "2");
         assert!(!resolved.contains_key("ivf-pq.pq.m"));
         assert!(!resolved.contains_key("ivf-pq.metric"));
         assert!(!resolved.contains_key("fields.embedding.metric"));
         let defaults = CoreOptions::new(&values)
-            .vector_index_options("ivf-pq", "embedding", true)
-            .unwrap();
+            .vector_index_options(Some("ivf-pq"), "embedding", true)
+            .unwrap()
+            .options;
         assert_eq!(defaults["ivf-pq.metric"], "inner_product");
         assert_eq!(values["ivf-pq.dimension"], "8");
     }

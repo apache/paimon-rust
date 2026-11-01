@@ -197,37 +197,54 @@ pub(super) fn validate_global_vector_index_types(
     Ok(())
 }
 
-pub(super) fn configured_vector_index_type(
-    table_options: &HashMap<String, String>,
-    query_options: &HashMap<String, String>,
-    column: &str,
-) -> crate::Result<Option<String>> {
-    if let Some(kind) = super::global_index_options::vector_index_type(query_options, column)? {
-        return Ok(Some(kind.into()));
-    }
-    if let Some(kind) = super::global_index_options::vector_index_type(table_options, column)? {
-        return Ok(Some(kind.into()));
-    }
-    Ok(None)
+/// Resolve query and table sources separately, preserving query-over-table
+/// precedence while keeping the implementation and its parameters together.
+pub(super) struct VectorSearchOptions {
+    pub table_metric: String,
+    pub resolved: crate::spec::VectorIndexOptions,
+    pub query_options: HashMap<String, String>,
 }
 
-/// Resolve only after discovering that no persisted vector implementation exists.
-pub(super) fn raw_vector_index_type(
+pub(super) fn resolve_vector_search_options(
     table_options: &HashMap<String, String>,
     query_options: &HashMap<String, String>,
     column: &str,
     explicit: Option<&str>,
-) -> crate::Result<Option<String>> {
-    let Some(kind) = explicit else {
-        return configured_vector_index_type(table_options, query_options, column);
-    };
-    let kind = kind.trim().to_ascii_lowercase();
-    if !is_vindex_index_type(&kind) {
-        return Err(crate::Error::ConfigInvalid {
-            message: format!("Unsupported vector index type for {column}: {kind}"),
-        });
+    default_metric: bool,
+) -> crate::Result<VectorSearchOptions> {
+    let mut query =
+        CoreOptions::new(query_options).vector_index_options(explicit, column, false)?;
+    let mut table = CoreOptions::new(table_options).vector_index_options(
+        query.index_type.as_deref().or(explicit),
+        column,
+        default_metric,
+    )?;
+    if query.index_type.is_none() && table.index_type.is_some() {
+        query = CoreOptions::new(query_options).vector_index_options(
+            table.index_type.as_deref(),
+            column,
+            false,
+        )?;
     }
-    Ok(Some(kind))
+    let table_metric = table.metric.clone();
+    if let Some(kind) = table.index_type.as_deref() {
+        if !is_vindex_index_type(kind) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("Unsupported vector index type for {column}: {kind}"),
+            });
+        }
+        if let Some(metric) = query.options.get(&format!("{kind}.metric")) {
+            table.metric = metric.clone();
+        }
+        table.options = merge_vector_read_options(&table.options, &query.options, column, kind);
+    } else {
+        table.options.extend(query.options.clone());
+    }
+    Ok(VectorSearchOptions {
+        table_metric,
+        resolved: table,
+        query_options: query.options,
+    })
 }
 
 pub(super) fn current_tokio_runtime_handle() -> crate::Result<tokio::runtime::Handle> {
@@ -515,20 +532,34 @@ fn add_refine_prefixes(prefixes: &mut Vec<String>, base: &str, index_type: &str)
     prefixes.push(base.to_string());
 }
 
+#[cfg(test)]
 pub(super) fn configured_refine_factor(
     search_options: &HashMap<String, String>,
     table_options: &HashMap<String, String>,
     field_name: &str,
     index_type: &str,
 ) -> crate::Result<usize> {
-    let query =
-        CoreOptions::new(search_options).vector_index_options(index_type, field_name, false)?;
+    let query = CoreOptions::new(search_options)
+        .vector_index_options(Some(index_type), field_name, false)?
+        .options;
     if let Some(value) = configured_refine_factor_from_options(&query, field_name, index_type) {
         return parse_refine_factor(&value);
     }
-    let resolved =
-        CoreOptions::new(table_options).vector_index_options(index_type, field_name, false)?;
-    if let Some(value) = configured_refine_factor_from_options(&resolved, field_name, index_type) {
+    let resolved = CoreOptions::new(table_options)
+        .vector_index_options(Some(index_type), field_name, false)?
+        .options;
+    resolved_refine_factor(&query, &resolved, field_name, index_type)
+}
+
+pub(super) fn resolved_refine_factor(
+    query: &HashMap<String, String>,
+    table: &HashMap<String, String>,
+    field_name: &str,
+    index_type: &str,
+) -> crate::Result<usize> {
+    if let Some(value) = configured_refine_factor_from_options(query, field_name, index_type)
+        .or_else(|| configured_refine_factor_from_options(table, field_name, index_type))
+    {
         return parse_refine_factor(&value);
     }
     Ok(0)
@@ -542,8 +573,21 @@ pub(super) fn vector_read_options(
     column: &str,
     kind: &str,
 ) -> crate::Result<HashMap<String, String>> {
-    let resolve = |source: &HashMap<String, String>| -> crate::Result<HashMap<String, String>> {
-        let mut options = CoreOptions::new(source).vector_index_options(kind, column, false)?;
+    Ok(
+        resolve_vector_search_options(table, query, column, Some(kind), false)?
+            .resolved
+            .options,
+    )
+}
+
+pub(super) fn merge_vector_read_options(
+    table: &HashMap<String, String>,
+    query: &HashMap<String, String>,
+    column: &str,
+    kind: &str,
+) -> HashMap<String, String> {
+    let normalize = |source: &HashMap<String, String>| {
+        let mut options = source.clone();
         for (native, suffixes) in [
             ("ivf.nprobe", &["nprobe", "ivf.nprobe"][..]),
             ("diskann.l_search", &["l_search", "diskann.l_search"][..]),
@@ -559,11 +603,11 @@ pub(super) fn vector_read_options(
                 options.insert(native.into(), value);
             }
         }
-        Ok(options)
+        options
     };
-    let mut options = resolve(table)?;
-    options.extend(resolve(query)?);
-    Ok(options)
+    let mut options = normalize(table);
+    options.extend(normalize(query));
+    options
 }
 
 fn configured_refine_factor_from_options(
@@ -605,17 +649,41 @@ pub(super) fn targets_primary_key_column(table: &Table, column: &str) -> bool {
     let core = table.schema().core_options();
     !table.schema().primary_keys().is_empty()
         && !core.data_evolution_enabled()
-        && core.primary_key_vector_index_enabled()
-        && core
-            .primary_key_vector_index_columns()
-            .ok()
-            .is_some_and(|columns| columns.iter().any(|c| c == column))
+        && core.vector_index_enabled()
+        && core.vector_index_columns().iter().any(|c| c == column)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::FileIOBuilder;
+
+    #[test]
+    fn shared_search_result_keeps_legacy_defaults_separate_from_query_metrics() {
+        let table = HashMap::from([
+            (
+                "global-index.vector.index-columns".into(),
+                "embedding".into(),
+            ),
+            (
+                "fields.embedding.global-index.vector.index-type".into(),
+                "ivf-flat".into(),
+            ),
+            ("ivf-flat.metric".into(), "l2".into()),
+        ]);
+        let plain =
+            resolve_vector_search_options(&table, &HashMap::new(), "embedding", None, false)
+                .unwrap();
+        assert_eq!(plain.resolved.metric, "inner_product");
+        assert!(!plain.query_options.contains_key("ivf-flat.metric"));
+        // A query source can also carry a compatibility declaration. Only its
+        // explicit metric, not its compatibility build default, constrains reads.
+        let query =
+            resolve_vector_search_options(&table, &table, "embedding", None, false).unwrap();
+        assert_eq!(query.table_metric, "inner_product");
+        assert_eq!(query.resolved.metric, "l2");
+        assert_eq!(query.query_options["ivf-flat.metric"], "l2");
+    }
     use crate::spec::{GlobalIndexMeta, IndexFileMeta};
 
     #[test]

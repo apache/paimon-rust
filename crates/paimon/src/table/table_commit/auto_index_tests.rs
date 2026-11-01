@@ -594,7 +594,7 @@ async fn vector_definitions_require_a_supported_algorithm_and_metric() {
         .await
         .unwrap_err()
         .to_string()
-        .contains("fields.embedding.global-index.vector.index-type"));
+        .contains("Vector index implementation is not configured"));
     for (key, value) in [
         ("fields.embedding.global-index.vector.index-type", "btree"),
         (

@@ -947,15 +947,20 @@ async fn reader_uses_planned_splits_after_index_manifest_is_removed() {
     let table = build_committed_pk_vector_table(&[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]).await;
     let options = HashMap::new();
     let query = [0.0, 1.0];
-    let params =
-        PkVectorSearchParams::resolve(&table, &options, None, "embedding", &[&query], 2).unwrap();
-    let scan = crate::table::pk_vector_scan::PkVectorScan::new(
+    let params = PkVectorSearchParams::resolve(
         &table,
-        params.vector_field.id(),
-        params.index_type.clone(),
+        &options,
         None,
-    );
-    let read = PkVectorRead::new(&table, &options, None, "embedding", &[&query], 2, params);
+        "embedding",
+        &[&query],
+        2,
+        None,
+        None,
+    )
+    .unwrap();
+    let scan =
+        crate::table::pk_vector_scan::PkVectorScan::new(&table, params.vector_field.id(), None);
+    let read = PkVectorRead::new(&table, &options, None, "embedding", &[&query], 2);
     let plan = scan.plan().await.unwrap();
     let snapshot_id = plan.snapshot_id;
     let manager = table.snapshot_manager();
@@ -1181,4 +1186,43 @@ fn residual_uses_only_data_conjuncts_of_the_filter() {
         vec![mixed],
         "a mixed partition/data conjunct must stay whole in the residual"
     );
+}
+
+#[tokio::test]
+async fn reader_rejects_mixed_valid_payload_types_including_empty_markers() {
+    for cross_bucket in [false, true] {
+        let table = build_committed_pk_vector_table(&[[1.0, 0.0], [0.0, 1.0]]).await;
+        let scan = crate::table::pk_vector_scan::PkVectorScan::new(&table, 1, None);
+        let mut plan = scan.plan().await.unwrap();
+        assert_eq!(plan.splits[0].ann_segments.len(), 1);
+        let mut other = plan.splits[0].ann_segments[0].clone();
+        other.index_type = "ivf-pq".into();
+        other.row_count = 0;
+        if cross_bucket {
+            let mut split = plan.splits[0].clone();
+            split.data_split = DataSplitBuilder::new()
+                .with_snapshot(plan.snapshot_id)
+                .with_partition(split.data_split.partition().clone())
+                .with_bucket(1)
+                .with_bucket_path("memory:/pk_vector_route_test/bucket-1".into())
+                .with_total_buckets(2)
+                .with_data_files(split.data_split.data_files().to_vec())
+                .build()
+                .unwrap();
+            split.ann_segments = vec![other];
+            plan.splits.push(split);
+        } else {
+            plan.splits[0].ann_segments.push(other);
+        }
+        let reader = PkVectorRead::new(
+            &table,
+            &HashMap::new(),
+            None,
+            "embedding",
+            &[&[1.0, 0.0]],
+            1,
+        );
+        let err = reader.read(plan).await.unwrap_err();
+        assert!(err.to_string().contains("multiple index types"), "{err}");
+    }
 }

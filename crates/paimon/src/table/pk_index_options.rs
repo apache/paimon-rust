@@ -39,21 +39,11 @@ pub(super) fn field_options(
     crate::table::global_index_options::field_index_options(options, column, family, index_type)
 }
 
-pub(super) fn vector_index_type(
-    options: &HashMap<String, String>,
-    column: &str,
-) -> Result<&'static str> {
-    crate::table::global_index_options::vector_index_type(options, column)?.ok_or_else(|| {
-        Error::ConfigInvalid {
-            message: format!("fields.{column}.pk-vector.index.type is required but not set"),
-        }
-    })
-}
-
 pub(super) fn definitions(schema: &TableSchema) -> Result<Vec<Definition>> {
     let options = schema.options();
     let owners = crate::table::global_index_options::declarations(options)?
         .into_iter()
+        .map(|definition| (definition.column.clone(), definition))
         .collect::<HashMap<_, _>>();
     for column in owners.keys() {
         if !schema.fields().iter().any(|field| field.name() == column) {
@@ -62,21 +52,21 @@ pub(super) fn definitions(schema: &TableSchema) -> Result<Vec<Definition>> {
             });
         }
     }
-    if CoreOptions::new(options).primary_key_vector_index_enabled() {
-        schema.core_options().primary_key_vector_index_column()?;
+    if CoreOptions::new(options).vector_index_enabled() {
+        schema.core_options().single_vector_index_column()?;
     }
     let mut result = Vec::new();
     for field in schema.fields() {
-        let Some(kind) = owners.get(field.name()) else {
+        let Some(declaration) = owners.get(field.name()) else {
             continue;
         };
-        let kind = kind.as_str();
+        let kind = declaration.index_type.as_str();
         let family = if crate::vindex::is_vindex_index_type(kind) {
             "vector"
         } else {
             kind
         };
-        let configured = field_options(options, field.name(), family, kind)?;
+        let configured = declaration.options.clone();
         let mut merged = options.clone();
         merged.extend(configured.clone());
         match family {

@@ -22,6 +22,7 @@ use crate::spec::{
     IndexManifestEntry, IntType, ROW_ID_FIELD_NAME,
 };
 use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
+use crate::table::vector_search_common::configured_refine_factor;
 use crate::table::vector_search_common::{collect_ranked_rows, reorder_and_strip_position};
 use crate::table::vector_search_test_utils::{
     build_vindex_segment_bytes, de_vector_table, id_gt_filter, pk_vector_table,
@@ -1769,6 +1770,15 @@ impl crate::table::SearchTaskExecutor for WireSearchExecutor {
         let mut results = Vec::new();
         for (task, frame) in tasks.iter().zip(frames) {
             let value: serde_json::Value = serde_json::from_slice(&task.serialize()?).unwrap();
+            if value["kind"] == "vector-index" {
+                let resolved: crate::spec::VectorIndexOptions =
+                    serde_json::from_value(value["payload"]["resolved"].clone()).unwrap();
+                assert_eq!(resolved.index_type.as_deref(), Some("ivf-flat"));
+                assert_eq!(
+                    resolved.options.get("refine_factor").map(String::as_str),
+                    Some("2")
+                );
+            }
             self.kinds
                 .lock()
                 .unwrap()

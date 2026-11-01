@@ -88,16 +88,10 @@ impl BatchVectorRead {
     ) -> crate::Result<Self> {
         let core = CoreOptions::new(table.schema().options());
         let reader = if targets_primary_key_column(table, column) {
-            let pk_col = core.primary_key_vector_index_column()?;
-            let params = if context.vector_index_type.is_some() {
-                PkVectorSearchParams::resolve_for_type(
-                    table, options, filter, &pk_col, queries, limit, None, false,
-                )?
-            } else {
-                PkVectorSearchParams::resolve(table, options, filter, &pk_col, queries, limit)?
-            };
+            let pk_col = core.single_vector_index_column()?;
+            PkVectorSearchParams::validate_inputs(table, filter, &pk_col, queries, limit)?;
             VectorReadKind::PrimaryKey(Box::new(
-                PkVectorRead::new(table, options, filter, &pk_col, queries, limit, params)
+                PkVectorRead::new(table, options, filter, &pk_col, queries, limit)
                     .with_vector_index_type(context.vector_index_type.clone()),
             ))
         } else {

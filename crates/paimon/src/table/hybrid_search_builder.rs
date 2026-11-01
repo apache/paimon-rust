@@ -1081,16 +1081,16 @@ fn route_is_primary_key(
     }
     match route.kind {
         HybridSearchRouteKind::Vector => {
-            core.primary_key_vector_index_enabled()
+            core.vector_index_enabled()
                 && core
-                    .primary_key_vector_index_columns()
-                    .ok()
-                    .is_some_and(|cols| cols.iter().any(|c| c == route.field_name()))
+                    .vector_index_columns()
+                    .iter()
+                    .any(|c| c == route.field_name())
         }
         HybridSearchRouteKind::FullText => {
             !core.data_evolution_enabled()
                 && core
-                    .primary_key_full_text_index_columns()
+                    .full_text_index_columns()
                     .iter()
                     .any(|c| c == route.field_name())
         }

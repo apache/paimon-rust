@@ -252,7 +252,7 @@ fn resolves_to_pk_full_text_path(
     primary_key
         && !core.data_evolution_enabled()
         && core
-            .primary_key_full_text_index_columns()
+            .full_text_index_columns()
             .iter()
             .any(|c| c == text_column)
 }

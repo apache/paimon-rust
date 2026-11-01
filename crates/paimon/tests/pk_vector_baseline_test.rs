@@ -573,6 +573,58 @@ fn fixture_discriminating() -> ([f32; DIM], Vec<[f32; DIM]>) {
     (query, vectors)
 }
 
+#[cfg(not(windows))]
+#[tokio::test]
+async fn pk_vector_reads_captured_payload_after_algorithm_configuration_changes() {
+    let (query, vectors) = fixture_discriminating();
+    let (_tmp, table) = build_table(&query, &vectors, 3).await;
+    let expected = analytic_topk(&query, &vectors, 3);
+    for declared in ["ivf-pq", "diskann"] {
+        let changed = table.copy_with_options(HashMap::from([
+            (
+                format!("fields.{VECTOR_COLUMN}.pk-vector.index.type"),
+                declared.into(),
+            ),
+            (
+                format!("global-index.{declared}.index-columns"),
+                VECTOR_COLUMN.into(),
+            ),
+            (format!("{declared}.metric"), "invalid-unused-metric".into()),
+            // These parameters must resolve using the captured IVF-flat type.
+            ("ivf-flat.refine_factor".into(), "2".into()),
+        ]));
+        let mut builder = changed.new_vector_search_builder();
+        builder
+            .with_vector_column(VECTOR_COLUMN)
+            .with_vector_index_type(VECTOR_COLUMN, "invalid-unused-hint")
+            .with_query_vector(query.to_vec())
+            .with_limit(3);
+        let plan = builder.new_scan().unwrap().plan().await.unwrap();
+        let result = builder.new_read().unwrap().read(plan).await.unwrap();
+        assert_eq!(
+            result
+                .positions()
+                .unwrap()
+                .iter()
+                .map(|p| p.row_position as u64)
+                .collect::<Vec<_>>(),
+            expected.iter().map(|(pos, _)| *pos).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result
+                .positions()
+                .unwrap()
+                .iter()
+                .map(|p| p.score)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(_, distance)| l2_score(*distance))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
 // Gated off Windows: the fixture table location is a `file://` URL built from a
 // temp dir path, which `FileIO` cannot derive on Windows (see #397); the sibling
 // `rest_catalog_test` gates its identical `file://` tempdir tests the same way.
@@ -1493,8 +1545,8 @@ async fn pk_vector_invalid_refine_factor_fails_loud_on_empty_table() {
         );
     }
 
-    // Case 3: non-integer via a TABLE option (the fix moved table-option
-    // resolution ahead of planning too).
+    // Case 3: non-integer via a TABLE option is validated after planning,
+    // before the empty-plan early return.
     {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let location = format!("file://{}", tmp.path().display());
