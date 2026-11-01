@@ -1830,6 +1830,32 @@ SELECT
 FROM paimon.my_db.user_events;
 ```
 
+### Compatibility Functions
+
+`SQLContext` registers the following functions without requiring a catalog:
+
+| Function | Behavior |
+| --- | --- |
+| `mod(value, divisor)` | Numeric remainder with DataFusion `%` coercion, null, sign, and division-by-zero behavior |
+| `regexp_extract(text, pattern[, index])` | The first matched group; default index 1; index 0 selects the complete match |
+| `regexp_extract_all(text, pattern[, index])` | A list of matched groups, in occurrence order |
+| `date_sub(date, days)` | Subtracts integral calendar days and returns `DATE`; negative days add days |
+| `sha2(text_or_binary, bits)` | Lowercase SHA-2 hex for 224, 256, 384, or 512 bits; 0 means 256; other lengths return null |
+| `to_base64(text_or_binary)` | Standard Base64 with `=` padding; strings are encoded as UTF-8 |
+| `curdate()` | Alias of `current_date()` |
+| `timestamp_millis(value)` | Alias of `to_timestamp_millis(value)`, preserving millisecond epoch units |
+| `to_timestamp_ltz(value[, format...])` | Alias of `to_timestamp`, preserving its session time zone and nanosecond result |
+
+Regular expressions use Rust regex syntax, like DataFusion's existing regex
+functions, rather than the full Java regex dialect. No match or an unmatched
+optional group produces an empty string; no matches for `regexp_extract_all`
+produce an empty list. Null arguments produce null. Invalid patterns, negative
+or out-of-range group indices, and date arithmetic overflow produce errors.
+
+The timestamp aliases retain DataFusion semantics: optional formats are Chrono
+strftime strings, not Spark/Java patterns; numeric `to_timestamp_ltz` inputs
+are epoch seconds. The Flink `(number, precision)` overload is not implemented.
+
 ### Column Projection
 
 Only the required columns are read, reducing I/O:
