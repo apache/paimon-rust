@@ -317,24 +317,24 @@ async fn execute_cow_merge_once(
 ) -> DFResult<DataFrame> {
     let (source_ref, source_alias) = extract_source_ref(&merge.source)?;
     let (target_ref, target_alias) = extract_table_ref(&merge.table)?;
-    let s_alias = source_alias.as_deref().unwrap_or(&source_ref);
-    let t_alias = target_alias.as_deref().unwrap_or("__cow_t");
+    let s_alias = source_alias.unwrap_or_else(|| Ident::new(&source_ref));
+    let t_alias = target_alias.unwrap_or_else(|| Ident::new("__cow_t"));
 
     // Rewrite column qualifiers before rendering SQL, preserving literal contents.
     let mut aliased_merge = merge.clone();
     rewrite_table_references(
         &mut aliased_merge.on,
         &target_ref,
-        t_alias,
+        &t_alias,
         &source_ref,
-        s_alias,
+        &s_alias,
     );
     rewrite_table_references(
         &mut aliased_merge.clauses,
         &target_ref,
-        t_alias,
+        &t_alias,
         &source_ref,
-        s_alias,
+        &s_alias,
     );
     let clauses = extract_cow_merge_clauses(&aliased_merge, enable_ident_normalization)?;
     validate_merge_insert_columns(&clauses.inserts, table.schema().fields())?;
@@ -361,7 +361,7 @@ async fn execute_cow_merge_once(
 
     // Build partition filter from source data to avoid scanning all partitions
     let partition_set =
-        build_source_partition_set(ctx, table, &source_ref, s_alias, t_alias, on_expr).await?;
+        build_source_partition_set(ctx, table, &source_ref, &s_alias, &t_alias, on_expr).await?;
 
     let mut writer = CopyOnWriteMergeWriter::new(table, update_columns.clone(), partition_set)
         .await
@@ -375,8 +375,8 @@ async fn execute_cow_merge_once(
 
     let merge_ctx = CowMergeContext {
         source_ref: &source_ref,
-        s_alias,
-        t_alias,
+        s_alias: &s_alias,
+        t_alias: &t_alias,
         on_condition: &on_condition,
         has_target_data,
         cow_table_name,
@@ -416,8 +416,8 @@ async fn execute_cow_merge_once(
 /// Context for CoW merge inner execution — groups join-related parameters.
 struct CowMergeContext<'a> {
     source_ref: &'a str,
-    s_alias: &'a str,
-    t_alias: &'a str,
+    s_alias: &'a Ident,
+    t_alias: &'a Ident,
     on_condition: &'a str,
     has_target_data: bool,
     cow_table_name: String,
@@ -660,8 +660,8 @@ async fn execute_merge_into_once(
     let (target_ref, target_alias) = extract_table_ref(&merge.table)?;
     let (source_ref, source_alias) = extract_source_ref(&merge.source)?;
     let on_condition = merge.on.to_string();
-    let t_alias = target_alias.as_deref().unwrap_or(&target_ref);
-    let s_alias = source_alias.as_deref().unwrap_or(&source_ref);
+    let t_alias = target_alias.unwrap_or_else(|| Ident::new(&target_ref));
+    let s_alias = source_alias.unwrap_or_else(|| Ident::new(&source_ref));
 
     // 2. Build a single LEFT JOIN: source LEFT JOIN target
     //    _ROW_ID IS NOT NULL → matched (UPDATE path)
@@ -746,7 +746,7 @@ async fn execute_merge_into_once(
             ctx,
             &not_matched_batches,
             &parsed.inserts,
-            s_alias,
+            &s_alias,
             &injected_columns,
             table.schema().fields(),
             &mut temp_tracker,
@@ -852,7 +852,7 @@ async fn build_insert_batches(
     ctx: &SQLContext,
     not_matched_batches: &[RecordBatch],
     inserts: &[MergeInsertClause],
-    s_alias: &str,
+    s_alias: &Ident,
     injected_columns: &[String],
     table_fields: &[DataField],
     temp_tracker: &mut TempTableTracker<'_>,
@@ -881,7 +881,7 @@ async fn build_insert_batches(
 async fn build_insert_batches_inner(
     ctx: &SQLContext,
     inserts: &[MergeInsertClause],
-    s_alias: &str,
+    s_alias: &Ident,
     tmp_name: &str,
     table_fields: &[DataField],
 ) -> DFResult<Vec<RecordBatch>> {
@@ -1273,12 +1273,12 @@ fn extract_merge_clauses(
     })
 }
 
-/// Extract table name and optional alias from a TableFactor.
-fn extract_table_ref(table: &TableFactor) -> DFResult<(String, Option<String>)> {
+/// Extract table name and optional alias, retaining identifier quoting and case.
+fn extract_table_ref(table: &TableFactor) -> DFResult<(String, Option<Ident>)> {
     match table {
         TableFactor::Table { name, alias, .. } => {
             let table_name = name.to_string();
-            let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+            let alias_name = alias.as_ref().map(|a| a.name.clone());
             Ok((table_name, alias_name))
         }
         other => Err(DataFusionError::Plan(format!(
@@ -1288,18 +1288,18 @@ fn extract_table_ref(table: &TableFactor) -> DFResult<(String, Option<String>)> 
 }
 
 /// Extract source reference (table or subquery) from a TableFactor.
-fn extract_source_ref(source: &TableFactor) -> DFResult<(String, Option<String>)> {
+fn extract_source_ref(source: &TableFactor) -> DFResult<(String, Option<Ident>)> {
     match source {
         TableFactor::Table { name, alias, .. } => {
             let table_name = name.to_string();
-            let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+            let alias_name = alias.as_ref().map(|a| a.name.clone());
             Ok((table_name, alias_name))
         }
         TableFactor::Derived {
             subquery, alias, ..
         } => {
             let subquery_sql = format!("({subquery})");
-            let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+            let alias_name = alias.as_ref().map(|a| a.name.clone());
             if alias_name.is_none() {
                 return Err(DataFusionError::Plan(
                     "Subquery source in MERGE INTO must have an alias".to_string(),
@@ -1538,15 +1538,20 @@ async fn build_source_partition_set(
     ctx: &SQLContext,
     table: &Table,
     source_ref: &str,
-    s_alias: &str,
-    t_alias: &str,
+    s_alias: &Ident,
+    t_alias: &Ident,
     on_expr: &SqlExpr,
 ) -> DFResult<Option<HashSet<Vec<u8>>>> {
     let partition_keys = table.schema().partition_keys();
     if partition_keys.is_empty() {
         return Ok(None);
     }
-    if !can_prune_target_by_source_partitions(partition_keys, t_alias, s_alias, on_expr) {
+    if !can_prune_target_by_source_partitions(
+        partition_keys,
+        &t_alias.value,
+        &s_alias.value,
+        on_expr,
+    ) {
         return Ok(None);
     }
 
@@ -1640,9 +1645,9 @@ fn is_qualified_column(parts: &[Ident], alias: &str, column: &str) -> bool {
 fn rewrite_table_references<T: VisitMut>(
     node: &mut T,
     target_ref: &str,
-    t_alias: &str,
+    t_alias: &Ident,
     source_ref: &str,
-    s_alias: &str,
+    s_alias: &Ident,
 ) {
     let _: ControlFlow<()> = visit_expressions_mut(node, |expr| {
         if let SqlExpr::CompoundIdentifier(parts) = expr {
@@ -1660,7 +1665,7 @@ fn rewrite_table_references<T: VisitMut>(
                     None
                 };
                 if let Some(alias) = alias {
-                    parts.splice(..prefix_len, [Ident::new(alias)]);
+                    parts.splice(..prefix_len, [alias.clone()]);
                     break;
                 }
             }
@@ -1695,6 +1700,15 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::SQLContext;
+
+    const MERGE_ALIAS_CASES: [(&str, &str); 6] = [
+        ("T", "S"),
+        ("\"t\"", "\"s\""),
+        ("\"target alias\"", "\"source alias\""),
+        ("\"order\"", "\"select\""),
+        ("\"target\"\"alias\"", "\"source\"\"alias\""),
+        ("\"Target\"", "\"Source\""),
+    ];
 
     async fn setup_sql_context() -> (TempDir, SQLContext, Arc<FileSystemCatalog>) {
         let temp_dir = TempDir::new().unwrap();
@@ -1783,8 +1797,50 @@ mod tests {
                     .unwrap()
             };
             let mut actual = parse_expr(input);
-            rewrite_table_references(&mut actual, "target", "t", "source", "s");
+            rewrite_table_references(
+                &mut actual,
+                "target",
+                &Ident::new("t"),
+                "source",
+                &Ident::new("s"),
+            );
             assert_eq!(actual, parse_expr(expected), "{input}");
+        }
+    }
+
+    #[test]
+    fn test_merge_preserves_alias_quotes() {
+        for (target_alias, source_alias) in MERGE_ALIAS_CASES {
+            for derived in [false, true] {
+                let source = if derived {
+                    "(SELECT id FROM source)"
+                } else {
+                    "source"
+                };
+                let merge = parse_merge(&format!(
+                    "MERGE INTO target AS {target_alias} USING {source} AS {source_alias} \
+                     ON {target_alias}.id = {source_alias}.id WHEN MATCHED THEN DELETE"
+                ));
+                let (target_ref, target_ident) = extract_table_ref(&merge.table).unwrap();
+                let (source_ref, source_ident) = extract_source_ref(&merge.source).unwrap();
+                let target_ident = target_ident.unwrap();
+                let source_ident = source_ident.unwrap();
+                assert_eq!(target_ident.to_string(), target_alias);
+                assert_eq!(source_ident.to_string(), source_alias);
+                if !derived {
+                    let mut condition = parse_merge(
+                        "MERGE INTO target USING source ON target.id = source.id WHEN MATCHED THEN DELETE",
+                    ).on;
+                    rewrite_table_references(
+                        &mut condition,
+                        &target_ref,
+                        &target_ident,
+                        &source_ref,
+                        &source_ident,
+                    );
+                    assert_eq!(condition, merge.on);
+                }
+            }
         }
     }
 
@@ -2678,6 +2734,107 @@ mod tests {
                 ],
                 "ON: {on_predicate}, MATCHED: {matched_predicate}, INSERT: {insert_predicate}",
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merge_quoted_aliases_update_insert_and_delete() {
+        for (target_alias, source_alias) in MERGE_ALIAS_CASES {
+            for data_evolution in [false, true] {
+                for derived in [false, true] {
+                    let (_tmp, sql_context, catalog) = setup_sql_context().await;
+                    let options = if data_evolution {
+                        " WITH ('data-evolution.enabled' = 'true', 'row-tracking.enabled' = 'true', 'deletion-vectors.enabled' = 'true')"
+                    } else {
+                        ""
+                    };
+                    for sql in [
+                        format!("CREATE TABLE paimon.test_db.t_quoted_aliases (id INT, name VARCHAR, value INT){options}"),
+                        "INSERT INTO paimon.test_db.t_quoted_aliases (id, name, value) VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30)".to_string(),
+                        "CREATE TABLE paimon.test_db.source (id INT, name VARCHAR)".to_string(),
+                        "INSERT INTO paimon.test_db.source VALUES (1, 'ALICE'), (4, 'dave')".to_string(),
+                    ] {
+                        sql_context.sql(&sql).await.unwrap().collect().await.unwrap();
+                    }
+                    let table = catalog
+                        .get_table(&Identifier::new("test_db", "t_quoted_aliases"))
+                        .await
+                        .unwrap();
+                    let source = if derived {
+                        "(SELECT id, name FROM paimon.test_db.source)"
+                    } else {
+                        "paimon.test_db.source"
+                    };
+                    let merge_prefix = format!(
+                        "MERGE INTO paimon.test_db.t_quoted_aliases AS {target_alias} \
+                         USING {source} AS {source_alias} ON {target_alias}.id = {source_alias}.id"
+                    );
+                    let merge = parse_merge(&format!(
+                        "{merge_prefix} WHEN MATCHED THEN UPDATE SET name = {source_alias}.name \
+                         WHEN NOT MATCHED AND {source_alias}.id = 4 THEN INSERT (id, name, value) \
+                         VALUES ({source_alias}.id, {source_alias}.name, 40)"
+                    ));
+                    let result = execute_merge_into(&sql_context, &merge, table.clone(), true)
+                        .await
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        result[0]
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .unwrap()
+                            .value(0),
+                        2,
+                    );
+                    let batches = sql_context
+                        .sql("SELECT id, name, value FROM paimon.test_db.t_quoted_aliases ORDER BY id")
+                        .await
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        collect_rows(&batches),
+                        vec![
+                            (1, "ALICE".to_string(), 10),
+                            (2, "bob".to_string(), 20),
+                            (3, "charlie".to_string(), 30),
+                            (4, "dave".to_string(), 40),
+                        ]
+                    );
+
+                    let delete = parse_merge(&format!("{merge_prefix} WHEN MATCHED THEN DELETE"));
+                    let result = execute_merge_into(&sql_context, &delete, table, true)
+                        .await
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        result[0]
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .unwrap()
+                            .value(0),
+                        2,
+                    );
+                    let batches = sql_context
+                        .sql("SELECT id, name, value FROM paimon.test_db.t_quoted_aliases ORDER BY id")
+                        .await
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        collect_rows(&batches),
+                        vec![(2, "bob".to_string(), 20), (3, "charlie".to_string(), 30),]
+                    );
+                }
+            }
         }
     }
 
