@@ -115,7 +115,8 @@ impl PkVectorSearchParams {
             true,
         )?;
         let mut vector_options = configuration.resolved;
-        // Like Java, persisted PK payloads are checked against the table metric.
+        // Raw-only PK plans use the table metric. The reader replaces it with
+        // the persisted payload metric when the captured plan has ANN segments.
         vector_options.metric = configuration.table_metric;
         let metric = VectorSearchMetric::parse(&vector_options.metric)?;
         let refine_factor = if let Some(kind) = vector_options.index_type.as_deref() {
