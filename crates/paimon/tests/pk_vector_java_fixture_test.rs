@@ -33,13 +33,17 @@
 //! `(file, position)`. Search returns those positions with scores; a projected
 //! result read must retrieve the same rows without inventing global row IDs.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use arrow_array::{Array, Float32Array, Int32Array, RecordBatch};
+use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+use arrow_array::{Array, ArrayRef, Float32Array, Int32Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use paimon::catalog::Identifier;
 use paimon::io::{FileIO, FileIOBuilder};
 use paimon::table::{SchemaManager, Table};
+use std::sync::Arc;
 
 const VECTOR_COLUMN: &str = "embedding";
 const FIXTURE: &str = "testdata/pkvector/pk_vector_ivf_flat";
@@ -222,5 +226,98 @@ async fn reads_back_java_written_pk_vector_table() {
             (got - want).abs() < 1e-4,
             "materialized score diverges: got {got}, want {want}"
         );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn persisted_metric_survives_table_and_query_overrides() {
+    let (_tmp, original) = open_java_fixture().await;
+    // Leave a level-0 file outside the Java ANN segment, so raw fallback must
+    // use the same persisted metric as indexed scoring and refinement.
+    let element = Arc::new(Field::new("element", DataType::Float32, true));
+    let mut vector =
+        FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element.clone());
+    vector.values().append_slice(&[0.5, 0.0]);
+    vector.append(true);
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("embedding", DataType::FixedSizeList(element, 2), true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![100])) as ArrayRef,
+            Arc::new(vector.finish()),
+        ],
+    )
+    .unwrap();
+    let write_builder = original.new_write_builder();
+    let mut writer = write_builder.new_write().unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    write_builder
+        .new_commit()
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    for metric in ["inner_product", "cosine"] {
+        let table = original.copy_with_options(HashMap::from([
+            (
+                "fields.embedding.pk-vector.distance.metric".into(),
+                metric.into(),
+            ),
+            ("fields.embedding.distance.metric".into(), metric.into()),
+        ]));
+        for refine in [None, Some("2")] {
+            let mut options = HashMap::from([("ivf-flat.metric".into(), metric.into())]);
+            if let Some(refine) = refine {
+                options.insert("ivf.refine_factor".into(), refine.into());
+            }
+            let mut builder = table.new_vector_search_builder();
+            builder
+                .with_vector_column(VECTOR_COLUMN)
+                .with_query_vector(vec![0.0, 0.0])
+                .with_limit(3)
+                .with_options(options.clone());
+            let result = builder.execute().await.unwrap();
+            let positions = result.positions().unwrap();
+            assert_eq!(
+                positions.iter().map(|p| p.score).collect::<Vec<_>>(),
+                vec![1.0, 0.8, 0.5]
+            );
+            let batches = result
+                .new_read_builder()
+                .with_projection(&["id"])
+                .read()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(batch_i32(&batches, "id"), vec![0, 100, 1]);
+
+            let mut batch = table.new_batch_vector_search_builder();
+            batch
+                .with_vector_column(VECTOR_COLUMN)
+                .with_query_vectors(vec![vec![0.0, 0.0]; 2])
+                .with_limit(3)
+                .with_options(options);
+            for result in batch.execute().await.unwrap() {
+                let positions = result.positions().unwrap();
+                assert_eq!(
+                    positions.iter().map(|p| p.score).collect::<Vec<_>>(),
+                    vec![1.0, 0.8, 0.5]
+                );
+                let batches = result
+                    .new_read_builder()
+                    .with_projection(&["id"])
+                    .read()
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(batch_i32(&batches, "id"), vec![0, 100, 1]);
+            }
+        }
     }
 }
