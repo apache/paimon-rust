@@ -322,7 +322,7 @@ pub async fn execute_procedure(
     proc_name: &str,
     arguments: &FunctionArguments,
 ) -> DFResult<DataFrame> {
-    let args = extract_named_args(arguments)?;
+    let args = extract_named_args(ctx, arguments)?;
     reject_unknown_args(proc_name, &args)?;
 
     match proc_name {
@@ -376,7 +376,10 @@ fn extract_procedure_name(name: &ObjectName) -> DFResult<(Option<String>, String
     }
 }
 
-fn extract_named_args(args: &FunctionArguments) -> DFResult<HashMap<String, String>> {
+fn extract_named_args(
+    ctx: &SessionContext,
+    args: &FunctionArguments,
+) -> DFResult<HashMap<String, String>> {
     let arg_list = match args {
         FunctionArguments::List(list) => &list.args,
         FunctionArguments::None => return Ok(HashMap::new()),
@@ -395,7 +398,11 @@ fn extract_named_args(args: &FunctionArguments) -> DFResult<HashMap<String, Stri
                 arg: FunctionArgExpr::Expr(expr),
                 operator: FunctionArgOperator::RightArrow,
             } => {
-                let value = expr_to_string(expr)?;
+                let value = match expr_to_string(expr) {
+                    Ok(value) => value,
+                    Err(error) if matches!(expr, SqlExpr::Value(_)) => return Err(error),
+                    Err(_) => constant_argument(ctx, expr)?,
+                };
                 let name = name.value.to_lowercase();
                 // Java `PaimonProcedureResolver.buildNameToArgumentMap` rejects a repeat
                 // rather than letting the last one win.
@@ -434,6 +441,81 @@ fn expr_to_string(expr: &SqlExpr) -> DFResult<String> {
         _ => Err(DataFusionError::Plan(format!(
             "Unsupported argument expression: {expr}"
         ))),
+    }
+}
+
+fn constant_argument(ctx: &SessionContext, expr: &SqlExpr) -> DFResult<String> {
+    use datafusion::common::{
+        tree_node::{TreeNode, TreeNodeRecursion},
+        DFSchema,
+    };
+    use datafusion::logical_expr::{simplify::SimplifyContext, Expr, Volatility};
+    use datafusion::optimizer::simplify_expressions::ExprSimplifier;
+    let schema = DFSchema::empty();
+    let state = ctx.state();
+    let expression = state.create_logical_expr(&expr.to_string(), &schema)?;
+    expression.apply(|node| {
+        let allowed = match node {
+            Expr::Literal(_, _)
+            | Expr::Alias(_)
+            | Expr::Cast(_)
+            | Expr::TryCast(_)
+            | Expr::BinaryExpr(_)
+            | Expr::Negative(_)
+            | Expr::Not(_)
+            | Expr::Case(_)
+            | Expr::IsNull(_)
+            | Expr::IsNotNull(_)
+            | Expr::Between(_)
+            | Expr::InList(_)
+            | Expr::IsTrue(_)
+            | Expr::IsNotTrue(_)
+            | Expr::IsFalse(_)
+            | Expr::IsNotFalse(_)
+            | Expr::IsUnknown(_)
+            | Expr::IsNotUnknown(_)
+            | Expr::Like(_)
+            | Expr::SimilarTo(_) => true,
+            Expr::ScalarFunction(function) => {
+                function.func.signature().volatility == Volatility::Immutable
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err(DataFusionError::Plan(
+                "CALL arguments must be immutable scalar constant expressions".into(),
+            ));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let simplifier = ExprSimplifier::new(
+        SimplifyContext::builder()
+            .with_schema(Arc::new(schema.clone()))
+            .with_config_options(state.config_options().clone())
+            .build(),
+    );
+    let expression = simplifier.simplify(simplifier.coerce(expression, &schema)?)?;
+    let Expr::Literal(value, _) = expression else {
+        return Err(DataFusionError::Plan(
+            "CALL argument did not reduce to a scalar constant".into(),
+        ));
+    };
+    if let Some(Some(value)) = value.try_as_str() {
+        return Ok(value.to_string());
+    }
+    match value {
+        ScalarValue::Int8(Some(_))
+        | ScalarValue::Int16(Some(_))
+        | ScalarValue::Int32(Some(_))
+        | ScalarValue::Int64(Some(_))
+        | ScalarValue::UInt8(Some(_))
+        | ScalarValue::UInt16(Some(_))
+        | ScalarValue::UInt32(Some(_))
+        | ScalarValue::UInt64(Some(_))
+        | ScalarValue::Boolean(Some(_)) => Ok(value.to_string()),
+        _ => Err(DataFusionError::Plan(
+            "CALL arguments must be non-null strings, integers, or booleans".into(),
+        )),
     }
 }
 

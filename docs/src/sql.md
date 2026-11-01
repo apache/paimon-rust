@@ -1855,6 +1855,26 @@ meaningful for a column mask, so it requires `policy_type => 'COLUMN_MASKING'`:
 CALL sys.list_policies(database => 'sales', table => 'orders');
 ```
 
+### Constant procedure arguments
+
+CALL arguments still use named `name => expression` syntax. In addition to
+literals, SQLContext accepts immutable scalar constant expressions such as
+casts, arithmetic, string functions, CASE and boolean predicates.
+
+```sql
+CALL sys.create_tag(
+    table => concat('my_db.', 'events'),
+    tag => concat('release_', '1'),
+    snapshot_id => CAST(1 + 0 AS BIGINT)
+);
+```
+
+Expressions must reduce to non-NULL strings, integers or booleans. Column
+references, subqueries, aggregate/window functions and non-immutable functions
+are rejected. Argument names, duplicates and procedure-specific types are
+validated as before. All arguments are evaluated and validated before the
+procedure performs any metadata changes; evaluation errors are returned.
+
 ## Queries
 
 ### Basic Queries
