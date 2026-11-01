@@ -5676,6 +5676,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_higher_order_functions_bypass_rest_lookup() {
+        let catalog = Arc::new(MockCatalog::new());
+        catalog
+            .denied_functions
+            .lock()
+            .unwrap()
+            .extend(["array_transform", "list_transform"].map(str::to_string));
+        let ctx = make_sql_context(catalog.clone()).await;
+        ctx.sql("SET datafusion.sql_parser.dialect = 'duckdb'")
+            .await
+            .unwrap();
+        ctx.ctx()
+            .sql("SELECT array_transform([1, 2], x -> x + 1) = [2, 3]")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        for function in ["array_transform", "list_transform"] {
+            let batches = ctx
+                .sql(&format!("SELECT {function}([1, 2], x -> x + 1) = [2, 3]"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                ScalarValue::try_from_array(batches[0].column(0), 0).unwrap(),
+                ScalarValue::Boolean(Some(true))
+            );
+        }
+        assert!(catalog.function_lookups.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn nested_rest_function_leaves_registered_functions_local() {
         let catalog = Arc::new(MockCatalog::new());
         add_unary_sql_function(&catalog, "local_math", "abs(x) + 1", true);

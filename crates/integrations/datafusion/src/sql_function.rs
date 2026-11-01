@@ -369,6 +369,7 @@ fn normalize_identifier(identifier: &Ident) -> String {
 
 fn is_registered_function(state: &SessionState, name: &str) -> bool {
     state.scalar_functions().contains_key(name)
+        || state.higher_order_functions().contains_key(name)
         || state.aggregate_functions().contains_key(name)
         || state.window_functions().contains_key(name)
 }
