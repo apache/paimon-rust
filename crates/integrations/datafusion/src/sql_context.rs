@@ -156,6 +156,7 @@ impl SQLContextBuilder {
         let mut state_builder = SessionStateBuilder::new()
             .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
+            .with_type_planner(Arc::new(crate::binary_cast::BinaryTypePlanner))
             .with_relation_planners(vec![Arc::new(
                 crate::relation_planner::PaimonRelationPlanner::new(),
             )])
@@ -169,6 +170,7 @@ impl SQLContextBuilder {
         let state = state_builder.build();
         let ctx = SessionContext::new_with_state(state);
         crate::compat_functions::register_compat_functions(&ctx);
+        crate::binary_cast::register(&ctx);
         crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
         crate::json_functions::register_json_functions(&ctx);
@@ -477,7 +479,7 @@ impl SQLContext {
             .await;
         }
 
-        let statements = parse_sql_statements(&rewritten_sql)?;
+        let mut statements = parse_sql_statements(&rewritten_sql)?;
 
         if statements.len() != 1 {
             return Err(DataFusionError::Plan(
@@ -485,6 +487,15 @@ impl SQLContext {
             ));
         }
 
+        let rewritten;
+        let persistent_definition = matches!(&statements[0], Statement::CreateView(view) if !view.temporary && self.is_paimon_catalog_ref(&TableReference::from(view.name.to_string().as_str())))
+            || matches!(&statements[0], Statement::CreateFunction(_));
+        let sql = if !persistent_definition && crate::binary_cast::rewrite(&mut statements[0])? {
+            rewritten = statements[0].to_string();
+            rewritten.as_str()
+        } else {
+            sql
+        };
         match &statements[0] {
             statement @ (Statement::ShowDatabases { .. }
             | Statement::ShowSchemas { .. }
@@ -4377,6 +4388,32 @@ mod tests {
             Identifier::new(database, name),
             schema,
         ));
+    }
+
+    #[tokio::test]
+    async fn binary_cast_preserves_persistent_view_sql() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog.clone()).await;
+        ctx.sql("CREATE VIEW bounded_view AS SELECT CAST('ab' AS BINARY(4)) AS bytes")
+            .await
+            .unwrap();
+        let view = catalog
+            .get_view(&Identifier::new("default", "bounded_view"))
+            .await
+            .unwrap();
+        assert!(view.query_for("spark").contains("BINARY(4)"));
+        assert!(!view.query_for("spark").contains("__paimon"));
+        let rows = ctx
+            .sql("SELECT to_base64(bytes) = 'YWIAAA==' FROM bounded_view")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            ScalarValue::try_from_array(rows[0].column(0), 0).unwrap(),
+            ScalarValue::Boolean(Some(true))
+        );
     }
 
     #[tokio::test]

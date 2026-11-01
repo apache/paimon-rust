@@ -582,6 +582,27 @@ use paimon_datafusion::register_variant_functions;
 register_variant_functions(&ctx);
 ```
 
+### Binary casts in queries
+
+`CAST` and `TRY_CAST` accept `BINARY`, `BINARY(n)`, `VARBINARY`,
+`VARBINARY(n)` and `VARBINARY(MAX)` through SQLContext.
+
+- Without a length, casts preserve the bytes. Strings use their UTF-8 bytes.
+- `BINARY(n)` truncates to at most `n` bytes and right-pads shorter values with
+  zero bytes.
+- `VARBINARY(n)` truncates to at most `n` bytes without padding.
+- Widths are byte counts, including for multibyte text. They must be positive
+  and fit an Arrow binary offset. SQL NULL remains NULL.
+
+```sql
+SELECT to_base64(CAST('ab' AS BINARY(4))); -- YWIAAA==
+SELECT to_base64(CAST('abcd' AS VARBINARY(2))); -- YWI=
+```
+
+The source conversions supported by DataFusion's binary cast remain in effect.
+`TRY_CAST` preserves its native conversion-failure behavior; an invalid type
+length is a planning error.
+
 ## DDL
 
 ### DATABASE
