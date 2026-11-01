@@ -211,6 +211,10 @@ clients still depend on the legacy PK namespace. Existing stored options do not
 need migration for the updated resolver.
 Explicit single-column builds also use these declarations as defaults; explicit
 builder options take precedence over them.
+Native vector builds can pass the complete schema option map. Unchanged entries
+retain table precedence; changed entries remain procedure overrides. Standalone builder
+option maps still accept native parameter aliases. Captured shards retain the
+original schema and option map for worker execution.
 FULL/DETAIL raw fallback uses the same per-column parameters as automatic
 builds, including vector metric defaults and full-text tokenization. A declared
 full-text column can use raw fallback before its first index is published.

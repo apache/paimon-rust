@@ -21,6 +21,7 @@ use crate::spec::CoreOptions;
 use crate::table::global_index_types::normalize_global_index_type;
 use crate::table::{GlobalIndexBuildBuilder, Table};
 use crate::Result;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 pub(super) struct Definition {
@@ -176,7 +177,31 @@ pub(super) fn field_index_options(
         .collect())
 }
 
-/// A procedure JSON object replaces that field's schema object before parsing.
+/// Native frontends can echo the entire effective schema in build options.
+/// Unchanged schema entries keep table precedence and validation semantics;
+/// a standalone procedure map retains the native parameter aliases.
+pub(super) fn build_procedure_options<'a>(
+    table: &HashMap<String, String>,
+    user: &'a HashMap<String, String>,
+) -> Cow<'a, HashMap<String, String>> {
+    // Pinned worker tables add read selectors that are absent from the original
+    // frontend map. These selectors do not identify a build option source.
+    let mut schema_keys = table
+        .keys()
+        .filter(|key| !key.starts_with("scan.") && !key.starts_with("incremental-"))
+        .peekable();
+    if schema_keys.peek().is_none() || !schema_keys.all(|key| user.contains_key(key)) {
+        return Cow::Borrowed(user);
+    }
+    Cow::Owned(
+        user.iter()
+            .filter(|(key, value)| table.get(*key) != Some(*value))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+/// A procedure's declarations and JSON replace the corresponding schema source.
 /// Flat procedure parameters keep their own precedence layer and cannot create
 /// false conflicts with legacy JSON in the table source.
 pub(super) fn build_table_options(
@@ -185,16 +210,28 @@ pub(super) fn build_table_options(
     column: &str,
 ) -> HashMap<String, String> {
     let mut effective = table.clone();
-    let prefix = format!("fields.{column}.");
     effective.extend(
         user.iter()
-            .filter(|(key, _)| {
-                key.starts_with(&prefix)
-                    && (key.ends_with(".index-options") || key.ends_with(".index.options"))
-            })
+            .filter(|(key, _)| build_definition_option(key, column))
             .map(|(key, value)| (key.clone(), value.clone())),
     );
     effective
+}
+
+fn build_definition_option(key: &str, column: &str) -> bool {
+    key.strip_prefix(&format!("fields.{column}."))
+        .is_some_and(|suffix| {
+            suffix == "index-options"
+                || suffix.ends_with(".index-options")
+                || suffix.ends_with(".index.options")
+                || matches!(
+                    suffix,
+                    "pk-vector.index.type" | "global-index.vector.index-type"
+                )
+        })
+        || (key.starts_with("global-index.")
+            && (key.ends_with(".index-columns") || key.ends_with(".index-column")))
+        || (key.starts_with("pk-") && key.ends_with(".index.columns"))
 }
 
 /// Parse a procedure's original option map without treating table properties as
@@ -206,11 +243,22 @@ pub(super) fn build_options(
 ) -> Result<HashMap<String, String>> {
     let core = CoreOptions::new(options);
     if crate::vindex::is_vindex_index_type(kind) {
-        let resolved = core.vector_index_options(
-            Some(kind),
-            column,
-            declares_column(options, column, "vector"),
-        )?;
+        // Declarations establish defaults in the schema layer. A procedure
+        // without a metric must not replace an existing table metric with IP.
+        let mut resolved = core.vector_index_options(Some(kind), column, false)?;
+        // The shared result also retains the former Rust family's metric
+        // priority. Apply it to explicit metric parameters without injecting
+        // an unspecified procedure metric.
+        for key in [
+            format!("{kind}.metric"),
+            format!("{kind}.distance.metric"),
+            format!("fields.{column}.metric"),
+            format!("fields.{column}.distance.metric"),
+        ] {
+            if let Some(metric) = resolved.options.get_mut(&key) {
+                *metric = resolved.metric.clone();
+            }
+        }
         Ok(resolved.options)
     } else {
         core.global_index_options(kind, column)

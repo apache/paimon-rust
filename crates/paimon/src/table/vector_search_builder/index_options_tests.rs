@@ -164,6 +164,98 @@ fn declaration(kind: &str, column: &str) -> HashMap<String, String> {
 }
 
 #[tokio::test]
+async fn untyped_raw_json_metrics_preserve_source_priority_and_worker_results() {
+    let original = raw_table().await;
+    let key = "fields.embedding.index-options";
+    for mode in ["full", "detail"] {
+        for (table_json, query_json, expected) in [
+            (None, None, vec![1.0, 0.5, 1.0 / 3.0]),
+            (
+                Some(r#"{"metric":"cosine"}"#),
+                None,
+                vec![1.0, 1.0 / 2.0_f32.sqrt(), 0.0],
+            ),
+            (
+                None,
+                Some(r#"{"distance.metric":"cosine"}"#),
+                vec![1.0, 1.0 / 2.0_f32.sqrt(), 0.0],
+            ),
+            (
+                Some(r#"{"metric":"cosine"}"#),
+                Some(r#"{"metric":"l2"}"#),
+                vec![1.0, 0.5, 1.0 / 3.0],
+            ),
+            // An explicit query metric need not parse an unused invalid table JSON.
+            (
+                Some("invalid unused table JSON"),
+                Some(r#"{"metric":"inner_product"}"#),
+                vec![1.0, 1.0, 0.0],
+            ),
+            // Other implementation namespaces in JSON cannot invent a metric/type.
+            (
+                None,
+                Some(r#"{"diskann.metric":"cosine","index_type":"diskann"}"#),
+                vec![1.0, 0.5, 1.0 / 3.0],
+            ),
+        ] {
+            let table = original.copy_with_options(
+                table_json
+                    .map(|json| HashMap::from([(key.into(), json.into())]))
+                    .unwrap_or_default(),
+            );
+            let mut options = HashMap::from([
+                ("vector-index.search-mode".into(), mode.into()),
+                ("opaque.query.option".into(), r#"{"values":[1,2]}"#.into()),
+            ]);
+            if let Some(json) = query_json {
+                options.insert(key.into(), json.into());
+            }
+            let mut builder = table.new_vector_search_builder();
+            builder
+                .with_vector_column("embedding")
+                .with_query_vector(vec![1.0, 0.0])
+                .with_limit(3)
+                .with_options(options.clone());
+            let plan = builder.new_scan().unwrap().plan().await.unwrap();
+            assert_eq!(raw_type(&plan), None);
+            let plan: VectorScanPlan =
+                serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+            let reader = builder.new_read().unwrap();
+            let local = reader.read(plan.clone()).await.unwrap();
+            assert_eq!(local.row_ids().unwrap().scores, expected);
+            let worker = Worker {
+                table: table.clone(),
+                options: options.clone(),
+            };
+            let remote = reader
+                .read_with_executor(plan.clone(), &worker)
+                .await
+                .unwrap();
+            assert_eq!(
+                remote.row_ids().unwrap().row_ids,
+                local.row_ids().unwrap().row_ids
+            );
+            assert_eq!(remote.row_ids().unwrap().scores, expected);
+            let mut batch = table.new_batch_vector_search_builder();
+            batch
+                .with_vector_column("embedding")
+                .with_query_vectors(vec![vec![1.0, 0.0]; 2])
+                .with_limit(3)
+                .with_options(options);
+            for result in batch
+                .new_read()
+                .unwrap()
+                .read_with_executor(plan, &worker)
+                .await
+                .unwrap()
+            {
+                assert_eq!(result.row_ids().unwrap().scores, expected);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn configuration_is_captured_by_single_batch_plan_reader_and_worker() {
     let table = raw_table().await;
     let mut options = declaration("ivf-flat", "embedding");

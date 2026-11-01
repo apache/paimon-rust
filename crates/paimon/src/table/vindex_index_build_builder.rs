@@ -69,9 +69,13 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         column: &str,
         field: &crate::spec::DataField,
     ) -> Result<(HashMap<String, String>, VindexVectorIndexOptions)> {
-        let mut effective = super::global_index_options::build_table_options(
+        let procedure = super::global_index_options::build_procedure_options(
             self.table.schema().options(),
             &self.options,
+        );
+        let mut effective = super::global_index_options::build_table_options(
+            self.table.schema().options(),
+            &procedure,
             column,
         );
         let defaults = super::global_index_options::declared_options(
@@ -81,7 +85,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             &self.index_type,
         )?;
         let user =
-            super::global_index_options::build_options(&self.options, column, &self.index_type)?;
+            super::global_index_options::build_options(&procedure, column, &self.index_type)?;
         let native_user = crate::vindex::build_parameters(&user, &self.index_type, column);
         let native = VindexVectorIndexOptions::new_with_defaults(
             &effective,

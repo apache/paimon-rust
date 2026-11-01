@@ -1770,7 +1770,7 @@ async fn resolve_raw_vector_metric_resolved(
     if index_type.is_some() {
         return RawVectorMetric::parse(&configuration.resolved.metric);
     }
-    let table_metric = configured_raw_vector_metric_override(table_options, field_name)?;
+    let table_metric = resolved_vector_metric_override(table_options, field_name, None)?;
     if let Some(metric) = table_metric {
         return Ok(metric);
     }
@@ -1788,6 +1788,18 @@ fn resolved_vector_metric_override(
     if let Some(kind) = index_type {
         direct_raw_vector_metric_override(options, field_name, Some(kind))
     } else {
+        if options.contains_key(&format!("fields.{field_name}.index-options")) {
+            // Like Java, use the logical family only to parse explicit field
+            // parameters. It does not select a native backend or default metric.
+            let resolved = CoreOptions::new(options).vector_index_options(
+                Some("vector"),
+                field_name,
+                false,
+            )?;
+            if let Some(metric) = resolved.options.get("vector.metric") {
+                return RawVectorMetric::parse(metric).map(Some);
+            }
+        }
         configured_raw_vector_metric_override(options, field_name)
     }
 }

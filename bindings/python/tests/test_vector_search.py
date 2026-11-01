@@ -52,6 +52,30 @@ def _single(table):
     return table.new_vector_search_builder().with_vector_column('embedding').with_query_vector([1, 0]).with_limit(10)
 
 
+@pytest.mark.parametrize('mode', ['full', 'detail'])
+@pytest.mark.parametrize('batch', [False, True])
+@pytest.mark.parametrize('source', ['table', 'query', 'both'])
+def test_untyped_raw_field_json_metric_and_query_precedence(table, mode, batch, source):
+    import pickle
+    key = 'fields.embedding.index-options'
+    table_options = {'vector-index.search-mode': mode}
+    if source in ('table', 'both'):
+        table_options[key] = '{"metric":"cosine"}'
+    configured = table.copy(table_options)
+    builder = (configured.new_batch_vector_search_builder().with_query_vectors([[1, 0], [1, 0]])
+               if batch else configured.new_vector_search_builder().with_query_vector([1, 0]))
+    query_options = {'opaque.query.option': '{"values":[1,2]}'}
+    if source in ('query', 'both'):
+        query_options[key] = '{"metric":"l2"}' if source == 'both' else '{"metric":"cosine"}'
+    builder.with_options(query_options).with_vector_column('embedding').with_limit(3)
+    plan = pickle.loads(pickle.dumps(builder.new_vector_search_scan().scan()))
+    reader = builder.new_batch_vector_search_read() if batch else builder.new_vector_search_read()
+    results = reader.read_batch_plan(plan) if batch else [reader.read_plan(plan)]
+    expected = [1 / 3, 1, 1] if source == 'both' else [0, 1, 1]
+    for result in results:
+        assert sorted(result.row_ids().values()) == pytest.approx(expected)
+
+
 def test_vector_build_accepts_raw_schema_options_and_field_json(table):
     options = {
         'bucket': '-1', 'data-evolution.enabled': 'true', 'row-tracking.enabled': 'true',
@@ -70,8 +94,29 @@ def test_vector_build_accepts_raw_schema_options_and_field_json(table):
     assert sorted(actual.values()) == pytest.approx([0, 1, 1])
 
 
+@pytest.mark.parametrize('kind', ['ivf-flat', 'diskann'])
+def test_vector_build_echoed_schema_retains_source_semantics(table, kind):
+    import pickle
+    configured = table.copy({
+        f'{kind}.dimension': '2', f'{kind}.metric': 'cosine',
+        'nlist': 'ignored table property', 'vindex.build.granule.enabled': 'true',
+    })
+    options = configured.schema().options()
+    builder = (configured.new_global_index_build_builder().with_index_column('embedding')
+               .with_index_type(kind))
+    assert builder.plan().shards()
+    builder.with_options(options)
+    shards = pickle.loads(pickle.dumps(builder.plan())).shards()
+    worker = configured.copy({f'{kind}.dimension': '999'})
+    for shard in shards:
+        assert worker.new_global_index_build_builder().build_shard(shard)
+    assert builder.execute() > 0
+    assert sorted(_single(configured).execute().row_ids().values()) == pytest.approx([0, 1, 1])
+
+
 @pytest.mark.parametrize('shared_json', [False, True, 'aliases'])
-def test_full_text_json_encoded_lists_keep_raw_and_indexed_semantics(tmp_path, shared_json):
+@pytest.mark.parametrize('declared', [False, True])
+def test_full_text_json_encoded_lists_keep_raw_and_indexed_semantics(tmp_path, shared_json, declared):
     import json
     ctx = SQLContext()
     ctx.register_catalog('paimon', {'warehouse': str(tmp_path)})
@@ -89,7 +134,7 @@ def test_full_text_json_encoded_lists_keep_raw_and_indexed_semantics(tmp_path, s
     finally:
         writer.close()
         commit.close()
-    options = {'global-index.full-text.index-columns': 'body'}
+    options = {'global-index.full-text.index-columns': 'body'} if declared else {}
     if shared_json == 'aliases':
         options.update({'full-text.stop-words': json.dumps(['paimon']), 'full-text.columns': json.dumps(['body'])})
     elif shared_json:
@@ -98,16 +143,17 @@ def test_full_text_json_encoded_lists_keep_raw_and_indexed_semantics(tmp_path, s
         options.update({'full-text.stop-words': json.dumps(['paimon']),
                         'full-text.text-fields': json.dumps(['body'])})
     table = table.copy(options)
+    search_table = table.copy({'global-index.full-text.index-columns': 'body'})
 
     def hits(query):
-        return (table.new_full_text_search_builder().with_query('body', json.dumps({'match': {'query': query}}))
+        return (search_table.new_full_text_search_builder().with_query('body', json.dumps({'match': {'query': query}}))
                 .with_limit(3).execute().row_ids())
 
     assert len(hits('paimon')) == 0
     before = hits('data')
     assert len(before) == 1
     builder = (table.new_global_index_build_builder().with_index_column('body')
-               .with_index_type('full-text').with_options(options))
+               .with_index_type('full-text').with_options(table.schema().options()))
     assert builder.execute() == 1
     assert len(hits('paimon')) == 0
     assert hits('data') == before
