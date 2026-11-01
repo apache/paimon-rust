@@ -20,6 +20,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::SessionState;
 use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
     visit_expressions, visit_expressions_mut, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
@@ -35,15 +36,25 @@ const MAX_EXPANDED_CALLS: usize = 1024;
 type FunctionReference = (String, Identifier);
 
 pub(crate) async fn expand_sql(
+    state: &SessionState,
     sql: &str,
     catalogs: &HashMap<String, Arc<dyn Catalog>>,
     current_catalog: &str,
     current_database: &str,
 ) -> DFResult<String> {
-    expand_sql_internal(sql, catalogs, current_catalog, current_database, None).await
+    expand_sql_internal(
+        state,
+        sql,
+        catalogs,
+        current_catalog,
+        current_database,
+        None,
+    )
+    .await
 }
 
 async fn expand_sql_internal(
+    state: &SessionState,
     sql: &str,
     catalogs: &HashMap<String, Arc<dyn Catalog>>,
     current_catalog: &str,
@@ -59,6 +70,7 @@ async fn expand_sql_internal(
         )));
     }
     let statement = expand_statement_internal(
+        state,
         statements.remove(0),
         catalogs,
         current_catalog,
@@ -71,6 +83,7 @@ async fn expand_sql_internal(
 }
 
 pub(crate) async fn expand_sql_with_candidate(
+    state: &SessionState,
     sql: &str,
     catalogs: &HashMap<String, Arc<dyn Catalog>>,
     current_catalog: &str,
@@ -78,6 +91,7 @@ pub(crate) async fn expand_sql_with_candidate(
     candidate: &Function,
 ) -> DFResult<String> {
     expand_sql_internal(
+        state,
         sql,
         catalogs,
         current_catalog,
@@ -88,12 +102,14 @@ pub(crate) async fn expand_sql_with_candidate(
 }
 
 pub(crate) async fn expand_statement(
+    state: &SessionState,
     statement: Statement,
     catalogs: &HashMap<String, Arc<dyn Catalog>>,
     current_catalog: &str,
     current_database: &str,
 ) -> DFResult<Statement> {
     expand_statement_with_budget(
+        state,
         statement,
         catalogs,
         current_catalog,
@@ -104,6 +120,7 @@ pub(crate) async fn expand_statement(
 }
 
 pub(crate) async fn expand_statement_with_budget(
+    state: &SessionState,
     statement: Statement,
     catalogs: &HashMap<String, Arc<dyn Catalog>>,
     current_catalog: &str,
@@ -111,6 +128,7 @@ pub(crate) async fn expand_statement_with_budget(
     max_expanded_calls: usize,
 ) -> DFResult<Statement> {
     expand_statement_internal(
+        state,
         statement,
         catalogs,
         current_catalog,
@@ -122,6 +140,7 @@ pub(crate) async fn expand_statement_with_budget(
 }
 
 async fn expand_statement_internal(
+    state: &SessionState,
     mut statement: Statement,
     catalogs: &HashMap<String, Arc<dyn Catalog>>,
     current_catalog: &str,
@@ -139,7 +158,7 @@ async fn expand_statement_internal(
         let _: ControlFlow<()> = visit_expressions(&statement, |expr| {
             if let SqlExpr::Function(function) = expr {
                 if let Some(reference) =
-                    function_reference(function, current_catalog, current_database)
+                    function_reference(function, current_catalog, current_database, state)
                 {
                     references.insert(reference, ());
                 }
@@ -172,7 +191,8 @@ async fn expand_statement_internal(
                 }
             };
             if let Some(function) = &function {
-                let nested = function_dependencies(function, &reference.0, reference.1.database());
+                let nested =
+                    function_dependencies(function, &reference.0, reference.1.database(), state);
                 pending.extend(nested.iter().cloned());
                 dependencies.insert(reference.clone(), nested);
             }
@@ -195,7 +215,8 @@ async fn expand_statement_internal(
             let SqlExpr::Function(call) = expr else {
                 return ControlFlow::Continue(());
             };
-            let Some(reference) = function_reference(call, current_catalog, current_database)
+            let Some(reference) =
+                function_reference(call, current_catalog, current_database, state)
             else {
                 return ControlFlow::Continue(());
             };
@@ -209,7 +230,7 @@ async fn expand_statement_internal(
             }
             total_expanded_calls += 1;
 
-            match expand_call(function, call, &reference.0, &functions) {
+            match expand_call(function, call, &reference.0, &functions, state) {
                 Ok(expanded) => {
                     *expr = expanded;
                     expanded_count += 1;
@@ -235,6 +256,7 @@ fn function_dependencies(
     function: &Function,
     current_catalog: &str,
     current_database: &str,
+    state: &SessionState,
 ) -> Vec<FunctionReference> {
     let Some(definition) = function
         .definition("datafusion")
@@ -251,7 +273,20 @@ fn function_dependencies(
     let mut dependencies = Vec::new();
     let _: ControlFlow<()> = visit_expressions(&body, |expr| {
         if let SqlExpr::Function(call) = expr {
-            if let Some(reference) = function_reference(call, current_catalog, current_database) {
+            // A definition's self-reference is recursive even if it shares a
+            // name with a local function. Preserve this validation before CREATE.
+            if bare_function_name(call)
+                .as_ref()
+                .map(normalize_identifier)
+                .as_deref()
+                == Some(function.name())
+            {
+                dependencies.push((current_catalog.to_string(), function.identifier().clone()));
+                return ControlFlow::Continue(());
+            }
+            if let Some(reference) =
+                function_reference(call, current_catalog, current_database, state)
+            {
                 dependencies.push(reference);
             }
         }
@@ -304,6 +339,7 @@ fn function_reference(
     function: &datafusion::sql::sqlparser::ast::Function,
     current_catalog: &str,
     current_database: &str,
+    state: &SessionState,
 ) -> Option<(String, Identifier)> {
     let identifiers = function
         .name
@@ -312,6 +348,10 @@ fn function_reference(
         .map(|part| part.as_ident().map(normalize_identifier))
         .collect::<Option<Vec<_>>>()?;
     match identifiers.as_slice() {
+        // Local registrations (including aliases) follow DataFusion resolution first.
+        // An explicitly qualified call still requests the catalog function, even
+        // when its name collides with a local scalar, aggregate or window function.
+        [function] if is_registered_function(state, function) => None,
         [function] => Some((
             current_catalog.to_string(),
             Identifier::new(current_database, function),
@@ -327,11 +367,18 @@ fn normalize_identifier(identifier: &Ident) -> String {
     IdentNormalizer::default().normalize(identifier.clone())
 }
 
+fn is_registered_function(state: &SessionState, name: &str) -> bool {
+    state.scalar_functions().contains_key(name)
+        || state.aggregate_functions().contains_key(name)
+        || state.window_functions().contains_key(name)
+}
+
 fn expand_call(
     function: &Function,
     call: &datafusion::sql::sqlparser::ast::Function,
     owner_catalog: &str,
     functions: &HashMap<FunctionReference, Option<Function>>,
+    state: &SessionState,
 ) -> DFResult<SqlExpr> {
     if !function.is_deterministic() {
         return Err(DataFusionError::Plan(format!(
@@ -434,6 +481,9 @@ fn expand_call(
             return ControlFlow::Continue(());
         };
         let function_name = normalize_identifier(&function_name);
+        if is_registered_function(state, &function_name) {
+            return ControlFlow::Continue(());
+        }
         let reference = (
             owner_catalog.to_string(),
             Identifier::new(function.identifier().database(), &function_name),
@@ -497,7 +547,8 @@ mod tests {
     async fn leaves_bare_functions_for_datafusion_without_a_paimon_catalog() {
         let sql = "SELECT vector_from_json('[1, 2.5]')";
 
-        let expanded = expand_sql(sql, &HashMap::new(), "datafusion", "public")
+        let state = datafusion::prelude::SessionContext::new().state();
+        let expanded = expand_sql(&state, sql, &HashMap::new(), "datafusion", "public")
             .await
             .unwrap();
 

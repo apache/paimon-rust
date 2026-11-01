@@ -100,6 +100,12 @@ RETURN scalar_expression;
 
 Use `SQLContext::sql` for function expansion:
 
+Bare calls to registered DataFusion scalar, aggregate, and window functions
+(including aliases and session UDFs) resolve locally without a REST function
+lookup. Use `catalog.database.function(...)` to explicitly call a catalog
+function with a colliding name. Catalog lookup errors, including permission
+denials, are preserved for those explicit calls and for unknown bare names.
+
 ```rust,ignore
 let mut ctx = paimon_datafusion::SQLContext::new();
 ctx.register_catalog("paimon", rest_catalog).await?;
