@@ -753,6 +753,7 @@ impl SQLContext {
                     .default_schema
                     .clone();
                 let expanded = crate::sql_function::expand_statement(
+                    &self.ctx.state(),
                     statements[0].clone(),
                     &self.catalogs,
                     &current_catalog,
@@ -848,6 +849,7 @@ impl SQLContext {
             .default_schema
             .clone();
         let expanded = crate::sql_function::expand_sql(
+            &self.ctx.state(),
             &rewritten_sql,
             &self.catalogs,
             &current_catalog,
@@ -1974,6 +1976,7 @@ impl SQLContext {
             state.config_mut().options_mut().catalog.default_schema =
                 identifier.database().to_string();
             let expanded_query = crate::sql_function::expand_sql(
+                &self.ctx.state(),
                 &query_sql,
                 &self.catalogs,
                 &catalog_name,
@@ -2162,6 +2165,7 @@ impl SQLContext {
             quote(function.name())
         );
         let expanded = crate::sql_function::expand_sql_with_candidate(
+            &self.ctx.state(),
             &validation_sql,
             &self.catalogs,
             catalog_name,
@@ -4015,6 +4019,7 @@ mod tests {
 
     use async_trait::async_trait;
     use datafusion::arrow::array::StringViewArray;
+    use datafusion::common::ScalarValue;
     use datafusion::execution::memory_pool::FairSpillPool;
     use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
@@ -4065,6 +4070,8 @@ mod tests {
         calls: Mutex<Vec<CatalogCall>>,
         existing_table: Mutex<Option<Table>>,
         functions: Mutex<HashMap<Identifier, paimon::catalog::Function>>,
+        denied_functions: Mutex<std::collections::HashSet<String>>,
+        function_lookups: Mutex<Vec<Identifier>>,
         views: Mutex<HashMap<Identifier, paimon::catalog::View>>,
         drop_view_supported: bool,
     }
@@ -4075,6 +4082,8 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 existing_table: Mutex::new(None),
                 functions: Mutex::new(HashMap::new()),
+                denied_functions: Mutex::new(Default::default()),
+                function_lookups: Mutex::new(Vec::new()),
                 views: Mutex::new(HashMap::new()),
                 drop_view_supported: true,
             }
@@ -4221,6 +4230,24 @@ mod tests {
             &self,
             identifier: &Identifier,
         ) -> paimon::Result<paimon::catalog::Function> {
+            self.function_lookups
+                .lock()
+                .unwrap()
+                .push(identifier.clone());
+            if self
+                .denied_functions
+                .lock()
+                .unwrap()
+                .contains(identifier.object())
+            {
+                return Err(paimon::Error::UnexpectedError {
+                    message: format!(
+                        "Forbidden: cannot access function {}",
+                        identifier.full_name()
+                    ),
+                    source: None,
+                });
+            }
             self.functions
                 .lock()
                 .unwrap()
@@ -5615,6 +5642,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_functions_bypass_rest_function_lookup() {
+        use datafusion::logical_expr::{create_udf, Volatility};
+        let catalog = Arc::new(MockCatalog::new());
+        catalog
+            .denied_functions
+            .lock()
+            .unwrap()
+            .extend(["count", "abs", "row_number", "registered_identity"].map(str::to_string));
+        let ctx = make_sql_context(catalog.clone()).await;
+        ctx.ctx().register_udf(create_udf(
+            "registered_identity",
+            vec![ArrowDataType::Int64],
+            ArrowDataType::Int64,
+            Volatility::Immutable,
+            Arc::new(|args| Ok(args[0].clone())),
+        ));
+        let batches = ctx
+            .sql(
+                "SELECT count(*) AS n, abs(-2) AS a, row_number() OVER () AS r, \
+             registered_identity(CAST(42 AS BIGINT)) AS v",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        for (name, expected) in [("n", 1), ("a", 2), ("r", 1), ("v", 42)] {
+            let value =
+                ScalarValue::try_from_array(batches[0].column_by_name(name).unwrap(), 0).unwrap();
+            assert_eq!(value.to_string(), expected.to_string());
+        }
+        assert!(catalog.function_lookups.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn registered_higher_order_functions_bypass_rest_lookup() {
+        let catalog = Arc::new(MockCatalog::new());
+        catalog
+            .denied_functions
+            .lock()
+            .unwrap()
+            .extend(["array_transform", "list_transform"].map(str::to_string));
+        let ctx = make_sql_context(catalog.clone()).await;
+        ctx.sql("SET datafusion.sql_parser.dialect = 'duckdb'")
+            .await
+            .unwrap();
+        ctx.ctx()
+            .sql("SELECT array_transform([1, 2], x -> x + 1) = [2, 3]")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        for function in ["array_transform", "list_transform"] {
+            let batches = ctx
+                .sql(&format!("SELECT {function}([1, 2], x -> x + 1) = [2, 3]"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                ScalarValue::try_from_array(batches[0].column(0), 0).unwrap(),
+                ScalarValue::Boolean(Some(true))
+            );
+        }
+        assert!(catalog.function_lookups.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn nested_rest_function_leaves_registered_functions_local() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "local_math", "abs(x) + 1", true);
+        catalog
+            .denied_functions
+            .lock()
+            .unwrap()
+            .insert("abs".into());
+        let ctx = make_sql_context(catalog.clone()).await;
+        add_bigint_view(
+            &catalog,
+            "default",
+            "local_math_view",
+            "SELECT local_math(-41) AS answer",
+        );
+        for sql in [
+            "SELECT local_math(-41) AS answer",
+            "SELECT * FROM local_math_view",
+        ] {
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            assert_eq!(
+                ScalarValue::try_from_array(batches[0].column(0), 0).unwrap(),
+                ScalarValue::Int64(Some(42))
+            );
+        }
+        assert!(catalog
+            .function_lookups
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|id| id.object() != "abs"));
+    }
+
+    #[tokio::test]
+    async fn qualified_collision_does_not_rebind_nested_local_function() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "abs", "x + 100", true);
+        add_unary_sql_function(&catalog, "local_math", "abs(x) + 1", true);
+        let ctx = make_sql_context(catalog).await;
+        let batches = ctx
+            .sql("SELECT paimon.default.abs(1), local_math(-41)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            ScalarValue::try_from_array(batches[0].column(0), 0).unwrap(),
+            ScalarValue::Int64(Some(101))
+        );
+        assert_eq!(
+            ScalarValue::try_from_array(batches[0].column(1), 0).unwrap(),
+            ScalarValue::Int64(Some(42))
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_rest_function_and_unknown_function_preserve_permission_errors() {
+        let catalog = Arc::new(MockCatalog::new());
+        catalog
+            .denied_functions
+            .lock()
+            .unwrap()
+            .extend(["abs".to_string(), "private_function".to_string()]);
+        let ctx = make_sql_context(catalog).await;
+        for sql in ["SELECT paimon.default.abs(1)", "SELECT private_function(1)"] {
+            let error = ctx.sql(sql).await.unwrap_err().to_string();
+            assert!(
+                error.contains("Forbidden: cannot access function"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn bare_rest_sql_function_is_expanded() {
         let catalog = Arc::new(MockCatalog::new());
         add_plus_one_function(&catalog);
@@ -6031,6 +6203,7 @@ mod tests {
             .remove(0);
 
         let error = crate::sql_function::expand_statement_with_budget(
+            &ctx.ctx.state(),
             statement,
             &ctx.catalogs,
             &ctx.current_catalog_name(),

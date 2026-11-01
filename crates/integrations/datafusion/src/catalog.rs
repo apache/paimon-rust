@@ -1079,6 +1079,7 @@ impl SchemaProvider for PaimonSchemaProvider {
                     let catalogs =
                         HashMap::from([(catalog_name.clone(), Arc::clone(&catalog))]);
                     let query = crate::sql_function::expand_sql(
+                        &state,
                         view.query_for("datafusion"),
                         &catalogs,
                         &catalog_name,
