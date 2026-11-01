@@ -489,6 +489,36 @@ SELECT
     is_variant_null(NULL) AS sql_null;
 ```
 
+### JSON Text Functions
+
+`SQLContext` registers these functions without requiring a catalog:
+
+| Function | Result |
+| --- | --- |
+| `json_value(text, path)`, `json_extract_scalar(text, path)` | An unquoted string, number, or boolean; objects and arrays return `NULL` |
+| `get_json_object(text, path)` | Unquoted strings, scalar text, or serialized object/array fragments |
+| `get_json_string`, `json_extract_string`, `json_get_str` | Aliases of `get_json_object` with the same two arguments |
+| `json_valid(text)` | Whether text can be parsed as a Paimon JSON Variant |
+| `json_format(text_or_variant)` | Compact JSON serialization, retaining JSON string quotes and JSON `null` |
+
+```sql
+SELECT json_value('{"a":[1,"hello"]}', '$.a[1]'); -- hello
+SELECT get_json_object('{"a":[1,2]}', '$.a'); -- [1,2]
+SELECT json_format(parse_json('{"a":1}')); -- {"a":1}
+```
+
+Extraction supports the existing Variant path subset: `$`, `.name`,
+`['name']` / `["name"]`, and zero-based `[index]`. It does not implement
+wildcards, recursive descent, JSONPath predicates, or SQL/JSON `RETURNING`,
+`ON EMPTY`, and `ON ERROR` clauses. Extraction returns SQL `NULL` for invalid
+JSON, invalid/missing paths, JSON null, or SQL null arguments.
+
+The functions use the same parser as `parse_json`, including its rejection of
+duplicate object keys. `json_valid` returns false for rejected text and SQL
+`NULL` for SQL null. `json_format` reports malformed text as an error rather
+than converting it to null. JSON text and the binary Paimon Variant encoding
+are distinct: extraction takes text; `json_format` accepts either representation.
+
 ### Variant Shredding
 
 Variant shredding stores selected fields from a `VARIANT` column as typed
