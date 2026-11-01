@@ -78,6 +78,12 @@ fn vector_references(indexes: &[IndexManifestEntry]) -> Result<HashMap<FileId, V
     Ok(references)
 }
 
+pub(in crate::table::compact) fn validate_index_references(
+    indexes: &[IndexManifestEntry],
+) -> Result<()> {
+    vector_references(indexes).map(|_| ())
+}
+
 fn resolve_vector(table: &Table, bucket_path: &str, reference: &VectorReference) -> DeletionFile {
     let location = IndexFileLocation::BucketLocal {
         table_path: table.location().trim_end_matches('/'),
@@ -126,12 +132,12 @@ fn bucket_path(table: &Table, partition: &[u8], bucket: i32) -> Result<String> {
 }
 
 /// Apply captured physical masks before merging, including masks on L0 files.
-pub(in crate::table::compact) async fn with_deletion_files(
+pub(in crate::table::compact) fn with_deletion_entries(
     table: &Table,
     split: &DataSplit,
-    snapshot: &Snapshot,
+    indexes: &[IndexManifestEntry],
 ) -> Result<DataSplit> {
-    let references = vector_references(&read_indexes(table, snapshot).await?)?;
+    let references = vector_references(indexes)?;
     let partition = split.partition().to_serialized_bytes();
     let files = split
         .data_files()
@@ -151,6 +157,48 @@ pub(in crate::table::compact) async fn with_deletion_files(
         .with_data_files(split.data_files().to_vec())
         .with_data_deletion_files(files)
         .build()
+}
+
+/// Vector indexes exclude captured deletions and lookup hits discovered by this
+/// compaction. Decode each complete-level source mask once for all columns.
+pub(in crate::table::compact) async fn index_source_deletions(
+    table: &Table,
+    split: &DataSplit,
+    indexes: &[IndexManifestEntry],
+    updates: &[DeletionVectorUpdate],
+    files: &[&DataFileMeta],
+) -> Result<HashMap<String, RoaringBitmap>> {
+    let references = vector_references(indexes)?;
+    let partition = split.partition().to_serialized_bytes();
+    let mut pending = HashMap::<&str, Vec<_>>::new();
+    for update in updates
+        .iter()
+        .filter(|update| update.partition == partition && update.bucket == split.bucket())
+    {
+        pending.entry(&update.file_name).or_default().push(update);
+    }
+    let mut masks = HashMap::new();
+    for file in files {
+        let mut mask = read_bitmap(
+            table,
+            split.bucket_path(),
+            references.get(&(partition.clone(), split.bucket(), file.file_name.clone())),
+        )
+        .await?;
+        for update in pending.get(file.file_name.as_str()).into_iter().flatten() {
+            mask |= RoaringBitmap::deserialize_from(update.bitmap.as_slice())
+                .map_err(|error| super::super::invalid(&error.to_string()))?;
+        }
+        if !mask.is_empty() {
+            if i64::from(mask.max().unwrap()) >= file.row_count {
+                return Err(super::super::invalid(
+                    "PK index deletion exceeds source rows",
+                ));
+            }
+            masks.insert(file.file_name.clone(), mask);
+        }
+    }
+    Ok(masks)
 }
 
 /// Selected masks must be unchanged. Actual point-lookup hits must still be

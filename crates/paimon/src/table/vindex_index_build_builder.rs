@@ -64,6 +64,41 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         self
     }
 
+    fn configured_options(
+        &self,
+        column: &str,
+        field: &crate::spec::DataField,
+    ) -> Result<(HashMap<String, String>, VindexVectorIndexOptions)> {
+        let procedure = super::global_index_options::build_procedure_options(
+            self.table.schema().options(),
+            &self.options,
+        );
+        let mut effective = super::global_index_options::build_table_options(
+            self.table.schema().options(),
+            &procedure,
+            column,
+        );
+        let defaults = super::global_index_options::declared_options(
+            &effective,
+            column,
+            "vector",
+            &self.index_type,
+        )?;
+        let user =
+            super::global_index_options::build_options(&procedure, column, &self.index_type)?;
+        let native_user = crate::vindex::build_parameters(&user, &self.index_type, column);
+        let native = VindexVectorIndexOptions::new_with_defaults(
+            &effective,
+            &defaults,
+            &native_user,
+            &self.index_type,
+            field,
+        )?;
+        effective.extend(defaults);
+        effective.extend(user);
+        Ok((effective, native))
+    }
+
     pub(super) async fn plan(&self) -> Result<GlobalIndexBuildPlan> {
         // Building the index scans the table's rows.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
@@ -85,29 +120,13 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 source: None,
             })?;
 
-        let defaults = super::global_index_options::declared_options(
-            self.table.schema().options(),
-            index_column,
-            "vector",
-            &self.index_type,
-        )?;
-        let mut merged_options = self.table.schema().options().clone();
-        merged_options.extend(defaults.clone());
-        merged_options.extend(self.options.clone());
-        let core_options = CoreOptions::new(&merged_options);
         super::global_index_build_common::validate_build_table(self.table)?;
-        let rows_per_shard = core_options.global_index_row_count_per_shard()?;
-        core_options.global_index_build_parallelism()?;
-
         let index_field = find_index_field(self.table, index_column)?;
         validate_vector_field(index_field)?;
-        let options = VindexVectorIndexOptions::new_with_defaults(
-            self.table.schema().options(),
-            &defaults,
-            &self.options,
-            &self.index_type,
-            index_field,
-        )?;
+        let (merged_options, options) = self.configured_options(index_column, index_field)?;
+        let core_options = CoreOptions::new(&merged_options);
+        let rows_per_shard = core_options.global_index_row_count_per_shard()?;
+        core_options.global_index_build_parallelism()?;
         checked_i32(
             options.dimension() as u64,
             "vindex dimension is too large for Rust builder",
@@ -128,14 +147,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             ));
         };
 
-        let mut read_builder = self.table.new_read_builder();
-        if let Some(filter) = &self.partition_filter {
-            read_builder.with_filter(filter.clone());
-        }
-        let manifest_entries = read_builder
-            .new_scan()
-            .with_scan_all_files()
-            .plan_manifest_entries(snapshot)
+        let manifest_entries = view
+            .manifest_entries(self.table, self.partition_filter.as_ref())
             .await?;
         let indexed = crate::table::global_index_build_common::indexed_row_ranges(
             view.index_entries(),
@@ -190,19 +203,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             })?;
         let index_field = find_index_field(self.table, index_column)?;
         validate_vector_field(index_field)?;
-        let defaults = super::global_index_options::declared_options(
-            self.table.schema().options(),
-            index_column,
-            "vector",
-            &self.index_type,
-        )?;
-        let options = VindexVectorIndexOptions::new_with_defaults(
-            self.table.schema().options(),
-            &defaults,
-            &self.options,
-            &self.index_type,
-            index_field,
-        )?;
+        let (_, options) = self.configured_options(index_column, index_field)?;
         let dimension = checked_i32(
             options.dimension() as u64,
             "vindex dimension is too large for Rust builder",
@@ -237,16 +238,12 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         Vec<timing::VectorIndexBuildTiming>,
     )> {
         let plan = self.plan().await?;
-        let mut options = self.table.schema().options().clone();
-        if let Some(column) = &self.index_column {
-            options.extend(super::global_index_options::declared_options(
-                self.table.schema().options(),
-                column,
-                "vector",
-                &self.index_type,
-            )?);
-        }
-        options.extend(self.options.clone());
+        let column = self
+            .index_column
+            .as_deref()
+            .expect("plan validates index column");
+        let (options, _) =
+            self.configured_options(column, find_index_field(self.table, column)?)?;
         let parallelism = CoreOptions::new(&options).global_index_build_parallelism()?;
         let prepared = super::global_index_build_common::preparation::prepare_shards(
             self.table,

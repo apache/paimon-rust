@@ -22,6 +22,7 @@ use crate::spec::{
     IndexManifestEntry, IntType, ROW_ID_FIELD_NAME,
 };
 use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
+use crate::table::vector_search_common::configured_refine_factor;
 use crate::table::vector_search_common::{collect_ranked_rows, reorder_and_strip_position};
 use crate::table::vector_search_test_utils::{
     build_vindex_segment_bytes, de_vector_table, id_gt_filter, pk_vector_table,
@@ -245,6 +246,13 @@ fn scheduled_vector_transport_restores_one_shared_raw_filter_per_bitmap() {
         .collect::<Vec<_>>();
     for search in &mut searches {
         search.set_shared_include_row_ids(Arc::clone(&shared));
+        search.options = HashMap::from([
+            (
+                "global-index.diskann.index-columns".into(),
+                "embedding".into(),
+            ),
+            ("opaque.parameter".into(), "unchanged".into()),
+        ]);
     }
     let wire = TaskVectorQueries::capture(&searches).unwrap();
     assert_eq!(
@@ -253,6 +261,10 @@ fn scheduled_vector_transport_restores_one_shared_raw_filter_per_bitmap() {
         "encode a shared bitmap once per query batch"
     );
     let restored = wire.restore().unwrap();
+    assert!(restored.iter().all(
+        |search| search.options["global-index.diskann.index-columns"] == "embedding"
+            && search.options["opaque.parameter"] == "unchanged"
+    ));
     let restored_shared = shared_batch_include_row_ids(&restored).unwrap();
     assert_eq!(restored_shared.as_ref(), shared.as_ref());
     let scoring = RawScoringPlan::new(&restored, RawVectorMetric::L2);
@@ -481,10 +493,16 @@ async fn raw_search_without_files_uses_the_configured_indexer_default() {
         (" IVF-FLAT ", RawVectorMetric::InnerProduct),
         ("diskann", RawVectorMetric::InnerProduct),
     ] {
-        let options = HashMap::from([(
-            "fields.embedding.index-type".to_string(),
-            index_type.to_string(),
-        )]);
+        let options = HashMap::from([
+            (
+                "pk-vector.index.columns".to_string(),
+                "embedding".to_string(),
+            ),
+            (
+                "fields.embedding.pk-vector.index.type".to_string(),
+                index_type.to_string(),
+            ),
+        ]);
         assert_eq!(
             resolve_raw_vector_metric(
                 &file_io,
@@ -494,6 +512,7 @@ async fn raw_search_without_files_uses_the_configured_indexer_default() {
                 &[],
                 2,
                 "embedding",
+                None,
             )
             .await
             .unwrap(),
@@ -509,6 +528,7 @@ async fn raw_search_without_files_uses_the_configured_indexer_default() {
                 &[],
                 2,
                 "embedding",
+                None,
             )
             .await
             .unwrap(),
@@ -517,7 +537,11 @@ async fn raw_search_without_files_uses_the_configured_indexer_default() {
     }
     let mut table_options = HashMap::from([
         (
-            "fields.embedding.index-type".to_string(),
+            "pk-vector.index.columns".to_string(),
+            "embedding".to_string(),
+        ),
+        (
+            "fields.embedding.pk-vector.index.type".to_string(),
             "ivf-flat".to_string(),
         ),
         ("fields.other.distance.metric".to_string(), "l2".to_string()),
@@ -542,6 +566,7 @@ async fn raw_search_without_files_uses_the_configured_indexer_default() {
                     &[],
                     2,
                     "embedding",
+                    None,
                 )
                 .await
                 .unwrap(),
@@ -610,6 +635,7 @@ async fn indexed_vector_metric_ignores_unrelated_column_options() {
             &[entry],
             2,
             "embedding",
+            None,
         )
         .await
         .unwrap(),
@@ -641,6 +667,7 @@ async fn test_resolve_raw_vector_metric_uses_vindex_manifest_metadata() {
         &[entry],
         2,
         "embedding",
+        None,
     )
     .await
     .unwrap();
@@ -680,6 +707,7 @@ async fn test_resolve_raw_vector_metric_falls_back_to_vindex_header() {
             &[entry],
             2,
             "embedding",
+            None,
         )
         .await
         .unwrap();
@@ -1493,6 +1521,7 @@ async fn raw_query_metric_options_precede_table_options() {
         &[],
         2,
         "embedding",
+        None,
     )
     .await
     .unwrap();
@@ -1510,6 +1539,7 @@ async fn raw_query_metric_options_precede_table_options() {
         &[],
         2,
         "embedding",
+        None,
     )
     .await
     .unwrap();
@@ -1746,6 +1776,15 @@ impl crate::table::SearchTaskExecutor for WireSearchExecutor {
         let mut results = Vec::new();
         for (task, frame) in tasks.iter().zip(frames) {
             let value: serde_json::Value = serde_json::from_slice(&task.serialize()?).unwrap();
+            if value["kind"] == "vector-index" {
+                let resolved: crate::spec::VectorIndexOptions =
+                    serde_json::from_value(value["payload"]["resolved"].clone()).unwrap();
+                assert_eq!(resolved.index_type.as_deref(), Some("ivf-flat"));
+                assert_eq!(
+                    resolved.options.get("refine_factor").map(String::as_str),
+                    Some("2")
+                );
+            }
             self.kinds
                 .lock()
                 .unwrap()
@@ -1901,6 +1940,7 @@ async fn scheduled_vector_selects_global_candidates_before_rerank() {
         &entries,
         find_field_id_by_name(table.schema().fields(), "embedding").unwrap(),
         "embedding",
+        None,
     )
     .await
     .unwrap();

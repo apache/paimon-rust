@@ -345,6 +345,7 @@ impl TableCommit {
                         entries: prepared.entries,
                         changelog_entries: prepared.changelog_entries,
                         deletion_vector_updates: prepared.deletion_vector_updates,
+                        index_entries: prepared.index_entries,
                         schema_id: prepared.schema_id,
                         read_snapshot: prepared.read_snapshot,
                         planned_snapshot_id: prepared.snapshot_id,

@@ -21,7 +21,7 @@ use crate::table::global_index_build_common::vector::{
     validate_vector_field as validate_common_vector_field,
 };
 use crate::table::Table;
-use crate::{Error, Result};
+use crate::Result;
 
 pub(super) fn find_index_field<'a>(table: &'a Table, column: &str) -> Result<&'a DataField> {
     find_vector_index_field(table, column)
@@ -31,91 +31,4 @@ pub(super) fn validate_vector_field(field: &DataField) -> Result<()> {
     validate_common_vector_field(field, "vindex")
 }
 
-pub(super) fn checked_vector_bytes(row_count: usize, dimension: usize) -> Result<usize> {
-    row_count
-        .checked_mul(dimension)
-        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
-        .ok_or_else(|| Error::DataInvalid {
-            message: format!(
-                "vindex vector byte length overflows: row_count={row_count}, dimension={dimension}"
-            ),
-            source: None,
-        })
-}
-
-pub(super) fn checked_std_vector_bytes(
-    row_count: usize,
-    dimension: usize,
-) -> std::io::Result<usize> {
-    row_count
-        .checked_mul(dimension)
-        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "vindex vector byte length overflows usize",
-            )
-        })
-}
-
-pub(super) fn checked_training_vector_count(row_count: usize, ratio: f64) -> Result<usize> {
-    if row_count == 0 || !(ratio > 0.0 && ratio <= 1.0) {
-        return Err(Error::DataInvalid {
-            message: format!(
-                "Invalid vindex training sample: row_count={row_count}, ratio={ratio}; expected a positive row count and ratio in (0, 1]"
-            ),
-            source: None,
-        });
-    }
-    Ok(((row_count as f64 * ratio).ceil() as usize).clamp(1, row_count))
-}
-
-pub(super) fn checked_training_sample_index(
-    sample: usize,
-    rows: usize,
-    samples: usize,
-) -> Result<usize> {
-    sample
-        .checked_mul(rows / samples)
-        .and_then(|base| {
-            sample
-                .checked_mul(rows % samples)
-                .and_then(|remainder| base.checked_add(remainder / samples))
-        })
-        .ok_or_else(|| Error::DataInvalid {
-            message: "vindex training sample index overflows usize".to_string(),
-            source: None,
-        })
-}
-
-pub(super) fn checked_i32(value: u64, context: &str) -> Result<i32> {
-    i32::try_from(value).map_err(|_| Error::DataInvalid {
-        message: format!("{context}: {value}"),
-        source: None,
-    })
-}
-
-pub(super) fn checked_i64(value: u64, context: &str) -> Result<i64> {
-    i64::try_from(value).map_err(|_| Error::DataInvalid {
-        message: format!("{context}: {value}"),
-        source: None,
-    })
-}
-
-pub(super) fn checked_row_count(row_range_start: i64, row_range_end: i64) -> Result<i64> {
-    if row_range_end < row_range_start {
-        return Err(Error::DataInvalid {
-            message: format!("Invalid vindex row range [{row_range_start}, {row_range_end}]"),
-            source: None,
-        });
-    }
-    row_range_end
-        .checked_sub(row_range_start)
-        .and_then(|count| count.checked_add(1))
-        .ok_or_else(|| Error::DataInvalid {
-            message: format!(
-                "Row count overflows for row range [{row_range_start}, {row_range_end}]"
-            ),
-            source: None,
-        })
-}
+pub(super) use crate::table::index_build::vector_validation::*;

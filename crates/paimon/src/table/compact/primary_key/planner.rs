@@ -23,7 +23,8 @@ use crate::spec::{
     AggregationConfig, ChangelogProducer, DataField, DataFileMeta, DataType, MergeEngine,
     PartialUpdateConfig, TableSchema,
 };
-use crate::{Error, Result};
+use crate::table::universal_compaction::{integer_option, Run, UniversalCompaction};
+use crate::Result;
 use std::collections::{BTreeMap, HashSet};
 
 pub(in crate::table::compact) fn enabled(schema: &TableSchema) -> Result<bool> {
@@ -140,28 +141,6 @@ fn mergeable_field(schema: &TableSchema, field: &DataField, function: &str) -> b
     }
 }
 
-fn number(
-    options: &std::collections::HashMap<String, String>,
-    key: &str,
-    default: i32,
-    minimum: i32,
-) -> Result<i32> {
-    let value = options
-        .get(key)
-        .map(|value| value.parse::<i32>())
-        .transpose()
-        .map_err(|_| Error::ConfigInvalid {
-            message: format!("Invalid {key}"),
-        })?
-        .unwrap_or(default);
-    if value < minimum {
-        return Err(Error::ConfigInvalid {
-            message: format!("{key} must be at least {minimum}"),
-        });
-    }
-    Ok(value)
-}
-
 pub(in crate::table::compact) fn select(
     files: Vec<DataFileMeta>,
     properties: &std::collections::HashMap<String, String>,
@@ -176,8 +155,13 @@ pub(in crate::table::compact) fn select_with_force_level_zero(
     properties: &std::collections::HashMap<String, String>,
     force_level_zero: bool,
 ) -> Result<Option<(Vec<DataFileMeta>, i32)>> {
-    let trigger = number(properties, "num-sorted-run.compaction-trigger", 5, 1)?;
-    let configured_levels = number(properties, "num-levels", trigger.saturating_add(1), 2)?;
+    let strategy = UniversalCompaction::from_options(properties, "")?;
+    let configured_levels = integer_option(
+        properties,
+        "num-levels",
+        strategy.trigger.saturating_add(1),
+        2,
+    )?;
     let levels = configured_levels.max(
         files
             .iter()
@@ -185,13 +169,6 @@ pub(in crate::table::compact) fn select_with_force_level_zero(
             .max()
             .unwrap_or(2),
     );
-    let ratio = number(properties, "compaction.size-ratio", 1, 0)?;
-    let amplification = number(
-        properties,
-        "compaction.max-size-amplification-percent",
-        200,
-        0,
-    )?;
     let mut l0 = files
         .iter()
         .filter(|file| file.level == 0)
@@ -224,36 +201,14 @@ pub(in crate::table::compact) fn select_with_force_level_zero(
     if runs.is_empty() {
         return Ok(None);
     }
-    let sizes = runs
+    let candidates = runs
         .iter()
-        .map(|(_, files)| {
-            files
-                .iter()
-                .map(|file| file.file_size as u128)
-                .sum::<u128>()
+        .map(|(level, files)| Run {
+            size: files.iter().map(|file| file.file_size as u128).sum(),
+            stop_before_large: *level > 1,
         })
         .collect::<Vec<_>>();
-    let mut count = None;
-    if runs.len() >= trigger as usize {
-        let additional = sizes[..sizes.len() - 1].iter().sum::<u128>();
-        if additional * 100 > amplification as u128 * sizes[sizes.len() - 1] {
-            count = Some(runs.len());
-        } else {
-            count = pick_for_size_ratio(&runs, &sizes, ratio, 1, false);
-        }
-        if count.is_none() && runs.len() > trigger as usize {
-            count = pick_for_size_ratio(
-                &runs,
-                &sizes,
-                ratio,
-                runs.len() - trigger as usize + 1,
-                false,
-            );
-        }
-    }
-    if count.is_none() && l0_count > 0 && force_level_zero {
-        count = pick_for_size_ratio(&runs, &sizes, ratio, l0_count, true);
-    }
+    let count = strategy.pick(&candidates, if force_level_zero { l0_count } else { 0 });
     let Some(count) = count else {
         return Ok(None);
     };
@@ -272,34 +227,11 @@ pub(in crate::table::compact) fn select_with_force_level_zero(
     Ok(Some((selected, output_level)))
 }
 
-fn pick_for_size_ratio(
-    runs: &[(i32, Vec<DataFileMeta>)],
-    sizes: &[u128],
-    ratio: i32,
-    mut count: usize,
-    force: bool,
-) -> Option<usize> {
-    let mut size = sizes[..count].iter().sum::<u128>();
-    let mut triggered = force || count > 1;
-    while count < runs.len() {
-        // Match Java's double arithmetic, including threshold rounding for
-        // large runs, rather than comparing exact integer cross-products.
-        if size as f64 * (100.0 + f64::from(ratio)) / 100.0 < sizes[count] as f64
-            && (!triggered || runs[count].0 > 1)
-        {
-            break;
-        }
-        size += sizes[count];
-        count += 1;
-        triggered = true;
-    }
-    triggered.then_some(count)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spec::stats::BinaryTableStats;
+    use crate::Error;
     use std::collections::HashMap;
     fn file(name: &str, level: i32, size: i64) -> DataFileMeta {
         DataFileMeta {

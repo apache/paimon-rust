@@ -26,8 +26,8 @@ use crate::spec::{
     should_read_pk_index_source, CoreOptions, DataField, DataFileMeta, FileKind,
     IndexManifestEntry, Predicate, PrimaryKeyIndexSourceMeta,
 };
-use crate::{Error, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::Result;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -45,30 +45,16 @@ pub(super) struct Definition {
 }
 
 pub(super) fn definitions(fields: &[DataField], options: &Options) -> Result<Vec<Definition>> {
-    let mut owners = HashMap::new();
-    for family in ["btree", "bitmap", "vector", "full-text", "multivalue", "fm"] {
-        let key = format!("pk-{family}.index.columns");
-        if let Some(columns) = options.get(&key) {
-            let mut unique = HashSet::new();
-            for column in columns.split(',').map(str::trim) {
-                if !unique.insert(column) {
-                    return Err(config_invalid(format!(
-                        "{key} contains duplicate column '{column}'"
-                    )));
-                }
-                if owners.insert(column, family).is_some() {
-                    return Err(config_invalid(format!(
-                        "Column '{column}' can own at most one primary-key index"
-                    )));
-                }
-            }
-        }
-    }
+    let owners = super::global_index_options::declarations_for_read(options)?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
     let mut result = Vec::new();
     for field in fields {
-        let Some(&family @ ("btree" | "bitmap")) = owners.get(field.name()) else {
+        let Some(family @ ("btree" | "bitmap")) = owners.get(field.name()).map(String::as_str)
+        else {
             continue;
         };
+        let family = if family == "btree" { "btree" } else { "bitmap" };
         result.push(Definition {
             field_id: field.id(),
             index_type: family,
@@ -78,58 +64,13 @@ pub(super) fn definitions(fields: &[DataField], options: &Options) -> Result<Vec
     Ok(result)
 }
 
-fn config_invalid(message: String) -> Error {
-    Error::ConfigInvalid { message }
-}
-
 fn definition_options(options: &Options, column: &str, family: &str) -> Result<Options> {
     let mut resolved = options.clone();
     resolved.remove("sorted-index.records-per-file");
     resolved.remove("sorted-index.records-per-range");
-    let option_key = format!("fields.{column}.pk-{family}.index.options");
-    let Some(raw) = options
-        .get(&option_key)
-        .filter(|raw| !raw.trim().is_empty())
-    else {
-        return Ok(resolved);
-    };
-    let parsed: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(raw).map_err(|_| {
-            config_invalid(format!(
-                "{option_key} must be a JSON object of option key-value pairs"
-            ))
-        })?;
-    let prefix = format!("{family}-index.");
-    for (key, value) in parsed {
-        if key.trim().is_empty() {
-            return Err(config_invalid(format!(
-                "{option_key} contains an empty option key"
-            )));
-        }
-        let value = match value {
-            serde_json::Value::String(value) => value,
-            serde_json::Value::Number(_) | serde_json::Value::Bool(_) => value.to_string(),
-            _ => {
-                return Err(config_invalid(format!(
-                    "{option_key} contains an invalid option value for {key}"
-                )))
-            }
-        };
-        let qualified = if key.starts_with(&prefix) || key.starts_with("fields.") {
-            key
-        } else {
-            format!("{prefix}{key}")
-        };
-        if resolved
-            .get(&qualified)
-            .is_some_and(|previous| previous != &value)
-        {
-            return Err(config_invalid(format!(
-                "{option_key} defines conflicting values for {qualified}"
-            )));
-        }
-        resolved.insert(qualified, value);
-    }
+    resolved.extend(super::pk_index_options::field_options(
+        options, column, family, family,
+    )?);
     Ok(resolved)
 }
 
@@ -468,7 +409,57 @@ pub(super) async fn refine(
     definitions: &[Definition],
     predicates: &[Predicate],
 ) -> Result<Vec<DataSplit>> {
-    let (groups, sources) = plan_groups(table, &splits, entries, definitions);
+    // Source frames contain file names and counts, but no key type. A declaration
+    // may have been removed before an allowed type change and then re-added.
+    // Equal-width encodings (for example INT/FLOAT) cannot be distinguished by
+    // the native reader. Writers prove one unchanged codec across the complete
+    // level. Check every visible active source here; retired/stats-pruned sources
+    // keep their ordinal offsets without preventing partial-coverage reads.
+    let files = splits
+        .iter()
+        .flat_map(|split| {
+            split.data_files().iter().map(move |file| {
+                (
+                    (
+                        split.partition().to_serialized_bytes(),
+                        split.bucket(),
+                        file.file_name.as_str(),
+                    ),
+                    file,
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    let mut compatible = Vec::new();
+    for entry in entries {
+        let Some(meta) = &entry.index_file.global_index_meta else {
+            continue;
+        };
+        let Some(field) = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| field.id() == meta.index_field_id)
+        else {
+            continue;
+        };
+        let Ok(source) = PrimaryKeyIndexSourceMeta::from_global_index_meta(meta) else {
+            continue;
+        };
+        let source_files = source
+            .source_files()
+            .iter()
+            .filter_map(|source| {
+                files
+                    .get(&(entry.partition.clone(), entry.bucket, source.file_name()))
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        if super::pk_index_schema::source_types_match(table, field, &source_files).await {
+            compatible.push(entry.clone());
+        }
+    }
+    let (groups, sources) = plan_groups(table, &splits, &compatible, definitions);
     if groups.is_empty() {
         return Ok(splits);
     }

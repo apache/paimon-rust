@@ -385,6 +385,17 @@ impl KeyValueFileReader {
         split: DataSplit,
         file: DataFileMeta,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_physical_file_with_ranges(split, file, None)
+    }
+
+    /// Select physical positions before decoding schema-evolution casts. The
+    /// caller retains the selected ranges to reconstruct source ordinals.
+    pub(super) fn read_physical_file_with_ranges(
+        self,
+        split: DataSplit,
+        file: DataFileMeta,
+        ranges: Option<Vec<super::RowRange>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         Ok(Box::pin(try_stream! {
             let config = self.config;
             let old = if file.schema_id != config.table_schema_id {
@@ -405,9 +416,11 @@ impl KeyValueFileReader {
             .with_parquet_read_budget(config.parquet_read_budget)
             .with_table_options(config.table_options)
             .with_mosaic_prefetch(config.mosaic_prefetch);
-            let expected = file.row_count;
+            let expected = ranges.as_ref().map_or(file.row_count, |ranges| {
+                ranges.iter().map(super::RowRange::count).sum()
+            });
             let mut stream = reader.read_single_file_stream_with_schema_and_local_ranges(
-                &split, file, old.map(|s| s.fields().to_vec()), data_schema, None, None,
+                &split, file, old.map(|s| s.fields().to_vec()), data_schema, None, ranges,
             )?;
             let mut rows = 0i64;
             while let Some(batch) = stream.next().await {

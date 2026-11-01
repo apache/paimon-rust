@@ -130,8 +130,8 @@ impl BucketVectorPayload {
     /// Consume the payload into the pieces a planner needs, so its decoded metadata
     /// moves out of the payload rather than being cloned out of it.
     ///
-    /// Two decoded fields are deliberately left behind. `row_count` is the payload's
-    /// own row count, which the read path derives from the source metadata instead.
+    /// Preserve the payload's vector count: Java records empty segments with zero
+    /// rows, independently of the physical row range in their source metadata.
     /// `deletion_vectors_ranges` belongs to deletion-vector index files -- Java
     /// builds a vector payload through the overload that leaves it null, and a read
     /// takes its deletion vectors from the bucket's data split -- so a value here
@@ -142,6 +142,7 @@ impl BucketVectorPayload {
             index_type: self.index_type,
             file_name: self.file_name,
             file_size: self.file_size,
+            row_count: self.row_count,
             external_path: self.external_path,
             global_index_meta: self.global_index_meta,
         }
@@ -157,6 +158,7 @@ pub(crate) struct BucketVectorPayloadParts {
     /// As decoded: Java writes a signed length, so a negative value is possible on
     /// the wire and is rejected where it is converted, not here.
     pub(crate) file_size: i64,
+    pub(crate) row_count: i64,
     pub(crate) external_path: Option<String>,
     pub(crate) global_index_meta: GlobalIndexMeta,
 }
