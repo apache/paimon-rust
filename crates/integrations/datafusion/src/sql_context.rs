@@ -477,7 +477,7 @@ impl SQLContext {
             .await;
         }
 
-        let statements = parse_sql_statements(&rewritten_sql)?;
+        let mut statements = parse_sql_statements(&rewritten_sql)?;
 
         if statements.len() != 1 {
             return Err(DataFusionError::Plan(
@@ -485,6 +485,15 @@ impl SQLContext {
             ));
         }
 
+        let rewritten;
+        let persistent_definition = matches!(&statements[0], Statement::CreateView(view) if !view.temporary && self.is_paimon_catalog_ref(&TableReference::from(view.name.to_string().as_str())))
+            || matches!(&statements[0], Statement::CreateFunction(_));
+        let sql = if !persistent_definition && crate::regex_operators::rewrite(&mut statements[0]) {
+            rewritten = statements[0].to_string();
+            rewritten.as_str()
+        } else {
+            sql
+        };
         match &statements[0] {
             statement @ (Statement::ShowDatabases { .. }
             | Statement::ShowSchemas { .. }
@@ -2585,6 +2594,8 @@ fn validate_persistent_create_function(create_function: &CreateFunction) -> DFRe
 }
 
 fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
+    let parseable = crate::regex_operators::parseable_sql(sql)?;
+    let sql = parseable.as_ref();
     let dialect = GenericDialect {};
     let mut tokens = Tokenizer::new(&dialect, sql)
         .tokenize_with_location()
@@ -5843,6 +5854,45 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn regex_operators_preserve_stored_sql_and_existing_null_definitions() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(
+            &catalog,
+            "null_pattern",
+            "CAST(x AS VARCHAR) RLIKE NULL",
+            true,
+        );
+        add_bigint_view(
+            &catalog,
+            "default",
+            "null_view",
+            "SELECT CAST('abc' RLIKE NULL AS BIGINT) AS answer",
+        );
+        let ctx = make_sql_context(catalog.clone()).await;
+        ctx.sql("CREATE VIEW regex_view AS SELECT 'abc' RLIKE '^a' AS flag")
+            .await
+            .unwrap();
+        let view = catalog
+            .get_view(&Identifier::new("default", "regex_view"))
+            .await
+            .unwrap();
+        assert!(view.query_for("spark").contains("RLIKE"));
+        assert!(!view.query_for("spark").contains(" ~ "));
+        for sql in [
+            "SELECT flag FROM regex_view",
+            "SELECT null_pattern(1) IS NULL",
+            "SELECT answer IS NULL FROM null_view",
+        ] {
+            let rows = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            assert_eq!(
+                ScalarValue::try_from_array(rows[0].column(0), 0).unwrap(),
+                ScalarValue::Boolean(Some(true)),
+                "{sql}"
+            );
+        }
     }
 
     #[tokio::test]

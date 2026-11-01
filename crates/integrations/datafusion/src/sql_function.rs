@@ -61,7 +61,8 @@ async fn expand_sql_internal(
     current_database: &str,
     candidate: Option<&Function>,
 ) -> DFResult<String> {
-    let mut statements = Parser::parse_sql(&GenericDialect {}, sql)
+    let parseable = crate::regex_operators::parseable_sql(sql)?;
+    let mut statements = Parser::parse_sql(&GenericDialect {}, parseable.as_ref())
         .map_err(|error| DataFusionError::Plan(format!("Invalid REST SQL: {error}")))?;
     if statements.len() != 1 {
         return Err(DataFusionError::Plan(format!(
@@ -243,6 +244,7 @@ async fn expand_statement_internal(
             return Err(error);
         }
         if expanded_count == 0 {
+            crate::regex_operators::rewrite(&mut statement);
             return Ok(statement);
         }
     }
@@ -264,7 +266,10 @@ fn function_dependencies(
     else {
         return Vec::new();
     };
-    let Ok(mut parser) = Parser::new(&GenericDialect {}).try_with_sql(definition) else {
+    let Ok(parseable) = crate::regex_operators::parseable_sql(definition) else {
+        return Vec::new();
+    };
+    let Ok(mut parser) = Parser::new(&GenericDialect {}).try_with_sql(parseable.as_ref()) else {
         return Vec::new();
     };
     let Ok(body) = parser.parse_expr() else {
@@ -439,8 +444,9 @@ fn expand_call(
         )));
     }
 
+    let parseable = crate::regex_operators::parseable_sql(definition)?;
     let mut body = Parser::new(&GenericDialect {})
-        .try_with_sql(definition)
+        .try_with_sql(parseable.as_ref())
         .map_err(|error| {
             DataFusionError::Plan(format!("Invalid SQL function definition: {error}"))
         })?
