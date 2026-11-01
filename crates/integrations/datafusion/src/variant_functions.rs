@@ -670,7 +670,9 @@ fn string_at(array: &dyn Array, row: usize) -> DFResult<Option<String>> {
     }
 }
 
-fn variant_children(array: &dyn Array) -> DFResult<Option<(&BinaryArray, &BinaryArray)>> {
+pub(crate) fn variant_children(
+    array: &dyn Array,
+) -> DFResult<Option<(&BinaryArray, &BinaryArray)>> {
     let ArrowDataType::Struct(fields) = array.data_type() else {
         return Ok(None);
     };
@@ -738,7 +740,7 @@ fn variant_array(values: Vec<Option<GenericVariant>>) -> DFResult<ArrayRef> {
     Ok(Arc::new(array))
 }
 
-fn variant_arrow_type() -> ArrowDataType {
+pub(crate) fn variant_arrow_type() -> ArrowDataType {
     paimon::arrow::variant_arrow_type()
 }
 
