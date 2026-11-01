@@ -587,6 +587,9 @@ or filter restricts the listing to the current catalog/database unless an
 explicit database or `catalog.database` is supplied. Identifiers follow the
 session's normal quoting and case rules. `LIKE` uses SQL `%` and `_` wildcards;
 `ILIKE` ignores case. Table providers and data files are not loaded for listing.
+Scoped and filtered table listings access only the selected namespace and
+propagate its metadata-listing errors. Session-only temporary namespaces and
+the enabled `information_schema` namespace are included.
 `FULL`, `EXTENDED`, `HISTORY`, `LIMIT`, `STARTS WITH`, typed scopes, and `WHERE`
 filters are rejected rather than silently ignored.
 

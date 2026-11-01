@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::catalog::information_schema::{INFORMATION_SCHEMA, INFORMATION_SCHEMA_TABLES};
+use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::{col, lit, DataFrame, SessionContext};
 use datafusion::sql::planner::IdentNormalizer;
@@ -140,10 +142,9 @@ pub(crate) async fn execute(
             )
         }
         Statement::ShowTables { .. } => {
-            let mut frame = ctx.table("information_schema.tables").await?;
             // Preserve unqualified SHOW TABLES across all catalogs. Scoped or filtered
             // listings default to the current catalog/database.
-            if scope.is_some() || options.filter_position.is_some() {
+            let frame = if scope.is_some() || options.filter_position.is_some() {
                 let (catalog_name, database_name) = match scope.as_deref() {
                     None => (&config.default_catalog, &config.default_schema),
                     Some([database]) => (&config.default_catalog, database),
@@ -154,25 +155,10 @@ pub(crate) async fn execute(
                         ))
                     }
                 };
-                if let Some(catalog) = catalogs.get(catalog_name) {
-                    // Validate without loading table data or swallowing permissions.
-                    catalog
-                        .get_database(database_name)
-                        .await
-                        .map_err(crate::to_datafusion_error)?;
-                } else if ctx
-                    .catalog(catalog_name)
-                    .and_then(|c| c.schema(database_name))
-                    .is_none()
-                {
-                    return Err(DataFusionError::Plan(format!(
-                        "Unknown namespace '{catalog_name}.{database_name}'"
-                    )));
-                }
-                frame = frame
-                    .filter(col("table_catalog").eq(lit(catalog_name.clone())))?
-                    .filter(col("table_schema").eq(lit(database_name.clone())))?;
-            }
+                scoped_tables_frame(ctx, catalog_name, database_name).await?
+            } else {
+                ctx.table("information_schema.tables").await?
+            };
             filter(frame, options, "table_name")?.sort(vec![
                 col("table_catalog").sort(true, true),
                 col("table_schema").sort(true, true),
@@ -181,6 +167,59 @@ pub(crate) async fn execute(
         }
         _ => unreachable!(),
     }
+}
+
+async fn scoped_tables_frame(
+    ctx: &SessionContext,
+    catalog_name: &str,
+    database_name: &str,
+) -> Result<DataFrame> {
+    let catalog = ctx
+        .catalog(catalog_name)
+        .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'")))?;
+    let tables = if database_name == INFORMATION_SCHEMA && ctx.copied_config().information_schema()
+    {
+        INFORMATION_SCHEMA_TABLES
+            .iter()
+            .map(|name| (name.to_string(), TableType::View))
+            .collect()
+    } else if let Some(catalog) = catalog.downcast_ref::<crate::catalog::PaimonCatalogProvider>() {
+        catalog.table_metadata(database_name).await?
+    } else {
+        let schema = catalog.schema(database_name).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Unknown namespace '{catalog_name}.{database_name}'"
+            ))
+        })?;
+        let mut tables = Vec::new();
+        for name in schema.table_names() {
+            if let Some(table_type) = schema.table_type(&name).await? {
+                tables.push((name, table_type));
+            }
+        }
+        tables
+    };
+    let schema = Arc::new(Schema::new(
+        ["table_catalog", "table_schema", "table_name", "table_type"]
+            .map(|name| Field::new(name, DataType::Utf8, false))
+            .to_vec(),
+    ));
+    let names = StringArray::from_iter_values(tables.iter().map(|(name, _)| name));
+    let types =
+        StringArray::from_iter_values(tables.iter().map(|(_, table_type)| match table_type {
+            TableType::Base => "BASE TABLE",
+            TableType::View => "VIEW",
+            TableType::Temporary => "LOCAL TEMPORARY",
+        }));
+    ctx.read_batch(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![catalog_name; tables.len()])),
+            Arc::new(StringArray::from(vec![database_name; tables.len()])),
+            Arc::new(names),
+            Arc::new(types),
+        ],
+    )?)
 }
 
 fn names_frame(ctx: &SessionContext, name: &str, mut values: Vec<String>) -> Result<DataFrame> {

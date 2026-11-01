@@ -53,12 +53,20 @@ async fn create_sql_context(catalog: Arc<FileSystemCatalog>) -> SQLContext {
 
 struct MetadataListingCatalog {
     get_table_calls: AtomicUsize,
+    deny_database_listing: AtomicBool,
+    deny_database_access: AtomicBool,
+    deny_table_listing: AtomicBool,
+    deny_view_listing: AtomicBool,
 }
 
 impl MetadataListingCatalog {
     fn new() -> Self {
         Self {
             get_table_calls: AtomicUsize::new(0),
+            deny_database_listing: AtomicBool::new(false),
+            deny_database_access: AtomicBool::new(false),
+            deny_table_listing: AtomicBool::new(false),
+            deny_view_listing: AtomicBool::new(false),
         }
     }
 
@@ -70,6 +78,12 @@ impl MetadataListingCatalog {
 #[async_trait]
 impl Catalog for MetadataListingCatalog {
     async fn list_databases(&self) -> paimon::Result<Vec<String>> {
+        if self.deny_database_listing.load(Ordering::SeqCst) {
+            return Err(paimon::Error::UnexpectedError {
+                message: "Forbidden: list databases".into(),
+                source: None,
+            });
+        }
         Ok(vec!["default".to_string()])
     }
 
@@ -83,6 +97,12 @@ impl Catalog for MetadataListingCatalog {
     }
 
     async fn get_database(&self, name: &str) -> paimon::Result<paimon::catalog::Database> {
+        if self.deny_database_access.load(Ordering::SeqCst) {
+            return Err(paimon::Error::UnexpectedError {
+                message: "Forbidden: get database".into(),
+                source: None,
+            });
+        }
         Ok(paimon::catalog::Database::new(
             name.to_string(),
             std::collections::HashMap::new(),
@@ -107,10 +127,22 @@ impl Catalog for MetadataListingCatalog {
     }
 
     async fn list_tables(&self, _database_name: &str) -> paimon::Result<Vec<String>> {
+        if self.deny_table_listing.load(Ordering::SeqCst) {
+            return Err(paimon::Error::UnexpectedError {
+                message: "Forbidden: list tables".into(),
+                source: None,
+            });
+        }
         Ok(vec!["metadata_only".to_string()])
     }
 
     async fn list_views(&self, _database_name: &str) -> paimon::Result<Vec<String>> {
+        if self.deny_view_listing.load(Ordering::SeqCst) {
+            return Err(paimon::Error::UnexpectedError {
+                message: "Forbidden: list views".into(),
+                source: None,
+            });
+        }
         Ok(vec!["metadata_view".to_string()])
     }
 
@@ -920,6 +952,102 @@ async fn test_show_tables_keeps_metadata_only_listing() {
         vec!["metadata_only", "metadata_view"]
     );
     assert_eq!(catalog.get_table_calls(), 0);
+}
+
+#[tokio::test]
+async fn test_scoped_show_propagates_listing_denials_without_enumerating_databases() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+    for denied in [&catalog.deny_table_listing, &catalog.deny_view_listing] {
+        denied.store(true, Ordering::SeqCst);
+        let result = ctx.sql("SHOW TABLES IN default").await;
+        let error = match result {
+            Err(error) => error,
+            Ok(frame) => frame.collect().await.unwrap_err(),
+        };
+        assert!(error.to_string().contains("Forbidden: list"), "{error}");
+        denied.store(false, Ordering::SeqCst);
+    }
+    catalog.deny_database_listing.store(true, Ordering::SeqCst);
+    assert_eq!(
+        collect_string_column(&ctx, "SHOW TABLES IN default", "table_name").await,
+        vec!["metadata_only", "metadata_view"]
+    );
+    assert_eq!(catalog.get_table_calls(), 0);
+    let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
+    ctx.register_temp_table(
+        "default.visible_temp",
+        Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()),
+    )
+    .unwrap();
+    catalog.deny_database_access.store(true, Ordering::SeqCst);
+    let result = ctx.sql("SHOW TABLES IN default").await;
+    let error = match result {
+        Err(error) => error,
+        Ok(frame) => frame.collect().await.unwrap_err(),
+    };
+    assert!(
+        error.to_string().contains("Forbidden: get database"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_scoped_show_accepts_temp_only_database_and_shadowing() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
+    ctx.register_temp_table(
+        "scratch.temp_table",
+        Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()),
+    )
+    .unwrap();
+    ctx.sql("CREATE TEMPORARY VIEW scratch.temp_view AS SELECT 1 AS id")
+        .await
+        .unwrap();
+    ctx.sql("SELECT * FROM scratch.temp_view")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_string_column(&ctx, "SHOW TABLES IN scratch", "table_name").await,
+        vec!["temp_table", "temp_view"]
+    );
+    ctx.sql("CREATE TABLE shadow (id INT)").await.unwrap();
+    ctx.sql("CREATE TEMPORARY VIEW shadow AS SELECT 1 AS id")
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_string_column(&ctx, "SHOW TABLES IN default LIKE 'shadow'", "table_type").await,
+        vec!["VIEW"]
+    );
+}
+
+#[tokio::test]
+async fn test_scoped_show_accepts_information_schema() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    assert_eq!(
+        collect_string_column(
+            &ctx,
+            "SHOW TABLES IN information_schema LIKE 'tables'",
+            "table_name"
+        )
+        .await,
+        vec!["tables"]
+    );
+    ctx.sql("SET datafusion.catalog.default_schema = 'information_schema'")
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_string_column(&ctx, "SHOW TABLES LIKE 'columns'", "table_name").await,
+        vec!["columns"]
+    );
 }
 
 #[tokio::test]
