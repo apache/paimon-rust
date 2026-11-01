@@ -518,6 +518,7 @@ duplicate object keys. `json_valid` returns false for rejected text and SQL
 `NULL` for SQL null. `json_format` reports malformed text as an error rather
 than converting it to null. JSON text and the binary Paimon Variant encoding
 are distinct: extraction takes text; `json_format` accepts either representation.
+Dictionary-encoded string columns have the same JSON text semantics.
 
 ### Variant Shredding
 

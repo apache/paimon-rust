@@ -44,7 +44,7 @@ pub(crate) fn register_json_functions(ctx: &SessionContext) {
         let signature = match kind {
             Kind::Scalar | Kind::Fragment => Signature::string(2, Volatility::Immutable),
             Kind::Valid => Signature::string(1, Volatility::Immutable),
-            Kind::Format => Signature::any(1, Volatility::Immutable),
+            Kind::Format => Signature::user_defined(Volatility::Immutable),
         };
         ctx.register_udf(
             ScalarUDF::from(JsonFunction {
@@ -78,6 +78,30 @@ impl ScalarUDFImpl for JsonFunction {
     }
     fn signature(&self) -> &Signature {
         &self.signature
+    }
+
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        let [input] = arg_types else {
+            return Err(DataFusionError::Plan(
+                "json_format expects one argument".into(),
+            ));
+        };
+        let mut value = input;
+        while let DataType::Dictionary(_, inner) = value {
+            value = inner;
+        }
+        if matches!(
+            value,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Null
+        ) {
+            return Ok(vec![value.clone()]);
+        }
+        if input == &variant_arrow_type() {
+            return Ok(vec![input.clone()]);
+        }
+        Err(DataFusionError::Plan(
+            "json_format expects JSON text or a VARIANT".into(),
+        ))
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {

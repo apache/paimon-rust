@@ -99,6 +99,11 @@ async fn json_validation_and_format_preserve_json_types() {
     };
     assert!(message.contains("Invalid JSON"), "{message}");
     assert!(ctx.sql("SELECT json_format(42)").await.is_err());
+    assert!(ctx
+        .sql("SELECT json_format(decode('7b7d', 'hex'))")
+        .await
+        .is_err());
+    assert!(ctx.sql("SELECT json_format(named_struct('value', decode('00', 'hex'), 'metadata', decode('00', 'hex')))").await.is_err());
 }
 
 #[tokio::test]
@@ -145,5 +150,46 @@ async fn json_functions_evaluate_string_arrays_and_dynamic_paths() {
             ScalarValue::Boolean(Some(false))
         );
         ctx.ctx().deregister_table("json_inputs").unwrap();
+    }
+}
+
+#[tokio::test]
+async fn json_format_accepts_dictionary_encoded_text() {
+    use datafusion::arrow::array::{Array, DictionaryArray, Int8Array};
+    use datafusion::arrow::datatypes::Int8Type;
+    let ctx = SQLContext::new();
+    let array = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from(vec![Some(0), Some(1), None]),
+        Arc::new(StringArray::from(vec!["{\"a\":1}", "[2,3]"])),
+    )
+    .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "doc",
+        array.data_type().clone(),
+        true,
+    )]));
+    ctx.ctx()
+        .register_batch(
+            "dictionary_json",
+            RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap(),
+        )
+        .unwrap();
+    let batches = ctx
+        .sql(
+            "SELECT json_format(doc), json_value(doc, '$.a'), json_valid(doc) FROM dictionary_json",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    for (row, expected) in [Some("{\"a\":1}"), Some("[2,3]"), None]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            ScalarValue::try_from_array(batches[0].column(0), row).unwrap(),
+            ScalarValue::Utf8(expected.map(str::to_string))
+        );
     }
 }
