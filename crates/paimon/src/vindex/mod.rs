@@ -266,6 +266,30 @@ fn compile_training_config(
     })
 }
 
+/// The generic build API accepts a complete table option map. Native parameters
+/// remain scoped to this implementation/column; qualified typos still reach the
+/// strict validator, while unrelated table properties stay in the captured plan.
+pub(crate) fn build_parameters(
+    options: &HashMap<String, String>,
+    kind: &str,
+    column: &str,
+) -> HashMap<String, String> {
+    let prefix = format!("{kind}.");
+    let field = format!("fields.{column}.");
+    options
+        .iter()
+        .filter(|(key, _)| {
+            key.starts_with(&prefix)
+                || native_option_key(key).is_some()
+                || matches!(key.as_str(), "index.type" | "vindex.build.granule.enabled")
+                || key.strip_prefix(&field).is_some_and(|suffix| {
+                    native_option_key(suffix).is_some() || suffix == "train.sample-ratio"
+                })
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 fn validate_user_option_keys(
     options: &HashMap<String, String>,
     index_type: &str,
@@ -279,6 +303,9 @@ fn validate_user_option_keys(
                 "index.type"
                     | "global-index.row-count-per-shard"
                     | "global-index.build.parallelism"
+                    | "global-index.num-sorted-run.compaction-trigger"
+                    | "global-index.compaction.size-ratio"
+                    | "global-index.compaction.max-size-amplification-percent"
             ) {
                 return false;
             }
@@ -289,6 +316,15 @@ fn validate_user_option_keys(
                 .strip_prefix(&format!("{index_type}."))
                 .or_else(|| key.strip_prefix(&format!("fields.{field}.")))
                 .unwrap_or(key);
+            if matches!(
+                suffix,
+                "refine-factor" | "refine_factor" | "rerank-factor" | "rerank_factor"
+            ) || (index_type != DISKANN_IDENTIFIER && matches!(suffix, "nprobe" | "ivf.nprobe"))
+                || (index_type == DISKANN_IDENTIFIER
+                    && matches!(suffix, "l_search" | "diskann.l_search"))
+            {
+                return false;
+            }
             if suffix == "train.sample-ratio" {
                 return key.as_str() == suffix;
             }
@@ -412,6 +448,11 @@ fn collect_native_options(
             let Some(native_key) = native_option_key(suffix) else {
                 continue;
             };
+            // DLF prefers dimension over index.dimension within each source.
+            // Iterating alias keys in hash order must not choose the dimension.
+            if suffix == "index.dimension" && options.contains_key(&format!("{prefix}dimension")) {
+                continue;
+            }
             // Schema options follow Java. Explicit Rust/SQL builder options also
             // accept the documented native aliases.
             if prefix.is_empty()

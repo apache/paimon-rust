@@ -110,13 +110,22 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
             return Ok(self.table.clone());
         }
         // Native vector builders keep declarations in their own option layer.
-        let defaults = super::global_index_options::declared_options(
+        let overrides = super::global_index_options::build_table_options(
             self.table.schema().options(),
+            &self.options,
+            columns[0],
+        )
+        .into_iter()
+        .filter(|(key, value)| self.table.schema().options().get(key) != Some(value))
+        .collect();
+        let effective = self.table.copy_with_options(overrides);
+        let defaults = super::global_index_options::declared_options(
+            effective.schema().options(),
             columns[0],
             index_type,
             index_type,
         )?;
-        Ok(self.table.copy_with_options(defaults))
+        Ok(effective.copy_with_options(defaults))
     }
 
     /// Restrict the build to partitions. Repeated calls combine filters with AND.
@@ -249,7 +258,15 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
             builder
                 .with_index_columns(&columns)
                 .with_index_type(index_type)
-                .with_options(self.options.clone());
+                .with_options(if columns.len() == 1 {
+                    super::global_index_options::build_options(
+                        &self.options,
+                        columns[0],
+                        index_type,
+                    )?
+                } else {
+                    self.options.clone()
+                });
             if let Some(filter) = &self.partition_filter {
                 builder.with_partition_filter(filter.clone())?;
             }
@@ -258,9 +275,9 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
         if index_type == FULL_TEXT_GLOBAL_INDEX_TYPE {
             let mut builder = FullTextIndexBuildBuilder::new(&table);
             builder.view = view;
-            builder
-                .with_index_column(columns[0])
-                .with_options(self.options.clone());
+            builder.with_index_column(columns[0]).with_options(
+                super::global_index_options::build_options(&self.options, columns[0], index_type)?,
+            );
             builder.partition_filter = self.partition_filter.clone();
             return Ok(builder.prepare().await?.into());
         }

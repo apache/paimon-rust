@@ -122,8 +122,12 @@ pub(super) fn pk_vector_table(options: &[(&str, &str)]) -> Table {
 /// returned table has one committed batch of `(id, embedding)` rows and a real
 /// vindex index built end-to-end.
 pub(super) async fn de_vector_table() -> Table {
+    de_vector_table_with_metric(None).await
+}
+
+pub(super) async fn de_vector_table_with_metric(metric: Option<&str>) -> Table {
     let table_path = "memory:/de_vector_search_test";
-    let schema = Schema::builder()
+    let mut schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column(
             "embedding",
@@ -134,9 +138,11 @@ pub(super) async fn de_vector_table() -> Table {
         .option("global-index.enabled", "true")
         .option("global-index.row-count-per-shard", "10")
         .option("ivf-flat.dimension", "2")
-        .option("ivf-flat.nlist", "2")
-        .build()
-        .unwrap();
+        .option("ivf-flat.nlist", "2");
+    if let Some(metric) = metric {
+        schema = schema.option("ivf-flat.metric", metric);
+    }
+    let schema = schema.build().unwrap();
     let file_io = FileIOBuilder::new("memory").build().unwrap();
     let table = Table::new(
         file_io.clone(),

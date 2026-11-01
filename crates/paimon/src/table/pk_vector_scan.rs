@@ -42,10 +42,12 @@ use crate::vindex::pkvector::RowRangesByFile;
 /// A payload whose bucket-local path is resolved in planning Phase C, once the
 /// owning bucket's data split (and directory) is known.
 struct UnresolvedAnnSegment {
+    index_type: String,
     source_meta: PrimaryKeyIndexSourceMeta,
     file_name: String,
     external_path: Option<String>,
     file_size: u64,
+    row_count: i64,
     index_meta: Vec<u8>,
 }
 
@@ -85,7 +87,9 @@ fn current_ann_segments(
         sources.sort_by(|a, b| a.file_name().cmp(b.file_name()));
     }
 
-    let mut segments_by_level: BTreeMap<i32, Vec<BucketAnnSegment>> = BTreeMap::new();
+    // Duplicate matches invalidate one format's level. Distinct valid formats
+    // remain visible so the reader can reject a mixed-algorithm snapshot.
+    let mut segments_by_level: BTreeMap<(String, i32), Vec<BucketAnnSegment>> = BTreeMap::new();
     for segment in ann_segments {
         let source_meta = &segment.source_meta;
         let Some(desired) = sources_by_level.get(&source_meta.data_level()) else {
@@ -95,7 +99,7 @@ fn current_ann_segments(
             && desired.as_slice() == source_meta.source_files()
         {
             segments_by_level
-                .entry(source_meta.data_level())
+                .entry((segment.index_type.clone(), source_meta.data_level()))
                 .or_default()
                 .push(segment);
         }
@@ -238,21 +242,14 @@ pub(crate) struct PkVectorScanPlan {
 pub(crate) struct PkVectorScan {
     table: Table,
     vector_field_id: i32,
-    index_type: String,
     filter: Option<Predicate>,
 }
 
 impl PkVectorScan {
-    pub(crate) fn new(
-        table: &Table,
-        vector_field_id: i32,
-        index_type: String,
-        filter: Option<Predicate>,
-    ) -> Self {
+    pub(crate) fn new(table: &Table, vector_field_id: i32, filter: Option<Predicate>) -> Self {
         Self {
             table: table.clone(),
             vector_field_id,
-            index_type,
             filter,
         }
     }
@@ -287,7 +284,6 @@ impl PkVectorScan {
             })
         });
         plan_from_bucket_splits(
-            &self.index_type,
             self.vector_field_id,
             partition_filter.as_ref(),
             self.table.location().trim_end_matches('/'),
@@ -376,7 +372,7 @@ impl Scan for PkVectorScan {
                         entry.index_file.file_name, entry.kind
                     )));
                 }
-                if entry.index_file.index_type != self.index_type {
+                if !crate::vindex::is_vindex_index_type(&entry.index_file.index_type) {
                     continue;
                 }
                 let Some(gim) = entry.index_file.global_index_meta.clone() else {
@@ -395,21 +391,20 @@ impl Scan for PkVectorScan {
                 let partition = BinaryRow::from_serialized_bytes(&entry.partition)?;
                 let file_size = u64::try_from(entry.index_file.file_size)
                     .map_err(|_| data_invalid("index file size must not be negative"))?;
-                let source_meta =
-                    PrimaryKeyIndexSourceMeta::from_global_index_meta(&gim).map_err(|_| {
-                        data_invalid(format!(
-                            "index file {} is not active",
-                            entry.index_file.file_name
-                        ))
-                    })?;
+                let Ok(source_meta) = PrimaryKeyIndexSourceMeta::from_global_index_meta(&gim)
+                else {
+                    continue;
+                };
                 entries.push((
                     partition,
                     entry.bucket,
                     UnresolvedAnnSegment {
+                        index_type: entry.index_file.index_type.clone(),
                         source_meta,
                         file_name: entry.index_file.file_name.clone(),
                         external_path: entry.index_file.external_path.clone(),
                         file_size,
+                        row_count: entry.index_file.row_count,
                         index_meta: gim.index_meta.clone().unwrap_or_default(),
                     },
                 ));
@@ -442,7 +437,6 @@ impl Scan for PkVectorScan {
 /// so planning from engine-supplied splits is testable the same way planning from a
 /// manifest is.
 fn plan_from_bucket_splits(
-    index_type: &str,
     vector_field_id: i32,
     partition_filter: Option<&PartitionFilter>,
     table_path: &str,
@@ -520,10 +514,10 @@ fn plan_from_bucket_splits(
 
         for payload in payload_files {
             let parts = payload.into_parts();
-            // The same three filters the manifest route applies: this column's
-            // index type, this column's field id, and a payload that carries the
+            // The same three filters the manifest route applies: a supported
+            // vector format, this column's field id, and a payload that carries the
             // source metadata a search needs to map ordinals back to rows.
-            if parts.index_type != index_type
+            if !crate::vindex::is_vindex_index_type(&parts.index_type)
                 || parts.global_index_meta.index_field_id != vector_field_id
                 || parts.global_index_meta.source_meta.is_none()
             {
@@ -533,11 +527,11 @@ fn plan_from_bucket_splits(
             // negative value the segment addressing cannot represent.
             let file_size = u64::try_from(parts.file_size)
                 .map_err(|_| data_invalid("index file size must not be negative"))?;
-            let source_meta =
+            let Ok(source_meta) =
                 PrimaryKeyIndexSourceMeta::from_global_index_meta(&parts.global_index_meta)
-                    .map_err(|_| {
-                        data_invalid(format!("index file {} is not active", parts.file_name))
-                    })?;
+            else {
+                continue;
+            };
             let index_meta = parts
                 .global_index_meta
                 .index_meta
@@ -547,10 +541,12 @@ fn plan_from_bucket_splits(
                 data_split.partition().clone(),
                 data_split.bucket(),
                 UnresolvedAnnSegment {
+                    index_type: parts.index_type,
                     source_meta,
                     file_name: parts.file_name,
                     external_path: parts.external_path,
                     file_size,
+                    row_count: parts.row_count,
                     index_meta,
                 },
             ));
@@ -623,7 +619,6 @@ pub(super) fn plan_from_search_splits(
 ) -> crate::Result<PkVectorScanPlan> {
     let snapshot_id = snapshot.as_ref().map_or(0, Snapshot::id);
     let core = table.schema().core_options();
-    let index_type = core.primary_key_vector_index_type(column)?;
     let field_id = crate::table::find_field_id_by_name(table.schema().fields(), column)
         .ok_or_else(|| data_invalid("PK-vector column does not exist"))?;
     let partition = filter
@@ -718,20 +713,27 @@ pub(super) fn plan_from_search_splits(
                 .global_index_meta
                 .as_ref()
                 .ok_or_else(|| data_invalid("PK payload lacks global metadata"))?;
-            if file.index_type != index_type || meta.index_field_id != field_id {
+            if !crate::vindex::is_vindex_index_type(&file.index_type)
+                || meta.index_field_id != field_id
+            {
                 return Err(data_invalid(
                     "PK payload does not match the reader's vector column or index type",
                 ));
             }
+            let Ok(source_meta) = PrimaryKeyIndexSourceMeta::from_global_index_meta(meta) else {
+                continue;
+            };
             entries.push((
                 data_split.partition().clone(),
                 data_split.bucket(),
                 UnresolvedAnnSegment {
-                    source_meta: PrimaryKeyIndexSourceMeta::from_global_index_meta(meta)?,
+                    index_type: file.index_type.clone(),
+                    source_meta,
                     file_name: file.file_name.clone(),
                     external_path: file.external_path.clone(),
                     file_size: u64::try_from(file.file_size)
                         .map_err(|_| data_invalid("Index file size must not be negative"))?,
+                    row_count: file.row_count,
                     index_meta: meta.index_meta.clone().unwrap_or_default(),
                 },
             ));
@@ -852,9 +854,11 @@ fn plan_from_inputs(
             .unwrap_or_default()
             .into_iter()
             .map(|p| BucketAnnSegment {
+                index_type: p.index_type,
                 source_meta: p.source_meta,
                 path: location.resolve(&p.file_name, p.external_path.as_deref()),
                 file_size: p.file_size,
+                row_count: p.row_count,
                 index_meta: p.index_meta,
             })
             .collect();
@@ -970,6 +974,7 @@ mod tests {
 
     fn ann_segment(data_level: i32, path: &str, source_files: &[(&str, i64)]) -> BucketAnnSegment {
         BucketAnnSegment {
+            index_type: "ivf-flat".to_string(),
             source_meta: PrimaryKeyIndexSourceMeta::new(
                 data_level,
                 source_files
@@ -982,6 +987,7 @@ mod tests {
             .unwrap(),
             path: path.to_string(),
             file_size: 1,
+            row_count: 1,
             index_meta: Vec::new(),
         }
     }
@@ -993,10 +999,12 @@ mod tests {
         external_path: Option<&str>,
     ) -> UnresolvedAnnSegment {
         UnresolvedAnnSegment {
+            index_type: "ivf-flat".to_string(),
             source_meta: PrimaryKeyIndexSourceMeta::from_global_index_meta(&gim).unwrap(),
             file_name: file_name.to_string(),
             external_path: external_path.map(str::to_string),
             file_size: 10,
+            row_count: 1,
             index_meta: gim.index_meta.clone().unwrap_or_default(),
         }
     }
@@ -1124,6 +1132,65 @@ mod tests {
     }
 
     #[test]
+    fn current_segments_keep_different_formats_and_ignore_stale_ones() {
+        let active = vec![dfm("a", 1, 5, Some(1))];
+        let mut other = ann_segment(5, "pq", &[("a", 1)]);
+        other.index_type = "ivf-pq".into();
+        other.row_count = 0; // A completed all-null unit still selects its format.
+        let mut stale = ann_segment(5, "stale", &[("a", 2)]);
+        stale.index_type = "diskann".into();
+        let current = current_ann_segments(
+            &active,
+            vec![ann_segment(5, "flat", &[("a", 1)]), other, stale],
+        )
+        .unwrap();
+        assert_eq!(
+            current
+                .iter()
+                .map(|segment| (segment.index_type.as_str(), segment.row_count))
+                .collect::<Vec<_>>(),
+            vec![("ivf-flat", 1), ("ivf-pq", 0)]
+        );
+    }
+
+    #[test]
+    fn engine_plan_selects_valid_payload_independently_of_configured_format() {
+        let mut malformed = gim(2, 5, &[("d0", 4)]);
+        malformed.source_meta = Some(vec![0]);
+        let split = engine_split(
+            11,
+            0,
+            BinaryRow::new(0),
+            vec![dfm("d0", 4, 5, Some(1))],
+            vec![
+                BucketVectorPayload::new_for_test(
+                    "diskann",
+                    "stale",
+                    1,
+                    4,
+                    None,
+                    None,
+                    gim(2, 5, &[("old", 4)]),
+                ),
+                BucketVectorPayload::new_for_test(
+                    "ivf-flat",
+                    "malformed",
+                    1,
+                    4,
+                    None,
+                    None,
+                    malformed,
+                ),
+                engine_payload(gim(2, 5, &[("d0", 4)])),
+            ],
+            &[],
+        );
+        let plan = plan_from_bucket_splits(2, None, "/tbl", false, vec![split]).unwrap();
+        assert_eq!(plan.splits[0].ann_segments.len(), 1);
+        assert_eq!(plan.splits[0].ann_segments[0].index_type, "ivf-pq");
+    }
+
+    #[test]
     fn rejects_data_split_with_wrong_snapshot() {
         let data = DataSplitBuilder::new()
             .with_snapshot(2)
@@ -1215,9 +1282,6 @@ mod tests {
         const PRUNE_DIM: usize = 4;
         /// The primary-key vector column name.
         const PRUNE_VECTOR_COLUMN: &str = "embedding";
-        /// vindex index type string; only used to route `PkVectorScan::new`, no index
-        /// segment is built for these tests.
-        const PRUNE_INDEX_TYPE: &str = "ivf-flat";
         /// Number of rows written; `id`/`score` values live in `0..PRUNE_ROWS`.
         const PRUNE_ROWS: i32 = 4;
         /// A predicate literal guaranteed to fall outside the written `id`/`score`
@@ -1386,31 +1450,23 @@ mod tests {
                 )]),
             ] {
                 let view = table.copy_with_options(extra);
-                assert!(PkVectorScan::new(
-                    &view,
-                    prune_vector_field_id(&view),
-                    PRUNE_INDEX_TYPE.to_string(),
-                    None
-                )
-                .plan()
-                .await
-                .is_err());
+                assert!(PkVectorScan::new(&view, prune_vector_field_id(&view), None)
+                    .plan()
+                    .await
+                    .is_err());
             }
             let empty_window = table.copy_with_options(HashMap::from([(
                 "incremental-between-timestamp".to_string(),
                 "0,1".to_string(),
             )]));
-            assert!(PkVectorScan::new(
-                &empty_window,
-                prune_vector_field_id(&empty_window),
-                PRUNE_INDEX_TYPE.to_string(),
-                None
-            )
-            .plan()
-            .await
-            .unwrap()
-            .splits
-            .is_empty());
+            assert!(
+                PkVectorScan::new(&empty_window, prune_vector_field_id(&empty_window), None)
+                    .plan()
+                    .await
+                    .unwrap()
+                    .splits
+                    .is_empty()
+            );
         }
 
         #[tokio::test]
@@ -1423,15 +1479,10 @@ mod tests {
                     options.insert("scan.snapshot-id".into(), snapshot.id().to_string());
                 }
                 let view = table.copy_with_options(options);
-                let plan = PkVectorScan::new(
-                    &view,
-                    prune_vector_field_id(&view),
-                    PRUNE_INDEX_TYPE.to_string(),
-                    None,
-                )
-                .plan()
-                .await
-                .unwrap();
+                let plan = PkVectorScan::new(&view, prune_vector_field_id(&view), None)
+                    .plan()
+                    .await
+                    .unwrap();
                 assert_eq!(plan.snapshot_id, snapshot.id());
                 assert!(!plan.splits.is_empty());
             }
@@ -1453,28 +1504,18 @@ mod tests {
                 .await
                 .unwrap();
             for view in [pinned, tagged] {
-                let plan = PkVectorScan::new(
-                    &view,
-                    prune_vector_field_id(&view),
-                    PRUNE_INDEX_TYPE.to_string(),
-                    None,
-                )
-                .plan()
-                .await
-                .unwrap();
+                let plan = PkVectorScan::new(&view, prune_vector_field_id(&view), None)
+                    .plan()
+                    .await
+                    .unwrap();
                 assert_eq!(plan.snapshot_id, snapshot.id());
                 assert_eq!(plan.splits.len(), 1);
             }
             let empty = table.copy_with_pinned_snapshot(None);
-            let plan = PkVectorScan::new(
-                &empty,
-                prune_vector_field_id(&empty),
-                PRUNE_INDEX_TYPE.to_string(),
-                None,
-            )
-            .plan()
-            .await
-            .unwrap();
+            let plan = PkVectorScan::new(&empty, prune_vector_field_id(&empty), None)
+                .plan()
+                .await
+                .unwrap();
             assert_eq!(plan.snapshot_id, 0);
             assert!(plan.splits.is_empty());
         }
@@ -1487,11 +1528,10 @@ mod tests {
             let (_tmp, table) = build_pruning_test_table(false).await;
             let field_id = prune_vector_field_id(&table);
 
-            let unfiltered =
-                PkVectorScan::new(&table, field_id, PRUNE_INDEX_TYPE.to_string(), None)
-                    .plan()
-                    .await
-                    .unwrap();
+            let unfiltered = PkVectorScan::new(&table, field_id, None)
+                .plan()
+                .await
+                .unwrap();
             assert_eq!(
                 unfiltered.splits.len(),
                 1,
@@ -1499,15 +1539,10 @@ mod tests {
             );
 
             let out_of_range = prune_equal(&table, "id", OUT_OF_RANGE);
-            let filtered = PkVectorScan::new(
-                &table,
-                field_id,
-                PRUNE_INDEX_TYPE.to_string(),
-                Some(out_of_range),
-            )
-            .plan()
-            .await
-            .unwrap();
+            let filtered = PkVectorScan::new(&table, field_id, Some(out_of_range))
+                .plan()
+                .await
+                .unwrap();
             assert!(
                 filtered.splits.is_empty(),
                 "pk predicate stats-excludes the only file"
@@ -1522,11 +1557,10 @@ mod tests {
             let field_id = prune_vector_field_id(&table);
 
             // Control: without a filter the file is present.
-            let unfiltered =
-                PkVectorScan::new(&table, field_id, PRUNE_INDEX_TYPE.to_string(), None)
-                    .plan()
-                    .await
-                    .unwrap();
+            let unfiltered = PkVectorScan::new(&table, field_id, None)
+                .plan()
+                .await
+                .unwrap();
             assert_eq!(
                 unfiltered.splits.len(),
                 1,
@@ -1534,15 +1568,10 @@ mod tests {
             );
 
             let out_of_range = prune_equal(&table, "score", OUT_OF_RANGE);
-            let filtered = PkVectorScan::new(
-                &table,
-                field_id,
-                PRUNE_INDEX_TYPE.to_string(),
-                Some(out_of_range),
-            )
-            .plan()
-            .await
-            .unwrap();
+            let filtered = PkVectorScan::new(&table, field_id, Some(out_of_range))
+                .plan()
+                .await
+                .unwrap();
             assert!(
                 filtered.splits.is_empty(),
                 "non-pk predicate stats-excludes the file under deletion vectors"
@@ -1604,6 +1633,59 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn java_empty_vector_payload_covers_sources_after_transport_without_io() {
+        // Use Java's zero-row payload, whose source still has six physical rows.
+        let decoded = BucketVectorSearchSplit::deserialize(include_bytes!(
+            "goldens/bucket_vector_search_split_v1_deletion_vectors.bin"
+        ))
+        .unwrap();
+        let empty = &decoded.payload_files()[1];
+        let mut meta = empty.global_index_meta().clone();
+        meta.row_range_end = 5;
+        let payload = BucketVectorPayload::new_for_test(
+            "ivf-flat",
+            empty.file_name(),
+            empty.file_size(),
+            empty.row_count(),
+            None,
+            None,
+            meta,
+        );
+        let split = engine_split(
+            11,
+            0,
+            BinaryRow::new(0),
+            vec![dfm("data-1.orc", 6, 1, Some(1))],
+            vec![payload],
+            &[],
+        );
+        let plan = plan_from_bucket_splits(1, None, "/tbl", false, vec![split]).unwrap();
+        let split = &plan.splits[0];
+        assert_eq!(split.ann_segments[0].row_count, 0);
+        assert_eq!(split.active_files[0].row_count, 6);
+        let result = crate::vindex::pkvector::bucket::bucket_search(
+            None,
+            &split.ann_segments,
+            &split.active_files,
+            &Default::default(),
+            &|_, _, _, _, _| unreachable!("empty segment covers its sources without an exact read"),
+            &[0., 0.],
+            crate::vindex::pkvector::metric::VectorSearchMetric::L2,
+            1,
+            1,
+            &Default::default(),
+            false,
+            None,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.indexed.is_empty());
+        assert!(result.exact.is_empty());
+    }
+
     fn engine_payload(meta: GlobalIndexMeta) -> BucketVectorPayload {
         BucketVectorPayload::new_for_test("ivf-pq", "seg0", 1, 4, None, None, meta)
     }
@@ -1651,8 +1733,7 @@ mod tests {
             .unwrap()
             .planned(None);
         let split = BucketVectorSearchSplit::new_for_test(data_split, vec![], Default::default());
-        let Err(err) = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split])
-        else {
+        let Err(err) = plan_from_bucket_splits(2, None, "/tbl", false, vec![split]) else {
             panic!("a marked split must not plan")
         };
         assert!(
@@ -1664,7 +1745,7 @@ mod tests {
     #[test]
     fn plans_the_java_golden_bucket_split() {
         let split = BucketVectorSearchSplit::deserialize(BUCKET_SPLIT_GOLDEN).unwrap();
-        let plan = plan_from_bucket_splits("ivf-pq", 7, None, "/tbl", false, vec![split]).unwrap();
+        let plan = plan_from_bucket_splits(7, None, "/tbl", false, vec![split]).unwrap();
 
         // The snapshot the split pins, not one re-resolved from the table.
         assert_eq!(plan.snapshot_id, 11);
@@ -1702,7 +1783,7 @@ mod tests {
             vec![engine_payload(gim(2, 5, &[("d0", i64::MAX)]))],
             &[],
         );
-        let plan = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split]).unwrap();
+        let plan = plan_from_bucket_splits(2, None, "/tbl", false, vec![split]).unwrap();
         let selections = plan
             .physical_row_ranges_by_split
             .expect("split-driven plan");
@@ -1725,11 +1806,9 @@ mod tests {
         );
         // Derived from the fixture itself so the test cannot drift from it.
         let payload = &split.payload_files()[0];
-        let index_type = payload.index_type().to_string();
         let field_id = payload.global_index_meta().index_field_id;
 
-        let plan = plan_from_bucket_splits(&index_type, field_id, None, "/tbl", false, vec![split])
-            .unwrap();
+        let plan = plan_from_bucket_splits(field_id, None, "/tbl", false, vec![split]).unwrap();
         let selections = plan
             .physical_row_ranges_by_split
             .expect("split-driven plan");
@@ -1750,13 +1829,11 @@ mod tests {
         // both return the same rows for this fixture.
         let split = BucketVectorSearchSplit::deserialize(BUCKET_SPLIT_NO_PREFILTER).unwrap();
         let payload = &split.payload_files()[0];
-        let index_type = payload.index_type().to_string();
         let field_id = payload.global_index_meta().index_field_id;
         let source_meta =
             PrimaryKeyIndexSourceMeta::from_global_index_meta(payload.global_index_meta()).unwrap();
 
-        let plan = plan_from_bucket_splits(&index_type, field_id, None, "/tbl", false, vec![split])
-            .unwrap();
+        let plan = plan_from_bucket_splits(field_id, None, "/tbl", false, vec![split]).unwrap();
         let row_ranges_by_file = plan
             .physical_row_ranges_by_split
             .expect("split-driven plan")
@@ -1782,7 +1859,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_bucket_split_input() {
-        let error = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, Vec::new())
+        let error = plan_from_bucket_splits(2, None, "/tbl", false, Vec::new())
             .map(|_| ())
             .expect_err("empty input pins no snapshot to report");
         assert!(
@@ -1794,7 +1871,6 @@ mod tests {
     #[test]
     fn rejects_bucket_splits_pinning_different_snapshots() {
         let error = plan_from_bucket_splits(
-            "ivf-pq",
             2,
             None,
             "/tbl",
@@ -1812,7 +1888,6 @@ mod tests {
     #[test]
     fn rejects_two_splits_for_one_bucket() {
         let error = plan_from_bucket_splits(
-            "ivf-pq",
             2,
             None,
             "/tbl",
@@ -1841,7 +1916,7 @@ mod tests {
             vec![engine_payload(gim(2, 5, &[("d0", 4)]))],
             IndexMap::new(),
         );
-        let error = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split])
+        let error = plan_from_bucket_splits(2, None, "/tbl", false, vec![split])
             .map(|_| ())
             .expect_err("two row-range authorities may disagree");
         assert!(
@@ -1863,7 +1938,7 @@ mod tests {
             vec![engine_payload(gim(2, 5, &[("d0", 4), ("d1", 3)]))],
             &[("d0", &[])],
         );
-        let plan = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split]).unwrap();
+        let plan = plan_from_bucket_splits(2, None, "/tbl", false, vec![split]).unwrap();
         let ranges = plan
             .physical_row_ranges_by_split
             .expect("split-driven plan");
@@ -1891,7 +1966,7 @@ mod tests {
             )],
             &[],
         );
-        let error = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split])
+        let error = plan_from_bucket_splits(2, None, "/tbl", false, vec![split])
             .map(|_| ())
             .expect_err("a signed wire size can be negative, segment addressing cannot");
         assert!(
@@ -1931,7 +2006,7 @@ mod tests {
             )],
             &[],
         );
-        let plan = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split]).unwrap();
+        let plan = plan_from_bucket_splits(2, None, "/tbl", false, vec![split]).unwrap();
         assert_eq!(plan.splits.len(), 1);
         assert_eq!(plan.splits[0].ann_segments.len(), 1);
         let ranges = plan
@@ -1942,7 +2017,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_payloads_for_another_column_or_index_type() {
+    fn skips_payloads_for_another_column_or_non_vector_type() {
         let split = engine_split(
             11,
             0,
@@ -1964,7 +2039,7 @@ mod tests {
             ],
             &[],
         );
-        let plan = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split]).unwrap();
+        let plan = plan_from_bucket_splits(2, None, "/tbl", false, vec![split]).unwrap();
         assert_eq!(plan.splits.len(), 1);
         assert!(plan.splits[0].ann_segments.is_empty());
         // Still exact-fallback eligible: no ANN segment covers the file.
@@ -1988,7 +2063,6 @@ mod tests {
         // pruning first would hide an inconsistent input behind an empty plan.
         let filter = partition_filter_on_dt(3);
         let error = plan_from_bucket_splits(
-            "ivf-pq",
             2,
             Some(&filter),
             "/tbl",
@@ -2024,7 +2098,6 @@ mod tests {
     fn pruning_every_split_keeps_the_pinned_snapshot() {
         let filter = partition_filter_on_dt(3);
         let plan = plan_from_bucket_splits(
-            "ivf-pq",
             2,
             Some(&filter),
             "/tbl",
@@ -2051,11 +2124,11 @@ mod tests {
     #[test]
     fn resolves_a_payload_without_an_external_path_into_the_bucket_directory() {
         let split = one_file_split(11, 0, &[]);
-        let plan = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", true, vec![split]).unwrap();
+        let plan = plan_from_bucket_splits(2, None, "/tbl", true, vec![split]).unwrap();
         assert_eq!(plan.splits[0].ann_segments[0].path, "bucket-0/seg0");
 
         let split = one_file_split(11, 0, &[]);
-        let plan = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split]).unwrap();
+        let plan = plan_from_bucket_splits(2, None, "/tbl", false, vec![split]).unwrap();
         assert_eq!(plan.splits[0].ann_segments[0].path, "/tbl/index/seg0");
     }
 }

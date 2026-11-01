@@ -216,7 +216,11 @@ impl<'a> FullTextSearchBuilder<'a> {
                     message: "Text column must be set via with_text_column()".to_string(),
                 })?;
 
-        if !resolves_to_pk_full_text_path(&core, text_column) {
+        if !resolves_to_pk_full_text_path(
+            &core,
+            text_column,
+            !self.table.schema().primary_keys().is_empty(),
+        ) {
             return Err(crate::Error::Unsupported {
                 message: "materialized full-text read (execute_read) is only supported on the \
                           primary-key full-text path (data-evolution disabled and the column \
@@ -240,10 +244,15 @@ impl<'a> FullTextSearchBuilder<'a> {
 /// data-evolution is DISABLED and the column is a configured
 /// `pk-full-text.index.columns` entry (membership via the non-erroring accessor so
 /// a malformed config cannot abort an unrelated append/DE query).
-fn resolves_to_pk_full_text_path(core: &CoreOptions<'_>, text_column: &str) -> bool {
-    !core.data_evolution_enabled()
+fn resolves_to_pk_full_text_path(
+    core: &CoreOptions<'_>,
+    text_column: &str,
+    primary_key: bool,
+) -> bool {
+    primary_key
+        && !core.data_evolution_enabled()
         && core
-            .primary_key_full_text_index_columns()
+            .full_text_index_columns()
             .iter()
             .any(|c| c == text_column)
 }
@@ -1323,6 +1332,58 @@ mod tests {
     }
 
     #[test]
+    fn json_encoded_flat_analyzer_collections_match_field_json() {
+        for options in [
+            HashMap::from([
+                (
+                    "full-text.stop-words".into(),
+                    r#"["paimon","index"]"#.into(),
+                ),
+                ("full-text.columns".into(), r#"["body","title"]"#.into()),
+            ]),
+            HashMap::from([
+                (
+                    "full-text.stop-words".into(),
+                    r#"["paimon","index"]"#.into(),
+                ),
+                ("full-text.text_fields".into(), r#"["body","title"]"#.into()),
+            ]),
+            HashMap::from([
+                (
+                    "full-text.stop-words".into(),
+                    r#"["paimon","index"]"#.into(),
+                ),
+                ("full-text.text-fields".into(), r#"["body","title"]"#.into()),
+            ]),
+            HashMap::from([(
+                "fields.body.index-options".into(),
+                r#"{"stop-words":["paimon","index"],"text-fields":["body","title"]}"#.into(),
+            )]),
+        ] {
+            let config = raw_full_text_config(&options, "body").unwrap();
+            assert_eq!(config.text_fields, vec!["body", "title"]);
+            assert_eq!(config.tokenizer.stop_words, vec!["paimon", "index"]);
+            let defaults = super::super::global_index_options::field_index_options(
+                &options,
+                "body",
+                "full-text",
+                "full-text",
+            )
+            .unwrap();
+            let mut merged = options.clone();
+            merged.extend(defaults);
+            let native = super::super::index_build::full_text::native_full_text_options(&merged);
+            for (key, value) in &native {
+                match key.replace('_', "-").as_str() {
+                    "stop-words" => assert_eq!(value, "paimon;index"),
+                    "text-fields" | "columns" => assert_eq!(value, "body;title"),
+                    _ => (),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_raw_full_text_config_preserves_native_text_fields() {
         let options = HashMap::from([(
             "full-text.text-fields".to_string(),
@@ -1899,15 +1960,16 @@ mod tests {
         ]);
         let core = CoreOptions::new(&de_on);
         assert!(
-            !resolves_to_pk_full_text_path(&core, "body"),
+            !resolves_to_pk_full_text_path(&core, "body", true),
             "data-evolution on must not resolve to the PK full-text path"
         );
         // Off + configured column -> PK path; a non-configured column -> not PK.
         let de_off =
             HashMap::from([("pk-full-text.index.columns".to_string(), "body".to_string())]);
         let core_off = CoreOptions::new(&de_off);
-        assert!(resolves_to_pk_full_text_path(&core_off, "body"));
-        assert!(!resolves_to_pk_full_text_path(&core_off, "other"));
+        assert!(resolves_to_pk_full_text_path(&core_off, "body", true));
+        assert!(!resolves_to_pk_full_text_path(&core_off, "other", true));
+        assert!(!resolves_to_pk_full_text_path(&core_off, "body", false));
     }
 
     // A non-positive limit must fail loud at construction, even on an empty table

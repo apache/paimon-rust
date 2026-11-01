@@ -55,10 +55,13 @@ pub(crate) type ExactFileSearchFuture<'a> =
 /// sources stay range-backed instead of holding the full index bytes.
 #[derive(Clone)]
 pub(crate) struct BucketAnnSegment {
+    pub index_type: String,
     pub source_meta: PkVectorSourceMeta,
     /// Resolved index-file path (globally unique; the key the loader reads by).
     pub path: String,
     pub file_size: u64,
+    /// Indexed vectors; zero is Java's completed, empty source unit.
+    pub row_count: i64,
     pub index_meta: Vec<u8>,
 }
 
@@ -68,9 +71,11 @@ impl BucketAnnSegment {
     /// `source_meta`-driven logic.
     pub(crate) fn for_test(source_meta: PkVectorSourceMeta) -> Self {
         Self {
+            index_type: "ivf-flat".to_string(),
             source_meta,
             path: "seg".to_string(),
             file_size: 0,
+            row_count: 1,
             index_meta: Vec::new(),
         }
     }
@@ -424,6 +429,11 @@ pub(crate) async fn bucket_search(
     let mut segments_by_path: HashMap<&str, usize> = HashMap::new();
     let mut source_to_segment: HashMap<&str, &str> = HashMap::new();
     for (idx, segment) in ann_segments.iter().enumerate() {
+        if segment.row_count < 0 {
+            return Err(data_invalid(
+                "ANN segment vector count must not be negative",
+            ));
+        }
         if segments_by_path
             .insert(segment.path.as_str(), idx)
             .is_some()
@@ -485,7 +495,7 @@ pub(crate) async fn bucket_search(
             }
         }
     }
-    let searcher = if ann_segments.is_empty() {
+    let searcher = if ann_segments.iter().all(|segment| segment.row_count == 0) {
         None
     } else {
         Some(
@@ -560,7 +570,7 @@ pub(crate) async fn bucket_search(
         query_owned,
     )) = ann_shared
     {
-        for segment in ann_segments {
+        for segment in ann_segments.iter().filter(|segment| segment.row_count > 0) {
             let searcher = searcher.clone();
             let segment = segment.clone();
             let active_source_files = active_source_files.clone();
@@ -735,6 +745,11 @@ pub(crate) async fn bucket_search_batch(
     let mut segments_by_path: HashMap<&str, usize> = HashMap::new();
     let mut source_to_segment: HashMap<&str, &str> = HashMap::new();
     for (idx, segment) in ann_segments.iter().enumerate() {
+        if segment.row_count < 0 {
+            return Err(data_invalid(
+                "ANN segment vector count must not be negative",
+            ));
+        }
         if segments_by_path
             .insert(segment.path.as_str(), idx)
             .is_some()
@@ -788,7 +803,7 @@ pub(crate) async fn bucket_search_batch(
             }
         }
     }
-    let searcher = if ann_segments.is_empty() {
+    let searcher = if ann_segments.iter().all(|segment| segment.row_count == 0) {
         None
     } else {
         Some(
@@ -852,7 +867,7 @@ pub(crate) async fn bucket_search_batch(
         queries_owned,
     )) = ann_shared
     {
-        for segment in ann_segments {
+        for segment in ann_segments.iter().filter(|segment| segment.row_count > 0) {
             let searcher = searcher.clone();
             let segment = segment.clone();
             let active_source_files = active_source_files.clone();
@@ -1615,15 +1630,19 @@ mod tests {
     #[tokio::test]
     async fn test_rejects_duplicate_ann_segment_path() {
         let seg1 = BucketAnnSegment {
+            index_type: "ivf-flat".to_string(),
             source_meta: meta(&[("data-1", 2)]),
             path: "duplicate-path".to_string(),
             file_size: 100,
+            row_count: 1,
             index_meta: vec![1, 2, 3],
         };
         let seg2 = BucketAnnSegment {
+            index_type: "ivf-flat".to_string(),
             source_meta: meta(&[("data-2", 2)]),
             path: "duplicate-path".to_string(),
             file_size: 200,
+            row_count: 1,
             index_meta: vec![4, 5, 6],
         };
         let ann = FakeAnnSearcher { result: vec![] };
@@ -1655,15 +1674,19 @@ mod tests {
     #[tokio::test]
     async fn test_rejects_source_file_covered_by_multiple_segments() {
         let seg1 = BucketAnnSegment {
+            index_type: "ivf-flat".to_string(),
             source_meta: meta(&[("data-1", 2)]),
             path: "segment-1".to_string(),
             file_size: 100,
+            row_count: 1,
             index_meta: vec![1, 2, 3],
         };
         let seg2 = BucketAnnSegment {
+            index_type: "ivf-flat".to_string(),
             source_meta: meta(&[("data-1", 2), ("data-2", 2)]),
             path: "segment-2".to_string(),
             file_size: 200,
+            row_count: 1,
             index_meta: vec![4, 5, 6],
         };
         let ann = FakeAnnSearcher { result: vec![] };
@@ -2599,9 +2622,11 @@ mod tests {
         for i in 0..n {
             let src = format!("cov-{i}");
             segments.push(BucketAnnSegment {
+                index_type: "ivf-flat".to_string(),
                 source_meta: meta(&[(src.as_str(), 2)]),
                 path: format!("seg-{i}"),
                 file_size: 0,
+                row_count: 1,
                 index_meta: Vec::new(),
             });
             actives.push(active(&src, 2));
@@ -2762,9 +2787,11 @@ mod tests {
         let (mut segments, _active_files, probe, peak) = n_segment_bucket(2, None);
         // Break segment 1's source row count vs the active file (active says 2).
         segments[1] = BucketAnnSegment {
+            index_type: "ivf-flat".to_string(),
             source_meta: meta(&[("cov-1", 99)]),
             path: "seg-1".to_string(),
             file_size: 0,
+            row_count: 1,
             index_meta: Vec::new(),
         };
         let searcher: Arc<dyn PkVectorAnnSearcher> = probe;
@@ -3245,15 +3272,19 @@ mod tests {
             loaded: loaded.clone(),
         });
         let seg_a = BucketAnnSegment {
+            index_type: "ivf-flat".to_string(),
             source_meta: meta(&[("cov-a", 2)]),
             path: "seg-a".to_string(),
             file_size: 0,
+            row_count: 1,
             index_meta: Vec::new(),
         };
         let seg_b = BucketAnnSegment {
+            index_type: "ivf-flat".to_string(),
             source_meta: meta(&[("cov-b", 2)]),
             path: "seg-b".to_string(),
             file_size: 0,
+            row_count: 1,
             index_meta: Vec::new(),
         };
         let factory = unreachable_search();
