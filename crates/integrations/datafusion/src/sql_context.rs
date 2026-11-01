@@ -485,24 +485,11 @@ impl SQLContext {
         }
 
         match &statements[0] {
-            Statement::ShowDatabases {
-                terse,
-                history,
-                show_options,
-            } => {
-                if *terse
-                    || *history
-                    || show_options.show_in.is_some()
-                    || show_options.starts_with.is_some()
-                    || show_options.limit.is_some()
-                    || show_options.limit_from.is_some()
-                    || show_options.filter_position.is_some()
-                {
-                    return Err(DataFusionError::Plan(
-                        "SHOW DATABASES options are not supported".to_string(),
-                    ));
-                }
-                self.handle_show_databases().await
+            statement @ (Statement::ShowDatabases { .. }
+            | Statement::ShowSchemas { .. }
+            | Statement::ShowCatalogs { .. }
+            | Statement::ShowTables { .. }) => {
+                crate::show_metadata::execute(&self.ctx, &self.catalogs, statement).await
             }
             Statement::CreateDatabase {
                 db_name,
@@ -1379,23 +1366,6 @@ impl SQLContext {
                 Arc::new(StringArray::from(vec![definition])),
             ],
         )?;
-        self.ctx.read_batch(batch)
-    }
-
-    async fn handle_show_databases(&self) -> DFResult<DataFrame> {
-        let catalog = self.current_catalog()?;
-        let mut databases = catalog
-            .list_databases()
-            .await
-            .map_err(to_datafusion_error)?;
-        databases.sort_unstable();
-
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "database_name",
-            ArrowDataType::Utf8,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(databases))])?;
         self.ctx.read_batch(batch)
     }
 
