@@ -160,37 +160,20 @@ impl HttpClient {
         // A mutation may have been published before an intermediary returned an
         // error, so POST/DELETE must never enter this loop.
         let mut connect_retries = 0;
-        let mut connect_deadline: Option<tokio::time::Instant> = None;
         for attempt in 0..=5 {
             let pending = request
                 .try_clone()
                 .expect("GET requests have no streaming body");
-            let sending = self.client.execute(pending);
-            let response = if let Some(deadline) = connect_deadline {
-                tokio::time::timeout_at(deadline, sending)
-                    .await
-                    .map_err(|e| Error::UnexpectedError {
-                        message: "REST GET connection retry budget exhausted".to_string(),
-                        source: Some(Box::new(e)),
-                    })?
-            } else {
-                sending.await
-            };
-            let response = match response {
+            let response = match self.client.execute(pending).await {
                 Ok(response) => response,
                 Err(e) => {
                     if e.is_connect() && connect_retries < 2 && attempt < 5 {
-                        let deadline = *connect_deadline.get_or_insert_with(|| {
-                            tokio::time::Instant::now() + Duration::from_secs(5)
-                        });
                         let delay = Duration::from_millis(
                             rand::thread_rng().gen_range(100..=200) << connect_retries,
                         );
-                        if tokio::time::Instant::now() + delay < deadline {
-                            connect_retries += 1;
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
+                        connect_retries += 1;
+                        tokio::time::sleep(delay).await;
+                        continue;
                     }
                     return Err(Error::UnexpectedError {
                         message: "http get failed".to_string(),
@@ -198,8 +181,6 @@ impl HttpClient {
                     });
                 }
             };
-            // Keep the existing HTTP-status retry policy after connecting.
-            connect_deadline = None;
             if attempt == 5 || !matches!(response.status().as_u16(), 429 | 503) {
                 return self.parse_response(response).await;
             }
@@ -462,6 +443,8 @@ mod tests {
         client.client = reqwest::Client::builder()
             .no_proxy()
             .dns_resolver(resolver.clone())
+            .connect_timeout(Duration::from_secs(180))
+            .read_timeout(Duration::from_secs(180))
             .build()
             .unwrap();
         (client, resolver)
@@ -477,6 +460,30 @@ mod tests {
             .get::<serde_json::Value>("/", None::<&[(&str, &str)]>)
             .await
             .unwrap();
+        assert_eq!(result, serde_json::json!({"ok": true}));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dns_retry_preserves_slow_response_headers() {
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                Json(serde_json::json!({"ok": true}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, resolver) = dns_client(1, listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            client.get::<serde_json::Value>("/", None::<&[(&str, &str)]>),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(result, serde_json::json!({"ok": true}));
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
         server.abort();
