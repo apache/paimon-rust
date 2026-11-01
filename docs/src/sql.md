@@ -1924,6 +1924,31 @@ Only the required columns are read, reducing I/O:
 SELECT name FROM paimon.my_db.users;
 ```
 
+### Lateral collection expansion
+
+SQLContext supports `LATERAL VIEW explode`, `posexplode`,
+`explode_outer`, and `posexplode_outer` for arrays and maps. The
+`LATERAL VIEW OUTER` spelling also preserves empty/NULL collections.
+
+```sql
+SELECT t.id, expanded.pos, expanded.value
+FROM events t
+LATERAL VIEW posexplode_outer(t.items) expanded AS pos, value;
+```
+
+Positions are zero-based INT values. Array defaults are `col`, or
+`pos, col`; map defaults are `key, value`, or `pos, key, value`.
+An explicit AS list must have the matching number of column names. A NULL array
+element remains an element with its position. Outer expansion of an empty or
+NULL collection emits one row with NULL positions and values; ordinary
+expansion emits no rows. Empty parent inputs emit no rows in either mode.
+
+Multiple lateral views can reference columns produced by earlier views.
+Qualified/quoted aliases, joins, filters, subqueries and set operations retain
+their normal SQL behavior. Use one FROM relation with explicit joins instead
+of comma-separated FROM items. Unsupported generators and modifiers report
+planning errors.
+
 ### Filter Pushdown
 
 The following filter predicates are pushed down to the Paimon storage layer:

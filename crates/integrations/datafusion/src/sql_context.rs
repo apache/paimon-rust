@@ -156,9 +156,10 @@ impl SQLContextBuilder {
         let mut state_builder = SessionStateBuilder::new()
             .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
-            .with_relation_planners(vec![Arc::new(
-                crate::relation_planner::PaimonRelationPlanner::new(),
-            )])
+            .with_relation_planners(vec![
+                Arc::new(crate::lateral_views::ExplodeRelationPlanner),
+                Arc::new(crate::relation_planner::PaimonRelationPlanner::new()),
+            ])
             .with_optimizer_rules(crate::lateral_vector_search::optimizer_rules())
             .with_query_planner(Arc::new(
                 crate::lateral_vector_search::PaimonQueryPlanner::new(),
@@ -169,6 +170,7 @@ impl SQLContextBuilder {
         let state = state_builder.build();
         let ctx = SessionContext::new_with_state(state);
         crate::compat_functions::register_compat_functions(&ctx);
+        crate::lateral_views::register(&ctx);
         crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
         crate::json_functions::register_json_functions(&ctx);
@@ -477,7 +479,7 @@ impl SQLContext {
             .await;
         }
 
-        let statements = parse_sql_statements(&rewritten_sql)?;
+        let mut statements = parse_sql_statements(&rewritten_sql)?;
 
         if statements.len() != 1 {
             return Err(DataFusionError::Plan(
@@ -485,6 +487,14 @@ impl SQLContext {
             ));
         }
 
+        let rewritten;
+        let persistent_definition = matches!(&statements[0], Statement::CreateView(view) if !view.temporary && self.is_paimon_catalog_ref(&TableReference::from(view.name.to_string().as_str())));
+        let sql = if !persistent_definition && crate::lateral_views::rewrite(&mut statements[0])? {
+            rewritten = statements[0].to_string();
+            rewritten.as_str()
+        } else {
+            sql
+        };
         match &statements[0] {
             statement @ (Statement::ShowDatabases { .. }
             | Statement::ShowSchemas { .. }
@@ -2585,6 +2595,8 @@ fn validate_persistent_create_function(create_function: &CreateFunction) -> DFRe
 }
 
 fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
+    let parseable = crate::lateral_views::parseable_sql(sql)?;
+    let sql = parseable.as_ref();
     let dialect = GenericDialect {};
     let mut tokens = Tokenizer::new(&dialect, sql)
         .tokenize_with_location()

@@ -1426,8 +1426,9 @@ async fn validate_view_dependencies(
 }
 
 fn view_relation_identifiers(view: &View, catalog_name: &str) -> DFResult<Vec<Identifier>> {
+    let parseable = crate::lateral_views::parseable_sql(view.query_for("datafusion"))?;
     let statements =
-        Parser::parse_sql(&GenericDialect {}, view.query_for("datafusion")).map_err(|error| {
+        Parser::parse_sql(&GenericDialect {}, parseable.as_ref()).map_err(|error| {
             plan_datafusion_err!(
                 "Invalid SQL for REST catalog view '{}': {error}",
                 view.full_name()
