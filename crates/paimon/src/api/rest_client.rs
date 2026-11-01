@@ -22,6 +22,7 @@ use super::rest_error::RestError;
 use super::user_agent;
 use crate::Error;
 use crate::Result;
+use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -155,21 +156,31 @@ impl HttpClient {
                 message: "http get failed".to_string(),
                 source: Some(Box::new(e)),
             })?;
-        // Retry only idempotent reads and only on Java's retryable HTTP statuses.
+        // Retry only idempotent reads. Connection failures include DNS failures.
         // A mutation may have been published before an intermediary returned an
         // error, so POST/DELETE must never enter this loop.
+        let mut connect_retries = 0;
         for attempt in 0..=5 {
             let pending = request
                 .try_clone()
                 .expect("GET requests have no streaming body");
-            let response =
-                self.client
-                    .execute(pending)
-                    .await
-                    .map_err(|e| Error::UnexpectedError {
+            let response = match self.client.execute(pending).await {
+                Ok(response) => response,
+                Err(e) => {
+                    if e.is_connect() && connect_retries < 2 && attempt < 5 {
+                        let delay = Duration::from_millis(
+                            rand::thread_rng().gen_range(100..=200) << connect_retries,
+                        );
+                        connect_retries += 1;
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(Error::UnexpectedError {
                         message: "http get failed".to_string(),
                         source: Some(Box::new(e)),
-                    })?;
+                    });
+                }
+            };
             if attempt == 5 || !matches!(response.status().as_u16(), 429 | 503) {
                 return self.parse_response(response).await;
             }
@@ -387,6 +398,7 @@ impl HttpClient {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -397,6 +409,120 @@ mod tests {
 
     use super::*;
     use crate::api::auth::AuthProvider;
+
+    struct FlakyResolver {
+        calls: AtomicUsize,
+        failures: usize,
+        address: std::net::SocketAddr,
+    }
+
+    impl reqwest::dns::Resolve for FlakyResolver {
+        fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let fail = self.calls.fetch_add(1, Ordering::SeqCst) < self.failures;
+            let address = self.address;
+            Box::pin(async move {
+                if fail {
+                    Err(std::io::Error::other("injected DNS failure").into())
+                } else {
+                    Ok(Box::new(std::iter::once(address)) as reqwest::dns::Addrs)
+                }
+            })
+        }
+    }
+
+    fn dns_client(
+        failures: usize,
+        address: std::net::SocketAddr,
+    ) -> (HttpClient, Arc<FlakyResolver>) {
+        let resolver = Arc::new(FlakyResolver {
+            calls: AtomicUsize::new(0),
+            failures,
+            address,
+        });
+        let mut client = HttpClient::new("http://retry.test", None).unwrap();
+        client.client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(resolver.clone())
+            .connect_timeout(Duration::from_secs(180))
+            .read_timeout(Duration::from_secs(180))
+            .build()
+            .unwrap();
+        (client, resolver)
+    }
+
+    #[tokio::test]
+    async fn get_recovers_from_dns_failure() {
+        let app = Router::new().route("/", get(|| async { Json(serde_json::json!({"ok": true})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, resolver) = dns_client(1, listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = client
+            .get::<serde_json::Value>("/", None::<&[(&str, &str)]>)
+            .await
+            .unwrap();
+        assert_eq!(result, serde_json::json!({"ok": true}));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dns_retry_preserves_slow_response_headers() {
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                Json(serde_json::json!({"ok": true}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, resolver) = dns_client(1, listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            client.get::<serde_json::Value>("/", None::<&[(&str, &str)]>),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, serde_json::json!({"ok": true}));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn persistent_dns_failure_is_bounded() {
+        let (client, resolver) = dns_client(usize::MAX, "127.0.0.1:1".parse().unwrap());
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get::<serde_json::Value>("/", None::<&[(&str, &str)]>),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::UnexpectedError {
+                source: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn mutations_do_not_retry_dns_failure() {
+        let (client, resolver) = dns_client(usize::MAX, "127.0.0.1:1".parse().unwrap());
+        assert!(client
+            .post::<serde_json::Value, _>("/", &serde_json::json!({}))
+            .await
+            .is_err());
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert!(client
+            .delete::<serde_json::Value>("/", None::<&[(&str, &str)]>)
+            .await
+            .is_err());
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn retry_after_or_exponential_backoff_matches_java() {
