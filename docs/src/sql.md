@@ -566,6 +566,30 @@ DROP DATABASE paimon.my_db CASCADE;
 `IF EXISTS` and `CASCADE`. `CREATE SCHEMA` and `DROP SCHEMA` remain supported
 as compatibility aliases.
 
+### Metadata Listings
+
+```sql
+SHOW CATALOGS;
+SHOW CATALOGS LIKE 'paim%';
+SHOW DATABASES LIKE 'report%';
+SHOW SCHEMAS IN paimon LIKE 'report%';
+SHOW TABLES IN reporting;
+SHOW TABLES FROM paimon.reporting LIKE 'daily_%';
+```
+
+`SHOW SCHEMAS` is an alias for `SHOW DATABASES`; both return `database_name`.
+`SHOW CATALOGS` returns `catalog_name`. Database listings default to the current
+catalog and accept `IN catalog` or `FROM catalog`.
+
+Table listings retain the `information_schema.tables` output columns.
+Unqualified `SHOW TABLES` retains DataFusion's listing across catalogs. A scope
+or filter restricts the listing to the current catalog/database unless an
+explicit database or `catalog.database` is supplied. Identifiers follow the
+session's normal quoting and case rules. `LIKE` uses SQL `%` and `_` wildcards;
+`ILIKE` ignores case. Table providers and data files are not loaded for listing.
+`FULL`, `EXTENDED`, `HISTORY`, `LIMIT`, `STARTS WITH`, typed scopes, and `WHERE`
+filters are rejected rather than silently ignored.
+
 ### CREATE TABLE
 
 ```sql

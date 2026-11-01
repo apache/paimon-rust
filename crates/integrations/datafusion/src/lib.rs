@@ -61,6 +61,7 @@ mod physical_plan;
 mod procedures;
 mod relation_planner;
 pub mod runtime;
+mod show_metadata;
 mod sql_context;
 mod sql_function;
 mod system_tables;

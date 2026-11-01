@@ -835,6 +835,110 @@ async fn test_branch_partitions_system_table_reads_branch_snapshot() {
 // ======================= DATABASE / SCHEMA =======================
 
 #[tokio::test]
+async fn test_show_metadata_scopes_and_patterns() {
+    let (_tmp, catalog) = create_test_env();
+    let (_other_tmp, other_catalog) = create_test_env();
+    let mut ctx = create_sql_context(catalog).await;
+    ctx.register_catalog("other", other_catalog).await.unwrap();
+    for sql in [
+        "CREATE DATABASE analytics",
+        "CREATE DATABASE other.analytics",
+        "CREATE TABLE analytics.events_a (id INT)",
+        "CREATE TABLE analytics.events_b (id INT)",
+        "CREATE TABLE analytics.metrics (id INT)",
+        "CREATE TABLE other.analytics.events_other (id INT)",
+        "CREATE DATABASE \"Mixed.Db\"",
+        "CREATE TABLE \"Mixed.Db\".\"O'Reilly\" (id INT)",
+    ] {
+        ctx.sql(sql).await.unwrap();
+    }
+    for (sql, column, expected) in [
+        ("SHOW CATALOGS LIKE 'paim%'", "catalog_name", vec!["paimon"]),
+        (
+            "SHOW DATABASES LIKE 'ana%'",
+            "database_name",
+            vec!["analytics"],
+        ),
+        (
+            "SHOW SCHEMAS IN paimon LIKE 'ana%'",
+            "database_name",
+            vec!["analytics"],
+        ),
+        (
+            "SHOW TABLES IN analytics LIKE 'events_%'",
+            "table_name",
+            vec!["events_a", "events_b"],
+        ),
+        (
+            "SHOW TABLES FROM other.analytics",
+            "table_name",
+            vec!["events_other"],
+        ),
+        (
+            "SHOW TABLES IN analytics ILIKE 'EVENTS_%'",
+            "table_name",
+            vec!["events_a", "events_b"],
+        ),
+        (
+            "SHOW TABLES IN \"Mixed.Db\" LIKE 'O''Reilly'",
+            "table_name",
+            vec!["O'Reilly"],
+        ),
+        (
+            "SHOW TABLES IN analytics LIKE 'absent%'",
+            "table_name",
+            vec![],
+        ),
+    ] {
+        assert_eq!(
+            collect_string_column(&ctx, sql, column).await,
+            expected,
+            "{sql}"
+        );
+    }
+    ctx.sql("USE analytics").await.unwrap();
+    assert_eq!(
+        collect_string_column(&ctx, "SHOW TABLES LIKE 'events_%'", "table_name").await,
+        vec!["events_a", "events_b"]
+    );
+}
+
+#[tokio::test]
+async fn test_show_tables_keeps_metadata_only_listing() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_string_column(
+            &ctx,
+            "SHOW TABLES IN default LIKE 'metadata_%'",
+            "table_name"
+        )
+        .await,
+        vec!["metadata_only", "metadata_view"]
+    );
+    assert_eq!(catalog.get_table_calls(), 0);
+}
+
+#[tokio::test]
+async fn test_show_metadata_rejects_invalid_scope_and_unsupported_modifiers() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    for sql in [
+        "SHOW TABLES IN missing_catalog.default",
+        "SHOW TABLES IN missing_database",
+        "SHOW TABLES IN a.b.c",
+        "SHOW FULL TABLES IN default",
+        "SHOW TABLES IN default LIMIT 1",
+        "SHOW TABLES IN default WHERE table_name = 'x'",
+    ] {
+        assert!(ctx.sql(sql).await.is_err(), "accepted {sql}");
+    }
+}
+
+#[tokio::test]
 async fn test_database_statements() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;
@@ -875,7 +979,7 @@ async fn test_database_statements_reject_unsupported_options() {
 
     assert_sql_error_contains(
         &sql_context,
-        "SHOW DATABASES LIKE 'a%'",
+        "SHOW DATABASES LIMIT 1",
         "SHOW DATABASES options are not supported",
     )
     .await;
