@@ -815,6 +815,21 @@ ALTER TABLE paimon.my_db.users SET TBLPROPERTIES('data-evolution.enabled' = 'tru
 ALTER TABLE IF EXISTS paimon.my_db.users ADD COLUMN age INT;
 ```
 
+### Alternate column changes and extended descriptions
+
+`ALTER TABLE ... MODIFY COLUMN name type [NULL | NOT NULL] [COMMENT 'text']`
+uses existing scalar schema-evolution validation. Unspecified nullability and
+comments, field IDs and stored data are preserved. The existing
+`alter-column-null-to-not-null.disabled` policy still applies. Temporary objects,
+FIRST/AFTER, defaults and nested/container type changes are rejected before a
+schema update; nested field IDs must not be reassigned by a type declaration.
+
+`DESCRIBE [TABLE] EXTENDED table` and FORMATTED return Paimon columns with comments
+plus catalog/database/table, schema ID, location, table comment, keys and sorted
+table properties. Credential-like property values are redacted. Identifier
+normalization follows the session setting and quoted names are preserved.
+Temporary/native objects and views keep existing native DESCRIBE behavior.
+
 ### Table and column comments
 
 ```sql
@@ -1949,6 +1964,76 @@ SELECT
     try_variant_get(payload, '$.score', 'double') AS score
 FROM paimon.my_db.user_events;
 ```
+
+### Aggregate compatibility
+
+SQLContext accepts the following aggregates in queries and view definitions.
+Session registrations take priority, and stored REST definitions retain their
+original SQL. REST SQL function bodies must still be scalar expressions.
+Bare compatibility names follow built-in precedence; use a qualified catalog
+function name to call a persistent function with the same name.
+
+| Function | Contract |
+| --- | --- |
+| `count_if(condition)` | Counts TRUE; FALSE and NULL do not contribute; an empty group returns 0 |
+| `any(condition)` | Boolean OR; an empty or all-NULL group returns NULL |
+| `first(value[, ignoreNulls])`, `any_value(value[, ignoreNulls])` | Native first-value aggregation; the optional NULL flag must be a boolean literal; without ordering the chosen value is not deterministic |
+| `approx_count_distinct(value[, relativeSD])` | BIGINT estimate with native fixed-precision HLL; optional relativeSD must be a numeric literal between 0.008125 and 0.39; smaller errors are rejected |
+| `max_by(value, key)`, `min_by(value, key)` | Select by greatest/least non-NULL key; a selected NULL value remains NULL; empty/all-NULL-key groups return NULL |
+| `arg_max(value, key)` | Like max_by but ignores rows where value or key is NULL |
+| `collect_list(value)` | Collects non-NULL values with duplicates; empty/all-NULL groups return an empty array |
+| `listagg(value[, delimiter]) WITHIN GROUP (ORDER BY ...)` | Native ordered string aggregation; NULL values are skipped; the default delimiter is empty |
+
+Native FILTER and supported ordering/DISTINCT clauses are retained. The selection
+aggregates reject DISTINCT, OVER, additional ordering and NULL modifiers. Tied
+keys may choose any eligible value. LISTAGG overflow and top-k selection forms
+are unsupported. Approximate counts use native HLL estimates rather than Spark's
+serialized HLL++ state.
+
+### JSON output and Variant string casts
+
+`to_json(value)` produces compact JSON from structs, lists, maps, Variant and
+scalar values. SQL NULL returns SQL NULL; nested NULLs become JSON null. Binary
+values use padded Base64. Decimals retain their digits; non-finite floats are
+rejected. Temporal values use Arrow string formatting. Map keys must be non-NULL.
+
+`json_object(key, value, ...)` constructs an object. Keys are converted to strings,
+NULL keys are rejected, NULL values are retained, and the last repeated key wins.
+`json_object()` returns `{}`.
+
+`CAST(variant_value AS STRING)` unwraps Variant strings, formats scalar values and
+serializes arrays/objects as JSON. SQL NULL and Variant JSON null become SQL NULL.
+TRY_CAST returns NULL for malformed Variant values. Only the exact Paimon Variant
+representation uses this conversion; ordinary casts retain native behavior.
+
+### Additional scalar compatibility
+
+| Function | Contract |
+| --- | --- |
+| `assert_true(condition[, message])` | Returns NULL for TRUE; FALSE or NULL raises an execution error with the optional message |
+| `conv(text, from_base, to_base)` | Base 2 through 36 conversion of a 64-bit value; a negative destination base formats a signed result; invalid bases return NULL |
+| `date_diff(end, start)` | BIGINT calendar days after native DATE coercion |
+| `date_diff(unit, start, end)` | Signed whole-unit difference at microsecond precision, from microsecond through week and calendar month/quarter/year; calendar fields use UTC and month-end clamping |
+| `convert_tz(datetime, from_zone, to_zone)` | Interprets a timezone-less datetime in the source zone, returning a timezone-less microsecond timestamp in the destination zone |
+
+CONV reads an optional sign and valid digit prefix, uses uppercase output, and
+saturates overflowing unsigned input at 2^64-1 before applying the sign. No valid
+digits means zero. NULL inputs propagate except that assert_true(NULL) fails.
+CONVERT_TZ accepts IANA zones and fixed offsets; invalid inputs, ambiguous local
+times and nonexistent local times return NULL.
+
+### Custom LIKE escape characters
+
+LIKE, NOT LIKE and ILIKE accept a one-character ESCAPE literal, including Unicode:
+
+```sql
+SELECT value LIKE 'item!_%' ESCAPE '!' FROM events;
+```
+
+The escape quotes the next pattern character. `%` matches any number of Unicode
+characters and `_` matches one, including newlines. A trailing escape is an error;
+NULL values/patterns return NULL. The backslash path remains native. LIKE ANY
+with a custom escape is unsupported.
 
 ### Compatibility Functions
 

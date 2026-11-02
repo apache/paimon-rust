@@ -170,11 +170,13 @@ impl SQLContextBuilder {
             state_builder = state_builder.with_runtime_env(runtime_env);
         }
         let state = state_builder.build();
-        let ctx = SessionContext::new_with_state(state);
+        let mut ctx = SessionContext::new_with_state(state);
         crate::compat_functions::register_compat_functions(&ctx);
         crate::binary_cast::register(&ctx);
         crate::lateral_views::register(&ctx);
         crate::scalar_compat::register(&ctx);
+        crate::scalar_extra::register(&ctx);
+        crate::json_output::register(&mut ctx);
         crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
         crate::json_functions::register_json_functions(&ctx);
@@ -504,7 +506,8 @@ impl SQLContext {
             let binary_changed = crate::binary_cast::rewrite(&mut statements[0])?;
             let regex_changed = crate::regex_operators::rewrite(&mut statements[0]);
             let lateral_changed = crate::lateral_views::rewrite(&mut statements[0])?;
-            binary_changed || regex_changed || lateral_changed
+            let compat_changed = crate::sql_compat::rewrite(&mut statements[0], &self.ctx.state())?;
+            binary_changed || regex_changed || lateral_changed || compat_changed
         };
         let sql = if changed {
             rewritten = statements[0].to_string();
@@ -513,6 +516,11 @@ impl SQLContext {
             sql
         };
         match &statements[0] {
+            Statement::ExplainTable {
+                hive_format: Some(_),
+                table_name,
+                ..
+            } => crate::ddl_compat::describe(self, table_name).await,
             Statement::Comment {
                 object_type,
                 object_name,
@@ -1414,7 +1422,7 @@ impl SQLContext {
     }
 
     /// The temporary table or view `name` resolves to in queries.
-    async fn temp_table_for(
+    pub(crate) async fn temp_table_for(
         &self,
         name: &ObjectName,
     ) -> DFResult<Option<(String, String, String, Arc<dyn TableProvider>)>> {
@@ -1626,6 +1634,64 @@ impl SQLContext {
                         op,
                         enable_ident_normalization,
                     )?);
+                }
+                AlterTableOperation::ModifyColumn {
+                    col_name,
+                    data_type,
+                    options,
+                    column_position,
+                } => {
+                    if self.temp_table_for(name).await?.is_some() {
+                        return Err(DataFusionError::NotImplemented(
+                            "MODIFY COLUMN on temporary tables or views is not supported".into(),
+                        ));
+                    }
+                    if column_position.is_some() {
+                        return Err(DataFusionError::Plan(
+                            "MODIFY COLUMN FIRST/AFTER is not supported".into(),
+                        ));
+                    }
+                    let name = normalize_schema_identifier(col_name, enable_ident_normalization);
+                    let target = sql_data_type_to_paimon_type(data_type, true)?;
+                    if matches!(
+                        target,
+                        PaimonDataType::Row(_)
+                            | PaimonDataType::Array(_)
+                            | PaimonDataType::Map(_)
+                            | PaimonDataType::Multiset(_)
+                    ) {
+                        return Err(DataFusionError::NotImplemented("MODIFY COLUMN supports scalar types; nested field evolution requires preserving nested field IDs".into()));
+                    }
+                    changes.push(SchemaChange::UpdateColumnType {
+                        field_names: vec![name.clone()],
+                        new_data_type: target,
+                        keep_nullability: true,
+                    });
+                    let mut nullability = false;
+                    let mut comment = false;
+                    for option in options {
+                        match option {
+                            ColumnOption::Null | ColumnOption::NotNull if !nullability => {
+                                nullability = true;
+                                changes.push(SchemaChange::update_column_nullability(
+                                    name.clone(),
+                                    matches!(option, ColumnOption::Null),
+                                ));
+                            }
+                            ColumnOption::Comment(value) if !comment => {
+                                comment = true;
+                                changes.push(SchemaChange::update_column_comment(
+                                    name.clone(),
+                                    value.clone(),
+                                ));
+                            }
+                            _ => {
+                                return Err(DataFusionError::Plan(format!(
+                                    "Unsupported or repeated MODIFY COLUMN option: {option}"
+                                )))
+                            }
+                        }
+                    }
                 }
                 AlterTableOperation::RenameTable { table_name } => {
                     let new_name = match table_name {
@@ -2695,6 +2761,9 @@ fn validate_persistent_create_function(create_function: &CreateFunction) -> DFRe
 }
 
 fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
+    if let Some(statement) = crate::ddl_compat::parse_describe(sql)? {
+        return Ok(vec![statement]);
+    }
     let regex_sql = crate::regex_operators::parseable_sql(sql)?;
     let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
     let sql = parseable.as_ref();
@@ -4530,6 +4599,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_compatibility_preserves_persistent_function_and_view_sql() {
+        let catalog = Arc::new(MockCatalog::new());
+        catalog.denied_functions.lock().unwrap().extend([
+            "max_by".to_string(),
+            "count_if".to_string(),
+            "collect_list".to_string(),
+        ]);
+        let ctx = make_sql_context(catalog.clone()).await;
+        ctx.sql("CREATE FUNCTION choose_value(x BIGINT) RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN x + date_diff(DATE '2026-11-02',DATE '2026-11-01')").await.unwrap();
+        let function = catalog
+            .get_function(&Identifier::new("default", "choose_value"))
+            .await
+            .unwrap();
+        let definition = function.definition("datafusion").unwrap().sql().unwrap();
+        assert!(definition.contains("date_diff"), "{definition}");
+        assert!(!definition.contains("first_value"), "{definition}");
+        ctx.sql("CREATE VIEW chosen AS SELECT max_by(choose_value(v),100) AS answer FROM (VALUES (7),(7)) t(v)").await.unwrap();
+        let view = catalog
+            .get_view(&Identifier::new("default", "chosen"))
+            .await
+            .unwrap();
+        assert!(view.query_for("datafusion").contains("choose_value"));
+        assert!(view.query_for("datafusion").contains("max_by"));
+        assert!(!view.query_for("datafusion").contains("first_value"));
+        let batches = ctx
+            .sql("SELECT answer FROM chosen")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            datafusion::common::ScalarValue::try_from_array(batches[0].column(0), 0)
+                .unwrap()
+                .to_string(),
+            "8"
+        );
+        let error = ctx
+            .sql("CREATE FUNCTION invalid_aggregate(x BIGINT) RETURNS BIGINT RETURN max_by(x,100)")
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("body must be a scalar expression"));
+    }
+
+    #[tokio::test]
     async fn binary_cast_preserves_persistent_view_sql() {
         let catalog = Arc::new(MockCatalog::new());
         let ctx = make_sql_context(catalog.clone()).await;
@@ -6361,11 +6477,15 @@ mod tests {
     #[tokio::test]
     async fn recursive_rest_sql_functions_are_rejected() {
         let catalog = Arc::new(MockCatalog::new());
-        add_unary_sql_function(&catalog, "first", "second(x)", true);
-        add_unary_sql_function(&catalog, "second", "first(x)", true);
+        add_unary_sql_function(&catalog, "cycle_first", "cycle_second(x)", true);
+        add_unary_sql_function(&catalog, "cycle_second", "cycle_first(x)", true);
         let ctx = make_sql_context(catalog).await;
 
-        let error = ctx.sql("SELECT first(1)").await.unwrap_err().to_string();
+        let error = ctx
+            .sql("SELECT cycle_first(1)")
+            .await
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("recursive"), "unexpected error: {error}");
     }
