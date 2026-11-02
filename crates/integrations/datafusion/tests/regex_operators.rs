@@ -23,6 +23,7 @@ async fn regex_operators_preserve_boolean_and_null_semantics() {
     for expression in [
         "'abc' RLIKE '^a'",
         "'abc' REGEXP '^a'",
+        "CAST(CAST('abc' AS VARBINARY(2)) AS STRING) RLIKE '^ab$'",
         "'abc' NOT RLIKE '^z'",
         "('abc' NOT RLIKE '^a') = FALSE",
         "('abc' NOT REGEXP '^a') = FALSE",
