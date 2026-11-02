@@ -408,6 +408,24 @@ impl CompactResult {
         &self.changelog_files
     }
 
+    /// Files created by this result; retired index entries still belong to the table.
+    pub(super) fn abort_message(&self) -> super::CommitMessage {
+        let mut message = super::CommitMessage::new(
+            self.task.partition.clone(),
+            self.task.bucket,
+            self.files.clone(),
+        );
+        message.new_changelog_files = self.changelog_files.clone();
+        message.new_index_files = self
+            .index_entries
+            .iter()
+            .flatten()
+            .filter(|entry| matches!(entry.kind, FileKind::Add))
+            .map(|entry| entry.index_file.clone())
+            .collect();
+        message
+    }
+
     pub fn metrics(&self) -> CompactMetrics {
         CompactMetrics {
             files_removed: self.task.files.len(),
