@@ -1795,6 +1795,41 @@ The preview uses the latest snapshot at the time of the call; concurrent changes
 can affect the number of files matched by a later drop. Reads retain the usual
 local-cache behavior. Partition filtering is not supported by this procedure.
 
+### compact
+
+Compact an append, primary-key or data-evolution table:
+
+```sql
+CALL sys.compact(table => 'paimon.my_db.my_table');
+```
+
+Set `partitions` to compact only matching partitions. Alternatives are separated
+by `;` and the constraints of each alternative by `,`; omitted partition keys are
+unrestricted. It is rejected on unpartitioned tables.
+
+```sql
+CALL sys.compact(
+  table => 'paimon.my_db.my_table',
+  partitions => 'dt=2026-10-10,hr=1;dt=2026-10-11,hr=2'
+);
+```
+
+The result is one row with `tasks`, `files_removed`, `files_added` and
+`rows_written`. `files_removed` counts files replaced in the new snapshot; they are
+kept for time travel until snapshot expiration. `rows_written` counts physical rows
+in the new files, which may include deleted rows retained by the table format. When
+no compaction task is planned, nothing is committed and every column is `0`. All
+tasks are committed in one snapshot; if a task fails, files written by earlier tasks
+are deleted on a best-effort basis and a warning names any file left behind.
+Compaction memory is charged to the session memory pool.
+
+Primary-key tables follow the incremental compaction strategy of Paimon core, so
+existing higher-level files may be kept instead of rewritten.
+
+On primary-key tables, compaction with the `lookup` changelog producer, the
+`first-row` merge engine or deletion vectors requires `local-cache.enabled = true`
+on the catalog.
+
 ### grant_permission
 
 Grant an access to a principal on a REST catalog. Only the REST catalog supports
