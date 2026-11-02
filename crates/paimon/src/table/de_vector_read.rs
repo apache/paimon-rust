@@ -634,36 +634,45 @@ async fn scalar_matched_row_ids(
         return Ok(None);
     };
     let ranges = intersect_sorted_ranges(&ranges, vector_ranges);
-    // Candidates outside the rows this search ranks do not make it inexact.
-    if exact && intersect_sorted_ranges(&candidate_ranges, &ranges).is_empty() {
-        let mut row_ids = RoaringTreemap::new();
-        for range in ranges {
-            let start = u64::try_from(range.from()).map_err(|_| crate::Error::DataInvalid {
-                message: "Scalar vector index returned a negative row ID".to_string(),
-                source: None,
-            })?;
-            let end = u64::try_from(range.to()).map_err(|_| crate::Error::DataInvalid {
-                message: "Scalar vector index returned a negative row ID".to_string(),
-                source: None,
-            })?;
-            row_ids.insert_range(start..=end);
-        }
-        return Ok(Some(row_ids));
+    // With an exact answer, only rows in `candidate_ranges` still need the data;
+    // the rest are proven matches whether or not refinement is enabled.
+    let (mut matched, candidates) = if exact {
+        let candidates = intersect_sorted_ranges(&candidate_ranges, &ranges);
+        let mut matched = scalar_row_ids(&ranges)?;
+        matched -= scalar_row_ids(&candidates)?;
+        (matched, candidates)
+    } else {
+        (RoaringTreemap::new(), ranges)
+    };
+    if candidates.is_empty() {
+        return Ok(Some(matched));
     }
     if !core.global_index_filter_refine_from_data() {
         log::warn!("Scalar global index only provides candidates for {filter:?}; global-index.filter.refine-from-data is false, so indexed candidates are excluded");
-        return Ok(Some(RoaringTreemap::new()));
-    }
-    if ranges.is_empty() {
-        return Ok(Some(RoaringTreemap::new()));
+        return Ok(Some(matched));
     }
     let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
         message: "Scalar vector filter refinement requires table context".to_string(),
         source: None,
     })?;
-    Ok(Some(
-        matching_row_ids_for_filter(table, filter, Some(ranges)).await?,
-    ))
+    matched |= matching_row_ids_for_filter(table, filter, Some(candidates)).await?;
+    Ok(Some(matched))
+}
+
+fn scalar_row_ids(ranges: &[RowRange]) -> crate::Result<RoaringTreemap> {
+    let mut row_ids = RoaringTreemap::new();
+    for range in ranges {
+        let start = u64::try_from(range.from()).map_err(|_| crate::Error::DataInvalid {
+            message: "Scalar vector index returned a negative row ID".to_string(),
+            source: None,
+        })?;
+        let end = u64::try_from(range.to()).map_err(|_| crate::Error::DataInvalid {
+            message: "Scalar vector index returned a negative row ID".to_string(),
+            source: None,
+        })?;
+        row_ids.insert_range(start..=end);
+    }
+    Ok(row_ids)
 }
 
 #[cfg(test)]

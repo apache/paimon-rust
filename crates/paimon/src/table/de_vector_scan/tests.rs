@@ -1130,6 +1130,18 @@ async fn top1_after_bitmap_then_btree(
 }
 
 #[tokio::test]
+async fn bitmap_candidates_keep_exact_btree_hits_without_refinement() {
+    // Bitmap rows 0/1 are only candidates for `f > 1.5`, BTree row 2 is an
+    // exact hit. Without refinement the candidates drop out, row 2 stays.
+    let ids = top1_after_bitmap_then_btree(vec![Some(0.0), Some(1.0)], |pb| {
+        pb.greater_than("f", crate::spec::Datum::Double(1.5))
+            .unwrap()
+    })
+    .await;
+    assert_eq!(ids, vec![2]);
+}
+
+#[tokio::test]
 async fn pruned_null_bitmap_keeps_btree_answer_exact() {
     // The bitmap shard covers only NULL rows, so `f > 1.5` prunes it and the
     // BTree answer stays exact even without refinement.

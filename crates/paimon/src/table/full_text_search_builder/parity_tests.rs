@@ -330,6 +330,82 @@ async fn scalar_modes_and_refinement_follow_java_before_top_k() {
 }
 
 #[tokio::test]
+async fn bitmap_candidates_keep_exact_btree_hits_in_full_text_filters() {
+    // Rows 0/1 have a bitmap on the double `f`, so they are only candidates for
+    // `f > 1.5`; rows 2/3 have a BTree, so rows 2 and 3 are exact hits.
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("text", DataType::VarChar(VarCharType::string_type()))
+        .column("f", DataType::Double(crate::spec::DoubleType::new()))
+        .options(HashMap::from([
+            ("bucket".into(), "-1".into()),
+            ("row-tracking.enabled".into(), "true".into()),
+            ("data-evolution.enabled".into(), "true".into()),
+            ("global-index.enabled".into(), "true".into()),
+            ("scalar-index.search-mode".into(), "full".into()),
+            ("full-text-index.search-mode".into(), "full".into()),
+        ]))
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "text_mixed_scalar"),
+        format!("memory:/text-mixed-scalar-{}", uuid::Uuid::new_v4()),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    let append = |start: i32, f: Vec<f64>| {
+        let table = table.clone();
+        async move {
+            let rows = f.len() as i32;
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowType::Int32, true),
+                Field::new("text", ArrowType::Utf8, true),
+                Field::new("f", ArrowType::Float64, true),
+            ]));
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int32Array::from_iter_values(start..start + rows)),
+                Arc::new(StringArray::from(vec!["paimon"; f.len()])),
+                Arc::new(arrow_array::Float64Array::from(f)),
+            ];
+            let mut write = TableWrite::new(&table, "data".into()).unwrap();
+            write
+                .write_arrow_batch(&RecordBatch::try_new(schema, columns).unwrap())
+                .await
+                .unwrap();
+            TableCommit::new(table.clone(), "data".into())
+                .commit(write.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+        }
+    };
+    append(0, vec![0.0, 1.0]).await;
+    index(&table, "bitmap", "f").await;
+    append(2, vec![2.0, 3.0]).await;
+    index(&table, "btree", "f").await;
+    index(&table, "full-text", "text").await;
+
+    let filter = PredicateBuilder::new(table.schema().fields())
+        .greater_than("f", Datum::Double(1.5))
+        .unwrap();
+    for refine in [false, true] {
+        let table = table.copy_with_options(HashMap::from([(
+            "global-index.filter.refine-from-data".into(),
+            refine.to_string(),
+        )]));
+        assert_eq!(
+            ids(query(&table)
+                .with_filter(filter.clone())
+                .execute()
+                .await
+                .unwrap()),
+            vec![2, 3],
+            "refine={refine}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn empty_string_filters_preserve_java_search_refinement() {
     for kind in ["btree", "bitmap"] {
         let table = new_table(false);
