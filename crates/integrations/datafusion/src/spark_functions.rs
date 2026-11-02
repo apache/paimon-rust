@@ -24,7 +24,7 @@ use datafusion::common::utils::SingleRowListArrayBuilder;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
-use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawWindowExpr};
+use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult};
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::type_coercion::functions::fields_with_udf;
 use datafusion::logical_expr::{
@@ -34,9 +34,8 @@ use datafusion::logical_expr::{
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 
-// Bridge upstream integration gaps and register missing Spark-compatible functions.
+// Adapt input and return types while retaining upstream behavior.
 pub(crate) fn apply_compatibility_fixes(ctx: &SessionContext) {
-    crate::spark_percentile::register(ctx);
     ctx.register_udf(date_part().as_ref().clone());
     for bits in [false, true] {
         ctx.register_udf(ScalarUDF::from(ByteLength {
@@ -78,9 +77,6 @@ fn date_part() -> Arc<ScalarUDF> {
 pub(crate) struct FunctionPlanner;
 
 impl ExprPlanner for FunctionPlanner {
-    fn plan_window(&self, expr: RawWindowExpr) -> Result<PlannerResult<RawWindowExpr>> {
-        crate::spark_percentile::plan_window(expr)
-    }
     fn plan_extract(&self, args: Vec<Expr>) -> Result<PlannerResult<Vec<Expr>>> {
         Ok(PlannerResult::Planned(Expr::ScalarFunction(
             ScalarFunction::new_udf(date_part(), args),

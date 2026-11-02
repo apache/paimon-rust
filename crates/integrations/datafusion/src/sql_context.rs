@@ -159,7 +159,6 @@ impl SQLContextBuilder {
             .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
             .with_spark_features()
-            .with_analyzer_rule(Arc::new(crate::spark_percentile::ValidatePercentiles))
             .with_type_planner(Arc::new(crate::binary_cast::BinaryTypePlanner))
             .with_relation_planners(vec![
                 Arc::new(crate::lateral_views::ExplodeRelationPlanner),
@@ -513,17 +512,12 @@ impl SQLContext {
         let persistent_definition = matches!(&statements[0], Statement::CreateView(view) if !view.temporary && self.is_paimon_catalog_ref(&TableReference::from(view.name.to_string().as_str())))
             || matches!(&statements[0], Statement::CreateFunction(_));
         let changed = !persistent_definition && {
-            let precedence_changed = crate::sql_precedence::has_distinct(&statements[0]);
             let binary_changed = crate::binary_cast::rewrite(&mut statements[0])?;
             let regex_changed = crate::regex_operators::rewrite(&mut statements[0]);
             let lateral_changed = crate::lateral_views::rewrite(&mut statements[0])?;
             let compat_changed =
                 crate::expression_compat::rewrite(&mut statements[0], &self.ctx.state())?;
-            precedence_changed
-                || binary_changed
-                || regex_changed
-                || lateral_changed
-                || compat_changed
+            binary_changed || regex_changed || lateral_changed || compat_changed
         };
         let sql = if changed {
             rewritten = statements[0].to_string();
@@ -738,11 +732,6 @@ impl SQLContext {
                     if self.is_paimon_catalog_ref(&table_ref) {
                         self.handle_create_view(create_view, options).await
                     } else {
-                        let state = self.ctx.state();
-                        let plan = state
-                            .create_logical_plan(&create_view.query.to_string())
-                            .await?;
-                        crate::spark_percentile::validate_plan(&plan, state.config_options())?;
                         self.ctx.sql_with_options(sql, options).await
                     }
                 }
@@ -2126,10 +2115,6 @@ impl SQLContext {
             let (catalog, database, name) = self.resolve_temp_table_name(table_ref)?;
             let df = self.ctx.sql_with_options(&query_sql, sql_options).await?;
             let logical_plan = df.logical_plan().clone();
-            crate::spark_percentile::validate_plan(
-                &logical_plan,
-                self.ctx.state().config_options(),
-            )?;
             if create_view.if_not_exists
                 && self.temp_table_exist(format!("{catalog}.{database}.{name}"))?
             {
@@ -2156,7 +2141,6 @@ impl SQLContext {
             )
             .await?;
             let logical_plan = state.create_logical_plan(&expanded_query).await?;
-            crate::spark_percentile::validate_plan(&logical_plan, state.config_options())?;
             let mut arrow_fields = logical_plan
                 .schema()
                 .as_arrow()
@@ -2839,7 +2823,9 @@ fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
             .map(|(_, token)| token)
             .collect();
     }
-    let mut statements = crate::sql_precedence::parse_tokens(tokens)
+    let mut statements = Parser::new(&dialect)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
         .map_err(|error| DataFusionError::Plan(format!("SQL parse error: {error}")))?;
     if create_function_if_not_exists {
         let Some(Statement::CreateFunction(create_function)) = statements.first_mut() else {
@@ -4620,60 +4606,6 @@ mod tests {
             Identifier::new(database, name),
             schema,
         ));
-    }
-
-    #[tokio::test]
-    async fn spark_percentiles_validate_before_writing_persistent_view_metadata() {
-        use datafusion::common::ScalarValue;
-        let catalog = Arc::new(MockCatalog::new());
-        catalog.denied_functions.lock().unwrap().extend([
-            "approx_percentile".to_string(),
-            "percentile_approx".to_string(),
-        ]);
-        let ctx = make_sql_context(catalog.clone()).await;
-        for (name, query) in [
-            (
-                "bad_quantile",
-                "SELECT approx_percentile(v,1.1) AS q FROM (VALUES (1)) t(v)",
-            ),
-            (
-                "bad_window_quantile",
-                "SELECT approx_percentile(v,1.1) OVER() AS q FROM (VALUES (1)) t(v) WHERE FALSE",
-            ),
-            (
-                "bad_folded_quantile",
-                "SELECT approx_percentile(v,1+1) AS q FROM (VALUES (1)) t(v)",
-            ),
-        ] {
-            assert!(
-                ctx.sql(&format!("CREATE VIEW {name} AS {query}"))
-                    .await
-                    .is_err(),
-                "{name}"
-            );
-            assert!(catalog
-                .get_view(&Identifier::new("default", name))
-                .await
-                .is_err());
-        }
-        ctx.sql("CREATE VIEW valid_quantile AS SELECT percentile_approx(v,0.5) AS q, approx_percentile(DATE '2024-01-01',0.5) AS d, approx_percentile(TIMESTAMP '2024-01-01 00:00:01.5',0.5) AS t FROM (VALUES (0),(10)) t(v)").await.unwrap();
-        let batches = ctx
-            .sql("SELECT q,d=DATE '2024-01-01',t=TIMESTAMP '2024-01-01 00:00:01.5' FROM valid_quantile")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        assert_eq!(
-            ScalarValue::try_from_array(batches[0].column(0), 0).unwrap(),
-            ScalarValue::Int64(Some(0))
-        );
-        for column in [1, 2] {
-            assert_eq!(
-                ScalarValue::try_from_array(batches[0].column(column), 0).unwrap(),
-                ScalarValue::Boolean(Some(true))
-            );
-        }
     }
 
     #[tokio::test]

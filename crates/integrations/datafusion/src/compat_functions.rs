@@ -68,25 +68,6 @@ struct ConfiguredAlias {
     inner: Arc<ScalarUDF>,
 }
 
-// Spark's current-date/time expressions are foldable despite being query-stable.
-// Recognize implementations, so a same-named application UDF cannot gain this exception.
-pub(crate) fn is_native_context_constant(function: &ScalarUDF) -> bool {
-    use datafusion::functions::datetime::{current_date::CurrentDateFunc, now::NowFunc};
-    let inner = function.inner();
-    inner.downcast_ref::<CurrentDateFunc>().is_some()
-        || inner.downcast_ref::<NowFunc>().is_some()
-        || inner
-            .downcast_ref::<ConfiguredAlias>()
-            .is_some_and(|alias| {
-                alias.name == "curdate"
-                    && alias
-                        .inner
-                        .inner()
-                        .downcast_ref::<CurrentDateFunc>()
-                        .is_some()
-            })
-}
-
 impl ScalarUDFImpl for ConfiguredAlias {
     fn name(&self) -> &str {
         self.name

@@ -63,7 +63,7 @@ async fn expand_sql_internal(
 ) -> DFResult<String> {
     let regex_sql = crate::regex_operators::parseable_sql(sql)?;
     let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
-    let mut statements = crate::sql_precedence::parse_sql(parseable.as_ref())
+    let mut statements = Parser::parse_sql(&GenericDialect {}, parseable.as_ref())
         .map_err(|error| DataFusionError::Plan(format!("Invalid REST SQL: {error}")))?;
     if statements.len() != 1 {
         return Err(DataFusionError::Plan(format!(
@@ -450,9 +450,15 @@ fn expand_call(
     }
 
     let parseable = crate::regex_operators::parseable_sql(definition)?;
-    let mut body = crate::sql_precedence::parse_expr(parseable.as_ref()).map_err(|error| {
-        DataFusionError::Plan(format!("Invalid SQL function definition: {error}"))
-    })?;
+    let mut body = Parser::new(&GenericDialect {})
+        .try_with_sql(parseable.as_ref())
+        .map_err(|error| {
+            DataFusionError::Plan(format!("Invalid SQL function definition: {error}"))
+        })?
+        .parse_expr()
+        .map_err(|error| {
+            DataFusionError::Plan(format!("Invalid SQL function definition: {error}"))
+        })?;
     let replacements: HashMap<String, SqlExpr> = input_params
         .iter()
         .zip(values)
