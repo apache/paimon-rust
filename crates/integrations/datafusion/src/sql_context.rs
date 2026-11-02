@@ -171,11 +171,11 @@ impl SQLContextBuilder {
         if let Some(runtime_env) = self.runtime_env {
             state_builder = state_builder.with_runtime_env(runtime_env);
         }
-        // EXTRACT bypasses the function registry, so intercept it before Spark's planner.
+        // EXTRACT and SUBSTRING bypass the registry; apply the same adapters to their syntax.
         state_builder
             .expr_planners()
             .get_or_insert_with(Vec::new)
-            .insert(0, Arc::new(crate::spark_functions::DatePartPlanner));
+            .insert(0, Arc::new(crate::spark_functions::FunctionPlanner));
         let state = state_builder.build();
         let mut ctx = SessionContext::new_with_state(state);
         crate::spark_functions::apply_compatibility_fixes(&ctx);

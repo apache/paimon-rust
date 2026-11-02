@@ -2044,6 +2044,22 @@ aggregates and the additional functions documented below remain available.
 This enables the upstream function subset; it does not enable every Spark SQL
 syntax, cast mode or configuration option.
 
+SQLContext also adapts binary inputs for length and substring functions in the
+pinned upstream version. `octet_length` and `bit_length` accept strings and binary
+values and return Spark INT results, including for Arrow large-offset
+representations. String byte lengths count UTF-8 bytes; `length` continues to
+count characters for strings. Fixed-size and dictionary binary inputs work with
+length functions and both function-call and SQL `SUBSTRING` syntax without
+decoding bytes as text.
+
+### Split-index extension
+
+`split_index(text, delimiter, index)` provides Flink's zero-based splitting
+contract without changing Spark `split` or one-based `split_part`. The delimiter
+is literal and empty pieces are preserved. NULL arguments, an empty input,
+negative indexes and indexes outside the result return NULL. An empty delimiter
+uses Java whitespace as the separator.
+
 ### Aggregate compatibility
 
 SQLContext accepts the following aggregates in queries and view definitions.

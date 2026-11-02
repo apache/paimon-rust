@@ -32,6 +32,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Kind {
     Split,
+    SplitIndex,
     Locate,
     Typeof,
 }
@@ -41,9 +42,14 @@ struct Function {
     signature: Signature,
 }
 pub(crate) fn register(ctx: &SessionContext) {
-    for kind in [Kind::Split, Kind::Locate, Kind::Typeof] {
+    for kind in [Kind::Split, Kind::SplitIndex, Kind::Locate, Kind::Typeof] {
         let signature = if kind == Kind::Typeof {
             Signature::any(1, Volatility::Immutable)
+        } else if kind == Kind::SplitIndex {
+            Signature::exact(
+                vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
+                Volatility::Immutable,
+            )
         } else {
             Signature::one_of(
                 vec![
@@ -69,6 +75,7 @@ impl ScalarUDFImpl for Function {
     fn name(&self) -> &str {
         match self.kind {
             Kind::Split => "split",
+            Kind::SplitIndex => "split_index",
             Kind::Locate => "locate",
             Kind::Typeof => "typeof",
         }
@@ -80,7 +87,7 @@ impl ScalarUDFImpl for Function {
         Ok(match self.kind {
             Kind::Split => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             Kind::Locate => DataType::Int32,
-            Kind::Typeof => DataType::Utf8,
+            Kind::Typeof | Kind::SplitIndex => DataType::Utf8,
         })
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -91,6 +98,26 @@ impl ScalarUDFImpl for Function {
         }
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
         let output: ArrayRef = match self.kind {
+            Kind::SplitIndex => {
+                let text = arrays[0].as_any().downcast_ref::<StringArray>().unwrap();
+                let separators = arrays[1].as_any().downcast_ref::<StringArray>().unwrap();
+                let indexes = arrays[2].as_any().downcast_ref::<Int64Array>().unwrap();
+                let output = (0..text.len())
+                    .map(|i| {
+                        if arrays.iter().any(|a| a.is_null(i)) || text.value(i).is_empty() {
+                            return None;
+                        }
+                        let index = usize::try_from(indexes.value(i)).ok()?;
+                        let separator = separators.value(i);
+                        if separator.is_empty() {
+                            text.value(i).split(java_whitespace).nth(index)
+                        } else {
+                            text.value(i).split(separator).nth(index)
+                        }
+                    })
+                    .collect::<StringArray>();
+                Arc::new(output)
+            }
             Kind::Split => {
                 let text = arrays[0].as_any().downcast_ref::<StringArray>().unwrap();
                 let patterns = arrays[1].as_any().downcast_ref::<StringArray>().unwrap();
@@ -197,6 +224,11 @@ impl ScalarUDFImpl for Function {
             Ok(ColumnarValue::Array(output))
         }
     }
+}
+// StringUtils uses Java Character.isWhitespace when the whole separator is empty.
+fn java_whitespace(ch: char) -> bool {
+    matches!(ch, '\u{0009}'..='\u{000d}' | '\u{001c}'..='\u{0020}' | '\u{1680}' |
+        '\u{2000}'..='\u{2006}' | '\u{2008}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{205f}' | '\u{3000}')
 }
 fn sql_type(ty: &DataType) -> String {
     if decoded_type(ty) == &paimon::arrow::variant_arrow_type() {
