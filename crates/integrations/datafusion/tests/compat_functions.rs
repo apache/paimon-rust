@@ -226,6 +226,91 @@ async fn binary_encoding_preserves_non_utf8_bytes_across_arrow_types() {
 }
 
 #[tokio::test]
+async fn hex_preserves_binary_view_bytes_and_nulls() {
+    use datafusion::arrow::datatypes::DataType;
+
+    let ctx = SQLContext::new();
+    assert_true(
+        &ctx,
+        &["hex(arrow_cast(decode('00ff', 'hex'), 'BinaryView')) = '00FF'"],
+    )
+    .await;
+    assert_dictionary_binary_encoding(&ctx, DataType::BinaryView, "hex(bytes)", "00FF").await;
+}
+
+#[tokio::test]
+async fn sha2_preserves_fixed_size_binary_bytes_and_nulls() {
+    use datafusion::arrow::datatypes::DataType;
+
+    let ctx = SQLContext::new();
+    let expected = "06eb7d6a69ee19e5fbdf749018d3d2abfa04bcbd1365db312eb86dc7169389b8";
+    assert_true(
+        &ctx,
+        &[&format!(
+            "sha2(arrow_cast(decode('00ff', 'hex'), 'FixedSizeBinary(2)'), 256) = '{expected}'"
+        )],
+    )
+    .await;
+    assert_dictionary_binary_encoding(
+        &ctx,
+        DataType::FixedSizeBinary(2),
+        "sha2(bytes, 256)",
+        expected,
+    )
+    .await;
+}
+
+async fn assert_dictionary_binary_encoding(
+    ctx: &SQLContext,
+    data_type: datafusion::arrow::datatypes::DataType,
+    expression: &str,
+    expected: &str,
+) {
+    use datafusion::arrow::array::{
+        Array, ArrayRef, BinaryArray, DictionaryArray, Int8Array, RecordBatch,
+    };
+    use datafusion::arrow::compute::cast;
+    use datafusion::arrow::datatypes::{Field, Int8Type, Schema};
+    use std::sync::Arc;
+
+    let bytes: ArrayRef = Arc::new(BinaryArray::from(vec![Some(&[0_u8, 255][..]), None]));
+    let values = cast(&bytes, &data_type).unwrap();
+    let encoded =
+        DictionaryArray::<Int8Type>::try_new(Int8Array::from(vec![Some(0), Some(1), None]), values)
+            .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "bytes",
+        encoded.data_type().clone(),
+        true,
+    )]));
+    ctx.ctx()
+        .register_batch(
+            "encoded_bytes",
+            RecordBatch::try_new(schema, vec![Arc::new(encoded)]).unwrap(),
+        )
+        .unwrap();
+    let batches = ctx
+        .sql(&format!("SELECT {expression} FROM encoded_bytes"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(
+        ScalarValue::try_from_array(batch.column(0), 0).unwrap(),
+        ScalarValue::Utf8(Some(expected.into()))
+    );
+    for row in [1, 2] {
+        assert_eq!(
+            ScalarValue::try_from_array(batch.column(0), row).unwrap(),
+            ScalarValue::Utf8(None)
+        );
+    }
+}
+
+#[tokio::test]
 async fn binary_encoding_preserves_dictionary_bytes_and_value_nulls() {
     use datafusion::arrow::array::{Array, BinaryArray, DictionaryArray, Int8Array, RecordBatch};
     use datafusion::arrow::datatypes::{Field, Int8Type, Schema};

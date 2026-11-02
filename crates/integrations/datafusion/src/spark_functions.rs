@@ -237,6 +237,10 @@ impl ScalarUDFImpl for Inputs {
             .map(|ty| decoded(ty).clone())
             .collect::<Vec<_>>();
         match (self.name(), types.as_mut_slice()) {
+            ("hex", [value]) if *value == DataType::BinaryView => *value = DataType::Binary,
+            ("sha2", [value, _]) if matches!(value, DataType::FixedSizeBinary(_)) => {
+                *value = DataType::Binary;
+            }
             ("hex" | "unhex", [value]) if *value == DataType::Null => *value = DataType::Utf8,
             ("hour", [value]) if *value == DataType::Null => {
                 *value = DataType::Timestamp(TimeUnit::Microsecond, None)
