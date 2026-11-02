@@ -177,7 +177,6 @@ inout@0.1.4		X									X
 integer-encoding@3.0.4											X							
 inventory@0.3.24		X									X							
 ipnet@2.12.0		X									X							
-itertools@0.13.0		X									X							
 itertools@0.14.0		X									X							
 itoa@1.0.18		X									X							
 jieba-macros@0.10.3											X							
@@ -215,6 +214,7 @@ lru@0.16.4											X
 lru@0.18.2											X							
 lz4_flex@0.11.6											X							
 lz4_flex@0.13.1											X							
+lz4_flex@0.14.0											X							
 lzokay-native@0.1.0											X							
 matrixmultiply@0.3.11		X									X							
 md-5@0.10.6		X									X							
@@ -469,28 +469,17 @@ windows-link@0.2.1		X									X
 windows-registry@0.6.1		X									X							
 windows-result@0.4.1		X									X							
 windows-strings@0.5.1		X									X							
-windows-sys@0.52.0		X									X							
 windows-sys@0.59.0		X									X							
-windows-sys@0.60.2		X									X							
 windows-sys@0.61.2		X									X							
 windows-targets@0.52.6		X									X							
-windows-targets@0.53.5		X									X							
 windows_aarch64_gnullvm@0.52.6		X									X							
-windows_aarch64_gnullvm@0.53.1		X									X							
 windows_aarch64_msvc@0.52.6		X									X							
-windows_aarch64_msvc@0.53.1		X									X							
 windows_i686_gnu@0.52.6		X									X							
-windows_i686_gnu@0.53.1		X									X							
 windows_i686_gnullvm@0.52.6		X									X							
-windows_i686_gnullvm@0.53.1		X									X							
 windows_i686_msvc@0.52.6		X									X							
-windows_i686_msvc@0.53.1		X									X							
 windows_x86_64_gnu@0.52.6		X									X							
-windows_x86_64_gnu@0.53.1		X									X							
 windows_x86_64_gnullvm@0.52.6		X									X							
-windows_x86_64_gnullvm@0.53.1		X									X							
 windows_x86_64_msvc@0.52.6		X									X							
-windows_x86_64_msvc@0.53.1		X									X							
 wit-bindgen@0.57.1		X	X								X							
 writeable@0.6.3														X				
 xattr@1.6.1		X									X							
