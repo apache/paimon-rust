@@ -132,7 +132,6 @@ fn builder_ranks_supplied_results_without_authentication_or_query_validation() {
     assert!(table.new_hybrid_search_builder().rank(&[]).is_err());
 }
 
-#[cfg(feature = "fulltext")]
 mod captured_routes {
     use super::*;
     use crate::spec::{Datum, PredicateBuilder};

@@ -45,10 +45,8 @@ use crate::vindex::range_reader::VindexFileReader;
 ///
 /// The most live row ids one ANN segment's mask may hold.
 ///
-/// Mirrors Java `LuminaVectorGlobalIndexReader.toScopedIds`, which refuses an
-/// include-set above `Integer.MAX_VALUE` before allocating the dense array the
-/// backend is handed. The number is Paimon's own for this exact quantity at this
-/// exact seam, not one picked here.
+/// Caps mask expansion at `Integer.MAX_VALUE` live row ids, preserving the
+/// existing allocation bound before any ranges are inserted.
 ///
 /// The limit is on what goes INTO the mask, charged before each insertion, so
 /// nothing is ever allocated for a span that could not be handed over anyway. That
@@ -436,9 +434,9 @@ pub(crate) enum AnnSegmentSource {
 pub(crate) type SegmentLoader =
     Box<dyn Fn(&BucketAnnSegment) -> BoxFuture<'static, crate::Result<Bytes>> + Send + Sync>;
 
-/// Production loader for either buffered Lumina data or a range-backed vindex
-/// source. It runs before the dedicated-executor score and must not acquire a
-/// second search permit; the bucket leaf already holds one across both phases.
+/// Production loader for a range-backed vindex source. It runs before scoring
+/// on the dedicated executor and must not acquire a second search permit; the
+/// bucket leaf already holds one across both phases.
 pub(crate) type SourceSegmentLoader = Box<
     dyn Fn(&BucketAnnSegment) -> BoxFuture<'static, crate::Result<AnnSegmentSource>> + Send + Sync,
 >;
@@ -546,10 +544,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
         let source_files = segment.source_meta.source_files();
         // The live-row mask depends only on the segment's sources, the active set,
         // the deletion vectors, and the selections — none of which vary by query —
-        // so it is BUILT once, then cloned into each query's search. Handing every
-        // query one `Arc` instead would save those clones, but it also moves a
-        // filtered search from Lumina's per-query scalar calls onto its native batch
-        // call; worth doing, not here.
+        // so it is built once, then cloned into each query's search.
         let live = build_live_row_ids(
             source_files,
             active_source_files,
@@ -1181,9 +1176,8 @@ mod tests {
     #[test]
     fn the_no_prefilter_shape_reaches_the_backend_with_no_filter_at_all() {
         // The backend-facing half of the no-pre-filter case. `include_row_ids` is
-        // what Lumina turns into a Vec<u64> of every live id and a filtered search;
-        // for a query that filters nothing it must stay unset, exactly as on the
-        // manifest route.
+        // the reader's row-id filter; for a query that filters nothing it must
+        // stay unset, exactly as on the manifest route.
         use std::sync::{Arc, Mutex};
         let seen: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
         let scorer_seen = Arc::clone(&seen);
@@ -1316,10 +1310,9 @@ mod tests {
     }
 
     #[test]
-    fn the_live_row_limit_is_javas_dense_filter_limit() {
-        // Java rejects an include-set above `Integer.MAX_VALUE` before it allocates
-        // the dense array (`LuminaVectorGlobalIndexReader.toScopedIds`). Exactly that
-        // many rows is what a backend can still be handed; one more is not.
+    fn the_live_row_limit_bounds_mask_allocation() {
+        // Exactly Integer.MAX_VALUE inserted rows fit the allocation bound;
+        // one more must be rejected before materializing the range.
         let at_limit = vec![PkVectorSourceFile::new("f0".into(), i32::MAX as i64).unwrap()];
         let mut dvs = HashMap::new();
         dvs.insert("f0".to_string(), dv(&[0]));

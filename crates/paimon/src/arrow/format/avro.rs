@@ -119,14 +119,15 @@ impl FormatFileReader for AvroFormatReader {
 // Value access helpers — work directly with apache_avro::types::Value
 // ---------------------------------------------------------------------------
 
-/// Find the position of a named field from the first record.
+/// Find the position of a named field from a populated record.
 /// All records in an Avro file share the same schema, so the index is valid
 /// for every record.
 fn field_index(records: &[Value], name: &str) -> Option<usize> {
-    match records.first() {
-        Some(Value::Record(fields)) => fields.iter().position(|(n, _)| n == name),
+    // Null parent ROWs are represented by empty records while building children.
+    records.iter().find_map(|record| match record {
+        Value::Record(fields) => fields.iter().position(|(n, _)| n == name),
         _ => None,
-    }
+    })
 }
 
 /// Look up a field by cached index, unwrapping unions.
@@ -828,6 +829,32 @@ mod tests {
     // -----------------------------------------------------------------------
     // unwrap_value
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn first_null_nested_row_does_not_hide_later_children() {
+        let typ = DataType::Row(RowType::new(vec![DataField::new(
+            1,
+            "keep".into(),
+            DataType::Int(IntType::new()),
+        )]));
+        let records = vec![
+            Value::Record(vec![("profile".into(), Value::Null)]),
+            Value::Record(vec![(
+                "profile".into(),
+                Value::Record(vec![("keep".into(), Value::Int(7))]),
+            )]),
+        ];
+        let array = build_column(&records, "profile", &typ, records.len()).unwrap();
+        let rows = array.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(rows.is_null(0));
+        let child = rows
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(child.is_valid(1));
+        assert_eq!(child.value(1), 7);
+    }
 
     #[test]
     fn test_unwrap_value_null() {

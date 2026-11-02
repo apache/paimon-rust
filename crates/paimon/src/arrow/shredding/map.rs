@@ -1115,9 +1115,7 @@ fn map_array_to_physical(
 /// shared-shredding physical ROW values.
 pub(crate) struct MapShreddingReadPlan {
     logical_fields: Vec<DataField>,
-    /// Physical fields decoded from the file; part of the mirrored
-    /// [`ShreddingReadPlan`] API surface.
-    #[allow(dead_code)]
+    /// Physical read types, including projections inside each MAP value.
     physical_fields: Vec<DataField>,
     logical_schema: arrow_schema::SchemaRef,
     contexts: HashMap<usize, MapReadContext>,
@@ -1209,16 +1207,17 @@ impl MapShreddingReadPlan {
         }))
     }
 
-    /// Return the physical struct children needed for one logical field.
-    /// `None` means the whole root field must be decoded.
-    pub(crate) fn projected_physical_children(&self, field_name: &str) -> Option<HashSet<String>> {
+    /// Map logical value projections onto every direct and overflow source.
+    pub(crate) fn projected_physical_field(&self, field_name: &str) -> Option<DataField> {
         let field_index = self
             .logical_fields
             .iter()
             .position(|field| field.name() == field_name)?;
         let ctx = self.contexts.get(&field_index)?;
-        ctx.selected_names.as_ref()?;
-
+        let physical = &self.physical_fields[field_index];
+        if ctx.selected_names.is_none() {
+            return Some(physical.clone());
+        }
         let mut children = HashSet::from([FIELD_MAPPING_NAME.to_string()]);
         children.extend(
             ctx.selected_columns
@@ -1228,7 +1227,21 @@ impl MapShreddingReadPlan {
         if ctx.include_overflow {
             children.insert(OVERFLOW_NAME.to_string());
         }
-        Some(children)
+        let DataType::Row(row) = physical.data_type() else {
+            return None;
+        };
+        Some(DataField::new(
+            physical.id(),
+            physical.name().into(),
+            DataType::Row(RowType::with_nullable(
+                physical.data_type().is_nullable(),
+                row.fields()
+                    .iter()
+                    .filter(|child| children.contains(child.name()))
+                    .cloned()
+                    .collect(),
+            )),
+        ))
     }
 }
 

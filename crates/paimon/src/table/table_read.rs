@@ -49,7 +49,7 @@ use std::sync::Arc;
 mod audit;
 pub use audit::AuditLogRead;
 
-const MAX_MERGE_INPUT_STREAMS: usize = 256;
+pub(super) const MAX_MERGE_INPUT_STREAMS: usize = 256;
 const MAX_TOTAL_BLOB_READS: usize = 64;
 
 /// Table read: reads data from splits (e.g. produced by [TableScan::plan]).

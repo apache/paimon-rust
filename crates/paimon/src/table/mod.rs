@@ -44,6 +44,7 @@ mod bucket_router;
 mod chunk_shuffle;
 mod commit_callback;
 mod commit_message;
+mod compact;
 mod consumer_manager;
 pub(crate) mod cow_writer;
 mod data_evolution_fields;
@@ -57,6 +58,7 @@ mod data_file_writer;
 mod de_vector_read;
 mod de_vector_scan;
 mod dedicated_format_file_writer;
+mod deletion_vector_index;
 mod dynamic_bucket_assigner;
 mod dynamic_bucket_assigner_router;
 mod dynamic_bucket_index;
@@ -74,29 +76,31 @@ mod format_table_scan;
 mod format_table_write_tests;
 mod format_table_writer;
 mod format_write_builder;
-#[cfg(feature = "fulltext")]
 mod full_text_index_adapter;
-#[cfg(feature = "fulltext")]
 mod full_text_index_build_builder;
-#[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 mod global_index_build_builder;
 pub(crate) mod global_index_build_common;
 mod global_index_build_plan;
 mod global_index_drop_builder;
 mod global_index_freshness;
+mod global_index_options;
 mod global_index_result;
 pub(crate) mod global_index_scanner;
+mod global_index_schema;
 mod global_index_search_filter;
 mod global_index_types;
 mod hybrid_search_builder;
 mod incremental_scan;
+mod index_build;
 pub(crate) mod index_file_path;
 mod inline_blob;
 mod instant;
+mod kv_data_file_writer;
 mod kv_file_reader;
 mod kv_file_writer;
-mod lumina_index_build_builder;
+#[cfg(test)]
+mod maintenance_test_utils;
 mod managed_blob_reader;
 mod managed_blob_reference;
 #[cfg(test)]
@@ -112,13 +116,13 @@ mod partition_filter;
 mod partition_row_count;
 mod partition_spec;
 mod partition_stat;
-#[cfg(feature = "fulltext")]
 mod pk_full_text_bucket_search;
 mod pk_full_text_bucket_state;
-#[cfg(feature = "fulltext")]
 mod pk_full_text_read;
-#[cfg(feature = "fulltext")]
 mod pk_full_text_scan;
+mod pk_index_maintenance;
+mod pk_index_options;
+mod pk_index_schema;
 mod pk_search_position;
 mod pk_search_ranker;
 mod pk_sorted_index_scan;
@@ -156,7 +160,6 @@ mod scan_stats;
 pub(crate) mod schema_manager;
 mod search_scan_split;
 mod search_task;
-#[cfg(any(feature = "fulltext", test))]
 pub(crate) use search_task::SearchTask;
 pub(crate) use search_task::SearchTaskExecutor;
 #[cfg(test)]
@@ -189,6 +192,7 @@ mod table_upsert;
 pub(crate) mod table_write;
 mod tag_manager;
 pub(crate) mod time_travel;
+mod universal_compaction;
 mod update_assignment;
 mod update_input;
 mod upsert_key_matcher;
@@ -212,6 +216,10 @@ pub use branch_manager::BranchManager;
 pub use bucket_router::BucketRouter;
 pub use commit_callback::{CommitCallback, CommitCallbackContext};
 pub use commit_message::{CommitMessage, COMMIT_MESSAGE_SERIALIZER_VERSION};
+pub use compact::{
+    CompactBuilder, CompactExecutor, CompactMetrics, CompactPlan, CompactPlanner, CompactResult,
+    CompactTask,
+};
 pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
@@ -225,7 +233,6 @@ pub use format_partition::{
 };
 pub use format_partition_stats::FormatTablePartitionStatsCollector;
 pub use format_partition_truncate::FormatTableTruncator;
-#[cfg(feature = "fulltext")]
 pub use full_text_search_builder::{
     FullTextRead, FullTextScan, FullTextScanPlan, FullTextSearchBuilder,
 };
@@ -675,7 +682,6 @@ impl Table {
     /// Create a full-text search builder.
     ///
     /// Reference: [FullTextSearchBuilderImpl](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/FullTextSearchBuilderImpl.java)
-    #[cfg(feature = "fulltext")]
     pub fn new_full_text_search_builder(&self) -> FullTextSearchBuilder<'_> {
         FullTextSearchBuilder::new(self)
     }
@@ -709,6 +715,11 @@ impl Table {
     /// Reference: [pypaimon FileStoreTable.new_write_builder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/table/file_store_table.py).
     pub fn new_write_builder(&self) -> WriteBuilder<'_> {
         WriteBuilder::new(self)
+    }
+
+    /// Plan and execute append, data-evolution or fixed/dynamic bucket PK compaction.
+    pub fn new_compact_builder(&self) -> CompactBuilder<'_> {
+        CompactBuilder::new(self)
     }
 
     /// Create a one-shot fixed-bucket builder for a postpone table.

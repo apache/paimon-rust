@@ -169,6 +169,12 @@ pub(super) async fn matching_indexed_rows(
                     .is_some_and(|meta| meta.extra_field_ids.as_ref().is_none_or(Vec::is_empty))
             })
             .collect::<Vec<_>>();
+        let resolved = GlobalIndexScanner::read_defaults(
+            evaluation.table_options,
+            &scalar_entries,
+            evaluation.schema_fields,
+        )?;
+        let core = CoreOptions::new(&resolved);
         let scanner = GlobalIndexScanner::create_with_fm_options(
             evaluation.file_io,
             evaluation.table_path,
@@ -182,13 +188,18 @@ pub(super) async fn matching_indexed_rows(
                 .iter()
                 .any(|entry| entry.index_file.index_type.eq_ignore_ascii_case("fm"))
             {
-                crate::fm_index::FMOptions::from_options(evaluation.table_options)?.read
+                crate::fm_index::FMOptions::from_options(&resolved)?.read
             } else {
                 crate::fm_index::FMReadOptions::default()
             },
         )?;
         let answer = match scanner {
-            Some(scanner) => scanner.matching_ranges_with_exactness(filter).await?,
+            Some(scanner) => {
+                scanner
+                    .with_field_options(evaluation.table_options, &scalar_entries)?
+                    .matching_ranges_with_exactness(filter)
+                    .await?
+            }
             None => None,
         };
         match answer {

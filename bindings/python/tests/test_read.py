@@ -1601,8 +1601,9 @@ def test_combined_incremental_plan_preserves_pk_events_and_range():
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
         ctx.sql("CREATE SCHEMA paimon.incdb")
+        # Keep the explicit incremental window aligned with these two writes.
         ctx.sql("""CREATE TABLE paimon.incdb.t (id INT, value INT, PRIMARY KEY (id))
-            WITH ('bucket' = '1', 'changelog-producer' = 'none')""")
+            WITH ('bucket' = '1', 'changelog-producer' = 'none', 'write-only' = 'true')""")
         ctx.sql("INSERT INTO paimon.incdb.t VALUES (1, 10)")
         ctx.sql("INSERT INTO paimon.incdb.t VALUES (1, 20)")
         table = PaimonCatalog({"warehouse": warehouse}).get_table("incdb.t")
@@ -1659,8 +1660,9 @@ def _make_input_changelog_table(warehouse):
     ctx = SQLContext()
     ctx.register_catalog("paimon", {"warehouse": warehouse})
     ctx.sql("CREATE SCHEMA paimon.cldb")
+    # The range/packing tests below inspect two raw input-changelog commits.
     ctx.sql("""CREATE TABLE paimon.cldb.t (id INT, value STRING, PRIMARY KEY (id))
-        WITH ('bucket' = '1', 'changelog-producer' = 'input')""")
+        WITH ('bucket' = '1', 'changelog-producer' = 'input', 'write-only' = 'true')""")
     ctx.sql("INSERT INTO paimon.cldb.t VALUES (1, 'a'), (2, 'b')")
     ctx.sql("INSERT INTO paimon.cldb.t VALUES (3, 'c')")
     return PaimonCatalog({"warehouse": warehouse}).get_table("cldb.t")
@@ -1708,7 +1710,8 @@ def test_parallel_read_keeps_streaming_row_kinds(method, ordered):
         ctx.sql("CREATE SCHEMA paimon.parallel_changes")
         ctx.sql("""CREATE TABLE paimon.parallel_changes.t (
             dt STRING, id INT, value STRING, PRIMARY KEY (dt, id)
-        ) PARTITIONED BY (dt) WITH ('bucket' = '1', 'changelog-producer' = 'input')""")
+        ) PARTITIONED BY (dt) WITH (
+            'bucket' = '1', 'changelog-producer' = 'input', 'write-only' = 'true')""")
         ctx.sql("INSERT INTO paimon.parallel_changes.t VALUES ('p1', 1, 'a'), ('p2', 2, 'b')")
         ctx.sql("INSERT INTO paimon.parallel_changes.t VALUES ('p3', 3, 'c')")
         table = PaimonCatalog({"warehouse": warehouse}).get_table("parallel_changes.t")

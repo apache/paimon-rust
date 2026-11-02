@@ -52,11 +52,13 @@ mod write_routing;
 mod partition;
 mod snapshot;
 mod tag;
+mod temporal;
 
 #[pymodule]
 fn pypaimon_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register_module(py, m)?;
     context::register_module(py, m)?;
+    m.add_function(wrap_pyfunction!(temporal::temporal_match, m)?)?;
     variant::register_module(py, m)?;
     evolution::register_module(m)?;
     Ok(())

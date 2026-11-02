@@ -528,11 +528,11 @@ make build
 
 ## Test
 
-Python integration tests expect the shared Paimon test warehouse to be prepared
-first from the repository root:
+Python integration tests automatically extract the committed golden warehouse
+into a temporary directory. Set `PAIMON_TEST_WAREHOUSE` to use an existing
+warehouse instead. Spark and Docker are not required.
 
 ```shell
-make docker-up
 cd bindings/python
 ```
 

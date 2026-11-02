@@ -1502,11 +1502,14 @@ assert routing.plan().snapshot_id() == 2
     #[test]
     fn file_planning_binding_keeps_complete_entries_and_independent_query_filters() {
         Python::attach(|py| {
+            // File planning below inspects two raw L0 commits, including
+            // first-row's ordinary-read exclusion of those files.
             let schema = Schema::builder()
                 .column("id", DataType::Int(IntType::new()))
                 .primary_key(["id"])
                 .option("bucket", "1")
                 .option("merge-engine", "first-row")
+                .option("write-only", "true")
                 .build()
                 .unwrap();
             let table = Arc::new(Table::new(

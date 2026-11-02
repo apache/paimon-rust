@@ -19,6 +19,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::spec::TableType;
 
+mod index_options;
+pub use index_options::VectorIndexOptions;
+
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DELETION_VECTORS_MERGE_ON_READ_OPTION: &str = "deletion-vectors.merge-on-read";
 pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
@@ -92,6 +95,8 @@ const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const ROW_TRACKING_PARTITION_GROUP_ON_COMMIT_OPTION: &str =
     "row-tracking.partition-group-on-commit";
 const CLUSTERING_INCREMENTAL_OPTION: &str = "clustering.incremental";
+const COMPACTION_MIN_FILE_NUM_OPTION: &str = "compaction.min.file-num";
+const COMPACTION_SMALL_FILE_RATIO_OPTION: &str = "compaction.small-file-ratio";
 pub(crate) const TABLE_TYPE_OPTION: &str = "type";
 
 pub(crate) const PATH_OPTION: &str = "path";
@@ -189,8 +194,6 @@ pub(crate) const BLOB_DESCRIPTOR_FIELD_FALLBACK: &str = "blob.stored-descriptor-
 pub(crate) const BLOB_VIEW_FIELD_OPTION: &str = "blob-view-field";
 pub(crate) const VIDEO_FRAME_FIELD_OPTION: &str = "video-frame-field";
 pub const BLOB_VIEW_RESOLVE_ENABLED_OPTION: &str = "blob-view.resolve.enabled";
-const PK_VECTOR_INDEX_COLUMNS_OPTION: &str = "pk-vector.index.columns";
-const PK_FULL_TEXT_INDEX_COLUMNS_OPTION: &str = "pk-full-text.index.columns";
 
 /// Merge engine for primary-key tables.
 ///
@@ -1195,6 +1198,25 @@ impl<'a> CoreOptions<'a> {
         Ok(value)
     }
 
+    /// Write buffer budget, matching Java `CoreOptions.WRITE_BUFFER_SIZE`.
+    /// Sorted global-index builds use it for retained serialized sort keys,
+    /// excluding the active Arrow batch, writer buffers and disk-merge keys.
+    pub fn write_buffer_size(&self) -> crate::Result<usize> {
+        let raw = self
+            .options
+            .get("write-buffer-size")
+            .map(String::as_str)
+            .unwrap_or("256mb");
+        let bytes = parse_memory_size(raw)
+            .and_then(|size| usize::try_from(size).ok())
+            .filter(|size| *size > 0);
+        bytes.ok_or_else(|| crate::Error::ConfigInvalid {
+            message: format!(
+                "Option 'write-buffer-size' must be a positive memory size, got: {raw}"
+            ),
+        })
+    }
+
     pub fn btree_index_fallback_scan_max_size(&self) -> crate::Result<i64> {
         self.fallback_scan_max_size(BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION)
     }
@@ -1616,6 +1638,85 @@ impl<'a> CoreOptions<'a> {
             .get("target-file-size")
             .and_then(|v| parse_memory_size(v))
             .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
+    }
+
+    /// Skip automatic compaction and declared global-index maintenance after
+    /// a data commit. Defaults to false.
+    /// `write.compaction-skip` is the legacy alias; `write-only` takes precedence.
+    pub fn write_only(&self) -> crate::Result<bool> {
+        match self
+            .options
+            .get("write-only")
+            .or_else(|| self.options.get("write.compaction-skip"))
+        {
+            None => Ok(false),
+            Some(raw) if raw.eq_ignore_ascii_case("true") => Ok(true),
+            Some(raw) if raw.eq_ignore_ascii_case("false") => Ok(false),
+            Some(raw) => Err(crate::Error::ConfigInvalid {
+                message: format!("write-only must be true or false, got '{raw}'"),
+            }),
+        }
+    }
+
+    /// Maximum concurrent buckets in one automatic compaction round. Default is 4.
+    pub fn write_compaction_parallelism(&self) -> crate::Result<usize> {
+        self.options
+            .get("write.compaction.parallelism")
+            .map_or(Ok(4), |raw| {
+                raw.parse::<usize>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: format!(
+                            "write.compaction.parallelism must be a positive integer, got '{raw}'"
+                        ),
+                    })
+            })
+    }
+
+    /// Include L0 files below normal compaction triggers. Java defaults to false.
+    pub fn compaction_force_up_level0(&self) -> crate::Result<bool> {
+        match self.options.get("compaction.force-up-level-0") {
+            None => Ok(false),
+            Some(raw) if raw.eq_ignore_ascii_case("true") => Ok(true),
+            Some(raw) if raw.eq_ignore_ascii_case("false") => Ok(false),
+            Some(raw) => Err(crate::Error::ConfigInvalid {
+                message: format!("compaction.force-up-level-0 must be true or false, got '{raw}'"),
+            }),
+        }
+    }
+
+    /// Minimum input files for a compaction task. Default is 5. Data evolution
+    /// permits one file for a forced rewrite; ordinary append requires two.
+    pub fn compaction_min_file_num(&self) -> crate::Result<usize> {
+        let minimum = if self.data_evolution_enabled() { 1 } else { 2 };
+        self.options
+            .get(COMPACTION_MIN_FILE_NUM_OPTION)
+            .map_or(Ok(5), |raw| {
+                raw.parse::<i32>()
+                    .ok()
+                    .filter(|count| *count >= minimum)
+                    .map(|count| count as usize)
+                    .ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: format!(
+                            "compaction.min.file-num must be at least {minimum}, got '{raw}'"
+                        ),
+                    })
+            })
+    }
+
+    /// Strict append small-file threshold: target size times the configured ratio.
+    /// `compaction.small-file-ratio` defaults to 0.7, matching Java.
+    pub fn compaction_file_size(&self) -> crate::Result<i64> {
+        let ratio = self
+            .options
+            .get(COMPACTION_SMALL_FILE_RATIO_OPTION)
+            .map_or(Some(0.7), |raw| raw.parse::<f64>().ok())
+            .filter(|ratio| ratio.is_finite() && *ratio >= 0.0)
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: "compaction.small-file-ratio must be a finite nonnegative number".into(),
+            })?;
+        Ok((self.target_file_size() as f64 * ratio) as i64)
     }
 
     /// Maximum automatically inferred postpone bucket count (Java default: 2048).
@@ -2069,26 +2170,16 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or_default()
     }
 
-    /// True when the PK-vector index column option key is present (regardless of value).
-    pub fn primary_key_vector_index_enabled(&self) -> bool {
-        self.options.contains_key(PK_VECTOR_INDEX_COLUMNS_OPTION)
-    }
-
-    /// The configured PK-vector index columns, split on ',' and trimmed. Blank tokens
-    /// are preserved so schema validation can reject malformed column lists.
-    pub fn primary_key_vector_index_columns(&self) -> crate::Result<Vec<String>> {
-        let raw = self
-            .options
-            .get(PK_VECTOR_INDEX_COLUMNS_OPTION)
-            .ok_or_else(|| crate::Error::ConfigInvalid {
-                message: "pk-vector.index.columns is not set".to_string(),
-            })?;
-        Ok(raw.split(',').map(|c| c.trim().to_string()).collect())
+    // PK layout adapters remain internal. Public configuration uses the shared
+    // global_index_* and vector_index_* resolvers, including legacy fallback.
+    /// Whether a shared or legacy vector declaration is present.
+    pub(crate) fn vector_index_enabled(&self) -> bool {
+        !self.vector_index_columns().is_empty()
     }
 
     /// The single PK-vector index column. The first release supports exactly one.
-    pub fn primary_key_vector_index_column(&self) -> crate::Result<String> {
-        let mut columns = self.primary_key_vector_index_columns()?;
+    pub(crate) fn single_vector_index_column(&self) -> crate::Result<String> {
+        let mut columns = self.vector_index_columns();
         if columns.len() != 1 {
             return Err(crate::Error::ConfigInvalid {
                 message: format!(
@@ -2100,46 +2191,18 @@ impl<'a> CoreOptions<'a> {
         Ok(columns.remove(0))
     }
 
-    /// The index type for a PK-vector column. Required — planning and the index reader
-    /// both need it, so an absent value is a hard error rather than a guessed default.
-    pub fn primary_key_vector_index_type(&self, col: &str) -> crate::Result<String> {
-        self.options
-            .get(&format!("fields.{col}.pk-vector.index.type"))
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| crate::Error::ConfigInvalid {
-                message: format!("fields.{col}.pk-vector.index.type is required but not set"),
-            })
-    }
-
-    /// The distance metric name for a PK-vector column, defaulting to inner_product.
-    /// Validated against the supported metrics; an unknown value is a hard error.
-    pub fn primary_key_vector_distance_metric(&self, col: &str) -> crate::Result<String> {
-        let raw = self
-            .options
-            .get(&format!("fields.{col}.pk-vector.distance.metric"))
-            .map(|v| v.trim().to_string())
-            .unwrap_or_else(|| "inner_product".to_string());
-        // Validate now (fail-loud) without exposing the crate-private metric enum.
-        crate::vindex::pkvector::metric::VectorSearchMetric::parse(&raw)?;
-        Ok(raw)
-    }
-
     /// True when the PK full-text index column option key is present (any value).
-    pub fn primary_key_full_text_index_enabled(&self) -> bool {
-        self.options.contains_key(PK_FULL_TEXT_INDEX_COLUMNS_OPTION)
+    pub(crate) fn full_text_index_enabled(&self) -> bool {
+        !self.full_text_index_columns().is_empty()
     }
 
     /// Configured PK full-text index columns: split on ',' and trim each token,
     /// mirroring Java `split(",",-1).map(trim)`. Blank tokens are PRESERVED (do NOT
     /// filter them) so parsing matches Java exactly; `[]` only when the key is
     /// absent. Never returns a `Result`, never errors (do not copy the fail-loud
-    /// shape of `primary_key_vector_index_columns`).
-    pub fn primary_key_full_text_index_columns(&self) -> Vec<String> {
-        match self.options.get(PK_FULL_TEXT_INDEX_COLUMNS_OPTION) {
-            None => Vec::new(),
-            Some(raw) => raw.split(',').map(|c| c.trim().to_string()).collect(),
-        }
+    /// shape of a fallible vector-column resolver).
+    pub(crate) fn full_text_index_columns(&self) -> Vec<String> {
+        self.global_index_columns("full-text")
     }
 }
 
@@ -4215,7 +4278,7 @@ mod tests {
     #[test]
     fn test_pk_vector_index_disabled_by_default() {
         let opts = HashMap::new();
-        assert!(!CoreOptions::new(&opts).primary_key_vector_index_enabled());
+        assert!(!CoreOptions::new(&opts).vector_index_enabled());
     }
 
     #[test]
@@ -4235,15 +4298,21 @@ mod tests {
             ),
         ]);
         let co = CoreOptions::new(&opts);
-        assert!(co.primary_key_vector_index_enabled());
-        assert_eq!(co.primary_key_vector_index_column().unwrap(), "embedding");
+        assert!(co.vector_index_enabled());
+        assert_eq!(co.single_vector_index_column().unwrap(), "embedding");
         assert_eq!(
-            co.primary_key_vector_index_type("embedding").unwrap(),
+            co.vector_index_options(None, "embedding", false)
+                .unwrap()
+                .index_type
+                .as_deref()
+                .unwrap(),
             "ivf-flat"
         );
         assert_eq!(
-            co.primary_key_vector_distance_metric("embedding").unwrap(),
-            "Inner-Product"
+            co.vector_index_options(None, "embedding", true)
+                .map(|resolved| resolved.metric)
+                .unwrap(),
+            "inner_product"
         );
     }
 
@@ -4252,7 +4321,8 @@ mod tests {
         let opts = HashMap::from([("pk-vector.index.columns".to_string(), "e".to_string())]);
         assert_eq!(
             CoreOptions::new(&opts)
-                .primary_key_vector_distance_metric("e")
+                .vector_index_options(None, "e", true)
+                .map(|resolved| resolved.metric)
                 .unwrap(),
             "inner_product"
         );
@@ -4268,7 +4338,8 @@ mod tests {
             ),
         ]);
         assert!(CoreOptions::new(&opts)
-            .primary_key_vector_distance_metric("e")
+            .vector_index_options(None, "e", true)
+            .map(|resolved| resolved.metric)
             .is_err());
     }
 
@@ -4281,12 +4352,7 @@ mod tests {
             (" ", vec![""]),
         ] {
             let opts = HashMap::from([("pk-vector.index.columns".to_string(), value.to_string())]);
-            assert_eq!(
-                CoreOptions::new(&opts)
-                    .primary_key_vector_index_columns()
-                    .unwrap(),
-                expected
-            );
+            assert_eq!(CoreOptions::new(&opts).vector_index_columns(), expected);
         }
     }
 
@@ -4294,27 +4360,27 @@ mod tests {
     fn test_pk_vector_multiple_columns_unsupported() {
         let opts = HashMap::from([("pk-vector.index.columns".to_string(), "a,b".to_string())]);
         assert!(CoreOptions::new(&opts)
-            .primary_key_vector_index_column()
+            .single_vector_index_column()
             .is_err());
     }
 
     #[test]
-    fn test_pk_vector_index_type_absent_errors() {
+    fn test_pk_vector_missing_implementation_stays_unresolved() {
         let opts = HashMap::from([("pk-vector.index.columns".to_string(), "e".to_string())]);
-        assert!(CoreOptions::new(&opts)
-            .primary_key_vector_index_type("e")
-            .is_err());
+        let resolved = CoreOptions::new(&opts)
+            .vector_index_options(None, "e", false)
+            .unwrap();
+        assert_eq!(resolved.index_type, None);
+        assert_eq!(resolved.metric, "inner_product");
+        assert_eq!(resolved.options, opts);
     }
 
     #[test]
     fn test_pk_full_text_index_absent_is_disabled_and_empty() {
         let opts = HashMap::new();
         let co = CoreOptions::new(&opts);
-        assert!(!co.primary_key_full_text_index_enabled());
-        assert_eq!(
-            co.primary_key_full_text_index_columns(),
-            Vec::<String>::new()
-        );
+        assert!(!co.full_text_index_enabled());
+        assert_eq!(co.full_text_index_columns(), Vec::<String>::new());
     }
 
     #[test]
@@ -4324,9 +4390,9 @@ mod tests {
             "a, b ,c".to_string(),
         )]);
         let co = CoreOptions::new(&opts);
-        assert!(co.primary_key_full_text_index_enabled());
+        assert!(co.full_text_index_enabled());
         assert_eq!(
-            co.primary_key_full_text_index_columns(),
+            co.full_text_index_columns(),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
     }
@@ -4337,9 +4403,9 @@ mod tests {
         // three columns with a blank in the middle.
         let opts = HashMap::from([("pk-full-text.index.columns".to_string(), "a,,b".to_string())]);
         let co = CoreOptions::new(&opts);
-        assert!(co.primary_key_full_text_index_enabled());
+        assert!(co.full_text_index_enabled());
         assert_eq!(
-            co.primary_key_full_text_index_columns(),
+            co.full_text_index_columns(),
             vec!["a".to_string(), "".to_string(), "b".to_string()]
         );
     }
@@ -4351,9 +4417,9 @@ mod tests {
         // `split(",",-1).map(trim)`, so " , " yields two empty tokens (NOT []).
         let opts = HashMap::from([("pk-full-text.index.columns".to_string(), " , ".to_string())]);
         let co = CoreOptions::new(&opts);
-        assert!(co.primary_key_full_text_index_enabled());
+        assert!(co.full_text_index_enabled());
         assert_eq!(
-            co.primary_key_full_text_index_columns(),
+            co.full_text_index_columns(),
             vec!["".to_string(), "".to_string()]
         );
     }

@@ -643,6 +643,50 @@ impl CatalogProvider for PaimonCatalogProvider {
 }
 
 impl PaimonCatalogProvider {
+    /// List one namespace without loading persistent table providers or losing catalog errors.
+    pub(super) async fn table_metadata(
+        &self,
+        database: &str,
+    ) -> DFResult<Vec<(String, TableType)>> {
+        let temp = self
+            .temp_tables
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(database)
+            .cloned();
+        let mut tables = HashMap::new();
+        match self.catalog.get_database(database).await {
+            Ok(_) => {
+                for name in self
+                    .catalog
+                    .list_tables(database)
+                    .await
+                    .map_err(to_datafusion_error)?
+                {
+                    tables.insert(name, TableType::Base);
+                }
+                let views = match self.catalog.list_views(database).await {
+                    Ok(views) => views,
+                    Err(paimon::Error::Unsupported { .. }) => Vec::new(),
+                    Err(error) => return Err(to_datafusion_error(error)),
+                };
+                for name in views {
+                    tables.entry(name).or_insert(TableType::View);
+                }
+            }
+            Err(paimon::Error::DatabaseNotExist { .. }) if temp.is_some() => {}
+            Err(error) => return Err(to_datafusion_error(error)),
+        }
+        if let Some(temp) = temp {
+            for name in temp.table_names() {
+                if let Some(table_type) = temp.table_type(&name).await? {
+                    tables.insert(name, table_type);
+                }
+            }
+        }
+        Ok(tables.into_iter().collect())
+    }
+
     /// Registers a temporary table or view in the specified database.
     /// Creates the database if it does not exist.
     ///
@@ -1079,6 +1123,7 @@ impl SchemaProvider for PaimonSchemaProvider {
                     let catalogs =
                         HashMap::from([(catalog_name.clone(), Arc::clone(&catalog))]);
                     let query = crate::sql_function::expand_sql(
+                        &state,
                         view.query_for("datafusion"),
                         &catalogs,
                         &catalog_name,
@@ -1381,8 +1426,10 @@ async fn validate_view_dependencies(
 }
 
 fn view_relation_identifiers(view: &View, catalog_name: &str) -> DFResult<Vec<Identifier>> {
+    let regex_sql = crate::regex_operators::parseable_sql(view.query_for("datafusion"))?;
+    let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
     let statements =
-        Parser::parse_sql(&GenericDialect {}, view.query_for("datafusion")).map_err(|error| {
+        Parser::parse_sql(&GenericDialect {}, parseable.as_ref()).map_err(|error| {
             plan_datafusion_err!(
                 "Invalid SQL for REST catalog view '{}': {error}",
                 view.full_name()

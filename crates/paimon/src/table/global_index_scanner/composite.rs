@@ -104,11 +104,14 @@ impl GlobalIndexScanner {
                         false
                     }
                 });
-                if self.btree_fallback_scan_max_size <= 0
+                let fallback_limit = selected
+                    .first()
+                    .map_or(self.btree_fallback_scan_max_size, |entry| {
+                        self.btree_fallback_limit(entry)
+                    });
+                if fallback_limit <= 0
                     || !valid
-                    || sizes
-                        .values()
-                        .any(|size| *size > self.btree_fallback_scan_max_size)
+                    || sizes.values().any(|size| *size > fallback_limit)
                 {
                     continue;
                 }

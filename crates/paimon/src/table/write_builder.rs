@@ -435,6 +435,7 @@ mod tests {
 
     fn input_changelog_pk_table(file_io: &FileIO, table_path: &str) -> Table {
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])

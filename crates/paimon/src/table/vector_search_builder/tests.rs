@@ -577,22 +577,16 @@ async fn result_read_empty_plan_reserved_projection_fails_loud() {
 }
 
 #[tokio::test]
-async fn result_read_empty_plan_lumina_array_float_is_admitted() {
-    // A Lumina PK-vector `ARRAY<FLOAT>` column is a valid configuration, but
-    // batch query dimension validation routed every `ARRAY<FLOAT>` column
-    // through the vindex resolver, which rejects `lumina` as an unsupported
-    // index type before planning — failing even an empty table. The
-    // dimension must be resolved per the configured backend, so a
-    // well-formed Lumina query is admitted and (with no snapshot) yields an
-    // empty stream rather than an "Unsupported vindex index type" error.
+async fn result_read_empty_plan_diskann_array_float_is_admitted() {
+    // An empty PK-vector table resolves ARRAY<FLOAT> dimensions from DiskANN options.
     let table = pk_vector_table(&[
         ("pk-vector.index.columns", "embedding"),
         (
             "fields.embedding.pk-vector.index.type",
-            crate::lumina::LUMINA_IDENTIFIER,
+            crate::vindex::DISKANN_IDENTIFIER,
         ),
         ("fields.embedding.pk-vector.distance.metric", "l2"),
-        ("lumina.index.dimension", "4"),
+        ("diskann.dimension", "4"),
     ]);
     let mut stream = async {
         table
@@ -607,7 +601,7 @@ async fn result_read_empty_plan_lumina_array_float_is_admitted() {
             .await
     }
     .await
-    .expect("Lumina ARRAY<FLOAT> query must be admitted, not rejected as unsupported vindex");
+    .expect("DiskANN ARRAY<FLOAT> query must be admitted");
     assert!(stream.try_next().await.unwrap().is_none());
 }
 

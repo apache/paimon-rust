@@ -190,12 +190,33 @@ impl BranchManager {
         let tag_dst = tag_manager.with_branch(branch_name).tag_path(tag_name);
         self.file_io.copy_file(&tag_src, &tag_dst).await?;
 
-        // Copy snapshot file to branch
+        // Copy the live snapshot, or restore an expired snapshot from the tag.
         let snap_src = snapshot_manager.snapshot_path(snapshot.id());
         let snap_dst = snapshot_manager
             .with_branch(branch_name)
             .snapshot_path(snapshot.id());
-        self.file_io.copy_file(&snap_src, &snap_dst).await?;
+        if self.file_io.exists(&snap_src).await? {
+            self.file_io.copy_file(&snap_src, &snap_dst).await?;
+        } else {
+            // Keep snapshot fields unknown to Rust, excluding Java's tag-only metadata.
+            let tag_bytes = self.file_io.new_input(&tag_dst)?.read().await?;
+            let mut snapshot_json: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_slice(&tag_bytes).map_err(|e| crate::Error::DataInvalid {
+                    message: format!("tag '{tag_name}' JSON invalid: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
+            snapshot_json.remove("tagCreateTime");
+            snapshot_json.remove("tagTimeRetained");
+            let json =
+                serde_json::to_vec(&snapshot_json).map_err(|e| crate::Error::DataInvalid {
+                    message: format!("failed to serialize snapshot: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
+            self.file_io
+                .new_output(&snap_dst)?
+                .write(bytes::Bytes::from(json))
+                .await?;
+        }
 
         // Copy schemas to branch
         self.copy_schemas_to_branch(branch_name, snapshot.schema_id())

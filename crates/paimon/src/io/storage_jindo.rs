@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use libloading::Library;
 use opendal::raw::*;
-use opendal::{Buffer, Builder, BytesRange, Capability, EntryMode, ErrorKind, Metadata};
+use opendal::{Buffer, Builder, BytesRange, Capability, ErrorKind, Metadata, MetadataBuilder};
 use opendal::{Error as OpendalError, OperationContext, Operator, Result as OpendalResult};
 use tokio::sync::{OnceCell, Semaphore};
 
@@ -280,6 +280,7 @@ impl Service for JindoService {
     type Lister = JindoLister;
     type Deleter = ();
     type Copier = ();
+    type Composer = ();
 
     fn info(&self) -> ServiceInfo {
         self.info.clone()
@@ -365,7 +366,6 @@ impl Service for JindoService {
         _from: &str,
         _to: &str,
         _args: OpCopy,
-        _opts: OpCopier,
     ) -> OpendalResult<Self::Copier> {
         unsupported("copy")
     }
@@ -997,18 +997,17 @@ impl JindoClient {
     }
 
     fn file_status_metadata(&self, status: JdoPtr) -> OpendalResult<Metadata> {
-        let mode = match unsafe { (self.api.file_status_type)(status) } {
-            1 => EntryMode::DIR,
-            2 => EntryMode::FILE,
-            _ => EntryMode::Unknown,
-        };
         let size = unsafe { (self.api.file_status_size)(status) };
         let mtime = unsafe { (self.api.file_status_mtime)(status) };
-        let mut metadata = Metadata::new(mode).with_content_length(size.max(0) as u64);
+        let mut metadata = match unsafe { (self.api.file_status_type)(status) } {
+            1 => MetadataBuilder::dir(),
+            2 => MetadataBuilder::file(size.max(0) as u64),
+            _ => MetadataBuilder::unknown(),
+        };
         if mtime > 0 {
-            metadata.set_last_modified(Timestamp::from_millisecond(mtime)?);
+            metadata.last_modified(Timestamp::from_millisecond(mtime)?);
         }
-        Ok(metadata)
+        Ok(metadata.build())
     }
 
     fn read(&self, path: &str, range: BytesRange) -> OpendalResult<Vec<u8>> {

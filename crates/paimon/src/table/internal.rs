@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Unstable execution bridge for the repository's language bindings.
+//! Unstable execution bridge for the repository's language bindings and benchmarks.
 //!
 //! Source plans are the public input to search readers. Candidate and scoring
 //! requests below are internal execution stages: Core owns their ordering and
@@ -52,13 +52,20 @@ pub async fn read_batch_vector_with_executor(
     reader.read_with_executor(plan, executor).await
 }
 
-#[cfg(feature = "fulltext")]
 pub async fn read_full_text_with_executor(
     reader: &super::FullTextRead,
     plan: super::FullTextScanPlan,
     executor: &dyn SearchTaskExecutor,
 ) -> crate::Result<GlobalIndexResult> {
     reader.read_with_executor(plan, executor).await
+}
+
+/// Run the exhaustive reference collector for benchmarks without a table option.
+pub async fn read_full_text_exhaustive(
+    reader: &super::FullTextRead,
+    plan: super::FullTextScanPlan,
+) -> crate::Result<GlobalIndexResult> {
+    reader.read_exhaustive(plan, None).await
 }
 
 pub async fn execute_hybrid_with_executor(

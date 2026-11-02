@@ -18,6 +18,7 @@
 //! CALL procedure support for Paimon tables.
 //!
 //! Supported procedures:
+//! - `CALL sys.create_branch(table => '...', branch => '...'[, tag => '...', ignore_if_exists => true])`
 //! - `CALL sys.create_tag(table => '...', tag => '...', snapshot_id => ..., time_retained => '...')`
 //! - `CALL sys.replace_tag(table => '...', tag => '...', snapshot_id => ..., time_retained => '...')`
 //! - `CALL sys.delete_tag(table => '...', tag => '...')`
@@ -31,8 +32,7 @@
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'btree')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'ivf-pq')`
-//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'multivalue', 'fm', 'lumina', or a vindex type such as 'ivf-pq')
-//! - `CALL sys.create_lumina_index(table => '...', index_column => '...')`
+//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'multivalue', 'fm', or a vindex type such as 'diskann')
 //!
 //! REST management procedures (REST catalogs only, mirroring Java's
 //! `RESTCatalog.permissionManagement()` / `policyManagement()`):
@@ -74,7 +74,6 @@ use paimon::api::{
     PermissionColumns, PermissionResource, PolicyType, ResourceType, RowFilter,
 };
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
-use paimon::lumina::{is_lumina_index_type, LUMINA_IDENTIFIER};
 use paimon::spec::{CoreOptions, DataType, Datum, Predicate, PredicateBuilder, Snapshot};
 use paimon::table::{
     normalize_global_index_type, BranchManager, ConsumerManager, SnapshotManager, Table,
@@ -204,6 +203,7 @@ async fn earlier_or_equal_from_all(
 /// a misspelled `index_type` on `create_global_index` would build the default index.
 fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
     Some(match proc_name {
+        "create_branch" => &["table", "branch", "tag", "ignore_if_exists"],
         "create_tag" => &["table", "tag", "snapshot_id", "time_retained"],
         "replace_tag" => &["table", "tag", "snapshot_id", "time_retained"],
         "delete_tag" => &["table", "tag"],
@@ -224,7 +224,6 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
             "partitions",
             "dry_run",
         ],
-        "create_lumina_index" => &["table", "index_column", "index_type", "options"],
         "grant_permission" => &[
             "resource_type",
             "access",
@@ -323,10 +322,11 @@ pub async fn execute_procedure(
     proc_name: &str,
     arguments: &FunctionArguments,
 ) -> DFResult<DataFrame> {
-    let args = extract_named_args(arguments)?;
+    let args = extract_named_args(ctx, arguments)?;
     reject_unknown_args(proc_name, &args)?;
 
     match proc_name {
+        "create_branch" => proc_create_branch(ctx, catalog, catalog_name, &args).await,
         "create_tag" => proc_create_tag(ctx, catalog, catalog_name, &args).await,
         "replace_tag" => proc_replace_tag(ctx, catalog, catalog_name, &args).await,
         "delete_tag" => proc_delete_tag(ctx, catalog, catalog_name, &args).await,
@@ -347,7 +347,6 @@ pub async fn execute_procedure(
         "delete_branch" => proc_delete_branch(ctx, catalog, catalog_name, &args).await,
         "create_global_index" => proc_create_global_index(ctx, catalog, catalog_name, &args).await,
         "drop_global_index" => proc_drop_global_index(ctx, catalog, catalog_name, &args).await,
-        "create_lumina_index" => proc_create_lumina_index(ctx, catalog, catalog_name, &args).await,
         "grant_permission" => proc_grant_permission(ctx, catalog, catalog_name, &args).await,
         "revoke_permission" => proc_revoke_permission(ctx, catalog, catalog_name, &args).await,
         "list_permissions" => proc_list_permissions(ctx, catalog, catalog_name, &args).await,
@@ -377,7 +376,10 @@ fn extract_procedure_name(name: &ObjectName) -> DFResult<(Option<String>, String
     }
 }
 
-fn extract_named_args(args: &FunctionArguments) -> DFResult<HashMap<String, String>> {
+fn extract_named_args(
+    ctx: &SessionContext,
+    args: &FunctionArguments,
+) -> DFResult<HashMap<String, String>> {
     let arg_list = match args {
         FunctionArguments::List(list) => &list.args,
         FunctionArguments::None => return Ok(HashMap::new()),
@@ -396,7 +398,11 @@ fn extract_named_args(args: &FunctionArguments) -> DFResult<HashMap<String, Stri
                 arg: FunctionArgExpr::Expr(expr),
                 operator: FunctionArgOperator::RightArrow,
             } => {
-                let value = expr_to_string(expr)?;
+                let value = match expr_to_string(expr) {
+                    Ok(value) => value,
+                    Err(error) if matches!(expr, SqlExpr::Value(_)) => return Err(error),
+                    Err(_) => constant_argument(ctx, expr)?,
+                };
                 let name = name.value.to_lowercase();
                 // Java `PaimonProcedureResolver.buildNameToArgumentMap` rejects a repeat
                 // rather than letting the last one win.
@@ -435,6 +441,81 @@ fn expr_to_string(expr: &SqlExpr) -> DFResult<String> {
         _ => Err(DataFusionError::Plan(format!(
             "Unsupported argument expression: {expr}"
         ))),
+    }
+}
+
+fn constant_argument(ctx: &SessionContext, expr: &SqlExpr) -> DFResult<String> {
+    use datafusion::common::{
+        tree_node::{TreeNode, TreeNodeRecursion},
+        DFSchema,
+    };
+    use datafusion::logical_expr::{simplify::SimplifyContext, Expr, Volatility};
+    use datafusion::optimizer::simplify_expressions::ExprSimplifier;
+    let schema = DFSchema::empty();
+    let state = ctx.state();
+    let expression = state.create_logical_expr(&expr.to_string(), &schema)?;
+    expression.apply(|node| {
+        let allowed = match node {
+            Expr::Literal(_, _)
+            | Expr::Alias(_)
+            | Expr::Cast(_)
+            | Expr::TryCast(_)
+            | Expr::BinaryExpr(_)
+            | Expr::Negative(_)
+            | Expr::Not(_)
+            | Expr::Case(_)
+            | Expr::IsNull(_)
+            | Expr::IsNotNull(_)
+            | Expr::Between(_)
+            | Expr::InList(_)
+            | Expr::IsTrue(_)
+            | Expr::IsNotTrue(_)
+            | Expr::IsFalse(_)
+            | Expr::IsNotFalse(_)
+            | Expr::IsUnknown(_)
+            | Expr::IsNotUnknown(_)
+            | Expr::Like(_)
+            | Expr::SimilarTo(_) => true,
+            Expr::ScalarFunction(function) => {
+                function.func.signature().volatility == Volatility::Immutable
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err(DataFusionError::Plan(
+                "CALL arguments must be immutable scalar constant expressions".into(),
+            ));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let simplifier = ExprSimplifier::new(
+        SimplifyContext::builder()
+            .with_schema(Arc::new(schema.clone()))
+            .with_config_options(state.config_options().clone())
+            .build(),
+    );
+    let expression = simplifier.simplify(simplifier.coerce(expression, &schema)?)?;
+    let Expr::Literal(value, _) = expression else {
+        return Err(DataFusionError::Plan(
+            "CALL argument did not reduce to a scalar constant".into(),
+        ));
+    };
+    if let Some(Some(value)) = value.try_as_str() {
+        return Ok(value.to_string());
+    }
+    match value {
+        ScalarValue::Int8(Some(_))
+        | ScalarValue::Int16(Some(_))
+        | ScalarValue::Int32(Some(_))
+        | ScalarValue::Int64(Some(_))
+        | ScalarValue::UInt8(Some(_))
+        | ScalarValue::UInt16(Some(_))
+        | ScalarValue::UInt32(Some(_))
+        | ScalarValue::UInt64(Some(_))
+        | ScalarValue::Boolean(Some(_)) => Ok(value.to_string()),
+        _ => Err(DataFusionError::Plan(
+            "CALL arguments must be non-null strings, integers, or booleans".into(),
+        )),
     }
 }
 
@@ -664,6 +745,56 @@ async fn proc_replace_tag(
     tm.replace(tag_name, &snapshot, time_retained)
         .await
         .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+async fn proc_create_branch(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let branch = require_arg(args, "branch")?;
+    let ignore_if_exists = bool_arg(args, "ignore_if_exists")?;
+    // Validate before the existence check: an invalid name must not become a
+    // successful no-op just because it resolves to an existing directory.
+    BranchManager::validate_branch_name(branch).map_err(to_datafusion_error)?;
+    if branch.contains('$') {
+        return Err(DataFusionError::Plan(format!(
+            "Branch name '{branch}' cannot contain the SQL suffix delimiter '$'"
+        )));
+    }
+    let table = get_table(catalog, catalog_name, args).await?;
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "create_branch is not supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
+    if table.schema().core_options().is_format_table() {
+        return Err(DataFusionError::NotImplemented(
+            "create_branch requires a FileStoreTable; format-table is not supported".to_string(),
+        ));
+    }
+    if !table.is_main_branch() {
+        return Err(DataFusionError::NotImplemented(
+            "create_branch requires a main-branch source table".to_string(),
+        ));
+    }
+
+    let manager = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    if ignore_if_exists
+        && manager
+            .branch_exists(branch)
+            .await
+            .map_err(to_datafusion_error)?
+    {
+        return ok_result(ctx);
+    }
+    match args.get("tag") {
+        Some(tag) => manager.create_branch_from_tag(branch, tag).await,
+        None => manager.create_branch(branch).await,
+    }
+    .map_err(to_datafusion_error)?;
     ok_result(ctx)
 }
 
@@ -1015,34 +1146,6 @@ async fn proc_create_tag_from_watermark(
     tm.create_with_retention(tag_name, &snapshot, time_retained)
         .await
         .map_err(to_datafusion_error)?;
-    ok_result(ctx)
-}
-
-async fn proc_create_lumina_index(
-    ctx: &SessionContext,
-    catalog: &Arc<dyn Catalog>,
-    catalog_name: &str,
-    args: &HashMap<String, String>,
-) -> DFResult<DataFrame> {
-    let table = get_table(catalog, catalog_name, args).await?;
-    let index_column = require_arg(args, "index_column")?;
-    let mut builder = table.new_global_index_build_builder();
-    builder.with_index_column(index_column);
-    let index_type = normalize_index_type(
-        args.get("index_type")
-            .map(String::as_str)
-            .unwrap_or(LUMINA_IDENTIFIER),
-    );
-    if !is_lumina_index_type(&index_type) {
-        return Err(DataFusionError::NotImplemented(format!(
-            "Unsupported Lumina index type: {index_type}"
-        )));
-    }
-    builder.with_index_type(&index_type);
-    if let Some(options) = args.get("options") {
-        builder.with_options(parse_key_value_options(options)?);
-    }
-    builder.execute().await.map_err(to_datafusion_error)?;
     ok_result(ctx)
 }
 
@@ -2104,10 +2207,7 @@ mod tests {
         assert_eq!(normalize_index_type(" BitMap\t"), "bitmap");
         assert_eq!(normalize_index_type("IVF-FLAT"), "ivf-flat");
         assert_eq!(normalize_index_type("Ivf-Pq"), "ivf-pq");
-        assert_eq!(
-            normalize_index_type("Lumina-Vector-Ann"),
-            "lumina-vector-ann"
-        );
+        assert_eq!(normalize_index_type("DiskANN"), "diskann");
         // Already canonical values are returned unchanged, and an unknown type
         // is normalized but not rewritten -- the caller still rejects it.
         assert_eq!(normalize_index_type("ivf-flat"), "ivf-flat");

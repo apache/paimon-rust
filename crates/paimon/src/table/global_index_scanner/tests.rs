@@ -35,6 +35,155 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
+#[test]
+fn multivalue_field_options_override_bitmap_reader_defaults() {
+    let options = HashMap::from([
+        (
+            "bitmap-index.fallback-scan-max-size".into(),
+            "invalid default".into(),
+        ),
+        (
+            "fields.tags.index-options".into(),
+            r#"{"fallback-scan-max-size":"1 mb"}"#.into(),
+        ),
+    ]);
+    let fields = vec![DataField::new(
+        1,
+        "tags".into(),
+        DataType::Array(crate::spec::ArrayType::new(DataType::Int(
+            crate::spec::IntType::new(),
+        ))),
+    )];
+    let entry = make_global_index_entry_with_type(
+        MULTIVALUE_GLOBAL_INDEX_TYPE,
+        "unopened.index",
+        1,
+        0,
+        1,
+        &BTreeIndexMeta::new(None, None, false),
+    );
+    assert!(crate::spec::CoreOptions::new(&options)
+        .bitmap_index_fallback_scan_max_size()
+        .is_err());
+    let resolved = GlobalIndexScanner::read_defaults(&options, &[entry], &fields).unwrap();
+    assert_eq!(
+        crate::spec::CoreOptions::new(&resolved)
+            .bitmap_index_fallback_scan_max_size()
+            .unwrap(),
+        1024 * 1024
+    );
+    assert_eq!(
+        options["bitmap-index.fallback-scan-max-size"],
+        "invalid default"
+    );
+}
+
+#[tokio::test]
+async fn shared_field_options_control_range_read_fallback() {
+    let (io, path, name, tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
+    let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+    let mut entry = make_global_index_entry(&name, 1, 0, 99, &meta);
+    entry.index_file.file_size = std::fs::metadata(tmp.path().join("index").join(&name))
+        .unwrap()
+        .len() as i64;
+    let mut second = entry.clone();
+    second.index_file.file_name = "other.index".into();
+    second
+        .index_file
+        .global_index_meta
+        .as_mut()
+        .unwrap()
+        .index_field_id = 2;
+    io.copy_file(
+        &format!("{path}/index/{name}"),
+        &format!("{path}/index/other.index"),
+    )
+    .await
+    .unwrap();
+    let entries = vec![entry, second];
+    let mut fields = int_schema_fields();
+    fields.push(DataField::new(
+        2,
+        "other".into(),
+        fields[0].data_type().clone(),
+    ));
+    let predicate = Predicate::Leaf {
+        column: "id".into(),
+        index: 0,
+        data_type: fields[0].data_type().clone(),
+        op: PredicateOperator::GtEq,
+        literals: vec![Datum::Int(50)],
+    };
+    let make = || {
+        GlobalIndexScanner::create_with_fm_options(
+            &io,
+            &path,
+            1,
+            0,
+            0,
+            0,
+            &entries,
+            &fields,
+            FMReadOptions::default(),
+        )
+        .unwrap()
+        .unwrap()
+    };
+    assert!(make().evaluate(&predicate).await.unwrap().is_none());
+    let options = HashMap::from([
+        (
+            "btree-index.fallback-scan-max-size".into(),
+            "invalid default".into(),
+        ),
+        (
+            "fields.id.index-options".into(),
+            r#"{"fallback-scan-max-size":"1 mb"}"#.into(),
+        ),
+        (
+            "fields.unrelated.index-options".into(),
+            "invalid JSON".into(),
+        ),
+        (
+            "fields.other.index-options".into(),
+            r#"{"fallback-scan-max-size":0}"#.into(),
+        ),
+    ]);
+    let defaults = GlobalIndexScanner::read_defaults(&options, &entries, &fields).unwrap();
+    let core = crate::spec::CoreOptions::new(&defaults);
+    let scanner = GlobalIndexScanner::create_with_fm_options(
+        &io,
+        &path,
+        1,
+        core.btree_index_fallback_scan_max_size().unwrap(),
+        core.btree_index_data_block_cache_size().unwrap(),
+        0,
+        &entries,
+        &fields,
+        FMReadOptions::default(),
+    )
+    .unwrap()
+    .unwrap()
+    .with_field_options(&options, &entries)
+    .unwrap();
+    assert_eq!(
+        scanner
+            .evaluate(&predicate)
+            .await
+            .unwrap()
+            .unwrap()
+            .row_ranges,
+        vec![RowRange::new(25, 99)]
+    );
+    let other = Predicate::Leaf {
+        column: "other".into(),
+        index: 1,
+        data_type: fields[1].data_type().clone(),
+        op: PredicateOperator::GtEq,
+        literals: vec![Datum::Int(50)],
+    };
+    assert!(scanner.evaluate(&other).await.unwrap().is_none());
+}
+
 #[tokio::test]
 async fn test_try_fold_bounded_respects_concurrency_limit() {
     for limit in [1, 3] {
