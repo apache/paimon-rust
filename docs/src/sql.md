@@ -1965,6 +1965,50 @@ SELECT
 FROM paimon.my_db.user_events;
 ```
 
+### Spark-compatible functions
+
+`SQLContext::new()` and its builder enable the matching `datafusion-spark`
+function packages and Spark expression planner by default. This includes
+numeric, string, date/time, hash, array/map and aggregate functions such as
+`pmod`, `factorial`, `soundex`, `last_day`, `unix_date`, `crc32`, `sha1`,
+`collect_set` and `try_sum`. EXTRACT and SQL SUBSTRING syntax use the Spark
+expression planner. See the upstream
+[Spark function package](https://github.com/apache/datafusion/tree/54.0.0/datafusion/spark)
+for the versioned function inventory and signatures.
+
+Spark functions take precedence over DataFusion defaults with the same name.
+Functions registered by the application after constructing SQLContext take
+priority. Registered functions resolve locally without REST function lookups;
+qualified catalog calls retain catalog resolution.
+
+The upstream package's behavior applies, including these migration differences:
+
+- `concat` propagates NULL inputs.
+- `mod` and `pmod` return NULL for a zero divisor by default. Set
+  `datafusion.execution.enable_ansi_mode = true` to report division by zero.
+  Their numeric coercion and decimal result types follow the Spark package.
+- `size` returns INT and uses the package's legacy NULL-to-minus-one behavior.
+- Two-argument `date_diff`/`datediff` return INT. The three-argument Paimon
+  `date_diff(unit, start, end)` extension still returns BIGINT.
+- `hour` takes timestamps; cast dates or strings to TIMESTAMP explicitly.
+  `hex` numeric inputs use upstream BIGINT coercion.
+- The upstream 54 AVG implementation returns DOUBLE. DISTINCT plans that
+  DataFusion can lower to a deduplication step are supported; remaining AVG and
+  TRY_SUM DISTINCT plans report an unsupported error. COLLECT_LIST ORDER BY is
+  unsupported. COLLECT_LIST DISTINCT delegates to upstream COLLECT_SET.
+  Collection aggregates return empty arrays for empty growing window frames.
+  Window frames requiring retraction follow the upstream version's limits,
+  including unsupported AVG suffix frames.
+
+SQLContext normalizes dictionary-encoded inputs for the migrated scalar
+functions, types bare NULL arguments, and bridges ordinary SQL integer
+arguments to the INT signatures of date arithmetic and factorial. Values outside
+that integer range fail during conversion. These adapters delegate computation
+to upstream functions. Paimon Variant handling, metadata SQL, selection
+aggregates and the additional functions documented below remain available.
+This enables the upstream function subset; it does not enable every Spark SQL
+syntax, cast mode or configuration option.
+
 ### Aggregate compatibility
 
 SQLContext accepts the following aggregates in queries and view definitions.
@@ -1989,7 +2033,8 @@ aggregates reject DISTINCT, OVER, additional ordering and NULL modifiers. Tied
 keys may choose any eligible value. LISTAGG overflow and top-k selection forms
 are unsupported. Approximate counts use native HLL estimates rather than Spark's
 serialized HLL++ state.
-COLLECT_LIST always ignores NULLs and rejects RESPECT NULLS. Aggregate values and
+COLLECT_LIST always ignores NULLs and rejects explicit IGNORE/RESPECT NULLS clauses.
+Aggregate values and
 selection keys are evaluated once, including volatile expressions.
 
 ### JSON output and Variant string casts
@@ -2015,7 +2060,7 @@ representation uses this conversion; ordinary casts retain native behavior.
 | --- | --- |
 | `assert_true(condition[, message])` | Returns NULL for TRUE; FALSE or NULL raises an execution error with the optional message |
 | `conv(text, from_base, to_base)` | Source base 2 through 36 conversion of a 64-bit value; a negative destination base formats a signed result; invalid bases, including negative source bases, return NULL |
-| `date_diff(end, start)` | BIGINT calendar days after native DATE coercion |
+| `date_diff(end, start)` | Upstream Spark INT calendar days after DATE coercion |
 | `date_diff(unit, start, end)` | Signed whole-unit difference at microsecond precision, from microsecond through week and calendar month/quarter/year; calendar fields use UTC and month-end clamping |
 | `convert_tz(datetime, from_zone, to_zone)` | Interprets a timezone-less datetime in the source zone, returning a timezone-less microsecond timestamp in the destination zone |
 
@@ -2044,12 +2089,12 @@ with a custom escape is unsupported.
 
 | Function | Behavior |
 | --- | --- |
-| `mod(value, divisor)` | Numeric remainder with DataFusion `%` coercion, null, sign, and division-by-zero behavior |
+| `mod(value, divisor)` | Upstream Spark numeric remainder, with NULL on zero by default and errors in ANSI mode |
 | `regexp_extract(text, pattern[, index])` | The first matched group; default index 1; index 0 selects the complete match |
 | `regexp_extract_all(text, pattern[, index])` | A list of matched groups, in occurrence order |
 | `date_sub(date, days)` | Subtracts integral calendar days and returns `DATE`; negative days add days |
-| `sha2(text_or_binary, bits)` | Lowercase SHA-2 hex for 224, 256, 384, or 512 bits; 0 means 256; other lengths return null |
-| `to_base64(text_or_binary)` | Standard Base64 with `=` padding; strings are encoded as UTF-8 |
+| `sha2(text_or_binary, bits)` | Lowercase SHA-2 hex with upstream INT coercion for bits; 224/256/384/512 are supported, 0 means 256, and other INT values return NULL |
+| `to_base64(text_or_binary)` | Alias of upstream Spark `base64`, with standard `=` padding; strings use UTF-8 |
 | `curdate()` | Alias of `current_date()` |
 | `timestamp_millis(value)` | Alias of `to_timestamp_millis(value)`, preserving millisecond epoch units |
 | `to_timestamp_ltz(value[, format...])` | Alias of `to_timestamp`, preserving its session time zone and nanosecond result |
@@ -2077,9 +2122,10 @@ are epoch seconds. The Flink `(number, precision)` overload is not implemented.
 | `hex(value)` | Uppercase hexadecimal UTF-8/string or raw binary bytes; integer inputs use hexadecimal digits, with negative signed values represented as 64-bit two's complement. |
 | `unhex(text)` | Decodes case-insensitive hex. An odd number of digits is left-padded with zero; invalid hex returns NULL. |
 | `size(collection)` | Counts array elements or map entries, including NULL values, and returns INT. |
-| `hour(value)` | Extracts an INT hour from timestamps, times or timestamp strings. Dates produce zero; timestamp timezone metadata is honored. |
+| `hour(timestamp)` | Upstream Spark INT hour extraction; timestamp timezone metadata is honored. |
 
-Except for `typeof`, NULL inputs produce NULL. Empty collections have size zero.
+Except for `typeof` and `size`, NULL inputs produce NULL. SIZE returns -1 for
+NULL collections. Empty collections have size zero.
 These functions are registered locally and do not require REST function metadata.
 Split patterns follow the same Rust regex restrictions as the other regex
 compatibility functions. SQLContext's `date` alias follows native DataFusion

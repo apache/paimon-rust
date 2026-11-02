@@ -18,13 +18,16 @@
 use chrono::{Datelike, Months, NaiveDate, NaiveDateTime, TimeZone};
 use datafusion::arrow::array::timezone::Tz;
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Int64Array, Int64Builder,
-    NullArray, StringArray, StringBuilder, TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Int64Array, Int64Builder, NullArray,
+    StringArray, StringBuilder, TimestampMicrosecondArray,
 };
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, TimeUnit};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
+use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
+use datafusion::logical_expr::type_coercion::functions::fields_with_udf;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    Volatility,
 };
 use datafusion::prelude::SessionContext;
 use regex::{Regex, RegexBuilder};
@@ -102,7 +105,19 @@ impl ScalarUDFImpl for Extra {
                 out
             }
             (Kind::Conv, 3) => vec![DataType::Utf8, DataType::Int64, DataType::Int64],
-            (Kind::DateDiff, 2) => vec![DataType::Date32, DataType::Date32],
+            (Kind::DateDiff, 2) => {
+                let fields = types
+                    .iter()
+                    .map(|ty| Arc::new(Field::new("arg", ty.clone(), true)))
+                    .collect::<Vec<_>>();
+                fields_with_udf(
+                    &fields,
+                    datafusion_spark::function::datetime::date_diff().as_ref(),
+                )?
+                .iter()
+                .map(|field| field.data_type().clone())
+                .collect()
+            }
             (Kind::DateDiff, 3) => vec![
                 DataType::Utf8,
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -130,16 +145,46 @@ impl ScalarUDFImpl for Extra {
             }
         })
     }
-    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+    fn return_type(&self, types: &[DataType]) -> Result<DataType> {
         Ok(match self.kind {
             Kind::Assert => DataType::Null,
             Kind::Conv => DataType::Utf8,
+            Kind::DateDiff if types.len() == 2 => DataType::Int32,
             Kind::DateDiff => DataType::Int64,
             Kind::ConvertTz => DataType::Timestamp(TimeUnit::Microsecond, None),
             Kind::Like => DataType::Boolean,
         })
     }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        if self.kind == Kind::DateDiff && args.arg_fields.len() == 2 {
+            return datafusion_spark::function::datetime::date_diff()
+                .inner()
+                .return_field_from_args(args);
+        }
+        let types = args
+            .arg_fields
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect::<Vec<_>>();
+        Ok(Arc::new(Field::new(
+            self.name(),
+            self.return_type(&types)?,
+            true,
+        )))
+    }
+    fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> Result<ExprSimplifyResult> {
+        if self.kind == Kind::DateDiff && args.len() == 2 {
+            datafusion_spark::function::datetime::date_diff()
+                .inner()
+                .simplify(args, info)
+        } else {
+            Ok(ExprSimplifyResult::Original(args))
+        }
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if self.kind == Kind::DateDiff && args.args.len() == 2 {
+            return datafusion_spark::function::datetime::date_diff().invoke_with_args(args);
+        }
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
         let len = arrays[0].len();
         let out: ArrayRef = match self.kind {
@@ -176,39 +221,25 @@ impl ScalarUDFImpl for Extra {
             }
             Kind::DateDiff => {
                 let mut output = Int64Builder::new();
-                if arrays.len() == 2 {
-                    let end = arrays[0].as_any().downcast_ref::<Date32Array>().unwrap();
-                    let start = arrays[1].as_any().downcast_ref::<Date32Array>().unwrap();
-                    for row in 0..len {
-                        if end.is_null(row) || start.is_null(row) {
-                            output.append_null();
-                        } else {
-                            output.append_value(
-                                i64::from(end.value(row)) - i64::from(start.value(row)),
-                            );
-                        }
+                let unit = arrays[0].as_any().downcast_ref::<StringArray>().unwrap();
+                let start = arrays[1]
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                let end = arrays[2]
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                for row in 0..len {
+                    if arrays.iter().any(|a| a.is_null(row)) {
+                        output.append_null();
+                        continue;
                     }
-                } else {
-                    let unit = arrays[0].as_any().downcast_ref::<StringArray>().unwrap();
-                    let start = arrays[1]
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .unwrap();
-                    let end = arrays[2]
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .unwrap();
-                    for row in 0..len {
-                        if arrays.iter().any(|a| a.is_null(row)) {
-                            output.append_null();
-                            continue;
-                        }
-                        output.append_value(date_diff(
-                            unit.value(row),
-                            start.value(row),
-                            end.value(row),
-                        )?);
-                    }
+                    output.append_value(date_diff(
+                        unit.value(row),
+                        start.value(row),
+                        end.value(row),
+                    )?);
                 }
                 Arc::new(output.finish())
             }

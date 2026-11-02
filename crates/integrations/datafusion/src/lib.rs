@@ -73,6 +73,7 @@ mod scalar_compat;
 mod scalar_extra;
 mod selection_aggregate;
 mod show_metadata;
+mod spark_functions;
 mod sql_context;
 mod sql_function;
 mod system_tables;

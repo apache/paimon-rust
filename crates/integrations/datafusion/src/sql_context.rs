@@ -76,6 +76,7 @@ use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
+use datafusion_spark::SessionStateBuilderSpark;
 use futures::StreamExt;
 use paimon::catalog::{parse_object_name, Catalog, Identifier, ParsedObjectName};
 use paimon::spec::{
@@ -157,6 +158,7 @@ impl SQLContextBuilder {
         let mut state_builder = SessionStateBuilder::new()
             .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
+            .with_spark_features()
             .with_type_planner(Arc::new(crate::binary_cast::BinaryTypePlanner))
             .with_relation_planners(vec![
                 Arc::new(crate::lateral_views::ExplodeRelationPlanner),
@@ -169,8 +171,14 @@ impl SQLContextBuilder {
         if let Some(runtime_env) = self.runtime_env {
             state_builder = state_builder.with_runtime_env(runtime_env);
         }
+        // EXTRACT bypasses the function registry, so intercept it before Spark's planner.
+        state_builder
+            .expr_planners()
+            .get_or_insert_with(Vec::new)
+            .insert(0, Arc::new(crate::spark_functions::DatePartPlanner));
         let state = state_builder.build();
         let mut ctx = SessionContext::new_with_state(state);
+        crate::spark_functions::apply_compatibility_fixes(&ctx);
         crate::compat_functions::register_compat_functions(&ctx);
         crate::binary_cast::register(&ctx);
         crate::lateral_views::register(&ctx);
@@ -4598,6 +4606,58 @@ mod tests {
             Identifier::new(database, name),
             schema,
         ));
+    }
+
+    #[tokio::test]
+    async fn spark_functions_resolve_locally_in_persistent_functions_and_views() {
+        use datafusion::common::ScalarValue;
+        let catalog = Arc::new(MockCatalog::new());
+        catalog.denied_functions.lock().unwrap().extend([
+            "pmod".to_string(),
+            "try_sum".to_string(),
+            "collect_set".to_string(),
+        ]);
+        let ctx = make_sql_context(catalog.clone()).await;
+        ctx.sql("CREATE FUNCTION spark_adjust(x BIGINT) RETURNS BIGINT LANGUAGE SQL IMMUTABLE RETURN x + pmod(x,3)").await.unwrap();
+        let function = catalog
+            .get_function(&Identifier::new("default", "spark_adjust"))
+            .await
+            .unwrap();
+        assert!(function
+            .definition("datafusion")
+            .unwrap()
+            .sql()
+            .unwrap()
+            .contains("pmod"));
+        ctx.sql("CREATE VIEW spark_total AS SELECT try_sum(spark_adjust(v)) AS answer FROM (VALUES (1),(2),(2)) t(v)").await.unwrap();
+        let view = catalog
+            .get_view(&Identifier::new("default", "spark_total"))
+            .await
+            .unwrap();
+        assert!(view.query_for("datafusion").contains("try_sum"));
+        assert!(view.query_for("datafusion").contains("spark_adjust"));
+        let batches = ctx
+            .sql("SELECT answer FROM spark_total")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            ScalarValue::try_from_array(batches[0].column(0), 0).unwrap(),
+            ScalarValue::Int64(Some(10))
+        );
+        let batches = ctx
+            .sql("SELECT array_length(collect_set(v)) FROM (VALUES (1),(1),(2)) t(v)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            ScalarValue::try_from_array(batches[0].column(0), 0).unwrap(),
+            ScalarValue::UInt64(Some(2))
+        );
     }
 
     #[tokio::test]

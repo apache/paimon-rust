@@ -429,7 +429,16 @@ async fn compatible_aggregates_preserve_null_filter_and_ordering_contracts() {
     assert_eq!(rows(&ctx,"SELECT k,count_if(p) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM (VALUES (1,TRUE),(2,FALSE),(3,TRUE)) t(k,p) ORDER BY k").await,vec![vec!["1","1"],vec!["2","1"],vec!["3","2"]]);
     rejects(&ctx, "SELECT approx_count_distinct(1,0.0001)").await;
     rejects(&ctx, "SELECT first(1, 7)").await;
-    assert_eq!(rows(&ctx,"SELECT to_json(collect_list(v IGNORE NULLS)),to_json(collect_list(v) IGNORE NULLS) FROM (VALUES (1),(NULL)) t(v)").await,vec![vec!["[1]","[1]"]]);
+    rejects(
+        &ctx,
+        "SELECT collect_list(v IGNORE NULLS) FROM (VALUES (1),(NULL)) t(v)",
+    )
+    .await;
+    rejects(
+        &ctx,
+        "SELECT collect_list(v) IGNORE NULLS FROM (VALUES (1),(NULL)) t(v)",
+    )
+    .await;
     rejects(
         &ctx,
         "SELECT collect_list(v) RESPECT NULLS FROM (VALUES (1),(NULL)) t(v)",
