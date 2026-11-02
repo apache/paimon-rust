@@ -298,7 +298,18 @@ impl DataEvolutionReader {
         let mut layouts = Vec::with_capacity(files.len());
         // Normal files with the fields their write columns name.
         let mut normal_files = Vec::new();
+        // The fields each commit wrote to dedicated files. A commit assigns
+        // its snapshot ID as the sequence number of the files it writes.
+        let mut dedicated_by_commit: HashMap<i64, HashSet<i32>> = HashMap::new();
         for (file, info) in files.iter().zip(infos) {
+            if is_vector_store_file_name(&file.file_name)
+                || is_blob_or_video_file_name(&file.file_name)
+            {
+                dedicated_by_commit
+                    .entry(file.max_sequence_number)
+                    .or_default()
+                    .extend(&info.field_ids);
+            }
             if is_vector_store_file_name(&file.file_name) {
                 let columns = info.normalized_write_cols.unwrap_or_default();
                 layouts.push((
@@ -316,11 +327,13 @@ impl DataEvolutionReader {
         // retyped from VECTOR to text too, and does not read a field dropped
         // since. So normal layouts list only those fields, while dedicated
         // layouts keep every field, as the source plan rejects a field of two
-        // vector bunches, read or not. A normal file without write columns
-        // leaves out the fields its own schema stores in dedicated files; that
-        // schema is read only where the answer can decide: for a BLOB or
-        // VECTOR field that a dedicated file of the group also holds or that
-        // the table now stores in BLOB files.
+        // vector bunches, read or not. With the write-cols optimization, a
+        // normal file without write columns leaves out the fields its writer
+        // stored in dedicated files, and the writer's options, which a copy
+        // of the table can change, are recorded nowhere. So such a file
+        // leaves out the fields its own commit wrote to dedicated files, as a
+        // commit writes a row range once, and counts as holding the other
+        // such fields of its schema.
         let maybe_dedicated: HashSet<i32> = self
             .table_fields
             .iter()
@@ -330,23 +343,14 @@ impl DataEvolutionReader {
             })
             .map(DataField::id)
             .collect();
-        let in_dedicated_files: HashSet<i32> = layouts
-            .iter()
-            .flat_map(|(_, field_ids)| field_ids.iter().copied())
-            .collect();
-        for (file, written) in &normal_files {
-            let decides = file.write_cols.is_none()
-                && written.iter().any(|id| {
-                    maybe_dedicated.contains(id)
-                        && (in_dedicated_files.contains(id) || dedicated_blobs.contains(id))
-                });
-            let held = if decides {
-                self.fields_without_write_cols(file).await?
-            } else {
-                written.clone()
-            };
-            let held = held.into_iter().filter(|id| maybe_dedicated.contains(id));
-            layouts.push((FieldLayout::Normal, held.collect()));
+        for (file, written) in &mut normal_files {
+            if file.write_cols.is_none() {
+                if let Some(dedicated) = dedicated_by_commit.get(&file.max_sequence_number) {
+                    written.retain(|id| !dedicated.contains(id));
+                }
+            }
+            let held = written.iter().filter(|id| maybe_dedicated.contains(id));
+            layouts.push((FieldLayout::Normal, held.copied().collect()));
         }
         let blob_fields: HashSet<i32> = self
             .table_fields
@@ -363,62 +367,24 @@ impl DataEvolutionReader {
         if !read_where_stored || field_has_two_layouts(&layouts) {
             return Ok(false);
         }
-        // Like the source plan, the newest normal file that writes a field,
-        // as its write columns say, provides it. One without write columns
-        // that leaves the field out would hide an older file that holds it;
-        // files of one schema hold such a field alike, so only files of more
-        // than one schema need their schemas read. Only the table's BLOB and
-        // VECTOR fields can be left out: a field typed otherwise now was at
-        // most a VECTOR before an ALTER to text, whose old values no read can
-        // decode.
+        // Like the source plan, the newest normal file that writes a field
+        // provides it. When that file has no write columns and another file
+        // of the group holds the field too, the merge is right only if the
+        // newest one holds it, which its metadata cannot tell, so the group
+        // is read file by file.
         normal_files.sort_by_key(|(file, _)| std::cmp::Reverse(file.max_sequence_number));
-        let vector_provided: HashSet<i32> = layouts
-            .iter()
-            .filter(|(layout, _)| matches!(layout, FieldLayout::Vector(_)))
-            .flat_map(|(_, field_ids)| field_ids.iter().copied())
-            .collect();
-        let fields = self.table_fields.iter().map(DataField::id);
-        for id in fields.filter(|id| maybe_dedicated.contains(id)) {
-            if dedicated_blobs.contains(&id) || vector_provided.contains(&id) {
-                continue;
-            }
+        for id in &maybe_dedicated {
             let mut writers = normal_files
                 .iter()
-                .filter(|(_, written)| written.contains(&id))
-                .map(|(file, _)| *file);
-            let Some(newest) = writers.next() else {
-                continue;
-            };
-            let older: Vec<_> = writers.collect();
-            if newest.write_cols.is_some()
-                || older.iter().all(|file| file.schema_id == newest.schema_id)
-                || self.fields_without_write_cols(newest).await?.contains(&id)
-            {
-                continue;
-            }
-            for file in older {
-                if file.write_cols.is_some()
-                    || self.fields_without_write_cols(file).await?.contains(&id)
-                {
-                    return Ok(false);
-                }
+                .filter(|(_, written)| written.contains(id));
+            let newest_without_write_cols = writers
+                .next()
+                .is_some_and(|(newest, _)| newest.write_cols.is_none());
+            if newest_without_write_cols && writers.next().is_some() {
+                return Ok(false);
             }
         }
         Ok(true)
-    }
-
-    /// The fields a normal file without write columns holds: those its
-    /// schema keeps in normal files, which with the write-cols optimization
-    /// leave out the fields the schema stores in dedicated files. Like Java,
-    /// the schema the file was written with decides, not the options of this
-    /// read.
-    async fn fields_without_write_cols(&self, file: &DataFileMeta) -> crate::Result<Vec<i32>> {
-        let schema = self.schema_manager.schema(file.schema_id).await?;
-        Ok(schema
-            .data_file_fields(None)
-            .iter()
-            .map(DataField::id)
-            .collect())
     }
 
     /// Managed BLOB payloads are fetched by the format reader, before the

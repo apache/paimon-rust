@@ -2465,12 +2465,14 @@ The optional fourth argument selects the mode:
   column the range wrote in two layouts (inline and in dedicated files, after a change
   of the column's storage, or in VECTOR files before and after an `ALTER TABLE`, or with
   and without another VECTOR column), whose BLOB column it wrote in a layout the table
-  no longer uses, or whose BLOB or VECTOR column an older file holds inline and the
-  newest file writing it leaves out, written with
-  `data-evolution.write-cols-optimization.enabled` after the column moved to dedicated
-  files; and every file of rows whose files are no longer column slices because a
-  compaction in the range, such as the one a write runs after its commit unless
-  `write-only=true`, merged some of them (Java's reader fails on such a range). A
+  no longer uses, or whose BLOB or VECTOR column another file holds while the newest
+  normal data file that may hold it lists no write columns (with
+  `data-evolution.write-cols-optimization.enabled`, such a file can leave the column to
+  dedicated files under writer options a copy of the table can change, so this includes
+  a rewrite of every column); and every file of rows whose files are no longer column
+  slices because a compaction in the range, such as the one a write runs after its
+  commit unless `write-only=true`, merged some of them (Java's reader fails on such a
+  range). A
   column the table has since dropped, or changed from VECTOR to a string type, keeps
   rows from merging only when the range wrote it in VECTOR files of two layouts.
 - `changelog` returns the changelog rows of each commit. A `lookup` or `full-compaction`

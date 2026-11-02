@@ -3241,11 +3241,128 @@ async fn delta_reads_embeddings_a_newer_file_does_not_hold_as_written() {
     }
 }
 
+/// A table whose schema keeps the VECTOR column in vector files, with the
+/// write-cols optimization. Returns its handle, a `copy_with_options` handle
+/// that stores the column inline (`vector.file.format` empty) and the Arrow
+/// field of `id`.
+async fn vector_table_written_two_ways(
+    path: &str,
+) -> (
+    paimon::table::Table,
+    paimon::table::Table,
+    arrow_schema::Field,
+) {
+    use arrow_schema::{DataType as ArrowDataType, Field};
+    use paimon::spec::{DataType, FloatType, IntType, Schema, TableSchema, VectorType};
+    let vector = VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap();
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column("embedding", DataType::Vector(vector))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("data-evolution.write-cols-optimization.enabled", "true")
+        .option("vector.file.format", "parquet")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let inline = table.copy_with_options(std::collections::HashMap::from([(
+        "vector.file.format".to_string(),
+        String::new(),
+    )]));
+    (table, inline, Field::new("id", ArrowDataType::Int32, false))
+}
+
+fn id_and_embedding_batch(id: &arrow_schema::Field) -> RecordBatch {
+    use arrow_schema::Schema as ArrowSchema;
+    RecordBatch::try_new(
+        std::sync::Arc::new(ArrowSchema::new(vec![
+            id.clone(),
+            embedding_field("embedding"),
+        ])),
+        vec![
+            std::sync::Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+            embedding_array(&[[1.0, 0.0], [0.0, 1.0]]),
+        ],
+    )
+    .unwrap()
+}
+
+/// A rewrite of every column by a writer whose options store the VECTOR
+/// column inline omits its write columns, as a rewrite of `id` alone under
+/// the schema's options would. A range of it and the vector files of the
+/// insert it rewrites is read as written, the new embedding included.
+#[tokio::test]
+async fn delta_reads_an_inline_rewrite_of_vector_files_as_written() {
+    let row = evolved_row;
+    let vector = |values: [i32; 2]| row(None, None, None, Some(values));
+    let path = "memory:/incremental_batch/dynamic_inline_rewrite";
+    let (table, inline, id) = vector_table_written_two_ways(path).await;
+    write_batch(&table, &id_and_embedding_batch(&id)).await;
+    let ids = std::sync::Arc::new(Int32Array::from(vec![9])) as arrow_array::ArrayRef;
+    rewrite(&inline, 0, vec![(id, ids), new_embedding([9.0, 9.0])]).await;
+
+    let rewritten = vec![
+        row(Some(9), None, None, Some([9, 9])),
+        row(Some(2), None, None, Some([0, 1])),
+    ];
+    let inserted = vec![
+        row(Some(1), None, None, Some([1, 0])),
+        row(Some(2), None, None, Some([0, 1])),
+    ];
+    let mut per_commit = [inserted, rewritten.clone()].concat();
+    per_commit.sort();
+    let insert_files = vec![
+        row(Some(1), None, None, None),
+        row(Some(2), None, None, None),
+        vector([1, 0]),
+        vector([0, 1]),
+    ];
+    let mut by_file = [insert_files, rewritten].concat();
+    by_file.sort();
+    let columns: [Option<&[&str]>; 3] = [None, Some(&["id", "embedding"]), Some(&["embedding"])];
+    for columns in columns {
+        let (rows, merged) = read_evolved_range(&table, 0, 2, columns).await;
+        assert_eq!(rows, project_evolved(&per_commit, columns), "{columns:?}");
+        assert_eq!(merged, project_evolved(&by_file, columns), "{columns:?}");
+    }
+}
+
+/// An insert by a writer whose options store the VECTOR column inline holds
+/// the embeddings; a later rewrite of `id` under the schema's options omits
+/// its write columns and holds none. A range of both is read as written, the
+/// inserted embeddings included.
+#[tokio::test]
+async fn delta_reads_embeddings_of_an_inline_insert_as_written() {
+    let row = evolved_row;
+    let path = "memory:/incremental_batch/dynamic_inline_insert";
+    let (table, inline, id) = vector_table_written_two_ways(path).await;
+    write_batch(&inline, &id_and_embedding_batch(&id)).await;
+    let ids = std::sync::Arc::new(Int32Array::from(vec![11])) as arrow_array::ArrayRef;
+    rewrite(&table, 0, vec![(id, ids)]).await;
+
+    let mut by_file = vec![
+        row(Some(1), None, None, Some([1, 0])),
+        row(Some(2), None, None, Some([0, 1])),
+        row(Some(11), None, None, None),
+        row(Some(2), None, None, None),
+    ];
+    by_file.sort();
+    let columns: [Option<&[&str]>; 3] = [None, Some(&["id"]), Some(&["embedding"])];
+    for columns in columns {
+        let (rows, merged) = read_evolved_range(&table, 0, 2, columns).await;
+        let expected = project_evolved(&by_file, columns);
+        assert_eq!(rows, expected, "{columns:?}");
+        assert_eq!(merged, expected, "{columns:?}");
+    }
+}
+
 /// A table handle built in memory can lack a schema file, which reads of
-/// the files of its own schema never need. Without the write-cols
-/// optimization or files of another schema, what a file without write columns
-/// holds does not decide the merge, so a range of an insert, an `id` rewrite
-/// and a rewrite of every column reads without one.
+/// the files of its own schema never need. A range of an insert, an `id`
+/// rewrite and a rewrite of every column reads without one. The last rewrite
+/// omits its write columns, which cannot tell whether it holds the VECTOR
+/// column the insert holds, so the range is read file by file.
 #[tokio::test]
 async fn delta_reads_a_table_without_a_schema_file() {
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
@@ -3298,7 +3415,7 @@ async fn delta_reads_a_table_without_a_schema_file() {
     per_commit.sort();
     assert_eq!(
         read_evolved_range(&table, 0, 3, None).await,
-        (per_commit, current.clone())
+        (per_commit.clone(), per_commit)
     );
     assert_eq!(read_evolved_snapshot(&table).await, current);
 }
