@@ -1932,6 +1932,9 @@ fn test_write_commit_read_roundtrip() {
         assert!(pc_result.error.is_null());
         assert!(!pc_result.messages.is_null());
 
+        // Closing must preserve the commit messages already handed to the caller.
+        assert!(paimon_table_write_close(tw).is_null());
+
         let tc_result = paimon_write_builder_new_commit(wb);
         assert!(tc_result.error.is_null());
         let tc = tc_result.commit;
