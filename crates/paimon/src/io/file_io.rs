@@ -1987,10 +1987,10 @@ mod file_action_test {
     use super::*;
     use bytes::Bytes;
     use opendal::raw::{
-        oio, OpCopier, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite,
+        oio, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite,
         RpCreateDir, RpPresign, RpRename, RpStat, Service, ServiceInfo, Servicer,
     };
-    use opendal::{Capability, EntryMode, Metadata, OperationContext};
+    use opendal::{Capability, MetadataBuilder, OperationContext};
 
     #[derive(Debug)]
     struct CountingListProvider {
@@ -2025,6 +2025,7 @@ mod file_action_test {
         type Lister = CountingLister;
         type Deleter = ();
         type Copier = ();
+        type Composer = ();
 
         fn info(&self) -> ServiceInfo {
             ServiceInfo::with_scheme("counting")
@@ -2059,9 +2060,7 @@ mod file_action_test {
             }
             if let Some((calls, size)) = &self.stat_response {
                 calls.fetch_add(1, AtomicOrdering::SeqCst);
-                return Ok(RpStat::new(
-                    Metadata::new(EntryMode::FILE).with_content_length(*size),
-                ));
+                return Ok(RpStat::new(MetadataBuilder::file(*size).build()));
             }
             Err(unsupported_test_operation())
         }
@@ -2107,7 +2106,6 @@ mod file_action_test {
             _from: &str,
             _to: &str,
             _args: OpCopy,
-            _opts: OpCopier,
         ) -> opendal::Result<Self::Copier> {
             Err(unsupported_test_operation())
         }
@@ -2159,7 +2157,7 @@ mod file_action_test {
                 self.next += 1;
                 return Ok(Some(oio::Entry::new(
                     "objects/first.txt",
-                    Metadata::new(EntryMode::FILE).with_content_length(1),
+                    MetadataBuilder::file(1).build(),
                 )));
             }
 

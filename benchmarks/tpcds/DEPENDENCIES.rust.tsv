@@ -37,7 +37,7 @@ async-compression@0.4.42		X									X
 async-stream@0.3.6											X							
 async-stream-impl@0.3.6											X							
 async-trait@0.1.91		X									X							
-asyncband@0.6.7		X																
+asyncband@0.7.4		X																
 atoi@2.0.0											X							
 atomic-waker@1.1.2		X									X							
 autocfg@1.5.1		X									X							
@@ -292,11 +292,11 @@ object_store@0.13.2		X									X
 once_cell@1.21.4		X									X							
 once_cell_polyfill@1.70.2		X									X							
 oneshot@0.1.13		X									X							
-opendal-core@0.58.2		X																
-opendal-http-transport-reqwest@0.58.2		X																
-opendal-layer-retry@0.58.2		X																
-opendal-service-fs@0.58.2		X																
-opendal-service-oss@0.58.2		X																
+opendal-core@0.59.5		X																
+opendal-http-transport-reqwest@0.59.5		X																
+opendal-layer-retry@0.59.5		X																
+opendal-service-fs@0.59.5		X																
+opendal-service-oss@0.59.5		X																
 openssl@0.10.81		X																
 openssl-macros@0.1.1		X									X							
 openssl-probe@0.2.1		X									X							
@@ -342,7 +342,7 @@ prost@0.13.5		X
 prost-derive@0.13.5		X																
 psm@0.1.31		X									X							
 quad-rand@0.2.3											X							
-quick-xml@0.41.0											X							
+quick-xml@0.42.0											X							
 quote@1.0.47		X									X							
 r-efi@5.3.0		X								X	X							
 r-efi@6.0.0		X								X	X							
