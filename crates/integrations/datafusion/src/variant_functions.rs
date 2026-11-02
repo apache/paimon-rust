@@ -516,7 +516,7 @@ fn cast_to_f64(variant: VariantRef<'_>) -> DFResult<f64> {
     }
 }
 
-fn cast_to_string(variant: VariantRef<'_>) -> DFResult<String> {
+pub(crate) fn cast_to_string(variant: VariantRef<'_>) -> DFResult<String> {
     match variant.kind().map_err(to_df_error)? {
         VariantKind::Object | VariantKind::Array => variant.to_json().map_err(to_df_error),
         VariantKind::Boolean => Ok(variant.get_boolean().map_err(to_df_error)?.to_string()),

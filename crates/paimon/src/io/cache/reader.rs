@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn coalesced_shared_stripe_collisions_do_not_wait_on_self() {
+    async fn coalesced_shared_stripe_collisions_preserve_data_and_cache_hits() {
         let directory = tempfile::tempdir().unwrap();
         let block_size = 256 * 1024;
         let data = Bytes::from(vec![42; 32 * block_size]);
@@ -495,21 +495,24 @@ mod tests {
             data.len() as u64,
             cache.clone(),
         );
+        // The focused batch_download_locks_deduplicate_and_skip_busy_stripes test
+        // checks lock behavior. This end-to-end read also publishes 32 disk blocks;
+        // allow slower CI filesystems the same budget as the disjoint-read fixture.
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(30),
             reader.read(0..data.len() as u64),
         )
         .await
-        .expect("colliding stripes must not wait for their own lock timeout")
+        .expect("coalesced shared read must complete")
         .unwrap();
         assert_eq!(result, data);
         assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
         let _fills = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(30),
             cache.fill_slots.clone().acquire_many_owned(8),
         )
         .await
-        .unwrap()
+        .expect("shared cache background fills must complete")
         .unwrap();
         assert_eq!(reader.read(0..data.len() as u64).await.unwrap(), data);
         assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
