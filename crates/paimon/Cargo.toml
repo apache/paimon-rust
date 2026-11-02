@@ -121,7 +121,7 @@ ryu = "1"
 crc32fast = "1"
 zstd = "0.13"
 snap = "1"
-lz4_flex = "0.13"
+lz4_flex = "0.14"
 flate2 = "1"
 bzip2 = "0.6"
 liblzma = { version = "0.4", default-features = false, features = ["static"] }
