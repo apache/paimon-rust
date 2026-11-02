@@ -115,6 +115,7 @@ fn dynamic_write_rejects_custom_bucket_keys() {
 /// HashMap iteration order. Record physical data/index paths to verify ownership.
 #[derive(Debug)]
 struct FailSecondHash {
+    root: std::path::PathBuf,
     operator: opendal::Operator,
     indexes: std::sync::Mutex<Vec<String>>,
     data: std::sync::Mutex<Vec<String>>,
@@ -124,6 +125,12 @@ struct FailSecondHash {
 impl paimon::io::FileIOProvider for FailSecondHash {
     async fn create(&self, path: &str) -> paimon::Result<(opendal::Operator, String)> {
         let path = path.strip_prefix("file://").unwrap_or(path);
+        let relative = std::path::Path::new(path)
+            .strip_prefix(&self.root)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replace(std::path::MAIN_SEPARATOR, "/");
         let name = path.rsplit('/').next().unwrap();
         if name.starts_with("index-") && path.contains("/index/") {
             let mut indexes = self.indexes.lock().unwrap();
@@ -140,10 +147,7 @@ impl paimon::io::FileIOProvider for FailSecondHash {
         if name.ends_with(".parquet") {
             self.data.lock().unwrap().push(path.to_string());
         }
-        Ok((
-            self.operator.clone(),
-            path.trim_start_matches('/').to_string(),
-        ))
+        Ok((self.operator.clone(), relative))
     }
 }
 
@@ -156,8 +160,9 @@ async fn failed_hash_prepare_cleans_indexes_and_data() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut config = opendal_service_fs::FsConfig::default();
-    config.root = Some("/".into());
+    config.root = Some(tmp.path().to_str().unwrap().into());
     let provider = Arc::new(FailSecondHash {
+        root: tmp.path().to_path_buf(),
         operator: opendal::Operator::from_config(config).unwrap(),
         indexes: Default::default(),
         data: Default::default(),
@@ -211,8 +216,9 @@ async fn failed_later_prepare_preserves_returned_and_committed_files() {
     for publish_first in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = opendal_service_fs::FsConfig::default();
-        config.root = Some("/".into());
+        config.root = Some(tmp.path().to_str().unwrap().into());
         let provider = Arc::new(FailSecondHash {
+            root: tmp.path().to_path_buf(),
             operator: opendal::Operator::from_config(config).unwrap(),
             indexes: Default::default(),
             data: Default::default(),
