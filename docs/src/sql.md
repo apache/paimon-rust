@@ -2044,6 +2044,25 @@ column masks it returns (see `create_policy`) are applied to the result:
 - Time travel, branches, system tables, incremental and audit-log reads, and
   search are refused on such tables.
 
+### Regular expression operators
+
+SQLContext supports `value RLIKE pattern`, `value REGEXP pattern`, and their
+`NOT` forms in queries, expressions, views and SQL functions. They use
+DataFusion's native case-sensitive regex matching: a match may occur anywhere
+unless the pattern contains anchors. Inline flags such as `(?i)` can change
+case sensitivity.
+
+```sql
+SELECT phone RLIKE '^1[3-9][0-9]{9}$' FROM users;
+SELECT name NOT REGEXP '(?i)^test';
+```
+
+Patterns use Rust regex syntax, including its restrictions on look-around and
+backreferences. A NULL value or pattern produces SQL NULL; an invalid pattern
+reports an error. Operator text inside strings, comments and quoted identifiers
+is not interpreted as SQL syntax. Persistent Paimon view and function definitions
+retain their portable SQL text.
+
 ## Python Multimodal Helper Functions
 
 When you use `pypaimon_rust.datafusion.SQLContext`, the Python binding registers a small set of scalar helper functions for BLOB-backed media and vector workflows. These helpers are Python-binding built-ins; they are not registered by the Rust `paimon_datafusion::SQLContext`.
