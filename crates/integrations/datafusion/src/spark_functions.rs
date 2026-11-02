@@ -358,10 +358,13 @@ impl Inputs {
     }
 }
 fn decoded(mut ty: &DataType) -> &DataType {
-    while let DataType::Dictionary(_, value) = ty {
-        ty = value;
+    loop {
+        ty = match ty {
+            DataType::Dictionary(_, value) => value,
+            DataType::RunEndEncoded(_, value) => value.data_type(),
+            _ => return ty,
+        };
     }
-    ty
 }
 impl ScalarUDFImpl for Inputs {
     fn name(&self) -> &str {

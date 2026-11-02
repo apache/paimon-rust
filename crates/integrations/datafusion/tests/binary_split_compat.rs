@@ -113,3 +113,49 @@ async fn binary_functions_decode_dictionary_value_and_key_nulls() {
         .await;
     }
 }
+
+#[tokio::test]
+async fn byte_lengths_preserve_run_end_encoded_strings_and_slices() {
+    use datafusion::arrow::array::{
+        Array, ArrayRef, Int32Array, RecordBatch, RunArray, StringArray,
+    };
+    use datafusion::arrow::compute::cast;
+    use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema};
+    use std::sync::Arc;
+
+    for ty in [DataType::Utf8, DataType::Utf8View, DataType::LargeUtf8] {
+        let ctx = SQLContext::new();
+        let values = cast(&StringArray::from(vec![Some("中a"), None, Some("")]), &ty).unwrap();
+        let runs: ArrayRef = Arc::new(
+            RunArray::<Int32Type>::try_new(&Int32Array::from(vec![2, 3, 5]), values.as_ref())
+                .unwrap(),
+        );
+        for (name, values, expected) in [
+            (
+                "runs",
+                Arc::clone(&runs),
+                &["4|32", "4|32", "NULL|NULL", "0|0", "0|0"][..],
+            ),
+            (
+                "sliced_runs",
+                runs.slice(1, 3),
+                &["4|32", "NULL|NULL", "0|0"][..],
+            ),
+        ] {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "s",
+                values.data_type().clone(),
+                true,
+            )]));
+            ctx.ctx()
+                .register_batch(name, RecordBatch::try_new(schema, vec![values]).unwrap())
+                .unwrap();
+            check(
+                &ctx,
+                &format!("SELECT octet_length(s),bit_length(s) FROM {name}"),
+                expected,
+            )
+            .await;
+        }
+    }
+}
