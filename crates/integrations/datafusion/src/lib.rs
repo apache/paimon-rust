@@ -56,6 +56,7 @@ mod golden_warehouse;
 mod hybrid_search;
 mod json_functions;
 mod lateral_vector_search;
+mod lateral_views;
 mod memory;
 mod merge_condition;
 mod merge_into;
