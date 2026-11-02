@@ -238,7 +238,11 @@ fn lower_aggregate(call: &Function, name: &str) -> Result<Expr> {
                 {
                     return Err(error("Specify LISTAGG ordering only once"));
                 }
-                let order = std::mem::take(&mut lowered.within_group);
+                let mut order = std::mem::take(&mut lowered.within_group);
+                // Ordered-set literals are values, not SELECT-list positions.
+                for key in &mut order {
+                    key.expr = Expr::Nested(Box::new(key.expr.clone()));
+                }
                 if let FunctionArguments::List(list) = &mut lowered.args {
                     list.clauses.push(FunctionArgumentClause::OrderBy(order));
                 }

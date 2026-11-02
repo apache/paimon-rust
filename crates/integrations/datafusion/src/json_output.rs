@@ -122,7 +122,7 @@ impl ScalarUDFImpl for Output {
     }
     fn coerce_types(&self, types: &[DataType]) -> Result<Vec<DataType>> {
         if self.kind == Kind::Object {
-            if types.len() % 2 != 0 {
+            if !types.len().is_multiple_of(2) {
                 return Err(DataFusionError::Plan(
                     "json_object requires key/value pairs".into(),
                 ));
@@ -160,7 +160,7 @@ impl ScalarUDFImpl for Output {
         for row in 0..len {
             if self.kind == Kind::Object {
                 let mut fields = BTreeMap::new();
-                for pair in arrays.chunks_exact(2) {
+                for pair in arrays.as_chunks::<2>().0 {
                     if pair[0].is_null(row) {
                         return Err(error("json_object keys cannot be NULL"));
                     }

@@ -171,13 +171,13 @@ async fn ddl_compatibility_respects_name_resolution_and_does_not_mutate_shadowed
         .await
         .iter()
         .any(|r| r[0] == "id"));
-    ctx.sql("CREATE TEMP VIEW default.shadow AS SELECT 99 AS id")
+    ctx.sql("CREATE TEMP VIEW default.shadow AS SELECT 99 AS temp_only")
         .await
         .unwrap();
     assert!(rows(&ctx, "DESCRIBE TABLE EXTENDED DEFAULT.SHADOW")
         .await
         .iter()
-        .any(|r| r[0] == "id"));
+        .any(|r| r[0] == "temp_only"));
     rejects(&ctx, "ALTER TABLE default.shadow MODIFY COLUMN id BIGINT").await;
     assert_eq!(
         catalog.get_table(&id).await.unwrap().schema().fields(),
@@ -248,6 +248,7 @@ async fn compatible_aggregates_preserve_null_filter_and_ordering_contracts() {
     assert_eq!(rows(&ctx,"SELECT max_by(v,k),min_by(v,k),arg_max(v,k) FROM (VALUES ('ignored',NULL),('a',1),('b',2),(NULL,3)) t(v,k)").await,vec![vec!["NULL","a","b"]]);
     assert_eq!(rows(&ctx,"SELECT max_by(v,k),min_by(v,k),arg_max(v,k) FROM (VALUES ('a',CAST(NULL AS INT))) t(v,k)").await,vec![vec!["NULL","NULL","NULL"]]);
     assert_eq!(rows(&ctx,"SELECT max_by(v,k) FILTER (WHERE k<3),listagg(v,',') WITHIN GROUP (ORDER BY k DESC) FROM (VALUES ('a',1),('b',2),(NULL,3)) t(v,k)").await,vec![vec!["b","b,a"]]);
+    assert_eq!(rows(&ctx,"SELECT listagg(v,',') WITHIN GROUP (ORDER BY 100),listagg(v,',') WITHIN GROUP (ORDER BY 0) FROM (VALUES ('a'),('a')) t(v)").await,vec![vec!["a,a","a,a"]]);
     assert_eq!(rows(&ctx,"SELECT array_length(collect_list(v)),array_length(collect_list(DISTINCT v)),listagg(v,',') WITHIN GROUP (ORDER BY v) FROM (VALUES ('b'),(NULL),('a'),('a')) t(v)").await,vec![vec!["3","2","a,a,b"]]);
     assert_eq!(rows(&ctx,"SELECT array_length(collect_list(v)),count_if(p),any(p) FROM (VALUES (CAST(NULL AS INT),CAST(NULL AS BOOLEAN))) t(v,p) WHERE FALSE").await,vec![vec!["0","0","NULL"]]);
     assert_eq!(rows(&ctx,"SELECT k,count_if(p) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM (VALUES (1,TRUE),(2,FALSE),(3,TRUE)) t(k,p) ORDER BY k").await,vec![vec!["1","1"],vec!["2","1"],vec!["3","2"]]);
