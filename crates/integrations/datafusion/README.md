@@ -32,6 +32,11 @@ functions with the same name; application registrations made afterward take
 priority. Paimon-specific Variant functions, metadata SQL and compatibility
 extensions remain available.
 
+Additional adapters cover binary length/slicing and null-safe comparison
+precedence. `approx_percentile`/`percentile_approx` use Spark's mergeable GK
+summaries, with scalar/array percentages, accuracy, DISTINCT and window support.
+The separate `split_index` extension follows Flink's zero-based contract.
+
 The [SQL guide](../../../docs/src/sql.md#spark-compatible-functions) describes
 the supported subset and migration differences, including legacy `size(NULL)`
 behavior, ANSI remainder handling and date-difference result types. This package

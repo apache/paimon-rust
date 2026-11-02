@@ -2044,6 +2044,51 @@ aggregates and the additional functions documented below remain available.
 This enables the upstream function subset; it does not enable every Spark SQL
 syntax, cast mode or configuration option.
 
+SQLContext also fills these gaps in the pinned upstream version:
+
+- `octet_length` and `bit_length` accept strings and binary values and return
+  Spark INT results, including for Arrow large-offset representations. String
+  lengths count UTF-8 bytes; `length` continues to count characters for strings.
+  Fixed-size and dictionary binary inputs work with length functions and both
+  function-call and SQL `SUBSTRING` syntax without decoding bytes as text.
+- `IS [NOT] DISTINCT FROM` binds more tightly than `NOT`, `AND` and `OR`.
+  Explicit parentheses retain their meaning in queries, DML, functions and views.
+
+### Approximate percentiles
+
+`approx_percentile(value, percentage[, accuracy])` and its `percentile_approx`
+alias follow Spark's Greenwald–Khanna summaries. They select ranked values rather
+than interpolating as `approx_percentile_cont` does. `percentage` is a foldable
+number or array of numbers between 0 and 1. Arrays preserve the requested order
+and repeated percentages. NULL percentages or array elements are rejected.
+`accuracy` is a foldable integer from 1 through 2147483647, defaults to 10000,
+and controls relative rank error as `1 / accuracy`. It is not a T-Digest centroid
+count. Invalid parameters are rejected even for empty grouped inputs.
+
+NULL input values are ignored. Empty or all-NULL groups and empty percentage
+arrays return typed NULL. Results retain the numeric, decimal, date, timestamp
+or interval input type; dates use Date32 and timestamps use microseconds.
+Like Spark, the summary converts values through DOUBLE, so large integers and
+decimals can reflect floating-point rounding. Decimal results reuse Paimon's
+Java 8/11/17 numeric conversion and half-up rescaling. Mixed calendar intervals
+and intervals outside Spark's BIGINT microsecond range are rejected.
+
+Partial aggregation, FILTER, DISTINCT and window frames are supported. DISTINCT
+retains unique input values across partial states. Moving windows retain and
+recompute the active frame because a quantile summary cannot subtract rows;
+their memory and work grow with the frame size.
+Growing windows keep incremental summaries. As in Spark, window calls reject
+DISTINCT and FILTER. RESPECT NULLS is accepted and has the default behavior;
+IGNORE NULLS is rejected for both aggregates and windows.
+
+### Split-index extension
+
+`split_index(text, delimiter, index)` provides Flink's zero-based splitting
+contract without changing Spark `split` or one-based `split_part`. The delimiter
+is literal and empty pieces are preserved. NULL arguments, an empty input,
+negative indexes and indexes outside the result return NULL. An empty delimiter
+uses Java whitespace as the separator.
+
 ### Aggregate compatibility
 
 SQLContext accepts the following aggregates in queries and view definitions.
