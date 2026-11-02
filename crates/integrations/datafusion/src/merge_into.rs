@@ -1548,9 +1548,10 @@ async fn build_source_partition_set(
     }
     if !can_prune_target_by_source_partitions(
         partition_keys,
-        &t_alias.value,
-        &s_alias.value,
+        t_alias,
+        s_alias,
         on_expr,
+        ctx.ctx().enable_ident_normalization(),
     ) {
         return Ok(None);
     }
@@ -1572,13 +1573,23 @@ async fn build_source_partition_set(
 
 fn can_prune_target_by_source_partitions(
     partition_keys: &[String],
-    t_alias: &str,
-    s_alias: &str,
+    t_alias: &Ident,
+    s_alias: &Ident,
     on_expr: &SqlExpr,
+    enable_ident_normalization: bool,
 ) -> bool {
-    partition_keys
-        .iter()
-        .all(|key| on_expr_contains_alias_column_eq(on_expr, t_alias, key, s_alias, key))
+    let t_alias = normalize_schema_identifier(t_alias, enable_ident_normalization);
+    let s_alias = normalize_schema_identifier(s_alias, enable_ident_normalization);
+    partition_keys.iter().all(|key| {
+        on_expr_contains_alias_column_eq(
+            on_expr,
+            &t_alias,
+            key,
+            &s_alias,
+            key,
+            enable_ident_normalization,
+        )
+    })
 }
 
 fn on_expr_contains_alias_column_eq(
@@ -1587,6 +1598,7 @@ fn on_expr_contains_alias_column_eq(
     left_column: &str,
     right_alias: &str,
     right_column: &str,
+    enable_ident_normalization: bool,
 ) -> bool {
     match expr {
         SqlExpr::BinaryOp {
@@ -1600,12 +1612,14 @@ fn on_expr_contains_alias_column_eq(
                 left_column,
                 right_alias,
                 right_column,
+                enable_ident_normalization,
             ) || on_expr_contains_alias_column_eq(
                 right,
                 left_alias,
                 left_column,
                 right_alias,
                 right_column,
+                enable_ident_normalization,
             )
         }
         SqlExpr::BinaryOp {
@@ -1613,26 +1627,40 @@ fn on_expr_contains_alias_column_eq(
             op: BinaryOperator::Eq,
             right,
         } => {
-            is_alias_column(left, left_alias, left_column)
-                && is_alias_column(right, right_alias, right_column)
-                || is_alias_column(left, right_alias, right_column)
-                    && is_alias_column(right, left_alias, left_column)
+            is_alias_column(left, left_alias, left_column, enable_ident_normalization)
+                && is_alias_column(right, right_alias, right_column, enable_ident_normalization)
+                || is_alias_column(left, right_alias, right_column, enable_ident_normalization)
+                    && is_alias_column(right, left_alias, left_column, enable_ident_normalization)
         }
         _ => false,
     }
 }
 
-fn is_alias_column(expr: &SqlExpr, alias: &str, column: &str) -> bool {
+fn is_alias_column(
+    expr: &SqlExpr,
+    alias: &str,
+    column: &str,
+    enable_ident_normalization: bool,
+) -> bool {
     match expr {
-        SqlExpr::CompoundIdentifier(parts) => is_qualified_column(parts, alias, column),
+        SqlExpr::CompoundIdentifier(parts) => {
+            is_qualified_column(parts, alias, column, enable_ident_normalization)
+        }
         _ => false,
     }
 }
 
-fn is_qualified_column(parts: &[Ident], alias: &str, column: &str) -> bool {
+fn is_qualified_column(
+    parts: &[Ident],
+    alias: &str,
+    column: &str,
+    enable_ident_normalization: bool,
+) -> bool {
+    // Aliases and expression identifiers follow the session's SQL rules;
+    // partition column names already contain the exact catalog spelling.
     parts.len() == 2
-        && parts[0].value.eq_ignore_ascii_case(alias)
-        && parts[1].value.eq_ignore_ascii_case(column)
+        && normalize_schema_identifier(&parts[0], enable_ident_normalization) == alias
+        && normalize_schema_identifier(&parts[1], enable_ident_normalization) == column
 }
 
 /// Replace table qualifiers in column references, leaving literals and column names intact.
@@ -1933,9 +1961,10 @@ mod tests {
 
         assert!(!can_prune_target_by_source_partitions(
             &partition_keys,
-            "t",
-            "s",
+            &Ident::new("t"),
+            &Ident::new("s"),
             &merge.on,
+            true,
         ));
     }
 
@@ -1949,9 +1978,10 @@ mod tests {
 
         assert!(can_prune_target_by_source_partitions(
             &partition_keys,
-            "t",
-            "s",
+            &Ident::new("t"),
+            &Ident::new("s"),
             &merge.on,
+            true,
         ));
     }
 
@@ -1965,10 +1995,47 @@ mod tests {
 
         assert!(can_prune_target_by_source_partitions(
             &partition_keys,
-            "t",
-            "s",
+            &Ident::new("t"),
+            &Ident::new("s"),
             &merge.on,
+            true,
         ));
+    }
+
+    #[test]
+    fn test_source_partition_pruning_normalizes_identifiers() {
+        for (target, source, condition, partition_key, normalize, expected) in [
+            ("T", "S", "t.PT = S.pt", "pt", true, true),
+            ("T", "S", "T.pt = S.pt", "pt", false, true),
+            ("T", "S", "t.pt = S.pt", "pt", false, false),
+            ("\"t\"", "S", "T.pt = s.pt", "pt", true, true),
+            ("\"T\"", "\"t\"", "\"T\".pt = \"t\".pt", "pt", true, true),
+            ("\"T\"", "\"t\"", "\"t\".pt = \"t\".pt", "pt", true, false),
+            ("\"T\"", "\"t\"", "\"t\".pt = \"t\".pt", "pt", false, false),
+            ("T", "t", "t.pt = t.pt", "pt", false, false),
+            ("t", "s", "t.\"PT\" = s.\"PT\"", "pt", true, false),
+            ("t", "s", "t.\"PT\" = s.\"PT\"", "PT", true, true),
+            ("t", "s", "t.PT = s.PT", "pt", false, false),
+            ("t", "s", "t.PT = s.PT", "PT", false, true),
+        ] {
+            let merge = parse_merge(&format!(
+                "MERGE INTO target AS {target} USING source AS {source} \
+                 ON {condition} WHEN MATCHED THEN DELETE"
+            ));
+            let (_, target_alias) = extract_table_ref(&merge.table).unwrap();
+            let (_, source_alias) = extract_source_ref(&merge.source).unwrap();
+            assert_eq!(
+                can_prune_target_by_source_partitions(
+                    &[partition_key.to_string()],
+                    &target_alias.unwrap(),
+                    &source_alias.unwrap(),
+                    &merge.on,
+                    normalize,
+                ),
+                expected,
+                "{condition}, partition: {partition_key}, normalize: {normalize}",
+            );
+        }
     }
 
     #[tokio::test]
@@ -2835,6 +2902,93 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cow_merge_partition_pruning_respects_identifier_rules() {
+        for (target_alias, source_alias, predicate, normalize) in [
+            ("\"T\"", "\"t\"", "\"t\".value = \"t\".value", true),
+            ("\"T\"", "\"t\"", "\"t\".value = \"t\".value", false),
+            ("T", "t", "t.value = t.value", false),
+            ("t", "s", "t.\"VALUE\" = s.\"VALUE\"", true),
+        ] {
+            let (_tmp, ctx, _catalog) = setup_sql_context().await;
+            ctx.sql(&format!(
+                "SET datafusion.sql_parser.enable_ident_normalization = {normalize}"
+            ))
+            .await
+            .unwrap();
+            for sql in [
+                "CREATE TABLE paimon.test_db.t_partition_aliases (id INT, name VARCHAR, value INT, \"VALUE\" INT) PARTITIONED BY (value)",
+                "CREATE TABLE paimon.test_db.source (id INT, name VARCHAR, value INT, \"VALUE\" INT)",
+                "INSERT INTO paimon.test_db.t_partition_aliases VALUES (1, 'old', 1, 7)",
+                "INSERT INTO paimon.test_db.source VALUES (1, 'new', 2, 7)",
+            ] {
+                ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            }
+            let prefix = format!(
+                "MERGE INTO paimon.test_db.t_partition_aliases AS {target_alias} \
+                 USING paimon.test_db.source AS {source_alias} \
+                 ON {target_alias}.id = {source_alias}.id AND {predicate}"
+            );
+            let result = ctx
+                .sql(&format!(
+                    "{prefix} WHEN MATCHED THEN UPDATE SET name = {source_alias}.name \
+                     WHEN NOT MATCHED THEN INSERT (id, name, value, \"VALUE\") \
+                     VALUES ({source_alias}.id, {source_alias}.name, {source_alias}.value, {source_alias}.\"VALUE\")"
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                result[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0),
+                1,
+            );
+            let batches = ctx
+                .sql("SELECT id, name, value FROM paimon.test_db.t_partition_aliases")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                collect_rows(&batches),
+                vec![(1, "new".to_string(), 1)],
+                "{prefix}"
+            );
+
+            let result = ctx
+                .sql(&format!("{prefix} WHEN MATCHED THEN DELETE"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                result[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0),
+                1,
+            );
+            let batches = ctx
+                .sql("SELECT id, name, value FROM paimon.test_db.t_partition_aliases")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert!(collect_rows(&batches).is_empty(), "{prefix}");
         }
     }
 
