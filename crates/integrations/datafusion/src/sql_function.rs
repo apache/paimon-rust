@@ -61,7 +61,8 @@ async fn expand_sql_internal(
     current_database: &str,
     candidate: Option<&Function>,
 ) -> DFResult<String> {
-    let parseable = crate::regex_operators::parseable_sql(sql)?;
+    let regex_sql = crate::regex_operators::parseable_sql(sql)?;
+    let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
     let mut statements = Parser::parse_sql(&GenericDialect {}, parseable.as_ref())
         .map_err(|error| DataFusionError::Plan(format!("Invalid REST SQL: {error}")))?;
     if statements.len() != 1 {
@@ -149,6 +150,7 @@ async fn expand_statement_internal(
     max_expanded_calls: usize,
     candidate: Option<&Function>,
 ) -> DFResult<Statement> {
+    crate::lateral_views::rewrite(&mut statement)?;
     let candidate_reference =
         candidate.map(|function| (current_catalog.to_string(), function.identifier().clone()));
     let mut functions = HashMap::new();

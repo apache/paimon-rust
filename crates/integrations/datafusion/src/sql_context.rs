@@ -158,9 +158,10 @@ impl SQLContextBuilder {
             .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
             .with_type_planner(Arc::new(crate::binary_cast::BinaryTypePlanner))
-            .with_relation_planners(vec![Arc::new(
-                crate::relation_planner::PaimonRelationPlanner::new(),
-            )])
+            .with_relation_planners(vec![
+                Arc::new(crate::lateral_views::ExplodeRelationPlanner),
+                Arc::new(crate::relation_planner::PaimonRelationPlanner::new()),
+            ])
             .with_optimizer_rules(crate::lateral_vector_search::optimizer_rules())
             .with_query_planner(Arc::new(
                 crate::lateral_vector_search::PaimonQueryPlanner::new(),
@@ -172,6 +173,7 @@ impl SQLContextBuilder {
         let ctx = SessionContext::new_with_state(state);
         crate::compat_functions::register_compat_functions(&ctx);
         crate::binary_cast::register(&ctx);
+        crate::lateral_views::register(&ctx);
         crate::scalar_compat::register(&ctx);
         crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
@@ -501,7 +503,8 @@ impl SQLContext {
         let changed = !persistent_definition && {
             let binary_changed = crate::binary_cast::rewrite(&mut statements[0])?;
             let regex_changed = crate::regex_operators::rewrite(&mut statements[0]);
-            binary_changed || regex_changed
+            let lateral_changed = crate::lateral_views::rewrite(&mut statements[0])?;
+            binary_changed || regex_changed || lateral_changed
         };
         let sql = if changed {
             rewritten = statements[0].to_string();
@@ -2692,7 +2695,8 @@ fn validate_persistent_create_function(create_function: &CreateFunction) -> DFRe
 }
 
 fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
-    let parseable = crate::regex_operators::parseable_sql(sql)?;
+    let regex_sql = crate::regex_operators::parseable_sql(sql)?;
+    let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
     let sql = parseable.as_ref();
     let dialect = GenericDialect {};
     let mut tokens = Tokenizer::new(&dialect, sql)
