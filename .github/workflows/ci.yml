@@ -240,6 +240,9 @@ jobs:
     env:
       RUST_LOG: DEBUG
       RUST_BACKTRACE: full
+      # DataFusion builds default and Vortex test binaries on the same runner.
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
 
@@ -250,9 +253,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: integration-${{ matrix.suite }}-${{ runner.os }}-line-tables-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            integration-${{ runner.os }}-
+            integration-${{ matrix.suite }}-${{ runner.os }}-line-tables-
 
       - name: Rust Integration Test
         if: matrix.suite == 'rust'
