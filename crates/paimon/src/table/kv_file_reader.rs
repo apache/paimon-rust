@@ -243,15 +243,16 @@ fn repeats_a_key(
         let column = batch.column(index);
         if let Some(previous) = previous.filter(|_| at_boundary) {
             let last = previous.column(index).slice(previous.num_rows() - 1, 1);
-            match arrow_ord::cmp::eq(&last, &column.slice(0, 1)) {
+            match arrow_ord::cmp::not_distinct(&last, &column.slice(0, 1)) {
                 Ok(equal) => at_boundary = equal.true_count() == 1,
                 Err(_) => return true,
             }
         }
         if rows > 1 {
-            let Ok(equal) =
-                arrow_ord::cmp::eq(&column.slice(0, rows - 1), &column.slice(1, rows - 1))
-            else {
+            let Ok(equal) = arrow_ord::cmp::not_distinct(
+                &column.slice(0, rows - 1),
+                &column.slice(1, rows - 1),
+            ) else {
                 return true;
             };
             adjacent = Some(match adjacent {
@@ -2322,6 +2323,17 @@ mod tests {
         builder.build_serialized()
     }
 
+    fn nullable_int_key(value: Option<i32>) -> Vec<u8> {
+        match value {
+            Some(value) => int_key(value),
+            None => {
+                let mut builder = crate::spec::BinaryRowBuilder::new(1);
+                builder.set_null_at(0);
+                builder.build_serialized()
+            }
+        }
+    }
+
     async fn write_multi_row_group_kv_file(
         file_io: &FileIO,
         table_path: &str,
@@ -3118,6 +3130,20 @@ mod tests {
         file_name: &str,
         rows: &[(i32, i64, i32)],
     ) -> DataFileMeta {
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|&(id, seq, value)| (Some(id), seq, value))
+            .collect();
+        write_kv_nullable_versions(file_io, table_path, file_name, &rows).await
+    }
+
+    /// Like `write_kv_versions`, with a nullable `id`.
+    async fn write_kv_nullable_versions(
+        file_io: &FileIO,
+        table_path: &str,
+        file_name: &str,
+        rows: &[(Option<i32>, i64, i32)],
+    ) -> DataFileMeta {
         let schema = crate::arrow::build_target_arrow_schema(&[
             DataField::new(
                 SEQUENCE_NUMBER_FIELD_ID,
@@ -3138,7 +3164,7 @@ mod tests {
             vec![
                 Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.1))),
                 Arc::new(Int8Array::from_value(0, rows.len())),
-                Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(Int32Array::from_iter(rows.iter().map(|row| row.0))),
                 Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.2))),
             ],
         )
@@ -3161,8 +3187,8 @@ mod tests {
         let mut file = dummy_data_file(file_name.to_string());
         file.file_size = bytes.len() as i64;
         file.row_count = rows.len() as i64;
-        file.min_key = int_key(rows[0].0);
-        file.max_key = int_key(rows[rows.len() - 1].0);
+        file.min_key = nullable_int_key(rows[0].0);
+        file.max_key = nullable_int_key(rows[rows.len() - 1].0);
         file.min_sequence_number = rows.iter().map(|row| row.1).min().unwrap();
         file.max_sequence_number = rows.iter().map(|row| row.1).max().unwrap();
         file
@@ -3289,6 +3315,86 @@ mod tests {
         let batches = read_kv_split(&table, split).await;
         assert_eq!(int_column(&batches, "id"), vec![1, 2, 3]);
         assert_eq!(int_column(&batches, "value"), vec![10, 21, 30]);
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_repeated_keys_under_first_row() {
+        // First-row reads carry the file level next to the merge input, so the
+        // switch to merging has to use that schema too. The first version wins.
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_repeated_keys_first_row";
+        let table = pk_table(&file_io, table_path, &[("merge-engine", "first-row")]);
+        write_schema_file(&table, table.schema()).await;
+        let a = write_kv_versions(
+            &file_io,
+            table_path,
+            "a.parquet",
+            &[(1, 0, 10), (2, 1, 20), (2, 2, 21), (3, 3, 30)],
+        )
+        .await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![a])
+            .build()
+            .unwrap();
+        let batches = read_kv_split(&table, split).await;
+        assert_eq!(int_column(&batches, "id"), vec![1, 2, 3]);
+        assert_eq!(int_column(&batches, "value"), vec![10, 20, 30]);
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_repeated_null_keys() {
+        // NULL == NULL is NULL under plain equality, so a repeated NULL key needs
+        // the null-safe comparison. Batch size 64 repeats it inside one batch, 1
+        // repeats it across a batch boundary.
+        for batch_size in ["64", "1"] {
+            let file_io = test_file_io();
+            let table_path = format!("memory:/kv_repeated_null_keys_{batch_size}");
+            let table = pk_table(
+                &file_io,
+                &table_path,
+                &[
+                    ("primary-key.nullable", "true"),
+                    ("read.batch-size", batch_size),
+                ],
+            );
+            write_schema_file(&table, table.schema()).await;
+            let a = write_kv_nullable_versions(
+                &file_io,
+                &table_path,
+                "a.parquet",
+                &[(None, 0, 10), (None, 1, 11), (Some(2), 2, 20)],
+            )
+            .await;
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(format!("{table_path}/bucket-0"))
+                .with_total_buckets(1)
+                .with_data_files(vec![a])
+                .build()
+                .unwrap();
+            let batches = read_kv_split(&table, split).await;
+            let ids: Vec<Option<i32>> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch.column(batch.schema().index_of("id").unwrap());
+                    let ids = column.as_any().downcast_ref::<Int32Array>().unwrap();
+                    ids.iter().collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(ids, vec![None, Some(2)], "batch size {batch_size}");
+            assert_eq!(
+                int_column(&batches, "value"),
+                vec![11, 20],
+                "batch size {batch_size}"
+            );
+        }
     }
 
     #[tokio::test]
