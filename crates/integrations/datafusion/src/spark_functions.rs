@@ -32,7 +32,7 @@ use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 
 // Normalize integration input types; all evaluation and simplification remain upstream.
-pub(crate) fn register(ctx: &SessionContext) {
+pub(crate) fn apply_compatibility_fixes(ctx: &SessionContext) {
     for name in [
         "base64",
         "sha2",
