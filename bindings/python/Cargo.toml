@@ -37,7 +37,7 @@ datafusion = { workspace = true }
 datafusion-ffi = { workspace = true }
 futures = "0.3"
 paimon = { path = "../../crates/paimon", features = ["storage-all", "internal-api"] }
-paimon-datafusion = { path = "../../crates/integrations/datafusion", features = ["fulltext"] }
+paimon-datafusion = { path = "../../crates/integrations/datafusion" }
 paimon-vindex-core = "0.5.0"
 pyo3 = { version = "0.28", features = ["abi3-py310", "chrono"] }
 roaring = "0.11"

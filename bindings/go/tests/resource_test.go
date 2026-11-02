@@ -21,7 +21,6 @@ package paimon_test
 
 import (
 	"errors"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -165,10 +164,6 @@ func TestWriteBuildersShareResourceBudget(t *testing.T) {
 }
 
 func TestPostponeWriteBuilderWithResourceBudget(t *testing.T) {
-	warehouse := testWarehouse()
-	if _, err := os.Stat(filepath.Join(warehouse, "default.db", "postpone_fixed_bucket_pk_table")); os.IsNotExist(err) {
-		t.Skip("postpone fixed-bucket test table is unavailable")
-	}
 	table := openCopiedTable(t, "postpone_fixed_bucket_pk_table")
 	resources, err := paimon.NewResourceContext(0)
 	if err != nil {

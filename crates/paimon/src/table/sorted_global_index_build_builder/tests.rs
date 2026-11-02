@@ -16,6 +16,85 @@
 // under the License.
 
 use super::*;
+
+#[tokio::test]
+async fn direct_scalar_builder_normalizes_native_type_and_manifest_together() {
+    use crate::spec::IndexManifestEntry;
+    use crate::table::global_index_scanner::GlobalIndexScanner;
+    for (configured, canonical) in [("BTREE", "btree"), ("Bitmap", "bitmap"), ("FM", "fm")] {
+        let table = test_table_with_path(
+            &format!("memory:/scalar_type_case/{}", uuid::Uuid::new_v4()),
+            table_options("10"),
+        );
+        setup_dirs(&table).await;
+        let mut write = TableWrite::new(&table, "case-source".into()).unwrap();
+        write
+            .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "alice"]))
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "case-source".into())
+            .commit(write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        let mut build = SortedGlobalIndexBuildBuilder::new(&table);
+        build
+            .with_index_columns(&["name"])
+            .with_index_type(configured)
+            .with_options(HashMap::from([(
+                "fm-index.sa-sample-rate".into(),
+                "1".into(),
+            )]));
+        let (_, messages) = build.prepare().await.unwrap();
+        let entries = messages
+            .iter()
+            .flat_map(|message| {
+                message.new_index_files.iter().map(|file| {
+                    assert_eq!(file.index_type, canonical);
+                    assert!(file
+                        .file_name
+                        .starts_with(&format!("{canonical}-global-index-")));
+                    IndexManifestEntry {
+                        kind: FileKind::Add,
+                        partition: message.partition.clone(),
+                        bucket: message.bucket,
+                        index_file: file.clone(),
+                        version: 1,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let scanner = GlobalIndexScanner::create_with_fm_options(
+            table.file_io(),
+            table.location(),
+            1,
+            i64::MAX,
+            128 * 1024 * 1024,
+            i64::MAX,
+            &entries,
+            table.schema().fields(),
+            crate::fm_index::FMReadOptions {
+                locate_cost_ratio: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let predicates = PredicateBuilder::new(table.schema().fields());
+        let predicate = if canonical == "fm" {
+            predicates
+                .contains("name", Datum::String("bo".into()))
+                .unwrap()
+        } else {
+            predicates
+                .equal("name", Datum::String("bob".into()))
+                .unwrap()
+        };
+        assert_eq!(
+            scanner.matching_ranges(&predicate).await.unwrap(),
+            Some(vec![RowRange::new(1, 1)])
+        );
+    }
+}
 use crate::btree::{BTreeFileFooter, BTreeIndexMeta};
 use crate::catalog::Identifier;
 use crate::io::FileIOBuilder;
@@ -42,14 +121,23 @@ use std::sync::Arc;
 /// rejected, and an inverted or overflowing range is still an error.
 #[test]
 fn checked_row_count_spans_beyond_i32() {
+    let checked_row_count = |start, end| {
+        // Persisted ranges can bypass RowRange::new's ordering assertion.
+        let range = serde_json::from_value::<RowRange>(serde_json::json!({
+            "from": start,
+            "to": end,
+        }))
+        .unwrap();
+        crate::table::index_build::row_count(&range)
+    };
     let start = 0;
     let end = i64::from(i32::MAX) + 10;
     assert_eq!(
-        super::checked_row_count(start, end).unwrap(),
+        checked_row_count(start, end).unwrap(),
         i64::from(i32::MAX) + 11
     );
-    assert!(super::checked_row_count(5, 4).is_err());
-    assert!(super::checked_row_count(i64::MIN, i64::MAX).is_err());
+    assert!(checked_row_count(5, 4).is_err());
+    assert!(checked_row_count(i64::MIN, i64::MAX).is_err());
 }
 
 fn data_file(name: &str, first_row_id: Option<i64>, row_count: i64) -> DataFileMeta {
@@ -118,6 +206,7 @@ fn test_table(options: HashMap<String, String>) -> Table {
 
 fn test_table_with_path(table_path: &str, options: HashMap<String, String>) -> Table {
     let schema = Schema::builder()
+        .option("write-only", "true")
         .column("id", DataType::Int(IntType::new()))
         .column("name", DataType::VarChar(VarCharType::string_type()))
         .options(options)
@@ -833,14 +922,18 @@ async fn scalar_build_with_deletion_vectors_preserves_physical_coverage() {
 #[tokio::test]
 async fn test_execute_writes_btree_index_manifest_and_file() {
     for version in [1, 2] {
-        assert_btree_build_version(version).await;
+        for budget in ["128b", "64mb"] {
+            assert_btree_build_version(version, budget).await;
+        }
     }
 }
 
-async fn assert_btree_build_version(version: u32) {
+async fn assert_btree_build_version(version: u32, budget: &str) {
     let table_path = "memory:/test_btree_global_index_builder_e2e";
     let mut options = table_options("10");
+    options.insert("read.batch-size".into(), "1".into());
     options.insert("btree-index.file-version".into(), version.to_string());
+    options.insert("write-buffer-size".into(), budget.to_string());
     options.insert(
         "btree-index.bloom-filter.enabled".to_string(),
         "true".to_string(),
@@ -1632,7 +1725,9 @@ async fn test_detail_mode_defers_manifest_pruning_for_unindexed_ranges() {
 #[tokio::test]
 async fn test_execute_writes_bitmap_index_manifest_and_java_file() {
     let table_path = "memory:/test_bitmap_global_index_builder_e2e";
-    let table = test_table_with_path(table_path, table_options("10"));
+    let mut options = table_options("10");
+    options.insert("write-buffer-size".into(), "128b".into());
+    let table = test_table_with_path(table_path, options);
     setup_dirs(&table).await;
 
     let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
@@ -1735,7 +1830,10 @@ async fn test_execute_writes_bitmap_index_manifest_and_java_file() {
 #[tokio::test]
 async fn test_execute_multivalue_index_and_array_queries_end_to_end() {
     let table_path = "memory:/test_multivalue_global_index_builder_e2e";
-    let table = multivalue_table(table_path);
+    let table = multivalue_table(table_path).copy_with_options(HashMap::from([
+        ("write-buffer-size".into(), "128b".into()),
+        ("read.batch-size".into(), "1".into()),
+    ]));
     setup_dirs(&table).await;
 
     let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
@@ -2797,6 +2895,7 @@ async fn composite_ranges(
 async fn test_composite_btree_build_query_coverage_and_drop() {
     for version in [1, 2] {
         let mut options = table_options("2");
+        options.insert("write-buffer-size".into(), "128b".into());
         options.insert("btree-index.file-version".into(), version.to_string());
         options.insert("btree-index.bloom-filter.enabled".into(), "true".into());
         let table =
@@ -3626,4 +3725,77 @@ async fn test_composite_btree_preserves_exact_column_names() {
         .execute()
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn invalid_write_buffer_size_is_rejected_before_an_empty_build() {
+    for value in ["0", "-1mb", "invalid"] {
+        let mut options = table_options("10");
+        options.insert("write-buffer-size".into(), value.into());
+        let table = test_table(options);
+        let error = table
+            .new_global_index_build_builder()
+            .with_index_column("name")
+            .build()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::ConfigInvalid { .. }));
+        assert!(error.to_string().contains("write-buffer-size"));
+    }
+}
+
+#[tokio::test]
+async fn write_buffer_size_limits_keys_and_builder_options_override_table() {
+    let table = test_table_with_path(
+        "memory:/index_build_write_buffer_override",
+        table_options("10"),
+    );
+    setup_dirs(&table).await;
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "alice"]))
+        .await
+        .unwrap();
+    builder
+        .new_commit()
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    let table = table.copy_with_options(HashMap::from([("write-buffer-size".into(), "1b".into())]));
+    let before = table
+        .snapshot_manager()
+        .get_latest_snapshot_id()
+        .await
+        .unwrap();
+    let error = table
+        .new_global_index_build_builder()
+        .with_index_column("name")
+        .build()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::ResourceExhausted { .. }));
+    assert!(error.to_string().contains("write-buffer-size"));
+    assert_eq!(
+        table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        table
+            .new_global_index_build_builder()
+            .with_index_column("name")
+            .with_options(HashMap::from([("write-buffer-size".into(), "128b".into())]))
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("name", Datum::String("alice".into()))
+        .unwrap();
+    assert_eq!(scan_ids(&table, predicate).await, vec![1, 3]);
 }

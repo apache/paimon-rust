@@ -4591,6 +4591,7 @@ pub(in crate::table) mod tests {
 
     fn test_pk_schema() -> TableSchema {
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])
@@ -4612,6 +4613,7 @@ pub(in crate::table) mod tests {
 
     fn pk_changelog_schema(options: &[(&str, &str)]) -> TableSchema {
         let mut builder = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])
@@ -4639,6 +4641,7 @@ pub(in crate::table) mod tests {
 
     fn ordinary_dynamic_pk_changelog_schema() -> TableSchema {
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("pt", DataType::VarChar(VarCharType::string_type()))
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
@@ -6201,7 +6204,7 @@ pub(in crate::table) mod tests {
             append(&table, 1).await.unwrap();
             let mut message = crate::table::CommitMessage::new(vec![], 0, vec![]);
             message.new_index_files.push(crate::spec::IndexFileMeta {
-                index_type: "lumina".into(),
+                index_type: "diskann".into(),
                 file_name: "audit-index".into(),
                 file_size: 1,
                 row_count: 1,

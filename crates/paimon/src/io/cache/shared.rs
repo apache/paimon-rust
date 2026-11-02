@@ -480,6 +480,45 @@ impl SharedDiskCache {
         }
     }
 
+    /// Remove only one unpublished generated file, without rotating the shared epoch.
+    pub(crate) async fn remove_generated(&self, mut key: BlockKey, blocks: u64) -> io::Result<()> {
+        let gate = lock(self.root.join("directory.lock"))
+            .await
+            .ok_or_else(|| {
+                io::Error::other("Shared generated-file cleanup could not acquire directory lock")
+            })?;
+        let root = self.root.clone();
+        let max_size = self.max_size;
+        let ratio = self.high_priority_ratio;
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let _gate = gate;
+            let Some(generation) = read_generation(&root) else {
+                return Ok(());
+            };
+            let mut used = clean_usage(&root, max_size)
+                .map(Ok)
+                .unwrap_or_else(|| recover_usage(&root, max_size, ratio))?;
+            std::fs::write(root.join("dirty"), b"")?;
+            for index in 0..blocks {
+                key.block_index = index;
+                let path = root.join(generation_key(&key, &generation).cache_relative_path());
+                let size = match std::fs::metadata(&path) {
+                    Ok(meta) => meta.len(),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                match std::fs::remove_file(path) {
+                    Ok(()) => used = used.saturating_sub(size),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error),
+                }
+            }
+            finish_usage(&root, used)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
     pub(crate) async fn invalidate(&self) -> io::Result<()> {
         let gate = lock(self.root.join("directory.lock"))
             .await

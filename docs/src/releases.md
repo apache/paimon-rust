@@ -27,6 +27,8 @@ Apache Paimon Rust follows [Semantic Versioning](https://semver.org/). All relea
 
 ### 0.5.0 (In Development)
 
+- Removed Lumina vector index support; use vindex DiskANN via `create_global_index` with `index_type => 'diskann'`. Rebuild existing Lumina indexes in the vindex format.
+
 See [GitHub Issues](https://github.com/apache/paimon-rust/issues) for the current roadmap.
 
 ## Past Releases

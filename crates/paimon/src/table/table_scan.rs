@@ -2538,8 +2538,13 @@ impl<'a> PaimonTableScan<'a> {
         settings: GlobalIndexScanSettings,
         data_ranges: &[RowRange],
     ) -> crate::Result<Option<Vec<RowRange>>> {
-        let core_options = CoreOptions::new(self.table.schema().options());
-        super::global_index_scanner::evaluate_global_index(
+        let resolved = super::global_index_scanner::GlobalIndexScanner::read_defaults(
+            self.table.schema().options(),
+            index_entries,
+            self.table.schema().fields(),
+        )?;
+        let core_options = CoreOptions::new(&resolved);
+        super::global_index_scanner::evaluate_global_index_with_options(
             super::global_index_scanner::GlobalIndexEvaluation {
                 file_io: self.table.file_io(),
                 table_path: self.table.location().trim_end_matches('/'),
@@ -2556,13 +2561,14 @@ impl<'a> PaimonTableScan<'a> {
                     .iter()
                     .any(|entry| entry.index_file.index_type.eq_ignore_ascii_case("fm"))
                 {
-                    crate::fm_index::FMOptions::from_options(self.table.schema().options())?.read
+                    crate::fm_index::FMOptions::from_options(&resolved)?.read
                 } else {
                     crate::fm_index::FMReadOptions::default()
                 },
                 next_row_id: snapshot.next_row_id(),
                 data_ranges,
             },
+            self.table.schema().options(),
         )
         .await
     }
@@ -3979,6 +3985,7 @@ mod tests {
     fn scan_stats_test_table(table_path: &str) -> Table {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let schema = PaimonSchema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .build()
             .unwrap();
@@ -6149,6 +6156,7 @@ mod tests {
     pub(super) fn pk_stats_gate_table(table_path: &str) -> Table {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let schema = PaimonSchema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])
@@ -6354,6 +6362,7 @@ mod tests {
         let table_path = "memory:/test_first_row_stats_gate";
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let schema = PaimonSchema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])

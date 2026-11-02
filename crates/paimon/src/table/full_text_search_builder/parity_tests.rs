@@ -1095,3 +1095,126 @@ async fn index_only_data_plan_applies_reader_partitions_across_commits() {
         assert_eq!(user_ids(&table, result).await, expected);
     }
 }
+
+#[tokio::test]
+async fn certified_top_k_preserves_local_and_scheduled_filtered_results() {
+    let table = new_table(false).copy_with_options(HashMap::from([(
+        "full-text-index.search-mode".into(),
+        "fast".into(),
+    )]));
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", ArrowType::Int32, true),
+        Field::new("text", ArrowType::Utf8, true),
+        Field::new("label", ArrowType::Utf8, true),
+        Field::new("pt", ArrowType::Int32, true),
+    ]));
+    let mut writer = TableWrite::new(&table, "distinct-scores".into()).unwrap();
+    writer
+        .write_arrow_batch(
+            &RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from((0..8).collect::<Vec<_>>())) as ArrayRef,
+                    Arc::new(StringArray::from(
+                        (0..8)
+                            .map(|id| "paimon ".repeat(8 - id % 4))
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(vec![
+                        "drop", "keep", "keep", "keep", "drop", "keep", "keep", "keep",
+                    ])),
+                    Arc::new(Int32Array::from(vec![0; 8])),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    TableCommit::new(table.clone(), "distinct-scores".into())
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    index(&table, "full-text", "text").await;
+    let filter = PredicateBuilder::new(table.schema().fields())
+        .equal("label", Datum::String("keep".into()))
+        .unwrap();
+    let mut builder = query(&table);
+    builder.with_filter(filter).with_limit(2);
+    let read = builder.new_read().unwrap();
+    let plan = builder.new_scan().unwrap().scan().await.unwrap();
+    let exhaustive = CandidateCountExecutor {
+        inner: WireExecutor {
+            table: table.clone(),
+            work: Default::default(),
+            batch_sizes: Default::default(),
+            corrupt_scores: false,
+        },
+        expected_candidates: 3,
+    };
+    let expected = read
+        .read_exhaustive(plan.clone(), Some(&exhaustive))
+        .await
+        .unwrap()
+        .into_row_ids()
+        .unwrap();
+    assert!(exhaustive
+        .inner
+        .work
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|task| task["payload"]["top_k"].is_null()));
+    let local = read
+        .read(plan.clone())
+        .await
+        .unwrap()
+        .into_row_ids()
+        .unwrap();
+    let executor = WireExecutor {
+        table: table.clone(),
+        work: Default::default(),
+        batch_sizes: Default::default(),
+        corrupt_scores: false,
+    };
+    let checked = CandidateCountExecutor {
+        inner: executor,
+        expected_candidates: 2,
+    };
+    let remote = read
+        .read_with_executor(plan, &checked)
+        .await
+        .unwrap()
+        .into_row_ids()
+        .unwrap();
+    assert_eq!(local.row_ids, expected.row_ids);
+    assert_eq!(local.scores, expected.scores);
+    assert_eq!(remote.row_ids, expected.row_ids);
+    assert_eq!(remote.scores, expected.scores);
+    let work = checked.inner.work.lock().unwrap();
+    assert!(work.iter().all(|task| task["payload"]["top_k"] == 2));
+}
+
+struct CandidateCountExecutor {
+    inner: WireExecutor,
+    expected_candidates: usize,
+}
+
+#[async_trait::async_trait]
+impl crate::table::SearchTaskExecutor for CandidateCountExecutor {
+    async fn execute(
+        &self,
+        tasks: Vec<crate::table::SearchTask>,
+    ) -> crate::Result<Vec<crate::table::SearchTaskResult>> {
+        let results = self.inner.execute(tasks).await?;
+        assert!(!results.is_empty());
+        for result in &results {
+            let value: serde_json::Value = serde_json::from_slice(&result.serialize()?).unwrap();
+            assert_eq!(
+                value["payload"]["row_ids"].as_array().unwrap().len(),
+                self.expected_candidates,
+                "worker must return the expected candidate count"
+            );
+        }
+        Ok(results)
+    }
+}

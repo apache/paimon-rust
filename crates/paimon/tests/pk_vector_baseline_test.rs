@@ -25,11 +25,9 @@
 //! (result reader -> Arrow batches, best-first order, `__paimon_search_score`).
 //!
 //! Why Rust-built rather than a committed cross-language fixture: the Java
-//! primary-key vector ANN segment is an opaque native Lumina format that cannot
-//! be reproduced byte-for-byte here, whereas the Rust read path is backed by the
-//! vindex (IVF) segment format. This test therefore validates the Rust read path
-//! against real vindex IVF segment bytes it produces itself, with no committed
-//! binaries and nothing skipped.
+//! primary-key vector fixture uses a format that this Rust test does not build.
+//! This test validates the Rust read path against real vindex IVF segment bytes
+//! it produces itself, with no external binaries or skipped tests.
 //!
 //! Two constraints the primary-key read path enforces are satisfied by hand
 //! (mirroring Java `PrimaryKeyIndexSourcePolicy` and `PrimaryKeyIndexSourceMeta`):
@@ -118,6 +116,7 @@ fn analytic_topk(query: &[f32], vectors: &[[f32; DIM]], k: usize) -> Vec<(u64, f
 /// is built on read).
 fn table_options() -> Vec<(String, String)> {
     vec![
+        ("write-only".to_string(), "true".to_string()),
         ("bucket".to_string(), "1".to_string()),
         ("deletion-vectors.enabled".to_string(), "true".to_string()),
         (
@@ -572,6 +571,57 @@ fn fixture_discriminating() -> ([f32; DIM], Vec<[f32; DIM]>) {
         [9.0, 0.0, 0.0, 0.0], // pos 5
     ];
     (query, vectors)
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn pk_vector_reads_captured_payload_after_algorithm_configuration_changes() {
+    let (query, vectors) = fixture_discriminating();
+    let (_tmp, table) = build_table(&query, &vectors, 3).await;
+    let expected = analytic_topk(&query, &vectors, 3);
+    for declared in ["ivf-pq", "diskann"] {
+        let changed = table.copy_with_options(HashMap::from([
+            (
+                format!("fields.{VECTOR_COLUMN}.pk-vector.index.type"),
+                declared.into(),
+            ),
+            (
+                format!("global-index.{declared}.index-columns"),
+                VECTOR_COLUMN.into(),
+            ),
+            (format!("{declared}.metric"), "invalid-unused-metric".into()),
+            // These parameters must resolve using the captured IVF-flat type.
+            ("ivf-flat.refine_factor".into(), "2".into()),
+        ]));
+        let mut builder = changed.new_vector_search_builder();
+        builder
+            .with_vector_column(VECTOR_COLUMN)
+            .with_query_vector(query.to_vec())
+            .with_limit(3);
+        let plan = builder.new_scan().unwrap().plan().await.unwrap();
+        let result = builder.new_read().unwrap().read(plan).await.unwrap();
+        assert_eq!(
+            result
+                .positions()
+                .unwrap()
+                .iter()
+                .map(|p| p.row_position as u64)
+                .collect::<Vec<_>>(),
+            expected.iter().map(|(pos, _)| *pos).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result
+                .positions()
+                .unwrap()
+                .iter()
+                .map(|p| p.score)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(_, distance)| l2_score(*distance))
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 // Gated off Windows: the fixture table location is a `file://` URL built from a
@@ -1493,8 +1543,8 @@ async fn pk_vector_invalid_refine_factor_fails_loud_on_empty_table() {
         );
     }
 
-    // Case 3: non-integer via a TABLE option (the fix moved table-option
-    // resolution ahead of planning too).
+    // Case 3: non-integer via a TABLE option is validated after planning,
+    // before the empty-plan early return.
     {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let location = format!("file://{}", tmp.path().display());

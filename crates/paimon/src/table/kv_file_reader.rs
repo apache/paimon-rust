@@ -27,8 +27,9 @@
 
 use super::data_file_reader::{file_index_selection_to_local_ranges, DataFileReader};
 use super::sort_merge::{
-    AggregateMergeFunction, DeduplicateMergeFunction, FirstRowMergeFunction, MergeFunction,
-    PartialUpdateMergeFunction, SortMergeReaderBuilder,
+    schema_with_level, with_level, AggregateMergeFunction, DeduplicateMergeFunction,
+    FirstRowMergeFunction, LookupMergeFunction, MergeFunction, PartialUpdateMergeFunction,
+    QueryReducerMergeFunction, SortMergeReaderBuilder, CHANGELOG_BATCH_METADATA_KEY,
 };
 use crate::arrow::format::MosaicPrefetchOptions;
 use crate::arrow::shredding::variant::assemble_variant_extraction_array;
@@ -62,6 +63,8 @@ pub(crate) struct KeyValueFileReader {
     /// of a key survives); they are enforced by the post-merge residual
     /// filter using the full `config.predicates` instead.
     pushdown_predicates: Vec<Predicate>,
+    include_file_levels: bool,
+    lookup: Option<Arc<dyn super::sort_merge::LookupProvider>>,
     #[cfg(test)]
     input_batch_sizes: Option<std::sync::Arc<std::sync::Mutex<Vec<usize>>>>,
 }
@@ -429,13 +432,85 @@ impl KeyValueFileReader {
             &config.table_fields,
             &config.primary_keys,
         );
+        let include_file_levels = config.merge_engine == MergeEngine::FirstRow
+            || config
+                .table_options
+                .get("changelog-producer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lookup"));
         Self {
             file_io,
             config,
+            include_file_levels,
+            lookup: None,
             pushdown_predicates,
             #[cfg(test)]
             input_batch_sizes: None,
         }
+    }
+
+    pub(super) fn with_lookup(
+        mut self,
+        lookup: Option<Arc<dyn super::sort_merge::LookupProvider>>,
+    ) -> Self {
+        self.include_file_levels |= lookup.is_some();
+        self.lookup = lookup;
+        self
+    }
+
+    /// Decode an immutable file without filtering or merging physical rows.
+    /// Lookup files need these ordinals even when a snapshot deletes some rows.
+    pub(super) fn read_physical_file(
+        self,
+        split: DataSplit,
+        file: DataFileMeta,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_physical_file_with_ranges(split, file, None)
+    }
+
+    /// Select physical positions before decoding schema-evolution casts. The
+    /// caller retains the selected ranges to reconstruct source ordinals.
+    pub(super) fn read_physical_file_with_ranges(
+        self,
+        split: DataSplit,
+        file: DataFileMeta,
+        ranges: Option<Vec<super::RowRange>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        Ok(Box::pin(try_stream! {
+            let config = self.config;
+            let old = if file.schema_id != config.table_schema_id {
+                Some(config.schema_manager.schema(file.schema_id).await?)
+            } else { None };
+            let fields = old.as_ref().map_or(config.table_fields.as_slice(), |s| s.fields());
+            let keys = old.as_ref().map(|s| s.trimmed_primary_keys());
+            let data_schema = key_value_data_schema_fields(
+                fields, keys.as_deref().unwrap_or(&config.primary_keys),
+            )?;
+            let reader = DataFileReader::new(
+                self.file_io, config.schema_manager.clone(), config.table_schema_id,
+                config.table_fields.clone(),
+                key_value_fields_extractor(&config.table_fields, &config.primary_keys),
+                config.read_type, vec![],
+            )
+            .with_batch_size(Some(config.read_batch_size))
+            .with_parquet_read_budget(config.parquet_read_budget)
+            .with_table_options(config.table_options)
+            .with_mosaic_prefetch(config.mosaic_prefetch);
+            let expected = ranges.as_ref().map_or(file.row_count, |ranges| {
+                ranges.iter().map(super::RowRange::count).sum()
+            });
+            let mut stream = reader.read_single_file_stream_with_schema_and_local_ranges(
+                &split, file, old.map(|s| s.fields().to_vec()), data_schema, None, ranges,
+            )?;
+            let mut rows = 0i64;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                rows += batch.num_rows() as i64;
+                yield batch;
+            }
+            if rows != expected {
+                Err(Error::DataInvalid { message: "Lookup physical row count differs from file metadata".into(), source: None })?;
+            }
+        }))
     }
 
     #[cfg(test)]
@@ -447,7 +522,28 @@ impl KeyValueFileReader {
         self
     }
 
-    fn new_merge_function(
+    pub(super) fn new_merge_function(
+        config: &KeyValueReadConfig,
+        merge_output_fields: &[DataField],
+    ) -> crate::Result<Box<dyn MergeFunction>> {
+        let inner = Self::new_unwrapped_merge_function(config, merge_output_fields)?;
+        Ok(
+            if config.merge_engine != MergeEngine::FirstRow
+                && config
+                    .table_options
+                    .get("changelog-producer")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("lookup"))
+            {
+                Box::new(QueryReducerMergeFunction(Box::new(LookupMergeFunction(
+                    inner,
+                ))))
+            } else {
+                inner
+            },
+        )
+    }
+
+    pub(super) fn new_unwrapped_merge_function(
         config: &KeyValueReadConfig,
         merge_output_fields: &[DataField],
     ) -> crate::Result<Box<dyn MergeFunction>> {
@@ -652,6 +748,11 @@ impl KeyValueFileReader {
         internal_read_type.extend(user_fields.clone());
 
         let internal_schema = crate::arrow::build_read_arrow_schema(&internal_read_type)?;
+        let merge_input_schema = if self.include_file_levels {
+            schema_with_level(internal_schema.as_ref())?
+        } else {
+            internal_schema
+        };
 
         // Output schema: user's read_type order
         let output_schema = crate::arrow::build_read_arrow_schema(&self.config.read_type)?;
@@ -743,6 +844,8 @@ impl KeyValueFileReader {
             data_splits.into_iter().map(|split| vec![split]).collect()
         };
         let file_io = self.file_io;
+        let include_file_levels = self.include_file_levels;
+        let lookup = self.lookup;
         let config = self.config;
         let table_schema_id = config.table_schema_id;
         let pushdown_predicates = self.pushdown_predicates;
@@ -809,6 +912,7 @@ impl KeyValueFileReader {
                     // writers recorded `delete_row_count = 0` for files holding
                     // them.
                     let skip_merge = skip_single_runs
+                        && lookup.is_none()
                         && input_stream_count == 1
                         && matches!(
                             config.merge_engine,
@@ -891,6 +995,7 @@ impl KeyValueFileReader {
                                     )),
                                     None => None,
                                 };
+                                let file_level = file_meta.level;
                                 let mut file_stream = reader.read_single_file_stream_with_schema_and_local_ranges(
                                     split.as_ref(),
                                     file_meta,
@@ -900,7 +1005,10 @@ impl KeyValueFileReader {
                                     local_row_ranges,
                                 )?;
                                 while let Some(batch) = file_stream.next().await {
-                                    yield batch?;
+                                    let batch = batch?;
+                                    if include_file_levels {
+                                        yield with_level(batch, file_level)?;
+                                    } else { yield batch; }
                                 }
                             }
                         });
@@ -941,7 +1049,7 @@ impl KeyValueFileReader {
                         // batch back, and once a key repeats, merge from there.
                         let fallback = SortMergeReaderBuilder::new(
                             Vec::new(),
-                            internal_schema.clone(),
+                            merge_input_schema.clone(),
                             key_indices.clone(),
                             seq_index,
                             value_kind_index,
@@ -953,7 +1061,8 @@ impl KeyValueFileReader {
                         .with_user_sequence_descending(
                             !CoreOptions::new(&config.table_options)
                                 .sequence_field_sort_order_is_ascending(),
-                        );
+                        )
+                        .with_batch_size(config.read_batch_size);
                         let key_indices = key_indices.clone();
                         let stream: ArrowRecordBatchStream = try_stream! {
                             let mut held: Option<RecordBatch> = None;
@@ -993,7 +1102,7 @@ impl KeyValueFileReader {
                     } else {
                         SortMergeReaderBuilder::new(
                             file_streams,
-                            internal_schema.clone(),
+                            merge_input_schema.clone(),
                             key_indices.clone(),
                             seq_index,
                             value_kind_index,
@@ -1002,10 +1111,12 @@ impl KeyValueFileReader {
                             merge_output_schema.clone(),
                             merge_function(&config, &merge_output_fields)?,
                         )
+                        .with_lookup(lookup.clone())
                         .with_user_sequence_descending(
                             !CoreOptions::new(&config.table_options)
                                 .sequence_field_sort_order_is_ascending(),
                         )
+                        .with_batch_size(config.read_batch_size)
                         .build()?
                     };
 
@@ -1066,7 +1177,11 @@ impl KeyValueFileReader {
                         let options =
                             RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
                         let reordered = RecordBatch::try_new_with_options(
-                            output_schema.clone(),
+                            if batch.schema().metadata().contains_key(CHANGELOG_BATCH_METADATA_KEY) {
+                                let mut metadata = output_schema.metadata().clone();
+                                metadata.insert(CHANGELOG_BATCH_METADATA_KEY.into(), "true".into());
+                                Arc::new(output_schema.as_ref().clone().with_metadata(metadata))
+                            } else { output_schema.clone() },
                             columns,
                             &options,
                         )
@@ -1220,6 +1335,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
         let schema = |name: &str| {
             Schema::builder()
+                .option("write-only", "true")
                 .column("id", DataType::Int(IntType::new()))
                 .column(name, DataType::Variant(VariantType::new()))
                 .primary_key(["id"])
@@ -1607,6 +1723,7 @@ mod tests {
 
     fn pk_table(file_io: &FileIO, table_path: &str, options: &[(&str, &str)]) -> Table {
         let mut builder = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])
@@ -1671,6 +1788,7 @@ mod tests {
     /// line up across versions exactly as a real ADD COLUMN produces.
     fn evo_user_schema(with_score: bool) -> Schema {
         let mut builder = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()));
         if with_score {
@@ -2571,7 +2689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kv_input_decode_honors_read_batch_size_without_changing_merge_batching() {
+    async fn kv_input_decode_and_merge_output_honor_read_batch_size() {
         let file_io = test_file_io();
         let table_path = "memory:/kv_read_batch_size";
         setup_dirs(&file_io, table_path).await;
@@ -2634,8 +2752,12 @@ mod tests {
         let mut decoded_batch_sizes = input_batch_sizes.lock().unwrap().clone();
         decoded_batch_sizes.sort_unstable();
         assert_eq!(decoded_batch_sizes, vec![1, 1, 2, 2, 2, 2]);
-        assert_eq!(batches.len(), 1, "merge output batching stays independent");
-        assert_eq!(batches[0].num_rows(), 5);
+        let output_batch_sizes: Vec<usize> = batches.iter().map(|b| b.num_rows()).collect();
+        assert_eq!(
+            output_batch_sizes,
+            vec![2, 2, 1],
+            "merge output follows read.batch-size"
+        );
         assert_eq!(int_column(&batches, "value"), vec![11, 21, 31, 41, 51]);
     }
 
@@ -3979,6 +4101,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("seq_a", DataType::Int(IntType::new()))
             .column("value_a", DataType::Int(IntType::new()))
@@ -4189,6 +4312,7 @@ mod tests {
         setup_dirs(&file_io, table_path).await;
 
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("version", DataType::Int(IntType::new()))
             .column("value", DataType::VarChar(VarCharType::string_type()))

@@ -266,7 +266,10 @@ impl GlobalIndexScanner {
             file_size,
             meta,
             cmp,
-            Arc::clone(&self.btree_data_block_cache),
+            Arc::clone(
+                self.field_options(entry)
+                    .map_or(&self.btree_data_block_cache, |s| &s.btree_cache),
+            ),
             Arc::from(resolved_path.as_str()),
         )
         .await
@@ -356,8 +359,12 @@ impl GlobalIndexScanner {
             Box::new(file_reader),
             file_size,
             manifest_meta,
-            self.fm_read_options,
-            Arc::clone(&self.fm_read_context),
+            self.field_options(entry)
+                .map_or(self.fm_read_options, |s| s.fm_options),
+            Arc::clone(
+                self.field_options(entry)
+                    .map_or(&self.fm_read_context, |s| &s.fm_context),
+            ),
             entry.file_name.clone(),
         )
         .await
@@ -420,14 +427,28 @@ impl GlobalIndexScanner {
             }
         }
 
-        plan.allow_btree = plan.selected_btree > 0
-            && btree_valid
-            && self.btree_fallback_scan_max_size > 0
-            && btree_total <= self.btree_fallback_scan_max_size;
+        let btree_limit = entries
+            .iter()
+            .find(|e| matches!(e.index_type, GlobalIndexFileKind::BTree))
+            .map_or(self.btree_fallback_scan_max_size, |entry| {
+                self.btree_fallback_limit(entry)
+            });
+        let bitmap_limit = entries
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.index_type,
+                    GlobalIndexFileKind::Bitmap | GlobalIndexFileKind::Multivalue
+                )
+            })
+            .and_then(|entry| self.field_options(entry))
+            .map_or(self.bitmap_fallback_scan_max_size, |s| s.bitmap_fallback);
+        plan.allow_btree =
+            plan.selected_btree > 0 && btree_valid && btree_limit > 0 && btree_total <= btree_limit;
         plan.allow_bitmap = plan.selected_bitmap > 0
             && bitmap_valid
-            && self.bitmap_fallback_scan_max_size > 0
-            && bitmap_total <= self.bitmap_fallback_scan_max_size;
+            && bitmap_limit > 0
+            && bitmap_total <= bitmap_limit;
         plan
     }
 

@@ -27,41 +27,23 @@ use planning::plan_sorted_index_shards;
 use planning::SortedGlobalIndexShard;
 use validation::*;
 
-use super::bitmap_global_index_format::{make_bitmap_key_comparator, serialize_bitmap_datum};
 use super::global_index_build_common::IndexColumns;
-use super::global_index_types::{
-    normalize_queryable_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
-    FM_GLOBAL_INDEX_TYPE,
-};
-use super::sorted_global_index_options::SortedIndexWriteOptions;
-use crate::btree::key_serde::KeyComparator;
+use super::global_index_types::{normalize_queryable_global_index_type, BTREE_GLOBAL_INDEX_TYPE};
+#[cfg(test)]
+use super::global_index_types::{BITMAP_GLOBAL_INDEX_TYPE, FM_GLOBAL_INDEX_TYPE};
+#[cfg(test)]
 use crate::btree::{make_key_comparator, serialize_datum};
-use crate::fm_index::{FMOptions, FMWriteOptions};
-use crate::spec::{CoreOptions, DataType, Datum, Predicate};
+use crate::spec::{CoreOptions, Predicate};
+#[cfg(test)]
+use crate::spec::{DataType, Datum};
+#[cfg(test)]
+use crate::table::bitmap_global_index_format::serialize_bitmap_datum;
+#[cfg(test)]
+use crate::table::index_build::scalar::make_index_key_codec;
+use crate::table::index_build::scalar::ScalarIndexOptions;
 use crate::table::{CommitMessage, RowRange, Table, TableCommit};
 use crate::{Error, Result};
 use std::collections::HashMap;
-
-const INDEX_DIR: &str = "index";
-
-type SortedIndexKeyRow = (Option<Vec<u8>>, i64);
-type SerializeKeyFn = fn(&Datum, &DataType) -> Vec<u8>;
-
-enum GlobalIndexWriteOptions {
-    Sorted(SortedIndexWriteOptions),
-    FM(FMWriteOptions),
-}
-
-fn make_index_key_codec(index_type: &str, data_type: &DataType) -> (KeyComparator, SerializeKeyFn) {
-    match index_type {
-        BTREE_GLOBAL_INDEX_TYPE => (make_key_comparator(data_type), serialize_datum),
-        BITMAP_GLOBAL_INDEX_TYPE => (
-            make_bitmap_key_comparator(data_type),
-            serialize_bitmap_datum,
-        ),
-        _ => unreachable!("normalized sorted global index type"),
-    }
-}
 
 pub(super) struct SortedGlobalIndexBuildBuilder<'a> {
     table: &'a Table,
@@ -69,6 +51,7 @@ pub(super) struct SortedGlobalIndexBuildBuilder<'a> {
     index_type: String,
     options: HashMap<String, String>,
     partition_filter: Option<Predicate>,
+    pub(super) view: Option<super::global_index_build_common::GlobalIndexBuildView>,
 }
 
 impl<'a> SortedGlobalIndexBuildBuilder<'a> {
@@ -79,6 +62,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
             options: HashMap::new(),
             partition_filter: None,
+            view: None,
         }
     }
 
@@ -149,14 +133,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         let core_options = CoreOptions::new(&resolved_options);
         super::global_index_build_common::validate_build_table(self.table)?;
         let records_per_range = core_options.sorted_index_records_per_range()?;
-        let write_options = if index_type == FM_GLOBAL_INDEX_TYPE {
-            GlobalIndexWriteOptions::FM(FMOptions::from_options(&resolved_options)?.write)
-        } else {
-            GlobalIndexWriteOptions::Sorted(SortedIndexWriteOptions::from_options(
-                index_type,
-                &resolved_options,
-            )?)
-        };
+        let write_options = ScalarIndexOptions::from_options(index_type, &resolved_options)?;
 
         let index_fields = super::global_index_build_common::resolve_index_fields(
             self.table,
@@ -174,27 +151,24 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             .collect::<Vec<_>>();
         let extra_field_ids = (!extra_field_ids.is_empty()).then_some(extra_field_ids);
 
-        let Some(snapshot) = self.table.snapshot_manager().get_latest_snapshot().await? else {
+        let view = super::global_index_build_common::GlobalIndexBuildView::resolve(
+            self.table,
+            self.view.as_ref(),
+        )
+        .await?;
+        let Some(snapshot) = view.snapshot() else {
             return Ok((None, vec![]));
         };
 
-        let mut read_builder = self.table.new_read_builder();
-        if let Some(filter) = &self.partition_filter {
-            read_builder.with_filter(filter.clone());
-        }
-        let manifest_entries = read_builder
-            .new_scan()
-            .with_scan_all_files()
-            .plan_manifest_entries(&snapshot)
+        let manifest_entries = view
+            .manifest_entries(self.table, self.partition_filter.as_ref())
             .await?;
         let indexed = crate::table::global_index_build_common::indexed_row_ranges(
-            self.table,
-            snapshot.index_manifest(),
+            view.index_entries(),
             index_type,
             index_field.id(),
             extra_field_ids.as_deref(),
-        )
-        .await?;
+        );
 
         let shards = plan_sorted_index_shards(
             self.table.location(),
@@ -211,8 +185,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         }
 
         crate::table::global_index_build_common::validate_existing_index_overlap(
-            self.table,
-            snapshot.index_manifest(),
+            view.index_entries(),
             index_type,
             index_field.id(),
             extra_field_ids.as_deref(),
@@ -220,8 +193,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
                 .iter()
                 .map(|shard| RowRange::new(shard.row_range_start, shard.row_range_end))
                 .collect::<Vec<_>>(),
-        )
-        .await?;
+        )?;
 
         let commit = self.new_commit();
         let shard_count = shards.len();

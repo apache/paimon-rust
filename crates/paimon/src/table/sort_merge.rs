@@ -30,17 +30,19 @@ use crate::spec::{AggregationConfig, CoreOptions, DataField, PartialUpdateConfig
 use crate::table::aggregator::{new_aggregator, FieldAggregator};
 use crate::table::ArrowRecordBatchStream;
 use crate::Error;
-use arrow_array::{new_null_array, Array, ArrayRef, Int64Array, Int8Array, RecordBatch};
+use arrow_array::{
+    new_null_array, Array, ArrayRef, Int32Array, Int64Array, Int8Array, RecordBatch,
+};
 use arrow_ord::ord::make_comparator;
 use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
-use arrow_schema::{SchemaRef, SortOptions};
+use arrow_schema::{Schema, SchemaRef, SortOptions};
 use arrow_select::interleave::interleave;
 use async_stream::try_stream;
 use futures::StreamExt;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // MergeFunction
@@ -57,7 +59,7 @@ pub(crate) enum BufferedBatch {
 }
 
 impl BufferedBatch {
-    fn column_for_output<'a>(
+    pub(super) fn column_for_output<'a>(
         &'a self,
         output_col_idx: usize,
         source_output_col_indices: &[usize],
@@ -72,6 +74,7 @@ impl BufferedBatch {
 }
 
 /// A row reference as an index into the batch buffer.
+#[derive(Clone)]
 pub(crate) struct MergeRow {
     /// Index into the shared batch buffer.
     pub batch_idx: usize,
@@ -83,7 +86,6 @@ pub(crate) struct MergeRow {
     pub user_sequence: Option<OwnedRow>,
 }
 
-#[cfg(test)]
 impl MergeRow {
     fn source_batch<'a>(
         &self,
@@ -106,6 +108,19 @@ impl MergeRow {
                 source: None,
             }),
         }
+    }
+
+    pub(super) fn level(&self, batches: &[BufferedBatch]) -> crate::Result<i32> {
+        let batch = self.source_batch(batches)?;
+        let levels = batch
+            .column_by_name(LEVEL_FIELD_NAME)
+            .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+            .filter(|levels| self.row_idx < levels.len() && levels.is_valid(self.row_idx))
+            .ok_or_else(|| Error::DataInvalid {
+                message: "Merge input must contain a non-null INT _LEVEL for each row".into(),
+                source: None,
+            })?;
+        Ok(levels.value(self.row_idx))
     }
 }
 
@@ -150,6 +165,120 @@ pub(crate) trait MergeFunction: Send + Sync {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult>;
+
+    /// Emit at most one key's changelog alongside its merged state. The reader
+    /// drains it before advancing to the next key, keeping memory bounded even
+    /// when all data rows are deleted.
+    fn merge_with_changelog(
+        &self,
+        rows: &[MergeRow],
+        batches: &[BufferedBatch],
+        columns: &[usize],
+        schema: &SchemaRef,
+    ) -> crate::Result<(MergeResult, Option<RecordBatch>)> {
+        Ok((self.merge(rows, batches, columns, schema)?, None))
+    }
+}
+
+/// Point lookup into retained sorted runs during incremental compaction.
+#[async_trait::async_trait]
+pub(crate) trait LookupProvider: Send + Sync {
+    async fn lookup(&self, key: &[u8]) -> crate::Result<Option<RecordBatch>>;
+}
+
+const LEVEL_FIELD_NAME: &str = "_LEVEL";
+
+/// Java KeyValue.schemaWithLevel appends the non-null INT SpecialFields.LEVEL.
+/// This column carries each input row's file level through merging; it is not
+/// part of the data-file schema or the merge output.
+pub(super) fn schema_with_level(schema: &Schema) -> crate::Result<SchemaRef> {
+    let level = crate::arrow::build_target_arrow_schema(&[DataField::new(
+        i32::MAX - 3,
+        LEVEL_FIELD_NAME.to_string(),
+        crate::spec::DataType::Int(crate::spec::IntType::with_nullable(false)),
+    )])?;
+    let mut fields = schema.fields().to_vec();
+    fields.push(level.field(0).clone().into());
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
+}
+
+pub(super) fn with_level(batch: RecordBatch, level: i32) -> crate::Result<RecordBatch> {
+    let schema = schema_with_level(batch.schema().as_ref())?;
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(Int32Array::from(vec![level; batch.num_rows()])));
+    RecordBatch::try_new(schema, columns).map_err(|error| Error::DataInvalid {
+        message: format!("Invalid merge input with level: {error}"),
+        source: Some(Box::new(error)),
+    })
+}
+
+/// Route changelog batches to a separate writer.
+pub(super) const CHANGELOG_BATCH_METADATA_KEY: &str = "paimon.compact.changelog";
+
+/// Lookup states at positive levels are already materialized. The lowest
+/// positive level is the latest state; older levels must not be reduced again.
+/// Mirrors Java LookupMergeFunction#pickHighLevel/getResult.
+pub(super) fn lookup_rows(
+    rows: &[MergeRow],
+    batches: &[BufferedBatch],
+) -> crate::Result<(Option<MergeRow>, bool, Vec<MergeRow>)> {
+    let mut base = None;
+    let mut base_level = i32::MAX;
+    let mut levels = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let level = row.level(batches)?;
+        if level > 0 && (base.is_none() || level < base_level) {
+            base = Some(index);
+            base_level = level;
+        }
+        levels.push(level);
+    }
+    let has_l0 = levels.contains(&0);
+    let selected = rows
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| levels[*index] <= 0 || base == Some(*index))
+        .map(|(_, row)| row.clone())
+        .collect();
+    Ok((base.map(|index| rows[index].clone()), has_l0, selected))
+}
+
+pub(super) struct LookupMergeFunction(pub Box<dyn MergeFunction>);
+
+impl MergeFunction for LookupMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batches: &[BufferedBatch],
+        columns: &[usize],
+        schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        let (_, _, selected) = lookup_rows(rows, batches)?;
+        self.0.merge(&selected, batches, columns, schema)
+    }
+}
+
+/// Java queries wrap LookupMergeFunction in ReducerMergeFunctionWrapper, then
+/// drop retract results. The shortcut counts the original inputs, before
+/// lookup discards superseded high-level states. Compaction has no such wrapper.
+pub(super) struct QueryReducerMergeFunction(pub Box<dyn MergeFunction>);
+
+impl MergeFunction for QueryReducerMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batches: &[BufferedBatch],
+        columns: &[usize],
+        schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        if let Some(result) = singleton_reducer_result(rows)? {
+            return Ok(result);
+        }
+        self.0.merge(rows, batches, columns, schema)
+    }
 }
 
 /// Deduplicate merge: keeps the row with the highest sequence.
@@ -249,6 +378,7 @@ impl MergeFunction for FirstRowMergeFunction {
 #[derive(Debug)]
 pub(crate) struct PartialUpdateMergeFunction {
     ignore_delete: bool,
+    reduce_singletons: bool,
     remove_record_on_delete: bool,
     sequence_group_partial_delete: HashSet<usize>,
     sequence_group_enabled: bool,
@@ -325,6 +455,9 @@ impl PartialUpdateMergeFunction {
         PartialUpdateConfig::new(table_options).validate_write_mode(true, table_name)?;
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+            reduce_singletons: table_options
+                .get("changelog-producer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
             remove_record_on_delete: PartialUpdateConfig::new(table_options)
                 .remove_record_on_delete(),
             sequence_group_partial_delete: HashSet::new(),
@@ -437,6 +570,9 @@ impl PartialUpdateMergeFunction {
 
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+            reduce_singletons: table_options
+                .get("changelog-producer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
             remove_record_on_delete: config.remove_record_on_delete(),
             sequence_group_partial_delete,
             sequence_group_enabled,
@@ -458,8 +594,10 @@ impl MergeFunction for PartialUpdateMergeFunction {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult> {
-        if let Some(result) = singleton_reducer_result(rows)? {
-            return Ok(result);
+        if !self.reduce_singletons {
+            if let Some(result) = singleton_reducer_result(rows)? {
+                return Ok(result);
+            }
         }
         self.merge_unreduced(rows, batch_buffer, source_output_col_indices, output_schema)
     }
@@ -504,21 +642,20 @@ impl PartialUpdateMergeFunction {
         }
         let mut saw_add = false;
         let mut current_delete_row = false;
-        let mut saw_retract = false;
+        let mut initialized = false;
         let mut latest_row = None;
 
         for row_idx in ordered_row_indices {
             let row = &rows[row_idx];
             let kind = RowKind::from_value(row.value_kind)?;
             if !kind.is_add() {
-                if self.ignore_delete {
+                if self.ignore_delete && !self.reduce_singletons {
                     continue;
                 }
-                latest_row = Some(row);
-                if !saw_add && !saw_retract {
+                if !initialized {
                     // Java initializes the row from the first retract before
-                    // applying sequence-group retractions. That row also
-                    // becomes the DELETE payload when no insert follows.
+                    // checking ignore-delete or applying sequence-group
+                    // retractions. Keep that payload for later sparse updates.
                     Self::replace_with_source(
                         &mut selected_by_col,
                         aggregators.as_mut().map(|guard| guard.as_mut_slice()),
@@ -528,8 +665,12 @@ impl PartialUpdateMergeFunction {
                         source_output_col_indices,
                     )?;
                     group_sequence_rows.fill(Some((row.batch_idx, row.row_idx)));
+                    initialized = true;
                 }
-                saw_retract = true;
+                if self.ignore_delete {
+                    continue;
+                }
+                latest_row = Some(row);
                 if self.sequence_group_enabled {
                     let mut full_delete = false;
                     for (group_idx, group) in self.sequence_groups.iter().enumerate() {
@@ -617,6 +758,7 @@ impl PartialUpdateMergeFunction {
                 });
             }
             saw_add = true;
+            initialized = true;
             if !self.sequence_group_enabled {
                 current_delete_row = false;
             }
@@ -699,17 +841,24 @@ impl PartialUpdateMergeFunction {
             }
         }
 
-        if !saw_add && !saw_retract {
+        if !initialized {
             return Ok(MergeResult::Omit);
         }
         let deleted = current_delete_row || !saw_add;
+        // Ignored legacy retracts seed the value but do not advance Java's
+        // latestSequenceNumber, whose reset value is zero.
+        let ignored_retract_metadata = latest_row.is_none().then(|| MergeRow {
+            sequence_number: 0,
+            ..rows[0].clone()
+        });
+        let latest_row = latest_row.or(ignored_retract_metadata.as_ref()).unwrap();
 
         let output_columns: Vec<ArrayRef> = output_schema
             .fields()
             .iter()
             .enumerate()
             .map(|(output_col_idx, field)| {
-                if let Some(column) = merged_metadata_column(field, latest_row.unwrap(), deleted) {
+                if let Some(column) = merged_metadata_column(field, latest_row, deleted) {
                     return Ok(column);
                 }
                 let column = match aggregators
@@ -834,6 +983,7 @@ pub(crate) struct AggregateMergeFunction {
     /// `Some` holds the aggregator that owns a user value column.
     aggregators: Mutex<Vec<Option<Box<dyn FieldAggregator>>>>,
     remove_record_on_delete: bool,
+    reduce_singletons: bool,
 }
 
 impl AggregateMergeFunction {
@@ -892,6 +1042,9 @@ impl AggregateMergeFunction {
         Ok(Self {
             aggregators: Mutex::new(aggregators),
             remove_record_on_delete: config.remove_record_on_delete(),
+            reduce_singletons: table_options
+                .get("changelog-producer")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
         })
     }
 
@@ -1027,8 +1180,10 @@ impl MergeFunction for AggregateMergeFunction {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult> {
-        if let Some(result) = singleton_reducer_result(rows)? {
-            return Ok(result);
+        if !self.reduce_singletons {
+            if let Some(result) = singleton_reducer_result(rows)? {
+                return Ok(result);
+            }
         }
         let mut ordered: Vec<_> = rows.iter().collect();
         // Stable sorting keeps input order for equal sequences.
@@ -1222,6 +1377,7 @@ pub(crate) struct SortMergeReaderBuilder {
     output_schema: SchemaRef,
     merge_function: Box<dyn MergeFunction>,
     batch_size: usize,
+    lookup: Option<Arc<dyn LookupProvider>>,
 }
 
 impl SortMergeReaderBuilder {
@@ -1249,10 +1405,15 @@ impl SortMergeReaderBuilder {
             output_schema,
             merge_function,
             batch_size: 1024,
+            lookup: None,
         }
     }
 
-    #[cfg(test)]
+    pub(crate) fn with_lookup(mut self, lookup: Option<Arc<dyn LookupProvider>>) -> Self {
+        self.lookup = lookup;
+        self
+    }
+
     pub(crate) fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
@@ -1316,6 +1477,7 @@ impl SortMergeReaderBuilder {
             self.output_schema,
             self.merge_function,
             self.batch_size,
+            self.lookup.map(|lookup| (lookup, self.input_schema)),
         )
     }
 }
@@ -1389,6 +1551,7 @@ fn sort_merge_stream(
     output_schema: SchemaRef,
     merge_function: Box<dyn MergeFunction>,
     batch_size: usize,
+    lookup: Option<(Arc<dyn LookupProvider>, SchemaRef)>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let num_streams = streams.len();
     if num_streams == 0 {
@@ -1525,12 +1688,39 @@ fn sort_merge_stream(
                 tree.update(|a, b| compare_cursors(&cursors, a, b).then_with(|| a.cmp(&b)).is_gt());
             }
 
-            match merge_function.merge(
-                &same_key_rows,
-                &batch_buffer,
-                &source_output_col_indices,
-                &output_schema,
-            )? {
+            if let Some((lookup, schema)) = &lookup {
+                let mut has_base = false;
+                for row in &same_key_rows {
+                    if row.level(&batch_buffer)? > 0 {
+                        has_base = true;
+                        break;
+                    }
+                }
+                if !has_base {
+                    if let Some(batch) = lookup.lookup(&winner_key).await? {
+                        if batch.num_rows() != 1 || batch.schema().fields() != schema.fields() {
+                            Err(Error::DataInvalid { message: "Lookup must return one KV row matching the merge schema".into(), source: None })?;
+                        }
+                        let keys = convert_batch_keys(&batch, &key_indices, &mut row_converter)?;
+                        if keys.row(0).as_ref() != winner_key.as_slice() {
+                            Err(Error::DataInvalid { message: "Lookup returned a different primary key".into(), source: None })?;
+                        }
+                        let user = convert_batch_user_sequences(&batch, &user_sequence_indices, user_sequence_converter.as_mut())?;
+                        let sequence_number = batch.column(seq_index).as_any().downcast_ref::<Int64Array>()
+                            .ok_or_else(|| Error::DataInvalid { message: "Invalid lookup sequence".into(), source: None })?.value(0);
+                        let value_kind = batch.column(value_kind_index).as_any().downcast_ref::<Int8Array>()
+                            .ok_or_else(|| Error::DataInvalid { message: "Invalid lookup row kind".into(), source: None })?.value(0);
+                        let batch_idx = batch_buffer.len();
+                        batch_buffer.push(BufferedBatch::Source(batch));
+                        same_key_rows.insert(0, MergeRow { batch_idx, row_idx: 0, sequence_number, value_kind,
+                            user_sequence: user.map(|rows| rows.row(0).owned()) });
+                    }
+                }
+            }
+            let (merged, changelog) = merge_function.merge_with_changelog(
+                &same_key_rows, &batch_buffer, &source_output_col_indices, &output_schema,
+            )?;
+            match merged {
                 MergeResult::SourceRow { batch_idx, row_idx } => {
                     output_indices.push((batch_idx, row_idx));
                 }
@@ -1555,6 +1745,20 @@ fn sort_merge_stream(
                     output_indices.push((batch_idx, 0));
                 }
                 MergeResult::Omit | MergeResult::MaterializedDeleteRow(_) => {}
+            }
+
+            if let Some(changelog) = changelog {
+                if changelog.schema().as_ref() != output_schema.as_ref() {
+                    Err(Error::UnexpectedError { message: "Changelog merge result schema does not match merge output schema".into(), source: None })?;
+                }
+                let mut metadata = output_schema.metadata().clone();
+                metadata.insert(CHANGELOG_BATCH_METADATA_KEY.into(), "true".into());
+                yield RecordBatch::try_new(
+                    Arc::new(output_schema.as_ref().clone().with_metadata(metadata)), changelog.columns().to_vec(),
+                ).map_err(|error| Error::DataInvalid { message: format!("Invalid changelog batch: {error}"), source: Some(Box::new(error)) })?;
+            }
+            if output_indices.is_empty() {
+                compact_batch_buffer(&mut batch_buffer, &mut stream_batch_idx, &cursors);
             }
 
             // Yield a batch when we've accumulated enough rows.
@@ -1673,6 +1877,82 @@ mod tests {
     use futures::TryStreamExt;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn level_column_survives_concatenation_and_serialization() {
+        let input = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+        )])
+        .unwrap();
+        let inputs = [
+            with_level(input.clone(), 0).unwrap(),
+            with_level(input, 3).unwrap(),
+        ];
+        let schema = inputs[0].schema();
+        let field = schema.fields().last().unwrap();
+        assert_eq!(field.name(), "_LEVEL");
+        assert_eq!(field.data_type(), &DataType::Int32);
+        assert!(!field.is_nullable());
+        assert_eq!(
+            field.metadata()["PARQUET:field_id"],
+            (i32::MAX - 3).to_string()
+        );
+        let batch = arrow_select::concat::concat_batches(&schema, &inputs).unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut bytes, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        let restored = arrow_ipc::reader::StreamReader::try_new(bytes.as_slice(), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.schema(), schema);
+        let batches = vec![BufferedBatch::Source(restored)];
+        let levels = (0..4)
+            .map(|row_idx| {
+                MergeRow {
+                    batch_idx: 0,
+                    row_idx,
+                    sequence_number: row_idx as i64,
+                    value_kind: 0,
+                    user_sequence: None,
+                }
+                .level(&batches)
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(levels, vec![0, 0, 3, 3]);
+    }
+
+    #[test]
+    fn lookup_uses_each_rows_level_in_a_mixed_batch() {
+        let batch = RecordBatch::try_from_iter([(
+            "_LEVEL",
+            Arc::new(Int32Array::from(vec![-1, 0, 5, 2])) as ArrayRef,
+        )])
+        .unwrap();
+        let batches = vec![BufferedBatch::Source(batch)];
+        let rows = (0..4)
+            .map(|row_idx| MergeRow {
+                batch_idx: 0,
+                row_idx,
+                sequence_number: row_idx as i64,
+                value_kind: 0,
+                user_sequence: None,
+            })
+            .collect::<Vec<_>>();
+        let (base, has_l0, selected) = lookup_rows(&rows, &batches).unwrap();
+        assert_eq!(base.unwrap().row_idx, 3);
+        assert!(has_l0);
+        assert_eq!(
+            selected.iter().map(|row| row.row_idx).collect::<Vec<_>>(),
+            vec![0, 1, 3]
+        );
+    }
 
     #[test]
     fn first_row_merge_keeps_earliest_sequence_and_first_tie() {

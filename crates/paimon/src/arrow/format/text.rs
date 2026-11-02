@@ -633,7 +633,7 @@ impl FormatFileReader for TextFormatReader {
         // still has to decode their original physical column positions.
         match self.kind {
             TextKind::Csv | TextKind::Text => data_schema_fields.to_vec(),
-            TextKind::Json => projected_fields.to_vec(),
+            TextKind::Json => super::top_level_read_fields(data_schema_fields, projected_fields),
         }
     }
 

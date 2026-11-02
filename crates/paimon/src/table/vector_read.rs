@@ -87,12 +87,11 @@ impl BatchVectorRead {
         context: PlanContext,
     ) -> crate::Result<Self> {
         let core = CoreOptions::new(table.schema().options());
-        let reader = if targets_primary_key_column(&core, column) {
-            let pk_col = core.primary_key_vector_index_column()?;
-            let params =
-                PkVectorSearchParams::resolve(table, options, filter, &pk_col, queries, limit)?;
+        let reader = if targets_primary_key_column(table, column) {
+            let pk_col = core.single_vector_index_column()?;
+            PkVectorSearchParams::validate_inputs(table, filter, &pk_col, queries, limit)?;
             VectorReadKind::PrimaryKey(Box::new(PkVectorRead::new(
-                table, options, filter, &pk_col, queries, limit, params,
+                table, options, filter, &pk_col, queries, limit,
             )))
         } else {
             VectorReadKind::DataEvolution(DeVectorRead::new(column, queries, limit, options)?)
@@ -140,10 +139,7 @@ impl BatchVectorRead {
                             &self.context.column,
                         );
                         if index_files.iter().any(|file| {
-                            super::vector_search_common::VectorIndexBackend::from_index_type(
-                                &file.index_type,
-                            )
-                            .is_none()
+                            !crate::vindex::is_vindex_index_type(&file.index_type)
                                 || file
                                     .global_index_meta
                                     .as_ref()

@@ -95,13 +95,13 @@ jobs:
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-deny@0.19.6
 
       - name: Install cargo-about
         if: steps.release_license_inputs.outputs.changed == 'true'
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-about@0.9.1
 
@@ -127,7 +127,7 @@ jobs:
         run: cargo +1.98.0 fmt --all -- --check
 
       - name: Clippy
-        run: cargo +1.98.0 clippy --locked --all-targets --workspace --features fulltext,vortex -- -D warnings
+        run: cargo +1.98.0 clippy --locked --all-targets --workspace --features vortex -- -D warnings
 
   msrv:
     name: msrv (${{ matrix.host }})
@@ -149,22 +149,22 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Rust 1.94.0
-        run: rustup toolchain install 1.94.0 --profile minimal
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
 
       - name: Validate MSRV host
         env:
           EXPECTED_HOST: ${{ matrix.host }}
         run: |
-          rustc +1.94.0 -vV | grep -F "host: ${EXPECTED_HOST}"
+          rustc +1.95.0 -vV | grep -F "host: ${EXPECTED_HOST}"
 
       - name: Validate workspace MSRV metadata
         run: |
-          cargo +1.94.0 metadata --locked --format-version 1 --no-deps |
-            jq -e '.packages | all(.rust_version == "1.94.0")' >/dev/null
+          cargo +1.95.0 metadata --locked --format-version 1 --no-deps |
+            jq -e '.packages | all(.rust_version == "1.95.0")' >/dev/null
 
       - name: Check workspace at MSRV
-        run: cargo +1.94.0 check --locked --workspace --all-targets --all-features
+        run: cargo +1.95.0 check --locked --workspace --all-targets --all-features
 
   build:
     runs-on: ${{ matrix.os }}
@@ -177,7 +177,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build
-        run: cargo build --locked --features fulltext,vortex
+        run: cargo build --locked --features vortex
 
   unit:
     runs-on: ${{ matrix.os }}
@@ -203,7 +203,7 @@ jobs:
           "CARGO_BUILD_JOBS=2" >> $env:GITHUB_ENV
 
       - name: Test
-        run: cargo test --locked -p paimon --all-targets --features fulltext,vortex
+        run: cargo test --locked -p paimon --all-targets --features vortex
         env:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full
@@ -226,36 +226,23 @@ jobs:
       matrix:
         include:
           - suite: rust
-            needs_docker: true
-            needs_lumina: false
             needs_uv: false
           - suite: datafusion
-            needs_docker: true
-            needs_lumina: true
-            needs_uv: false
-          - suite: lumina
-            needs_docker: false
-            needs_lumina: true
             needs_uv: false
           - suite: python
-            needs_docker: true
-            needs_lumina: false
             needs_uv: true
           - suite: go
-            needs_docker: true
-            needs_lumina: false
             needs_uv: false
           - suite: jindo
-            needs_docker: false
-            needs_lumina: false
             needs_uv: false
           - suite: oss-cpp
-            needs_docker: false
-            needs_lumina: false
             needs_uv: false
     env:
       RUST_LOG: DEBUG
       RUST_BACKTRACE: full
+      # DataFusion builds default and Vortex test binaries on the same runner.
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
 
@@ -266,41 +253,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: integration-${{ matrix.suite }}-${{ runner.os }}-line-tables-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            integration-${{ runner.os }}-
-
-      - name: Start Docker containers
-        if: matrix.needs_docker == true
-        run: make docker-up
+            integration-${{ matrix.suite }}-${{ runner.os }}-line-tables-
 
       - name: Rust Integration Test
         if: matrix.suite == 'rust'
         run: cargo test --locked -p paimon-integration-tests --all-targets
-
-      - name: Install lumina native library
-        if: matrix.needs_lumina == true
-        run: |
-          pip install lumina-data
-          echo "LUMINA_LIB_PATH=$(python3 -c 'import lumina_data; print(lumina_data.__path__[0])')/lib/liblumina_py.so" >> $GITHUB_ENV
-
-      - name: Core Lumina Native Build Test
-        if: matrix.suite == 'lumina'
-        run: >
-          cargo test --locked -p paimon --lib
-          table::lumina_index_build_builder::tests::test_execute_writes_lumina_index_manifest
-          --features fulltext,vortex
-          -- --ignored --exact
-
-      # The test filter selects tests, not targets, so without `--test` cargo links all 26
-      # integration binaries with `vortex` enabled just to run one ignored test in one of them.
-      - name: DataFusion Lumina Build Query E2E Test
-        if: matrix.suite == 'lumina'
-        run: >
-          cargo test --locked -p paimon-datafusion --test read_tables
-          --features vortex
-          vector_search_tests::test_lumina_build_then_vector_search_query
-          -- --ignored --exact
 
       - name: DataFusion Integration Test
         if: matrix.suite == 'datafusion'
@@ -315,7 +274,7 @@ jobs:
 
       - name: Install uv
         if: matrix.needs_uv == true
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
         with:
           version: "0.9.3"
           enable-cache: true
@@ -324,6 +283,11 @@ jobs:
         if: matrix.suite == 'python'
         working-directory: bindings/python
         run: make install && make test
+
+      - name: Python Binding Rust Unit Tests
+        if: matrix.suite == 'python'
+        working-directory: bindings/python
+        run: make test-rust
 
       - name: Go Integration Test
         if: matrix.suite == 'go'
@@ -347,10 +311,6 @@ jobs:
           cargo test --locked -p paimon --features storage-jindo --lib
           io::storage_jindo::tests::test_real_sdk_io_and_failure_mapping
           -- --ignored --exact
-
-      - name: Stop Docker containers
-        if: ${{ always() && matrix.needs_docker }}
-        run: make docker-down
 
       - name: Checkout OSS C++ SDK
         if: matrix.suite == 'oss-cpp'

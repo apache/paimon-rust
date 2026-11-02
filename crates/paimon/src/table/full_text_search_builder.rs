@@ -26,7 +26,7 @@ use crate::spec::{
     IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
 };
 use crate::table::data_file_reader::DataFileReader;
-use crate::table::full_text_index_adapter::{search_full_text_file, search_full_text_index};
+use crate::table::full_text_index_adapter::{search_full_text_file, search_full_text_index_top_k};
 use crate::table::global_index_scanner::{
     deleted_row_ranges_for_data_evolution_dvs, unindexed_ranges_for_global_index_entries,
     RowRangeIndex,
@@ -216,7 +216,11 @@ impl<'a> FullTextSearchBuilder<'a> {
                     message: "Text column must be set via with_text_column()".to_string(),
                 })?;
 
-        if !resolves_to_pk_full_text_path(&core, text_column) {
+        if !resolves_to_pk_full_text_path(
+            &core,
+            text_column,
+            !self.table.schema().primary_keys().is_empty(),
+        ) {
             return Err(crate::Error::Unsupported {
                 message: "materialized full-text read (execute_read) is only supported on the \
                           primary-key full-text path (data-evolution disabled and the column \
@@ -240,10 +244,15 @@ impl<'a> FullTextSearchBuilder<'a> {
 /// data-evolution is DISABLED and the column is a configured
 /// `pk-full-text.index.columns` entry (membership via the non-erroring accessor so
 /// a malformed config cannot abort an unrelated append/DE query).
-fn resolves_to_pk_full_text_path(core: &CoreOptions<'_>, text_column: &str) -> bool {
-    !core.data_evolution_enabled()
+fn resolves_to_pk_full_text_path(
+    core: &CoreOptions<'_>,
+    text_column: &str,
+    primary_key: bool,
+) -> bool {
+    primary_key
+        && !core.data_evolution_enabled()
         && core
-            .primary_key_full_text_index_columns()
+            .full_text_index_columns()
             .iter()
             .any(|c| c == text_column)
 }
@@ -259,6 +268,7 @@ struct FullTextSearchEvaluation<'a> {
     partition_filter: Option<&'a Predicate>,
     row_filter: Option<&'a Predicate>,
     source_splits: Option<&'a [crate::table::SearchScanSplit]>,
+    allow_top_k: bool,
 }
 
 #[cfg(test)]
@@ -362,12 +372,25 @@ async fn evaluate_full_text_search_with_executor(
             fulltext_entries,
             indexed_search.include_row_ids.as_ref(),
         )?;
+        // Raw fallback can replace indexed hits, and deletion vectors are applied
+        // after the shard searches. Those paths require exhaustive candidates.
+        let top_k = (evaluation.allow_top_k
+            && search_mode == GlobalIndexSearchMode::Fast
+            && deleted_row_index.is_none()
+            && !core_options.deletion_vectors_enabled()
+            && evaluation.source_splits.is_none_or(|splits| {
+                splits
+                    .iter()
+                    .all(|split| !matches!(split, crate::table::SearchScanSplit::Raw { .. }))
+            })
+            && disjoint_full_text_ranges(&plans))
+        .then_some(search.limit);
         let results = if let Some(executor) = executor {
             let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Scheduled full-text search requires table context".into(),
                 source: None,
             })?;
-            execution::search_indexes(table, plans, &search.query_text, executor).await?
+            execution::search_indexes(table, plans, &search.query_text, top_k, executor).await?
         } else {
             let results = plans
                 .into_iter()
@@ -383,18 +406,18 @@ async fn evaluate_full_text_search_with_executor(
                     let local_filter = plan.local_filter;
                     let row_range_start = global_meta.row_range_start;
                     let row_range_end = global_meta.row_range_end;
-                    // Compound query leaves must see every candidate in the shard
-                    // before Boolean/boost composition and the final global Top-K.
+                    // The native engine evaluates the complete query before selecting hits.
                     let limit = candidate_limit(row_range_start, row_range_end)?;
                     Ok::<_, crate::Error>(async move {
                         let input = evaluation.file_io.new_input(&path)?;
                         let reader = Box::new(input.reader().await?);
-                        let result = search_full_text_index(
+                        let result = search_full_text_index_top_k(
                             reader,
                             file_name,
                             query_text,
                             limit,
                             local_filter,
+                            top_k,
                         )
                         .await?;
                         Ok::<_, crate::Error>(
@@ -496,6 +519,16 @@ async fn evaluate_full_text_search_with_executor(
 struct FullTextIndexSearchPlan {
     entry: IndexManifestEntry,
     local_filter: Option<RoaringTreemap>,
+}
+
+fn disjoint_full_text_ranges(plans: &[FullTextIndexSearchPlan]) -> bool {
+    let mut ranges = plans
+        .iter()
+        .filter_map(|plan| plan.entry.index_file.global_index_meta.as_ref())
+        .map(|meta| (meta.row_range_start, meta.row_range_end))
+        .collect::<Vec<_>>();
+    ranges.sort_unstable();
+    ranges.windows(2).all(|pair| pair[0].1 < pair[1].0)
 }
 
 fn plan_full_text_index_searches(
@@ -673,7 +706,7 @@ async fn read_raw_full_text_splits(
     let read = read_builder.new_read()?;
     let mut stream = read.to_arrow(splits)?;
 
-    let config = raw_full_text_config(table_options)?;
+    let config = raw_full_text_config(table_options, &search.field_name)?;
     let mut writer = tokio::task::spawn_blocking(move || {
         FullTextIndexWriter::new(config).map_err(full_text_error)
     })
@@ -884,8 +917,16 @@ fn raw_full_text_document(
 
 fn raw_full_text_config(
     table_options: &HashMap<String, String>,
+    column: &str,
 ) -> crate::Result<FullTextIndexConfig> {
-    let native_options: HashMap<String, String> = table_options
+    let mut options = table_options.clone();
+    options.extend(super::global_index_options::field_index_options(
+        table_options,
+        column,
+        "full-text",
+        "full-text",
+    )?);
+    let native_options: HashMap<String, String> = options
         .iter()
         .filter_map(|(key, value)| {
             key.strip_prefix("full-text.")
@@ -1016,6 +1057,7 @@ mod tests {
                 partition_filter: None,
                 row_filter: None,
                 source_splits: None,
+                allow_top_k: true,
             },
             &[],
             &search,
@@ -1172,6 +1214,7 @@ mod tests {
                 partition_filter: None,
                 row_filter: None,
                 source_splits: None,
+                allow_top_k: true,
             },
             &[entry],
             &search,
@@ -1259,6 +1302,7 @@ mod tests {
                 partition_filter: None,
                 row_filter: None,
                 source_splits: None,
+                allow_top_k: true,
             },
             &[entry, missing_empty_filter_entry],
             &search,
@@ -1288,13 +1332,65 @@ mod tests {
     }
 
     #[test]
+    fn json_encoded_flat_analyzer_collections_match_field_json() {
+        for options in [
+            HashMap::from([
+                (
+                    "full-text.stop-words".into(),
+                    r#"["paimon","index"]"#.into(),
+                ),
+                ("full-text.columns".into(), r#"["body","title"]"#.into()),
+            ]),
+            HashMap::from([
+                (
+                    "full-text.stop-words".into(),
+                    r#"["paimon","index"]"#.into(),
+                ),
+                ("full-text.text_fields".into(), r#"["body","title"]"#.into()),
+            ]),
+            HashMap::from([
+                (
+                    "full-text.stop-words".into(),
+                    r#"["paimon","index"]"#.into(),
+                ),
+                ("full-text.text-fields".into(), r#"["body","title"]"#.into()),
+            ]),
+            HashMap::from([(
+                "fields.body.index-options".into(),
+                r#"{"stop-words":["paimon","index"],"text-fields":["body","title"]}"#.into(),
+            )]),
+        ] {
+            let config = raw_full_text_config(&options, "body").unwrap();
+            assert_eq!(config.text_fields, vec!["body", "title"]);
+            assert_eq!(config.tokenizer.stop_words, vec!["paimon", "index"]);
+            let defaults = super::super::global_index_options::field_index_options(
+                &options,
+                "body",
+                "full-text",
+                "full-text",
+            )
+            .unwrap();
+            let mut merged = options.clone();
+            merged.extend(defaults);
+            let native = super::super::index_build::full_text::native_full_text_options(&merged);
+            for (key, value) in &native {
+                match key.replace('_', "-").as_str() {
+                    "stop-words" => assert_eq!(value, "paimon;index"),
+                    "text-fields" | "columns" => assert_eq!(value, "body;title"),
+                    _ => (),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_raw_full_text_config_preserves_native_text_fields() {
         let options = HashMap::from([(
             "full-text.text-fields".to_string(),
             "native_text,secondary".to_string(),
         )]);
 
-        let config = raw_full_text_config(&options).unwrap();
+        let config = raw_full_text_config(&options, "body").unwrap();
 
         assert_eq!(config.text_fields, vec!["native_text", "secondary"]);
         assert_eq!(config.default_text_field(), "native_text");
@@ -1306,7 +1402,7 @@ mod tests {
             "full-text.text-field".to_string(),
             "native_text".to_string(),
         )]);
-        let config = raw_full_text_config(&options).unwrap();
+        let config = raw_full_text_config(&options, "body").unwrap();
         let search = FullTextSearch::new(
             r#"{"match":{"column":"native_text","query":"rare common"}}"#.to_string(),
             10,
@@ -1370,6 +1466,22 @@ mod tests {
         let mut bytes = Vec::new();
         writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
         bytes
+    }
+
+    #[test]
+    fn top_k_requires_disjoint_inclusive_shard_ranges() {
+        let entries = [
+            full_text_index_entry("a", 0, 9),
+            full_text_index_entry("b", 10, 19),
+        ];
+        let plans = plan_full_text_index_searches(entries.iter().collect(), None).unwrap();
+        assert!(disjoint_full_text_ranges(&plans));
+        let entries = [
+            full_text_index_entry("a", 0, 9),
+            full_text_index_entry("b", 9, 19),
+        ];
+        let plans = plan_full_text_index_searches(entries.iter().collect(), None).unwrap();
+        assert!(!disjoint_full_text_ranges(&plans));
     }
 
     #[test]
@@ -1848,15 +1960,16 @@ mod tests {
         ]);
         let core = CoreOptions::new(&de_on);
         assert!(
-            !resolves_to_pk_full_text_path(&core, "body"),
+            !resolves_to_pk_full_text_path(&core, "body", true),
             "data-evolution on must not resolve to the PK full-text path"
         );
         // Off + configured column -> PK path; a non-configured column -> not PK.
         let de_off =
             HashMap::from([("pk-full-text.index.columns".to_string(), "body".to_string())]);
         let core_off = CoreOptions::new(&de_off);
-        assert!(resolves_to_pk_full_text_path(&core_off, "body"));
-        assert!(!resolves_to_pk_full_text_path(&core_off, "other"));
+        assert!(resolves_to_pk_full_text_path(&core_off, "body", true));
+        assert!(!resolves_to_pk_full_text_path(&core_off, "other", true));
+        assert!(!resolves_to_pk_full_text_path(&core_off, "body", false));
     }
 
     // A non-positive limit must fail loud at construction, even on an empty table

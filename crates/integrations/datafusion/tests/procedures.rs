@@ -716,42 +716,6 @@ async fn test_delete_branch_rejects_path_separated_name() {
     table.copy_with_branch("prod").await.unwrap();
 }
 
-#[tokio::test]
-async fn test_create_lumina_index_requires_index_column() {
-    let (_tmp, sql_context) = setup_table_with_snapshots().await;
-
-    assert_sql_error(
-        &sql_context,
-        "CALL sys.create_lumina_index(table => 'test_db.t1')",
-        "Missing required argument: 'index_column'",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_create_lumina_index_rejects_invalid_index_type() {
-    let (_tmp, sql_context) = setup_table_with_snapshots().await;
-
-    assert_sql_error(
-        &sql_context,
-        "CALL sys.create_lumina_index(table => 'test_db.t1', index_column => 'name', index_type => 'btree')",
-        "Unsupported Lumina index type: btree",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_create_lumina_index_rejects_invalid_options() {
-    let (_tmp, sql_context) = setup_table_with_snapshots().await;
-
-    assert_sql_error(
-        &sql_context,
-        "CALL sys.create_lumina_index(table => 'test_db.t1', index_column => 'name', options => 'lumina.index.dimension')",
-        "Expected comma-separated key=value pairs",
-    )
-    .await;
-}
-
 async fn setup_btree_global_index_table(
     table_name: &str,
 ) -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
@@ -838,7 +802,13 @@ async fn test_create_global_index_requires_index_column() {
 async fn test_create_global_index_rejects_unsupported_index_types() {
     let (_tmp, sql_context) = setup_btree_global_index_table("global_index_bad_type").await;
 
-    for index_type in ["hash", "ivf-hnsw-flat", "ivf-hnsw-sq"] {
+    for index_type in [
+        "hash",
+        "ivf-hnsw-flat",
+        "ivf-hnsw-sq",
+        "lumina",
+        "lumina-vector-ann",
+    ] {
         assert_sql_error(
             &sql_context,
             &format!(
@@ -852,6 +822,17 @@ async fn test_create_global_index_rejects_unsupported_index_types() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn test_removed_vector_procedure_is_unknown() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("removed_vector_proc").await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_lumina_index(table => 'test_db.removed_vector_proc', index_column => 'id')",
+        "Unknown procedure: create_lumina_index",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1211,7 +1192,6 @@ async fn test_create_and_drop_fm_global_index() {
     drop(tmp);
 }
 
-#[cfg(feature = "fulltext")]
 #[tokio::test]
 async fn test_create_and_drop_full_text_global_index() {
     let (tmp, sql_context) = setup_sql_context().await;
@@ -1297,7 +1277,6 @@ async fn test_create_and_drop_full_text_global_index() {
     drop(tmp);
 }
 
-#[cfg(feature = "fulltext")]
 #[tokio::test]
 async fn test_create_full_text_global_index_rejects_non_string_column() {
     let (_tmp, sql_context) = setup_btree_global_index_table("ft_bad_column").await;
@@ -2493,19 +2472,19 @@ async fn test_drop_global_index_rejects_unsupported_index_type() {
 }
 
 #[tokio::test]
-async fn test_drop_global_index_accepts_lumina_type() {
-    let (_tmp, sql_context) = setup_btree_global_index_table("lumina_drop_accepted").await;
+async fn test_drop_global_index_accepts_diskann_type() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("diskann_drop_accepted").await;
     exec(
         &sql_context,
-        "INSERT INTO paimon.test_db.lumina_drop_accepted (id, name) VALUES (1, 'alice')",
+        "INSERT INTO paimon.test_db.diskann_drop_accepted (id, name) VALUES (1, 'alice')",
     )
     .await;
 
-    // No lumina index exists; the call must be accepted and succeed (no-match Ok),
+    // No diskann index exists; the call must be accepted and succeed (no-match Ok),
     // NOT rejected as an unsupported type.
     exec(
         &sql_context,
-        "CALL sys.drop_global_index(table => 'test_db.lumina_drop_accepted', index_column => 'id', index_type => 'lumina')",
+        "CALL sys.drop_global_index(table => 'test_db.diskann_drop_accepted', index_column => 'id', index_type => 'diskann')",
     )
     .await;
 }

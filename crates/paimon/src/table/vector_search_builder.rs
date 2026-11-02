@@ -192,3 +192,6 @@ impl<'a> VectorSearchBuilder<'a> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod index_options_tests;

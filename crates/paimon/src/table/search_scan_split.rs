@@ -21,11 +21,12 @@ use super::bucket_filter::split_partition_and_data_predicates;
 use super::global_index_scanner::unindexed_ranges_for_global_index_entries;
 use super::global_index_types::normalize_queryable_global_index_type;
 use super::row_id_predicate::intersect_sorted_ranges;
-use super::vector_search_common::{configured_vector_index_type, VectorIndexBackend};
+use super::vector_search_common::resolve_vector_search_options;
 use super::{find_field_id_by_name, merge_row_ranges, DataSplit, RowRange, Table};
 use crate::spec::{
     CoreOptions, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifestEntry, Predicate,
 };
+use crate::vindex::is_vindex_index_type;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -80,15 +81,22 @@ pub(super) async fn global_search_splits(
             && if full_text {
                 file.index_type == "full-text"
             } else {
-                VectorIndexBackend::from_index_type(&file.index_type).is_some()
+                is_vindex_index_type(&file.index_type)
             }
     };
     let selected = entries
         .iter()
         .filter(|entry| entry.kind == FileKind::Add && belongs(&entry.index_file))
         .collect::<Vec<_>>();
-    // Full-text admits raw fallback only after finding its index definition.
-    if full_text && selected.is_empty() {
+    // A declaration supplies the definition even before its first payload is published.
+    if full_text
+        && selected.is_empty()
+        && !super::global_index_options::declares_column(
+            table.schema().options(),
+            column,
+            "full-text",
+        )
+    {
         return Ok(vec![]);
     }
     let row_filter = filter.and_then(|filter| {
@@ -199,8 +207,22 @@ pub(super) async fn global_search_splits(
             .values()
             .flat_map(|files| files.iter())
             .next()
-            .map(|file| file.index_type.clone())
-            .or_else(|| configured_vector_index_type(table.schema().options(), options, column));
+            .map(|file| file.index_type.clone());
+        let index_type = match index_type {
+            Some(kind) => Some(kind),
+            None if full_text => None,
+            None => {
+                resolve_vector_search_options(
+                    table.schema().options(),
+                    options,
+                    column,
+                    None,
+                    false,
+                )?
+                .resolved
+                .index_type
+            }
+        };
         result.push(SearchScanSplit::Raw {
             scalar_index_files: intersecting_scalar(&raw_ranges),
             row_ranges: raw_ranges,
@@ -450,7 +472,7 @@ mod tests {
     fn raw_source_scalar_metadata_cannot_add_search_payloads() {
         // A search payload hidden in scalar metadata would otherwise be searched
         // over [0, 2], extending the explicitly selected raw source [1, 1].
-        for index_type in ["ivf-flat", "lumina", "lumina-vector-ann", "full-text"] {
+        for index_type in ["ivf-flat", "diskann", "full-text"] {
             let source = raw_source_with_scalar(index_type);
             let error = VectorScanPlan::new(Some(snapshot()), vec![source.clone()]).unwrap_err();
             assert!(error.to_string().contains("unsupported index type"));
@@ -459,13 +481,8 @@ mod tests {
                 "splits": [source.clone()],
             });
             assert!(serde_json::from_value::<VectorScanPlan>(wire.clone()).is_err());
-            #[cfg(feature = "fulltext")]
-            {
-                assert!(
-                    crate::table::FullTextScanPlan::new(Some(snapshot()), vec![source]).is_err()
-                );
-                assert!(serde_json::from_value::<crate::table::FullTextScanPlan>(wire).is_err());
-            }
+            assert!(crate::table::FullTextScanPlan::new(Some(snapshot()), vec![source]).is_err());
+            assert!(serde_json::from_value::<crate::table::FullTextScanPlan>(wire).is_err());
         }
     }
 
@@ -485,13 +502,8 @@ mod tests {
             let plan = VectorScanPlan::new(Some(snapshot()), vec![source.clone()]).unwrap();
             let wire = serde_json::to_value(plan).unwrap();
             assert!(serde_json::from_value::<VectorScanPlan>(wire.clone()).is_ok());
-            #[cfg(feature = "fulltext")]
-            {
-                assert!(
-                    crate::table::FullTextScanPlan::new(Some(snapshot()), vec![source]).is_ok()
-                );
-                assert!(serde_json::from_value::<crate::table::FullTextScanPlan>(wire).is_ok());
-            }
+            assert!(crate::table::FullTextScanPlan::new(Some(snapshot()), vec![source]).is_ok());
+            assert!(serde_json::from_value::<crate::table::FullTextScanPlan>(wire).is_ok());
         }
     }
 }

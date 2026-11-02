@@ -19,8 +19,6 @@
 
 use crate::arrow::format::FilePredicates;
 use crate::arrow::residual::{evaluate_predicates_mask, widen_scan_fields};
-use crate::lumina::reader::LuminaVectorGlobalIndexReader;
-use crate::lumina::LuminaIndexMeta;
 use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::table::bucket_filter::split_partition_and_data_predicates;
 use crate::table::data_file_reader::DataFileReader;
@@ -40,10 +38,11 @@ use crate::table::source::DataSplit;
 use crate::table::vector_read::Read;
 use crate::table::vector_search_common::{
     collect_ranked_rows, current_tokio_runtime_handle, log_vindex_range_io_stats,
-    reorder_and_strip_position, vindex_concurrency_limits, RankedRow, VectorIndexBackend,
+    read_vector_index_metric, reorder_and_strip_position, vindex_concurrency_limits, RankedRow,
 };
 use crate::table::{ArrowRecordBatchStream, RowRange, Table};
 use crate::vector_search::{GlobalIndexIOMeta, GlobalIndexResult, VectorSearch};
+use crate::vindex::is_vindex_index_type;
 use crate::vindex::pkvector::ann::{AnnSegmentSource, PkVectorAnnSearcher, VindexAnnSearcher};
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment, ExactFileSearchFuture};
 use crate::vindex::pkvector::metric::VectorSearchMetric;
@@ -53,7 +52,6 @@ use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use arrow_array::{Array, Int64Array, RecordBatch};
 use futures::{stream, TryStreamExt};
 use std::collections::{HashMap, HashSet};
-use std::io::Cursor;
 use std::sync::Arc;
 
 pub(super) struct PkVectorRead {
@@ -63,11 +61,10 @@ pub(super) struct PkVectorRead {
     vector_column: String,
     queries: Vec<Vec<f32>>,
     limit: usize,
-    params: PkVectorSearchParams,
 }
 
 impl PkVectorRead {
-    /// Construct a reader from parameters resolved and validated by the builder.
+    /// Capture query inputs; format-dependent options wait for the scan plan.
     pub(super) fn new(
         table: &Table,
         options: &HashMap<String, String>,
@@ -75,7 +72,6 @@ impl PkVectorRead {
         vector_column: &str,
         queries: &[&[f32]],
         limit: usize,
-        params: PkVectorSearchParams,
     ) -> Self {
         Self {
             table: table.clone(),
@@ -84,7 +80,6 @@ impl PkVectorRead {
             vector_column: vector_column.to_string(),
             queries: queries.iter().map(|query| query.to_vec()).collect(),
             limit,
-            params,
         }
     }
 }
@@ -95,16 +90,61 @@ impl Read for PkVectorRead {
     async fn read(&self, plan: PkVectorScanPlan) -> crate::Result<Vec<GlobalIndexResult>> {
         let core = CoreOptions::new(self.table.schema().options());
         let queries: Vec<&[f32]> = self.queries.iter().map(Vec::as_slice).collect();
-        let candidates = search_pk_candidates_batch_with_plan(
+        let mut metadata_type = None;
+        for segment in plan.splits.iter().flat_map(|split| &split.ann_segments) {
+            if let Some(previous) = metadata_type {
+                if previous != segment.index_type.as_str() {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Vector column '{}' has multiple index types: {previous} and {}",
+                            self.vector_column, segment.index_type
+                        ),
+                        source: None,
+                    });
+                }
+            }
+            metadata_type = Some(segment.index_type.as_str());
+        }
+        let mut params = PkVectorSearchParams::resolve(
             &self.table,
             &self.options,
+            self.filter.as_ref(),
+            &self.vector_column,
+            &queries,
+            self.limit,
+            metadata_type,
+        )?;
+        // The payload's training metric governs ANN scores, raw fallback and
+        // refinement. Schema/query options cannot reinterpret an existing index.
+        // One payload establishes the metric; the search scorer validates every
+        // other payload against it without serializing extra remote header reads.
+        if let Some(segment) = plan
+            .splits
+            .iter()
+            .flat_map(|split| &split.ann_segments)
+            .find(|segment| segment.row_count > 0)
+        {
+            let metric = VectorSearchMetric::from_vindex(
+                read_vector_index_metric(
+                    self.table.file_io(),
+                    &segment.path,
+                    segment.file_size,
+                    Some(&segment.index_meta),
+                )
+                .await?,
+            );
+            params.metric = metric;
+            params.vector_options.metric = metric.as_str().into();
+        }
+        let candidates = search_pk_candidates_batch_with_plan(
+            &self.table,
             self.filter.as_ref(),
             &core,
             &self.vector_column,
             &queries,
             self.limit,
             &plan,
-            &self.params,
+            &params,
         )
         .await?;
         let table = Arc::new(self.table.clone());
@@ -116,7 +156,7 @@ impl Read for PkVectorRead {
                     plan.snapshot_id,
                     candidates,
                     &plan.splits,
-                    self.params.metric,
+                    params.metric,
                 )
             })
             .collect()
@@ -241,7 +281,6 @@ fn intersect_row_ranges_by_split(
 #[allow(clippy::too_many_arguments)]
 async fn search_pk_raw_candidates_batch_with_plan(
     table: &Table,
-    query_options: &HashMap<String, String>,
     filter: Option<&Predicate>,
     core: &CoreOptions<'_>,
     pk_col: &str,
@@ -250,8 +289,8 @@ async fn search_pk_raw_candidates_batch_with_plan(
     plan: &PkVectorScanPlan,
     params: &PkVectorSearchParams,
 ) -> crate::Result<Vec<OrchestratorSearchResult>> {
-    // An empty plan has nothing to search. Returned before the backend is resolved
-    // so a table with no searchable data never errors on an unrecognized index type.
+    // Options have been validated against the captured plan. An empty plan has
+    // no buckets to search, but must preserve one result per query.
     if plan.splits.is_empty() {
         return Ok(queries
             .iter()
@@ -264,32 +303,27 @@ async fn search_pk_raw_candidates_batch_with_plan(
 
     let metric = params.metric;
     let concurrency = params.concurrency;
-    let index_type = params.index_type.clone();
+    let index_type = params.vector_options.index_type.as_deref().unwrap_or("");
     let vector_field = params.vector_field.clone();
     let skip_exact_fallback = params.skip_exact_fallback;
     let indexed_limit = params.indexed_limit;
 
-    // Resolve the vector index backend from the single configured index type.
-    // Java enforces one index type per PK table and Rust filters segments to it,
-    // so one backend serves every segment. Computed after the empty-plan return so
-    // an empty table never errors on an unrecognized type.
-    let backend = VectorIndexBackend::from_index_type(&index_type).ok_or_else(|| {
-        crate::Error::DataInvalid {
+    // All valid segments use the format selected from the captured plan. An empty plan returns
+    // above before opening readers or resolving concurrency limits.
+    if !is_vindex_index_type(index_type) {
+        return Err(crate::Error::DataInvalid {
             message: format!("unsupported PK vector index backend/type: '{index_type}'"),
             source: None,
-        }
-    })?;
-    let (batch_index_parallelism, range_read_concurrency) = match backend {
-        VectorIndexBackend::Vindex => vindex_concurrency_limits(
-            core,
-            plan.splits
-                .iter()
-                .map(|split| split.ann_segments.len())
-                .sum(),
-            concurrency,
-        )?,
-        VectorIndexBackend::Lumina => (1, 0),
-    };
+        });
+    }
+    let (batch_index_parallelism, range_read_concurrency) = vindex_concurrency_limits(
+        core,
+        plan.splits
+            .iter()
+            .map(|split| split.ann_segments.len())
+            .sum(),
+        concurrency,
+    )?;
 
     // Production data-file reader, mirroring `table_read.rs::new_data_file_reader`
     // but projecting only the vector column with no predicates.
@@ -305,63 +339,43 @@ async fn search_pk_raw_candidates_batch_with_plan(
     .with_table_options(table.schema().options().clone());
 
     // Real ANN scorer + loader. Each segment source is opened lazily inside its
-    // bucket leaf and dropped after scoring. Lumina keeps its buffered-byte path;
-    // vindex remains range-backed and reads only metadata and probed lists.
-    let options = {
-        let mut o = table.schema().options().clone();
-        o.extend(query_options.clone());
-        o
-    };
-    let search_options = options.clone();
+    // bucket leaf and dropped after scoring. Range reads load only metadata
+    // and the index data needed for the search.
+    let search_options = params.vector_options.options.clone();
+    let options = search_options.clone();
     let field_name = pk_col.to_string();
 
     let loader_io = table.file_io().clone();
-    let loader_range_read_limiter = match backend {
-        VectorIndexBackend::Vindex => Some(RangeReadLimiter::new(range_read_concurrency)),
-        VectorIndexBackend::Lumina => None,
-    };
-    let loader: crate::vindex::pkvector::ann::SourceSegmentLoader = Box::new(
-        move |segment: &BucketAnnSegment| {
+    let loader_range_read_limiter = RangeReadLimiter::new(range_read_concurrency);
+    let loader: crate::vindex::pkvector::ann::SourceSegmentLoader =
+        Box::new(move |segment: &BucketAnnSegment| {
             let io = loader_io.clone();
             let range_read_limiter = loader_range_read_limiter.clone();
             let path = segment.path.clone();
             let file_size = segment.file_size;
             Box::pin(async move {
                 let input = io.new_input(&path)?;
-                match backend {
-                    VectorIndexBackend::Lumina => input
-                        .read()
+                let file_reader =
+                    input
+                        .reader()
                         .await
-                        .map(AnnSegmentSource::Buffered)
                         .map_err(|error| crate::Error::DataInvalid {
-                            message: format!("failed to read ANN index file '{path}': {error}"),
-                            source: None,
-                        }),
-                    VectorIndexBackend::Vindex => {
-                        let file_reader =
-                            input
-                                .reader()
-                                .await
-                                .map_err(|error| crate::Error::DataInvalid {
-                                    message: format!(
-                                        "failed to open ANN index file '{path}' for range reads: {error}"
-                                    ),
-                                    source: None,
-                                })?;
-                        Ok(AnnSegmentSource::Vindex(
-                            VindexFileReader::new_with_limiter(
-                                Arc::new(file_reader),
-                                current_tokio_runtime_handle()?,
-                                range_read_limiter.expect("Vindex range-read limiter"),
-                                file_size,
-                                path,
+                            message: format!(
+                                "failed to open ANN index file '{path}' for range reads: {error}"
                             ),
-                        ))
-                    }
-                }
+                            source: None,
+                        })?;
+                Ok(AnnSegmentSource::Vindex(
+                    VindexFileReader::new_with_limiter(
+                        Arc::new(file_reader),
+                        current_tokio_runtime_handle()?,
+                        range_read_limiter,
+                        file_size,
+                        path,
+                    ),
+                ))
             })
-        },
-    );
+        });
 
     let scorer: crate::vindex::pkvector::ann::SourceBatchScorer = Box::new(
         move |segment: &BucketAnnSegment, source: AnnSegmentSource, searches: &[VectorSearch]| {
@@ -370,15 +384,8 @@ async fn search_pk_raw_candidates_batch_with_plan(
                 segment.file_size,
                 segment.index_meta.clone(),
             );
-            match (backend, source) {
-                (VectorIndexBackend::Lumina, AnnSegmentSource::Buffered(data)) => {
-                    let lumina_metric =
-                        LuminaIndexMeta::deserialize(&segment.index_meta)?.metric()?;
-                    verify_segment_metric(metric, VectorSearchMetric::from_lumina(lumina_metric))?;
-                    let mut reader = LuminaVectorGlobalIndexReader::new(io_meta, options.clone());
-                    reader.visit_batch_vector_search(searches, |_| Ok(Cursor::new(data)))
-                }
-                (VectorIndexBackend::Vindex, AnnSegmentSource::Vindex(source)) => {
+            match source {
+                AnnSegmentSource::Vindex(source) => {
                     let range_io_stats = source.range_io_stats();
                     let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options.clone())
                         .with_batch_index_parallelism(batch_index_parallelism);
@@ -397,16 +404,13 @@ async fn search_pk_raw_candidates_batch_with_plan(
                     }
                     Ok(results)
                 }
-                (VectorIndexBackend::Lumina, AnnSegmentSource::Vindex(_))
-                | (VectorIndexBackend::Vindex, AnnSegmentSource::Buffered(_)) => {
-                    Err(crate::Error::DataInvalid {
-                        message: format!(
-                            "ANN segment '{}' was loaded with the wrong backend source",
-                            segment.path
-                        ),
-                        source: None,
-                    })
-                }
+                AnnSegmentSource::Buffered(_) => Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "ANN segment '{}' was loaded with the wrong backend source",
+                        segment.path
+                    ),
+                    source: None,
+                }),
             }
         },
     );
@@ -506,7 +510,6 @@ async fn search_pk_raw_candidates_batch_with_plan(
 #[allow(clippy::too_many_arguments)]
 async fn search_pk_candidates_batch_with_plan(
     table: &Table,
-    query_options: &HashMap<String, String>,
     filter: Option<&Predicate>,
     core: &CoreOptions<'_>,
     pk_col: &str,
@@ -516,15 +519,7 @@ async fn search_pk_candidates_batch_with_plan(
     params: &PkVectorSearchParams,
 ) -> crate::Result<Vec<Vec<PkVectorCandidate>>> {
     let searches = search_pk_raw_candidates_batch_with_plan(
-        table,
-        query_options,
-        filter,
-        core,
-        pk_col,
-        queries,
-        limit,
-        plan,
-        params,
+        table, filter, core, pk_col, queries, limit, plan, params,
     )
     .await?;
 

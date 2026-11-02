@@ -18,7 +18,6 @@
 use super::*;
 use crate::catalog::Identifier;
 use crate::io::{FileIO, FileIOBuilder};
-use crate::lumina::LuminaIndexMeta;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
     BinaryRow, DataField, DataFileMeta, DataType, Datum, FloatType, IntType, Predicate,
@@ -30,7 +29,6 @@ use crate::table::source::DataSplitBuilder;
 use crate::table::vector_scan::Scan;
 use crate::table::vector_search_test_utils::{build_vindex_segment_bytes, pk_vector_table};
 use crate::table::{Table, TableCommit, TableWrite};
-use crate::vindex::pkvector::bucket::BucketAnnSegment;
 use crate::vindex::pkvector::metric::VectorSearchMetric;
 use crate::vindex::IVF_FLAT_IDENTIFIER;
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
@@ -96,22 +94,6 @@ fn pk_data_file(name: &str, row_count: i64, first_row_id: Option<i64>) -> DataFi
         first_row_id,
         write_cols: None,
         column_max_sequence_numbers: None,
-    }
-}
-
-fn pk_search_split(bucket: i32, files: Vec<DataFileMeta>) -> PkVectorSearchSplit {
-    PkVectorSearchSplit {
-        data_split: DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(bucket)
-            .with_bucket_path(format!("memory:/t/bucket-{bucket}"))
-            .with_total_buckets(1)
-            .with_data_files(files)
-            .build()
-            .unwrap(),
-        ann_segments: Vec::new(),
-        active_files: Vec::new(),
     }
 }
 
@@ -287,26 +269,6 @@ async fn vector_rerank_fixture(
     (reader, split, vector_field)
 }
 
-fn pk_split_with_lumina_segment(path: &str, metric: &str) -> PkVectorSearchSplit {
-    let mut split = pk_search_split(0, vec![pk_data_file("file-a", 3, Some(0))]);
-    let source_meta = crate::spec::PrimaryKeyIndexSourceMeta::new(
-        1,
-        vec![crate::spec::PrimaryKeyIndexSourceFile::new("file-a".to_string(), 3).unwrap()],
-    )
-    .unwrap();
-    let mut segment = BucketAnnSegment::for_test(source_meta);
-    segment.path = path.to_string();
-    // Lumina stores its metric in the serialized index metadata blob, not in
-    // the segment file bytes. `deserialize` requires both keys present.
-    let meta = crate::lumina::LuminaIndexMeta::new(HashMap::from([
-        ("index.dimension".to_string(), "2".to_string()),
-        ("distance.metric".to_string(), metric.to_string()),
-    ]));
-    segment.index_meta = meta.serialize().unwrap();
-    split.ann_segments = vec![segment];
-    split
-}
-
 /// One Java `DataOutput#writeUTF` value (u16-BE length + modified UTF-8), used
 /// to assemble the `PrimaryKeyIndexSourceMeta` frame below.
 fn java_write_utf(s: &str) -> Vec<u8> {
@@ -359,6 +321,7 @@ async fn build_committed_pk_vector_table(vectors: &[[f32; 2]]) -> Table {
     const DIM: usize = 2;
     let table_path = "memory:/pk_vector_route_test";
     let schema = Schema::builder()
+        .option("write-only", "true")
         .column("id", DataType::Int(IntType::new()))
         .column(
             "embedding",
@@ -948,47 +911,6 @@ async fn rerank_reads_only_candidate_positions_not_whole_column() {
 }
 
 #[test]
-fn verify_segment_metric_accepts_matching_lumina_metric() {
-    // Lumina segment metadata says cosine; configured cosine => Ok. No segment
-    // file bytes are needed on the Lumina path.
-    let split = pk_split_with_lumina_segment("seg-lumina", "cosine");
-    let segment = &split.ann_segments[0];
-    let lumina_metric = LuminaIndexMeta::deserialize(&segment.index_meta)
-        .unwrap()
-        .metric()
-        .unwrap();
-    verify_segment_metric(
-        VectorSearchMetric::Cosine,
-        VectorSearchMetric::from_lumina(lumina_metric),
-    )
-    .expect("matching lumina metric must pass");
-}
-
-#[test]
-fn verify_segment_metric_rejects_mismatched_lumina_metric() {
-    // Lumina segment metadata says l2; configured inner_product => fail loud,
-    // naming both metrics.
-    let split = pk_split_with_lumina_segment("seg-lumina", "l2");
-    let segment = &split.ann_segments[0];
-    let lumina_metric = LuminaIndexMeta::deserialize(&segment.index_meta)
-        .unwrap()
-        .metric()
-        .unwrap();
-    let err = verify_segment_metric(
-        VectorSearchMetric::InnerProduct,
-        VectorSearchMetric::from_lumina(lumina_metric),
-    )
-    .expect_err("mismatched lumina metric must fail loud");
-    assert!(
-        matches!(err, crate::Error::DataInvalid { ref message, .. }
-            if message.contains("does not match configured metric")
-                && message.contains("l2")
-                && message.contains("inner_product")),
-        "unexpected error: {err:?}"
-    );
-}
-
-#[test]
 fn verify_segment_metric_accepts_matching_vindex_metric() {
     // Real IVF segment trained with L2; configured metric L2 => Ok.
     let bytes = bytes::Bytes::from(build_vindex_segment_bytes("l2"));
@@ -1021,19 +943,88 @@ fn verify_segment_metric_rejects_mismatched_vindex_metric() {
 
 // ---- Search results retain scored positions and the planned source context. ----
 #[tokio::test]
+async fn persisted_metric_skips_empty_segments_and_rejects_mixed_payloads() {
+    let table = build_committed_pk_vector_table(&[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]).await;
+    let scan = crate::table::pk_vector_scan::PkVectorScan::new(&table, 1, None);
+    let plan = scan.plan().await.unwrap();
+    let read_table = table.copy_with_options(HashMap::from([(
+        "fields.embedding.distance.metric".into(),
+        "inner_product".into(),
+    )]));
+    let read = PkVectorRead::new(
+        &read_table,
+        &HashMap::new(),
+        None,
+        "embedding",
+        &[&[0.0, 1.0]],
+        2,
+    );
+
+    // The second bucket is an independent source unit; source file names may
+    // coincide across buckets without overlapping segment ownership.
+    let mut other = plan.splits[0].clone();
+    other.data_split = DataSplitBuilder::new()
+        .with_snapshot(plan.snapshot_id)
+        .with_partition(other.data_split.partition().clone())
+        .with_bucket(1)
+        .with_bucket_path("memory:/pk_vector_route_test/bucket-1".into())
+        .with_total_buckets(2)
+        .with_data_files(other.data_split.data_files().to_vec())
+        .build()
+        .unwrap();
+    let mut with_empty = plan.clone();
+    let mut empty = other.clone();
+    let segment = &mut empty.ann_segments[0];
+    segment.row_count = 0;
+    segment.path = "memory:/missing-empty-payload".into();
+    with_empty.splits.insert(0, empty);
+    let results = read.read(with_empty).await.unwrap();
+    assert_eq!(
+        results[0]
+            .positions()
+            .unwrap()
+            .iter()
+            .map(|p| p.score)
+            .collect::<Vec<_>>(),
+        vec![1.0, 0.5]
+    );
+
+    let mut mixed = plan;
+    let bytes = build_vindex_segment_bytes("cosine");
+    let segment = &mut other.ann_segments[0];
+    segment.path = "memory:/mixed-cosine-payload".into();
+    segment.file_size = bytes.len() as u64;
+    table
+        .file_io()
+        .new_output(&segment.path)
+        .unwrap()
+        .write(bytes::Bytes::from(bytes))
+        .await
+        .unwrap();
+    mixed.splits.push(other);
+    let error = read
+        .read(mixed)
+        .await
+        .expect_err("mixed persisted metrics must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match configured metric"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn reader_uses_planned_splits_after_index_manifest_is_removed() {
     let table = build_committed_pk_vector_table(&[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]).await;
     let options = HashMap::new();
     let query = [0.0, 1.0];
     let params =
-        PkVectorSearchParams::resolve(&table, &options, None, "embedding", &[&query], 2).unwrap();
-    let scan = crate::table::pk_vector_scan::PkVectorScan::new(
-        &table,
-        params.vector_field.id(),
-        params.index_type.clone(),
-        None,
-    );
-    let read = PkVectorRead::new(&table, &options, None, "embedding", &[&query], 2, params);
+        PkVectorSearchParams::resolve(&table, &options, None, "embedding", &[&query], 2, None)
+            .unwrap();
+    let scan =
+        crate::table::pk_vector_scan::PkVectorScan::new(&table, params.vector_field.id(), None);
+    let read = PkVectorRead::new(&table, &options, None, "embedding", &[&query], 2);
     let plan = scan.plan().await.unwrap();
     let snapshot_id = plan.snapshot_id;
     let manager = table.snapshot_manager();
@@ -1259,4 +1250,43 @@ fn residual_uses_only_data_conjuncts_of_the_filter() {
         vec![mixed],
         "a mixed partition/data conjunct must stay whole in the residual"
     );
+}
+
+#[tokio::test]
+async fn reader_rejects_mixed_valid_payload_types_including_empty_markers() {
+    for cross_bucket in [false, true] {
+        let table = build_committed_pk_vector_table(&[[1.0, 0.0], [0.0, 1.0]]).await;
+        let scan = crate::table::pk_vector_scan::PkVectorScan::new(&table, 1, None);
+        let mut plan = scan.plan().await.unwrap();
+        assert_eq!(plan.splits[0].ann_segments.len(), 1);
+        let mut other = plan.splits[0].ann_segments[0].clone();
+        other.index_type = "ivf-pq".into();
+        other.row_count = 0;
+        if cross_bucket {
+            let mut split = plan.splits[0].clone();
+            split.data_split = DataSplitBuilder::new()
+                .with_snapshot(plan.snapshot_id)
+                .with_partition(split.data_split.partition().clone())
+                .with_bucket(1)
+                .with_bucket_path("memory:/pk_vector_route_test/bucket-1".into())
+                .with_total_buckets(2)
+                .with_data_files(split.data_split.data_files().to_vec())
+                .build()
+                .unwrap();
+            split.ann_segments = vec![other];
+            plan.splits.push(split);
+        } else {
+            plan.splits[0].ann_segments.push(other);
+        }
+        let reader = PkVectorRead::new(
+            &table,
+            &HashMap::new(),
+            None,
+            "embedding",
+            &[&[1.0, 0.0]],
+            1,
+        );
+        let err = reader.read(plan).await.unwrap_err();
+        assert!(err.to_string().contains("multiple index types"), "{err}");
+    }
 }

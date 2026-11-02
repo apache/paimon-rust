@@ -195,6 +195,12 @@ pub struct paimon_result_prepare_commit {
 }
 
 #[repr(C)]
+pub struct paimon_result_bytes_array {
+    pub bytes: paimon_bytes_array,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
 pub struct paimon_result_postpone_fixed_bucket_write_builder {
     pub write_builder: *mut paimon_postpone_fixed_bucket_write_builder,
     pub error: *mut paimon_error,
