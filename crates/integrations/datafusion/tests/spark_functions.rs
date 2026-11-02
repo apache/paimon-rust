@@ -54,6 +54,94 @@ async fn spark_function_families_are_available_without_a_catalog() {
 }
 
 #[tokio::test]
+async fn spark_date_part_preserves_epoch_types_and_fractional_arithmetic() {
+    use datafusion::arrow::datatypes::DataType;
+
+    let ctx = SQLContext::new();
+    assert_true(
+        &ctx,
+        "SELECT EXTRACT(EPOCH FROM TIMESTAMP '1970-01-01 00:00:01.500') / 2 = 0.75",
+    )
+    .await;
+    for expression in [
+        "date_part('epoch', ts)",
+        "datepart('EpOcH', ts)",
+        "EXTRACT(EPOCH FROM ts)",
+    ] {
+        let sql = format!(
+            "SELECT {expression} / 2 AS half FROM (VALUES \
+             (TIMESTAMP '1970-01-01 00:00:01.500'), \
+             (TIMESTAMP '1969-12-31 23:59:59.500'), \
+             (CAST(NULL AS TIMESTAMP))) t(ts)"
+        );
+        let frame = ctx.sql(&sql).await.unwrap();
+        assert_eq!(
+            frame.schema().field(0).data_type(),
+            &DataType::Float64,
+            "{sql}"
+        );
+        let batches = frame.collect().await.unwrap();
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3);
+        for (row, expected) in [Some(0.75), Some(-0.25), None].into_iter().enumerate() {
+            assert_eq!(
+                ScalarValue::try_from_array(batch.column(0), row).unwrap(),
+                ScalarValue::Float64(expected),
+                "{sql}, row {row}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn spark_date_part_preserves_nanosecond_types_and_arithmetic() {
+    use datafusion::arrow::datatypes::DataType;
+
+    let ctx = SQLContext::new();
+    for expression in [
+        "date_part('nanosecond', ts)",
+        "datepart('NaNoSeCoNdS', ts)",
+        "EXTRACT(NANOSECOND FROM ts)",
+    ] {
+        let sql = format!(
+            "SELECT {expression} + CAST(1 AS INT) AS adjusted FROM (VALUES \
+             (TIMESTAMP '1970-01-01 00:00:10.500'), \
+             (CAST(NULL AS TIMESTAMP))) t(ts)"
+        );
+        let frame = ctx.sql(&sql).await.unwrap();
+        assert_eq!(
+            frame.schema().field(0).data_type(),
+            &DataType::Int64,
+            "{sql}"
+        );
+        let batches = frame.collect().await.unwrap();
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+        for (row, expected) in [Some(10_500_000_001), None].into_iter().enumerate() {
+            assert_eq!(
+                ScalarValue::try_from_array(batch.column(0), row).unwrap(),
+                ScalarValue::Int64(expected),
+                "{sql}, row {row}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn spark_date_part_keeps_weekday_and_year_aliases() {
+    let ctx = SQLContext::new();
+    assert_true(
+        &ctx,
+        "SELECT date_part('dayofweek', DATE '1970-01-01') = 5, \
+         EXTRACT(DOW FROM DATE '1970-01-01') = 5, \
+         datepart('dayofweek_iso', DATE '1970-01-01') = 4, \
+         date_part('yearofweek', DATE '2021-01-01') = 2020, \
+         EXTRACT(YEAR FROM DATE '2021-01-01') = 2021",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn upstream_aggregates_keep_distinct_null_empty_and_overflow_contracts() {
     let ctx = SQLContext::new();
     assert_true(&ctx,"SELECT array_length(collect_list(DISTINCT v))=2,array_length(collect_set(v))=2,try_sum(v)=4,avg(v)=CAST(4 AS DOUBLE)/3 FROM (VALUES (1),(1),(2),(NULL)) t(v)").await;

@@ -21,7 +21,9 @@ use datafusion::arrow::datatypes::{DataType, Field, FieldRef, TimeUnit};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::utils::SingleRowListArrayBuilder;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
+use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
+use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult};
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::type_coercion::functions::fields_with_udf;
 use datafusion::logical_expr::{
@@ -31,8 +33,9 @@ use datafusion::logical_expr::{
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 
-// Normalize integration input types; all evaluation and simplification remain upstream.
+// Adapt input and return types while retaining upstream evaluation and simplification.
 pub(crate) fn apply_compatibility_fixes(ctx: &SessionContext) {
+    ctx.register_udf(date_part().as_ref().clone());
     for name in [
         "base64",
         "sha2",
@@ -52,6 +55,56 @@ pub(crate) fn apply_compatibility_fixes(ctx: &SessionContext) {
     for name in ["collect_list", "collect_set", "try_sum", "avg"] {
         let inner = Arc::clone(&ctx.state().aggregate_functions()[name]);
         ctx.register_udaf(AggregateUDF::from(AggregateInputs { inner }));
+    }
+}
+
+fn date_part() -> Arc<ScalarUDF> {
+    Arc::new(ScalarUDF::from(DatePart {
+        inner: datafusion_spark::function::datetime::date_part(),
+    }))
+}
+
+#[derive(Debug)]
+pub(crate) struct DatePartPlanner;
+
+impl ExprPlanner for DatePartPlanner {
+    fn plan_extract(&self, args: Vec<Expr>) -> Result<PlannerResult<Vec<Expr>>> {
+        Ok(PlannerResult::Planned(Expr::ScalarFunction(
+            ScalarFunction::new_udf(date_part(), args),
+        )))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DatePart {
+    inner: Arc<ScalarUDF>,
+}
+
+impl ScalarUDFImpl for DatePart {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn aliases(&self) -> &[String] {
+        self.inner.aliases()
+    }
+    fn signature(&self) -> &Signature {
+        self.inner.signature()
+    }
+    fn return_type(&self, types: &[DataType]) -> Result<DataType> {
+        self.inner.inner().return_type(types)
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        // Spark 54 declares every part as Int32 before delegating to this native UDF.
+        // Use its actual field so coercion preserves epoch fractions and nanoseconds.
+        datafusion::functions::datetime::date_part()
+            .inner()
+            .return_field_from_args(args)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        self.inner.invoke_with_args(args)
+    }
+    fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> Result<ExprSimplifyResult> {
+        self.inner.inner().simplify(args, info)
     }
 }
 
