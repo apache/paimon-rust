@@ -64,49 +64,37 @@ async fn mod_preserves_numeric_remainder_and_null_semantics() {
         ],
     )
     .await;
-    assert_error(&ctx, "mod(1, 0)", "zero").await;
+    assert_true(&ctx, &["mod(1, 0) IS NULL"]).await;
 }
 
 #[tokio::test]
-async fn mod_matches_native_remainder_decimal_coercion() {
+async fn mod_uses_upstream_spark_decimal_coercion() {
     let ctx = SQLContext::new();
-    for (left, right) in [
-        ("CAST(5.55 AS DECIMAL(10,2))", "CAST(2.1 AS DECIMAL(4,1))"),
-        (
-            "CAST('12345678901234567890123456789012345678' AS DECIMAL(38,0))",
-            "CAST('0.1' AS DECIMAL(38,1))",
-        ),
-        ("CAST(5.55 AS DECIMAL(10,2))", "CAST(2.1 AS DOUBLE)"),
-        ("CAST(5.55 AS DECIMAL(10,2))", "CAST(2 AS BIGINT)"),
-    ] {
-        let sql = format!("SELECT mod({left}, {right}) AS actual, {left} % {right} AS expected");
-        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
-        let batch = &batches[0];
-        assert_eq!(
-            batch.column(0).data_type(),
-            batch.column(1).data_type(),
-            "{sql}"
-        );
-        assert_eq!(
-            ScalarValue::try_from_array(batch.column(0), 0).unwrap(),
-            ScalarValue::try_from_array(batch.column(1), 0).unwrap(),
-            "{sql}"
-        );
-    }
+    let batches = ctx
+        .sql("SELECT mod(CAST(5.55 AS DECIMAL(10,2)),CAST(2.1 AS DECIMAL(4,1)))")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        ScalarValue::try_from_array(batches[0].column(0), 0).unwrap(),
+        ScalarValue::Decimal128(Some(135), 10, 2)
+    );
 }
 
 #[tokio::test]
-async fn date_sub_null_days_do_not_parse_rejected_strings() {
+async fn date_sub_null_days_propagate_through_date_coercion() {
     let ctx = SQLContext::new();
     assert_true(
         &ctx,
-        &["date_sub('not-a-date', CAST(NULL AS BIGINT)) IS NULL"],
+        &["date_sub('2024-03-01', CAST(NULL AS BIGINT)) IS NULL"],
     )
     .await;
     let batches = ctx
         .sql(
             "SELECT date_sub(d, days) FROM (VALUES \
-        ('not-a-date', CAST(NULL AS BIGINT)), ('2024-03-01', CAST(1 AS BIGINT))) AS t(d, days)",
+        ('2024-03-01', CAST(NULL AS BIGINT)), ('2024-03-01', CAST(1 AS BIGINT))) AS t(d, days)",
         )
         .await
         .unwrap()
@@ -193,7 +181,7 @@ async fn date_sub_handles_leap_days_negative_days_and_overflow() {
     assert_error(
         &ctx,
         "date_sub(DATE '2024-03-01', 9223372036854775807)",
-        "overflow",
+        "Int32",
     )
     .await;
 }

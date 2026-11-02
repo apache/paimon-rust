@@ -36,7 +36,6 @@ pub(crate) fn is_aggregate(name: &str) -> bool {
             | "max_by"
             | "min_by"
             | "arg_max"
-            | "collect_list"
             | "listagg"
     )
 }
@@ -180,32 +179,6 @@ fn lower_aggregate(call: &Function, name: &str) -> Result<Expr> {
                 )));
             }
             lowered.name = ObjectName::from(vec![Ident::new(format!("__paimon_{name}"))]);
-        }
-        "collect_list" => {
-            lowered.name = ObjectName::from(vec![Ident::new("array_agg")]);
-            if call.null_treatment == Some(NullTreatment::RespectNulls)
-                || list.clauses.iter().any(|c| {
-                    matches!(
-                        c,
-                        FunctionArgumentClause::IgnoreOrRespectNulls(NullTreatment::RespectNulls)
-                    )
-                })
-            {
-                return Err(error("collect_list does not support RESPECT NULLS"));
-            }
-            if let FunctionArguments::List(list) = &mut lowered.args {
-                list.clauses
-                    .retain(|c| !matches!(c, FunctionArgumentClause::IgnoreOrRespectNulls(_)));
-            }
-            lowered.null_treatment = Some(NullTreatment::IgnoreNulls);
-            let Expr::Function(mut coalesce) = expression("coalesce(NULL, ARRAY[])")? else {
-                unreachable!()
-            };
-            set_args(
-                &mut coalesce,
-                vec![Expr::Function(lowered), expression("ARRAY[]")?],
-            );
-            return Ok(Expr::Function(coalesce));
         }
         "listagg" => {
             lowered.name = ObjectName::from(vec![Ident::new("string_agg")]);

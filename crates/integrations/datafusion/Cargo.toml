@@ -39,13 +39,13 @@ bigdecimal = "0.4"
 chrono = "0.4"
 constant_time_eq = { workspace = true }
 datafusion = { workspace = true }
+datafusion-spark = { workspace = true }
 log = "0.4"
 paimon = { workspace = true }
 futures = "0.3"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "fs"] }
 uuid = { version = "1", features = ["v4"] }
 

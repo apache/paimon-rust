@@ -40,7 +40,7 @@ async fn six_sql_extensions_work_together() {
         table.tag_manager().get("v1").await.unwrap().unwrap().id(),
         1
     );
-    let batches=ctx.sql("SELECT id,p.pos,p.val,hex(b),typeof(p.val),size(split(txt,',')),hour(TIME '12:00:00') FROM default.events LATERAL VIEW posexplode_outer(split(txt,',')) p AS pos,val WHERE p.val RLIKE '^a$' OR p.val IS NULL ORDER BY id,p.pos").await.unwrap().collect().await.unwrap();
+    let batches=ctx.sql("SELECT id,p.pos,p.val,hex(b),typeof(p.val),size(split(txt,',')),hour(TIMESTAMP '1970-01-01 12:00:00') FROM default.events LATERAL VIEW posexplode_outer(split(txt,',')) p AS pos,val WHERE p.val RLIKE '^a$' OR p.val IS NULL ORDER BY id,p.pos").await.unwrap().collect().await.unwrap();
     let rows = batches
         .iter()
         .flat_map(|b| {
@@ -59,7 +59,7 @@ async fn six_sql_extensions_work_together() {
         rows,
         vec![
             vec!["1", "0", "a", "78790000", "string", "2", "12"],
-            vec!["2", "NULL", "NULL", "NULL", "string", "NULL", "12"]
+            vec!["2", "NULL", "NULL", "NULL", "string", "-1", "12"]
         ]
     );
 }
