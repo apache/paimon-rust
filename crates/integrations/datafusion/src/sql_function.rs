@@ -246,7 +246,7 @@ async fn expand_statement_internal(
             return Err(error);
         }
         if expanded_count == 0 {
-            crate::sql_compat::rewrite(&mut statement, state)?;
+            crate::expression_compat::rewrite(&mut statement, state)?;
             crate::binary_cast::rewrite(&mut statement)?;
             crate::regex_operators::rewrite(&mut statement);
             return Ok(statement);
@@ -377,7 +377,7 @@ fn normalize_identifier(identifier: &Ident) -> String {
 }
 
 fn is_registered_function(state: &SessionState, name: &str) -> bool {
-    crate::sql_compat::is_aggregate(name)
+    crate::expression_compat::is_aggregate(name)
         || state.scalar_functions().contains_key(name)
         || state.higher_order_functions().contains_key(name)
         || state.aggregate_functions().contains_key(name)

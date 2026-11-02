@@ -506,7 +506,8 @@ impl SQLContext {
             let binary_changed = crate::binary_cast::rewrite(&mut statements[0])?;
             let regex_changed = crate::regex_operators::rewrite(&mut statements[0]);
             let lateral_changed = crate::lateral_views::rewrite(&mut statements[0])?;
-            let compat_changed = crate::sql_compat::rewrite(&mut statements[0], &self.ctx.state())?;
+            let compat_changed =
+                crate::expression_compat::rewrite(&mut statements[0], &self.ctx.state())?;
             binary_changed || regex_changed || lateral_changed || compat_changed
         };
         let sql = if changed {
@@ -520,7 +521,7 @@ impl SQLContext {
                 hive_format: Some(_),
                 table_name,
                 ..
-            } => crate::ddl_compat::describe(self, table_name).await,
+            } => crate::extended_describe::describe(self, table_name).await,
             Statement::Comment {
                 object_type,
                 object_name,
@@ -2761,7 +2762,7 @@ fn validate_persistent_create_function(create_function: &CreateFunction) -> DFRe
 }
 
 fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
-    if let Some(statement) = crate::ddl_compat::parse_describe(sql)? {
+    if let Some(statement) = crate::extended_describe::parse_describe(sql)? {
         return Ok(vec![statement]);
     }
     let regex_sql = crate::regex_operators::parseable_sql(sql)?;
