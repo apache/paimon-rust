@@ -2846,12 +2846,16 @@ The optional fourth argument selects the mode:
   of the column's storage, or in VECTOR files before and after an `ALTER TABLE`, or with
   and without another VECTOR column), whose BLOB column it wrote in a layout the table
   no longer uses, or whose BLOB or VECTOR column another file holds while the newest
-  normal data file that may hold it lists no write columns (with
-  `data-evolution.write-cols-optimization.enabled`, such a file can leave the column to
-  dedicated files under writer options a copy of the table can change, so this includes
-  a rewrite of every column); and every file of rows whose files are no longer column
-  slices because a compaction in the range, such as the one a write runs after its
-  commit unless `write-only=true`, merged some of them (Java's reader fails on such a
+  normal data file that may hold it lists no write columns. A normal data file without
+  write columns counts as holding each BLOB or VECTOR column of its schema that no
+  dedicated file of its own commit holds, as with
+  `data-evolution.write-cols-optimization.enabled` it can leave the column to dedicated
+  files under writer options a copy of the table can change. So an insert that wrote
+  its embeddings to VECTOR files still merges with later updates, while a later update
+  that lists no write columns and writes no dedicated file, of rows whose BLOB or VECTOR
+  column the range wrote before, is read this way; and every file of rows whose files
+  are no longer column slices because a compaction in the range, such as the one a
+  write runs after its commit unless `write-only=true`, merged some of them (Java's reader fails on such a
   range). A
   column the table has since dropped, or changed from VECTOR to a string type, keeps
   rows from merging only when the range wrote it in VECTOR files of two layouts.

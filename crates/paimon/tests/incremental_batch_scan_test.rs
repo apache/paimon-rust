@@ -3358,6 +3358,46 @@ async fn delta_reads_embeddings_of_an_inline_insert_as_written() {
     }
 }
 
+/// A rewrite of `id`, the only normal column, under the schema's options
+/// omits its write columns and writes no VECTOR file, as a rewrite of both
+/// columns by a writer that stores the VECTOR column inline does. Their
+/// metadata is the same, so a range of an insert and such a rewrite is read
+/// file by file, the embeddings in the rows of the insert's VECTOR file.
+#[tokio::test]
+async fn delta_reads_a_rewrite_of_every_normal_column_file_by_file() {
+    let row = evolved_row;
+    let path = "memory:/incremental_batch/normal_columns_rewrite";
+    let (table, _, id) = vector_table_written_two_ways(path).await;
+    write_batch(&table, &id_and_embedding_batch(&id)).await;
+    let ids = std::sync::Arc::new(Int32Array::from(vec![11])) as arrow_array::ArrayRef;
+    rewrite(&table, 0, vec![(id, ids)]).await;
+
+    let rewritten = vec![
+        row(Some(11), None, None, None),
+        row(Some(2), None, None, None),
+    ];
+    let mut per_commit = vec![
+        row(Some(1), None, None, Some([1, 0])),
+        row(Some(2), None, None, Some([0, 1])),
+    ];
+    per_commit.extend(rewritten.clone());
+    per_commit.sort();
+    let mut by_file = vec![
+        row(Some(1), None, None, None),
+        row(Some(2), None, None, None),
+        row(None, None, None, Some([1, 0])),
+        row(None, None, None, Some([0, 1])),
+    ];
+    by_file.extend(rewritten);
+    by_file.sort();
+    let columns: [Option<&[&str]>; 3] = [None, Some(&["id"]), Some(&["embedding"])];
+    for columns in columns {
+        let (rows, merged) = read_evolved_range(&table, 0, 2, columns).await;
+        assert_eq!(rows, project_evolved(&per_commit, columns), "{columns:?}");
+        assert_eq!(merged, project_evolved(&by_file, columns), "{columns:?}");
+    }
+}
+
 /// A table handle built in memory can lack a schema file, which reads of
 /// the files of its own schema never need. A range of an insert, an `id`
 /// rewrite and a rewrite of every column reads without one. The last rewrite
