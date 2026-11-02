@@ -1426,7 +1426,8 @@ async fn validate_view_dependencies(
 }
 
 fn view_relation_identifiers(view: &View, catalog_name: &str) -> DFResult<Vec<Identifier>> {
-    let parseable = crate::lateral_views::parseable_sql(view.query_for("datafusion"))?;
+    let regex_sql = crate::regex_operators::parseable_sql(view.query_for("datafusion"))?;
+    let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
     let statements =
         Parser::parse_sql(&GenericDialect {}, parseable.as_ref()).map_err(|error| {
             plan_datafusion_err!(

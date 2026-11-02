@@ -582,6 +582,27 @@ use paimon_datafusion::register_variant_functions;
 register_variant_functions(&ctx);
 ```
 
+### Binary casts in queries
+
+`CAST` and `TRY_CAST` accept `BINARY`, `BINARY(n)`, `VARBINARY`,
+`VARBINARY(n)` and `VARBINARY(MAX)` through SQLContext.
+
+- Without a length, casts preserve the bytes. Strings use their UTF-8 bytes.
+- `BINARY(n)` truncates to at most `n` bytes and right-pads shorter values with
+  zero bytes.
+- `VARBINARY(n)` truncates to at most `n` bytes without padding.
+- Widths are byte counts, including for multibyte text. They must be positive
+  and fit an Arrow binary offset. SQL NULL remains NULL.
+
+```sql
+SELECT to_base64(CAST('ab' AS BINARY(4))); -- YWIAAA==
+SELECT to_base64(CAST('abcd' AS VARBINARY(2))); -- YWI=
+```
+
+The source conversions supported by DataFusion's binary cast remain in effect.
+`TRY_CAST` preserves its native conversion-failure behavior; an invalid type
+length is a planning error.
+
 ## DDL
 
 ### DATABASE
@@ -793,6 +814,27 @@ ALTER TABLE paimon.my_db.users SET TBLPROPERTIES('data-evolution.enabled' = 'tru
 ```sql
 ALTER TABLE IF EXISTS paimon.my_db.users ADD COLUMN age INT;
 ```
+
+### Table and column comments
+
+```sql
+CREATE TABLE db.t (id INT COMMENT 'identifier') COMMENT 'description';
+ALTER TABLE db.t ALTER COLUMN id COMMENT 'new description';
+COMMENT ON TABLE db.t IS 'new table description';
+COMMENT ON COLUMN db.t.id IS 'new column description';
+COMMENT ON TABLE db.t IS NULL;
+COMMENT ON COLUMN db.t.id IS NULL;
+```
+
+These statements update catalog metadata without changing field IDs, types or
+stored rows. Quoted identifiers retain their case; unquoted names follow the
+session's identifier-normalization setting. Column comments address top-level
+columns. Clearing a column comment uses Paimon's empty-description encoding.
+
+`ALTER TABLE IF EXISTS ... ALTER COLUMN ... COMMENT` ignores a missing table,
+but still reports a missing column. The nonstandard `COMMENT IF EXISTS` form
+is rejected. Comments on temporary objects, including temporary objects that
+shadow persistent tables, and writes to branch references are rejected.
 
 ## DML
 
@@ -1855,6 +1897,26 @@ meaningful for a column mask, so it requires `policy_type => 'COLUMN_MASKING'`:
 CALL sys.list_policies(database => 'sales', table => 'orders');
 ```
 
+### Constant procedure arguments
+
+CALL arguments still use named `name => expression` syntax. In addition to
+literals, SQLContext accepts immutable scalar constant expressions such as
+casts, arithmetic, string functions, CASE and boolean predicates.
+
+```sql
+CALL sys.create_tag(
+    table => concat('my_db.', 'events'),
+    tag => concat('release_', '1'),
+    snapshot_id => CAST(1 + 0 AS BIGINT)
+);
+```
+
+Expressions must reduce to non-NULL strings, integers or booleans. Column
+references, subqueries, aggregate/window functions and non-immutable functions
+are rejected. Argument names, duplicates and procedure-specific types are
+validated as before. All arguments are evaluated and validated before the
+procedure performs any metadata changes; evaluation errors are returned.
+
 ## Queries
 
 ### Basic Queries
@@ -1915,6 +1977,25 @@ including dictionary encodings and null dictionary values.
 The timestamp aliases retain DataFusion semantics: optional formats are Chrono
 strftime strings, not Spark/Java patterns; numeric `to_timestamp_ltz` inputs
 are epoch seconds. The Flink `(number, precision)` overload is not implemented.
+
+### Additional scalar compatibility functions
+
+| Function | Contract |
+|----------|----------|
+| `split(text, regex[, limit])` | Returns a string array using Rust regex syntax. A positive limit caps the number of parts and retains the remaining suffix in the last part; a nonpositive limit is unlimited. An empty pattern splits Unicode characters. |
+| `locate(needle, text[, start])` | Returns a one-based Unicode-character position, or zero if no match exists or start is nonpositive/out of range. Start defaults to one. |
+| `date(value)` | Alias of native `to_date`, retaining its accepted inputs and conversion errors. |
+| `typeof(value)` | Returns SQL-style names for common scalar, array, map, struct and Variant types, including typed NULLs. Other Arrow types retain their Arrow type labels. |
+| `hex(value)` | Uppercase hexadecimal UTF-8/string or raw binary bytes; integer inputs use hexadecimal digits, with negative signed values represented as 64-bit two's complement. |
+| `unhex(text)` | Decodes case-insensitive hex. An odd number of digits is left-padded with zero; invalid hex returns NULL. |
+| `size(collection)` | Counts array elements or map entries, including NULL values, and returns INT. |
+| `hour(value)` | Extracts an INT hour from timestamps, times or timestamp strings. Dates produce zero; timestamp timezone metadata is honored. |
+
+Except for `typeof`, NULL inputs produce NULL. Empty collections have size zero.
+These functions are registered locally and do not require REST function metadata.
+Split patterns follow the same Rust regex restrictions as the other regex
+compatibility functions. SQLContext's `date` alias follows native DataFusion
+behavior when session configuration changes.
 
 ### Column Projection
 
@@ -1987,6 +2068,25 @@ column masks it returns (see `create_policy`) are applied to the result:
   off `LIMIT` pushdown, so such queries read the data.
 - Time travel, branches, system tables, incremental and audit-log reads, and
   search are refused on such tables.
+
+### Regular expression operators
+
+SQLContext supports `value RLIKE pattern`, `value REGEXP pattern`, and their
+`NOT` forms in queries, expressions, views and SQL functions. They use
+DataFusion's native case-sensitive regex matching: a match may occur anywhere
+unless the pattern contains anchors. Inline flags such as `(?i)` can change
+case sensitivity.
+
+```sql
+SELECT phone RLIKE '^1[3-9][0-9]{9}$' FROM users;
+SELECT name NOT REGEXP '(?i)^test';
+```
+
+Patterns use Rust regex syntax, including its restrictions on look-around and
+backreferences. A NULL value or pattern produces SQL NULL; an invalid pattern
+reports an error. Operator text inside strings, comments and quoted identifiers
+is not interpreted as SQL syntax. Persistent Paimon view and function definitions
+retain their portable SQL text.
 
 ## Python Multimodal Helper Functions
 

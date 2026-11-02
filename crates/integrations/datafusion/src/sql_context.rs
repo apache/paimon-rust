@@ -66,10 +66,11 @@ use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, BinaryLength, CharacterLength, ColumnDef,
-    ColumnOption, CreateFunction, CreateFunctionBody, CreateTable, CreateTableOptions, CreateView,
-    Delete, Expr as SqlExpr, FromTable, FunctionBehavior, FunctionReturnType, Ident, Insert, Merge,
-    ObjectName, ObjectType, RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject,
-    SqlOption, Statement, TableFactor, TableObject, Truncate, Update, Use, Value as SqlValue,
+    ColumnOption, CommentDef, CommentObject, CreateFunction, CreateFunctionBody, CreateTable,
+    CreateTableOptions, CreateView, Delete, Expr as SqlExpr, FromTable, FunctionBehavior,
+    FunctionReturnType, Ident, Insert, Merge, ObjectName, ObjectType, RenameTableNameKind, Reset,
+    ResetStatement, Set, ShowCreateObject, SqlOption, Statement, TableFactor, TableObject,
+    Truncate, Update, Use, Value as SqlValue,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
@@ -156,6 +157,7 @@ impl SQLContextBuilder {
         let mut state_builder = SessionStateBuilder::new()
             .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
+            .with_type_planner(Arc::new(crate::binary_cast::BinaryTypePlanner))
             .with_relation_planners(vec![
                 Arc::new(crate::lateral_views::ExplodeRelationPlanner),
                 Arc::new(crate::relation_planner::PaimonRelationPlanner::new()),
@@ -170,7 +172,9 @@ impl SQLContextBuilder {
         let state = state_builder.build();
         let ctx = SessionContext::new_with_state(state);
         crate::compat_functions::register_compat_functions(&ctx);
+        crate::binary_cast::register(&ctx);
         crate::lateral_views::register(&ctx);
+        crate::scalar_compat::register(&ctx);
         crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
         crate::json_functions::register_json_functions(&ctx);
@@ -479,7 +483,13 @@ impl SQLContext {
             .await;
         }
 
-        let mut statements = parse_sql_statements(&rewritten_sql)?;
+        let alter_comment = parse_alter_column_comment(&rewritten_sql)?;
+        let from_alter_comment = alter_comment.is_some();
+        let mut statements = if let Some(statement) = alter_comment {
+            vec![statement]
+        } else {
+            parse_sql_statements(&rewritten_sql)?
+        };
 
         if statements.len() != 1 {
             return Err(DataFusionError::Plan(
@@ -488,14 +498,80 @@ impl SQLContext {
         }
 
         let rewritten;
-        let persistent_definition = matches!(&statements[0], Statement::CreateView(view) if !view.temporary && self.is_paimon_catalog_ref(&TableReference::from(view.name.to_string().as_str())));
-        let sql = if !persistent_definition && crate::lateral_views::rewrite(&mut statements[0])? {
+        let persistent_definition = matches!(&statements[0], Statement::CreateView(view) if !view.temporary && self.is_paimon_catalog_ref(&TableReference::from(view.name.to_string().as_str())))
+            || matches!(&statements[0], Statement::CreateFunction(_));
+        let changed = !persistent_definition && {
+            let binary_changed = crate::binary_cast::rewrite(&mut statements[0])?;
+            let regex_changed = crate::regex_operators::rewrite(&mut statements[0]);
+            let lateral_changed = crate::lateral_views::rewrite(&mut statements[0])?;
+            binary_changed || regex_changed || lateral_changed
+        };
+        let sql = if changed {
             rewritten = statements[0].to_string();
             rewritten.as_str()
         } else {
             sql
         };
         match &statements[0] {
+            Statement::Comment {
+                object_type,
+                object_name,
+                comment,
+                if_exists,
+            } if matches!(object_type, CommentObject::Table | CommentObject::Column) => {
+                if *if_exists && !from_alter_comment {
+                    return Err(DataFusionError::NotImplemented(
+                        "COMMENT IF EXISTS is not supported; ALTER TABLE IF EXISTS is supported"
+                            .into(),
+                    ));
+                }
+                let mut table_name = object_name.clone();
+                let column = if *object_type == CommentObject::Column {
+                    if table_name.0.len() < 2 {
+                        return Err(DataFusionError::Plan(
+                            "COMMENT ON COLUMN requires table.column".into(),
+                        ));
+                    }
+                    let part = table_name.0.pop().unwrap();
+                    let ident = part
+                        .as_ident()
+                        .ok_or_else(|| DataFusionError::Plan("Invalid column name".into()))?;
+                    Some(normalize_schema_identifier(
+                        ident,
+                        enable_ident_normalization,
+                    ))
+                } else {
+                    None
+                };
+                Self::ensure_main_branch_write_target(&table_name, "COMMENT ON")?;
+                for part in &mut table_name.0 {
+                    if let datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(ident) = part
+                    {
+                        ident.value =
+                            normalize_schema_identifier(ident, enable_ident_normalization);
+                    }
+                }
+                if self.temp_table_for(&table_name).await?.is_some() {
+                    return Err(DataFusionError::NotImplemented(
+                        "Comments on temporary tables or views are not supported".into(),
+                    ));
+                }
+                let (catalog, _, identifier) = self.resolve_catalog_and_table(&table_name)?;
+                let change = match column {
+                    Some(column) => SchemaChange::update_column_comment(
+                        column,
+                        comment.clone().unwrap_or_default(),
+                    ),
+                    None => SchemaChange::UpdateComment {
+                        comment: comment.clone(),
+                    },
+                };
+                catalog
+                    .alter_table(&identifier, vec![change], *if_exists)
+                    .await
+                    .map_err(to_datafusion_error)?;
+                ok_result(&self.ctx)
+            }
             statement @ (Statement::ShowDatabases { .. }
             | Statement::ShowSchemas { .. }
             | Statement::ShowCatalogs { .. }
@@ -1043,6 +1119,30 @@ impl SQLContext {
         let identifier = self.resolve_table_name(&ct.name)?;
 
         let mut builder = paimon::spec::Schema::builder();
+        let mut comments = Vec::new();
+        if let Some(comment) = &ct.comment {
+            comments.push(comment);
+        }
+        let options = match &ct.table_options {
+            CreateTableOptions::With(options)
+            | CreateTableOptions::Options(options)
+            | CreateTableOptions::TableProperties(options)
+            | CreateTableOptions::Plain(options) => options.as_slice(),
+            CreateTableOptions::None => &[],
+        };
+        for option in options {
+            if let SqlOption::Comment(comment) = option {
+                comments.push(comment);
+            }
+        }
+        if comments.len() > 1 {
+            return Err(DataFusionError::Plan("Duplicate table COMMENT".into()));
+        }
+        if let Some(CommentDef::WithEq(comment) | CommentDef::WithoutEq(comment)) =
+            comments.first().copied()
+        {
+            builder = builder.comment(Some(comment.clone()));
+        }
         let table_options = extract_options(&ct.table_options)?;
         let column_names: Vec<String> = ct
             .columns
@@ -2595,7 +2695,8 @@ fn validate_persistent_create_function(create_function: &CreateFunction) -> DFRe
 }
 
 fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
-    let parseable = crate::lateral_views::parseable_sql(sql)?;
+    let regex_sql = crate::regex_operators::parseable_sql(sql)?;
+    let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
     let sql = parseable.as_ref();
     let dialect = GenericDialect {};
     let mut tokens = Tokenizer::new(&dialect, sql)
@@ -2664,6 +2765,42 @@ fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
         create_function.or_alter = true;
     }
     Ok(statements)
+}
+
+/// Parse the Paimon/Flink column-comment spelling into the standard COMMENT AST.
+/// Token parsing preserves quoted names and literals and rejects trailing statements.
+fn parse_alter_column_comment(sql: &str) -> DFResult<Option<Statement>> {
+    let parse = || -> Result<Option<Statement>, datafusion::sql::sqlparser::parser::ParserError> {
+        let mut parser = Parser::new(&GenericDialect {}).try_with_sql(sql)?;
+        if !parser.parse_keywords(&[Keyword::ALTER, Keyword::TABLE]) {
+            return Ok(None);
+        }
+        let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+        let mut object_name = parser.parse_object_name(true)?;
+        if !parser.parse_keyword(Keyword::ALTER) {
+            return Ok(None);
+        }
+        let _ = parser.parse_keyword(Keyword::COLUMN);
+        let column = parser.parse_identifier()?;
+        if !parser.parse_keyword(Keyword::COMMENT) {
+            return Ok(None);
+        }
+        let comment = parser.parse_literal_string()?;
+        object_name
+            .0
+            .push(datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(
+                column,
+            ));
+        let _ = parser.consume_token(&Token::SemiColon);
+        parser.expect_token(&Token::EOF)?;
+        Ok(Some(Statement::Comment {
+            object_type: CommentObject::Column,
+            object_name,
+            comment: Some(comment),
+            if_exists,
+        }))
+    };
+    parse().map_err(|e| DataFusionError::Plan(format!("SQL parse error: {e}")))
 }
 
 fn validate_persistent_create_view(create_view: &CreateView) -> DFResult<()> {
@@ -3330,6 +3467,7 @@ fn extract_options(opts: &CreateTableOptions) -> DFResult<Vec<(String, String)>>
     };
     sql_options
         .iter()
+        .filter(|option| !matches!(option, SqlOption::Comment(_)))
         .map(|opt| match opt {
             SqlOption::KeyValue { key, value } => {
                 let v = value.to_string();
@@ -4389,6 +4527,32 @@ mod tests {
             Identifier::new(database, name),
             schema,
         ));
+    }
+
+    #[tokio::test]
+    async fn binary_cast_preserves_persistent_view_sql() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog.clone()).await;
+        ctx.sql("CREATE VIEW bounded_view AS SELECT CAST('ab' AS BINARY(4)) AS bytes")
+            .await
+            .unwrap();
+        let view = catalog
+            .get_view(&Identifier::new("default", "bounded_view"))
+            .await
+            .unwrap();
+        assert!(view.query_for("spark").contains("BINARY(4)"));
+        assert!(!view.query_for("spark").contains("__paimon"));
+        let rows = ctx
+            .sql("SELECT to_base64(bytes) = 'YWIAAA==' FROM bounded_view")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            ScalarValue::try_from_array(rows[0].column(0), 0).unwrap(),
+            ScalarValue::Boolean(Some(true))
+        );
     }
 
     #[tokio::test]
@@ -5855,6 +6019,45 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn regex_operators_preserve_stored_sql_and_existing_null_definitions() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(
+            &catalog,
+            "null_pattern",
+            "CAST(x AS VARCHAR) RLIKE NULL",
+            true,
+        );
+        add_bigint_view(
+            &catalog,
+            "default",
+            "null_view",
+            "SELECT CAST('abc' RLIKE NULL AS BIGINT) AS answer",
+        );
+        let ctx = make_sql_context(catalog.clone()).await;
+        ctx.sql("CREATE VIEW regex_view AS SELECT 'abc' RLIKE '^a' AS flag")
+            .await
+            .unwrap();
+        let view = catalog
+            .get_view(&Identifier::new("default", "regex_view"))
+            .await
+            .unwrap();
+        assert!(view.query_for("spark").contains("RLIKE"));
+        assert!(!view.query_for("spark").contains(" ~ "));
+        for sql in [
+            "SELECT flag FROM regex_view",
+            "SELECT null_pattern(1) IS NULL",
+            "SELECT answer IS NULL FROM null_view",
+        ] {
+            let rows = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            assert_eq!(
+                ScalarValue::try_from_array(rows[0].column(0), 0).unwrap(),
+                ScalarValue::Boolean(Some(true)),
+                "{sql}"
+            );
+        }
     }
 
     #[tokio::test]
