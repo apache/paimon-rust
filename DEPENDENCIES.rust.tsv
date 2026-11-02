@@ -130,7 +130,7 @@ crc@3.4.0		X										X
 crc-catalog@2.5.0		X										X							
 crc-fast@1.10.0		X										X							
 crc32fast@1.5.0		X										X							
-crossbeam-channel@0.5.16		X										X							
+crossbeam-channel@0.5.17		X										X							
 crossbeam-deque@0.8.7		X										X							
 crossbeam-epoch@0.9.20		X										X							
 crossbeam-utils@0.8.22		X										X							
@@ -695,7 +695,6 @@ windows-link@0.2.1		X										X
 windows-registry@0.6.1		X										X							
 windows-result@0.4.1		X										X							
 windows-strings@0.5.1		X										X							
-windows-sys@0.52.0		X										X							
 windows-sys@0.59.0		X										X							
 windows-sys@0.60.2		X										X							
 windows-sys@0.61.2		X										X							
