@@ -26,11 +26,14 @@ use common::incremental_helpers::{
     write_batch,
 };
 use futures::TryStreamExt;
+use paimon::catalog::Identifier;
+use paimon::io::{FileIOBuilder, FileIOProvider};
 use paimon::spec::{
     CommitKind, DataType, Datum, IntType, PredicateBuilder, Schema, TableSchema, VarCharType,
 };
 use paimon::table::{CompactPlan, CompactResult, IncrementalScanMode, Table};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 fn schema(options: &[(&str, &str)]) -> TableSchema {
     let mut builder = Schema::builder()
@@ -689,6 +692,77 @@ async fn compact_execution_failure_cleans_only_its_unsubmitted_output() {
             .unwrap(),
         Some(2)
     );
+}
+
+#[derive(Debug)]
+struct FailFileProvider {
+    operator: opendal::Operator,
+    failing_file: Mutex<Option<String>>,
+}
+
+#[async_trait::async_trait]
+impl FileIOProvider for FailFileProvider {
+    async fn create(&self, path: &str) -> paimon::Result<(opendal::Operator, String)> {
+        if let Some(name) = self.failing_file.lock().unwrap().as_deref() {
+            if path.ends_with(name) {
+                return Err(paimon::Error::IoUnsupported {
+                    message: format!("cannot access {name}"),
+                });
+            }
+        }
+        Ok((
+            self.operator.clone(),
+            path.trim_start_matches("memory:/").into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn abort_compact_attempts_every_output_and_reports_files_left_behind() {
+    let provider = Arc::new(FailFileProvider {
+        operator: opendal::Operator::from_config(opendal::services::MemoryConfig::default())
+            .unwrap(),
+        failing_file: Mutex::new(None),
+    });
+    let io = FileIOBuilder::new("unused")
+        .with_provider(provider.clone())
+        .build()
+        .unwrap();
+    let path = "memory:/compact/abort";
+    let table = Table::new(
+        io.clone(),
+        Identifier::new("default", "abort_compact"),
+        path.into(),
+        schema(&[("write-only", "true")]),
+        None,
+    );
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    append_files(&table, 2).await;
+    let builder = table.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let executor = builder.new_executor().unwrap();
+    let results = vec![
+        executor.execute(&plan.tasks()[0]).await.unwrap(),
+        executor.execute(&plan.tasks()[0]).await.unwrap(),
+    ];
+    let source = table.new_read_builder().new_scan().plan().await.unwrap();
+    let bucket = source.splits()[0].bucket_path().to_string();
+    let outputs: Vec<_> = results
+        .iter()
+        .map(|result| format!("{bucket}/{}", result.files()[0].file_name))
+        .collect();
+    *provider.failing_file.lock().unwrap() = Some(results[0].files()[0].file_name.clone());
+
+    let commit = builder.new_commit().unwrap();
+    let error = commit.abort_compact(&results).await.unwrap_err();
+    assert!(error.to_string().contains(&results[0].files()[0].file_name));
+    *provider.failing_file.lock().unwrap() = None;
+    assert!(io.exists(&outputs[0]).await.unwrap());
+    assert!(!io.exists(&outputs[1]).await.unwrap());
+
+    commit.abort_compact(&results).await.unwrap();
+    assert!(!io.exists(&outputs[0]).await.unwrap());
 }
 
 #[tokio::test]
