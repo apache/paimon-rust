@@ -1989,6 +1989,8 @@ aggregates reject DISTINCT, OVER, additional ordering and NULL modifiers. Tied
 keys may choose any eligible value. LISTAGG overflow and top-k selection forms
 are unsupported. Approximate counts use native HLL estimates rather than Spark's
 serialized HLL++ state.
+COLLECT_LIST always ignores NULLs and rejects RESPECT NULLS. Aggregate values and
+selection keys are evaluated once, including volatile expressions.
 
 ### JSON output and Variant string casts
 
@@ -1996,6 +1998,7 @@ serialized HLL++ state.
 scalar values. SQL NULL returns SQL NULL; nested NULLs become JSON null. Binary
 values use padded Base64. Decimals retain their digits; non-finite floats are
 rejected. Temporal values use Arrow string formatting. Map keys must be non-NULL.
+Spark JSON formatting options are not supported.
 
 `json_object(key, value, ...)` constructs an object. Keys are converted to strings,
 NULL keys are rejected, NULL values are retained, and the last repeated key wins.
@@ -2011,7 +2014,7 @@ representation uses this conversion; ordinary casts retain native behavior.
 | Function | Contract |
 | --- | --- |
 | `assert_true(condition[, message])` | Returns NULL for TRUE; FALSE or NULL raises an execution error with the optional message |
-| `conv(text, from_base, to_base)` | Base 2 through 36 conversion of a 64-bit value; a negative destination base formats a signed result; invalid bases return NULL |
+| `conv(text, from_base, to_base)` | Source base 2 through 36 conversion of a 64-bit value; a negative destination base formats a signed result; invalid bases, including negative source bases, return NULL |
 | `date_diff(end, start)` | BIGINT calendar days after native DATE coercion |
 | `date_diff(unit, start, end)` | Signed whole-unit difference at microsecond precision, from microsecond through week and calendar month/quarter/year; calendar fields use UTC and month-end clamping |
 | `convert_tz(datetime, from_zone, to_zone)` | Interprets a timezone-less datetime in the source zone, returning a timezone-less microsecond timestamp in the destination zone |

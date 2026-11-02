@@ -71,6 +71,7 @@ mod relation_planner;
 pub mod runtime;
 mod scalar_compat;
 mod scalar_extra;
+mod selection_aggregate;
 mod show_metadata;
 mod sql_context;
 mod sql_function;

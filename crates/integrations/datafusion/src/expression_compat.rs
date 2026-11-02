@@ -18,9 +18,9 @@
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::SessionState;
 use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentClause, FunctionArguments, Ident, NullTreatment, ObjectName, Select,
-    SelectItem, Statement, Value, VisitMut, VisitorMut,
+    DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause,
+    FunctionArguments, Ident, NullTreatment, ObjectName, Select, SelectItem, Statement, Value,
+    VisitMut, VisitorMut,
 };
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use std::ops::ControlFlow;
@@ -73,16 +73,6 @@ fn set_args(call: &mut Function, args: Vec<Expr>) {
             .map(|e| FunctionArg::Unnamed(FunctionArgExpr::Expr(e)))
             .collect();
     }
-}
-fn filter(call: &mut Function, predicate: Expr) {
-    call.filter = Some(Box::new(match call.filter.take() {
-        Some(original) => Expr::BinaryOp {
-            left: Box::new(Expr::Nested(original)),
-            op: BinaryOperator::And,
-            right: Box::new(Expr::Nested(Box::new(predicate))),
-        },
-        None => predicate,
-    }));
 }
 fn lower_aggregate(call: &Function, name: &str) -> Result<Expr> {
     let args = arguments(call)?;
@@ -189,33 +179,25 @@ fn lower_aggregate(call: &Function, name: &str) -> Result<Expr> {
                     "{name} does not support OVER, DISTINCT or additional ordering/NULL modifiers"
                 )));
             }
-            let direction = if name == "min_by" { "ASC" } else { "DESC" };
-            let Expr::Function(mut ordered) = expression(&format!(
-                "first_value({} ORDER BY ({}) {direction} NULLS LAST)",
-                args[0], args[1]
-            ))?
-            else {
-                unreachable!()
-            };
-            ordered.filter = lowered.filter.take();
-            filter(
-                &mut ordered,
-                Expr::IsNotNull(Box::new(Expr::Nested(Box::new(args[1].clone())))),
-            );
-            if name == "arg_max" {
-                filter(
-                    &mut ordered,
-                    Expr::IsNotNull(Box::new(Expr::Nested(Box::new(args[0].clone())))),
-                );
-            }
-            return Ok(Expr::Function(ordered));
+            lowered.name = ObjectName::from(vec![Ident::new(format!("__paimon_{name}"))]);
         }
         "collect_list" => {
             lowered.name = ObjectName::from(vec![Ident::new("array_agg")]);
-            filter(
-                &mut lowered,
-                Expr::IsNotNull(Box::new(Expr::Nested(Box::new(args[0].clone())))),
-            );
+            if call.null_treatment == Some(NullTreatment::RespectNulls)
+                || list.clauses.iter().any(|c| {
+                    matches!(
+                        c,
+                        FunctionArgumentClause::IgnoreOrRespectNulls(NullTreatment::RespectNulls)
+                    )
+                })
+            {
+                return Err(error("collect_list does not support RESPECT NULLS"));
+            }
+            if let FunctionArguments::List(list) = &mut lowered.args {
+                list.clauses
+                    .retain(|c| !matches!(c, FunctionArgumentClause::IgnoreOrRespectNulls(_)));
+            }
+            lowered.null_treatment = Some(NullTreatment::IgnoreNulls);
             let Expr::Function(mut coalesce) = expression("coalesce(NULL, ARRAY[])")? else {
                 unreachable!()
             };

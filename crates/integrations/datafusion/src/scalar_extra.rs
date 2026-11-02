@@ -255,7 +255,6 @@ impl ScalarUDFImpl for Extra {
     }
 }
 fn conv(input: &str, from: i64, to: i64) -> Option<String> {
-    let from = from.checked_abs()?;
     let base = to.checked_abs()?;
     if !(2..=36).contains(&from) || !(2..=36).contains(&base) {
         return None;
@@ -347,8 +346,8 @@ fn convert_tz(input: &str, from: &str, to: &str) -> Option<i64> {
                 .ok()?
                 .and_hms_opt(0, 0, 0)
         })?;
-    let from: Tz = from.parse().ok()?;
-    let to: Tz = to.parse().ok()?;
+    let from = timezone(from)?;
+    let to = timezone(to)?;
     Some(
         from.from_local_datetime(&value)
             .single()?
@@ -357,6 +356,23 @@ fn convert_tz(input: &str, from: &str, to: &str) -> Option<i64> {
             .and_utc()
             .timestamp_micros(),
     )
+}
+fn timezone(zone: &str) -> Option<Tz> {
+    if let Some(offset) = zone.strip_prefix(['+', '-']) {
+        let digits = match offset.as_bytes() {
+            [h1, h2] => [*h1, *h2, b'0', b'0'],
+            [h1, h2, m1, m2] | [h1, h2, b':', m1, m2] => [*h1, *h2, *m1, *m2],
+            _ => return None,
+        };
+        // Arrow validates the total offset, but accepts minute fields such as 60.
+        if !digits.iter().all(u8::is_ascii_digit)
+            || (digits[0] - b'0') * 10 + digits[1] - b'0' >= 24
+            || (digits[2] - b'0') * 10 + digits[3] - b'0' >= 60
+        {
+            return None;
+        }
+    }
+    zone.parse().ok()
 }
 fn like_regex(pattern: &str, escape: &str, insensitive: bool) -> Result<Regex> {
     let mut esc = escape.chars();

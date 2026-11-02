@@ -48,6 +48,172 @@ async fn rejects(ctx: &SQLContext, sql: &str) {
 }
 
 #[tokio::test]
+async fn aggregate_rewrites_evaluate_volatile_values_once() {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let ctx = SQLContext::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    ctx.ctx().register_udf(create_udf(
+        "flip",
+        vec![DataType::Int64],
+        DataType::Int64,
+        Volatility::Volatile,
+        Arc::new(move |args| {
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(args[0].clone())
+            } else {
+                Ok(ColumnarValue::Scalar(ScalarValue::Int64(None)))
+            }
+        }),
+    ));
+    for sql in [
+        "SELECT to_json(collect_list(flip(v))) FROM (VALUES (1)) t(v)",
+        "SELECT to_json(collect_list(flip(v))) FROM (VALUES (1)) t(v) GROUP BY v",
+        "SELECT arg_max(flip(v),v) FROM (VALUES (1)) t(v)",
+        "SELECT max_by(v,flip(v)) FROM (VALUES (1)) t(v)",
+        "SELECT min_by(v,flip(v)+0) FROM (VALUES (1)) t(v)",
+        "SELECT arg_max(v,flip(v)) FROM (VALUES (1)) t(v) GROUP BY v",
+    ] {
+        calls.store(0, Ordering::SeqCst);
+        let expected = if sql.contains("collect_list") {
+            "[1]"
+        } else {
+            "1"
+        };
+        assert_eq!(rows(&ctx, sql).await, vec![vec![expected]], "{sql}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn selection_aggregates_merge_native_state_across_batches_and_partitions() {
+    use datafusion::arrow::{
+        array::{Int64Array, RecordBatch},
+        datatypes::{DataType, Field, Schema},
+    };
+    use datafusion::datasource::MemTable;
+    use std::sync::Arc;
+    let ctx = SQLContext::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Int64, false),
+        Field::new("v", DataType::Int64, true),
+        Field::new("k", DataType::Int64, true),
+    ]));
+    let batch = |g: Vec<i64>, v: Vec<Option<i64>>, k: Vec<Option<i64>>| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(g)),
+                Arc::new(Int64Array::from(v)),
+                Arc::new(Int64Array::from(k)),
+            ],
+        )
+        .unwrap()
+    };
+    let partitions = vec![
+        vec![
+            batch(vec![1, 2], vec![Some(10), Some(200)], vec![Some(1), None]),
+            batch(vec![1, 3], vec![None, Some(300)], vec![Some(4), Some(10)]),
+        ],
+        vec![
+            batch(
+                vec![1, 2, 3],
+                vec![Some(30), Some(201), None],
+                vec![Some(3), None, Some(11)],
+            ),
+            batch(vec![1, 3], vec![Some(999), Some(301)], vec![None, Some(12)]),
+        ],
+    ];
+    ctx.ctx()
+        .register_table(
+            "selection_inputs",
+            Arc::new(MemTable::try_new(schema, partitions).unwrap()),
+        )
+        .unwrap();
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT g,arg_max(CAST(NULL AS BIGINT),1) FROM selection_inputs GROUP BY g ORDER BY g"
+        )
+        .await,
+        vec![vec!["1", "NULL"], vec!["2", "NULL"], vec!["3", "NULL"]]
+    );
+    assert_eq!(rows(&ctx,"SELECT g,max_by(v,k),min_by(v,k),arg_max(v,k),max_by(v,k) FILTER (WHERE v<300 OR v IS NULL) FROM selection_inputs GROUP BY g ORDER BY g").await,vec![vec!["1","NULL","10","30","NULL"],vec!["2","NULL","NULL","NULL","NULL"],vec!["3","301","300","301","NULL"]]);
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT max_by(v,k),min_by(v,k),arg_max(v,k) FROM selection_inputs"
+        )
+        .await,
+        vec![vec!["301", "10", "301"]]
+    );
+}
+
+#[tokio::test]
+async fn selection_aggregates_respect_logical_nulls_and_filter_validity() {
+    use datafusion::arrow::{
+        array::{Array, BooleanArray, DictionaryArray, Int64Array, Int8Array, RecordBatch},
+        datatypes::{DataType, Field, Int8Type, Schema},
+    };
+    use std::sync::Arc;
+    let ctx = SQLContext::new();
+    let v = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from(vec![0, 1]),
+        Arc::new(Int64Array::from(vec![Some(10), None])),
+    )
+    .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Int64, false),
+        Field::new("v", v.data_type().clone(), true),
+        Field::new("k", DataType::Int64, false),
+        Field::new("p", DataType::Boolean, true),
+    ]));
+    ctx.ctx()
+        .register_batch(
+            "nullable_selection",
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 1])),
+                    Arc::new(v),
+                    Arc::new(Int64Array::from(vec![1, 2])),
+                    Arc::new(BooleanArray::from(vec![Some(true), None])),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let global = rows(
+        &ctx,
+        "SELECT to_json(arg_max(v,k)),to_json(max_by(v,k)) FROM nullable_selection",
+    )
+    .await;
+    let grouped = rows(
+        &ctx,
+        "SELECT to_json(arg_max(v,k)),to_json(max_by(v,k)) FROM nullable_selection GROUP BY g",
+    )
+    .await;
+    let filtered = rows(
+        &ctx,
+        "SELECT max_by(k,k) FILTER(WHERE NOT p) FROM nullable_selection GROUP BY g",
+    )
+    .await;
+    assert_eq!(
+        (global, grouped, filtered),
+        (
+            vec![vec!["10".into(), "NULL".into()]],
+            vec![vec!["10".into(), "NULL".into()]],
+            vec![vec!["NULL".into()]]
+        )
+    );
+}
+
+#[tokio::test]
 async fn aggregate_rewrites_keep_filters_constant_keys_and_local_registrations() {
     use datafusion::arrow::datatypes::DataType;
     use datafusion::logical_expr::{create_udf, Volatility};
@@ -229,6 +395,15 @@ async fn ddl_compatibility_respects_name_resolution_and_does_not_mutate_shadowed
 #[tokio::test]
 async fn temporal_and_encoding_boundaries_are_explicit() {
     let ctx = SQLContext::new();
+    assert_eq!(rows(&ctx,"SELECT conv('10',-10,2) IS NULL,conv('9223372036854775808',-10,10) IS NULL,conv('10',10,-2)").await,vec![vec!["true","true","1010"]]);
+    for zone in ["+08:60", "-09:99", "+0860", "-0060", "+24:00"] {
+        assert_eq!(
+            rows(&ctx, &format!("SELECT convert_tz('2026-11-01 12:00:00','{zone}','UTC') IS NULL,convert_tz('2026-11-01 12:00:00','UTC','{zone}') IS NULL")).await,
+            vec![vec!["true", "true"]],
+            "{zone}"
+        );
+    }
+    assert_eq!(rows(&ctx,"SELECT convert_tz('2026-11-01 12:00:00','+08:30','UTC')=TIMESTAMP '2026-11-01 03:30:00',convert_tz('2026-11-01 12:00:00','UTC','-0930')=TIMESTAMP '2026-11-01 02:30:00',convert_tz('2026-11-01 12:00:00','+08','UTC')=TIMESTAMP '2026-11-01 04:00:00'").await,vec![vec!["true","true","true"]]);
     assert_eq!(rows(&ctx,"SELECT date_diff('month',TIMESTAMP '2024-01-31 12:00:00',TIMESTAMP '2024-02-29 12:00:00'),date_diff('month',TIMESTAMP '2024-02-29 12:00:00',TIMESTAMP '2024-01-31 12:00:00'),date_diff('hour',TIMESTAMP '2026-11-01 04:00:00',TIMESTAMP '2026-11-01 01:30:00')").await,vec![vec!["1","-1","-2"]]);
     assert_eq!(rows(&ctx,"SELECT conv('18446744073709551616',10,16),conv('  +1z',10,2),conv('bad',10,16),conv('ff',-9223372036854775808,10) IS NULL,convert_tz('2026-11-01 01:30:00','America/New_York','UTC') IS NULL,convert_tz('2026-11-01 12:00:00','invalid','UTC') IS NULL").await,vec![vec!["FFFFFFFFFFFFFFFF","1","0","true","true","true"]]);
 }
@@ -254,6 +429,12 @@ async fn compatible_aggregates_preserve_null_filter_and_ordering_contracts() {
     assert_eq!(rows(&ctx,"SELECT k,count_if(p) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM (VALUES (1,TRUE),(2,FALSE),(3,TRUE)) t(k,p) ORDER BY k").await,vec![vec!["1","1"],vec!["2","1"],vec!["3","2"]]);
     rejects(&ctx, "SELECT approx_count_distinct(1,0.0001)").await;
     rejects(&ctx, "SELECT first(1, 7)").await;
+    assert_eq!(rows(&ctx,"SELECT to_json(collect_list(v IGNORE NULLS)),to_json(collect_list(v) IGNORE NULLS) FROM (VALUES (1),(NULL)) t(v)").await,vec![vec!["[1]","[1]"]]);
+    rejects(
+        &ctx,
+        "SELECT collect_list(v) RESPECT NULLS FROM (VALUES (1),(NULL)) t(v)",
+    )
+    .await;
 }
 
 #[tokio::test]

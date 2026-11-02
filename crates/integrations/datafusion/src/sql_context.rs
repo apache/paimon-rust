@@ -176,6 +176,7 @@ impl SQLContextBuilder {
         crate::lateral_views::register(&ctx);
         crate::scalar_compat::register(&ctx);
         crate::scalar_extra::register(&ctx);
+        crate::selection_aggregate::register(&ctx);
         crate::json_output::register(&mut ctx);
         crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
