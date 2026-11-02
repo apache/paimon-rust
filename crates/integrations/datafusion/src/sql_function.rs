@@ -244,6 +244,7 @@ async fn expand_statement_internal(
             return Err(error);
         }
         if expanded_count == 0 {
+            crate::binary_cast::rewrite(&mut statement)?;
             crate::regex_operators::rewrite(&mut statement);
             return Ok(statement);
         }

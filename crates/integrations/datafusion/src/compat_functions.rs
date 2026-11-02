@@ -40,6 +40,7 @@ use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 pub(crate) fn register_compat_functions(ctx: &SessionContext) {
     for (name, alias) in [
         ("current_date", "curdate"),
+        ("to_date", "date"),
         ("to_timestamp_millis", "timestamp_millis"),
         ("to_timestamp", "to_timestamp_ltz"),
     ] {
