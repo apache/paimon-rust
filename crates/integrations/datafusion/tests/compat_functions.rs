@@ -64,49 +64,37 @@ async fn mod_preserves_numeric_remainder_and_null_semantics() {
         ],
     )
     .await;
-    assert_error(&ctx, "mod(1, 0)", "zero").await;
+    assert_true(&ctx, &["mod(1, 0) IS NULL"]).await;
 }
 
 #[tokio::test]
-async fn mod_matches_native_remainder_decimal_coercion() {
+async fn mod_uses_upstream_spark_decimal_coercion() {
     let ctx = SQLContext::new();
-    for (left, right) in [
-        ("CAST(5.55 AS DECIMAL(10,2))", "CAST(2.1 AS DECIMAL(4,1))"),
-        (
-            "CAST('12345678901234567890123456789012345678' AS DECIMAL(38,0))",
-            "CAST('0.1' AS DECIMAL(38,1))",
-        ),
-        ("CAST(5.55 AS DECIMAL(10,2))", "CAST(2.1 AS DOUBLE)"),
-        ("CAST(5.55 AS DECIMAL(10,2))", "CAST(2 AS BIGINT)"),
-    ] {
-        let sql = format!("SELECT mod({left}, {right}) AS actual, {left} % {right} AS expected");
-        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
-        let batch = &batches[0];
-        assert_eq!(
-            batch.column(0).data_type(),
-            batch.column(1).data_type(),
-            "{sql}"
-        );
-        assert_eq!(
-            ScalarValue::try_from_array(batch.column(0), 0).unwrap(),
-            ScalarValue::try_from_array(batch.column(1), 0).unwrap(),
-            "{sql}"
-        );
-    }
+    let batches = ctx
+        .sql("SELECT mod(CAST(5.55 AS DECIMAL(10,2)),CAST(2.1 AS DECIMAL(4,1)))")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        ScalarValue::try_from_array(batches[0].column(0), 0).unwrap(),
+        ScalarValue::Decimal128(Some(135), 10, 2)
+    );
 }
 
 #[tokio::test]
-async fn date_sub_null_days_do_not_parse_rejected_strings() {
+async fn date_sub_null_days_propagate_through_date_coercion() {
     let ctx = SQLContext::new();
     assert_true(
         &ctx,
-        &["date_sub('not-a-date', CAST(NULL AS BIGINT)) IS NULL"],
+        &["date_sub('2024-03-01', CAST(NULL AS BIGINT)) IS NULL"],
     )
     .await;
     let batches = ctx
         .sql(
             "SELECT date_sub(d, days) FROM (VALUES \
-        ('not-a-date', CAST(NULL AS BIGINT)), ('2024-03-01', CAST(1 AS BIGINT))) AS t(d, days)",
+        ('2024-03-01', CAST(NULL AS BIGINT)), ('2024-03-01', CAST(1 AS BIGINT))) AS t(d, days)",
         )
         .await
         .unwrap()
@@ -193,7 +181,7 @@ async fn date_sub_handles_leap_days_negative_days_and_overflow() {
     assert_error(
         &ctx,
         "date_sub(DATE '2024-03-01', 9223372036854775807)",
-        "overflow",
+        "Int32",
     )
     .await;
 }
@@ -235,6 +223,91 @@ async fn binary_encoding_preserves_non_utf8_bytes_across_arrow_types() {
         "sha2(arrow_cast(decode('00ff', 'hex'), 'LargeBinary'), 256) = sha2(decode('00ff', 'hex'), 256)",
         "sha2(arrow_cast(decode('00ff', 'hex'), 'BinaryView'), 256) = sha2(decode('00ff', 'hex'), 256)",
     ]).await;
+}
+
+#[tokio::test]
+async fn hex_preserves_binary_view_bytes_and_nulls() {
+    use datafusion::arrow::datatypes::DataType;
+
+    let ctx = SQLContext::new();
+    assert_true(
+        &ctx,
+        &["hex(arrow_cast(decode('00ff', 'hex'), 'BinaryView')) = '00FF'"],
+    )
+    .await;
+    assert_dictionary_binary_encoding(&ctx, DataType::BinaryView, "hex(bytes)", "00FF").await;
+}
+
+#[tokio::test]
+async fn sha2_preserves_fixed_size_binary_bytes_and_nulls() {
+    use datafusion::arrow::datatypes::DataType;
+
+    let ctx = SQLContext::new();
+    let expected = "06eb7d6a69ee19e5fbdf749018d3d2abfa04bcbd1365db312eb86dc7169389b8";
+    assert_true(
+        &ctx,
+        &[&format!(
+            "sha2(arrow_cast(decode('00ff', 'hex'), 'FixedSizeBinary(2)'), 256) = '{expected}'"
+        )],
+    )
+    .await;
+    assert_dictionary_binary_encoding(
+        &ctx,
+        DataType::FixedSizeBinary(2),
+        "sha2(bytes, 256)",
+        expected,
+    )
+    .await;
+}
+
+async fn assert_dictionary_binary_encoding(
+    ctx: &SQLContext,
+    data_type: datafusion::arrow::datatypes::DataType,
+    expression: &str,
+    expected: &str,
+) {
+    use datafusion::arrow::array::{
+        Array, ArrayRef, BinaryArray, DictionaryArray, Int8Array, RecordBatch,
+    };
+    use datafusion::arrow::compute::cast;
+    use datafusion::arrow::datatypes::{Field, Int8Type, Schema};
+    use std::sync::Arc;
+
+    let bytes: ArrayRef = Arc::new(BinaryArray::from(vec![Some(&[0_u8, 255][..]), None]));
+    let values = cast(&bytes, &data_type).unwrap();
+    let encoded =
+        DictionaryArray::<Int8Type>::try_new(Int8Array::from(vec![Some(0), Some(1), None]), values)
+            .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "bytes",
+        encoded.data_type().clone(),
+        true,
+    )]));
+    ctx.ctx()
+        .register_batch(
+            "encoded_bytes",
+            RecordBatch::try_new(schema, vec![Arc::new(encoded)]).unwrap(),
+        )
+        .unwrap();
+    let batches = ctx
+        .sql(&format!("SELECT {expression} FROM encoded_bytes"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(
+        ScalarValue::try_from_array(batch.column(0), 0).unwrap(),
+        ScalarValue::Utf8(Some(expected.into()))
+    );
+    for row in [1, 2] {
+        assert_eq!(
+            ScalarValue::try_from_array(batch.column(0), row).unwrap(),
+            ScalarValue::Utf8(None)
+        );
+    }
 }
 
 #[tokio::test]

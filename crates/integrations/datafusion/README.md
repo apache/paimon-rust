@@ -24,6 +24,19 @@
 
 This crate contains the integration of [Apache DataFusion](https://datafusion.apache.org/) and [Apache Paimon](https://paimon.apache.org/).
 
+## Spark-compatible functions
+
+`SQLContext` enables the matching `datafusion-spark` function packages and Spark
+EXTRACT/SUBSTRING expression planner by default. Spark functions replace native
+functions with the same name; application registrations made afterward take
+priority. Paimon-specific Variant functions, metadata SQL and compatibility
+extensions remain available.
+
+The [SQL guide](../../../docs/src/sql.md#spark-compatible-functions) describes
+the supported subset and migration differences, including legacy `size(NULL)`
+behavior, ANSI remainder handling and date-difference result types. This package
+does not provide every Spark SQL syntax or cast mode.
+
 ## External engine snapshots
 
 Implement `TableEngineResolver::resolve_table_snapshot` to support

@@ -147,6 +147,7 @@ datafusion-physical-optimizer@54.0.0		X
 datafusion-physical-plan@54.0.0		X																
 datafusion-pruning@54.0.0		X																
 datafusion-session@54.0.0		X																
+datafusion-spark@54.0.0		X																
 datafusion-sql@54.0.0		X																
 datasketches@0.2.0		X																
 deranged@0.5.8		X									X							

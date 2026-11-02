@@ -16,14 +16,9 @@
 // under the License.
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryBuilder, FixedSizeListArray, Int32Array, Int64Array, LargeListArray,
-    ListArray, ListBuilder, MapArray, StringArray, StringBuilder,
+    Array, ArrayRef, Int32Array, Int64Array, ListBuilder, StringArray, StringBuilder,
 };
-use datafusion::arrow::compute::{
-    cast,
-    kernels::temporal::{date_part, DatePart},
-};
-use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
@@ -38,11 +33,7 @@ use std::sync::Arc;
 enum Kind {
     Split,
     Locate,
-    Hex,
-    Unhex,
     Typeof,
-    Size,
-    Hour,
 }
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct Function {
@@ -50,26 +41,17 @@ struct Function {
     signature: Signature,
 }
 pub(crate) fn register(ctx: &SessionContext) {
-    for kind in [
-        Kind::Split,
-        Kind::Locate,
-        Kind::Hex,
-        Kind::Unhex,
-        Kind::Typeof,
-        Kind::Size,
-        Kind::Hour,
-    ] {
-        let signature = match kind {
-            Kind::Split | Kind::Locate => Signature::one_of(
+    for kind in [Kind::Split, Kind::Locate, Kind::Typeof] {
+        let signature = if kind == Kind::Typeof {
+            Signature::any(1, Volatility::Immutable)
+        } else {
+            Signature::one_of(
                 vec![
                     TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
                     TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Int64]),
                 ],
                 Volatility::Immutable,
-            ),
-            Kind::Unhex => Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
-            Kind::Typeof => Signature::any(1, Volatility::Immutable),
-            _ => Signature::user_defined(Volatility::Immutable),
+            )
         };
         ctx.register_udf(ScalarUDF::from(Function { kind, signature }));
     }
@@ -88,79 +70,17 @@ impl ScalarUDFImpl for Function {
         match self.kind {
             Kind::Split => "split",
             Kind::Locate => "locate",
-            Kind::Hex => "hex",
-            Kind::Unhex => "unhex",
             Kind::Typeof => "typeof",
-            Kind::Size => "size",
-            Kind::Hour => "hour",
         }
     }
     fn signature(&self) -> &Signature {
         &self.signature
     }
-    fn coerce_types(&self, types: &[DataType]) -> Result<Vec<DataType>> {
-        let [ty] = types else {
-            return Err(error("Expected one argument"));
-        };
-        let ty = decoded_type(ty);
-        let output = match self.kind {
-            Kind::Hex
-                if matches!(
-                    ty,
-                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Null
-                ) =>
-            {
-                DataType::Utf8
-            }
-            Kind::Hex if ty.is_binary() => DataType::Binary,
-            Kind::Hex if ty.is_integer() => ty.clone(),
-            Kind::Size
-                if matches!(
-                    ty,
-                    DataType::List(_)
-                        | DataType::LargeList(_)
-                        | DataType::FixedSizeList(_, _)
-                        | DataType::Map(_, _)
-                        | DataType::Null
-                ) =>
-            {
-                ty.clone()
-            }
-            Kind::Hour
-                if matches!(
-                    ty,
-                    DataType::Date32
-                        | DataType::Date64
-                        | DataType::Timestamp(_, _)
-                        | DataType::Time32(_)
-                        | DataType::Time64(_)
-                ) =>
-            {
-                ty.clone()
-            }
-            Kind::Hour
-                if matches!(
-                    ty,
-                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Null
-                ) =>
-            {
-                DataType::Timestamp(TimeUnit::Microsecond, None)
-            }
-            _ => {
-                return Err(DataFusionError::Plan(format!(
-                    "Unsupported {} input type: {ty}",
-                    self.name()
-                )))
-            }
-        };
-        Ok(vec![output])
-    }
     fn return_type(&self, _: &[DataType]) -> Result<DataType> {
         Ok(match self.kind {
             Kind::Split => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-            Kind::Locate | Kind::Size | Kind::Hour => DataType::Int32,
-            Kind::Unhex => DataType::Binary,
-            _ => DataType::Utf8,
+            Kind::Locate => DataType::Int32,
+            Kind::Typeof => DataType::Utf8,
         })
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -171,56 +91,6 @@ impl ScalarUDFImpl for Function {
         }
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
         let output: ArrayRef = match self.kind {
-            Kind::Hour => {
-                if matches!(arrays[0].data_type(), DataType::Date32 | DataType::Date64) {
-                    Arc::new(Int32Array::from_iter(
-                        (0..arrays[0].len()).map(|i| (!arrays[0].is_null(i)).then_some(0)),
-                    ))
-                } else {
-                    Arc::new(date_part(arrays[0].as_ref(), DatePart::Hour)?)
-                }
-            }
-            Kind::Size => {
-                let a = &arrays[0];
-                let values = (0..a.len())
-                    .map(|i| {
-                        if a.is_null(i) {
-                            return Ok(None);
-                        }
-                        let n = match a.data_type() {
-                            DataType::List(_) => {
-                                a.as_any()
-                                    .downcast_ref::<ListArray>()
-                                    .unwrap()
-                                    .value_length(i) as i64
-                            }
-                            DataType::LargeList(_) => a
-                                .as_any()
-                                .downcast_ref::<LargeListArray>()
-                                .unwrap()
-                                .value_length(i),
-                            DataType::FixedSizeList(_, _) => {
-                                a.as_any()
-                                    .downcast_ref::<FixedSizeListArray>()
-                                    .unwrap()
-                                    .value_length() as i64
-                            }
-                            DataType::Map(_, _) => {
-                                a.as_any()
-                                    .downcast_ref::<MapArray>()
-                                    .unwrap()
-                                    .value_length(i) as i64
-                            }
-                            DataType::Null => return Ok(None),
-                            _ => return Err(error("size expects an array or map")),
-                        };
-                        i32::try_from(n)
-                            .map(Some)
-                            .map_err(|_| error("Collection size exceeds INT range"))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Arc::new(Int32Array::from(values))
-            }
             Kind::Split => {
                 let text = arrays[0].as_any().downcast_ref::<StringArray>().unwrap();
                 let patterns = arrays[1].as_any().downcast_ref::<StringArray>().unwrap();
@@ -311,67 +181,6 @@ impl ScalarUDFImpl for Function {
                     ));
                 }
                 Arc::new(Int32Array::from(values))
-            }
-            Kind::Unhex => {
-                let text = arrays[0].as_any().downcast_ref::<StringArray>().unwrap();
-                let mut output = BinaryBuilder::new();
-                for value in text.iter() {
-                    let Some(value) = value else {
-                        output.append_null();
-                        continue;
-                    };
-                    if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                        output.append_null();
-                        continue;
-                    }
-                    let value = if value.len() % 2 == 1 {
-                        format!("0{value}")
-                    } else {
-                        value.to_string()
-                    };
-                    let decoded = (0..value.len())
-                        .step_by(2)
-                        .map(|i| u8::from_str_radix(&value[i..i + 2], 16))
-                        .collect::<std::result::Result<Vec<_>, _>>();
-                    match decoded {
-                        Ok(bytes) => output.append_value(bytes),
-                        Err(_) => output.append_null(),
-                    }
-                }
-                Arc::new(output.finish())
-            }
-            Kind::Hex => {
-                let mut output = StringBuilder::new();
-                for i in 0..arrays[0].len() {
-                    if arrays[0].is_null(i) {
-                        output.append_null();
-                        continue;
-                    }
-                    let scalar = ScalarValue::try_from_array(arrays[0].as_ref(), i)?;
-                    let text = if let Some(Some(s)) = scalar.try_as_str() {
-                        s.as_bytes()
-                            .iter()
-                            .map(|b| format!("{b:02X}"))
-                            .collect::<String>()
-                    } else if let ScalarValue::Binary(Some(bytes)) = scalar {
-                        bytes.iter().map(|b| format!("{b:02X}")).collect::<String>()
-                    } else {
-                        let value = cast(&arrays[0].slice(i, 1), &DataType::UInt64)?;
-                        let unsigned = value
-                            .as_any()
-                            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
-                            .unwrap();
-                        if unsigned.is_null(0) {
-                            let value = cast(&arrays[0].slice(i, 1), &DataType::Int64)?;
-                            let signed = value.as_any().downcast_ref::<Int64Array>().unwrap();
-                            format!("{:X}", signed.value(0))
-                        } else {
-                            format!("{:X}", unsigned.value(0))
-                        }
-                    };
-                    output.append_value(text);
-                }
-                Arc::new(output.finish())
             }
             Kind::Typeof => unreachable!(),
         };
