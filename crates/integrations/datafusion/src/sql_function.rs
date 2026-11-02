@@ -243,6 +243,7 @@ async fn expand_statement_internal(
             return Err(error);
         }
         if expanded_count == 0 {
+            crate::binary_cast::rewrite(&mut statement)?;
             return Ok(statement);
         }
     }
