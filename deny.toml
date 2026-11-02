@@ -25,6 +25,7 @@ ignore = [
     { id = "RUSTSEC-2026-0391", reason = "No caller uses the affected raw Encoder/Decoder::with_context constructors." },
     { id = "RUSTSEC-2026-0398", reason = "The affected zstd-safe seekable feature is not enabled." },
     { id = "RUSTSEC-2026-0403", reason = "No old zstd caller uses write::Decoder or raw streaming decode; compression-codecs now uses patched zstd-safe 8.2." },
+    { id = "RUSTSEC-2026-0435", reason = "Parquet 58 pins thrift 0.17 and only uses the compact protocol; the affected TBinaryInputProtocol::read_bytes is unused." },
 ]
 
 [licenses]

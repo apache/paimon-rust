@@ -36,12 +36,16 @@
 //! This version supports partition predicate pushdown by extracting
 //! translatable partition-only conjuncts from DataFusion filters.
 
+mod binary_cast;
 mod blob_descriptor_functions;
 mod blob_reader;
 mod blob_view;
 mod catalog;
+mod compat_functions;
 mod delete;
 mod error;
+mod expression_compat;
+mod extended_describe;
 mod filter_pushdown;
 mod format_partition_analyze;
 mod format_partition_ddl;
@@ -53,15 +57,24 @@ mod full_text_search;
 mod golden_warehouse;
 mod hybrid_search;
 mod incremental_query;
+mod json_functions;
+mod json_output;
 mod lateral_vector_search;
+mod lateral_views;
 mod memory;
 mod merge_condition;
 mod merge_into;
 mod partition_count_pushdown;
 mod physical_plan;
 mod procedures;
+mod regex_operators;
 mod relation_planner;
 pub mod runtime;
+mod scalar_compat;
+mod scalar_extra;
+mod selection_aggregate;
+mod show_metadata;
+mod spark_functions;
 mod sql_context;
 mod sql_function;
 mod system_tables;

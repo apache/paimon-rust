@@ -38,7 +38,7 @@ use crate::table::source::DataSplit;
 use crate::table::vector_read::Read;
 use crate::table::vector_search_common::{
     collect_ranked_rows, current_tokio_runtime_handle, log_vindex_range_io_stats,
-    reorder_and_strip_position, vindex_concurrency_limits, RankedRow,
+    read_vector_index_metric, reorder_and_strip_position, vindex_concurrency_limits, RankedRow,
 };
 use crate::table::{ArrowRecordBatchStream, RowRange, Table};
 use crate::vector_search::{GlobalIndexIOMeta, GlobalIndexResult, VectorSearch};
@@ -61,11 +61,10 @@ pub(super) struct PkVectorRead {
     vector_column: String,
     queries: Vec<Vec<f32>>,
     limit: usize,
-    params: PkVectorSearchParams,
 }
 
 impl PkVectorRead {
-    /// Construct a reader from parameters resolved and validated by the builder.
+    /// Capture query inputs; format-dependent options wait for the scan plan.
     pub(super) fn new(
         table: &Table,
         options: &HashMap<String, String>,
@@ -73,7 +72,6 @@ impl PkVectorRead {
         vector_column: &str,
         queries: &[&[f32]],
         limit: usize,
-        params: PkVectorSearchParams,
     ) -> Self {
         Self {
             table: table.clone(),
@@ -82,7 +80,6 @@ impl PkVectorRead {
             vector_column: vector_column.to_string(),
             queries: queries.iter().map(|query| query.to_vec()).collect(),
             limit,
-            params,
         }
     }
 }
@@ -93,16 +90,61 @@ impl Read for PkVectorRead {
     async fn read(&self, plan: PkVectorScanPlan) -> crate::Result<Vec<GlobalIndexResult>> {
         let core = CoreOptions::new(self.table.schema().options());
         let queries: Vec<&[f32]> = self.queries.iter().map(Vec::as_slice).collect();
-        let candidates = search_pk_candidates_batch_with_plan(
+        let mut metadata_type = None;
+        for segment in plan.splits.iter().flat_map(|split| &split.ann_segments) {
+            if let Some(previous) = metadata_type {
+                if previous != segment.index_type.as_str() {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Vector column '{}' has multiple index types: {previous} and {}",
+                            self.vector_column, segment.index_type
+                        ),
+                        source: None,
+                    });
+                }
+            }
+            metadata_type = Some(segment.index_type.as_str());
+        }
+        let mut params = PkVectorSearchParams::resolve(
             &self.table,
             &self.options,
+            self.filter.as_ref(),
+            &self.vector_column,
+            &queries,
+            self.limit,
+            metadata_type,
+        )?;
+        // The payload's training metric governs ANN scores, raw fallback and
+        // refinement. Schema/query options cannot reinterpret an existing index.
+        // One payload establishes the metric; the search scorer validates every
+        // other payload against it without serializing extra remote header reads.
+        if let Some(segment) = plan
+            .splits
+            .iter()
+            .flat_map(|split| &split.ann_segments)
+            .find(|segment| segment.row_count > 0)
+        {
+            let metric = VectorSearchMetric::from_vindex(
+                read_vector_index_metric(
+                    self.table.file_io(),
+                    &segment.path,
+                    segment.file_size,
+                    Some(&segment.index_meta),
+                )
+                .await?,
+            );
+            params.metric = metric;
+            params.vector_options.metric = metric.as_str().into();
+        }
+        let candidates = search_pk_candidates_batch_with_plan(
+            &self.table,
             self.filter.as_ref(),
             &core,
             &self.vector_column,
             &queries,
             self.limit,
             &plan,
-            &self.params,
+            &params,
         )
         .await?;
         let table = Arc::new(self.table.clone());
@@ -114,7 +156,7 @@ impl Read for PkVectorRead {
                     plan.snapshot_id,
                     candidates,
                     &plan.splits,
-                    self.params.metric,
+                    params.metric,
                 )
             })
             .collect()
@@ -239,7 +281,6 @@ fn intersect_row_ranges_by_split(
 #[allow(clippy::too_many_arguments)]
 async fn search_pk_raw_candidates_batch_with_plan(
     table: &Table,
-    query_options: &HashMap<String, String>,
     filter: Option<&Predicate>,
     core: &CoreOptions<'_>,
     pk_col: &str,
@@ -248,8 +289,8 @@ async fn search_pk_raw_candidates_batch_with_plan(
     plan: &PkVectorScanPlan,
     params: &PkVectorSearchParams,
 ) -> crate::Result<Vec<OrchestratorSearchResult>> {
-    // An empty plan has nothing to search. Returned before the backend is resolved
-    // so a table with no searchable data never errors on an unrecognized index type.
+    // Options have been validated against the captured plan. An empty plan has
+    // no buckets to search, but must preserve one result per query.
     if plan.splits.is_empty() {
         return Ok(queries
             .iter()
@@ -262,14 +303,14 @@ async fn search_pk_raw_candidates_batch_with_plan(
 
     let metric = params.metric;
     let concurrency = params.concurrency;
-    let index_type = params.index_type.clone();
+    let index_type = params.vector_options.index_type.as_deref().unwrap_or("");
     let vector_field = params.vector_field.clone();
     let skip_exact_fallback = params.skip_exact_fallback;
     let indexed_limit = params.indexed_limit;
 
-    // All segments use the table's configured vindex type. An empty plan returns
+    // All valid segments use the format selected from the captured plan. An empty plan returns
     // above before opening readers or resolving concurrency limits.
-    if !is_vindex_index_type(&index_type) {
+    if !is_vindex_index_type(index_type) {
         return Err(crate::Error::DataInvalid {
             message: format!("unsupported PK vector index backend/type: '{index_type}'"),
             source: None,
@@ -300,12 +341,8 @@ async fn search_pk_raw_candidates_batch_with_plan(
     // Real ANN scorer + loader. Each segment source is opened lazily inside its
     // bucket leaf and dropped after scoring. Range reads load only metadata
     // and the index data needed for the search.
-    let options = {
-        let mut o = table.schema().options().clone();
-        o.extend(query_options.clone());
-        o
-    };
-    let search_options = options.clone();
+    let search_options = params.vector_options.options.clone();
+    let options = search_options.clone();
     let field_name = pk_col.to_string();
 
     let loader_io = table.file_io().clone();
@@ -473,7 +510,6 @@ async fn search_pk_raw_candidates_batch_with_plan(
 #[allow(clippy::too_many_arguments)]
 async fn search_pk_candidates_batch_with_plan(
     table: &Table,
-    query_options: &HashMap<String, String>,
     filter: Option<&Predicate>,
     core: &CoreOptions<'_>,
     pk_col: &str,
@@ -483,15 +519,7 @@ async fn search_pk_candidates_batch_with_plan(
     params: &PkVectorSearchParams,
 ) -> crate::Result<Vec<Vec<PkVectorCandidate>>> {
     let searches = search_pk_raw_candidates_batch_with_plan(
-        table,
-        query_options,
-        filter,
-        core,
-        pk_col,
-        queries,
-        limit,
-        plan,
-        params,
+        table, filter, core, pk_col, queries, limit, plan, params,
     )
     .await?;
 

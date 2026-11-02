@@ -17,10 +17,11 @@
 
 //! Shared field declarations and native options for global-index maintenance and raw reads.
 
-use crate::table::global_index_build_common::{resolve_index_fields, IndexColumns};
+use crate::spec::CoreOptions;
 use crate::table::global_index_types::normalize_global_index_type;
 use crate::table::{GlobalIndexBuildBuilder, Table};
 use crate::Result;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 pub(super) struct Definition {
@@ -40,143 +41,227 @@ impl Definition {
     }
 }
 
-pub(super) fn definitions(table: &Table) -> Result<Vec<Definition>> {
-    let options = table.schema().options();
-    let mut owners = HashMap::new();
-    for family in ["btree", "bitmap", "multivalue", "fm", "full-text", "vector"] {
-        let key = format!("global-index.{family}.index-columns");
-        let Some(columns) = options.get(&key) else {
-            continue;
-        };
-        let mut unique = HashSet::new();
-        for column in columns.split(',').map(str::trim) {
-            if column.is_empty() || !unique.insert(column) {
-                return Err(crate::Error::ConfigInvalid {
-                    message: format!("{key} contains an empty or duplicate column '{column}'"),
-                });
-            }
-            if owners.insert(column, family).is_some() {
-                return Err(crate::Error::ConfigInvalid {
-                    message: format!("Column '{column}' can own at most one automatically maintained global index"),
-                });
-            }
-            resolve_index_fields(table, &IndexColumns::Columns(vec![column.into()]), "btree")?;
+/// Ownership is shared by maintenance and both table modes' read paths.
+pub(super) fn declarations(options: &HashMap<String, String>) -> Result<Vec<Definition>> {
+    declarations_impl(options, true)
+}
+
+/// Read planning can encounter unresolved legacy schema properties. Ignore
+/// blank/unmatched declarations, while still rejecting competing column owners.
+pub(super) fn declarations_for_read(
+    options: &HashMap<String, String>,
+) -> Result<Vec<(String, String)>> {
+    Ok(declarations_impl(options, false)?
+        .into_iter()
+        .map(|definition| (definition.column, definition.index_type))
+        .collect())
+}
+
+fn declarations_impl(options: &HashMap<String, String>, strict: bool) -> Result<Vec<Definition>> {
+    let core = CoreOptions::new(options);
+    for kind in core.global_index_types() {
+        if strict && kind != "vector" && normalize_global_index_type(&kind).is_none() {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("Unsupported global index type: {kind}"),
+            });
         }
     }
-    let mut result = Vec::with_capacity(owners.len());
-    for field in table.schema().fields() {
-        let column = field.name();
-        let Some(&family) = owners.get(column) else {
-            continue;
-        };
-        let index_type = if family == "vector" {
-            vector_index_type(options, column)?.ok_or_else(|| crate::Error::ConfigInvalid {
-                message: format!("fields.{column}.global-index.vector.index-type must specify a supported vector index type"),
-            })?
+    let mut result = Vec::new();
+    let mut owners = HashSet::new();
+    for family in ["btree", "bitmap", "multivalue", "fm", "full-text", "vector"] {
+        let columns = if family == "vector" {
+            core.vector_index_columns()
         } else {
-            family
+            core.global_index_columns(family)
         };
-        result.push(Definition {
-            column: column.into(),
-            index_type: index_type.into(),
-            options: field_index_options(options, column, family, index_type)?,
-        });
+        let mut unique = HashSet::new();
+        for column in columns {
+            if column.is_empty() && !strict {
+                continue;
+            }
+            if column.is_empty() || !unique.insert(column.clone()) {
+                return Err(crate::Error::ConfigInvalid { message: format!("global-index.{family}.index-columns (legacy pk-{family}.index.columns) contains an empty or duplicate column '{column}'") });
+            }
+            if !owners.insert(column.clone()) {
+                return Err(crate::Error::ConfigInvalid { message: format!("Column '{column}' can own at most one primary-key index or automatically maintained global index") });
+            }
+            let (kind, resolved) = if family == "vector" && strict {
+                let resolved = core.vector_index_options(None, &column, true)?;
+                let kind = resolved
+                    .index_type
+                    .ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Vector index implementation is not configured for '{column}'"
+                        ),
+                    })?;
+                let kind = normalize_global_index_type(&kind)
+                    .filter(|kind| crate::vindex::is_vindex_index_type(kind))
+                    .ok_or_else(|| crate::Error::ConfigInvalid {
+                        message: format!("Unsupported vector index type for {column}: {kind}"),
+                    })?;
+                (kind, resolved.options)
+            } else {
+                (
+                    family,
+                    if strict {
+                        core.global_index_options(family, &column)?
+                    } else {
+                        HashMap::new()
+                    },
+                )
+            };
+            result.push(Definition {
+                column,
+                index_type: kind.into(),
+                options: resolved
+                    .into_iter()
+                    .filter(|(key, value)| options.get(key) != Some(value))
+                    .collect(),
+            });
+        }
     }
     Ok(result)
 }
 
+pub(super) fn definitions(table: &Table) -> Result<Vec<Definition>> {
+    let options = table.schema().options();
+    let owners = declarations(options)?
+        .into_iter()
+        .map(|definition| (definition.column.clone(), definition))
+        .collect::<HashMap<_, _>>();
+    for column in owners.keys() {
+        if !table.schema().fields().iter().any(|f| f.name() == column) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("Global index contains unknown column '{column}'"),
+            });
+        }
+    }
+    let mut result = Vec::with_capacity(owners.len());
+    for field in table.schema().fields() {
+        let Some(definition) = owners.get(field.name()) else {
+            continue;
+        };
+        let definition = Definition {
+            column: field.name().into(),
+            index_type: definition.index_type.clone(),
+            options: definition.options.clone(),
+        };
+        let mut merged = options.clone();
+        merged.extend(definition.options.clone());
+        crate::table::universal_compaction::UniversalCompaction::from_options(
+            &merged,
+            "global-index.",
+        )?;
+        result.push(definition);
+    }
+    Ok(result)
+}
+
+/// Strict native adapters receive resolved overrides without unrelated table properties.
 pub(super) fn field_index_options(
     table_options: &HashMap<String, String>,
     column: &str,
-    family: &str,
+    _family: &str,
     index_type: &str,
 ) -> Result<HashMap<String, String>> {
-    let field_prefix = format!("fields.{column}.global-index.{family}.");
-    let native_prefix = match family {
-        "vector" | "full-text" => format!("{index_type}."),
-        _ => format!("{family}-index."),
+    let core = CoreOptions::new(table_options);
+    let resolved = if crate::vindex::is_vindex_index_type(index_type) {
+        core.vector_index_options(Some(index_type), column, true)?
+            .options
+    } else {
+        core.global_index_options(index_type, column)?
     };
-    let mut options = HashMap::new();
-    let mut insert = |key: &str, value: String| -> Result<()> {
-        if key.trim().is_empty() {
-            return Err(crate::Error::ConfigInvalid {
-                message: format!("{field_prefix}index-options contains an empty option key"),
-            });
-        }
-        let qualified = if key.starts_with(&native_prefix)
-            || key.starts_with("fields.")
-            || key.starts_with("global-index.")
-            || key.starts_with("sorted-index.")
-            || (family == "vector" && matches!(key, "index.type" | "vindex.build.granule.enabled"))
-        {
-            key.into()
-        } else {
-            format!("{native_prefix}{key}")
-        };
-        if options
-            .get(&qualified)
-            .or_else(|| table_options.get(&qualified))
-            .is_some_and(|previous| previous != &value)
-        {
-            return Err(crate::Error::ConfigInvalid {
-                message: format!("Conflicting field index options for {column}: {qualified}"),
-            });
-        }
-        options.insert(qualified, value);
-        Ok(())
-    };
-    let options_key = format!("{field_prefix}index-options");
-    if let Some(raw) = table_options
-        .get(&options_key)
-        .filter(|raw| !raw.trim().is_empty())
-    {
-        let parsed: serde_json::Map<String, serde_json::Value> = serde_json::from_str(raw)
-            .map_err(|_| crate::Error::ConfigInvalid {
-                message: format!("{options_key} must be a JSON object of option key-value pairs"),
-            })?;
-        for (key, value) in parsed {
-            let value = match value {
-                serde_json::Value::String(value) => value,
-                serde_json::Value::Number(_) | serde_json::Value::Bool(_) => value.to_string(),
-                _ => {
-                    return Err(crate::Error::ConfigInvalid {
-                        message: format!(
-                            "{options_key} contains an invalid option value for {key}"
-                        ),
-                    })
-                }
-            };
-            insert(&key, value)?;
-        }
-    }
-    if family == "vector" {
-        let metric_key = format!("{field_prefix}distance-metric");
-        let metric = table_options
-            .get(&metric_key)
-            .map(String::as_str)
-            .unwrap_or("inner_product");
-        crate::vindex::pkvector::metric::VectorSearchMetric::parse(metric)?;
-        options.insert(
-            format!("{native_prefix}metric"),
-            metric.to_ascii_lowercase().replace('-', "_"),
-        );
-    }
-    Ok(options)
+    Ok(resolved
+        .into_iter()
+        .filter(|(key, value)| table_options.get(key) != Some(value))
+        .collect())
 }
 
-pub(super) fn vector_index_type(
+/// Native frontends can echo the entire effective schema in build options.
+/// Unchanged schema entries keep table precedence and validation semantics;
+/// a standalone procedure map retains the native parameter aliases.
+pub(super) fn build_procedure_options<'a>(
+    table: &HashMap<String, String>,
+    user: &'a HashMap<String, String>,
+) -> Cow<'a, HashMap<String, String>> {
+    // Pinned worker tables add read selectors that are absent from the original
+    // frontend map. These selectors do not identify a build option source.
+    let mut schema_keys = table
+        .keys()
+        .filter(|key| !key.starts_with("scan.") && !key.starts_with("incremental-"))
+        .peekable();
+    if schema_keys.peek().is_none() || !schema_keys.all(|key| user.contains_key(key)) {
+        return Cow::Borrowed(user);
+    }
+    Cow::Owned(
+        user.iter()
+            .filter(|(key, value)| table.get(*key) != Some(*value))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+/// A procedure's declarations and JSON replace the corresponding schema source.
+/// Flat procedure parameters keep their own precedence layer and cannot create
+/// false conflicts with legacy JSON in the table source.
+pub(super) fn build_table_options(
+    table: &HashMap<String, String>,
+    user: &HashMap<String, String>,
+    column: &str,
+) -> HashMap<String, String> {
+    let mut effective = table.clone();
+    effective.extend(
+        user.iter()
+            .filter(|(key, _)| build_definition_option(key, column))
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    effective
+}
+
+fn build_definition_option(key: &str, column: &str) -> bool {
+    key.strip_prefix(&format!("fields.{column}."))
+        .is_some_and(|suffix| {
+            suffix == "index-options"
+                || suffix.ends_with(".index-options")
+                || suffix.ends_with(".index.options")
+                || matches!(
+                    suffix,
+                    "pk-vector.index.type" | "global-index.vector.index-type"
+                )
+        })
+        || (key.starts_with("global-index.")
+            && (key.ends_with(".index-columns") || key.ends_with(".index-column")))
+        || (key.starts_with("pk-") && key.ends_with(".index.columns"))
+}
+
+/// Parse a procedure's original option map without treating table properties as
+/// native vector parameters. Keep the original map in captured build plans.
+pub(super) fn build_options(
     options: &HashMap<String, String>,
     column: &str,
-) -> Result<Option<&'static str>> {
-    let key = format!("fields.{column}.global-index.vector.index-type");
-    match options.get(&key) {
-        Some(value) => normalize_global_index_type(value.trim())
-            .filter(|kind| crate::vindex::is_vindex_index_type(kind))
-            .map(Some)
-            .ok_or_else(|| crate::Error::ConfigInvalid {
-                message: format!("{key} must specify a supported vector index type"),
-            }),
-        None => Ok(None),
+    kind: &str,
+) -> Result<HashMap<String, String>> {
+    let core = CoreOptions::new(options);
+    if crate::vindex::is_vindex_index_type(kind) {
+        // Declarations establish defaults in the schema layer. A procedure
+        // without a metric must not replace an existing table metric with IP.
+        let mut resolved = core.vector_index_options(Some(kind), column, false)?;
+        // The shared result also retains the former Rust family's metric
+        // priority. Apply it to explicit metric parameters without injecting
+        // an unspecified procedure metric.
+        for key in [
+            format!("{kind}.metric"),
+            format!("{kind}.distance.metric"),
+            format!("fields.{column}.metric"),
+            format!("fields.{column}.distance.metric"),
+        ] {
+            if let Some(metric) = resolved.options.get_mut(&key) {
+                *metric = resolved.metric.clone();
+            }
+        }
+        Ok(resolved.options)
+    } else {
+        core.global_index_options(kind, column)
     }
 }
 
@@ -185,9 +270,13 @@ pub(super) fn declares_column(
     column: &str,
     family: &str,
 ) -> bool {
-    options
-        .get(&format!("global-index.{family}.index-columns"))
-        .is_some_and(|columns| columns.split(',').any(|name| name.trim() == column))
+    let core = CoreOptions::new(options);
+    let columns = if family == "vector" {
+        core.vector_index_columns()
+    } else {
+        core.global_index_columns(family)
+    };
+    columns.iter().any(|c| c == column)
 }
 
 pub(super) fn declared_options(
@@ -196,9 +285,15 @@ pub(super) fn declared_options(
     family: &str,
     index_type: &str,
 ) -> Result<HashMap<String, String>> {
-    let prefix = format!("fields.{column}.global-index.{family}.");
+    let prefixes = [
+        format!("fields.{column}.global-index.{family}."),
+        format!("fields.{column}.pk-{family}."),
+    ];
     if declares_column(options, column, family)
-        || options.keys().any(|key| key.starts_with(&prefix))
+        || options.contains_key(&format!("fields.{column}.index-options"))
+        || options
+            .keys()
+            .any(|key| prefixes.iter().any(|prefix| key.starts_with(prefix)))
     {
         field_index_options(options, column, family, index_type)
     } else {

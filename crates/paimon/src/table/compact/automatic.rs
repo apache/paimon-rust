@@ -21,8 +21,10 @@ use std::future::Future;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use super::{prepare_results, CompactExecutor, CompactPlan, PreparedCompact};
-use crate::table::{CommitMessage, Table, TableCommit};
+use crate::table::{Table, TableCommit};
 use crate::{Error, Result};
+#[cfg(test)]
+mod metadata_tests;
 
 pub(in crate::table) async fn execute_auto_plan(
     table: &Table,
@@ -39,8 +41,12 @@ pub(in crate::table) async fn execute_auto_plan(
             .or_default()
             .push(task);
     }
+    let inputs = match plan.tasks().first() {
+        Some(task) => Some(executor.capture_inputs(task).await?),
+        None => None,
+    };
     let (results, error) = run_buckets(buckets.into_values(), parallelism, |task| {
-        executor.execute(task)
+        executor.execute_captured(task, inputs.as_ref().expect("nonempty task plan"))
     })
     .await;
     let prepared = match error {
@@ -50,20 +56,8 @@ pub(in crate::table) async fn execute_auto_plan(
     if prepared.is_err() {
         // All started tasks have finished. Clean every successful output by
         // its own task, regardless of completion order. No publication began.
-        let messages = results
-            .iter()
-            .map(|result| {
-                let mut message = CommitMessage::new(
-                    result.task.partition.clone(),
-                    result.task.bucket,
-                    result.files.clone(),
-                );
-                message.new_changelog_files = result.changelog_files.clone();
-                message
-            })
-            .collect::<Vec<_>>();
         let _ = TableCommit::new(table.clone(), "auto-compact-cleanup".into())
-            .abort(&messages)
+            .abort_compact(&results)
             .await;
     }
     prepared

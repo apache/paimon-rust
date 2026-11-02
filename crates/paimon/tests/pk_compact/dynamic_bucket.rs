@@ -449,24 +449,19 @@ async fn dynamic_compaction_rejects_other_index_types_at_plan_and_commit() {
             .await
             .unwrap();
         let error = builder.new_planner().unwrap().plan().await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("only supports dynamic-bucket HASH"),
-            "{error}"
-        );
+        let expected = if index_type == "HASH_WITH_GLOBAL_METADATA" {
+            "Unsupported primary-key index type"
+        } else {
+            "Compaction requires HASH, deletion-vector or source-backed PK indexes"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
         let error = builder
             .new_commit()
             .unwrap()
             .commit_compact(results)
             .await
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("only supports dynamic-bucket HASH"),
-            "{error}"
-        );
+        assert!(error.to_string().contains(expected), "{error}");
         assert_eq!(latest(&table).await.id(), snapshot.id());
     }
 }

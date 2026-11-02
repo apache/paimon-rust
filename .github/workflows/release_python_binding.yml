@@ -116,7 +116,7 @@ jobs:
 
       - name: Install cargo-about
         if: matrix.os != 'macos-15-intel'
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-about@0.9.1
 
@@ -232,7 +232,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install cargo-about
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-about@0.9.1
 
@@ -253,7 +253,7 @@ jobs:
 
       - name: Publish to TestPyPI
         if: contains(env.RELEASE_TAG, '-')
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           repository-url: https://test.pypi.org/legacy/
           skip-existing: true
@@ -262,7 +262,7 @@ jobs:
 
       - name: Publish to PyPI
         if: ${{ !contains(env.RELEASE_TAG, '-') }}
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           skip-existing: true
           packages-dir: bindings/python/dist

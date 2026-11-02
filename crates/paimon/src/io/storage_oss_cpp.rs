@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use libloading::Library;
 use opendal::raw::*;
-use opendal::{Buffer, Builder, BytesRange, Capability, EntryMode, Error, ErrorKind, Metadata};
+use opendal::{
+    Buffer, Builder, BytesRange, Capability, Error, ErrorKind, Metadata, MetadataBuilder,
+};
 use opendal::{OperationContext, Operator, Result};
 use tokio::sync::{OnceCell, Semaphore};
 
@@ -215,6 +217,7 @@ impl Service for CppService {
     type Lister = CppLister;
     type Deleter = ();
     type Copier = ();
+    type Composer = ();
 
     fn info(&self) -> ServiceInfo {
         self.info.clone()
@@ -266,14 +269,7 @@ impl Service for CppService {
     fn delete(&self, _: &OperationContext) -> Result<Self::Deleter> {
         unsupported()
     }
-    fn copy(
-        &self,
-        _: &OperationContext,
-        _: &str,
-        _: &str,
-        _: OpCopy,
-        _: OpCopier,
-    ) -> Result<Self::Copier> {
+    fn copy(&self, _: &OperationContext, _: &str, _: &str, _: OpCopy) -> Result<Self::Copier> {
         unsupported()
     }
     async fn rename(
@@ -591,14 +587,14 @@ impl Client {
     }
     fn stat(&self, key: &str) -> Result<Metadata> {
         if key.is_empty() {
-            return Ok(Metadata::new(EntryMode::DIR));
+            return Ok(MetadataBuilder::dir().build());
         }
         if key.ends_with('/') {
             let (entries, _) = self.list(key, "", true, 1)?;
             return if entries.is_empty() {
                 Err(Error::new(ErrorKind::NotFound, "OSS directory not found"))
             } else {
-                Ok(Metadata::new(EntryMode::DIR))
+                Ok(MetadataBuilder::dir().build())
             };
         }
         let key = cstring(key)?;
@@ -755,15 +751,18 @@ unsafe extern "C" fn collect_entry(
 fn metadata(size: i64, modified: &str, dir: bool) -> Result<Metadata> {
     let size = u64::try_from(size)
         .map_err(|_| Error::new(ErrorKind::Unexpected, "Negative object size"))?;
-    let mut meta = Metadata::new(if dir { EntryMode::DIR } else { EntryMode::FILE });
-    meta.set_content_length(size);
+    let mut meta = if dir {
+        MetadataBuilder::dir()
+    } else {
+        MetadataBuilder::file(size)
+    };
     if !modified.is_empty() {
         let time = chrono::DateTime::parse_from_rfc2822(modified)
             .or_else(|_| chrono::DateTime::parse_from_rfc3339(modified))
             .map_err(|_| Error::new(ErrorKind::Unexpected, "Invalid object modification time"))?;
-        meta.set_last_modified(Timestamp::from_millisecond(time.timestamp_millis())?);
+        meta.last_modified(Timestamp::from_millisecond(time.timestamp_millis())?);
     }
-    Ok(meta)
+    Ok(meta.build())
 }
 fn cstring(value: &str) -> Result<CString> {
     CString::new(value).map_err(|_| Error::new(ErrorKind::ConfigInvalid, "NUL in OSS C++ input"))

@@ -516,7 +516,7 @@ fn cast_to_f64(variant: VariantRef<'_>) -> DFResult<f64> {
     }
 }
 
-fn cast_to_string(variant: VariantRef<'_>) -> DFResult<String> {
+pub(crate) fn cast_to_string(variant: VariantRef<'_>) -> DFResult<String> {
     match variant.kind().map_err(to_df_error)? {
         VariantKind::Object | VariantKind::Array => variant.to_json().map_err(to_df_error),
         VariantKind::Boolean => Ok(variant.get_boolean().map_err(to_df_error)?.to_string()),
@@ -670,7 +670,9 @@ fn string_at(array: &dyn Array, row: usize) -> DFResult<Option<String>> {
     }
 }
 
-fn variant_children(array: &dyn Array) -> DFResult<Option<(&BinaryArray, &BinaryArray)>> {
+pub(crate) fn variant_children(
+    array: &dyn Array,
+) -> DFResult<Option<(&BinaryArray, &BinaryArray)>> {
     let ArrowDataType::Struct(fields) = array.data_type() else {
         return Ok(None);
     };
@@ -738,7 +740,7 @@ fn variant_array(values: Vec<Option<GenericVariant>>) -> DFResult<ArrayRef> {
     Ok(Arc::new(array))
 }
 
-fn variant_arrow_type() -> ArrowDataType {
+pub(crate) fn variant_arrow_type() -> ArrowDataType {
     paimon::arrow::variant_arrow_type()
 }
 

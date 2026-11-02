@@ -222,7 +222,7 @@ impl PlanContext {
                 message: "Vector column must be set via with_vector_column()".to_string(),
             });
         }
-        if targets_primary_key_column(&core, column)
+        if targets_primary_key_column(table, column)
             && (include_row_ids.is_some() || prepared.is_some())
         {
             return Err(crate::Error::DataInvalid {
@@ -264,8 +264,8 @@ impl VectorScan {
     ) -> crate::Result<Self> {
         let context = PlanContext::new(table, column, filter, include_row_ids, prepared)?;
         let core = CoreOptions::new(table.schema().options());
-        let scan = if targets_primary_key_column(&core, column) {
-            let column = core.primary_key_vector_index_column()?;
+        let scan = if targets_primary_key_column(table, column) {
+            let column = core.single_vector_index_column()?;
             let field_id =
                 find_field_id_by_name(table.schema().fields(), &column).ok_or_else(|| {
                     crate::Error::DataInvalid {
@@ -276,7 +276,6 @@ impl VectorScan {
             VectorScanKind::PrimaryKey(Box::new(PkVectorScan::new(
                 table,
                 field_id,
-                core.primary_key_vector_index_type(&column)?,
                 filter.cloned(),
             )))
         } else {

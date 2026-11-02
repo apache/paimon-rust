@@ -95,13 +95,13 @@ jobs:
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-deny@0.19.6
 
       - name: Install cargo-about
         if: steps.release_license_inputs.outputs.changed == 'true'
-        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-about@0.9.1
 
@@ -240,6 +240,9 @@ jobs:
     env:
       RUST_LOG: DEBUG
       RUST_BACKTRACE: full
+      # DataFusion builds default and Vortex test binaries on the same runner.
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
 
@@ -250,9 +253,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: integration-${{ matrix.suite }}-${{ runner.os }}-line-tables-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            integration-${{ runner.os }}-
+            integration-${{ matrix.suite }}-${{ runner.os }}-line-tables-
 
       - name: Rust Integration Test
         if: matrix.suite == 'rust'
@@ -271,7 +274,7 @@ jobs:
 
       - name: Install uv
         if: matrix.needs_uv == true
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
         with:
           version: "0.9.3"
           enable-cache: true

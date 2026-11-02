@@ -80,7 +80,8 @@ impl PlanContext {
             }
         }
         let primary_key_field_id =
-            resolves_to_pk_full_text_path(&core, column).then_some(field.id());
+            resolves_to_pk_full_text_path(&core, column, !table.schema().primary_keys().is_empty())
+                .then_some(field.id());
         if primary_key_field_id.is_some() && config.include_row_ids.is_some() {
             return Err(crate::Error::Unsupported {
                 message:

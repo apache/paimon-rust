@@ -943,19 +943,88 @@ fn verify_segment_metric_rejects_mismatched_vindex_metric() {
 
 // ---- Search results retain scored positions and the planned source context. ----
 #[tokio::test]
+async fn persisted_metric_skips_empty_segments_and_rejects_mixed_payloads() {
+    let table = build_committed_pk_vector_table(&[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]).await;
+    let scan = crate::table::pk_vector_scan::PkVectorScan::new(&table, 1, None);
+    let plan = scan.plan().await.unwrap();
+    let read_table = table.copy_with_options(HashMap::from([(
+        "fields.embedding.distance.metric".into(),
+        "inner_product".into(),
+    )]));
+    let read = PkVectorRead::new(
+        &read_table,
+        &HashMap::new(),
+        None,
+        "embedding",
+        &[&[0.0, 1.0]],
+        2,
+    );
+
+    // The second bucket is an independent source unit; source file names may
+    // coincide across buckets without overlapping segment ownership.
+    let mut other = plan.splits[0].clone();
+    other.data_split = DataSplitBuilder::new()
+        .with_snapshot(plan.snapshot_id)
+        .with_partition(other.data_split.partition().clone())
+        .with_bucket(1)
+        .with_bucket_path("memory:/pk_vector_route_test/bucket-1".into())
+        .with_total_buckets(2)
+        .with_data_files(other.data_split.data_files().to_vec())
+        .build()
+        .unwrap();
+    let mut with_empty = plan.clone();
+    let mut empty = other.clone();
+    let segment = &mut empty.ann_segments[0];
+    segment.row_count = 0;
+    segment.path = "memory:/missing-empty-payload".into();
+    with_empty.splits.insert(0, empty);
+    let results = read.read(with_empty).await.unwrap();
+    assert_eq!(
+        results[0]
+            .positions()
+            .unwrap()
+            .iter()
+            .map(|p| p.score)
+            .collect::<Vec<_>>(),
+        vec![1.0, 0.5]
+    );
+
+    let mut mixed = plan;
+    let bytes = build_vindex_segment_bytes("cosine");
+    let segment = &mut other.ann_segments[0];
+    segment.path = "memory:/mixed-cosine-payload".into();
+    segment.file_size = bytes.len() as u64;
+    table
+        .file_io()
+        .new_output(&segment.path)
+        .unwrap()
+        .write(bytes::Bytes::from(bytes))
+        .await
+        .unwrap();
+    mixed.splits.push(other);
+    let error = read
+        .read(mixed)
+        .await
+        .expect_err("mixed persisted metrics must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match configured metric"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn reader_uses_planned_splits_after_index_manifest_is_removed() {
     let table = build_committed_pk_vector_table(&[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]).await;
     let options = HashMap::new();
     let query = [0.0, 1.0];
     let params =
-        PkVectorSearchParams::resolve(&table, &options, None, "embedding", &[&query], 2).unwrap();
-    let scan = crate::table::pk_vector_scan::PkVectorScan::new(
-        &table,
-        params.vector_field.id(),
-        params.index_type.clone(),
-        None,
-    );
-    let read = PkVectorRead::new(&table, &options, None, "embedding", &[&query], 2, params);
+        PkVectorSearchParams::resolve(&table, &options, None, "embedding", &[&query], 2, None)
+            .unwrap();
+    let scan =
+        crate::table::pk_vector_scan::PkVectorScan::new(&table, params.vector_field.id(), None);
+    let read = PkVectorRead::new(&table, &options, None, "embedding", &[&query], 2);
     let plan = scan.plan().await.unwrap();
     let snapshot_id = plan.snapshot_id;
     let manager = table.snapshot_manager();
@@ -1181,4 +1250,43 @@ fn residual_uses_only_data_conjuncts_of_the_filter() {
         vec![mixed],
         "a mixed partition/data conjunct must stay whole in the residual"
     );
+}
+
+#[tokio::test]
+async fn reader_rejects_mixed_valid_payload_types_including_empty_markers() {
+    for cross_bucket in [false, true] {
+        let table = build_committed_pk_vector_table(&[[1.0, 0.0], [0.0, 1.0]]).await;
+        let scan = crate::table::pk_vector_scan::PkVectorScan::new(&table, 1, None);
+        let mut plan = scan.plan().await.unwrap();
+        assert_eq!(plan.splits[0].ann_segments.len(), 1);
+        let mut other = plan.splits[0].ann_segments[0].clone();
+        other.index_type = "ivf-pq".into();
+        other.row_count = 0;
+        if cross_bucket {
+            let mut split = plan.splits[0].clone();
+            split.data_split = DataSplitBuilder::new()
+                .with_snapshot(plan.snapshot_id)
+                .with_partition(split.data_split.partition().clone())
+                .with_bucket(1)
+                .with_bucket_path("memory:/pk_vector_route_test/bucket-1".into())
+                .with_total_buckets(2)
+                .with_data_files(split.data_split.data_files().to_vec())
+                .build()
+                .unwrap();
+            split.ann_segments = vec![other];
+            plan.splits.push(split);
+        } else {
+            plan.splits[0].ann_segments.push(other);
+        }
+        let reader = PkVectorRead::new(
+            &table,
+            &HashMap::new(),
+            None,
+            "embedding",
+            &[&[1.0, 0.0]],
+            1,
+        );
+        let err = reader.read(plan).await.unwrap_err();
+        assert!(err.to_string().contains("multiple index types"), "{err}");
+    }
 }

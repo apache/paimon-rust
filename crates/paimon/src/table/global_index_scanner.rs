@@ -49,7 +49,7 @@ use crate::spec::{DataField, FileKind, GlobalIndexSearchMode, IndexManifestEntry
 use crate::table::RowRange;
 use crate::{Error, Result};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
@@ -121,9 +121,11 @@ pub(crate) struct GlobalIndexScanner {
     query_semaphore: Arc<Semaphore>,
     btree_fallback_scan_max_size: i64,
     btree_data_block_cache: Arc<BTreeDataBlockCache>,
+    btree_data_block_cache_size: usize,
     bitmap_fallback_scan_max_size: i64,
     fm_read_options: FMReadOptions,
     fm_read_context: Arc<FMReadContext>,
+    field_read_options: HashMap<String, Arc<FieldReadOptions>>,
     /// Global index entries grouped by field_id.
     entries_by_field: Vec<(i32, Vec<GlobalIndexEntry>)>,
     /// Composite BTree files grouped by the full ordered definition. These
@@ -140,6 +142,14 @@ pub(crate) struct GlobalIndexScanner {
     btree_file_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     #[cfg(test)]
     query_io_probe: Option<Arc<QueryIoProbe>>,
+}
+
+struct FieldReadOptions {
+    btree_fallback: i64,
+    bitmap_fallback: i64,
+    btree_cache: Arc<BTreeDataBlockCache>,
+    fm_options: FMReadOptions,
+    fm_context: Arc<FMReadContext>,
 }
 
 impl GlobalIndexScanner {
@@ -341,9 +351,11 @@ impl GlobalIndexScanner {
             query_semaphore: Arc::new(Semaphore::new(global_index_thread_num)),
             btree_fallback_scan_max_size,
             btree_data_block_cache: Arc::new(BTreeDataBlockCache::new(btree_data_block_cache_size)),
+            btree_data_block_cache_size,
             bitmap_fallback_scan_max_size,
             fm_read_options,
             fm_read_context: Arc::new(FMReadContext::new(fm_read_options.cache_size)),
+            field_read_options: HashMap::new(),
             entries_by_field: entries_by_field.into_iter().collect(),
             composite_entries: composite_entries.into_iter().collect(),
             #[cfg(test)]
@@ -354,6 +366,163 @@ impl GlobalIndexScanner {
             #[cfg(test)]
             query_io_probe: None,
         }))
+    }
+
+    /// Bootstrap shared reader resources from effective field settings. An
+    /// overridden invalid table default must not fail before field resolution.
+    pub(super) fn read_defaults(
+        options: &HashMap<String, String>,
+        entries: &[IndexManifestEntry],
+        fields: &[DataField],
+    ) -> Result<HashMap<String, String>> {
+        let mut defaults = options.clone();
+        let mut kinds = HashSet::new();
+        for entry in entries.iter().filter(|entry| entry.kind == FileKind::Add) {
+            let Some(kind) = normalize_queryable_global_index_type(&entry.index_file.index_type)
+            else {
+                continue;
+            };
+            let Some(meta) = entry.index_file.global_index_meta.as_ref() else {
+                continue;
+            };
+            let Some(field) = fields
+                .iter()
+                .find(|field| field.id() == meta.index_field_id)
+            else {
+                continue;
+            };
+            if !kinds.insert(kind) {
+                continue;
+            }
+            let resolved =
+                crate::spec::CoreOptions::new(options).global_index_options(kind, field.name())?;
+            if kind == "multivalue" {
+                if let Some(value) = resolved.get("multivalue-index.fallback-scan-max-size") {
+                    defaults.insert("bitmap-index.fallback-scan-max-size".into(), value.clone());
+                }
+            }
+            let prefix = format!("{kind}-index.");
+            defaults.extend(
+                resolved
+                    .into_iter()
+                    .filter(|(key, _)| key.starts_with(&prefix)),
+            );
+        }
+        Ok(defaults)
+    }
+
+    /// Resolve each column/profile once, sharing equal-budget caches across columns and shards.
+    pub(super) fn with_field_options(
+        mut self,
+        options: &HashMap<String, String>,
+        entries: &[IndexManifestEntry],
+    ) -> Result<Self> {
+        let mut resolved = HashMap::new();
+        let mut btree_caches = HashMap::from([(
+            self.btree_data_block_cache_size,
+            Arc::clone(&self.btree_data_block_cache),
+        )]);
+        let mut fm_contexts = HashMap::from([(
+            self.fm_read_options.cache_size,
+            Arc::clone(&self.fm_read_context),
+        )]);
+        for entry in entries.iter().filter(|entry| entry.kind == FileKind::Add) {
+            let Some(kind) = normalize_queryable_global_index_type(&entry.index_file.index_type)
+            else {
+                continue;
+            };
+            let Some(meta) = entry.index_file.global_index_meta.as_ref() else {
+                continue;
+            };
+            let Some(field) = self
+                .schema_fields
+                .iter()
+                .find(|f| f.id() == meta.index_field_id)
+            else {
+                continue;
+            };
+            let keys = [
+                format!("fields.{}.pk-{kind}.index.options", field.name()),
+                format!("fields.{}.global-index.{kind}.index-options", field.name()),
+                format!("fields.{}.index-options", field.name()),
+            ];
+            let key = (
+                keys.iter()
+                    .any(|key| options.contains_key(key))
+                    .then_some(field.id()),
+                kind,
+            );
+            let settings = match resolved.get(&key) {
+                Some(settings) => Arc::clone(settings),
+                None => {
+                    let mut map = crate::spec::CoreOptions::new(options)
+                        .global_index_options(kind, field.name())?;
+                    if kind == "multivalue" {
+                        if let Some(value) =
+                            map.get("multivalue-index.fallback-scan-max-size").cloned()
+                        {
+                            map.insert("bitmap-index.fallback-scan-max-size".into(), value);
+                        }
+                    }
+                    let core = crate::spec::CoreOptions::new(&map);
+                    let fm = if kind == "fm" {
+                        crate::fm_index::FMOptions::from_options(&map)?.read
+                    } else {
+                        self.fm_read_options
+                    };
+                    let settings = Arc::new(FieldReadOptions {
+                        btree_fallback: if kind == "btree" {
+                            core.btree_index_fallback_scan_max_size()?
+                        } else {
+                            self.btree_fallback_scan_max_size
+                        },
+                        bitmap_fallback: if matches!(kind, "bitmap" | "multivalue") {
+                            core.bitmap_index_fallback_scan_max_size()?
+                        } else {
+                            self.bitmap_fallback_scan_max_size
+                        },
+                        btree_cache: if kind == "btree" {
+                            let size = core.btree_index_data_block_cache_size()?;
+                            Arc::clone(
+                                btree_caches
+                                    .entry(size)
+                                    .or_insert_with(|| Arc::new(BTreeDataBlockCache::new(size))),
+                            )
+                        } else {
+                            Arc::clone(&self.btree_data_block_cache)
+                        },
+                        fm_options: fm,
+                        fm_context: Arc::clone(
+                            fm_contexts
+                                .entry(fm.cache_size)
+                                .or_insert_with(|| Arc::new(FMReadContext::new(fm.cache_size))),
+                        ),
+                    });
+                    resolved.insert(key, Arc::clone(&settings));
+                    settings
+                }
+            };
+            let path = super::index_file_path::IndexFileLocation::Global {
+                table_path: &self.table_path,
+            }
+            .resolve(
+                &entry.index_file.file_name,
+                entry.index_file.external_path.as_deref(),
+            );
+            self.field_read_options.insert(path, settings);
+        }
+        Ok(self)
+    }
+
+    fn field_options(&self, entry: &GlobalIndexEntry) -> Option<&FieldReadOptions> {
+        self.field_read_options
+            .get(&entry.resolved_path(&self.table_path))
+            .map(Arc::as_ref)
+    }
+
+    fn btree_fallback_limit(&self, entry: &GlobalIndexEntry) -> i64 {
+        self.field_options(entry)
+            .map_or(self.btree_fallback_scan_max_size, |s| s.btree_fallback)
     }
 
     fn btree_file_lock(&self, entry: &GlobalIndexEntry) -> Arc<tokio::sync::Mutex<()>> {
@@ -442,8 +611,23 @@ pub(crate) struct GlobalIndexEvaluation<'a> {
     pub(crate) data_ranges: &'a [RowRange],
 }
 
+#[cfg(test)]
 pub(crate) async fn evaluate_global_index(
     evaluation: GlobalIndexEvaluation<'_>,
+) -> Result<Option<Vec<RowRange>>> {
+    evaluate_global_index_impl(evaluation, None).await
+}
+
+pub(crate) async fn evaluate_global_index_with_options(
+    evaluation: GlobalIndexEvaluation<'_>,
+    options: &HashMap<String, String>,
+) -> Result<Option<Vec<RowRange>>> {
+    evaluate_global_index_impl(evaluation, Some(options)).await
+}
+
+async fn evaluate_global_index_impl(
+    evaluation: GlobalIndexEvaluation<'_>,
+    options: Option<&HashMap<String, String>>,
 ) -> Result<Option<Vec<RowRange>>> {
     let scanner = match GlobalIndexScanner::create_with_fm_options(
         evaluation.file_io,
@@ -456,7 +640,13 @@ pub(crate) async fn evaluate_global_index(
         evaluation.schema_fields,
         evaluation.fm_read_options,
     )? {
-        Some(s) => s,
+        Some(s) => {
+            if let Some(options) = options {
+                s.with_field_options(options, evaluation.index_entries)?
+            } else {
+                s
+            }
+        }
         None => return Ok(None),
     };
     let combined = Predicate::and(evaluation.predicates.to_vec());

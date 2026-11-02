@@ -33,6 +33,7 @@
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'ivf-pq')`
 //! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'multivalue', 'fm', or a vindex type such as 'diskann')
+//! - `CALL sys.compact(table => '...'[, partitions => '...'])`
 //!
 //! REST management procedures (REST catalogs only, mirroring Java's
 //! `RESTCatalog.permissionManagement()` / `policyManagement()`):
@@ -45,11 +46,16 @@
 //!
 //! The `index_type` argument of the three global index procedures is
 //! case-insensitive and surrounding whitespace is ignored.
-//! `drop_global_index` accepts partition alternatives such as
+//! `drop_global_index` and `compact` accept partition alternatives such as
 //! `partitions => 'dt=2026-10-10,hr=1;dt=2026-10-11,hr=2'`; omitted keys are unrestricted.
-//! Explicit empty or invalid partition specifications fail before deleting any index.
+//! Explicit empty or invalid partition specifications fail before the table is changed.
 //! Timezone-less LTZ partition values use local time for non-legacy names and UTC for
 //! legacy names. Ambiguous or nonexistent local times require an explicit offset.
+//!
+//! `compact` returns one row of `tasks`, `files_removed`, `files_added` and `rows_written`,
+//! and makes no commit when no compaction task is planned. All tasks share one commit.
+//! When a later task fails, outputs of finished tasks are deleted best-effort; once the
+//! commit starts they are retained because an uncertain commit may reference them.
 //!
 //! `column_names` and `excluded_column_names` are comma-separated lists, not SQL arrays:
 //! `column_names => 'id, region'`. Java's Spark procedures take `ARRAY<STRING>` there, but a
@@ -59,7 +65,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, StringArray};
+use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
@@ -76,11 +82,12 @@ use paimon::api::{
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::spec::{CoreOptions, DataType, Datum, Predicate, PredicateBuilder, Snapshot};
 use paimon::table::{
-    normalize_global_index_type, BranchManager, ConsumerManager, SnapshotManager, Table,
-    TagManager, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
+    normalize_global_index_type, BranchManager, CompactMetrics, ConsumerManager, SnapshotManager,
+    Table, TagManager, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
 
 use crate::error::to_datafusion_error;
+use crate::memory::compact_resources;
 
 /// Default `index_type` for the global index procedures when the argument is
 /// omitted, matching Java's `CreateGlobalIndexProcedure`.
@@ -224,6 +231,7 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
             "partitions",
             "dry_run",
         ],
+        "compact" => &["table", "partitions"],
         "grant_permission" => &[
             "resource_type",
             "access",
@@ -322,7 +330,7 @@ pub async fn execute_procedure(
     proc_name: &str,
     arguments: &FunctionArguments,
 ) -> DFResult<DataFrame> {
-    let args = extract_named_args(arguments)?;
+    let args = extract_named_args(ctx, arguments)?;
     reject_unknown_args(proc_name, &args)?;
 
     match proc_name {
@@ -347,6 +355,7 @@ pub async fn execute_procedure(
         "delete_branch" => proc_delete_branch(ctx, catalog, catalog_name, &args).await,
         "create_global_index" => proc_create_global_index(ctx, catalog, catalog_name, &args).await,
         "drop_global_index" => proc_drop_global_index(ctx, catalog, catalog_name, &args).await,
+        "compact" => proc_compact(ctx, catalog, catalog_name, &args).await,
         "grant_permission" => proc_grant_permission(ctx, catalog, catalog_name, &args).await,
         "revoke_permission" => proc_revoke_permission(ctx, catalog, catalog_name, &args).await,
         "list_permissions" => proc_list_permissions(ctx, catalog, catalog_name, &args).await,
@@ -376,7 +385,10 @@ fn extract_procedure_name(name: &ObjectName) -> DFResult<(Option<String>, String
     }
 }
 
-fn extract_named_args(args: &FunctionArguments) -> DFResult<HashMap<String, String>> {
+fn extract_named_args(
+    ctx: &SessionContext,
+    args: &FunctionArguments,
+) -> DFResult<HashMap<String, String>> {
     let arg_list = match args {
         FunctionArguments::List(list) => &list.args,
         FunctionArguments::None => return Ok(HashMap::new()),
@@ -395,7 +407,11 @@ fn extract_named_args(args: &FunctionArguments) -> DFResult<HashMap<String, Stri
                 arg: FunctionArgExpr::Expr(expr),
                 operator: FunctionArgOperator::RightArrow,
             } => {
-                let value = expr_to_string(expr)?;
+                let value = match expr_to_string(expr) {
+                    Ok(value) => value,
+                    Err(error) if matches!(expr, SqlExpr::Value(_)) => return Err(error),
+                    Err(_) => constant_argument(ctx, expr)?,
+                };
                 let name = name.value.to_lowercase();
                 // Java `PaimonProcedureResolver.buildNameToArgumentMap` rejects a repeat
                 // rather than letting the last one win.
@@ -434,6 +450,81 @@ fn expr_to_string(expr: &SqlExpr) -> DFResult<String> {
         _ => Err(DataFusionError::Plan(format!(
             "Unsupported argument expression: {expr}"
         ))),
+    }
+}
+
+fn constant_argument(ctx: &SessionContext, expr: &SqlExpr) -> DFResult<String> {
+    use datafusion::common::{
+        tree_node::{TreeNode, TreeNodeRecursion},
+        DFSchema,
+    };
+    use datafusion::logical_expr::{simplify::SimplifyContext, Expr, Volatility};
+    use datafusion::optimizer::simplify_expressions::ExprSimplifier;
+    let schema = DFSchema::empty();
+    let state = ctx.state();
+    let expression = state.create_logical_expr(&expr.to_string(), &schema)?;
+    expression.apply(|node| {
+        let allowed = match node {
+            Expr::Literal(_, _)
+            | Expr::Alias(_)
+            | Expr::Cast(_)
+            | Expr::TryCast(_)
+            | Expr::BinaryExpr(_)
+            | Expr::Negative(_)
+            | Expr::Not(_)
+            | Expr::Case(_)
+            | Expr::IsNull(_)
+            | Expr::IsNotNull(_)
+            | Expr::Between(_)
+            | Expr::InList(_)
+            | Expr::IsTrue(_)
+            | Expr::IsNotTrue(_)
+            | Expr::IsFalse(_)
+            | Expr::IsNotFalse(_)
+            | Expr::IsUnknown(_)
+            | Expr::IsNotUnknown(_)
+            | Expr::Like(_)
+            | Expr::SimilarTo(_) => true,
+            Expr::ScalarFunction(function) => {
+                function.func.signature().volatility == Volatility::Immutable
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err(DataFusionError::Plan(
+                "CALL arguments must be immutable scalar constant expressions".into(),
+            ));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let simplifier = ExprSimplifier::new(
+        SimplifyContext::builder()
+            .with_schema(Arc::new(schema.clone()))
+            .with_config_options(state.config_options().clone())
+            .build(),
+    );
+    let expression = simplifier.simplify(simplifier.coerce(expression, &schema)?)?;
+    let Expr::Literal(value, _) = expression else {
+        return Err(DataFusionError::Plan(
+            "CALL argument did not reduce to a scalar constant".into(),
+        ));
+    };
+    if let Some(Some(value)) = value.try_as_str() {
+        return Ok(value.to_string());
+    }
+    match value {
+        ScalarValue::Int8(Some(_))
+        | ScalarValue::Int16(Some(_))
+        | ScalarValue::Int32(Some(_))
+        | ScalarValue::Int64(Some(_))
+        | ScalarValue::UInt8(Some(_))
+        | ScalarValue::UInt16(Some(_))
+        | ScalarValue::UInt32(Some(_))
+        | ScalarValue::UInt64(Some(_))
+        | ScalarValue::Boolean(Some(_)) => Ok(value.to_string()),
+        _ => Err(DataFusionError::Plan(
+            "CALL arguments must be non-null strings, integers, or booleans".into(),
+        )),
     }
 }
 
@@ -1118,7 +1209,7 @@ async fn proc_drop_global_index(
     builder.with_dry_run(dry_run);
     if let Some(partitions) = args.get("partitions") {
         builder
-            .with_partition_filter(parse_global_index_partitions(&table, partitions)?)
+            .with_partition_filter(parse_partitions(&table, partitions)?)
             .map_err(to_datafusion_error)?;
     }
     let dropped = builder.execute().await.map_err(to_datafusion_error)?;
@@ -1134,12 +1225,84 @@ async fn proc_drop_global_index(
     ok_result(ctx)
 }
 
+async fn proc_compact(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let table = get_table(catalog, catalog_name, args).await?;
+    let started = std::time::Instant::now();
+    let resources = compact_resources(&ctx.task_ctx()).map_err(to_datafusion_error)?;
+    let mut builder = table.new_compact_builder().with_resources(resources);
+    if let Some(partitions) = args.get("partitions") {
+        builder = builder
+            .with_partition_filter(parse_partitions(&table, partitions)?)
+            .map_err(to_datafusion_error)?;
+    }
+    let plan = builder
+        .new_planner()
+        .map_err(to_datafusion_error)?
+        .plan()
+        .await
+        .map_err(to_datafusion_error)?;
+    let metrics = if plan.tasks().is_empty() {
+        CompactMetrics::default()
+    } else {
+        let executor = builder.new_executor().map_err(to_datafusion_error)?;
+        let commit = builder.new_commit().map_err(to_datafusion_error)?;
+        let mut results = Vec::with_capacity(plan.tasks().len());
+        for task in plan.tasks() {
+            match executor.execute(task).await {
+                Ok(result) => results.push(result),
+                Err(error) => {
+                    // Nothing has been submitted yet, so earlier outputs are unreferenced.
+                    if let Err(abort_error) = commit.abort_compact(&results).await {
+                        log::warn!(
+                            "Failed to delete unsubmitted compaction files of table {}: {abort_error}",
+                            table.identifier().full_name(),
+                        );
+                    }
+                    return Err(to_datafusion_error(error));
+                }
+            }
+        }
+        commit
+            .commit_compact(results)
+            .await
+            .map_err(to_datafusion_error)?
+    };
+    log::info!(
+        "Compacted table {} with {} task(s) in {:?}: {metrics:?}",
+        table.identifier().full_name(),
+        plan.tasks().len(),
+        started.elapsed(),
+    );
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("tasks", ArrowDataType::Int64, false),
+        Field::new("files_removed", ArrowDataType::Int64, false),
+        Field::new("files_added", ArrowDataType::Int64, false),
+        Field::new("rows_written", ArrowDataType::Int64, false),
+    ]));
+    let columns: Vec<ArrayRef> = [
+        plan.tasks().len() as i64,
+        metrics.files_removed as i64,
+        metrics.files_added as i64,
+        metrics.rows_written as i64,
+    ]
+    .into_iter()
+    .map(|value| Arc::new(Int64Array::from(vec![value])) as ArrayRef)
+    .collect();
+    ctx.read_batch(RecordBatch::try_new(schema, columns)?)
+}
+
 /// Semicolon-separated alternatives, each containing comma-separated key=value constraints.
-fn parse_global_index_partitions(table: &Table, partitions: &str) -> DFResult<Predicate> {
+fn parse_partitions(table: &Table, partitions: &str) -> DFResult<Predicate> {
     let partition_fields = table.schema().partition_fields();
     if partition_fields.is_empty() {
         return Err(DataFusionError::Plan(
-            "Cannot filter global index partitions on an unpartitioned table".to_string(),
+            "Cannot filter partitions on an unpartitioned table".to_string(),
         ));
     }
     let pb = PredicateBuilder::new(table.schema().fields());
@@ -1176,7 +1339,7 @@ fn parse_global_index_partitions(table: &Table, partitions: &str) -> DFResult<Pr
             let predicate = if value == options.partition_default_name() {
                 pb.is_null(key)
             } else {
-                let datum = parse_global_index_partition_value(
+                let datum = parse_partition_value(
                     value,
                     field.data_type(),
                     options.legacy_partition_name(),
@@ -1196,7 +1359,7 @@ fn parse_global_index_partitions(table: &Table, partitions: &str) -> DFResult<Pr
     Ok(Predicate::or(alternatives))
 }
 
-fn parse_global_index_partition_value(
+fn parse_partition_value(
     value: &str,
     data_type: &DataType,
     legacy_partition_name: bool,
@@ -1258,19 +1421,16 @@ fn parse_global_index_partition_value(
             })
         }
         DataType::Timestamp(typ) => {
-            parse_global_index_partition_timestamp(value, data_type, typ.precision(), false)
+            parse_partition_timestamp(value, data_type, typ.precision(), false)
         }
-        DataType::LocalZonedTimestamp(typ) => parse_global_index_partition_timestamp(
-            value,
-            data_type,
-            typ.precision(),
-            !legacy_partition_name,
-        ),
+        DataType::LocalZonedTimestamp(typ) => {
+            parse_partition_timestamp(value, data_type, typ.precision(), !legacy_partition_name)
+        }
         _ => paimon::table::parse_format_partition_value(value, data_type),
     }
 }
 
-fn parse_global_index_partition_timestamp(
+fn parse_partition_timestamp(
     value: &str,
     data_type: &DataType,
     precision: u32,
@@ -1794,51 +1954,39 @@ mod tests {
     use paimon::spec::CommitKind;
 
     #[test]
-    fn test_global_index_partition_values_are_typed_and_strict() {
+    fn test_partition_values_are_typed_and_strict() {
         use paimon::spec::{
             CharType, DateType, DecimalType, FloatType, IntType, TimeType, TimestampType,
             VarCharType,
         };
         assert_eq!(
-            parse_global_index_partition_value("01", &DataType::Int(IntType::new()), true),
+            parse_partition_value("01", &DataType::Int(IntType::new()), true),
             Some(Datum::Int(1))
         );
         for text in ["1.5", "2147483648", "bad"] {
-            assert!(
-                parse_global_index_partition_value(text, &DataType::Int(IntType::new()), true)
-                    .is_none()
-            );
+            assert!(parse_partition_value(text, &DataType::Int(IntType::new()), true).is_none());
         }
-        assert!(parse_global_index_partition_value(
-            "2026-02-30",
-            &DataType::Date(DateType::new()),
-            true
-        )
-        .is_none());
+        assert!(
+            parse_partition_value("2026-02-30", &DataType::Date(DateType::new()), true).is_none()
+        );
         assert_eq!(
-            parse_global_index_partition_value(
-                "1970-01-02",
-                &DataType::Date(DateType::new()),
-                true
-            ),
+            parse_partition_value("1970-01-02", &DataType::Date(DateType::new()), true),
             Some(Datum::Date(1))
         );
         assert_eq!(
-            parse_global_index_partition_value(
+            parse_partition_value(
                 "a=b",
                 &DataType::VarChar(VarCharType::new(3).unwrap()),
                 true,
             ),
             Some(Datum::String("a=b".into()))
         );
-        assert!(parse_global_index_partition_value(
-            "abcd",
-            &DataType::Char(CharType::new(3).unwrap()),
-            true,
-        )
-        .is_none());
+        assert!(
+            parse_partition_value("abcd", &DataType::Char(CharType::new(3).unwrap()), true)
+                .is_none()
+        );
         assert_eq!(
-            parse_global_index_partition_value(
+            parse_partition_value(
                 "12:00:00.123",
                 &DataType::Time(TimeType::new(3).unwrap()),
                 true,
@@ -1848,7 +1996,7 @@ mod tests {
         let decimal = DataType::Decimal(DecimalType::new(4, 2).unwrap());
         for (text, unscaled) in [("1.235", 124), ("-1.235", -124), ("1.235e1", 1235)] {
             assert_eq!(
-                parse_global_index_partition_value(text, &decimal, true),
+                parse_partition_value(text, &decimal, true),
                 Some(Datum::Decimal {
                     unscaled,
                     precision: 4,
@@ -1857,25 +2005,25 @@ mod tests {
             );
         }
         for text in ["99.995", "bad", "1_2.34"] {
-            assert!(parse_global_index_partition_value(text, &decimal, true).is_none());
+            assert!(parse_partition_value(text, &decimal, true).is_none());
         }
         let timestamp = DataType::Timestamp(TimestampType::new(1).unwrap());
         assert_eq!(
-            parse_global_index_partition_value("1970-01-01 00:00:00.199", &timestamp, true),
+            parse_partition_value("1970-01-01 00:00:00.199", &timestamp, true),
             Some(Datum::Timestamp {
                 millis: 199,
                 nanos: 0
             })
         );
-        assert!(parse_global_index_partition_value("123", &timestamp, true).is_none());
-        assert!(parse_global_index_partition_value("bad", &timestamp, true).is_none());
+        assert!(parse_partition_value("123", &timestamp, true).is_none());
+        assert!(parse_partition_value("bad", &timestamp, true).is_none());
         let float = DataType::Float(FloatType::new());
         assert_eq!(
-            parse_global_index_partition_value("1.1", &float, true),
+            parse_partition_value("1.1", &float, true),
             Some(Datum::Float(1.1))
         );
         for text in ["1e100", "1e-100", "1.234567891"] {
-            assert!(parse_global_index_partition_value(text, &float, true).is_none());
+            assert!(parse_partition_value(text, &float, true).is_none());
         }
     }
 
@@ -1901,17 +2049,15 @@ mod tests {
                         Datum::Timestamp { millis, nanos }
                     };
                     assert_eq!(
-                        parse_global_index_partition_value(text, &data_type, true),
+                        parse_partition_value(text, &data_type, true),
                         Some(expected),
                         "{data_type:?}: {text}"
                     );
                 }
-                assert!(parse_global_index_partition_value(
-                    "1970-01-01T00:00:00.1234567891Z",
-                    &data_type,
-                    true,
-                )
-                .is_none());
+                assert!(
+                    parse_partition_value("1970-01-01T00:00:00.1234567891Z", &data_type, true)
+                        .is_none()
+                );
             }
         }
     }

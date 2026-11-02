@@ -494,6 +494,37 @@ SELECT
     is_variant_null(NULL) AS sql_null;
 ```
 
+### JSON Text Functions
+
+`SQLContext` registers these functions without requiring a catalog:
+
+| Function | Result |
+| --- | --- |
+| `json_value(text, path)`, `json_extract_scalar(text, path)` | An unquoted string, number, or boolean; objects and arrays return `NULL` |
+| `get_json_object(text, path)` | Unquoted strings, scalar text, or serialized object/array fragments |
+| `get_json_string`, `json_extract_string`, `json_get_str` | Aliases of `get_json_object` with the same two arguments |
+| `json_valid(text)` | Whether text can be parsed as a Paimon JSON Variant |
+| `json_format(text_or_variant)` | Compact JSON serialization, retaining JSON string quotes and JSON `null` |
+
+```sql
+SELECT json_value('{"a":[1,"hello"]}', '$.a[1]'); -- hello
+SELECT get_json_object('{"a":[1,2]}', '$.a'); -- [1,2]
+SELECT json_format(parse_json('{"a":1}')); -- {"a":1}
+```
+
+Extraction supports the existing Variant path subset: `$`, `.name`,
+`['name']` / `["name"]`, and zero-based `[index]`. It does not implement
+wildcards, recursive descent, JSONPath predicates, or SQL/JSON `RETURNING`,
+`ON EMPTY`, and `ON ERROR` clauses. Extraction returns SQL `NULL` for invalid
+JSON, invalid/missing paths, JSON null, or SQL null arguments.
+
+The functions use the same parser as `parse_json`, including its rejection of
+duplicate object keys. `json_valid` returns false for rejected text and SQL
+`NULL` for SQL null. `json_format` reports malformed text as an error rather
+than converting it to null. JSON text and the binary Paimon Variant encoding
+are distinct: extraction takes text; `json_format` accepts either representation.
+Dictionary-encoded string columns have the same JSON text semantics.
+
 ### Variant Shredding
 
 Variant shredding stores selected fields from a `VARIANT` column as typed
@@ -556,6 +587,27 @@ use paimon_datafusion::register_variant_functions;
 register_variant_functions(&ctx);
 ```
 
+### Binary casts in queries
+
+`CAST` and `TRY_CAST` accept `BINARY`, `BINARY(n)`, `VARBINARY`,
+`VARBINARY(n)` and `VARBINARY(MAX)` through SQLContext.
+
+- Without a length, casts preserve the bytes. Strings use their UTF-8 bytes.
+- `BINARY(n)` truncates to at most `n` bytes and right-pads shorter values with
+  zero bytes.
+- `VARBINARY(n)` truncates to at most `n` bytes without padding.
+- Widths are byte counts, including for multibyte text. They must be positive
+  and fit an Arrow binary offset. SQL NULL remains NULL.
+
+```sql
+SELECT to_base64(CAST('ab' AS BINARY(4))); -- YWIAAA==
+SELECT to_base64(CAST('abcd' AS VARBINARY(2))); -- YWI=
+```
+
+The source conversions supported by DataFusion's binary cast remain in effect.
+`TRY_CAST` preserves its native conversion-failure behavior; an invalid type
+length is a planning error.
+
 ## DDL
 
 ### DATABASE
@@ -570,6 +622,33 @@ DROP DATABASE paimon.my_db CASCADE;
 `CREATE DATABASE` supports `IF NOT EXISTS`, and `DROP DATABASE` supports
 `IF EXISTS` and `CASCADE`. `CREATE SCHEMA` and `DROP SCHEMA` remain supported
 as compatibility aliases.
+
+### Metadata Listings
+
+```sql
+SHOW CATALOGS;
+SHOW CATALOGS LIKE 'paim%';
+SHOW DATABASES LIKE 'report%';
+SHOW SCHEMAS IN paimon LIKE 'report%';
+SHOW TABLES IN reporting;
+SHOW TABLES FROM paimon.reporting LIKE 'daily_%';
+```
+
+`SHOW SCHEMAS` is an alias for `SHOW DATABASES`; both return `database_name`.
+`SHOW CATALOGS` returns `catalog_name`. Database listings default to the current
+catalog and accept `IN catalog` or `FROM catalog`.
+
+Table listings retain the `information_schema.tables` output columns.
+Unqualified `SHOW TABLES` retains DataFusion's listing across catalogs. A scope
+or filter restricts the listing to the current catalog/database unless an
+explicit database or `catalog.database` is supplied. Identifiers follow the
+session's normal quoting and case rules. `LIKE` uses SQL `%` and `_` wildcards;
+`ILIKE` ignores case. Table providers and data files are not loaded for listing.
+Scoped and filtered table listings access only the selected namespace and
+propagate its metadata-listing errors. Session-only temporary namespaces and
+the enabled `information_schema` namespace are included.
+`FULL`, `EXTENDED`, `HISTORY`, `LIMIT`, `STARTS WITH`, typed scopes, and `WHERE`
+filters are rejected rather than silently ignored.
 
 ### CREATE TABLE
 
@@ -740,6 +819,42 @@ ALTER TABLE paimon.my_db.users SET TBLPROPERTIES('data-evolution.enabled' = 'tru
 ```sql
 ALTER TABLE IF EXISTS paimon.my_db.users ADD COLUMN age INT;
 ```
+
+### Alternate column changes and extended descriptions
+
+`ALTER TABLE ... MODIFY COLUMN name type [NULL | NOT NULL] [COMMENT 'text']`
+uses existing scalar schema-evolution validation. Unspecified nullability and
+comments, field IDs and stored data are preserved. The existing
+`alter-column-null-to-not-null.disabled` policy still applies. Temporary objects,
+FIRST/AFTER, defaults and nested/container type changes are rejected before a
+schema update; nested field IDs must not be reassigned by a type declaration.
+
+`DESCRIBE [TABLE] EXTENDED table` and FORMATTED return Paimon columns with comments
+plus catalog/database/table, schema ID, location, table comment, keys and sorted
+table properties. Credential-like property values are redacted. Identifier
+normalization follows the session setting and quoted names are preserved.
+Temporary/native objects and views keep existing native DESCRIBE behavior.
+
+### Table and column comments
+
+```sql
+CREATE TABLE db.t (id INT COMMENT 'identifier') COMMENT 'description';
+ALTER TABLE db.t ALTER COLUMN id COMMENT 'new description';
+COMMENT ON TABLE db.t IS 'new table description';
+COMMENT ON COLUMN db.t.id IS 'new column description';
+COMMENT ON TABLE db.t IS NULL;
+COMMENT ON COLUMN db.t.id IS NULL;
+```
+
+These statements update catalog metadata without changing field IDs, types or
+stored rows. Quoted identifiers retain their case; unquoted names follow the
+session's identifier-normalization setting. Column comments address top-level
+columns. Clearing a column comment uses Paimon's empty-description encoding.
+
+`ALTER TABLE IF EXISTS ... ALTER COLUMN ... COMMENT` ignores a missing table,
+but still reports a missing column. The nonstandard `COMMENT IF EXISTS` form
+is rejected. Comments on temporary objects, including temporary objects that
+shadow persistent tables, and writes to branch references are rejected.
 
 ## DML
 
@@ -1685,6 +1800,41 @@ The preview uses the latest snapshot at the time of the call; concurrent changes
 can affect the number of files matched by a later drop. Reads retain the usual
 local-cache behavior. Partition filtering is not supported by this procedure.
 
+### compact
+
+Compact an append, primary-key or data-evolution table:
+
+```sql
+CALL sys.compact(table => 'paimon.my_db.my_table');
+```
+
+Set `partitions` to compact only matching partitions. Alternatives are separated
+by `;` and the constraints of each alternative by `,`; omitted partition keys are
+unrestricted. It is rejected on unpartitioned tables.
+
+```sql
+CALL sys.compact(
+  table => 'paimon.my_db.my_table',
+  partitions => 'dt=2026-10-10,hr=1;dt=2026-10-11,hr=2'
+);
+```
+
+The result is one row with `tasks`, `files_removed`, `files_added` and
+`rows_written`. `files_removed` counts files replaced in the new snapshot; they are
+kept for time travel until snapshot expiration. `rows_written` counts physical rows
+in the new files, which may include deleted rows retained by the table format. When
+no compaction task is planned, nothing is committed and every column is `0`. All
+tasks are committed in one snapshot; if a task fails, files written by earlier tasks
+are deleted on a best-effort basis and a warning names any file left behind.
+Compaction memory is charged to the session memory pool.
+
+Primary-key tables follow the incremental compaction strategy of Paimon core, so
+existing higher-level files may be kept instead of rewritten.
+
+On primary-key tables, compaction with the `lookup` changelog producer, the
+`first-row` merge engine or deletion vectors requires `local-cache.enabled = true`
+on the catalog.
+
 ### grant_permission
 
 Grant an access to a principal on a REST catalog. Only the REST catalog supports
@@ -1802,6 +1952,26 @@ meaningful for a column mask, so it requires `policy_type => 'COLUMN_MASKING'`:
 CALL sys.list_policies(database => 'sales', table => 'orders');
 ```
 
+### Constant procedure arguments
+
+CALL arguments still use named `name => expression` syntax. In addition to
+literals, SQLContext accepts immutable scalar constant expressions such as
+casts, arithmetic, string functions, CASE and boolean predicates.
+
+```sql
+CALL sys.create_tag(
+    table => concat('my_db.', 'events'),
+    tag => concat('release_', '1'),
+    snapshot_id => CAST(1 + 0 AS BIGINT)
+);
+```
+
+Expressions must reduce to non-NULL strings, integers or booleans. Column
+references, subqueries, aggregate/window functions and non-immutable functions
+are rejected. Argument names, duplicates and procedure-specific types are
+validated as before. All arguments are evaluated and validated before the
+procedure performs any metadata changes; evaluation errors are returned.
+
 ## Queries
 
 ### Basic Queries
@@ -1835,6 +2005,172 @@ SELECT
 FROM paimon.my_db.user_events;
 ```
 
+### Spark-compatible functions
+
+`SQLContext::new()` and its builder enable the matching `datafusion-spark`
+function packages and Spark expression planner by default. This includes
+numeric, string, date/time, hash, array/map and aggregate functions such as
+`pmod`, `factorial`, `soundex`, `last_day`, `unix_date`, `crc32`, `sha1`,
+`collect_set` and `try_sum`. EXTRACT and SQL SUBSTRING syntax use the Spark
+expression planner. See the upstream
+[Spark function package](https://github.com/apache/datafusion/tree/54.0.0/datafusion/spark)
+for the versioned function inventory and signatures.
+
+Spark functions take precedence over DataFusion defaults with the same name.
+Functions registered by the application after constructing SQLContext take
+priority. Registered functions resolve locally without REST function lookups;
+qualified catalog calls retain catalog resolution.
+
+The upstream package's behavior applies, including these migration differences:
+
+- `concat` propagates NULL inputs.
+- `mod` and `pmod` return NULL for a zero divisor by default. Set
+  `datafusion.execution.enable_ansi_mode = true` to report division by zero.
+  Their numeric coercion and decimal result types follow the Spark package.
+- `size` returns INT and uses the package's legacy NULL-to-minus-one behavior.
+- Two-argument `date_diff`/`datediff` return INT. The three-argument Paimon
+  `date_diff(unit, start, end)` extension still returns BIGINT.
+- `hour` takes timestamps; cast dates or strings to TIMESTAMP explicitly.
+  `hex` numeric inputs use upstream BIGINT coercion.
+- The upstream 54 AVG implementation returns DOUBLE. DISTINCT plans that
+  DataFusion can lower to a deduplication step are supported; remaining AVG and
+  TRY_SUM DISTINCT plans report an unsupported error. COLLECT_LIST ORDER BY is
+  unsupported. COLLECT_LIST DISTINCT delegates to upstream COLLECT_SET.
+  Collection aggregates return empty arrays for empty growing window frames.
+  Window frames requiring retraction follow the upstream version's limits,
+  including unsupported AVG suffix frames.
+
+SQLContext normalizes dictionary-encoded inputs for the migrated scalar
+functions, types bare NULL arguments, and bridges ordinary SQL integer
+arguments to the INT signatures of date arithmetic and factorial. Values outside
+that integer range fail during conversion. These adapters delegate computation
+to upstream functions. Paimon Variant handling, metadata SQL, selection
+aggregates and the additional functions documented below remain available.
+This enables the upstream function subset; it does not enable every Spark SQL
+syntax, cast mode or configuration option.
+
+### Aggregate compatibility
+
+SQLContext accepts the following aggregates in queries and view definitions.
+Session registrations take priority, and stored REST definitions retain their
+original SQL. REST SQL function bodies must still be scalar expressions.
+Bare compatibility names follow built-in precedence; use a qualified catalog
+function name to call a persistent function with the same name.
+
+| Function | Contract |
+| --- | --- |
+| `count_if(condition)` | Counts TRUE; FALSE and NULL do not contribute; an empty group returns 0 |
+| `any(condition)` | Boolean OR; an empty or all-NULL group returns NULL |
+| `first(value[, ignoreNulls])`, `any_value(value[, ignoreNulls])` | Native first-value aggregation; the optional NULL flag must be a boolean literal; without ordering the chosen value is not deterministic |
+| `approx_count_distinct(value[, relativeSD])` | BIGINT estimate with native fixed-precision HLL; optional relativeSD must be a numeric literal between 0.008125 and 0.39; smaller errors are rejected |
+| `max_by(value, key)`, `min_by(value, key)` | Select by greatest/least non-NULL key; a selected NULL value remains NULL; empty/all-NULL-key groups return NULL |
+| `arg_max(value, key)` | Like max_by but ignores rows where value or key is NULL |
+| `collect_list(value)` | Collects non-NULL values with duplicates; empty/all-NULL groups return an empty array |
+| `listagg(value[, delimiter]) WITHIN GROUP (ORDER BY ...)` | Native ordered string aggregation; NULL values are skipped; the default delimiter is empty |
+
+Native FILTER and supported ordering/DISTINCT clauses are retained. The selection
+aggregates reject DISTINCT, OVER, additional ordering and NULL modifiers. Tied
+keys may choose any eligible value. LISTAGG overflow and top-k selection forms
+are unsupported. Approximate counts use native HLL estimates rather than Spark's
+serialized HLL++ state.
+COLLECT_LIST always ignores NULLs and rejects explicit IGNORE/RESPECT NULLS clauses.
+Aggregate values and
+selection keys are evaluated once, including volatile expressions.
+
+### JSON output and Variant string casts
+
+`to_json(value)` produces compact JSON from structs, lists, maps, Variant and
+scalar values. SQL NULL returns SQL NULL; nested NULLs become JSON null. Binary
+values use padded Base64. Decimals retain their digits; non-finite floats are
+rejected. Temporal values use Arrow string formatting. Map keys must be non-NULL.
+Spark JSON formatting options are not supported.
+
+`json_object(key, value, ...)` constructs an object. Keys are converted to strings,
+NULL keys are rejected, NULL values are retained, and the last repeated key wins.
+`json_object()` returns `{}`.
+
+`CAST(variant_value AS STRING)` unwraps Variant strings, formats scalar values and
+serializes arrays/objects as JSON. SQL NULL and Variant JSON null become SQL NULL.
+TRY_CAST returns NULL for malformed Variant values. Only the exact Paimon Variant
+representation uses this conversion; ordinary casts retain native behavior.
+
+### Additional scalar compatibility
+
+| Function | Contract |
+| --- | --- |
+| `assert_true(condition[, message])` | Returns NULL for TRUE; FALSE or NULL raises an execution error with the optional message |
+| `conv(text, from_base, to_base)` | Source base 2 through 36 conversion of a 64-bit value; a negative destination base formats a signed result; invalid bases, including negative source bases, return NULL |
+| `date_diff(end, start)` | Upstream Spark INT calendar days after DATE coercion |
+| `date_diff(unit, start, end)` | Signed whole-unit difference at microsecond precision, from microsecond through week and calendar month/quarter/year; calendar fields use UTC and month-end clamping |
+| `convert_tz(datetime, from_zone, to_zone)` | Interprets a timezone-less datetime in the source zone, returning a timezone-less microsecond timestamp in the destination zone |
+
+CONV reads an optional sign and valid digit prefix, uses uppercase output, and
+saturates overflowing unsigned input at 2^64-1 before applying the sign. No valid
+digits means zero. NULL inputs propagate except that assert_true(NULL) fails.
+CONVERT_TZ accepts IANA zones and fixed offsets; invalid inputs, ambiguous local
+times and nonexistent local times return NULL.
+
+### Custom LIKE escape characters
+
+LIKE, NOT LIKE and ILIKE accept a one-character ESCAPE literal, including Unicode:
+
+```sql
+SELECT value LIKE 'item!_%' ESCAPE '!' FROM events;
+```
+
+The escape quotes the next pattern character. `%` matches any number of Unicode
+characters and `_` matches one, including newlines. A trailing escape is an error;
+NULL values/patterns return NULL. The backslash path remains native. LIKE ANY
+with a custom escape is unsupported.
+
+### Compatibility Functions
+
+`SQLContext` registers the following functions without requiring a catalog:
+
+| Function | Behavior |
+| --- | --- |
+| `mod(value, divisor)` | Upstream Spark numeric remainder, with NULL on zero by default and errors in ANSI mode |
+| `regexp_extract(text, pattern[, index])` | The first matched group; default index 1; index 0 selects the complete match |
+| `regexp_extract_all(text, pattern[, index])` | A list of matched groups, in occurrence order |
+| `date_sub(date, days)` | Subtracts integral calendar days and returns `DATE`; negative days add days |
+| `sha2(text_or_binary, bits)` | Lowercase SHA-2 hex with upstream INT coercion for bits; 224/256/384/512 are supported, 0 means 256, and other INT values return NULL |
+| `to_base64(text_or_binary)` | Alias of upstream Spark `base64`, with standard `=` padding; strings use UTF-8 |
+| `curdate()` | Alias of `current_date()` |
+| `timestamp_millis(value)` | Alias of `to_timestamp_millis(value)`, preserving millisecond epoch units |
+| `to_timestamp_ltz(value[, format...])` | Alias of `to_timestamp`, preserving its session time zone and nanosecond result |
+
+Regular expressions use Rust regex syntax, like DataFusion's existing regex
+functions, rather than the full Java regex dialect. No match or an unmatched
+optional group produces an empty string; no matches for `regexp_extract_all`
+produce an empty list. Null arguments produce null. Invalid patterns, negative
+or out-of-range group indices, and date arithmetic overflow produce errors.
+SHA-2 and Base64 preserve raw bytes across Arrow binary representations,
+including dictionary encodings and null dictionary values.
+
+The timestamp aliases retain DataFusion semantics: optional formats are Chrono
+strftime strings, not Spark/Java patterns; numeric `to_timestamp_ltz` inputs
+are epoch seconds. The Flink `(number, precision)` overload is not implemented.
+
+### Additional scalar compatibility functions
+
+| Function | Contract |
+|----------|----------|
+| `split(text, regex[, limit])` | Returns a string array using Rust regex syntax. A positive limit caps the number of parts and retains the remaining suffix in the last part; a nonpositive limit is unlimited. An empty pattern splits Unicode characters. |
+| `locate(needle, text[, start])` | Returns a one-based Unicode-character position, or zero if no match exists or start is nonpositive/out of range. Start defaults to one. |
+| `date(value)` | Alias of native `to_date`, retaining its accepted inputs and conversion errors. |
+| `typeof(value)` | Returns SQL-style names for common scalar, array, map, struct and Variant types, including typed NULLs. Other Arrow types retain their Arrow type labels. |
+| `hex(value)` | Uppercase hexadecimal UTF-8/string or raw binary bytes; integer inputs use hexadecimal digits, with negative signed values represented as 64-bit two's complement. |
+| `unhex(text)` | Decodes case-insensitive hex. An odd number of digits is left-padded with zero; invalid hex returns NULL. |
+| `size(collection)` | Counts array elements or map entries, including NULL values, and returns INT. |
+| `hour(timestamp)` | Upstream Spark INT hour extraction; timestamp timezone metadata is honored. |
+
+Except for `typeof` and `size`, NULL inputs produce NULL. SIZE returns -1 for
+NULL collections. Empty collections have size zero.
+These functions are registered locally and do not require REST function metadata.
+Split patterns follow the same Rust regex restrictions as the other regex
+compatibility functions. SQLContext's `date` alias follows native DataFusion
+behavior when session configuration changes.
+
 ### Column Projection
 
 Only the required columns are read, reducing I/O:
@@ -1842,6 +2178,31 @@ Only the required columns are read, reducing I/O:
 ```sql
 SELECT name FROM paimon.my_db.users;
 ```
+
+### Lateral collection expansion
+
+SQLContext supports `LATERAL VIEW explode`, `posexplode`,
+`explode_outer`, and `posexplode_outer` for arrays and maps. The
+`LATERAL VIEW OUTER` spelling also preserves empty/NULL collections.
+
+```sql
+SELECT t.id, expanded.pos, expanded.value
+FROM events t
+LATERAL VIEW posexplode_outer(t.items) expanded AS pos, value;
+```
+
+Positions are zero-based INT values. Array defaults are `col`, or
+`pos, col`; map defaults are `key, value`, or `pos, key, value`.
+An explicit AS list must have the matching number of column names. A NULL array
+element remains an element with its position. Outer expansion of an empty or
+NULL collection emits one row with NULL positions and values; ordinary
+expansion emits no rows. Empty parent inputs emit no rows in either mode.
+
+Multiple lateral views can reference columns produced by earlier views.
+Qualified/quoted aliases, joins, filters, subqueries and set operations retain
+their normal SQL behavior. Use one FROM relation with explicit joins instead
+of comma-separated FROM items. Unsupported generators and modifiers report
+planning errors.
 
 ### Filter Pushdown
 
@@ -1881,6 +2242,25 @@ column masks it returns (see `create_policy`) are applied to the result:
   off `LIMIT` pushdown, so such queries read the data.
 - Time travel, branches, system tables, incremental and audit-log reads, and
   search are refused on such tables.
+
+### Regular expression operators
+
+SQLContext supports `value RLIKE pattern`, `value REGEXP pattern`, and their
+`NOT` forms in queries, expressions, views and SQL functions. They use
+DataFusion's native case-sensitive regex matching: a match may occur anywhere
+unless the pattern contains anchors. Inline flags such as `(?i)` can change
+case sensitivity.
+
+```sql
+SELECT phone RLIKE '^1[3-9][0-9]{9}$' FROM users;
+SELECT name NOT REGEXP '(?i)^test';
+```
+
+Patterns use Rust regex syntax, including its restrictions on look-around and
+backreferences. A NULL value or pattern produces SQL NULL; an invalid pattern
+reports an error. Operator text inside strings, comments and quoted identifiers
+is not interpreted as SQL syntax. Persistent Paimon view and function definitions
+retain their portable SQL text.
 
 ## Python Multimodal Helper Functions
 

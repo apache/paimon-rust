@@ -17,6 +17,9 @@
 
 mod common;
 
+#[path = "pk_compact/indexes.rs"]
+mod index_tests;
+
 #[path = "pk_compact/merge_engines.rs"]
 mod engine_tests;
 
