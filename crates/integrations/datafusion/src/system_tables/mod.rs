@@ -145,6 +145,19 @@ pub(crate) fn provider_for_table(
         .map(Some)
 }
 
+/// Rejects session options a `$audit_log` read does not take.
+pub(crate) fn ensure_audit_log_dynamic_options(
+    dynamic_options: &HashMap<String, String>,
+) -> DFResult<()> {
+    if paimon::spec::CoreOptions::new(dynamic_options).table_read_sequence_number_enabled() {
+        return Err(DataFusionError::Plan(
+            "table-read.sequence-number.enabled is not supported by dynamic options for $audit_log"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Builds a system-table provider from a loaded Paimon table.
 pub(crate) async fn load(
     catalog: Arc<dyn Catalog>,
@@ -157,13 +170,8 @@ pub(crate) async fn load(
     if !is_registered(&system_name) {
         return Ok(None);
     }
-    if system_name.eq_ignore_ascii_case("audit_log")
-        && paimon::spec::CoreOptions::new(&dynamic_options).table_read_sequence_number_enabled()
-    {
-        return Err(DataFusionError::Plan(
-            "table-read.sequence-number.enabled is not supported by dynamic options for $audit_log"
-                .to_string(),
-        ));
+    if system_name.eq_ignore_ascii_case("audit_log") {
+        ensure_audit_log_dynamic_options(&dynamic_options)?;
     }
     paimon::spec::CoreOptions::new(&dynamic_options)
         .ensure_read_authorized()

@@ -15,13 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result as DFResult};
-use paimon::catalog::{Catalog, Identifier, LoadedTable};
+use paimon::catalog::{Catalog, Identifier, LoadedTable, DEFAULT_MAIN_BRANCH};
+use paimon::spec::CoreOptions;
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
+
+const INCREMENTAL_WINDOW_OPTION: &str = "incremental-between-timestamp";
 
 /// [`Catalog::get_table`] for paths that need a `Table` rather than a
 /// [`paimon::catalog::LoadedTable`], rejecting an engine-served declared
@@ -136,4 +140,50 @@ pub(crate) async fn load_data_table_for_read(
         )));
     }
     Ok(table)
+}
+
+/// Names `read`, the table read for `identifier`, in a message: its branch
+/// too when a session `branch` or the name chose one.
+pub(crate) fn table_read_name(identifier: &Identifier, read: &Table) -> String {
+    match read.branch() {
+        DEFAULT_MAIN_BRANCH => format!("table '{}'", identifier.full_name()),
+        branch => {
+            // `t$branch_b` already names the branch it reads.
+            let table = identifier
+                .table_name()
+                .unwrap_or_else(|_| identifier.object().to_string());
+            format!(
+                "branch '{branch}' of table '{}.{table}'",
+                identifier.database()
+            )
+        }
+    }
+}
+
+/// Refuses `statement`, which needs the rows of the table it reads, when that
+/// read returns the changes of an incremental timestamp window instead: the
+/// rows the window's commits wrote, older versions included, and, for rows
+/// read file by file, a row once per file with the columns it did not write
+/// NULL. `read` is the table read for `identifier`, with the session's
+/// `options` applied.
+pub(crate) fn ensure_no_incremental_window(
+    statement: &str,
+    options: &HashMap<String, String>,
+    identifier: &Identifier,
+    read: &Table,
+) -> DFResult<()> {
+    if matches!(
+        CoreOptions::new(read.schema().options()).incremental_timestamp_window(),
+        Ok(None)
+    ) {
+        return Ok(());
+    }
+    let key = INCREMENTAL_WINDOW_OPTION;
+    let reason = if options.contains_key(key) {
+        format!("while scan option '{key}' is set; RESET 'paimon.{key}' first")
+    } else {
+        let read = table_read_name(identifier, read);
+        format!("on {read}, which sets scan option '{key}'")
+    };
+    Err(DataFusionError::Plan(format!("{statement} {reason}")))
 }

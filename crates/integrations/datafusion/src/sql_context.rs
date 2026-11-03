@@ -188,6 +188,7 @@ impl SQLContextBuilder {
         crate::json_output::register(&mut ctx);
         crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
+        crate::incremental_query::register_incremental_query(&ctx);
         crate::json_functions::register_json_functions(&ctx);
         SQLContext {
             ctx,
@@ -1799,6 +1800,32 @@ impl SQLContext {
         Ok(())
     }
 
+    /// Reject UPDATE, DELETE and MERGE INTO while the query that finds their
+    /// target rows, a read of `table` in this session, would return the
+    /// changes of an incremental timestamp window: the write would change
+    /// rows by versions the table no longer holds.
+    async fn ensure_target_lookup_reads_rows(
+        &self,
+        identifier: &Identifier,
+        table: &paimon::table::Table,
+        operation: &str,
+    ) -> DFResult<()> {
+        let statement = format!("Cannot execute {operation}");
+        let options = self.dynamic_options.read().unwrap().clone();
+        if options.is_empty() {
+            return crate::table_loader::ensure_no_incremental_window(
+                &statement, &options, identifier, table,
+            );
+        }
+        // The lookup's provider applies the session's options to the table, a
+        // session `branch` among them, so check the table it reads.
+        let read = table
+            .copy_with_time_travel(options.clone())
+            .await
+            .map_err(to_datafusion_error)?;
+        crate::table_loader::ensure_no_incremental_window(&statement, &options, identifier, &read)
+    }
+
     async fn handle_merge_into(
         &self,
         merge: &Merge,
@@ -1820,6 +1847,8 @@ impl SQLContext {
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
+        self.ensure_target_lookup_reads_rows(&identifier, &table, "MERGE INTO")
+            .await?;
 
         crate::merge_into::execute_merge_into(self, merge, table, enable_ident_normalization).await
     }
@@ -1845,6 +1874,8 @@ impl SQLContext {
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
+        self.ensure_target_lookup_reads_rows(&identifier, &table, "UPDATE")
+            .await?;
 
         crate::update::execute_update(self, update, table, enable_ident_normalization).await
     }
@@ -1873,6 +1904,8 @@ impl SQLContext {
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
+        self.ensure_target_lookup_reads_rows(&identifier, &table, "DELETE")
+            .await?;
 
         let table_ref = table_name.to_string();
         crate::delete::execute_delete(self, delete, table, &table_ref).await

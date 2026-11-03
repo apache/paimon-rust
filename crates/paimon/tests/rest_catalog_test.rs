@@ -1304,6 +1304,173 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
     }
 }
 
+// An upstream table that stores `incremental-between-timestamp` reads that
+// window's changes. Two inserts with pictures, a compaction of their files and
+// an update of every name are read file by file: each row once per file that
+// wrote it, its picture NULL in the files that did not, so every view resolved
+// to NULL. The mock server also serves the same files without the window.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_blob_view_refuses_an_upstream_that_stores_a_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = format!("file://{}", tmp.path().display());
+    let mut fs_options = Options::new();
+    fs_options.set(CatalogOptions::WAREHOUSE, &warehouse);
+    let fs_catalog = FileSystemCatalog::new(fs_options).expect("create filesystem catalog");
+    fs_catalog
+        .create_database("default", true, HashMap::new())
+        .await
+        .unwrap();
+
+    let source_options = [("write-only", "true"), ("compaction.min.file-num", "2")];
+    let source_id = Identifier::new("default", "source");
+    fs_catalog
+        .create_table(&source_id, blob_schema(&source_options), false)
+        .await
+        .unwrap();
+    let source = fs_catalog.get_table(&source_id).await.unwrap();
+    write_batch(
+        &source,
+        blob_batch(
+            vec![1, 2],
+            vec!["a", "b"],
+            vec![b"p1".to_vec(), b"p2".to_vec()],
+        ),
+        "writer-1",
+    )
+    .await;
+    write_batch(
+        &source,
+        blob_batch(
+            vec![3, 4],
+            vec!["c", "d"],
+            vec![b"p3".to_vec(), b"p4".to_vec()],
+        ),
+        "writer-2",
+    )
+    .await;
+    let compaction = source.new_compact_builder();
+    let plan = compaction.new_planner().unwrap().plan().await.unwrap();
+    let executor = compaction.new_executor().unwrap();
+    let mut results = Vec::new();
+    for task in plan.tasks() {
+        results.push(executor.execute(task).await.unwrap());
+    }
+    let commit = compaction.new_commit().unwrap();
+    commit.commit_compact(results).await.unwrap();
+    let source = fs_catalog.get_table(&source_id).await.unwrap();
+    let update = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("_ROW_ID", ArrowDataType::Int64, false),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2, 3])),
+            Arc::new(StringArray::from(vec!["A", "B", "C", "D"])),
+        ],
+    )
+    .unwrap();
+    let write_builder = source.new_write_builder();
+    let mut writer = write_builder
+        .new_data_evolution_writer(vec!["name".to_string()])
+        .unwrap();
+    writer.add_matched_batch(update).unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    write_builder.new_commit().commit(messages).await.unwrap();
+
+    // One view table for each name the mock server serves the source under.
+    let picture_id = source
+        .schema()
+        .fields()
+        .iter()
+        .find(|field| field.name() == "picture")
+        .unwrap()
+        .id();
+    let view_schema = blob_schema(&[("blob-view-field", "picture")]);
+    let mut views = Vec::new();
+    for upstream in ["source", "source_window"] {
+        let view_id = Identifier::new("default", format!("view_of_{upstream}"));
+        fs_catalog
+            .create_table(&view_id, view_schema.clone(), false)
+            .await
+            .unwrap();
+        let view = fs_catalog.get_table(&view_id).await.unwrap();
+        let refs = (0..4)
+            .map(|row_id| {
+                BlobViewStruct::new(Identifier::new("default", upstream), picture_id, row_id)
+                    .serialize()
+                    .unwrap()
+            })
+            .collect();
+        write_batch(
+            &view,
+            blob_batch(vec![1, 2, 3, 4], vec!["v1", "v2", "v3", "v4"], refs),
+            "view-writer",
+        )
+        .await;
+        views.push((view_id, view.location().to_string()));
+    }
+
+    let mut defaults = HashMap::new();
+    defaults.insert("prefix".to_string(), "mock-test".to_string());
+    let server = start_mock_server(
+        "test_warehouse".to_string(),
+        warehouse.clone(),
+        ConfigResponse::new(defaults),
+        vec!["default".to_string()],
+    )
+    .await;
+    server.add_table_with_schema(
+        "default",
+        "source",
+        blob_schema(&source_options),
+        source.location(),
+    );
+    let window = ("incremental-between-timestamp", "0,9999999999999");
+    server.add_table_with_schema(
+        "default",
+        "source_window",
+        blob_schema(&[source_options[0], source_options[1], window]),
+        source.location(),
+    );
+    for (view_id, location) in &views {
+        server.add_table_with_schema("default", view_id.object(), view_schema.clone(), location);
+    }
+    let url = server.url().expect("Failed to get server URL");
+    let mut rest_options = Options::new();
+    rest_options.set("uri", &url);
+    rest_options.set("warehouse", "test_warehouse");
+    rest_options.set("token.provider", "bear");
+    rest_options.set("token", "test_token");
+    let rest_catalog = RESTCatalog::new(rest_options, true)
+        .await
+        .expect("create rest catalog");
+
+    let source_view = rest_catalog
+        .get_table(&Identifier::new("default", "view_of_source"))
+        .await
+        .unwrap();
+    let resolved = read_all(&source_view.new_read_builder()).await.unwrap();
+    assert_eq!(
+        collect_blob_rows(&resolved),
+        (1..=4)
+            .map(|id| (id, format!("v{id}"), Some(format!("p{id}").into_bytes())))
+            .collect::<Vec<_>>()
+    );
+    let window_view = rest_catalog
+        .get_table(&Identifier::new("default", "view_of_source_window"))
+        .await
+        .unwrap();
+    let refused = read_all(&window_view.new_read_builder()).await;
+    assert!(
+        matches!(&refused, Err(paimon::Error::Unsupported { message })
+            if message.contains("Cannot resolve blob views of upstream table default.source_window, \
+                which sets scan option 'incremental-between-timestamp'")),
+        "{:?}",
+        refused.map(|batches| collect_blob_rows(&batches))
+    );
+}
+
 #[cfg(not(windows))]
 #[tokio::test]
 async fn test_rest_catalog_reads_format_table_with_bearer_and_local_file_dlf_auth() {

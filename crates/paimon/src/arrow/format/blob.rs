@@ -22,7 +22,7 @@ use super::delta_varint::{
 use super::delta_varint::{decode_varint, encode_varint};
 use super::metadata_cache::FileMetadataCache;
 use super::{FilePredicates, FormatFileReader};
-use crate::arrow::build_target_arrow_schema;
+use crate::arrow::build_read_arrow_schema;
 use crate::io::{BlobIndexCacheContext, FileRead};
 use crate::spec::{BlobDescriptor, DataField, DataType};
 use crate::table::{ArrowRecordBatchStream, RowRange};
@@ -223,7 +223,10 @@ impl FormatFileReader for BlobFormatReader {
         }
         let field_kind = validate_read_fields(read_fields)?;
 
-        let target_schema = build_target_arrow_schema(read_fields)?;
+        // A placeholder, a row an update left unwritten, reads as NULL, so
+        // the batch takes the nullable schema of the table readers: a NOT NULL
+        // field read as change events can hold it.
+        let target_schema = build_read_arrow_schema(read_fields)?;
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
         let blob_reader = IndexedBlobReader::open_with_parallelism(
             reader,
@@ -3677,34 +3680,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_reader_treats_java_placeholders_as_null() {
-        let read_fields = vec![DataField::new(
-            0,
-            "payload".to_string(),
-            DataType::Blob(BlobType::new()),
-        )];
         let file_bytes = load_blob_fixture("blob-placeholder.blob");
+        // A NOT NULL field reads them as NULL too.
+        for blob_type in [BlobType::new(), BlobType::with_nullable(false)] {
+            let read_fields = vec![DataField::new(
+                0,
+                "payload".to_string(),
+                DataType::Blob(blob_type),
+            )];
+            let batches = BlobFormatReader::new(String::new(), false)
+                .read_batch_stream(
+                    Box::new(BytesFileRead(Bytes::from(file_bytes.clone()))),
+                    file_bytes.len() as u64,
+                    &read_fields,
+                    None,
+                    Some(2),
+                    None,
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
 
-        let batches = BlobFormatReader::new(String::new(), false)
-            .read_batch_stream(
-                Box::new(BytesFileRead(Bytes::from(file_bytes.clone()))),
-                file_bytes.len() as u64,
-                &read_fields,
-                None,
-                Some(2),
-                None,
-            )
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(batches.len(), 2);
-        assert_eq!(collect_binary_values(&batches[0]), vec![None, None]);
-        assert_eq!(
-            collect_binary_values(&batches[1]),
-            vec![Some(b"latest-3".to_vec()), None]
-        );
+            assert_eq!(batches.len(), 2);
+            assert_eq!(collect_binary_values(&batches[0]), vec![None, None]);
+            assert_eq!(
+                collect_binary_values(&batches[1]),
+                vec![Some(b"latest-3".to_vec()), None]
+            );
+        }
     }
 
     #[tokio::test]

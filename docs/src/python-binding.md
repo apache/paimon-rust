@@ -174,7 +174,12 @@ primary keys and physical retracts remain separate rows. Readers do not merge
 these events into the window's final table state. The end snapshot must exist
 and supplies snapshot metadata, including for empty results. Snapshot deletion
 vectors and automatic global indexes are not applied to historical events.
-Builder filters, projections, and limits still apply.
+Builder filters, projections, and limits still apply. A Data Evolution range
+merges its files into rows as described for
+[`paimon_incremental_query`](sql.md#incremental-query); files that do not merge
+are read as written, one row per row of each file. Project `_ROW_ID`, for
+example `rb.with_projection(["_ROW_ID", "embedding"])`, to match those rows by
+their distinct `_ROW_ID`s to the table's rows.
 
 `split.is_streaming()` identifies this read contract. `split.serialize()` exports
 both batch and streaming splits to Java binary encoding, preserving the streaming
@@ -199,7 +204,10 @@ intersect the positions after assignment, even when they exclude earlier files.
 Slices require `start < end`; shards require a positive count and
 `0 <= index < count`. Slice and shard selection are mutually exclusive and may
 also be applied to `new_incremental_scan` results, where positions count the
-combined APPEND-delta batch. The selection is encoded in the returned splits
+combined APPEND-delta batch. There positions, `with_chunk_shuffle` chunk sizes
+and selected row ids count each Data Evolution row once, while a group read file
+by file returns the selected rows of each of its files, so a selection can return
+more rows than it selects. The selection is encoded in the returned splits
 and survives serialization and direct native reads.
 
 Deletion-vector reads accept both Java and Python Avro array-item schemas.

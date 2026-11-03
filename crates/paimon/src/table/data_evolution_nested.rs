@@ -43,10 +43,13 @@ pub(super) struct NestedSelection {
     pub whole_source: Option<usize>,
 }
 
-/// Return `None` only when no file supplies any leaf of this ROW.
+/// Return `None` only when no file supplies any leaf of this ROW. In change
+/// events (`change_events`), a child no file wrote reads as NULL even when it
+/// is NOT NULL.
 pub(super) fn select_nested_row(
     read_field: &DataField,
     sources: &[PhysicalRowSource<'_>],
+    change_events: bool,
 ) -> Result<Option<NestedSelection>> {
     let DataType::Row(read_row) = read_field.data_type() else {
         return Err(Error::DataInvalid {
@@ -123,7 +126,7 @@ pub(super) fn select_nested_row(
                 ),
             });
         }
-        if providers.is_empty() && !child.data_type().is_nullable() {
+        if providers.is_empty() && !change_events && !child.data_type().is_nullable() {
             return Err(Error::DataInvalid {
                 message: format!(
                     "Cannot read non-nullable nested field '{}.{}' without a provider",
@@ -516,7 +519,7 @@ mod tests {
             fields: &whole,
         }];
         assert_eq!(
-            select_nested_row(&requested, &sources)
+            select_nested_row(&requested, &sources, false)
                 .unwrap()
                 .unwrap()
                 .whole_source,
@@ -535,7 +538,9 @@ mod tests {
                 fields: &older,
             },
         ];
-        let selection = select_nested_row(&requested, &sources).unwrap().unwrap();
+        let selection = select_nested_row(&requested, &sources, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(selection.children, vec![Some(1), Some(1)]);
         assert_eq!(selection.whole_source, None);
         let old_request = source_read_field(&requested, &current, 1, &older, &selection).unwrap();
@@ -559,7 +564,7 @@ mod tests {
                 fields: &base,
             },
         ];
-        let selected = select_nested_row(&row(vec![name(), age()]), &sources)
+        let selected = select_nested_row(&row(vec![name(), age()]), &sources, false)
             .unwrap()
             .unwrap();
         assert_eq!(selected.anchors, vec![0, 1]);
@@ -581,7 +586,7 @@ mod tests {
                 fields: &base,
             },
         ];
-        let selected = select_nested_row(&row(vec![name()]), &sources)
+        let selected = select_nested_row(&row(vec![name()]), &sources, false)
             .unwrap()
             .unwrap();
         assert_eq!(selected.anchors, vec![0, 1]);
@@ -605,7 +610,9 @@ mod tests {
                 fields: &base_file,
             },
         ];
-        let selection = select_nested_row(&requested, &sources).unwrap().unwrap();
+        let selection = select_nested_row(&requested, &sources, false)
+            .unwrap()
+            .unwrap();
 
         let anchor = source_read_field(&requested, &current, 0, &age_file, &selection).unwrap();
         let provider = source_read_field(&requested, &current, 1, &base_file, &selection).unwrap();
@@ -631,7 +638,9 @@ mod tests {
             source_index: 0,
             fields: &physical,
         }];
-        let selection = select_nested_row(&requested, &sources).unwrap().unwrap();
+        let selection = select_nested_row(&requested, &sources, false)
+            .unwrap()
+            .unwrap();
         let read = source_read_field(&requested, &current, 0, &physical, &selection).unwrap();
         let DataType::Row(read_row) = read.data_type() else {
             panic!("read field must be ROW")
@@ -656,7 +665,7 @@ mod tests {
                 fields: &older,
             },
         ];
-        let selected = select_nested_row(&row(vec![name(), age()]), &sources)
+        let selected = select_nested_row(&row(vec![name(), age()]), &sources, false)
             .unwrap()
             .unwrap();
         assert_eq!(selected.anchors, vec![0]);
@@ -683,7 +692,7 @@ mod tests {
             },
         ];
         assert!(matches!(
-            select_nested_row(&read, &sources),
+            select_nested_row(&read, &sources, false),
             Err(Error::Unsupported { message }) if message.contains("profile.address")
         ));
     }
@@ -697,9 +706,25 @@ mod tests {
             fields: &available,
         }];
         assert!(matches!(
-            select_nested_row(&row(vec![required]), &sources),
+            select_nested_row(&row(vec![required]), &sources, false),
             Err(Error::DataInvalid { message, .. }) if message.contains("profile.required")
         ));
+    }
+
+    #[test]
+    fn change_events_read_a_missing_non_nullable_subfield_as_null() {
+        let required = field(4, "required", DataType::Int(IntType::with_nullable(false)));
+        let available = vec![row(vec![name()])];
+        let sources = [PhysicalRowSource {
+            source_index: 0,
+            fields: &available,
+        }];
+        let selected = select_nested_row(&row(vec![name(), required]), &sources, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.anchors, vec![0]);
+        assert_eq!(selected.children, vec![Some(0), None]);
+        assert_eq!(selected.whole_source, None);
     }
 
     fn struct_batch(

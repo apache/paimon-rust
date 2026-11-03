@@ -105,9 +105,10 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`SQLContext::new` creates a session context with the Paimon relation planner and
+`SQLContext::new` creates a session context with the Paimon relation planner,
 the catalog-independent `path_to_descriptor` and `descriptor_to_string` scalar
-functions pre-registered. Use `register_catalog(...).await` to add one or more
+functions and the `paimon_incremental_query` table-valued function
+pre-registered. Use `register_catalog(...).await` to add one or more
 Paimon catalogs; registering a catalog also registers the built-in scalar
 function `blob_view` (alias `sys.blob_view`) and the built-in table-valued
 functions (`vector_search`, `hybrid_search`, and `full_text_search`) against it.
@@ -412,6 +413,10 @@ SET 'paimon.blob-view.resolve.enabled' = 'false';
 SELECT id, picture FROM paimon.my_db.asset_refs;
 RESET 'paimon.blob-view.resolve.enabled';
 ```
+
+Resolution fails if the upstream table stores `incremental-between-timestamp`,
+since a read of it returns that window's changes instead of the table's rows.
+Remove the option from the upstream table, or read the raw references as above.
 
 Like ordinary BLOB reads, `paimon.blob-as-descriptor = true` makes resolved Blob
 View columns return serialized BLOB descriptors instead of loading the BLOB
@@ -2861,6 +2866,81 @@ This reads the earliest snapshot whose watermark is greater than or equal to the
 given value (snapshots without a watermark are skipped). It is mutually
 exclusive with the other time-travel selectors. If no matching snapshot exists,
 scan planning fails.
+
+## Incremental Query
+
+`paimon_incremental_query` reads the changes between two snapshots. The range
+excludes the start snapshot and includes the end snapshot:
+
+```sql
+SELECT * FROM paimon_incremental_query('my_db.my_table', 1, 5);
+SELECT * FROM paimon_incremental_query('my_db.my_table$audit_log', 1, 5, 'changelog');
+```
+
+The optional fourth argument selects the mode:
+
+- `delta` returns the rows each APPEND commit wrote, every version of a key included,
+  even rows a later `DELETE` removed.
+  A data-evolution table's range is read as one batch, as Java's `incremental-between`
+  scan reads it: the files it wrote for the same rows merge into rows when they are
+  column slices of one row range, that is, its normal data files cover the same rows,
+  its BLOB and VECTOR files lie within them, and each BLOB or VECTOR column has one
+  layout, for BLOB the one the table now uses, and the merge would read each column
+  where it is stored. For rows written before the range it returns every row of the
+  files the updates rewrote, unchanged rows included, with only the updated and the
+  partition columns set and the others NULL, NOT NULL columns included. (Java's reader
+  instead fails when two such updates of the same rows leave a NOT NULL column
+  unwritten.) Other files are returned as written, one row per row of each file.
+  These include BLOB or VECTOR files
+  alone, such as recomputed embeddings, so two embedding updates of the same rows return
+  both versions where Java returns the latest; every file of rows whose BLOB or VECTOR
+  column the range wrote in two layouts (inline and in dedicated files, after a change
+  of the column's storage, or in VECTOR files before and after an `ALTER TABLE`, or with
+  and without another VECTOR column), whose BLOB column it wrote in a layout the table
+  no longer uses, or whose BLOB or VECTOR column another file holds while the newest
+  normal data file that may hold it lists no write columns. A normal data file without
+  write columns counts as holding each BLOB or VECTOR column of its schema that no
+  dedicated file of its own commit holds, as with
+  `data-evolution.write-cols-optimization.enabled` it can leave the column to dedicated
+  files under writer options a copy of the table can change. So an insert that wrote
+  its embeddings to VECTOR files still merges with later updates, while a later update
+  that lists no write columns and writes no dedicated file, of rows whose BLOB or VECTOR
+  column the range wrote before, is read this way; and every file of rows whose files
+  are no longer column slices because a compaction in the range, such as the one a
+  write runs after its commit unless `write-only=true`, merged some of them (Java's reader fails on such a
+  range). A
+  column the table has since dropped, or changed from VECTOR to a string type, keeps
+  rows from merging only when the range wrote it in VECTOR files of two layouts.
+- `changelog` returns the changelog rows of each commit. A `lookup` or `full-compaction`
+  producer writes them when it compacts, in a later COMPACT snapshot, which the range
+  must include.
+- `diff` compares the table at the two snapshots and returns the added and changed
+  rows (`$audit_log` adds `-U` and `-D` rows). It requires a primary-key table with
+  `merge-engine=deduplicate` and no BLOB or VARIANT columns.
+- `auto`, the default, is `delta` when `changelog-producer` is `none` and
+  `changelog` otherwise.
+
+A `$audit_log` suffix puts `rowkind` first, followed by `_SEQUENCE_NUMBER` when
+`table-read.sequence-number.enabled=true`. Without it the columns are those of a
+query on the table, `_ROW_ID` included on a data-evolution table, so a column update
+returned without the row's other columns can be matched to its row. A row read file
+by file comes once per file that wrote it, and nothing in the output tells which is
+newer. To read the rows' values at the end of the range, join their distinct `_ROW_ID`s
+with the table `VERSION AS OF` the end snapshot, and filter after the join: a column a
+file did not write, other than a partition column, is NULL in that file's rows.
+
+The table name resolves in the calling session: `my_table` and `my_db.my_table`
+use the current catalog (and database), as in a `FROM` clause, and
+`my_catalog.my_db.my_table` names the catalog. The name is split at dots, as in
+the other Paimon table functions, and its parts are used as written, without SQL
+quoting or case folding. Dynamic options set with
+`SET 'paimon.…'` apply as they do to a query on the table, except options that
+choose another range to read (time-travel selectors, `incremental-between*`, file
+creation-time filters and a `scan.mode` other than `default`), which are rejected
+whether the session or the table read sets them. With `SET 'paimon.branch'`, the
+table read is that branch.
+
+The range is read in one partition, and `WHERE` filters apply after the read.
 
 ## Dynamic Options (SET / RESET)
 

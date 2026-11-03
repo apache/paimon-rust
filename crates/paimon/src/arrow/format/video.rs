@@ -21,7 +21,7 @@
 use super::blob::{build_blob_batch, BlobReadValue};
 use super::delta_varint::decode_delta_varints;
 use super::{FilePredicates, FormatFileReader};
-use crate::arrow::build_target_arrow_schema;
+use crate::arrow::build_read_arrow_schema;
 use crate::io::FileRead;
 use crate::spec::{DataField, DataType, VideoFrameDescriptor};
 use crate::table::{ArrowRecordBatchStream, RowRange};
@@ -271,7 +271,9 @@ impl FormatFileReader for VideoFormatReader {
         {
             return Err(corrupt("video format only supports one scalar BLOB field"));
         }
-        let schema = build_target_arrow_schema(read_fields)?;
+        // NULLs and placeholders read as NULL, also in a NOT NULL field, as
+        // in the BLOB reader.
+        let schema = build_read_arrow_schema(read_fields)?;
         let indexed =
             IndexedVideoReader::open(reader.as_ref(), file_size, self.path.clone()).await?;
         let mut positions: Box<dyn Iterator<Item = usize> + Send> = match row_selection {
@@ -386,7 +388,14 @@ mod tests {
         let bytes = java_fixture();
         let format = VideoFormatReader::new("file:/data.video".into());
         let field = DataField::new(0, "video".into(), DataType::Blob(BlobType::new()));
-        for fields in [vec![field], vec![]] {
+        // Rows 2 and 3 are a NULL and a placeholder, read as NULL even in a
+        // NOT NULL field.
+        let not_null = DataField::new(
+            0,
+            "video".into(),
+            DataType::Blob(BlobType::with_nullable(false)),
+        );
+        for fields in [vec![field], vec![not_null], vec![]] {
             let stream = format
                 .read_batch_stream(
                     Box::new(BytesFileRead(bytes.clone())),
