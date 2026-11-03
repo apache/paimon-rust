@@ -1387,7 +1387,7 @@ def test_time_travel_by_timestamp_string():
             assert result.column("id").to_pylist() == [1]
         for value in ["invalid", "1970-01-01 00:00:00"]:
             with pytest.raises(ValueError, match="did not resolve"):
-                table.new_read_builder({"scan.timestamp": value})
+                table.new_read_builder({"scan.timestamp": value}).new_scan()
         with pytest.raises(ValueError, match="Only one"):
             table.new_read_builder({"scan.timestamp": "1970-01-03",
                                     "scan.timestamp-millis": "172800000"})
@@ -1418,7 +1418,7 @@ def test_scan_version_adapts_before_binding_selector_validation():
                 {"scan.version": "1", "scan.tag-name": "v1"},
                 {"scan.version": "v1", "scan.snapshot-id": "1"}]:
             with pytest.raises(ValueError, match="did not resolve"):
-                table.new_read_builder(opts)
+                table.new_read_builder(opts).new_scan()
 
 
 def test_time_travel_unresolved_snapshot_raises():
@@ -1426,7 +1426,7 @@ def test_time_travel_unresolved_snapshot_raises():
         _make_two_snapshot_table(warehouse)
         table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
         with pytest.raises(ValueError, match="did not resolve"):
-            table.new_read_builder({"scan.snapshot-id": "999"})
+            table.new_read_builder({"scan.snapshot-id": "999"}).new_scan()
 
 
 def test_time_travel_unresolved_watermark_raises():
@@ -1436,7 +1436,7 @@ def test_time_travel_unresolved_watermark_raises():
         # The Rust commit path never writes watermarks, so no snapshot matches;
         # the binding must raise instead of silently reading latest.
         with pytest.raises(ValueError, match="did not resolve"):
-            table.new_read_builder({"scan.watermark": "1"})
+            table.new_read_builder({"scan.watermark": "1"}).new_scan()
 
 
 def test_unsupported_scan_option_raises_not_implemented():

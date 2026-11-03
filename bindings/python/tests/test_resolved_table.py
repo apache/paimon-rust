@@ -77,6 +77,10 @@ def test_resolved_options_replace_persisted_options(resolved_source):
     schema["options"]["scan.snapshot-id"] = "1"
     historical = Table.from_resolved_schema(str(root), json.dumps(schema))
     assert _read(historical) == (1, [{"id": 1, "name": "a"}])
+    schema["options"]["scan.snapshot-id"] = "3"
+    missing = Table.from_resolved_schema(str(root), json.dumps(schema))
+    with pytest.raises(ValueError, match="scan.snapshot-id=3 did not resolve"):
+        missing.new_read_builder().new_scan()
     assert "scan.snapshot-id" not in latest.schema().options()
 
 
