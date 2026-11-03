@@ -280,6 +280,12 @@ the ending snapshot, including when no selected files remain. The existing
 
 ### Custom Blob URI sources
 
+Batch and stream writers can be transferred between Python threads. Operations
+remain exclusive: calling another writer method while a write, prepare, or close
+is running raises `RuntimeError`. Call `close()` in a `finally` block to discard
+unprepared output and release source streams. Callback reference cycles are also
+visible to Python's garbage collector when collection runs on another thread.
+
 Before the first Arrow write, call
 `writer.with_blob_uri_reader_factory(factory)` to copy referenced Blob payloads
 from custom sources. The factory provides `create(uri)`, returning a reader with
