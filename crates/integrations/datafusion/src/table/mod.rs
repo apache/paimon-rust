@@ -25,10 +25,11 @@ use datafusion::arrow::datatypes::{
     DataType as ArrowDataType, Field, Schema, SchemaRef as ArrowSchemaRef,
 };
 use datafusion::catalog::Session;
+use datafusion::common::DFSchemaRef;
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::dml::{InsertOp, MergeIntoClause};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use paimon::spec::{
@@ -113,7 +114,7 @@ fn query_auth_output_schema(table: &Table, schema: ArrowSchemaRef) -> ArrowSchem
     ))
 }
 
-/// Read-only table provider for a Paimon table.
+/// Table provider for Paimon scans, INSERT, and native MERGE execution.
 ///
 /// Supports full table scan, column projection, and predicate pushdown for
 /// planning. Partition predicates prune splits eagerly, while supported
@@ -531,6 +532,17 @@ impl TableProvider for PaimonTableProvider {
         };
         let sink = PaimonDataSink::new(self.table.clone(), self.schema.clone(), overwrite);
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
+    }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: DFSchemaRef,
+        on: Expr,
+        clauses: Vec<MergeIntoClause>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        crate::merge_into::plan_merge(state, self.table.clone(), source, merge_schema, on, clauses)
     }
 
     fn supports_filters_pushdown(
