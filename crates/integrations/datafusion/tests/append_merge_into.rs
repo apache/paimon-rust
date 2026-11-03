@@ -1191,3 +1191,55 @@ async fn test_partitioned_successive_merges() {
         vec![(1, 100, 1), (2, 20, 1), (3, 300, 2), (4, 40, 2),]
     );
 }
+
+/// Rows of a fixed-bucket table are placed by hashing `bucket-key`, and a filter on
+/// that column reads only the matching bucket. A matched update of the bucket key
+/// must move the row, or such queries no longer find it.
+#[tokio::test]
+async fn test_update_bucket_key_moves_row_to_new_bucket() {
+    let (_tmp, sql_context) = setup(
+        "CREATE TABLE paimon.test_db.target (a INT, b INT, c VARCHAR) \
+         WITH ('bucket' = '4', 'bucket-key' = 'c')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.target VALUES \
+         (1, 10, 'alice'), (2, 20, 'bob'), (3, 30, 'carol'), (4, 40, 'dave')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.source (a INT, c VARCHAR) AS SELECT * FROM (VALUES (1, 'erin'), (3, 'frank')) AS t(a, c)",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "MERGE INTO paimon.test_db.target t \
+         USING paimon.test_db.source s ON t.a = s.a \
+         WHEN MATCHED THEN UPDATE SET c = s.c",
+    )
+    .await;
+
+    let batches = sql_context
+        .sql("SELECT a, b, c FROM paimon.test_db.target WHERE c IN ('erin', 'frank') ORDER BY a")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_int_int_str(&batches),
+        vec![(1, 10, "erin".into()), (3, 30, "frank".into())]
+    );
+    assert_eq!(
+        query_abc(&sql_context).await,
+        vec![
+            (1, 10, "erin".into()),
+            (2, 20, "bob".into()),
+            (3, 30, "frank".into()),
+            (4, 40, "dave".into()),
+        ]
+    );
+}
