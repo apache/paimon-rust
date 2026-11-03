@@ -21,7 +21,6 @@ use super::*;
 use datafusion::sql::sqlparser::ast::Merge;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
-use paimon::catalog::{Catalog, Identifier};
 use paimon::{CatalogOptions, FileSystemCatalog, Options};
 use tempfile::TempDir;
 
@@ -72,7 +71,7 @@ async fn test_retry_limits_and_non_conflict_errors() {
     }
 }
 
-async fn setup_sql_context() -> (TempDir, SQLContext, Arc<FileSystemCatalog>) {
+async fn setup_sql_context() -> (TempDir, SQLContext) {
     let temp_dir = TempDir::new().unwrap();
     let warehouse = format!("file://{}", temp_dir.path().display());
     let mut options = Options::new();
@@ -81,7 +80,7 @@ async fn setup_sql_context() -> (TempDir, SQLContext, Arc<FileSystemCatalog>) {
 
     let mut sql_context = SQLContext::new();
     sql_context
-        .register_catalog("paimon", catalog.clone())
+        .register_catalog("paimon", catalog)
         .await
         .unwrap();
     sql_context
@@ -89,11 +88,11 @@ async fn setup_sql_context() -> (TempDir, SQLContext, Arc<FileSystemCatalog>) {
         .await
         .unwrap();
 
-    (temp_dir, sql_context, catalog)
+    (temp_dir, sql_context)
 }
 
-async fn setup_data_evolution_table(name: &str) -> (TempDir, SQLContext, Table) {
-    let (tmp, sql_context, catalog) = setup_sql_context().await;
+async fn setup_data_evolution_table(name: &str) -> (TempDir, SQLContext) {
+    let (tmp, sql_context) = setup_sql_context().await;
 
     sql_context
         .sql(&format!(
@@ -112,25 +111,11 @@ async fn setup_data_evolution_table(name: &str) -> (TempDir, SQLContext, Table) 
         .await
         .unwrap();
 
-    let table = catalog
-        .get_table(&Identifier::new("test_db", name))
-        .await
-        .unwrap();
-    let mut extra = std::collections::HashMap::new();
-    extra.insert("data-evolution.enabled".to_string(), "true".to_string());
-    extra.insert("row-tracking.enabled".to_string(), "true".to_string());
-    let de_table = table.copy_with_options(extra);
-
-    (tmp, sql_context, de_table)
+    (tmp, sql_context)
 }
 
 // Exercise the native planner and provider while retaining these behavioral fixtures.
-async fn execute_merge_into(
-    ctx: &SQLContext,
-    merge: &Merge,
-    _table: Table,
-    _enable_ident_normalization: bool,
-) -> DFResult<DataFrame> {
+async fn execute_merge_into(ctx: &SQLContext, merge: &Merge) -> DFResult<DataFrame> {
     let batches = ctx.sql(&merge.to_string()).await?.collect().await?;
     ctx.ctx().read_batches(batches)
 }
@@ -146,7 +131,7 @@ fn parse_merge(sql: &str) -> Merge {
 
 #[tokio::test]
 async fn test_merge_into_updates_matched_rows() {
-    let (_tmp, sql_context, table) = setup_data_evolution_table("t_merge").await;
+    let (_tmp, sql_context) = setup_data_evolution_table("t_merge").await;
 
     // Create source table with updates
     sql_context
@@ -170,9 +155,7 @@ async fn test_merge_into_updates_matched_rows() {
         "MERGE INTO paimon.test_db.t_merge t USING paimon.test_db.source s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET NAME = s.name",
     );
-    execute_merge_into(&sql_context, &merge, table, true)
-        .await
-        .unwrap();
+    execute_merge_into(&sql_context, &merge).await.unwrap();
 
     let batches = sql_context
         .sql("SELECT id, name, value FROM paimon.test_db.t_merge ORDER BY id")
@@ -216,7 +199,7 @@ async fn test_merge_into_updates_matched_rows() {
 
 #[tokio::test]
 async fn test_merge_into_no_matches() {
-    let (_tmp, sql_context, table) = setup_data_evolution_table("t_merge2").await;
+    let (_tmp, sql_context) = setup_data_evolution_table("t_merge2").await;
 
     sql_context
         .sql("CREATE TABLE paimon.test_db.source (id INT, name VARCHAR)")
@@ -238,9 +221,7 @@ async fn test_merge_into_no_matches() {
         "MERGE INTO paimon.test_db.t_merge2 t USING paimon.test_db.source s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET name = s.name",
     );
-    let result = execute_merge_into(&sql_context, &merge, table, true)
-        .await
-        .unwrap();
+    let result = execute_merge_into(&sql_context, &merge).await.unwrap();
     let batches = result.collect().await.unwrap();
     let count = batches[0]
         .column(0)
@@ -255,8 +236,8 @@ async fn test_merge_into_no_matches() {
 // CoW MERGE INTO tests (append-only tables)
 // -----------------------------------------------------------------------
 
-async fn setup_append_only_table(name: &str) -> (TempDir, SQLContext, Table) {
-    let (tmp, sql_context, catalog) = setup_sql_context().await;
+async fn setup_append_only_table(name: &str) -> (TempDir, SQLContext) {
+    let (tmp, sql_context) = setup_sql_context().await;
 
     sql_context
         .sql(&format!(
@@ -275,12 +256,7 @@ async fn setup_append_only_table(name: &str) -> (TempDir, SQLContext, Table) {
         .await
         .unwrap();
 
-    let table = catalog
-        .get_table(&Identifier::new("test_db", name))
-        .await
-        .unwrap();
-
-    (tmp, sql_context, table)
+    (tmp, sql_context)
 }
 
 fn collect_rows(batches: &[RecordBatch]) -> Vec<(i32, String, i32)> {
@@ -311,7 +287,7 @@ fn collect_rows(batches: &[RecordBatch]) -> Vec<(i32, String, i32)> {
 
 #[tokio::test]
 async fn test_cow_merge_update_matched_rows() {
-    let (_tmp, sql_context, table) = setup_append_only_table("t_cow_upd").await;
+    let (_tmp, sql_context) = setup_append_only_table("t_cow_upd").await;
 
     sql_context
         .sql("CREATE TABLE paimon.test_db.source (id INT, name VARCHAR)")
@@ -329,9 +305,7 @@ async fn test_cow_merge_update_matched_rows() {
         "MERGE INTO paimon.test_db.t_cow_upd t USING paimon.test_db.source s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET NAME = s.name",
     );
-    execute_merge_into(&sql_context, &merge, table, true)
-        .await
-        .unwrap();
+    execute_merge_into(&sql_context, &merge).await.unwrap();
 
     let batches = sql_context
         .sql("SELECT id, name, value FROM paimon.test_db.t_cow_upd ORDER BY id")
@@ -354,7 +328,7 @@ async fn test_cow_merge_update_matched_rows() {
 
 #[tokio::test]
 async fn test_cow_merge_delete_matched_rows() {
-    let (_tmp, sql_context, table) = setup_append_only_table("t_cow_del").await;
+    let (_tmp, sql_context) = setup_append_only_table("t_cow_del").await;
 
     sql_context
         .sql("CREATE TABLE paimon.test_db.source (id INT)")
@@ -372,9 +346,7 @@ async fn test_cow_merge_delete_matched_rows() {
         "MERGE INTO paimon.test_db.t_cow_del t USING paimon.test_db.source s ON t.id = s.id \
          WHEN MATCHED THEN DELETE",
     );
-    execute_merge_into(&sql_context, &merge, table, true)
-        .await
-        .unwrap();
+    execute_merge_into(&sql_context, &merge).await.unwrap();
 
     let batches = sql_context
         .sql("SELECT id, name, value FROM paimon.test_db.t_cow_del ORDER BY id")
@@ -393,7 +365,7 @@ async fn test_cow_merge_delete_matched_rows() {
 
 #[tokio::test]
 async fn test_cow_merge_insert_not_matched() {
-    let (_tmp, sql_context, table) = setup_append_only_table("t_cow_ins").await;
+    let (_tmp, sql_context) = setup_append_only_table("t_cow_ins").await;
 
     sql_context
         .sql("CREATE TABLE paimon.test_db.source (id INT, name VARCHAR, value INT)")
@@ -411,9 +383,7 @@ async fn test_cow_merge_insert_not_matched() {
         "MERGE INTO paimon.test_db.t_cow_ins t USING paimon.test_db.source s ON t.id = s.id \
          WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
     );
-    execute_merge_into(&sql_context, &merge, table, true)
-        .await
-        .unwrap();
+    execute_merge_into(&sql_context, &merge).await.unwrap();
 
     let batches = sql_context
         .sql("SELECT id, name, value FROM paimon.test_db.t_cow_ins ORDER BY id")
@@ -438,7 +408,7 @@ async fn test_cow_merge_insert_not_matched() {
 
 #[tokio::test]
 async fn test_cow_merge_insert_not_matched_without_columns() {
-    let (_tmp, sql_context, table) = setup_append_only_table("t_cow_ins_nocols").await;
+    let (_tmp, sql_context) = setup_append_only_table("t_cow_ins_nocols").await;
 
     sql_context
         .sql("CREATE TABLE paimon.test_db.source (id INT, name VARCHAR, value INT)")
@@ -459,9 +429,7 @@ async fn test_cow_merge_insert_not_matched_without_columns() {
          ON t.id = s.id \
          WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.name, s.value)",
     );
-    execute_merge_into(&sql_context, &merge, table, true)
-        .await
-        .unwrap();
+    execute_merge_into(&sql_context, &merge).await.unwrap();
 
     let batches = sql_context
         .sql("SELECT id, name, value FROM paimon.test_db.t_cow_ins_nocols ORDER BY id")
@@ -486,7 +454,7 @@ async fn test_cow_merge_insert_not_matched_without_columns() {
 
 #[tokio::test]
 async fn test_cow_merge_insert_arity_validated_even_when_all_matched() {
-    let (_tmp, sql_context, table) = setup_append_only_table("t_cow_ins_arity").await;
+    let (_tmp, sql_context) = setup_append_only_table("t_cow_ins_arity").await;
 
     sql_context
         .sql("CREATE TABLE paimon.test_db.source (id INT, name VARCHAR, value INT)")
@@ -511,9 +479,7 @@ async fn test_cow_merge_insert_arity_validated_even_when_all_matched() {
          WHEN MATCHED THEN UPDATE SET value = s.value \
          WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.name)",
     );
-    let err = execute_merge_into(&sql_context, &merge, table, true)
-        .await
-        .unwrap_err();
+    let err = execute_merge_into(&sql_context, &merge).await.unwrap_err();
     assert!(err.to_string().contains("column(s) but"), "got {err}");
 
     // The target is unchanged: the matched UPDATE did not apply.
@@ -536,7 +502,7 @@ async fn test_cow_merge_insert_arity_validated_even_when_all_matched() {
 
 #[tokio::test]
 async fn test_cow_merge_update_and_insert() {
-    let (_tmp, sql_context, table) = setup_append_only_table("t_cow_upsert").await;
+    let (_tmp, sql_context) = setup_append_only_table("t_cow_upsert").await;
 
     sql_context
         .sql("CREATE TABLE paimon.test_db.source (id INT, name VARCHAR, value INT)")
@@ -555,9 +521,7 @@ async fn test_cow_merge_update_and_insert() {
          WHEN MATCHED THEN UPDATE SET name = s.name, value = s.value \
          WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
     );
-    execute_merge_into(&sql_context, &merge, table, true)
-        .await
-        .unwrap();
+    execute_merge_into(&sql_context, &merge).await.unwrap();
 
     let batches = sql_context
         .sql("SELECT id, name, value FROM paimon.test_db.t_cow_upsert ORDER BY id")
@@ -582,7 +546,7 @@ async fn test_cow_merge_update_and_insert() {
 #[tokio::test]
 async fn test_cow_merge_matched_null_predicates_fall_through() {
     for delete_fallback in [false, true] {
-        let (_tmp, sql_context, table) = setup_append_only_table("t_null_matched").await;
+        let (_tmp, sql_context) = setup_append_only_table("t_null_matched").await;
         for sql in [
             "CREATE TABLE paimon.test_db.source (id INT, flag INT)",
             "INSERT INTO paimon.test_db.source VALUES (1, NULL), (2, 1), (3, 0)",
@@ -602,7 +566,7 @@ async fn test_cow_merge_matched_null_predicates_fall_through() {
              WHEN MATCHED AND s.flag = 0 THEN UPDATE SET name = 'second' \
              WHEN MATCHED THEN {fallback}"
         ));
-        let result = execute_merge_into(&sql_context, &merge, table, true)
+        let result = execute_merge_into(&sql_context, &merge)
             .await
             .unwrap()
             .collect()
@@ -636,7 +600,7 @@ async fn test_cow_merge_matched_null_predicates_fall_through() {
 #[tokio::test]
 async fn test_merge_insert_null_predicates_fall_through() {
     for data_evolution in [false, true] {
-        let (_tmp, sql_context, table) = if data_evolution {
+        let (_tmp, sql_context) = if data_evolution {
             setup_data_evolution_table("t_null_insert").await
         } else {
             setup_append_only_table("t_null_insert").await
@@ -655,7 +619,7 @@ async fn test_merge_insert_null_predicates_fall_through() {
              WHEN NOT MATCHED AND s.flag = 0 THEN INSERT (id, name, value) VALUES (s.id, 'second', 100) \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, 'fallback', 100)",
         );
-        let result = execute_merge_into(&sql_context, &merge, table, true)
+        let result = execute_merge_into(&sql_context, &merge)
             .await
             .unwrap()
             .collect()
@@ -695,7 +659,7 @@ async fn test_merge_insert_null_predicates_fall_through() {
 #[tokio::test]
 async fn test_cow_merge_matched_or_predicates_preserve_clause_order() {
     for delete_second in [false, true] {
-        let (_tmp, sql_context, table) = setup_append_only_table("t_or_matched").await;
+        let (_tmp, sql_context) = setup_append_only_table("t_or_matched").await;
         for sql in [
             "CREATE TABLE paimon.test_db.source (id INT, flag INT)",
             "INSERT INTO paimon.test_db.source VALUES (1, 1), (2, 0), (3, NULL)",
@@ -715,7 +679,7 @@ async fn test_cow_merge_matched_or_predicates_preserve_clause_order() {
              WHEN MATCHED AND s.flag = 0 OR s.flag = 1 THEN {second_action} \
              WHEN MATCHED THEN UPDATE SET name = 'fallback'"
         ));
-        let result = execute_merge_into(&sql_context, &merge, table, true)
+        let result = execute_merge_into(&sql_context, &merge)
             .await
             .unwrap()
             .collect()
@@ -752,7 +716,7 @@ async fn test_cow_merge_matched_or_predicates_preserve_clause_order() {
 #[tokio::test]
 async fn test_merge_insert_or_predicates_preserve_clause_order() {
     for data_evolution in [false, true] {
-        let (_tmp, sql_context, table) = if data_evolution {
+        let (_tmp, sql_context) = if data_evolution {
             setup_data_evolution_table("t_or_insert").await
         } else {
             setup_append_only_table("t_or_insert").await
@@ -771,7 +735,7 @@ async fn test_merge_insert_or_predicates_preserve_clause_order() {
              WHEN NOT MATCHED AND s.flag = 0 OR s.flag = 1 THEN INSERT (id, name, value) VALUES (s.id, 'second', 100) \
              WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, 'fallback', 100)",
         );
-        let result = execute_merge_into(&sql_context, &merge, table, true)
+        let result = execute_merge_into(&sql_context, &merge)
             .await
             .unwrap()
             .collect()
@@ -816,7 +780,7 @@ async fn test_cow_merge_preserves_string_literals() {
         ("", " AND s.name = 'paimon.test_db.source.payload'", ""),
         ("", "", " AND s.name = 'paimon.test_db.source.payload'"),
     ] {
-        let (_tmp, sql_context, table) = setup_append_only_table("target").await;
+        let (_tmp, sql_context) = setup_append_only_table("target").await;
         for sql in [
             "CREATE TABLE paimon.test_db.source (id INT, name VARCHAR)",
             "INSERT INTO paimon.test_db.source VALUES (1, 'paimon.test_db.source.payload'), (4, 'paimon.test_db.source.payload')",
@@ -830,7 +794,7 @@ async fn test_cow_merge_preserves_string_literals() {
              WHEN MATCHED{matched_predicate} THEN UPDATE SET name = 'paimon.test_db.target.payload' \
              WHEN NOT MATCHED{insert_predicate} THEN INSERT (id, name, value) VALUES (s.id, 'paimon.test_db.source.payload', 40)"
         ));
-        let result = execute_merge_into(&sql_context, &merge, table, true)
+        let result = execute_merge_into(&sql_context, &merge)
             .await
             .unwrap()
             .collect()
@@ -868,7 +832,7 @@ async fn test_cow_merge_preserves_string_literals() {
 
 #[tokio::test]
 async fn test_cow_merge_no_matches() {
-    let (_tmp, sql_context, table) = setup_append_only_table("t_cow_nomatch").await;
+    let (_tmp, sql_context) = setup_append_only_table("t_cow_nomatch").await;
 
     sql_context
         .sql("CREATE TABLE paimon.test_db.source (id INT, name VARCHAR)")
@@ -882,9 +846,7 @@ async fn test_cow_merge_no_matches() {
         "MERGE INTO paimon.test_db.t_cow_nomatch t USING paimon.test_db.source s ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET name = s.name",
     );
-    let result = execute_merge_into(&sql_context, &merge, table, true)
-        .await
-        .unwrap();
+    let result = execute_merge_into(&sql_context, &merge).await.unwrap();
     let batches = result.collect().await.unwrap();
     let count = batches[0]
         .column(0)
