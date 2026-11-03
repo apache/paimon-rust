@@ -78,10 +78,25 @@ on the `RuntimeEnv` passed to `SQLContext::builder`.
 
 Paimon `MERGE INTO` continues to use `SQLContext`'s Paimon write implementation.
 DataFusion's generic `TableProvider::merge_into` hook, `file_row_index()` and
-`input_file_name()` for Paimon scans, range-partition declarations, and custom
-query-planner FFI are not provided by this upgrade. In particular, Paimon's
-logical row IDs are not physical file row offsets, and ordinary scan splits
-do not guarantee disjoint sorted ranges.
+`input_file_name()` for Paimon scans, and custom query-planner FFI are not
+provided by this upgrade. Paimon's logical row IDs are not physical file row
+offsets.
+
+Scans declare DataFusion `Range` partitioning when every table partition key is
+present unchanged in the scan output and uses a supported type: Boolean,
+integers, strings, Date, millisecond Time, or Decimal128. Composite keys use
+lexicographic order with `ASC NULLS LAST`. Whole splits with equal partition
+keys stay together; adjacent key groups are combined into at most the configured
+`datafusion.execution.target_partitions`. This can avoid exchanges for compatible
+aggregations and joins, but does not declare that rows within a range are sorted.
+Parallelism may be lower than the target when there are fewer distinct keys.
+
+Unpartitioned tables, empty scans, scans with only one execution partition or one
+distinct key, missing/projected-out keys, unsupported types (including floating
+point, binary, and timestamp keys), unreadable partition metadata, and scans with
+query authorization or attached authorization rules retain `UnknownPartitioning`
+and their original split assignments. File min/max statistics and hash buckets
+alone are not used to infer ranges.
 
 ## Registering Catalog
 
