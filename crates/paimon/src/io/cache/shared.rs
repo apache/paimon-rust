@@ -1172,12 +1172,23 @@ mod tests {
         let reverse = [collision, b, a];
         let guards = first.load_locks(&forward).await;
         assert_eq!(guards.len(), 2);
+        // Model a concurrent fork/dup keeping the locked descriptions alive.
+        let inherited: Vec<_> = guards
+            .iter()
+            .map(|guard| guard.try_clone().unwrap())
+            .collect();
         let contended = tokio::time::timeout(Duration::from_secs(1), second.load_locks(&reverse))
             .await
             .expect("busy stripes must not block another batch");
         assert!(contended.is_empty());
+        // Closing only our handles need not release locks inherited by a fork.
+        // Explicitly unlock before checking non-blocking reacquisition.
+        for guard in &guards {
+            guard.unlock().unwrap();
+        }
         drop(guards);
         assert_eq!(second.load_locks(&reverse).await.len(), 2);
+        drop(inherited);
     }
 
     #[tokio::test]
