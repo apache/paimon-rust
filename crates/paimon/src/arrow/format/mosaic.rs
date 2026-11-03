@@ -818,9 +818,6 @@ pub(super) fn validate_mosaic_schema(schema: &SchemaRef) -> crate::Result<()> {
 }
 
 fn validate_mosaic_arrow_type(data_type: &ArrowDataType) -> Result<(), String> {
-    if crate::arrow::multiset::contains_multiset(data_type) {
-        return Err("MULTISET is not supported by Mosaic".into());
-    }
     paimon_mosaic_core::types::validate_data_type(data_type)
 }
 

@@ -148,19 +148,13 @@ of at most a quarter of the limit and closes the row group once its encoded size
 reaches the limit, so large or skewed batches stay close to it. These options
 affect new writes only.
 
-## Multiset Arrow Values
+## Map and Multiset Arrow Values
 
-`MULTISET<T>` uses Arrow `List<Struct<key: T, value: Int32>>`, with a
-non-null entry struct and count. The element (`key`) follows the logical element
-nullability; this preserves NULL multiset elements, which Arrow Map cannot
-represent. The list entry field carries `paimon.multiset=true` metadata so that
-schema inference distinguishes it from an ordinary array of rows. Existing Arrow
-Map write inputs with non-null keys are also accepted for multiset columns.
-
-Row and Avro retain their Java file encodings. Parquet retains the Java MAP
-encoding, whose keys must be non-null; writing a multiset with a visible NULL
-element to Parquet returns an error. Mosaic and Vortex do not support multiset
-columns.
+`MAP<K, V>` and `MULTISET<T>` both use Arrow Map with a non-null entry struct
+and non-null keys. A multiset's values are non-null `Int32` occurrence counts.
+Column and ordinary map value nullability follow the existing schema rules.
+NULL keys are rejected by Arrow's runtime validation.
+Row, Avro, and Parquet retain their Java-compatible file encodings.
 
 ## Parquet Page Pruning
 

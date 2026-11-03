@@ -541,7 +541,6 @@ fn validate_vortex_schema(schema: &SchemaRef) -> crate::Result<()> {
 fn contains_unconvertible_type(data_type: &ArrowDataType) -> bool {
     match data_type {
         ArrowDataType::Map(..) => true,
-        ArrowDataType::List(field) if crate::arrow::multiset::is_multiset(field) => true,
         ArrowDataType::List(field)
         | ArrowDataType::LargeList(field)
         | ArrowDataType::ListView(field)
@@ -1783,7 +1782,7 @@ mod tests {
             panic!("expected Unsupported, got {err:?}");
         };
         assert!(message.contains("'nested'"), "message: {message}");
-        assert!(message.contains("List"), "message: {message}");
+        assert!(message.contains("Map"), "message: {message}");
     }
 
     /// Positive control: a nested ROW of primitives must still be accepted, so the walk
