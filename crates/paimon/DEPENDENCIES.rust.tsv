@@ -8,6 +8,7 @@ aho-corasick@1.1.4											X				X
 alloc-no-stdlib@2.0.4					X													
 alloc-stdlib@0.2.4					X													
 allocator-api2@0.2.21		X									X							
+alp@0.0.4		X																
 android_system_properties@0.1.5		X									X							
 anyhow@1.0.104		X									X							
 apache-avro@0.21.0		X																
@@ -15,27 +16,18 @@ approx@0.5.1		X
 arc-swap@1.9.2		X									X							
 arcref@0.2.0											X							
 arrow@59.3.2		X																
-arrow-arith@58.4.0		X																
 arrow-arith@59.3.2		X																
-arrow-array@58.4.0		X									X							
 arrow-array@59.3.2		X									X							
-arrow-buffer@58.4.0		X																
 arrow-buffer@59.3.2		X																
-arrow-cast@58.4.0		X																
 arrow-cast@59.3.2		X																
 arrow-csv@59.3.2		X																
-arrow-data@58.4.0		X																
 arrow-data@59.3.2		X																
 arrow-ipc@59.3.2		X																
 arrow-json@59.3.2		X																
-arrow-ord@58.4.0		X																
 arrow-ord@59.3.2		X																
 arrow-row@59.3.2		X																
-arrow-schema@58.4.0		X																
 arrow-schema@59.3.2		X																
-arrow-select@58.4.0		X																
 arrow-select@59.3.2		X																
-arrow-string@58.4.0		X																
 arrow-string@59.3.2		X																
 async-channel@2.5.0		X									X							
 async-compression@0.4.42		X									X							
@@ -63,7 +55,7 @@ base64ct@1.8.3		X									X
 better_io@0.2.0		X																
 bigdecimal@0.4.10		X									X							
 bindgen@0.72.1					X													
-bit-vec@0.9.1		X									X							
+bit-vec@0.10.1		X									X							
 bitflags@2.13.1		X									X							
 bitpacking@0.9.3											X							
 bitvec@1.1.1											X							
@@ -110,7 +102,6 @@ const_for@0.1.6											X
 core-foundation@0.10.1		X									X							
 core-foundation@0.9.4		X									X							
 core-foundation-sys@0.8.7		X									X							
-core_detect@1.0.0		X									X							
 cpubits@0.1.1		X									X							
 cpufeatures@0.2.17		X									X							
 cpufeatures@0.3.0		X									X							
@@ -162,8 +153,11 @@ ext-trait-proc_macros@1.0.1		X									X					X
 extension-traits@1.0.1		X									X					X		
 fallible-streaming-iterator@0.1.9		X									X							
 fastdivide@0.4.2											X							X
-fastlanes@0.5.2		X																
+fastlanes@0.6.1		X																
+fastlanes@0.7.2		X																
 fastrand@2.5.0		X									X							
+fearless_simd@1.2.0		X									X							
+fearless_simd_macros@0.1.0		X									X							
 find-msvc-tools@0.1.9		X									X							
 flatbuffers@25.12.19		X																
 flate2@1.1.9		X									X							
@@ -174,7 +168,7 @@ foreign-types-shared@0.1.1		X									X
 form_urlencoded@1.2.2		X									X							
 fs4@0.13.1		X									X							
 fs_extra@1.3.0											X							
-fsst-rs@0.5.11		X																
+fsst-rs@0.6.0		X																
 funty@2.0.0											X							
 futures@0.3.33		X									X							
 futures-channel@0.3.33		X									X							
@@ -240,6 +234,7 @@ inventory@0.3.24		X									X
 ipnet@2.12.0		X									X							
 itertools@0.13.0		X									X							
 itertools@0.14.0		X									X							
+itertools@0.15.0		X									X							
 itoa@1.0.18		X									X							
 jieba-macros@0.10.3											X							
 jieba-rs@0.10.3											X							
@@ -324,7 +319,7 @@ objc2-core-foundation@0.3.2		X									X					X
 objc2-system-configuration@0.3.2		X									X					X		
 once_cell@1.21.4		X									X							
 oneshot@0.1.13		X									X							
-oneshot@0.2.1		X									X							
+onpair@0.2.1		X																
 opendal-core@0.59.5		X																
 opendal-http-transport-reqwest@0.59.5		X																
 opendal-layer-retry@0.59.5		X																
@@ -347,13 +342,17 @@ ordered-multimap@0.7.3											X
 ownedbytes@0.9.0											X							
 paimon@0.6.0		X																
 paimon-ftindex-core@0.1.0		X																
-paimon-mosaic-core@0.2.0		X																
+paimon-mosaic-core@0.3.0		X																
 paimon-vindex-core@0.5.0		X																
 parking@2.2.1		X									X							
 parking_lot@0.12.5		X									X							
 parking_lot_core@0.9.12		X									X							
 parquet@59.3.2		X																
+parquet-variant@59.3.2		X																
+parquet-variant-compute@59.3.2		X																
+parquet-variant-json@59.3.2		X																
 paste@1.0.15		X									X							
+pastey@0.2.3		X									X							
 pbkdf2@0.12.2		X									X							
 pco@1.0.2		X																
 pem@4.0.0											X							
@@ -493,7 +492,7 @@ strum_macros@0.27.2											X
 subtle@2.6.1					X													
 syn@1.0.109		X									X							
 syn@2.0.119		X									X							
-syn@3.0.2		X									X							
+syn@3.0.9		X									X							
 sync_wrapper@1.0.2		X																
 synstructure@0.13.2											X							
 system-configuration@0.7.0		X									X							
@@ -550,36 +549,41 @@ utf8_iter@1.0.4		X									X
 uuid@1.24.0		X									X							
 vcpkg@0.2.15		X									X							
 version_check@0.9.5		X									X							
-vortex@0.75.0		X																
-vortex-alp@0.75.0		X																
-vortex-array@0.75.0		X																
-vortex-array-macros@0.75.0		X																
-vortex-btrblocks@0.75.0		X																
-vortex-buffer@0.75.0		X																
-vortex-bytebool@0.75.0		X																
-vortex-compressor@0.75.0		X																
-vortex-datetime-parts@0.75.0		X																
-vortex-decimal-byte-parts@0.75.0		X																
-vortex-error@0.75.0		X																
-vortex-fastlanes@0.75.0		X																
-vortex-file@0.75.0		X																
-vortex-flatbuffers@0.75.0		X																
-vortex-fsst@0.75.0		X																
-vortex-io@0.75.0		X																
-vortex-ipc@0.75.0		X																
-vortex-layout@0.75.0		X																
-vortex-mask@0.75.0		X																
-vortex-metrics@0.75.0		X																
-vortex-pco@0.75.0		X																
-vortex-proto@0.75.0		X																
-vortex-runend@0.75.0		X																
-vortex-scan@0.75.0		X																
-vortex-sequence@0.75.0		X																
-vortex-session@0.75.0		X																
-vortex-sparse@0.75.0		X																
-vortex-utils@0.75.0		X																
-vortex-zigzag@0.75.0		X																
-vortex-zstd@0.75.0		X																
+vortex@0.90.0		X																
+vortex-alp@0.90.0		X																
+vortex-array@0.90.0		X																
+vortex-array-macros@0.90.0		X																
+vortex-arrow@0.90.0		X																
+vortex-btrblocks@0.90.0		X																
+vortex-buffer@0.90.0		X																
+vortex-bytebool@0.90.0		X																
+vortex-compressor@0.90.0		X																
+vortex-compute@0.90.0		X																
+vortex-datetime-parts@0.90.0		X																
+vortex-decimal-byte-parts@0.90.0		X																
+vortex-edition@0.90.0		X																
+vortex-error@0.90.0		X																
+vortex-fastlanes@0.90.0		X																
+vortex-file@0.90.0		X																
+vortex-fsst@0.90.0		X																
+vortex-io@0.90.0		X																
+vortex-ipc@0.90.0		X																
+vortex-json@0.90.0		X																
+vortex-layout@0.90.0		X																
+vortex-mask@0.90.0		X																
+vortex-metrics@0.90.0		X																
+vortex-onpair@0.90.0		X																
+vortex-parquet-variant@0.90.0		X																
+vortex-pco@0.90.0		X																
+vortex-runend@0.90.0		X																
+vortex-scan@0.90.0		X																
+vortex-sequence@0.90.0		X																
+vortex-session@0.90.0		X																
+vortex-sparse@0.90.0		X																
+vortex-utils@0.90.0		X																
+vortex-uuid@0.90.0		X																
+vortex-zigzag@0.90.0		X																
+vortex-zstd@0.90.0		X																
 walkdir@2.5.0											X				X			
 want@0.3.1											X							
 wasi@0.11.1+wasi-snapshot-preview1		X	X								X							

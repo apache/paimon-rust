@@ -166,8 +166,7 @@ impl MosaicFormatWriter {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        let legacy_schema = crate::arrow::legacy::to_legacy_schema(&physical_schema)?;
-        let encoder = MosaicWriter::new(PendingOutput::default(), &legacy_schema, options)
+        let encoder = MosaicWriter::new(PendingOutput::default(), &physical_schema, options)
             .map_err(mosaic_write_error)?;
         Ok(Self {
             output: output.writer().await?,
@@ -331,7 +330,7 @@ impl FormatFileWriter for MosaicFormatWriter {
         };
         let groups_before = self.encoder.num_row_groups();
         self.encoder
-            .write_batch(&crate::arrow::legacy::to_legacy_batch(&batch)?)
+            .write_batch(&batch)
             .map_err(mosaic_write_error)?;
         self.pending_rows = if self.encoder.num_row_groups() > groups_before {
             0

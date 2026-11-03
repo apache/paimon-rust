@@ -14,19 +14,15 @@ approx@0.5.1		X
 arc-swap@1.9.2		X									X							
 arrow@59.3.2		X																
 arrow-arith@59.3.2		X																
-arrow-array@58.4.0		X									X							
 arrow-array@59.3.2		X									X							
-arrow-buffer@58.4.0		X																
 arrow-buffer@59.3.2		X																
 arrow-cast@59.3.2		X																
 arrow-csv@59.3.2		X																
-arrow-data@58.4.0		X																
 arrow-data@59.3.2		X																
 arrow-ipc@59.3.2		X																
 arrow-json@59.3.2		X																
 arrow-ord@59.3.2		X																
 arrow-row@59.3.2		X																
-arrow-schema@58.4.0		X																
 arrow-schema@59.3.2		X																
 arrow-select@59.3.2		X																
 arrow-string@59.3.2		X																
@@ -270,7 +266,7 @@ ownedbytes@0.9.0											X
 paimon@0.6.0		X																
 paimon-c@0.6.0		X																
 paimon-ftindex-core@0.1.0		X																
-paimon-mosaic-core@0.2.0		X																
+paimon-mosaic-core@0.3.0		X																
 paimon-vindex-core@0.5.0		X																
 parquet@59.3.2		X																
 paste@1.0.15		X									X							
@@ -394,7 +390,7 @@ strum@0.27.2											X
 strum_macros@0.27.2											X							
 subtle@2.6.1					X													
 syn@2.0.119		X									X							
-syn@3.0.2		X									X							
+syn@3.0.9		X									X							
 sync_wrapper@1.0.2		X																
 synstructure@0.13.2											X							
 system-configuration@0.7.0		X									X							

@@ -36,6 +36,9 @@ use std::sync::Arc;
 
 // Adapt input and return types while retaining upstream behavior.
 pub(crate) fn apply_compatibility_fixes(ctx: &SessionContext) {
+    // Use the compatibility rewrite for Spark's optional ignoreNulls argument
+    // and default RESPECT NULLS semantics. DataFusion 55's native UDAF ignores nulls.
+    ctx.deregister_udaf("any_value");
     ctx.register_udf(date_part().as_ref().clone());
     for bits in [false, true] {
         ctx.register_udf(ScalarUDF::from(ByteLength {
@@ -297,9 +300,6 @@ impl FilteredGroups {
     }
 }
 impl GroupsAccumulator for FilteredGroups {
-    fn supports_convert_to_state(&self) -> bool {
-        self.0.supports_convert_to_state()
-    }
     fn convert_to_state(
         &self,
         values: &[ArrayRef],
@@ -321,19 +321,8 @@ impl GroupsAccumulator for FilteredGroups {
             self.0.update_batch(values, groups, None, total)
         }
     }
-    fn merge_batch(
-        &mut self,
-        values: &[ArrayRef],
-        groups: &[usize],
-        predicate: Option<&BooleanArray>,
-        total: usize,
-    ) -> Result<()> {
-        if let Some(predicate) = predicate {
-            let (values, groups) = Self::filter(values, groups, predicate)?;
-            self.0.merge_batch(&values, &groups, None, total)
-        } else {
-            self.0.merge_batch(values, groups, None, total)
-        }
+    fn merge_batch(&mut self, values: &[ArrayRef], groups: &[usize], total: usize) -> Result<()> {
+        self.0.merge_batch(values, groups, total)
     }
     fn evaluate(&mut self, emit: EmitTo) -> Result<ArrayRef> {
         self.0.evaluate(emit)

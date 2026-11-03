@@ -28,10 +28,9 @@ use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use vortex::array::arrow::{ArrowSessionExt, FromArrowArray};
-use vortex::array::dtype::arrow::FromArrowType;
 use vortex::array::dtype::DType;
 use vortex::array::{ArrayRef, VortexSessionExecute};
+use vortex::arrow::ArrowSessionExt;
 use vortex::buffer::ByteBuffer;
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
 use vortex::io::runtime::current::CurrentThreadRuntime;
@@ -181,9 +180,9 @@ fn read_vortex_batches(
         .iter()
         .any(|field| matches!(field.data_type(), ArrowDataType::Struct(_)))
     {
-        // Vortex 0.75 can apply a child ROW's validity to its parent while
-        // projecting recursive struct layouts. Read complete ROWs and their
-        // independent validity before applying selection and outer projection.
+        // Preserve each ROW's independent validity when walking recursive
+        // layouts, including files written by older Vortex versions. Apply
+        // selection and outer projection after reconstructing complete ROWs.
         let names = scan_schema
             .fields()
             .iter()
@@ -197,8 +196,10 @@ fn read_vortex_batches(
                 unreachable!()
             };
             let indices = arrow_array::UInt64Array::from_iter_values(rows.iter());
-            let indices =
-                ArrayRef::from_arrow(&indices, false).map_err(|error| Error::DataInvalid {
+            let indices = session
+                .arrow()
+                .from_arrow_array(Arc::new(indices), false)
+                .map_err(|error| Error::DataInvalid {
                     message: format!("Failed to build Vortex row selection: {error}"),
                     source: None,
                 })?;
@@ -230,7 +231,14 @@ fn read_vortex_batches(
     // Apply column projection.
     {
         use vortex::array::expr::{root, select};
-        scan_builder = scan_builder.with_projection(select(projected_names, root()));
+        scan_builder = scan_builder.with_projection(
+            select(projected_names, root())
+                .bind(vortex_file.dtype())
+                .map_err(|e| Error::DataInvalid {
+                    message: format!("Failed to bind Vortex projection: {e}"),
+                    source: None,
+                })?,
+        );
     }
 
     // Vortex 0.68 filtered scans can block indefinitely on some runtimes.
@@ -424,9 +432,9 @@ fn vortex_array_to_record_batch(
     vortex_array: ArrayRef,
     schema: &SchemaRef,
 ) -> crate::Result<RecordBatch> {
-    let target_field = arrow_schema_58::Field::new(
+    let target_field = arrow_schema::Field::new(
         "",
-        crate::arrow::legacy::to_legacy_data_type(&ArrowDataType::Struct(schema.fields().clone()))?,
+        ArrowDataType::Struct(schema.fields().clone()),
         vortex_array.dtype().is_nullable(),
     );
     let mut ctx = session.create_execution_ctx();
@@ -438,7 +446,6 @@ fn vortex_array_to_record_batch(
             source: None,
         })?;
 
-    let arrow_array = crate::arrow::legacy::from_legacy_array(&arrow_array)?;
     let struct_array = arrow_array
         .as_any()
         .downcast_ref::<arrow_array::StructArray>()
@@ -476,6 +483,8 @@ fn vortex_array_to_record_batch(
 /// writes all accumulated arrays through Vortex into an in-memory buffer before
 /// flushing that buffer to Paimon's output file.
 pub(crate) struct VortexFormatWriter {
+    /// Reuse the Arrow conversion registry across input batches.
+    session: VortexSession,
     /// Vortex dtype derived from the target Arrow schema.
     dtype: DType,
     /// Converted arrays pending final Vortex write.
@@ -491,10 +500,17 @@ pub(crate) struct VortexFormatWriter {
 impl VortexFormatWriter {
     pub(crate) async fn new(output: &OutputFile, schema: SchemaRef) -> crate::Result<Self> {
         validate_vortex_schema(&schema)?;
-        let dtype = DType::from_arrow(Arc::new(crate::arrow::legacy::to_legacy_schema(&schema)?));
+        let session = VortexSession::default();
+        let dtype = session
+            .arrow()
+            .from_arrow_schema(schema.as_ref())
+            .map_err(|e| Error::Unsupported {
+                message: format!("Failed to convert Vortex schema: {e}"),
+            })?;
         let bytes_written = Arc::new(AtomicU64::new(0));
 
         Ok(Self {
+            session,
             dtype,
             arrays: Vec::new(),
             output: output.clone(),
@@ -504,8 +520,8 @@ impl VortexFormatWriter {
     }
 }
 
-/// `DType::from_arrow` ends in `unimplemented!` for a type it has no arm for, so screen
-/// the schema first. MAP and MULTISET remain unsupported at any depth, so the
+/// Screen the schema before Arrow conversion. MAP and MULTISET remain
+/// unsupported at any depth, so the
 /// walk also checks the metadata marking the Arrow list used for MULTISET.
 fn validate_vortex_schema(schema: &SchemaRef) -> crate::Result<()> {
     for field in schema.fields() {
@@ -544,7 +560,10 @@ fn contains_unconvertible_type(data_type: &ArrowDataType) -> bool {
 impl FormatFileWriter for VortexFormatWriter {
     async fn write(&mut self, batch: &RecordBatch) -> crate::Result<()> {
         let staged_bytes = batch.get_array_memory_size();
-        let vortex_arr = ArrayRef::from_arrow(crate::arrow::legacy::to_legacy_batch(batch)?, false)
+        let vortex_arr = self
+            .session
+            .arrow()
+            .from_arrow_record_batch(batch.clone(), batch.schema_ref())
             .map_err(|e| Error::DataInvalid {
                 message: format!("Failed to convert RecordBatch to Vortex: {e}"),
                 source: None,
@@ -572,6 +591,7 @@ impl FormatFileWriter for VortexFormatWriter {
     async fn close(self: Box<Self>) -> crate::Result<FormatWriteResult> {
         let this = *self;
         let VortexFormatWriter {
+            session: _,
             dtype,
             arrays,
             output,
@@ -653,6 +673,116 @@ mod tests {
     use futures::StreamExt;
     use std::ops::Range;
 
+    #[tokio::test]
+    async fn reads_vortex_0_75_file_with_nested_nulls_projection_and_selection() {
+        use crate::spec::{IntType, RowType};
+        use arrow_array::{Array, StructArray};
+        use futures::TryStreamExt;
+
+        let bytes = Bytes::from_static(include_bytes!(
+            "../../../testdata/vortex_compat/vortex_0_75.vortex"
+        ));
+        let fields = vec![
+            DataField::new(0, "id".into(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "name".into(),
+                DataType::VarChar(VarCharType::string_type()),
+            ),
+            DataField::new(
+                2,
+                "profile".into(),
+                DataType::Row(RowType::new(vec![DataField::new(
+                    3,
+                    "detail".into(),
+                    DataType::Row(RowType::new(vec![DataField::new(
+                        4,
+                        "keep".into(),
+                        DataType::Int(IntType::new()),
+                    )])),
+                )])),
+            ),
+        ];
+        for sparse in [false, true] {
+            let projection = if sparse {
+                vec![fields[2].clone(), fields[0].clone()]
+            } else {
+                fields.clone()
+            };
+            let selection = sparse.then(|| vec![RowRange::new(1, 2), RowRange::new(511, 511)]);
+            let batches = VortexFormatReader
+                .read_batch_stream(
+                    Box::new(WholeFileOnlyRead {
+                        bytes: bytes.clone(),
+                    }),
+                    bytes.len() as u64,
+                    &projection,
+                    None,
+                    None,
+                    selection,
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let schema = crate::arrow::build_target_arrow_schema(&projection).unwrap();
+            let batch = arrow_select::concat::concat_batches(&schema, &batches).unwrap();
+            let expected_ids = if sparse {
+                vec![1, 2, 511]
+            } else {
+                (0..512).collect()
+            };
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(ids.values().as_ref(), expected_ids);
+            let profile = batch
+                .column_by_name("profile")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let detail = profile
+                .column(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let keep = detail
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for (row, id) in expected_ids.iter().enumerate() {
+                assert_eq!(profile.is_valid(row), id % 4 != 2);
+                if profile.is_valid(row) {
+                    assert_eq!(detail.is_valid(row), id % 4 != 1);
+                    if detail.is_valid(row) {
+                        assert_eq!(keep.value(row), if id % 4 == 0 { 7 } else { 9 });
+                    }
+                }
+                if !sparse {
+                    let name = batch
+                        .column_by_name("name")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    assert_eq!(name.is_null(row), id % 4 == 1);
+                    if name.is_valid(row) {
+                        assert_eq!(
+                            name.value(row),
+                            ["one", "", "three", "four"][*id as usize % 4]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn test_arrow_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
@@ -697,9 +827,13 @@ mod tests {
             Some(NullBuffer::from(vec![true, true, false])),
         );
         let original = RecordBatch::try_new(schema.clone(), vec![Arc::new(profile)]).unwrap();
+        let session = VortexSession::default();
         let memory = vortex_array_to_record_batch(
-            &VortexSession::default(),
-            ArrayRef::from_arrow(original.clone(), false).unwrap(),
+            &session,
+            session
+                .arrow()
+                .from_arrow_record_batch(original.clone(), original.schema_ref())
+                .unwrap(),
             &schema,
         )
         .unwrap();

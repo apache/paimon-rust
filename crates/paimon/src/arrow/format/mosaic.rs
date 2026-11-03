@@ -511,7 +511,6 @@ fn read_planned_row_group(
         .row_group_reader_by_names(plan.index, &names)
         .map_err(mosaic_read_error)?;
     let batch = row_group_reader.read_columns().map_err(mosaic_read_error)?;
-    let batch = crate::arrow::legacy::from_legacy_batch(&batch)?;
     take_row_slices(batch, plan.selected_slices.as_deref(), read_schema)
 }
 
@@ -822,9 +821,7 @@ fn validate_mosaic_arrow_type(data_type: &ArrowDataType) -> Result<(), String> {
     if crate::arrow::multiset::contains_multiset(data_type) {
         return Err("MULTISET is not supported by Mosaic".into());
     }
-    let data_type =
-        crate::arrow::legacy::to_legacy_data_type(data_type).map_err(|error| error.to_string())?;
-    paimon_mosaic_core::types::validate_data_type(&data_type)
+    paimon_mosaic_core::types::validate_data_type(data_type)
 }
 
 fn selected_slices_for_row_group(
@@ -1225,7 +1222,7 @@ mod tests {
         let out = MemOutputFile::new();
         let mut writer = MosaicWriter::new(
             out,
-            &crate::arrow::legacy::to_legacy_schema(batches[0].schema().as_ref()).unwrap(),
+            batches[0].schema().as_ref(),
             WriterOptions {
                 compression: COMPRESSION_NONE,
                 num_buckets: 2,
@@ -1236,9 +1233,7 @@ mod tests {
         )
         .unwrap();
         for batch in batches {
-            writer
-                .write_batch(&crate::arrow::legacy::to_legacy_batch(batch).unwrap())
-                .unwrap();
+            writer.write_batch(batch).unwrap();
         }
         writer.close().unwrap();
         Bytes::from(writer.output().data.to_vec())
@@ -1442,7 +1437,7 @@ mod tests {
         let out = MemOutputFile::new();
         let mut writer = MosaicWriter::new(
             out,
-            &crate::arrow::legacy::to_legacy_schema(batches[0].schema().as_ref()).unwrap(),
+            batches[0].schema().as_ref(),
             WriterOptions {
                 compression: COMPRESSION_NONE,
                 num_buckets: 1,
@@ -1453,9 +1448,7 @@ mod tests {
         )
         .unwrap();
         for batch in batches {
-            writer
-                .write_batch(&crate::arrow::legacy::to_legacy_batch(batch).unwrap())
-                .unwrap();
+            writer.write_batch(batch).unwrap();
         }
         writer.close().unwrap();
         Bytes::from(writer.output().data.to_vec())

@@ -16,7 +16,6 @@
 // under the License.
 
 mod date_extract;
-pub(crate) mod legacy;
 pub(crate) mod multiset;
 pub(crate) use date_extract::evaluate_date_extract;
 mod cast_width;
