@@ -56,6 +56,10 @@ mod temporal;
 
 #[pymodule]
 fn pypaimon_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Wheels are versioned by maturin from the Cargo manifest. Release
+    // candidates append an `rcN` suffix to the distribution version in
+    // pyproject.toml only, so this is the Cargo base version.
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     error::register_module(py, m)?;
     context::register_module(py, m)?;
     m.add_function(wrap_pyfunction!(temporal::temporal_match, m)?)?;
