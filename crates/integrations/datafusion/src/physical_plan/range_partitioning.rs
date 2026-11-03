@@ -44,11 +44,28 @@ pub(super) fn range_partitioned_splits(
     partitions: &[Arc<[DataSplit]>],
 ) -> Option<(Vec<Arc<[DataSplit]>>, Partitioning)> {
     let fields = table.schema().partition_fields();
+    let options = table.schema().core_options();
     if fields.is_empty()
         || fields.len() != table.schema().partition_keys().len()
         || partitions.len() < 2
         || read_type.len() != schema.fields().len()
-        || table.schema().core_options().query_auth_enabled()
+        || options.query_auth_enabled()
+    {
+        return None;
+    }
+
+    // Native PK value aggregation can change non-key partition columns. Those
+    // values can remain in files even after the merge engine is changed, so the
+    // current engine alone cannot prove range membership. Full PK columns are
+    // immutable; format-table readers reconstruct partition columns from splits.
+    let primary_keys = table.schema().primary_keys();
+    if !options.is_format_table()
+        && !primary_keys.is_empty()
+        && table
+            .schema()
+            .partition_keys()
+            .iter()
+            .any(|key| !primary_keys.contains(key))
     {
         return None;
     }

@@ -144,6 +144,137 @@ async fn integer_ranges_keep_equal_keys_together_and_avoid_aggregation_shuffle()
 }
 
 #[tokio::test]
+async fn aggregation_of_non_primary_partition_keys_keeps_unknown_distribution() {
+    let (_tmp, ctx) = common::setup_sql_context().await;
+    common::exec(&ctx, "SET datafusion.execution.target_partitions = 2").await;
+    common::exec(&ctx, "CREATE TABLE paimon.test_db.aggregated_ranges (id INT NOT NULL, pt INT, value INT, PRIMARY KEY (id)) PARTITIONED BY (pt) WITH ('bucket' = '-1', 'merge-engine' = 'aggregation', 'fields.pt.aggregate-function' = 'sum', 'fields.value.aggregate-function' = 'sum')").await;
+    common::exec(
+        &ctx,
+        "INSERT INTO paimon.test_db.aggregated_ranges VALUES (1, 1, 10), (2, 2, 30)",
+    )
+    .await;
+    common::exec(
+        &ctx,
+        "INSERT INTO paimon.test_db.aggregated_ranges VALUES (1, 1, 20)",
+    )
+    .await;
+    let query = "SELECT pt AS id, CAST(sum(value) AS INT) AS value FROM paimon.test_db.aggregated_ranges GROUP BY pt";
+    assert_eq!(common::collect_id_value(&ctx, query).await, vec![(2, 60)]);
+    let physical = plan(
+        &ctx,
+        "SELECT id, pt, value FROM paimon.test_db.aggregated_ranges",
+    )
+    .await;
+    assert!(matches!(
+        scan(&physical).output_partitioning(),
+        Partitioning::UnknownPartitioning(_)
+    ));
+}
+
+#[tokio::test]
+async fn partial_update_of_non_primary_partition_keys_keeps_unknown_distribution() {
+    let (_tmp, ctx) = common::setup_sql_context().await;
+    common::exec(&ctx, "SET datafusion.execution.target_partitions = 2").await;
+    common::exec(&ctx, "CREATE TABLE paimon.test_db.partial_ranges (id INT NOT NULL, pt INT, ver INT, value INT, PRIMARY KEY (id)) PARTITIONED BY (pt) WITH ('bucket' = '-1', 'merge-engine' = 'partial-update', 'fields.ver.sequence-group' = 'pt,value', 'fields.pt.aggregate-function' = 'sum', 'fields.value.aggregate-function' = 'sum')").await;
+    common::exec(
+        &ctx,
+        "INSERT INTO paimon.test_db.partial_ranges VALUES (1, 1, 1, 10), (2, 2, 1, 30)",
+    )
+    .await;
+    common::exec(
+        &ctx,
+        "INSERT INTO paimon.test_db.partial_ranges VALUES (1, 1, 2, 20)",
+    )
+    .await;
+    let query = "SELECT pt AS id, CAST(sum(value) AS INT) AS value FROM paimon.test_db.partial_ranges GROUP BY pt";
+    assert_eq!(common::collect_id_value(&ctx, query).await, vec![(2, 60)]);
+    let physical = plan(
+        &ctx,
+        "SELECT id, pt, value FROM paimon.test_db.partial_ranges",
+    )
+    .await;
+    assert!(matches!(
+        scan(&physical).output_partitioning(),
+        Partitioning::UnknownPartitioning(_)
+    ));
+}
+
+#[tokio::test]
+async fn historically_aggregated_non_primary_partition_keys_keep_unknown_distribution() {
+    let (_tmp, ctx) = common::setup_sql_context().await;
+    common::exec(&ctx, "SET datafusion.execution.target_partitions = 2").await;
+    common::exec(&ctx, "CREATE TABLE paimon.test_db.historical_ranges (id INT NOT NULL, pt INT, value INT, PRIMARY KEY (id)) PARTITIONED BY (pt) WITH ('bucket' = '-1', 'merge-engine' = 'aggregation', 'fields.pt.aggregate-function' = 'sum', 'fields.value.aggregate-function' = 'sum')").await;
+    // Writer-side aggregation persists pt=2 in a file assigned to partition 1.
+    common::exec(
+        &ctx,
+        "INSERT INTO paimon.test_db.historical_ranges VALUES (1, 1, 10), (1, 1, 20), (2, 2, 30)",
+    )
+    .await;
+    common::exec(
+        &ctx,
+        "ALTER TABLE paimon.test_db.historical_ranges SET ('merge-engine' = 'deduplicate')",
+    )
+    .await;
+    let query = "SELECT pt AS id, CAST(sum(value) AS INT) AS value FROM paimon.test_db.historical_ranges GROUP BY pt";
+    assert_eq!(common::collect_id_value(&ctx, query).await, vec![(2, 60)]);
+    let physical = plan(
+        &ctx,
+        "SELECT id, pt, value FROM paimon.test_db.historical_ranges",
+    )
+    .await;
+    assert!(matches!(
+        scan(&physical).output_partitioning(),
+        Partitioning::UnknownPartitioning(_)
+    ));
+}
+
+#[tokio::test]
+async fn merge_engines_preserve_ranges_for_partition_columns_in_the_primary_key() {
+    let (_tmp, ctx) = common::setup_sql_context().await;
+    common::exec(&ctx, "SET datafusion.execution.target_partitions = 2").await;
+    for (name, engine, extra) in [
+        (
+            "aggregation_full_pk",
+            "aggregation",
+            ", 'fields.pt.aggregate-function' = 'sum'",
+        ),
+        (
+            "partial_full_pk",
+            "partial-update",
+            ", 'fields.ver.sequence-group' = 'value'",
+        ),
+    ] {
+        common::exec(&ctx, &format!("CREATE TABLE paimon.test_db.{name} (id INT NOT NULL, pt INT NOT NULL, ver INT, value INT, PRIMARY KEY (pt, id)) PARTITIONED BY (pt) WITH ('bucket' = '1', 'merge-engine' = '{engine}', 'fields.value.aggregate-function' = 'sum'{extra})")).await;
+        common::exec(
+            &ctx,
+            &format!("INSERT INTO paimon.test_db.{name} VALUES (1, 1, 1, 10), (2, 2, 1, 30)"),
+        )
+        .await;
+        common::exec(
+            &ctx,
+            &format!("INSERT INTO paimon.test_db.{name} VALUES (1, 1, 2, 20)"),
+        )
+        .await;
+        let query = format!("SELECT pt AS id, CAST(sum(value) AS INT) AS value FROM paimon.test_db.{name} GROUP BY pt");
+        let physical = plan(&ctx, &query).await;
+        let text = displayable(physical.as_ref()).indent(true).to_string();
+        assert!(
+            matches!(
+                scan(&physical).output_partitioning(),
+                Partitioning::Range(_)
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("RepartitionExec"), "{text}");
+        assert_eq!(
+            common::collect_id_value(&ctx, &query).await,
+            vec![(1, 30), (2, 30)],
+            "{engine}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn joins_align_different_ranges_after_primary_key_updates() {
     let (_tmp, ctx) = common::setup_sql_context().await;
     common::exec(&ctx, "SET datafusion.execution.target_partitions = 2").await;

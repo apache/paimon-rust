@@ -95,8 +95,10 @@ Unpartitioned tables, empty scans, scans with only one execution partition or on
 distinct key, missing/projected-out keys, unsupported types (including floating
 point, binary, and timestamp keys), unreadable partition metadata, and scans with
 query authorization or attached authorization rules retain `UnknownPartitioning`
-and their original split assignments. File min/max statistics and hash buckets
-alone are not used to infer ranges.
+and their original split assignments. Native primary-key tables also retain
+`UnknownPartitioning` unless every partition column belongs to the primary key:
+current or historical value aggregation can change a non-key partition column.
+File min/max statistics and hash buckets alone are not used to infer ranges.
 
 ## Registering Catalog
 
