@@ -3324,6 +3324,13 @@ fn build_pk_vector_table(path: &str, vectors: &[[f32; PK_DIM]]) -> Table {
     );
 
     crate::runtime().block_on(async {
+        // Automatic compaction reloads the schema from storage after committing.
+        file_io
+            .new_output(&table.schema_manager().schema_path(table.schema().id()))
+            .unwrap()
+            .write(serde_json::to_vec(table.schema()).unwrap().into())
+            .await
+            .unwrap();
         // Write a real data file via the public write path to obtain a genuine
         // DataFileMeta (name, row count, stats, file size).
         let write_builder = table.new_write_builder();

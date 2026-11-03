@@ -27,7 +27,7 @@ under the License.
 [dependencies]
 paimon = "0.6.0"
 paimon-datafusion = "0.6.0"
-datafusion = "54.0.0"
+datafusion = "55.2.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -36,7 +36,7 @@ and writes to ordinary Paimon tables can create them with `file.format=mosaic`.
 
 ## SQL Support Scope
 
-`paimon-datafusion` currently targets Apache DataFusion 54.x. The workspace pins `datafusion = "54.0.0"`.
+`paimon-datafusion` currently targets Apache DataFusion 55.x. The workspace uses `datafusion = "55.2.0"`.
 
 SQL support has two layers:
 
@@ -46,6 +46,42 @@ SQL support has two layers:
 Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. Persistent `CREATE FUNCTION` is supported only for the REST Catalog SQL scalar form documented below. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
 
 For the exact delegated SQL grammar, see the [DataFusion SQL Reference](https://datafusion.apache.org/user-guide/sql/index.html).
+
+### DataFusion 55 integration
+
+Paimon Parquet scans refresh supported dynamic predicates before reading each
+remaining row group. This lets an `ORDER BY ... LIMIT` threshold skip groups
+that can no longer contribute. Missing statistics, unsupported predicates, and
+snapshot errors keep the group readable; the original runtime filter still
+checks decoded rows. Floating-point predicates stay with DataFusion's row
+filter because Parquet bounds do not account for NaN ordering.
+
+The NULL-propagating `parse_json`, `try_parse_json`, `variant_get`,
+`try_variant_get`, `path_to_descriptor`, `descriptor_to_string`, and `blob_view`
+functions declare DataFusion's strict UDF metadata. This enables outer join
+elimination when a filter rejects their NULL results. `is_variant_null` keeps
+its distinct SQL NULL behavior.
+
+Regular and audit-log scans report actual output rows, batches, bytes, and
+compute time to DataFusion. For example, PostgreSQL-compatible JSON plans can
+be requested with:
+
+```sql
+EXPLAIN (ANALYZE, FORMAT pgjson, METRICS 'rows')
+SELECT * FROM paimon.default.my_table WHERE id > 10;
+```
+
+DataFusion's built-in array functions (including `array_scale`, `array_sum`,
+and `unnest_outer`) and its planner, aggregation, and spill improvements are
+available through the normal session. Custom spill backends can be configured
+on the `RuntimeEnv` passed to `SQLContext::builder`.
+
+Paimon `MERGE INTO` continues to use `SQLContext`'s Paimon write implementation.
+DataFusion's generic `TableProvider::merge_into` hook, `file_row_index()` and
+`input_file_name()` for Paimon scans, range-partition declarations, and custom
+query-planner FFI are not provided by this upgrade. In particular, Paimon's
+logical row IDs are not physical file row offsets, and ordinary scan splits
+do not guarantee disjoint sorted ranges.
 
 ## Registering Catalog
 
