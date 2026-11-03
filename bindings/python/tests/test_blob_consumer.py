@@ -15,7 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import gc
 import struct
+import sys
+import threading
+import weakref
 from urllib.parse import urlparse
 
 import pyarrow as pa
@@ -129,5 +133,102 @@ def test_blob_consumer_replacement_and_clear(tmp_path):
             writer.with_blob_consumer(123)
         writer.with_blob_consumer(None)
         writer.write_arrow(_batch())
+    finally:
+        writer.close()
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('captured', [False, True])
+def test_writer_callback_cycles_are_collected_on_another_thread(
+        tmp_path, monkeypatch, stream, captured):
+    _, table = _table(tmp_path)
+    finalized = []
+    unraisable = []
+    monkeypatch.setattr(sys, 'unraisablehook',
+                        lambda event: unraisable.append(str(event.exc_value)))
+
+    class Callback:
+        def __init__(self, writer, label):
+            self.writer = writer
+            self.label = label
+
+        def __call__(self, field, descriptor):
+            return False
+
+        def __del__(self):
+            finalized.append((self.label, threading.get_ident()))
+
+    def cycle():
+        builder = (table.new_stream_write_builder() if stream
+                   else table.new_batch_write_builder())
+        writer = builder.new_write()
+        callback = Callback(writer, 'first')
+        writer.with_blob_consumer(callback)
+        references = [weakref.ref(callback)]
+        if captured:
+            writer.write_arrow(_batch())
+            replacement = Callback(writer, 'second')
+            writer.with_blob_consumer(replacement)
+            references.append(weakref.ref(replacement))
+        return references
+
+    gc.collect()
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        references = cycle()
+        collector = threading.Thread(target=gc.collect)
+        collector.start()
+        collector.join()
+        assert unraisable == []
+        assert all(reference() is None for reference in references)
+        expected = ['first', 'second'] if captured else ['first']
+        assert sorted(finalized) == [(label, collector.ident) for label in expected]
+    finally:
+        # Also clean up the original-thread-only implementation on failure.
+        gc.collect()
+        if enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_writer_thread_handoff_keeps_exclusive_access(tmp_path, stream):
+    context, table = _table(tmp_path)
+    builder = (table.new_stream_write_builder() if stream
+               else table.new_batch_write_builder())
+    writer = builder.new_write()
+    entered = threading.Event()
+    release = threading.Event()
+    failures = []
+
+    def callback(field, descriptor):
+        entered.set()
+        assert release.wait(10)
+        return False
+
+    def write():
+        try:
+            writer.write_arrow(_batch())
+        except BaseException as error:
+            failures.append(str(error))
+
+    writer.with_blob_consumer(callback)
+    worker = threading.Thread(target=write)
+    try:
+        worker.start()
+        assert entered.wait(10), failures
+        with pytest.raises(RuntimeError, match='Already borrowed'):
+            writer.close()
+    finally:
+        release.set()
+        worker.join()
+    try:
+        assert failures == []
+        messages = writer.prepare_commit(True, 1) if stream else writer.prepare_commit()
+        commit = builder.new_commit()
+        commit.commit(1, messages) if stream else commit.commit(messages)
+        assert pa.Table.from_batches(context.sql(
+            'SELECT id, payload FROM paimon.consumer.t ORDER BY id')).to_pydict() == {
+                'id': [1, 2, 3], 'payload': [b'payload', None, b'']}
     finally:
         writer.close()
