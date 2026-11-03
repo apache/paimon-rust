@@ -22,29 +22,24 @@
 //! - **Append-only tables** (no PK, no deletion vectors): copy-on-write file rewriting
 //!   via [`paimon::table::CopyOnWriteMergeWriter`].
 
-use std::collections::{HashMap, HashSet};
-use std::ops::ControlFlow;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use datafusion::arrow::array::{
-    Array, ArrayRef, Int32Array, RecordBatch, UInt32Array, UInt64Array,
-};
-use datafusion::arrow::compute;
+use datafusion::arrow::array::{Array, Int32Array, RecordBatch, UInt32Array, UInt64Array};
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
-use datafusion::sql::sqlparser::ast::{
-    visit_expressions_mut, AssignmentTarget, BinaryOperator, Expr as SqlExpr, Ident, Merge,
-    MergeAction, MergeClauseKind, MergeInsertExpr, MergeInsertKind, TableFactor, VisitMut,
-};
 use futures::TryStreamExt;
 
-use paimon::spec::{datums_to_binary_row, extract_datum_from_arrow, CoreOptions, DataField};
-use paimon::table::{CopyOnWriteMergeWriter, DataSplitBuilder, Table, WriteBuilder};
+use paimon::spec::{datums_to_binary_row, extract_datum_from_arrow, DataField};
+use paimon::table::{CopyOnWriteMergeWriter, DataSplitBuilder, Table};
 
 use crate::error::to_datafusion_error;
-use crate::sql_context::{normalize_schema_identifier, SQLContext};
+use crate::sql_context::SQLContext;
+
+mod native;
+pub(crate) use native::plan_merge;
 
 /// Maximum number of retries when DML conflicts with concurrent compaction.
 const DML_MAX_RETRIES: u32 = 5;
@@ -92,14 +87,14 @@ impl Drop for TempTableTracker<'_> {
 }
 
 /// Retry a DML operation on conflict, using `is_retryable` to detect retryable errors.
-pub(crate) async fn retry_on_conflict<F, Fut>(
+pub(crate) async fn retry_on_conflict<F, Fut, T>(
     op_name: &str,
     is_retryable: fn(&DataFusionError) -> bool,
     mut action: F,
-) -> DFResult<DataFrame>
+) -> DFResult<T>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = DFResult<DataFrame>>,
+    Fut: std::future::Future<Output = DFResult<T>>,
 {
     let mut last_err = None;
     for _ in 0..DML_MAX_RETRIES {
@@ -120,35 +115,15 @@ where
     ))))
 }
 
-/// Execute a MERGE INTO statement on a Paimon table.
-///
-/// Dispatches to the appropriate execution path based on table type:
-/// - Data evolution tables → partial-column writes via `DataEvolutionWriter`
-/// - Append-only tables (no PK) → copy-on-write file rewriting via `CopyOnWriteMergeWriter`
-pub(crate) async fn execute_merge_into(
-    ctx: &SQLContext,
-    merge: &Merge,
-    table: Table,
-    enable_ident_normalization: bool,
-) -> DFResult<DataFrame> {
-    let schema = table.schema();
-    let core_options = CoreOptions::new(schema.options());
-
-    if core_options.data_evolution_enabled() {
-        execute_data_evolution_merge(ctx, merge, table, enable_ident_normalization).await
-    } else if schema.trimmed_primary_keys().is_empty() {
-        execute_cow_merge(ctx, merge, table, enable_ident_normalization).await
-    } else {
-        Err(DataFusionError::Plan(
-            "MERGE INTO on primary-key tables without data-evolution is not supported".to_string(),
-        ))
-    }
-}
-
 /// Check if a DataFusion error is caused by a row ID conflict during commit.
 pub(crate) fn is_row_id_conflict(err: &DataFusionError) -> bool {
     match err {
-        DataFusionError::External(e) => e.to_string().contains("Row ID conflict"),
+        DataFusionError::External(e) => {
+            matches!(
+                e.downcast_ref::<paimon::Error>(),
+                Some(paimon::Error::RowIdExistenceConflict { .. })
+            ) || e.to_string().contains("Row ID conflict")
+        }
         _ => false,
     }
 }
@@ -156,660 +131,14 @@ pub(crate) fn is_row_id_conflict(err: &DataFusionError) -> bool {
 /// Check if a DataFusion error is caused by a delete conflict during commit.
 pub(crate) fn is_delete_conflict(err: &DataFusionError) -> bool {
     match err {
-        DataFusionError::External(e) => e.to_string().contains("Delete conflict"),
+        DataFusionError::External(e) => {
+            matches!(
+                e.downcast_ref::<paimon::Error>(),
+                Some(paimon::Error::RowIdExistenceConflict { .. })
+            ) || e.to_string().contains("Delete conflict")
+        }
         _ => false,
     }
-}
-
-// ---------------------------------------------------------------------------
-// Data evolution path (existing)
-// ---------------------------------------------------------------------------
-
-/// Execute MERGE INTO on a data evolution table with retry on row ID conflict.
-async fn execute_data_evolution_merge(
-    ctx: &SQLContext,
-    merge: &Merge,
-    table: Table,
-    enable_ident_normalization: bool,
-) -> DFResult<DataFrame> {
-    retry_on_conflict("MERGE INTO", is_row_id_conflict, || {
-        execute_merge_into_once(ctx, merge, &table, enable_ident_normalization)
-    })
-    .await
-}
-
-// ---------------------------------------------------------------------------
-// Copy-on-Write path (append-only tables, no PK)
-// ---------------------------------------------------------------------------
-
-/// Parsed CoW merge clauses — supports UPDATE, DELETE, and INSERT.
-struct CowMergeClauses {
-    /// Ordered list of WHEN MATCHED clauses (preserves SQL ordering for correct semantics).
-    matched: Vec<CowMatchedClause>,
-    inserts: Vec<MergeInsertClause>,
-}
-
-/// A single WHEN MATCHED clause with optional predicate.
-struct CowMatchedClause {
-    action: CowMatchedAction,
-    predicate: Option<String>,
-}
-
-enum CowMatchedAction {
-    Update(MergeUpdateClause),
-    Delete,
-}
-
-/// Parse MERGE clauses for the CoW path (supports DELETE unlike the data-evolution parser).
-fn extract_cow_merge_clauses(
-    merge: &Merge,
-    enable_ident_normalization: bool,
-) -> DFResult<CowMergeClauses> {
-    let mut matched: Vec<CowMatchedClause> = Vec::new();
-    let mut inserts: Vec<MergeInsertClause> = Vec::new();
-
-    for clause in &merge.clauses {
-        match clause.clause_kind {
-            MergeClauseKind::Matched => {
-                let predicate = clause.predicate.as_ref().map(|p| p.to_string());
-                match &clause.action {
-                    MergeAction::Update(update_expr) => {
-                        let mut columns = Vec::new();
-                        let mut exprs = Vec::new();
-                        for assignment in &update_expr.assignments {
-                            let col_name = match &assignment.target {
-                                AssignmentTarget::ColumnName(name) => name
-                                    .0
-                                    .last()
-                                    .and_then(|p| p.as_ident())
-                                    .map(|ident| {
-                                        normalize_schema_identifier(
-                                            ident,
-                                            enable_ident_normalization,
-                                        )
-                                    })
-                                    .ok_or_else(|| {
-                                        DataFusionError::Plan(format!(
-                                            "Invalid column name in SET: {name}"
-                                        ))
-                                    })?,
-                                AssignmentTarget::Tuple(_) => {
-                                    return Err(DataFusionError::Plan(
-                                        "Tuple assignment in MERGE INTO SET is not supported"
-                                            .to_string(),
-                                    ));
-                                }
-                            };
-                            columns.push(col_name);
-                            exprs.push(assignment.value.to_string());
-                        }
-                        matched.push(CowMatchedClause {
-                            action: CowMatchedAction::Update(MergeUpdateClause { columns, exprs }),
-                            predicate,
-                        });
-                    }
-                    MergeAction::Delete { .. } => {
-                        matched.push(CowMatchedClause {
-                            action: CowMatchedAction::Delete,
-                            predicate,
-                        });
-                    }
-                    MergeAction::Insert(_) => {
-                        return Err(DataFusionError::Plan(
-                            "WHEN MATCHED THEN INSERT is not valid SQL".to_string(),
-                        ));
-                    }
-                }
-            }
-            MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget => {
-                match &clause.action {
-                    MergeAction::Insert(insert_expr) => {
-                        inserts.push(extract_merge_insert_clause(
-                            insert_expr,
-                            clause.predicate.as_ref(),
-                            enable_ident_normalization,
-                        )?);
-                    }
-                    _ => {
-                        return Err(DataFusionError::Plan(
-                            "WHEN NOT MATCHED only supports INSERT".to_string(),
-                        ));
-                    }
-                }
-            }
-            MergeClauseKind::NotMatchedBySource => {
-                return Err(DataFusionError::Plan(
-                    "WHEN NOT MATCHED BY SOURCE is not yet supported for CoW MERGE INTO"
-                        .to_string(),
-                ));
-            }
-        }
-    }
-
-    if matched.is_empty() && inserts.is_empty() {
-        return Err(DataFusionError::Plan(
-            "MERGE INTO requires at least one WHEN MATCHED or WHEN NOT MATCHED clause".to_string(),
-        ));
-    }
-
-    Ok(CowMergeClauses { matched, inserts })
-}
-
-/// Execute MERGE INTO on an append-only table with retry on delete conflict.
-async fn execute_cow_merge(
-    ctx: &SQLContext,
-    merge: &Merge,
-    table: Table,
-    enable_ident_normalization: bool,
-) -> DFResult<DataFrame> {
-    retry_on_conflict("CoW MERGE INTO", is_delete_conflict, || {
-        execute_cow_merge_once(ctx, merge, &table, enable_ident_normalization)
-    })
-    .await
-}
-
-/// Execute a single attempt of CoW MERGE INTO.
-async fn execute_cow_merge_once(
-    ctx: &SQLContext,
-    merge: &Merge,
-    table: &Table,
-    enable_ident_normalization: bool,
-) -> DFResult<DataFrame> {
-    let (source_ref, source_alias) = extract_source_ref(&merge.source)?;
-    let (target_ref, target_alias) = extract_table_ref(&merge.table)?;
-    let s_alias = source_alias.as_deref().unwrap_or(&source_ref);
-    let t_alias = target_alias.as_deref().unwrap_or("__cow_t");
-
-    // Rewrite column qualifiers before rendering SQL, preserving literal contents.
-    let mut aliased_merge = merge.clone();
-    rewrite_table_references(
-        &mut aliased_merge.on,
-        &target_ref,
-        t_alias,
-        &source_ref,
-        s_alias,
-    );
-    rewrite_table_references(
-        &mut aliased_merge.clauses,
-        &target_ref,
-        t_alias,
-        &source_ref,
-        s_alias,
-    );
-    let clauses = extract_cow_merge_clauses(&aliased_merge, enable_ident_normalization)?;
-    validate_merge_insert_columns(&clauses.inserts, table.schema().fields())?;
-    for matched in &clauses.matched {
-        if let CowMatchedAction::Update(update) = &matched.action {
-            validate_update_columns(&update.columns, table.schema().fields())?;
-        }
-    }
-
-    // Collect the union of all update columns across matched clauses (preserving order)
-    let mut update_columns: Vec<String> = Vec::new();
-    for mc in &clauses.matched {
-        if let CowMatchedAction::Update(upd) = &mc.action {
-            for col in &upd.columns {
-                if !update_columns.contains(col) {
-                    update_columns.push(col.clone());
-                }
-            }
-        }
-    }
-
-    let on_expr = &merge.on;
-    let on_condition = aliased_merge.on.to_string();
-
-    // Build partition filter from source data to avoid scanning all partitions
-    let partition_set =
-        build_source_partition_set(ctx, table, &source_ref, s_alias, t_alias, on_expr).await?;
-
-    let mut writer = CopyOnWriteMergeWriter::new(table, update_columns.clone(), partition_set)
-        .await
-        .map_err(to_datafusion_error)?;
-
-    // Read each target file individually, attach __paimon_file_idx and __paimon_row_offset
-    let mut temp_tracker = TempTableTracker::new(ctx);
-    let (has_target_data, cow_table_name) =
-        register_cow_target_table(ctx, table, &writer, &mut temp_tracker).await?;
-    let wb = table.new_write_builder();
-
-    let merge_ctx = CowMergeContext {
-        source_ref: &source_ref,
-        s_alias,
-        t_alias,
-        on_condition: &on_condition,
-        has_target_data,
-        cow_table_name,
-        update_columns: &update_columns,
-    };
-
-    let result = execute_cow_merge_inner(
-        ctx,
-        &clauses,
-        &mut writer,
-        &wb,
-        table,
-        &merge_ctx,
-        &mut temp_tracker,
-    )
-    .await;
-
-    let (insert_messages, total_count) = result?;
-
-    // CoW rewrite: prepare_commit consumes the writer
-    let cow_messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
-
-    let mut all_messages = cow_messages;
-    all_messages.extend(insert_messages);
-
-    if !all_messages.is_empty() {
-        wb.try_new_commit()
-            .map_err(to_datafusion_error)?
-            .commit(all_messages)
-            .await
-            .map_err(to_datafusion_error)?;
-    }
-
-    ok_result(ctx.ctx(), total_count)
-}
-
-/// Context for CoW merge inner execution — groups join-related parameters.
-struct CowMergeContext<'a> {
-    source_ref: &'a str,
-    s_alias: &'a str,
-    t_alias: &'a str,
-    on_condition: &'a str,
-    has_target_data: bool,
-    cow_table_name: String,
-    update_columns: &'a [String],
-}
-
-/// Inner function that populates the CoW writer with matched operations and handles INSERT.
-/// Returns (insert_commit_messages, total_affected_count).
-async fn execute_cow_merge_inner(
-    ctx: &SQLContext,
-    clauses: &CowMergeClauses,
-    writer: &mut CopyOnWriteMergeWriter,
-    wb: &WriteBuilder<'_>,
-    table: &Table,
-    merge_ctx: &CowMergeContext<'_>,
-    temp_tracker: &mut TempTableTracker<'_>,
-) -> DFResult<(Vec<paimon::table::CommitMessage>, u64)> {
-    let source_ref = merge_ctx.source_ref;
-    let s_alias = merge_ctx.s_alias;
-    let t_alias = merge_ctx.t_alias;
-    let on_condition = merge_ctx.on_condition;
-    let has_target_data = merge_ctx.has_target_data;
-    let cow_table_name = &merge_ctx.cow_table_name;
-    let cow_target_name = cow_table_name.clone();
-    let update_columns = merge_ctx.update_columns;
-    let mut insert_messages = Vec::new();
-    let mut total_count: u64 = 0;
-
-    if has_target_data && !clauses.matched.is_empty() {
-        let mut update_value_batches: Vec<RecordBatch> = Vec::new();
-        let mut update_batch_counter: usize = 0;
-        // Track consumed predicates for correct multi-clause ordering:
-        // each clause only applies to rows NOT matched by any previous clause.
-        let mut consumed_predicates: Vec<String> = Vec::new();
-
-        for mc in &clauses.matched {
-            // Build WHERE clause: exclude rows consumed by previous clauses, then apply this predicate
-            let mut conditions: Vec<String> = Vec::new();
-            for prev in &consumed_predicates {
-                // Only TRUE consumes a row; FALSE and NULL fall through.
-                conditions.push(format!("({prev}) IS NOT TRUE"));
-            }
-            if let Some(ref pred) = mc.predicate {
-                // Preserve OR grouping when combined with previous-clause exclusions.
-                conditions.push(format!("({pred})"));
-                consumed_predicates.push(pred.clone());
-            } else {
-                consumed_predicates.push("TRUE".to_string());
-            }
-            let where_clause = if conditions.is_empty() {
-                String::new()
-            } else {
-                format!(" WHERE {}", conditions.join(" AND "))
-            };
-
-            match &mc.action {
-                CowMatchedAction::Update(upd) => {
-                    let mut select_parts = vec![
-                        format!("{t_alias}.\"__paimon_file_idx\""),
-                        format!("{t_alias}.\"__paimon_row_offset\""),
-                    ];
-                    let clause_col_map: HashMap<&str, &str> = upd
-                        .columns
-                        .iter()
-                        .zip(upd.exprs.iter())
-                        .map(|(c, e)| (c.as_str(), e.as_str()))
-                        .collect();
-                    for col in update_columns {
-                        let quoted_alias = quote_identifier(&format!("__upd_{col}"));
-                        if let Some(expr) = clause_col_map.get(&col.as_str()) {
-                            select_parts.push(format!("{expr} AS {quoted_alias}"));
-                        } else {
-                            select_parts.push(format!(
-                                "{t_alias}.{} AS {quoted_alias}",
-                                quote_identifier(col)
-                            ));
-                        }
-                    }
-                    let select_clause = select_parts.join(", ");
-                    let join_sql = format!(
-                        "SELECT {select_clause} FROM {source_ref} AS {s_alias} \
-                         INNER JOIN {cow_target_name} AS {t_alias} ON {on_condition}{where_clause}"
-                    );
-
-                    let join_result = ctx.ctx().sql(&join_sql).await?.collect().await?;
-
-                    for batch in &join_result {
-                        if batch.num_rows() == 0 {
-                            continue;
-                        }
-
-                        let (file_idx_col, row_offset_col) = extract_tracking_columns(batch)?;
-
-                        let mut upd_fields = Vec::new();
-                        let mut upd_columns: Vec<Arc<dyn Array>> = Vec::new();
-                        for col in update_columns {
-                            let prefixed = format!("__upd_{col}");
-                            let idx = batch.schema().index_of(&prefixed).map_err(|e| {
-                                DataFusionError::Internal(format!(
-                                    "Column {prefixed} not found: {e}"
-                                ))
-                            })?;
-                            upd_fields.push(Field::new(
-                                col,
-                                batch.schema().field(idx).data_type().clone(),
-                                true,
-                            ));
-                            upd_columns.push(batch.column(idx).clone());
-                        }
-                        let upd_schema = Arc::new(Schema::new(upd_fields));
-                        let upd_batch = RecordBatch::try_new(upd_schema, upd_columns)?;
-
-                        let current_batch_idx = update_batch_counter;
-                        update_value_batches.push(upd_batch);
-                        update_batch_counter += 1;
-
-                        for row in 0..batch.num_rows() {
-                            let file_idx = file_idx_col.value(row) as usize;
-                            let row_offset = row_offset_col.value(row) as usize;
-                            writer.add_matched_update(file_idx, row_offset, current_batch_idx, row);
-                            total_count += 1;
-                        }
-                    }
-                }
-                CowMatchedAction::Delete => {
-                    let select_clause = format!(
-                        "{t_alias}.\"__paimon_file_idx\", {t_alias}.\"__paimon_row_offset\""
-                    );
-                    let join_sql = format!(
-                        "SELECT {select_clause} FROM {source_ref} AS {s_alias} \
-                         INNER JOIN {cow_target_name} AS {t_alias} ON {on_condition}{where_clause}"
-                    );
-
-                    let join_result = ctx.ctx().sql(&join_sql).await?.collect().await?;
-
-                    for batch in &join_result {
-                        if batch.num_rows() == 0 {
-                            continue;
-                        }
-
-                        let (file_idx_col, row_offset_col) = extract_tracking_columns(batch)?;
-
-                        for row in 0..batch.num_rows() {
-                            let file_idx = file_idx_col.value(row) as usize;
-                            let row_offset = row_offset_col.value(row) as usize;
-                            writer.add_matched_delete(file_idx, row_offset);
-                            total_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        if !update_value_batches.is_empty() {
-            writer.set_update_batches(update_value_batches);
-        }
-    }
-
-    // Handle NOT MATCHED → INSERT
-    if !clauses.inserts.is_empty() {
-        let insert_sql = if has_target_data {
-            format!(
-                "SELECT {s_alias}.* FROM {source_ref} AS {s_alias} \
-                 LEFT JOIN {cow_target_name} AS {t_alias} ON {on_condition} \
-                 WHERE {t_alias}.\"__paimon_file_idx\" IS NULL"
-            )
-        } else {
-            format!("SELECT * FROM {source_ref} AS {s_alias}")
-        };
-
-        let not_matched_batches = ctx.ctx().sql(&insert_sql).await?.collect().await?;
-
-        if !not_matched_batches.is_empty() {
-            let insert_batches = build_insert_batches(
-                ctx,
-                &not_matched_batches,
-                &clauses.inserts,
-                s_alias,
-                &[],
-                table.schema().fields(),
-                temp_tracker,
-            )
-            .await?;
-
-            let insert_count: usize = insert_batches.iter().map(|b| b.num_rows()).sum();
-            if insert_count > 0 {
-                let mut table_write = wb.new_write().map_err(to_datafusion_error)?;
-                for batch in &insert_batches {
-                    table_write
-                        .write_arrow_batch(batch)
-                        .await
-                        .map_err(to_datafusion_error)?;
-                }
-                let msgs = table_write
-                    .prepare_commit()
-                    .await
-                    .map_err(to_datafusion_error)?;
-                insert_messages.extend(msgs);
-                total_count += insert_count as u64;
-            }
-        }
-    }
-
-    Ok((insert_messages, total_count))
-}
-
-// ---------------------------------------------------------------------------
-// Data evolution path helpers
-// ---------------------------------------------------------------------------
-
-async fn execute_merge_into_once(
-    ctx: &SQLContext,
-    merge: &Merge,
-    table: &Table,
-    enable_ident_normalization: bool,
-) -> DFResult<DataFrame> {
-    // 1. Parse all MERGE clauses
-    let parsed = extract_merge_clauses(merge, enable_ident_normalization)?;
-    validate_merge_insert_columns(&parsed.inserts, table.schema().fields())?;
-    if let Some(update) = &parsed.update {
-        validate_update_columns(&update.columns, table.schema().fields())?;
-    }
-
-    // Validate preconditions early and create writer (before executing any SQL)
-    let wb = table.new_write_builder();
-    let update_writer = if let Some(ref upd) = parsed.update {
-        Some(
-            wb.new_data_evolution_writer(upd.columns.clone())
-                .map_err(to_datafusion_error)?,
-        )
-    } else {
-        None
-    };
-    let delete_writer = if parsed.delete {
-        Some(wb.new_delete().map_err(to_datafusion_error)?)
-    } else {
-        None
-    };
-
-    let (target_ref, target_alias) = extract_table_ref(&merge.table)?;
-    let (source_ref, source_alias) = extract_source_ref(&merge.source)?;
-    let on_condition = merge.on.to_string();
-    let t_alias = target_alias.as_deref().unwrap_or(&target_ref);
-    let s_alias = source_alias.as_deref().unwrap_or(&source_ref);
-
-    // 2. Build a single LEFT JOIN: source LEFT JOIN target
-    //    _ROW_ID IS NOT NULL → matched (UPDATE path)
-    //    _ROW_ID IS NULL     → not matched (INSERT path)
-    let mut select_parts = vec![format!("{t_alias}.\"_ROW_ID\"")];
-
-    // Add update expressions (prefixed to avoid collisions)
-    if let Some(ref upd) = parsed.update {
-        for (col, expr) in upd.columns.iter().zip(upd.exprs.iter()) {
-            select_parts.push(format!(
-                "{expr} AS {}",
-                quote_identifier(&format!("__upd_{col}"))
-            ));
-        }
-    }
-
-    // Add source columns for INSERT path (all source columns via s.*)
-    // We also need insert expressions if they differ from source columns
-    if !parsed.inserts.is_empty() {
-        select_parts.push(format!("{s_alias}.*"));
-    }
-
-    let select_clause = select_parts.join(", ");
-    // Safety: all interpolated values (select_clause, source_ref, s_alias, t_alias, on_condition)
-    // originate from sqlparser AST's Display impl, so they are well-formed SQL fragments.
-    let join_sql = format!(
-        "SELECT {select_clause} FROM {source_ref} AS {s_alias} \
-         LEFT JOIN {target_ref} AS {t_alias} ON {on_condition}"
-    );
-
-    let join_result = ctx.ctx().sql(&join_sql).await?.collect().await?;
-
-    // 3. Split by _ROW_ID null/not-null
-    let mut all_messages = Vec::new();
-    let mut total_count: u64 = 0;
-
-    // Separate matched and not-matched rows
-    let (matched_batches, not_matched_batches) = split_by_row_id(&join_result)?;
-
-    // 4. Handle matched rows (UPDATE or DELETE)
-    if let Some(mut writer) = update_writer {
-        let upd = parsed.update.as_ref().unwrap();
-        let matched_count: usize = matched_batches.iter().map(|b| b.num_rows()).sum();
-        if matched_count > 0 {
-            // Extract _ROW_ID + update columns (rename __upd_X → X)
-            let update_batches = project_update_columns(&matched_batches, &upd.columns)?;
-            for batch in update_batches {
-                writer
-                    .add_matched_batch(batch)
-                    .map_err(to_datafusion_error)?;
-            }
-            let update_messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
-            all_messages.extend(update_messages);
-            total_count += matched_count as u64;
-        }
-    }
-    if let Some(mut writer) = delete_writer {
-        let matched_count: usize = matched_batches.iter().map(|b| b.num_rows()).sum();
-        if matched_count > 0 {
-            for batch in &matched_batches {
-                writer
-                    .add_matched_batch(batch.clone())
-                    .map_err(to_datafusion_error)?;
-            }
-            let delete_messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
-            all_messages.extend(delete_messages);
-            total_count += matched_count as u64;
-        }
-    }
-
-    // 5. Handle not-matched rows (INSERT)
-    if !parsed.inserts.is_empty() {
-        // Collect the exact set of injected column names to strip from JOIN result
-        let mut injected_columns: Vec<String> = vec!["_ROW_ID".to_string()];
-        if let Some(ref upd) = parsed.update {
-            for col in &upd.columns {
-                injected_columns.push(format!("__upd_{col}"));
-            }
-        }
-        let mut temp_tracker = TempTableTracker::new(ctx);
-        let insert_batches = build_insert_batches(
-            ctx,
-            &not_matched_batches,
-            &parsed.inserts,
-            s_alias,
-            &injected_columns,
-            table.schema().fields(),
-            &mut temp_tracker,
-        )
-        .await?;
-        let insert_count: usize = insert_batches.iter().map(|b| b.num_rows()).sum();
-        if insert_count > 0 {
-            let mut table_write = wb.new_write().map_err(to_datafusion_error)?;
-            for batch in &insert_batches {
-                table_write
-                    .write_arrow_batch(batch)
-                    .await
-                    .map_err(to_datafusion_error)?;
-            }
-            let insert_messages = table_write
-                .prepare_commit()
-                .await
-                .map_err(to_datafusion_error)?;
-            all_messages.extend(insert_messages);
-            total_count += insert_count as u64;
-        }
-    }
-
-    // 6. Commit all messages atomically
-    if !all_messages.is_empty() {
-        wb.try_new_commit()
-            .map_err(to_datafusion_error)?
-            .commit(all_messages)
-            .await
-            .map_err(to_datafusion_error)?;
-    }
-
-    ok_result(ctx.ctx(), total_count)
-}
-
-/// Split join result into matched (_ROW_ID not null) and not-matched (_ROW_ID null) batches.
-fn split_by_row_id(batches: &[RecordBatch]) -> DFResult<(Vec<RecordBatch>, Vec<RecordBatch>)> {
-    let mut matched = Vec::new();
-    let mut not_matched = Vec::new();
-
-    for batch in batches {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let row_id_col = batch.column_by_name("_ROW_ID").ok_or_else(|| {
-            DataFusionError::Internal("_ROW_ID column not found in join result".to_string())
-        })?;
-
-        let is_not_null = compute::is_not_null(row_id_col)?;
-        let is_null = compute::is_null(row_id_col)?;
-
-        let matched_batch = compute::filter_record_batch(batch, &is_not_null)?;
-        if matched_batch.num_rows() > 0 {
-            matched.push(matched_batch);
-        }
-
-        let not_matched_batch = compute::filter_record_batch(batch, &is_null)?;
-        if not_matched_batch.num_rows() > 0 {
-            not_matched.push(not_matched_batch);
-        }
-    }
-
-    Ok((matched, not_matched))
 }
 
 /// Extract _ROW_ID + __upd_X columns from matched batches, renaming __upd_X → X.
@@ -847,285 +176,6 @@ pub(crate) fn project_update_columns(
     Ok(result)
 }
 
-/// Build insert batches from not-matched rows, applying INSERT clause projections and predicates.
-async fn build_insert_batches(
-    ctx: &SQLContext,
-    not_matched_batches: &[RecordBatch],
-    inserts: &[MergeInsertClause],
-    s_alias: &str,
-    injected_columns: &[String],
-    table_fields: &[DataField],
-    temp_tracker: &mut TempTableTracker<'_>,
-) -> DFResult<Vec<RecordBatch>> {
-    if not_matched_batches.is_empty() || not_matched_batches.iter().all(|b| b.num_rows() == 0) {
-        return Ok(Vec::new());
-    }
-
-    // Strip injected columns (_ROW_ID, __upd_*) — keep only source columns
-    let source_batches = strip_non_source_columns(not_matched_batches, injected_columns)?;
-
-    // Register as temp table for SQL-based projection/filtering
-    let first_schema = source_batches[0].schema();
-    let tmp_name = next_cow_table_name("__merge_not_matched");
-
-    let mem_table = datafusion::datasource::MemTable::try_new(first_schema, vec![source_batches])?;
-    ctx.register_temp_table(&tmp_name, Arc::new(mem_table))?;
-    temp_tracker.register(&tmp_name);
-
-    let result = build_insert_batches_inner(ctx, inserts, s_alias, &tmp_name, table_fields).await;
-
-    result
-}
-
-/// Execute INSERT clause queries against the registered temp table.
-async fn build_insert_batches_inner(
-    ctx: &SQLContext,
-    inserts: &[MergeInsertClause],
-    s_alias: &str,
-    tmp_name: &str,
-    table_fields: &[DataField],
-) -> DFResult<Vec<RecordBatch>> {
-    let mut all_batches = Vec::new();
-    let mut consumed_predicates: Vec<String> = Vec::new();
-
-    for ins in inserts {
-        let mut conditions = Vec::new();
-        for prev in &consumed_predicates {
-            // Only TRUE consumes a row; FALSE and NULL fall through.
-            conditions.push(format!("({prev}) IS NOT TRUE"));
-        }
-        if let Some(ref pred) = ins.predicate {
-            // Preserve OR grouping when combined with previous-clause exclusions.
-            conditions.push(format!("({pred})"));
-            consumed_predicates.push(pred.clone());
-        } else {
-            consumed_predicates.push("TRUE".to_string());
-        }
-
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", conditions.join(" AND "))
-        };
-
-        let select_clause = insert_select_clause(ins, table_fields)?;
-        let sql = format!("SELECT {select_clause} FROM {tmp_name} AS {s_alias}{where_clause}");
-
-        let batches = ctx.ctx().sql(&sql).await?.collect().await?;
-        for batch in batches {
-            all_batches.push(normalize_insert_batch_to_table_schema(
-                &batch,
-                table_fields,
-            )?);
-        }
-    }
-
-    Ok(all_batches)
-}
-
-fn normalize_insert_batch_to_table_schema(
-    batch: &RecordBatch,
-    table_fields: &[DataField],
-) -> DFResult<RecordBatch> {
-    if batch.num_columns() != table_fields.len() {
-        return Err(DataFusionError::Plan(format!(
-            "MERGE INSERT output has {} columns but target table has {}",
-            batch.num_columns(),
-            table_fields.len()
-        )));
-    }
-
-    let target_schema =
-        paimon::arrow::build_target_arrow_schema(table_fields).map_err(to_datafusion_error)?;
-    let mut columns = Vec::with_capacity(table_fields.len());
-
-    for (target_idx, field) in table_fields.iter().enumerate() {
-        let column = batch.column(target_idx).clone();
-        let target_type = target_schema.field(target_idx).data_type();
-        let column = cast_insert_column(field.name(), column, target_type)?;
-        columns.push(column);
-    }
-
-    RecordBatch::try_new(target_schema, columns).map_err(DataFusionError::from)
-}
-
-fn cast_insert_column(
-    name: &str,
-    column: ArrayRef,
-    target_type: &ArrowDataType,
-) -> DFResult<ArrayRef> {
-    if column.data_type() == target_type {
-        return Ok(column);
-    }
-
-    compute::cast(column.as_ref(), target_type).map_err(|e| {
-        DataFusionError::Plan(format!(
-            "Cannot cast MERGE INSERT column '{name}' from {:?} to {:?}: {e}",
-            column.data_type(),
-            target_type
-        ))
-    })
-}
-
-/// Remove injected columns from batches, keeping only source columns.
-fn strip_non_source_columns(
-    batches: &[RecordBatch],
-    injected_columns: &[String],
-) -> DFResult<Vec<RecordBatch>> {
-    let mut result = Vec::new();
-    for batch in batches {
-        let schema = batch.schema();
-        let mut indices = Vec::new();
-        let mut fields = Vec::new();
-        for (i, field) in schema.fields().iter().enumerate() {
-            if injected_columns.contains(field.name()) {
-                continue;
-            }
-            indices.push(i);
-            fields.push(field.as_ref().clone());
-        }
-        let new_schema = Arc::new(Schema::new(fields));
-        let columns: Vec<_> = indices.iter().map(|&i| batch.column(i).clone()).collect();
-        let projected = RecordBatch::try_new(new_schema, columns)?;
-        result.push(projected);
-    }
-    Ok(result)
-}
-
-/// Build the SELECT clause for an INSERT clause, ordered by table schema fields.
-///
-/// When the INSERT specifies explicit columns (`INSERT (col2, col1) VALUES (expr2, expr1)`),
-/// the output must be reordered to match the table schema so that `write_arrow_batch`
-/// (which reads columns by positional index) maps them correctly. When the INSERT omits
-/// the column list (`INSERT VALUES (expr1, expr2, ...)`), the values map to the table's
-/// columns by position, following standard SQL, where the MERGE INSERT column list is
-/// optional (unlike Spark, whose grammar requires an explicit list or `INSERT *`).
-fn insert_select_clause(ins: &MergeInsertClause, table_fields: &[DataField]) -> DFResult<String> {
-    if ins.columns.is_empty() && ins.value_exprs.is_empty() {
-        return Ok("*".to_string());
-    }
-
-    if ins.columns.is_empty() {
-        // No explicit column list: the values fill the table's columns by
-        // position. Without this branch the empty column->expr map below would
-        // emit `NULL` for every column and silently drop the source values,
-        // inserting all-NULL rows (or failing on a non-null column).
-        if ins.value_exprs.len() != table_fields.len() {
-            return Err(DataFusionError::Plan(format!(
-                "MERGE INSERT has {} value(s) but the table has {} column(s); \
-                 list the target columns explicitly or provide one value per column",
-                ins.value_exprs.len(),
-                table_fields.len()
-            )));
-        }
-        return Ok(table_fields
-            .iter()
-            .zip(ins.value_exprs.iter())
-            .map(|(field, expr)| format!("{expr} AS {}", quote_identifier(field.name())))
-            .collect::<Vec<_>>()
-            .join(", "));
-    }
-
-    // Build column_name -> expression mapping from the INSERT clause
-    let col_expr_map: HashMap<&str, &str> = ins
-        .columns
-        .iter()
-        .zip(ins.value_exprs.iter())
-        .map(|(col, expr)| (col.as_str(), expr.as_str()))
-        .collect();
-
-    // Emit SELECT in table schema order
-    Ok(table_fields
-        .iter()
-        .map(|field| {
-            match col_expr_map.get(field.name()) {
-                Some(expr) => format!("{expr} AS {}", quote_identifier(field.name())),
-                // Column not in INSERT list — fill with NULL
-                None => format!("NULL AS {}", quote_identifier(field.name())),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", "))
-}
-
-/// Parsed WHEN NOT MATCHED THEN INSERT clause.
-struct MergeInsertClause {
-    /// Column names from INSERT (col1, col2). Empty means INSERT *.
-    columns: Vec<String>,
-    /// SQL expressions from VALUES(...).
-    value_exprs: Vec<String>,
-    /// Optional AND predicate (SQL string).
-    predicate: Option<String>,
-}
-
-fn extract_merge_insert_clause(
-    insert_expr: &MergeInsertExpr,
-    predicate: Option<&SqlExpr>,
-    enable_ident_normalization: bool,
-) -> DFResult<MergeInsertClause> {
-    let columns = insert_expr
-        .columns
-        .iter()
-        .map(|name| match name.0.as_slice() {
-            [part] => part
-                .as_ident()
-                .map(|ident| normalize_schema_identifier(ident, enable_ident_normalization))
-                .ok_or_else(|| {
-                    DataFusionError::Plan(format!("Invalid column name in MERGE INSERT: {name}"))
-                }),
-            _ => Err(DataFusionError::Plan(format!(
-                "Expected a simple column name in MERGE INSERT, got: {name}"
-            ))),
-        })
-        .collect::<DFResult<Vec<_>>>()?;
-
-    let value_exprs = match &insert_expr.kind {
-        MergeInsertKind::Values(values) => {
-            let row = values.rows.first().ok_or_else(|| {
-                DataFusionError::Plan("INSERT VALUES must have at least one row".to_string())
-            })?;
-            row.iter().map(ToString::to_string).collect()
-        }
-        // INSERT ROW — BigQuery syntax, treat as INSERT *.
-        MergeInsertKind::Row => Vec::new(),
-    };
-
-    Ok(MergeInsertClause {
-        columns,
-        value_exprs,
-        predicate: predicate.map(ToString::to_string),
-    })
-}
-
-fn validate_merge_insert_columns(
-    inserts: &[MergeInsertClause],
-    table_fields: &[DataField],
-) -> DFResult<()> {
-    for insert in inserts {
-        validate_target_columns(&insert.columns, table_fields, "MERGE INSERT")?;
-        // A column-less positional INSERT maps its VALUES to the table columns by
-        // position, so the value count must match the column count. Validate it
-        // here, upfront: this runs in both CoW and data-evolution modes before any
-        // batch is built, whereas `insert_select_clause` only runs when unmatched
-        // rows exist — an all-matched MERGE would otherwise skip the arity check
-        // and commit. `INSERT *`/`INSERT ROW` (no columns and no values) is left
-        // untouched.
-        if insert.columns.is_empty()
-            && !insert.value_exprs.is_empty()
-            && insert.value_exprs.len() != table_fields.len()
-        {
-            return Err(DataFusionError::Plan(format!(
-                "MERGE INSERT has {} value(s) but the table has {} column(s); \
-                 list the target columns explicitly or provide one value per column",
-                insert.value_exprs.len(),
-                table_fields.len()
-            )));
-        }
-    }
-
-    Ok(())
-}
-
 pub(crate) fn validate_update_columns(
     columns: &[String],
     table_fields: &[DataField],
@@ -1157,163 +207,6 @@ fn validate_target_columns(
     Ok(())
 }
 
-/// Parsed WHEN MATCHED THEN UPDATE clause.
-struct MergeUpdateClause {
-    columns: Vec<String>,
-    exprs: Vec<String>,
-}
-
-/// Parsed merge clauses.
-struct ParsedMergeClauses {
-    update: Option<MergeUpdateClause>,
-    delete: bool,
-    inserts: Vec<MergeInsertClause>,
-}
-
-/// Extract UPDATE and INSERT clauses from the MERGE AST.
-fn extract_merge_clauses(
-    merge: &Merge,
-    enable_ident_normalization: bool,
-) -> DFResult<ParsedMergeClauses> {
-    let mut update: Option<MergeUpdateClause> = None;
-    let mut delete = false;
-    let mut inserts: Vec<MergeInsertClause> = Vec::new();
-
-    for clause in &merge.clauses {
-        match clause.clause_kind {
-            MergeClauseKind::Matched => {
-                if update.is_some() || delete {
-                    return Err(DataFusionError::Plan(
-                        "Multiple WHEN MATCHED clauses are not yet supported".to_string(),
-                    ));
-                }
-                if clause.predicate.is_some() {
-                    return Err(DataFusionError::Plan(
-                        "WHEN MATCHED AND <predicate> is not yet supported".to_string(),
-                    ));
-                }
-                match &clause.action {
-                    MergeAction::Update(update_expr) => {
-                        let mut columns = Vec::new();
-                        let mut exprs = Vec::new();
-                        for assignment in &update_expr.assignments {
-                            let col_name = match &assignment.target {
-                                AssignmentTarget::ColumnName(name) => name
-                                    .0
-                                    .last()
-                                    .and_then(|p| p.as_ident())
-                                    .map(|ident| {
-                                        normalize_schema_identifier(
-                                            ident,
-                                            enable_ident_normalization,
-                                        )
-                                    })
-                                    .ok_or_else(|| {
-                                        DataFusionError::Plan(format!(
-                                            "Invalid column name in SET: {name}"
-                                        ))
-                                    })?,
-                                AssignmentTarget::Tuple(_) => {
-                                    return Err(DataFusionError::Plan(
-                                        "Tuple assignment in MERGE INTO SET is not supported"
-                                            .to_string(),
-                                    ));
-                                }
-                            };
-                            columns.push(col_name);
-                            exprs.push(assignment.value.to_string());
-                        }
-                        update = Some(MergeUpdateClause { columns, exprs });
-                    }
-                    MergeAction::Delete { .. } => {
-                        delete = true;
-                    }
-                    MergeAction::Insert(_) => {
-                        return Err(DataFusionError::Plan(
-                            "WHEN MATCHED THEN INSERT is not valid SQL".to_string(),
-                        ));
-                    }
-                }
-            }
-            MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget => {
-                match &clause.action {
-                    MergeAction::Insert(insert_expr) => {
-                        inserts.push(extract_merge_insert_clause(
-                            insert_expr,
-                            clause.predicate.as_ref(),
-                            enable_ident_normalization,
-                        )?);
-                    }
-                    _ => {
-                        return Err(DataFusionError::Plan(
-                            "WHEN NOT MATCHED only supports INSERT".to_string(),
-                        ));
-                    }
-                }
-            }
-            MergeClauseKind::NotMatchedBySource => {
-                return Err(DataFusionError::Plan(
-                    "WHEN NOT MATCHED BY SOURCE is not yet supported for data evolution MERGE INTO"
-                        .to_string(),
-                ));
-            }
-        }
-    }
-
-    if update.is_none() && !delete && inserts.is_empty() {
-        return Err(DataFusionError::Plan(
-            "MERGE INTO requires at least one WHEN MATCHED or WHEN NOT MATCHED clause".to_string(),
-        ));
-    }
-
-    Ok(ParsedMergeClauses {
-        update,
-        delete,
-        inserts,
-    })
-}
-
-/// Extract table name and optional alias from a TableFactor.
-fn extract_table_ref(table: &TableFactor) -> DFResult<(String, Option<String>)> {
-    match table {
-        TableFactor::Table { name, alias, .. } => {
-            let table_name = name.to_string();
-            let alias_name = alias.as_ref().map(|a| a.name.value.clone());
-            Ok((table_name, alias_name))
-        }
-        other => Err(DataFusionError::Plan(format!(
-            "Unsupported table reference in MERGE INTO: {other}"
-        ))),
-    }
-}
-
-/// Extract source reference (table or subquery) from a TableFactor.
-fn extract_source_ref(source: &TableFactor) -> DFResult<(String, Option<String>)> {
-    match source {
-        TableFactor::Table { name, alias, .. } => {
-            let table_name = name.to_string();
-            let alias_name = alias.as_ref().map(|a| a.name.value.clone());
-            Ok((table_name, alias_name))
-        }
-        TableFactor::Derived {
-            subquery, alias, ..
-        } => {
-            let subquery_sql = format!("({subquery})");
-            let alias_name = alias.as_ref().map(|a| a.name.value.clone());
-            if alias_name.is_none() {
-                return Err(DataFusionError::Plan(
-                    "Subquery source in MERGE INTO must have an alias".to_string(),
-                ));
-            }
-            Ok((subquery_sql, alias_name))
-        }
-        other => Err(DataFusionError::Plan(format!(
-            "Unsupported source in MERGE INTO: {other}"
-        ))),
-    }
-}
-
-/// Extract __paimon_file_idx and __paimon_row_offset columns from a JOIN result batch.
 pub(crate) fn extract_tracking_columns(
     batch: &RecordBatch,
 ) -> DFResult<(&Int32Array, &UInt32Array)> {
@@ -1351,12 +244,24 @@ pub(crate) async fn register_cow_target_table(
     writer: &CopyOnWriteMergeWriter,
     temp_tracker: &mut TempTableTracker<'_>,
 ) -> DFResult<(bool, String)> {
-    let file_index = writer.file_index();
-    if file_index.is_empty() {
-        let table_name = next_cow_table_name("__cow_target");
-        return Ok((false, table_name));
+    let all_batches = read_cow_target_batches(table, writer).await?;
+    let has_data = !all_batches.is_empty();
+    let table_name = next_cow_table_name("__cow_target");
+    if let Some(batch) = all_batches.first() {
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(batch.schema(), vec![all_batches])?;
+        ctx.register_temp_table(&table_name, Arc::new(mem_table))?;
+        temp_tracker.register(&table_name);
     }
+    Ok((has_data, table_name))
+}
 
+/// Read a captured CoW file index, retaining physical file/row identity.
+async fn read_cow_target_batches(
+    table: &Table,
+    writer: &CopyOnWriteMergeWriter,
+) -> DFResult<Vec<RecordBatch>> {
+    let file_index = writer.file_index();
     // Read all files in parallel
     let read_futures: Vec<_> = file_index
         .iter()
@@ -1393,7 +298,6 @@ pub(crate) async fn register_cow_target_table(
     let file_results = futures::future::try_join_all(read_futures).await?;
 
     let mut all_batches: Vec<RecordBatch> = Vec::new();
-    let mut schema: Option<Arc<Schema>> = None;
 
     for (file_idx, batches) in file_results {
         let mut row_offset = 0u32;
@@ -1440,25 +344,12 @@ pub(crate) async fn register_cow_target_table(
             let augmented = RecordBatch::try_new(augmented_schema.clone(), columns)
                 .map_err(|e| DataFusionError::Internal(format!("Failed to augment batch: {e}")))?;
 
-            if schema.is_none() {
-                schema = Some(augmented.schema());
-            }
             all_batches.push(augmented);
             row_offset = end_offset;
         }
     }
 
-    let has_data = !all_batches.is_empty();
-    let table_name = next_cow_table_name("__cow_target");
-
-    if has_data {
-        let s = schema.unwrap();
-        let mem_table = datafusion::datasource::MemTable::try_new(s, vec![all_batches])?;
-        ctx.register_temp_table(&table_name, Arc::new(mem_table))?;
-        temp_tracker.register(&table_name);
-    }
-
-    Ok((has_data, table_name))
+    Ok(all_batches)
 }
 
 /// Build a partition set from Arrow batches containing partition column values.
@@ -1528,147 +419,6 @@ pub(crate) async fn build_partition_set_from_where(
     build_partition_set_from_batches(table, &batches)
 }
 
-/// Query source table for distinct partition values and build a partition set.
-///
-/// Returns `None` for non-partitioned tables or when the source lacks matching
-/// partition key columns (falls back to full-partition scan). The source values
-/// are only safe to apply to the target when the MERGE condition equates every
-/// target partition column with the same source column.
-async fn build_source_partition_set(
-    ctx: &SQLContext,
-    table: &Table,
-    source_ref: &str,
-    s_alias: &str,
-    t_alias: &str,
-    on_expr: &SqlExpr,
-) -> DFResult<Option<HashSet<Vec<u8>>>> {
-    let partition_keys = table.schema().partition_keys();
-    if partition_keys.is_empty() {
-        return Ok(None);
-    }
-    if !can_prune_target_by_source_partitions(partition_keys, t_alias, s_alias, on_expr) {
-        return Ok(None);
-    }
-
-    let cols = partition_keys
-        .iter()
-        .map(|k| format!("{s_alias}.{}", quote_identifier(k)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("SELECT DISTINCT {cols} FROM {source_ref} AS {s_alias}");
-    match ctx.ctx().sql(&sql).await {
-        Ok(df) => {
-            let batches = df.collect().await?;
-            build_partition_set_from_batches(table, &batches)
-        }
-        Err(_) => Ok(None),
-    }
-}
-
-fn can_prune_target_by_source_partitions(
-    partition_keys: &[String],
-    t_alias: &str,
-    s_alias: &str,
-    on_expr: &SqlExpr,
-) -> bool {
-    partition_keys
-        .iter()
-        .all(|key| on_expr_contains_alias_column_eq(on_expr, t_alias, key, s_alias, key))
-}
-
-fn on_expr_contains_alias_column_eq(
-    expr: &SqlExpr,
-    left_alias: &str,
-    left_column: &str,
-    right_alias: &str,
-    right_column: &str,
-) -> bool {
-    match expr {
-        SqlExpr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            on_expr_contains_alias_column_eq(
-                left,
-                left_alias,
-                left_column,
-                right_alias,
-                right_column,
-            ) || on_expr_contains_alias_column_eq(
-                right,
-                left_alias,
-                left_column,
-                right_alias,
-                right_column,
-            )
-        }
-        SqlExpr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => {
-            is_alias_column(left, left_alias, left_column)
-                && is_alias_column(right, right_alias, right_column)
-                || is_alias_column(left, right_alias, right_column)
-                    && is_alias_column(right, left_alias, left_column)
-        }
-        _ => false,
-    }
-}
-
-fn is_alias_column(expr: &SqlExpr, alias: &str, column: &str) -> bool {
-    match expr {
-        SqlExpr::CompoundIdentifier(parts) => is_qualified_column(parts, alias, column),
-        _ => false,
-    }
-}
-
-fn is_qualified_column(parts: &[Ident], alias: &str, column: &str) -> bool {
-    parts.len() == 2
-        && parts[0].value.eq_ignore_ascii_case(alias)
-        && parts[1].value.eq_ignore_ascii_case(column)
-}
-
-/// Replace table qualifiers in column references, leaving literals and column names intact.
-///
-/// For example, `paimon.test_db.target.a = source.a` becomes `t.a = s.a`
-/// when target_ref="paimon.test_db.target", t_alias="t", source_ref="source", s_alias="s".
-///
-/// Match the longest qualifier first, and rewrite it only once so an alias that
-/// equals another table name cannot be rewritten again.
-fn rewrite_table_references<T: VisitMut>(
-    node: &mut T,
-    target_ref: &str,
-    t_alias: &str,
-    source_ref: &str,
-    s_alias: &str,
-) {
-    let _: ControlFlow<()> = visit_expressions_mut(node, |expr| {
-        if let SqlExpr::CompoundIdentifier(parts) = expr {
-            for prefix_len in (1..parts.len()).rev() {
-                let qualifier = parts[..prefix_len]
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(".");
-                let alias = if qualifier == target_ref {
-                    Some(t_alias)
-                } else if qualifier == source_ref {
-                    Some(s_alias)
-                } else {
-                    None
-                };
-                if let Some(alias) = alias {
-                    parts.splice(..prefix_len, [Ident::new(alias)]);
-                    break;
-                }
-            }
-        }
-        ControlFlow::Continue(())
-    });
-}
-
 /// Return a DataFrame with a single "count" column.
 pub(crate) fn ok_result(ctx: &SessionContext, count: u64) -> DFResult<DataFrame> {
     let schema = Arc::new(Schema::new(vec![Field::new(
@@ -1686,15 +436,59 @@ pub(crate) fn ok_result(ctx: &SessionContext, count: u64) -> DFResult<DataFrame>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::sql::sqlparser::ast::Merge;
     use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
     use paimon::catalog::{Catalog, Identifier};
-    use paimon::io::FileIOBuilder;
-    use paimon::spec::{DataField, DataType, IntType, Schema as PaimonSchema, TableSchema};
     use paimon::{CatalogOptions, FileSystemCatalog, Options};
     use tempfile::TempDir;
 
     use crate::SQLContext;
+
+    #[tokio::test]
+    async fn test_retry_limits_and_non_conflict_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for (message, classify) in [
+            (
+                "Row ID conflict",
+                is_row_id_conflict as fn(&DataFusionError) -> bool,
+            ),
+            (
+                "Delete conflict",
+                is_delete_conflict as fn(&DataFusionError) -> bool,
+            ),
+        ] {
+            let attempts = AtomicUsize::new(0);
+            let result: DFResult<u64> = retry_on_conflict("MERGE INTO", classify, || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(DataFusionError::External(Box::new(std::io::Error::other(
+                    message,
+                ))))
+            })
+            .await;
+            assert_eq!(attempts.load(Ordering::SeqCst), 5);
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("after 5 retries"), "{err}");
+            assert!(err.contains(message), "{err}");
+
+            let attempts = AtomicUsize::new(0);
+            let result: DFResult<u64> = retry_on_conflict("MERGE INTO", classify, || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(DataFusionError::Execution("unrelated failure".into()))
+            })
+            .await;
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert!(
+                matches!(result, Err(DataFusionError::Execution(message)) if message == "unrelated failure")
+            );
+            let overlapping_update = to_datafusion_error(paimon::Error::DataInvalid {
+                message: "For Data Evolution table, multiple MERGE INTO operations have encountered conflicts, updating the same file".into(),
+                source: None,
+            });
+            assert!(!classify(&overlapping_update));
+        }
+    }
 
     async fn setup_sql_context() -> (TempDir, SQLContext, Arc<FileSystemCatalog>) {
         let temp_dir = TempDir::new().unwrap();
@@ -1748,6 +542,17 @@ mod tests {
         (tmp, sql_context, de_table)
     }
 
+    // Exercise the native planner and provider while retaining these behavioral fixtures.
+    async fn execute_merge_into(
+        ctx: &SQLContext,
+        merge: &Merge,
+        _table: Table,
+        _enable_ident_normalization: bool,
+    ) -> DFResult<DataFrame> {
+        let batches = ctx.sql(&merge.to_string()).await?.collect().await?;
+        ctx.ctx().read_batches(batches)
+    }
+
     fn parse_merge(sql: &str) -> Merge {
         let dialect = GenericDialect {};
         let stmts = Parser::parse_sql(&dialect, sql).unwrap();
@@ -1755,164 +560,6 @@ mod tests {
             datafusion::sql::sqlparser::ast::Statement::Merge(m) => m,
             _ => panic!("Expected MERGE statement"),
         }
-    }
-
-    #[test]
-    fn test_merge_reference_rewrite_preserves_literal_contents() {
-        for (input, expected) in [
-            ("target.id = source.id", "t.id = s.id"),
-            ("'source.payload'", "'source.payload'"),
-            ("'it''s target.payload'", "'it''s target.payload'"),
-            (
-                "'{\"path\":\"source.payload\"}'",
-                "'{\"path\":\"source.payload\"}'",
-            ),
-            ("source.name LIKE 'target.%'", "s.name LIKE 'target.%'"),
-            ("source.\"source.payload\"", "s.\"source.payload\""),
-            ("my_source.id = source.id", "my_source.id = s.id"),
-            (
-                "target.nested.value = source.value",
-                "t.nested.value = s.value",
-            ),
-        ] {
-            let parse_expr = |sql| {
-                Parser::new(&GenericDialect {})
-                    .try_with_sql(sql)
-                    .unwrap()
-                    .parse_expr()
-                    .unwrap()
-            };
-            let mut actual = parse_expr(input);
-            rewrite_table_references(&mut actual, "target", "t", "source", "s");
-            assert_eq!(actual, parse_expr(expected), "{input}");
-        }
-    }
-
-    #[test]
-    fn test_merge_update_assignments_normalize_identifiers() {
-        for (target, enabled, expected) in [
-            ("VALUE", true, "value"),
-            ("\"VALUE\"", true, "VALUE"),
-            ("VALUE", false, "VALUE"),
-        ] {
-            let merge = parse_merge(&format!(
-                "MERGE INTO target t USING source s ON t.id = s.id \
-                 WHEN MATCHED THEN UPDATE SET {target} = s.value"
-            ));
-
-            let parsed = extract_merge_clauses(&merge, enabled).unwrap();
-            assert_eq!(parsed.update.unwrap().columns, [expected]);
-
-            let cow = extract_cow_merge_clauses(&merge, enabled).unwrap();
-            let CowMatchedAction::Update(update) = &cow.matched[0].action else {
-                panic!("expected update action");
-            };
-            assert_eq!(update.columns, [expected]);
-        }
-    }
-
-    #[test]
-    fn test_merge_insert_columns_normalize_identifiers() {
-        for (target, enabled, expected) in [
-            ("MIXEDCASE", true, "mixedcase"),
-            ("\"MixedCase\"", true, "MixedCase"),
-            ("MixedCase", false, "MixedCase"),
-        ] {
-            let merge = parse_merge(&format!(
-                "MERGE INTO target t USING source s ON t.id = s.id \
-                 WHEN NOT MATCHED THEN INSERT ({target}) VALUES (s.value)"
-            ));
-
-            let parsed = extract_merge_clauses(&merge, enabled).unwrap();
-            assert_eq!(parsed.inserts[0].columns, [expected]);
-
-            let cow = extract_cow_merge_clauses(&merge, enabled).unwrap();
-            assert_eq!(cow.inserts[0].columns, [expected]);
-        }
-    }
-
-    #[test]
-    fn test_normalize_merge_insert_batch_uses_position() {
-        let table_fields = vec![
-            DataField::new(0, "a".to_string(), DataType::Int(IntType::new())),
-            DataField::new(1, "b".to_string(), DataType::Int(IntType::new())),
-        ];
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("b", ArrowDataType::Int32, false),
-                Field::new("x", ArrowDataType::Int32, false),
-            ])),
-            vec![
-                Arc::new(Int32Array::from(vec![100])),
-                Arc::new(Int32Array::from(vec![7])),
-            ],
-        )
-        .unwrap();
-
-        let normalized = normalize_insert_batch_to_table_schema(&batch, &table_fields).unwrap();
-        let first = normalized
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let second = normalized
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-
-        assert_eq!(normalized.schema().field(0).name(), "a");
-        assert_eq!(normalized.schema().field(1).name(), "b");
-        assert_eq!(first.value(0), 100);
-        assert_eq!(second.value(0), 7);
-    }
-
-    #[test]
-    fn test_source_partition_pruning_requires_partition_equality() {
-        let merge = parse_merge(
-            "MERGE INTO target t USING source s ON t.a = s.a \
-             WHEN MATCHED THEN UPDATE SET b = s.b",
-        );
-        let partition_keys = vec!["pt".to_string()];
-
-        assert!(!can_prune_target_by_source_partitions(
-            &partition_keys,
-            "t",
-            "s",
-            &merge.on,
-        ));
-    }
-
-    #[test]
-    fn test_source_partition_pruning_accepts_partition_equality() {
-        let merge = parse_merge(
-            "MERGE INTO target t USING source s ON t.a = s.a AND t.pt = s.pt \
-             WHEN MATCHED THEN UPDATE SET b = s.b",
-        );
-        let partition_keys = vec!["pt".to_string()];
-
-        assert!(can_prune_target_by_source_partitions(
-            &partition_keys,
-            "t",
-            "s",
-            &merge.on,
-        ));
-    }
-
-    #[test]
-    fn test_source_partition_pruning_accepts_reversed_partition_equality() {
-        let merge = parse_merge(
-            "MERGE INTO target t USING source s ON s.pt = t.pt AND t.a = s.a \
-             WHEN MATCHED THEN UPDATE SET b = s.b",
-        );
-        let partition_keys = vec!["pt".to_string()];
-
-        assert!(can_prune_target_by_source_partitions(
-            &partition_keys,
-            "t",
-            "s",
-            &merge.on,
-        ));
     }
 
     #[tokio::test]
@@ -2020,47 +667,6 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(count, 0);
-    }
-
-    #[tokio::test]
-    async fn test_merge_into_rejects_pk_table_without_data_evolution() {
-        let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let table_path = "memory:/test_merge_reject";
-        file_io
-            .mkdirs(&format!("{table_path}/snapshot/"))
-            .await
-            .unwrap();
-        file_io
-            .mkdirs(&format!("{table_path}/manifest/"))
-            .await
-            .unwrap();
-
-        let schema = PaimonSchema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .primary_key(["id"])
-            .option("bucket", "1")
-            .build()
-            .unwrap();
-        let table_schema = TableSchema::new(0, &schema);
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "t"),
-            table_path.to_string(),
-            table_schema,
-            None,
-        );
-
-        let sql_context = SQLContext::new();
-        let merge = parse_merge(
-            "MERGE INTO t USING s ON t.id = s.id \
-             WHEN MATCHED THEN UPDATE SET id = s.id",
-        );
-        let result = execute_merge_into(&sql_context, &merge, table, true).await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("primary-key tables without data-evolution"));
     }
 
     // -----------------------------------------------------------------------
@@ -2326,10 +932,7 @@ mod tests {
         let err = execute_merge_into(&sql_context, &merge, table, true)
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().contains("value(s) but the table has"),
-            "got {err}"
-        );
+        assert!(err.to_string().contains("column(s) but"), "got {err}");
 
         // The target is unchanged: the matched UPDATE did not apply.
         let batches = sql_context
@@ -2641,7 +1244,7 @@ mod tests {
 
             let merge = parse_merge(&format!(
                 "MERGE INTO paimon.test_db.target t USING paimon.test_db.source s \
-                 ON paimon.test_db.target.id = paimon.test_db.source.id{on_predicate} \
+                 ON t.id = s.id{on_predicate} \
                  WHEN MATCHED{matched_predicate} THEN UPDATE SET name = 'paimon.test_db.target.payload' \
                  WHEN NOT MATCHED{insert_predicate} THEN INSERT (id, name, value) VALUES (s.id, 'paimon.test_db.source.payload', 40)"
             ));

@@ -79,8 +79,8 @@ Operators such as sorting and aggregation may still buffer data during execution
 
 `sql_stream_with_options(sql, options)` applies `SQLOptions` as `sql_with_options()`
 does: they restrict statements delegated to DataFusion, but not statements Paimon
-handles itself, such as `DELETE`, `UPDATE`, `MERGE INTO` or `DROP TABLE` on a
-Paimon table.
+handles itself, such as `DELETE`, `UPDATE` or `DROP TABLE` on a Paimon table.
+`MERGE INTO` uses DataFusion's native planner and honors the DML restriction.
 
 ### Native Vector Search
 

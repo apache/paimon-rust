@@ -659,10 +659,7 @@ impl SQLContext {
                 )
                 .await
             }
-            Statement::Merge(merge) => {
-                self.handle_merge_into(merge, enable_ident_normalization)
-                    .await
-            }
+            Statement::Merge(merge) => self.handle_merge_into(merge, options).await,
             Statement::Update(update) => {
                 self.handle_update(update, enable_ident_normalization).await
             }
@@ -836,6 +833,15 @@ impl SQLContext {
                 .await
             }
             Statement::Query(_) | Statement::Explain { .. } => {
+                let mut statement = statements[0].clone();
+                if let Statement::Explain {
+                    statement: inner, ..
+                } = &mut statement
+                {
+                    if let Statement::Merge(merge) = inner.as_mut() {
+                        *merge = self.normalize_merge_into(merge).await?;
+                    }
+                }
                 let current_catalog = self.current_catalog_name();
                 let current_database = self
                     .ctx
@@ -846,7 +852,7 @@ impl SQLContext {
                     .clone();
                 let expanded = crate::sql_function::expand_statement(
                     &self.ctx.state(),
-                    statements[0].clone(),
+                    statement,
                     &self.catalogs,
                     &current_catalog,
                     &current_database,
@@ -1799,11 +1805,12 @@ impl SQLContext {
         Ok(())
     }
 
-    async fn handle_merge_into(
-        &self,
-        merge: &Merge,
-        enable_ident_normalization: bool,
-    ) -> DFResult<DataFrame> {
+    async fn handle_merge_into(&self, merge: &Merge, options: SQLOptions) -> DFResult<DataFrame> {
+        let merge = self.normalize_merge_into(merge).await?;
+        self.ctx.sql_with_options(&merge.to_string(), options).await
+    }
+
+    async fn normalize_merge_into(&self, merge: &Merge) -> DFResult<Merge> {
         self.ensure_no_time_travel_for_write("MERGE INTO")?;
         let table_name = match &merge.table {
             TableFactor::Table { name, .. } => name.clone(),
@@ -1814,14 +1821,71 @@ impl SQLContext {
             }
         };
         Self::ensure_main_branch_write_target(&table_name, "MERGE INTO")?;
-        let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
-
-        let table = catalog
-            .get_table(&identifier)
-            .await
-            .map_err(to_datafusion_error)?;
-
-        crate::merge_into::execute_merge_into(self, merge, table, enable_ident_normalization).await
+        let mut merge = merge.clone();
+        // Existing not-matched expressions resolve unqualified columns against
+        // the source. DataFusion 55 resolves them against the combined schema,
+        // which can make common column names ambiguous. Preserve source scope
+        // while leaving name/type validation to the native planner.
+        let source_qualifier = match &merge.source {
+            TableFactor::Table {
+                alias: Some(alias), ..
+            }
+            | TableFactor::Derived {
+                alias: Some(alias), ..
+            } => vec![alias.name.clone()],
+            TableFactor::Table { name, .. } => name
+                .0
+                .iter()
+                .filter_map(|p| p.as_ident().cloned())
+                .collect(),
+            _ => vec![],
+        };
+        if !source_qualifier.is_empty() {
+            for clause in &mut merge.clauses {
+                if let datafusion::sql::sqlparser::ast::MergeAction::Insert(insert) =
+                    &mut clause.action
+                {
+                    let qualify = |expr: &mut SqlExpr| {
+                        if let SqlExpr::Identifier(ident) = expr {
+                            let mut parts = source_qualifier.clone();
+                            parts.push(ident.clone());
+                            *expr = SqlExpr::CompoundIdentifier(parts);
+                        }
+                        std::ops::ControlFlow::<()>::Continue(())
+                    };
+                    let _ = datafusion::sql::sqlparser::ast::visit_expressions_mut(
+                        &mut insert.kind,
+                        qualify,
+                    );
+                    let _ = datafusion::sql::sqlparser::ast::visit_expressions_mut(
+                        &mut clause.predicate,
+                        qualify,
+                    );
+                }
+            }
+        }
+        // `_ROW_ID` is a query-visible virtual column, but positional INSERTs
+        // still map to the persisted user columns. Make that list explicit
+        // before handing the statement to DataFusion's native planner.
+        if merge.clauses.iter().any(|clause| matches!(
+            &clause.action,
+            datafusion::sql::sqlparser::ast::MergeAction::Insert(insert) if insert.columns.is_empty()
+        )) {
+            let (catalog, _, identifier) = self.resolve_catalog_and_table(&table_name)?;
+            let table = catalog.get_table(&identifier).await.map_err(to_datafusion_error)?;
+            if table.schema().core_options().data_evolution_enabled() {
+                for clause in &mut merge.clauses {
+                    if let datafusion::sql::sqlparser::ast::MergeAction::Insert(insert) = &mut clause.action {
+                        if insert.columns.is_empty() {
+                            insert.columns = table.schema().fields().iter().map(|field| {
+                                ObjectName::from(vec![Ident::with_quote('"', field.name())])
+                            }).collect();
+                        }
+                    }
+                }
+            }
+        }
+        Ok(merge)
     }
 
     async fn handle_update(

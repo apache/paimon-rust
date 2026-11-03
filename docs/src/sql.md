@@ -41,7 +41,7 @@ and writes to ordinary Paimon tables can create them with `file.format=mosaic`.
 SQL support has two layers:
 
 - DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
-- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `MSCK REPAIR TABLE`, `ANALYZE TABLE`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
+- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `MSCK REPAIR TABLE`, `ANALYZE TABLE`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`. `MERGE INTO` uses DataFusion's native planner and the Paimon table provider for execution.
 
 Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. Persistent `CREATE FUNCTION` is supported only for the REST Catalog SQL scalar form documented below. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
 
@@ -76,11 +76,13 @@ and `unnest_outer`) and its planner, aggregation, and spill improvements are
 available through the normal session. Custom spill backends can be configured
 on the `RuntimeEnv` passed to `SQLContext::builder`.
 
-Paimon `MERGE INTO` continues to use `SQLContext`'s Paimon write implementation.
-DataFusion's generic `TableProvider::merge_into` hook, `file_row_index()` and
-`input_file_name()` for Paimon scans, and custom query-planner FFI are not
-provided by this upgrade. Paimon's logical row IDs are not physical file row
-offsets.
+Paimon `MERGE INTO` uses DataFusion's native DML plan and
+`TableProvider::merge_into` hook. Planning and `EXPLAIN` do not modify data;
+collecting or executing the plan performs the write and returns an affected-row
+`count`. `SQLOptions` DML restrictions apply to MERGE statements.
+`file_row_index()` and `input_file_name()` for Paimon scans and custom
+query-planner FFI are not provided. Paimon's logical row IDs are not physical
+file row offsets.
 
 Scans declare DataFusion `Range` partitioning when every table partition key is
 present unchanged in the scan output and uses a supported type: Boolean,
@@ -1047,6 +1049,25 @@ WHEN MATCHED THEN UPDATE SET name = source.name;
 
 For append-only tables, `MERGE INTO` uses Copy-on-Write file rewriting and supports matched `UPDATE`, matched `DELETE`, and not-matched `INSERT`. For data-evolution row-tracking tables without primary keys, `MERGE INTO` uses the `_ROW_ID` virtual column for row-level tracking and supports matched `UPDATE`, matched `DELETE` when deletion vectors are enabled, and not-matched `INSERT`. Primary-key tables are not supported for `MERGE INTO`.
 
+The source is captured once per execution. On row-ID or CoW delete conflicts,
+the operation retries up to five attempts, refreshing the target scan and
+writers while replaying the captured source. Update, delete, and insert messages
+are published in one commit. Multiple source rows selecting an update or delete
+for the same target row fail without publishing any actions.
+
+Append-only tables support multiple conditional matched clauses with the first
+true clause taking effect; NULL predicates fall through. Data-evolution tables
+retain the restriction of one unconditional matched clause. Both support
+conditional not-matched inserts. `NOT MATCHED BY SOURCE` and subqueries inside
+`ON` or action expressions are not supported by the Paimon executor. Native
+planner restrictions also apply, including `UPDATE SET *`, `INSERT *`, `OUTPUT`,
+and action-level `WHERE` predicates. After declaring a table alias, use that
+alias in column references.
+
+`SQLContext` expands positional MERGE inserts to persisted column names for
+data-evolution tables, excluding the virtual `_ROW_ID`. When using a raw
+DataFusion `SessionContext`, list the insert columns explicitly for these tables.
+
 ### TRUNCATE TABLE
 
 Truncate an entire table or specific partitions:
@@ -1443,7 +1464,7 @@ by a conditional update or transaction.
 
 ### create_tag_from_timestamp
 
-Create a named tag from a commit timestamp (finds the earliest retained snapshot at or after the given time):
+Create a named tag from an epoch timestamp in milliseconds (finds the earliest retained snapshot at or after the given time):
 
 ```sql
 CALL sys.create_tag_from_timestamp(table => 'paimon.my_db.my_table', tag => 'my_tag', timestamp => 1234567890000);
@@ -1504,11 +1525,15 @@ CALL sys.rollback_to(table => 'paimon.my_db.my_table', tag => 'my_tag');
 
 ### rollback_to_timestamp
 
-Rollback a table to a specific timestamp:
+Rollback a table to an epoch timestamp in milliseconds (selects the latest retained snapshot at or before that time):
 
 ```sql
 CALL sys.rollback_to_timestamp(table => 'paimon.my_db.my_table', timestamp => 1234567890000);
 ```
+
+Both timestamp procedures take epoch milliseconds. The `$snapshots.commit_time`
+column is a local `TIMESTAMP`; its raw Arrow value includes the local timezone
+offset and must not be passed directly as an epoch timestamp.
 
 ### create_global_index
 
