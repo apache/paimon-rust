@@ -19,12 +19,15 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow_array::{Array, Int32Array};
+use arrow_array::{Array, Int32Array, RecordBatch};
+use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use datafusion::common::ScalarValue;
 use datafusion::physical_plan::{
     collect_partitioned, displayable, ExecutionPlan, ExecutionPlanProperties, Partitioning,
 };
 use paimon_datafusion::SQLContext;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ArrowWriter;
 
 fn scan(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     fn find(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -341,6 +344,225 @@ async fn joins_align_different_ranges_after_primary_key_updates() {
             vec![(1, 110), (2, 400), (3, 330), (4, 440)]
         );
     }
+}
+
+#[tokio::test]
+async fn joins_with_identical_ranges_avoid_exchanges() {
+    let (_tmp, ctx) = common::setup_sql_context().await;
+    common::exec(&ctx, "SET datafusion.execution.target_partitions = 2").await;
+    common::exec(&ctx, "CREATE TABLE paimon.test_db.compatible_left (id INT, pt INT, value INT) PARTITIONED BY (pt)").await;
+    common::exec(
+        &ctx,
+        "CREATE TABLE paimon.test_db.compatible_right (pt INT, value INT) PARTITIONED BY (pt)",
+    )
+    .await;
+    common::exec(&ctx, "INSERT INTO paimon.test_db.compatible_left VALUES (1, 1, 10), (2, 2, 20), (3, 3, 30), (4, 4, 40), (5, 3, 50)").await;
+    common::exec(&ctx, "INSERT INTO paimon.test_db.compatible_right VALUES (1, 100), (2, 200), (3, 300), (4, 400), (3, 301)").await;
+
+    let left = scan(&plan(&ctx, "SELECT * FROM paimon.test_db.compatible_left").await);
+    let right = scan(&plan(&ctx, "SELECT * FROM paimon.test_db.compatible_right").await);
+    let (Partitioning::Range(left), Partitioning::Range(right)) =
+        (left.output_partitioning(), right.output_partitioning())
+    else {
+        panic!("both inputs must have ranges");
+    };
+    assert_eq!(left.partition_count(), 2);
+    assert_eq!(right.partition_count(), 2);
+    assert_eq!(left.split_points(), right.split_points());
+    assert_eq!(
+        left.split_points()[0].values(),
+        &[ScalarValue::Int32(Some(3))]
+    );
+
+    common::exec(
+        &ctx,
+        "SET datafusion.optimizer.hash_join_single_partition_threshold = 0",
+    )
+    .await;
+    common::exec(
+        &ctx,
+        "SET datafusion.optimizer.hash_join_single_partition_threshold_rows = 0",
+    )
+    .await;
+    for prefer_hash in [true, false] {
+        common::exec(
+            &ctx,
+            &format!("SET datafusion.optimizer.prefer_hash_join = {prefer_hash}"),
+        )
+        .await;
+        let query = "SELECT l.id, l.value + r.value AS value FROM paimon.test_db.compatible_left l JOIN paimon.test_db.compatible_right r ON l.pt = r.pt";
+        let physical = plan(&ctx, query).await;
+        let text = displayable(physical.as_ref()).indent(true).to_string();
+        let join = if prefer_hash {
+            "HashJoinExec"
+        } else {
+            "SortMergeJoinExec"
+        };
+        assert!(text.contains(join), "{text}");
+        assert!(
+            !text.contains("RepartitionExec"),
+            "compatible ranges should avoid exchanges: {text}"
+        );
+        if !prefer_hash {
+            assert!(
+                text.contains("SortExec"),
+                "unordered range inputs still need local sorts: {text}"
+            );
+        }
+        let mut rows = common::collect_id_value(&ctx, query).await;
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![
+                (1, 110),
+                (2, 220),
+                (3, 330),
+                (3, 331),
+                (4, 440),
+                (5, 350),
+                (5, 351)
+            ],
+            "{join}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn format_table_restores_partition_columns_into_declared_ranges() {
+    use paimon::catalog::{Catalog, Identifier};
+    use paimon::spec::{DataType, IntType, Schema};
+    use paimon::{CatalogOptions, FileSystemCatalog, Options};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut options = Options::new();
+    // Match the file:/ paths returned by listing, as in the format-table fixtures.
+    options.set(
+        CatalogOptions::WAREHOUSE,
+        format!("file:{}", tmp.path().display()),
+    );
+    let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    catalog
+        .create_database("test_db", false, Default::default())
+        .await
+        .unwrap();
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("pt", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .partition_keys(["pt"])
+        .option("type", "format-table")
+        .option("file.format", "parquet")
+        .build()
+        .unwrap();
+    catalog
+        .create_table(&Identifier::new("test_db", "format_ranges"), schema, false)
+        .await
+        .unwrap();
+
+    // Physical files hold only data columns; pt must come from split metadata.
+    let physical_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", ArrowDataType::Int32, true),
+        Field::new("value", ArrowDataType::Int32, true),
+    ]));
+    for (pt, ids, values) in [
+        (10, vec![4, 5], vec![40, 50]),
+        (-10, vec![1, 2], vec![10, 20]),
+        (2, vec![3], vec![30]),
+    ] {
+        let directory = tmp.path().join(format!("test_db.db/format_ranges/pt={pt}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("part-0.parquet");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&physical_schema),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&path).unwrap(),
+            Arc::clone(&physical_schema),
+            None,
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path).unwrap()).unwrap();
+        assert!(reader.schema().field_with_name("pt").is_err());
+    }
+
+    let ctx = common::create_sql_context(catalog).await;
+    common::exec(&ctx, "SET datafusion.execution.target_partitions = 2").await;
+    let physical = plan(
+        &ctx,
+        "SELECT id, pt, value FROM paimon.test_db.format_ranges",
+    )
+    .await;
+    let scan = scan(&physical);
+    let Partitioning::Range(range) = scan.output_partitioning() else {
+        panic!(
+            "format table must declare ranges: {:?}",
+            scan.output_partitioning()
+        );
+    };
+    assert_eq!(range.partition_count(), 2);
+    assert_eq!(
+        range.split_points()[0].values(),
+        &[ScalarValue::Int32(Some(10))]
+    );
+    let mut actual = Vec::new();
+    for batches in collect_partitioned(scan, ctx.ctx().task_ctx())
+        .await
+        .unwrap()
+    {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let keys = batch
+                .column_by_name("pt")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let values = batch
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            rows.extend(
+                (0..batch.num_rows()).map(|i| (keys.value(i), ids.value(i), values.value(i))),
+            );
+        }
+        rows.sort_unstable();
+        actual.push(rows);
+    }
+    assert_eq!(
+        actual,
+        vec![
+            vec![(-10, 1, 10), (-10, 2, 20), (2, 3, 30)],
+            vec![(10, 4, 40), (10, 5, 50)]
+        ]
+    );
+
+    let query = "SELECT pt AS id, CAST(sum(value) AS INT) AS value FROM paimon.test_db.format_ranges GROUP BY pt";
+    let physical = plan(&ctx, query).await;
+    let text = displayable(physical.as_ref()).indent(true).to_string();
+    assert!(
+        !text.contains("RepartitionExec"),
+        "format-table ranges should avoid an exchange: {text}"
+    );
+    assert_eq!(
+        common::collect_id_value(&ctx, query).await,
+        vec![(-10, 30), (2, 30), (10, 90)]
+    );
 }
 
 #[tokio::test]
