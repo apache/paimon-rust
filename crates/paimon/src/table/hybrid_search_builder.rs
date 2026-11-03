@@ -645,7 +645,11 @@ impl<'a> HybridSearchBuilder<'a> {
         table: &'t Table,
         route: &HybridSearchRoute,
     ) -> super::VectorSearchBuilder<'t> {
-        vector_route_builder(table, route, self.filter.as_ref())
+        configure_vector_route_builder(
+            table.new_vector_search_builder(),
+            route,
+            self.filter.as_ref(),
+        )
     }
 
     fn validate_global_routes(&self) -> crate::Result<()> {
@@ -716,7 +720,7 @@ impl<'a> HybridSearchBuilder<'a> {
         let mut any_pk = false;
         let mut any_global = false;
         for route in &self.routes {
-            if route_is_primary_key(core, route) {
+            if route_is_primary_key(core, route, !self.table.schema().primary_keys().is_empty()) {
                 any_pk = true;
             } else {
                 any_global = true;
@@ -1052,19 +1056,26 @@ enum HybridAddressSpace {
 /// non-erroring accessor so a malformed config cannot misclassify an unrelated
 /// route). Full-text: data-evolution disabled AND the column configured in
 /// `pk-full-text.index.columns`.
-fn route_is_primary_key(core: &CoreOptions<'_>, route: &HybridSearchRoute) -> bool {
+fn route_is_primary_key(
+    core: &CoreOptions<'_>,
+    route: &HybridSearchRoute,
+    primary_key: bool,
+) -> bool {
+    if !primary_key || core.data_evolution_enabled() {
+        return false;
+    }
     match route.kind {
         HybridSearchRouteKind::Vector => {
-            core.primary_key_vector_index_enabled()
+            core.vector_index_enabled()
                 && core
-                    .primary_key_vector_index_columns()
-                    .ok()
-                    .is_some_and(|cols| cols.iter().any(|c| c == route.field_name()))
+                    .vector_index_columns()
+                    .iter()
+                    .any(|c| c == route.field_name())
         }
         HybridSearchRouteKind::FullText => {
             !core.data_evolution_enabled()
                 && core
-                    .primary_key_full_text_index_columns()
+                    .full_text_index_columns()
                     .iter()
                     .any(|c| c == route.field_name())
         }
@@ -1217,14 +1228,6 @@ fn build_hybrid_indexed_splits(
         });
     }
     Ok(out)
-}
-
-fn vector_route_builder<'t>(
-    table: &'t Table,
-    route: &HybridSearchRoute,
-    filter: Option<&Predicate>,
-) -> super::VectorSearchBuilder<'t> {
-    configure_vector_route_builder(table.new_vector_search_builder(), route, filter)
 }
 
 fn configure_vector_route_builder<'t>(
@@ -1543,6 +1546,7 @@ mod pk_hybrid_tests {
 
     fn pk_schema(extra: &[(&str, &str)]) -> TableSchema {
         let mut builder = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column(
                 VECTOR_COLUMN,

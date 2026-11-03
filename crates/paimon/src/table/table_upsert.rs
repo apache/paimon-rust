@@ -24,7 +24,10 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
-use arrow_select::{concat::concat_batches, take::take};
+use arrow_select::{
+    concat::{concat, concat_batches},
+    take::take,
+};
 use futures::TryStreamExt;
 use indexmap::IndexMap;
 
@@ -48,6 +51,16 @@ fn invalid(message: impl Into<String>) -> crate::Error {
     }
 }
 
+fn needs_zero_width_take_workaround(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::FixedSizeBinary(0) => true,
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| needs_zero_width_take_workaround(field.data_type())),
+        _ => false,
+    }
+}
+
 fn selected_rows(batch: &RecordBatch, rows: &[usize]) -> crate::Result<RecordBatch> {
     let indices = rows
         .iter()
@@ -58,8 +71,24 @@ fn selected_rows(batch: &RecordBatch, rows: &[usize]) -> crate::Result<RecordBat
         .columns()
         .iter()
         .map(|array| {
-            take(array.as_ref(), &indices, None)
-                .map_err(|error| invalid(format!("cannot select upsert rows: {error}")))
+            // Arrow's take kernel loses the explicit length of all-valid
+            // zero-width binary arrays, including their enclosing structs.
+            // Concatenating row slices preserves both length and validity.
+            let selected =
+                if !rows.is_empty() && needs_zero_width_take_workaround(array.data_type()) {
+                    let slices = rows
+                        .iter()
+                        .map(|row| array.slice(*row, 1))
+                        .collect::<Vec<_>>();
+                    let arrays = slices
+                        .iter()
+                        .map(|slice| slice.as_ref())
+                        .collect::<Vec<_>>();
+                    concat(&arrays)
+                } else {
+                    take(array.as_ref(), &indices, None)
+                };
+            selected.map_err(|error| invalid(format!("cannot select upsert rows: {error}")))
         })
         .collect::<crate::Result<Vec<_>>>()?;
     RecordBatch::try_new(batch.schema(), columns)
@@ -568,8 +597,74 @@ mod tests {
     use crate::table::TableCommit;
     use arrow_array::{Array, Int32Array, StringArray};
 
+    #[test]
+    fn selected_rows_preserve_zero_width_binary_values_and_nulls() {
+        use arrow_array::{FixedSizeBinaryArray, StructArray};
+        use arrow_buffer::{Buffer, NullBuffer};
+
+        let binary = Arc::new(
+            FixedSizeBinaryArray::try_new_with_len(
+                0,
+                Buffer::from([]),
+                Some(NullBuffer::from(vec![
+                    false, true, false, true, true, false,
+                ])),
+                6,
+            )
+            .unwrap()
+            .slice(1, 4),
+        ) as ArrayRef;
+        let nested = Arc::new(StructArray::new(
+            vec![
+                Arc::new(Field::new("nested", DataType::FixedSizeBinary(0), true)),
+                Arc::new(Field::new("sibling", DataType::Int32, false)),
+            ]
+            .into(),
+            vec![
+                binary.clone(),
+                Arc::new(Int32Array::from(vec![10, 11, 12, 13])),
+            ],
+            Some(NullBuffer::from(vec![true, true, false, true])),
+        )) as ArrayRef;
+        let nested_twice = Arc::new(StructArray::new(
+            vec![Arc::new(Field::new(
+                "row",
+                nested.data_type().clone(),
+                true,
+            ))]
+            .into(),
+            vec![nested.clone()],
+            None,
+        )) as ArrayRef;
+
+        for values in [binary, nested, nested_twice] {
+            let input = numeric_source(vec![0, 1, 2, 3], values);
+            for rows in [
+                vec![],
+                vec![0],
+                vec![1],
+                vec![2],
+                vec![3, 0, 3],
+                vec![1, 0, 1],
+            ] {
+                let selected = selected_rows(&input, &rows).unwrap();
+                assert_eq!(selected.schema(), input.schema());
+                assert_eq!(selected.num_rows(), rows.len());
+                for (output_row, input_row) in rows.iter().enumerate() {
+                    for column in 0..input.num_columns() {
+                        assert_eq!(
+                            selected.column(column).slice(output_row, 1).as_ref(),
+                            input.column(column).slice(*input_row, 1).as_ref(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     async fn numeric_table(path: &str) -> Table {
         let schema = PaimonSchema::builder()
+            .option("write-only", "true")
             .column("key", PaimonType::Int(IntType::new()))
             .column("value", PaimonType::Int(IntType::new()))
             .column("keep", PaimonType::Int(IntType::new()))

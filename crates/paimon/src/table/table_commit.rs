@@ -49,7 +49,14 @@ const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 /// Java RollingFileWriter.CHECK_ROLLING_RECORD_CNT.
 const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
 
+mod auto_index;
+#[cfg(test)]
+mod auto_index_tests;
+mod auto_maintenance;
 mod global_index_source_check;
+mod index_commit;
+
+use index_commit::IndexChanges;
 mod row_tracking;
 
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
@@ -388,9 +395,21 @@ impl TableCommit {
         }
         let latest = self.snapshot_manager.get_latest_snapshot().await?;
         let mut pending = Vec::new();
+        let mut recovered = Vec::new();
         for (id, messages) in commits {
             if !self.is_committed_identifier(&latest, id).await? {
                 pending.push((id, messages));
+            } else if self
+                .auto_compaction_enabled(messages.iter().any(|m| !m.new_files.is_empty()))?
+                || self
+                    .auto_index_enabled(messages.iter().any(|m| !m.new_files.is_empty()))
+                    .await?
+            {
+                let kind = direct_commit_kind(
+                    &self.messages_to_entries(&messages),
+                    &self.messages_to_index_entries(&messages),
+                );
+                recovered.push((id, kind));
             }
         }
         // Java checks every pending checkpoint before publishing any snapshot.
@@ -399,6 +418,9 @@ impl TableCommit {
             self.check_recovery_files(messages).await?;
         }
         let count = pending.len();
+        for (id, kind) in recovered {
+            self.recover_maintenance_after_write(id, &kind).await?;
+        }
         for (id, messages) in pending {
             self.filter_and_commit_with_identifier(messages, id).await?;
         }
@@ -434,15 +456,19 @@ impl TableCommit {
             return Ok(super::CompactMetrics::default());
         }
         let prepared = super::compact::prepare_results(&self.table, &results)?;
+        let maintain_indexes = self.auto_index_enabled(true).await?;
+        let planned_snapshot_id = prepared.snapshot_id;
         let mut commit = self.clone();
         // One stable identity per plan and task subset, allowing repeated plans
         // and idempotent retry without consuming the caller's checkpoint sequence.
         commit.commit_user = format!("{}-compact-{}", self.commit_user, prepared.commit_suffix);
-        commit
+        let outcome = commit
             .try_commit(
                 CommitEntriesPlan::Compact {
                     entries: prepared.entries,
                     changelog_entries: prepared.changelog_entries,
+                    deletion_vector_updates: prepared.deletion_vector_updates,
+                    index_entries: prepared.index_entries,
                     schema_id: prepared.schema_id,
                     read_snapshot: prepared.read_snapshot,
                     planned_snapshot_id: prepared.snapshot_id,
@@ -452,7 +478,49 @@ impl TableCommit {
                 true,
             )
             .await?;
+        if maintain_indexes {
+            let written = match outcome {
+                CommitOutcome::Published(snapshot) => Some(*snapshot),
+                CommitOutcome::Filtered => {
+                    let latest = commit.snapshot_manager.get_latest_snapshot().await?;
+                    commit
+                        .find_duplicate_commit(
+                            planned_snapshot_id.saturating_add(1),
+                            &latest,
+                            BATCH_COMMIT_IDENTIFIER,
+                            &CommitKind::COMPACT,
+                        )
+                        .await?
+                }
+                CommitOutcome::Empty => None,
+            };
+            if let Some(snapshot) = written {
+                commit.index_after_write(&snapshot).await?;
+            }
+        }
         Ok(prepared.metrics)
+    }
+
+    /// Delete files prepared by compaction results that were never submitted.
+    /// Every file is attempted; the error names each file left behind.
+    /// Never call it after `commit_compact` starts: an uncertain commit may
+    /// already reference them.
+    pub async fn abort_compact(&self, results: &[super::CompactResult]) -> Result<()> {
+        let messages: Vec<_> = results
+            .iter()
+            .map(super::CompactResult::abort_message)
+            .collect();
+        let failed = self.delete_new_files(&messages).await?;
+        if failed.is_empty() {
+            return Ok(());
+        }
+        Err(crate::Error::UnexpectedError {
+            message: format!(
+                "Failed to delete files of unsubmitted compaction results: {}",
+                failed.join(", ")
+            ),
+            source: None,
+        })
     }
 
     /// Commit new files with a caller-provided commit identifier.
@@ -519,7 +587,7 @@ impl TableCommit {
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
         // Never delete CommitMessage files on failure. A previous attempt may
         // have published them even when the caller received an exception.
-        self.try_commit(
+        self.commit_with_maintenance(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
@@ -566,7 +634,7 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
-        self.try_commit(
+        self.commit_with_maintenance(
             CommitEntriesPlan::Direct {
                 entries,
                 changelog_entries,
@@ -675,7 +743,7 @@ impl TableCommit {
 
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
 
-        self.try_commit(
+        self.commit_with_maintenance(
             CommitEntriesPlan::Overwrite {
                 partition_filter,
                 new_entries,
@@ -922,6 +990,7 @@ impl TableCommit {
             filter_committed,
         )
         .await
+        .map(|_| ())
     }
 
     /// Python-compatible alias for dropping partitions.
@@ -997,6 +1066,7 @@ impl TableCommit {
             filter_committed,
         )
         .await
+        .map(|_| ())
     }
 
     /// A Format Table has no snapshots, so an overwrite commit would find nothing to delete and
@@ -1030,6 +1100,13 @@ impl TableCommit {
                 .abort(commit_messages)
                 .await;
         }
+        self.delete_new_files(commit_messages).await?;
+        Ok(())
+    }
+
+    /// Delete new files of known-uncommitted messages, continuing past failures.
+    /// Returns each path that could not be deleted with its error.
+    async fn delete_new_files(&self, commit_messages: &[CommitMessage]) -> Result<Vec<String>> {
         CoreOptions::new(self.table.schema().options())
             .ensure_type_paimon_served(&self.table.identifier().full_name())?;
         super::write_builder::ensure_table_write_allowed(&self.table)?;
@@ -1038,6 +1115,7 @@ impl TableCommit {
         let index_file_in_data_file_dir =
             CoreOptions::new(self.table.schema().options()).index_file_in_data_file_dir();
 
+        let mut failed = Vec::new();
         for message in commit_messages {
             let bucket_path = self.bucket_path(&message.partition, message.bucket)?;
             for file in message
@@ -1048,7 +1126,9 @@ impl TableCommit {
                 .chain(message.compact_changelog_files.iter())
             {
                 for path in file.collect_files(&bucket_path) {
-                    let _ = self.table.file_io().delete_file(&path).await;
+                    if let Err(error) = self.table.file_io().delete_file(&path).await {
+                        failed.push(format!("{path}: {error}"));
+                    }
                 }
             }
             // An index file must be deleted where it was written: at its external
@@ -1073,10 +1153,12 @@ impl TableCommit {
                     index_file_in_data_file_dir,
                     file,
                 );
-                let _ = self.table.file_io().delete_file(&path).await;
+                if let Err(error) = self.table.file_io().delete_file(&path).await {
+                    failed.push(format!("{path}: {error}"));
+                }
             }
         }
-        Ok(())
+        Ok(failed)
     }
 
     fn bucket_path(&self, partition: &[u8], bucket: i32) -> Result<String> {
@@ -1113,7 +1195,7 @@ impl TableCommit {
         expected_snapshot_id: Option<i64>,
         commit_identifier: i64,
         filter_committed: bool,
-    ) -> Result<()> {
+    ) -> Result<CommitOutcome> {
         let mut retry_count = 0u32;
         let mut duplicate_check_start_snapshot_id: Option<i64> = None;
         let mut retry_state: Option<Box<RetryState>> = None;
@@ -1129,7 +1211,7 @@ impl TableCommit {
         let mut publication_uncertain = false;
         let mut last_publication_error = None;
         let result = async {
-            loop {
+            let outcome = loop {
                 let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
                 if filter_committed {
                     let recovery_start = match &plan {
@@ -1147,7 +1229,7 @@ impl TableCommit {
                         )
                         .await?
                     {
-                        break;
+                        break CommitOutcome::Filtered;
                     }
                     self.check_recovered_files_exist(&plan).await?;
                     filter_committed = false;
@@ -1164,9 +1246,10 @@ impl TableCommit {
                     {
                         if !self.commit_callbacks.is_empty() {
                             let entries = self.read_delta_entries(None, &snapshot).await?;
-                            self.notify_commit_callbacks(snapshot, entries).await?;
+                            self.notify_commit_callbacks(snapshot.clone(), entries)
+                                .await?;
                         }
-                        break;
+                        break CommitOutcome::Published(Box::new(snapshot));
                     }
                 }
                 validate_expected_latest_snapshot(expected_snapshot_id, &latest_snapshot)?;
@@ -1185,7 +1268,7 @@ impl TableCommit {
                     && !commit_empty_overwrite
                     && !commit_empty_append
                 {
-                    break;
+                    break CommitOutcome::Empty;
                 }
 
                 let result = self
@@ -1193,7 +1276,9 @@ impl TableCommit {
                     .await?;
 
                 match result {
-                    CommitAttemptResult::Success => break,
+                    CommitAttemptResult::Success(snapshot) => {
+                        break CommitOutcome::Published(snapshot)
+                    }
                     CommitAttemptResult::Retry(mut state) => {
                         if let Some(error) = state.publication_error.take() {
                             publication_uncertain = true;
@@ -1221,9 +1306,9 @@ impl TableCommit {
 
                 self.commit_retry_wait(retry_count).await;
                 retry_count += 1;
-            }
+            };
 
-            Ok(())
+            Ok(outcome)
         }
         .await;
         match result {
@@ -1256,10 +1341,15 @@ impl TableCommit {
             CommitEntriesPlan::Compact {
                 entries,
                 changelog_entries,
+                index_entries,
                 ..
             } => {
                 return self
-                    .check_recovery_entries(entries, changelog_entries, &[])
+                    .check_recovery_entries(
+                        entries,
+                        changelog_entries,
+                        index_entries.as_deref().unwrap_or_default(),
+                    )
                     .await;
             }
         };
@@ -1346,12 +1436,45 @@ impl TableCommit {
         {
             Ok(true) => {
                 if !self.commit_callbacks.is_empty() {
-                    self.notify_commit_callbacks(snapshot, resolved.entries)
+                    self.notify_commit_callbacks(snapshot.clone(), resolved.entries)
                         .await?;
                 }
-                return Ok(CommitAttemptResult::Success);
+                return Ok(CommitAttemptResult::Success(Box::new(snapshot)));
             }
-            Ok(false) => None,
+            Ok(false) => {
+                if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
+                    // Only this attempt's generated DV files are definitely
+                    // unpublished. Prepared data/changelogs and old shared
+                    // containers still belong to the caller or prior snapshots.
+                    let created = created_files
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<HashSet<_>>();
+                    for entry in resolved
+                        .new_index_manifest_entries
+                        .iter()
+                        .flatten()
+                        .filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
+                    {
+                        let Ok(bucket) = self.bucket_path(&entry.partition, entry.bucket) else {
+                            continue;
+                        };
+                        let path = committed_index_file_path(
+                            self.table.location(),
+                            &bucket,
+                            self.table
+                                .schema()
+                                .core_options()
+                                .index_file_in_data_file_dir(),
+                            &entry.index_file,
+                        );
+                        if created.contains(path.as_str()) {
+                            let _ = self.table.file_io().delete_file(&path).await;
+                        }
+                    }
+                }
+                None
+            }
             Err(error) => Some(error),
         };
         Ok(CommitAttemptResult::Retry(Box::new(RetryState {
@@ -1370,19 +1493,22 @@ impl TableCommit {
     ) -> Result<(Snapshot, Vec<PartitionStatistics>)> {
         let new_snapshot_id = latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1);
 
-        if self.data_evolution_enabled
-            && resolved.kind == CommitKind::COMPACT
-            && self.deletion_vectors_enabled
-        {
+        if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
             if let Some(snapshot) = latest_snapshot {
-                if let Some(indexes) = super::compact::data_evolution::rewrite_deletion_vectors(
+                if let Some(mut indexes) = super::compact::deletion_vectors::rewrite_indexes(
                     &self.table,
                     snapshot,
                     &resolved.entries,
+                    &resolved.deletion_vector_updates,
                     created_files,
                 )
                 .await?
                 {
+                    if let Some(prepared) = &resolved.new_index_manifest_entries {
+                        let is_pk = super::pk_index_maintenance::is_source_index;
+                        indexes.retain(|e| !is_pk(e));
+                        indexes.extend(prepared.iter().filter(|e| is_pk(e)).cloned());
+                    }
                     resolved.index_manifest_changed = true;
                     resolved.new_index_manifest_entries = Some(indexes);
                 }
@@ -1901,13 +2027,12 @@ impl TableCommit {
         retry_state: Option<&RetryState>,
         check_append_files: bool,
     ) -> Result<ResolvedCommit> {
-        let file_io = self.snapshot_manager.file_io();
-        let manifest_dir = self.snapshot_manager.manifest_dir();
-
         match plan {
             CommitEntriesPlan::Compact {
                 entries,
                 changelog_entries,
+                deletion_vector_updates,
+                index_entries,
                 schema_id,
                 read_snapshot,
                 planned_snapshot_id,
@@ -1927,14 +2052,24 @@ impl TableCommit {
                         source: None,
                     });
                 }
+                // Duplicate recovery runs before resolve_commit. An already
+                // published legacy result can omit this field, but a first
+                // publication must retain every historical row deletion.
+                let deletion_vector_updates = match deletion_vector_updates.as_deref() {
+                    Some(updates) => updates,
+                    None if !self.data_evolution_enabled && self.deletion_vectors_enabled => {
+                        return Err(crate::Error::DataInvalid {
+                            message: "Deletion-vector compaction results are missing row deletions; execute the plan again".into(),
+                            source: None,
+                        });
+                    }
+                    None => &[],
+                };
                 // Concurrent writes may replace HASH indexes, deletion vectors
                 // or global indexes. Rebase on the latest manifest every retry.
-                let index_manifest_name = match latest_snapshot {
-                    Some(snapshot) => {
-                        super::compact::validate_snapshot_indexes(&self.table, snapshot).await?
-                    }
-                    None => None,
-                };
+                if let Some(snapshot) = latest_snapshot {
+                    super::compact::validate_snapshot_indexes(&self.table, snapshot).await?;
+                }
                 validate_file_entries(entries.iter())?;
                 validate_file_entries(changelog_entries.iter())?;
                 // This runs after duplicate-commit filtering: an uncertain commit
@@ -1965,6 +2100,7 @@ impl TableCommit {
                         super::compact::validate_primary_key_changes(
                             self.table.schema(),
                             entries,
+                            changelog_entries,
                             &captured_files,
                         )?;
                     }
@@ -2057,13 +2193,44 @@ impl TableCommit {
                     base_data_files.as_deref().unwrap_or_default(),
                     entries,
                 )?;
+                if !self.data_evolution_enabled && self.deletion_vectors_enabled {
+                    let captured =
+                        read_snapshot
+                            .as_deref()
+                            .ok_or_else(|| crate::Error::DataInvalid {
+                                message:
+                                    "PK deletion-vector compaction requires its captured snapshot"
+                                        .into(),
+                                source: None,
+                            })?;
+                    super::compact::primary_key::deletion_vectors::validate_dependencies(
+                        &self.table,
+                        captured,
+                        latest_snapshot.as_ref().expect("validated latest snapshot"),
+                        entries,
+                        deletion_vector_updates,
+                    )
+                    .await?;
+                }
+                let indexes = self
+                    .resolve_indexes(
+                        latest_snapshot,
+                        entries,
+                        IndexChanges::Compact {
+                            captured: read_snapshot.as_deref(),
+                            active: base_data_files.as_deref().unwrap_or_default(),
+                            prepared: index_entries.as_deref(),
+                        },
+                    )
+                    .await?;
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
                     changelog_entries: changelog_entries.clone(),
+                    deletion_vector_updates: deletion_vector_updates.to_vec(),
                     kind: CommitKind::COMPACT,
-                    index_manifest_name,
-                    index_manifest_changed: false,
-                    new_index_manifest_entries: None,
+                    index_manifest_name: indexes.manifest_name,
+                    index_manifest_changed: indexes.entries.is_some(),
+                    new_index_manifest_entries: indexes.entries,
                     base_data_files,
                 })
             }
@@ -2107,36 +2274,22 @@ impl TableCommit {
                     None
                 };
 
-                let previous =
-                    Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot).await?;
-                self.check_global_index_sources(latest_snapshot, entries, new_index_entries)
+                let indexes = self
+                    .resolve_indexes(
+                        latest_snapshot,
+                        entries,
+                        IndexChanges::Direct(new_index_entries),
+                    )
                     .await?;
-                let mut index_entries = new_index_entries.clone();
-                index_entries.extend(
-                    self.global_index_update_entries(&previous, entries, new_index_entries)
-                        .await?,
-                );
-                let all = Self::merge_index_entries(&previous, &index_entries, false)?;
-                self.check_deletion_vector_references(
-                    latest_snapshot,
-                    entries,
-                    &index_entries,
-                    &all,
-                )
-                .await?;
-                let index_manifest_changed = all != previous;
-                let index_manifest_name = latest_snapshot
-                    .as_ref()
-                    .and_then(|s| s.index_manifest().map(str::to_string));
-                let new_index_manifest_entries = index_manifest_changed.then_some(all);
 
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
                     changelog_entries: changelog_entries.clone(),
+                    deletion_vector_updates: vec![],
                     kind,
-                    index_manifest_name,
-                    index_manifest_changed,
-                    new_index_manifest_entries,
+                    index_manifest_name: indexes.manifest_name,
+                    index_manifest_changed: indexes.entries.is_some(),
+                    new_index_manifest_entries: indexes.entries,
                     base_data_files,
                 })
             }
@@ -2171,169 +2324,29 @@ impl TableCommit {
                     )
                     .await?;
 
-                let previous =
-                    Self::read_prev_index_entries(file_io, &manifest_dir, latest_snapshot).await?;
-                self.check_global_index_sources(latest_snapshot, &entries, &new_index_entries)
+                let indexes = self
+                    .resolve_indexes(
+                        latest_snapshot,
+                        &entries,
+                        IndexChanges::Overwrite {
+                            entries: &new_index_entries,
+                            partition_filter: partition_filter.as_ref(),
+                        },
+                    )
                     .await?;
-                let mut all = previous.clone();
-                match partition_filter.as_ref() {
-                    None => all.clear(),
-                    Some(filter) => {
-                        let mut retained = Vec::new();
-                        for e in all {
-                            if !filter.matches_entry(&e.partition)? {
-                                retained.push(e);
-                            }
-                        }
-                        all = retained;
-                    }
-                }
-                let all = Self::merge_index_entries(&all, &new_index_entries, false)?;
-                self.check_deletion_vector_references(
-                    latest_snapshot,
-                    &entries,
-                    &new_index_entries,
-                    &all,
-                )
-                .await?;
-                let index_manifest_changed = all != previous;
-                let index_manifest_name = latest_snapshot
-                    .as_ref()
-                    .and_then(|s| s.index_manifest().map(str::to_string));
-                let new_index_manifest_entries = index_manifest_changed.then_some(all);
 
                 Ok(ResolvedCommit {
                     entries,
                     changelog_entries: vec![],
+                    deletion_vector_updates: vec![],
                     kind: CommitKind::OVERWRITE,
-                    index_manifest_name,
-                    index_manifest_changed,
-                    new_index_manifest_entries,
+                    index_manifest_name: indexes.manifest_name,
+                    index_manifest_changed: indexes.entries.is_some(),
+                    new_index_manifest_entries: indexes.entries,
                     base_data_files,
                 })
             }
         }
-    }
-
-    fn merge_index_entries(
-        previous_entries: &[IndexManifestEntry],
-        new_index_entries: &[IndexManifestEntry],
-        drop_previous_global_indexes: bool,
-    ) -> Result<Vec<IndexManifestEntry>> {
-        let mut all = if drop_previous_global_indexes {
-            previous_entries
-                .iter()
-                .filter(|entry| entry.index_file.global_index_meta.is_none())
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            previous_entries.to_vec()
-        };
-        let deletions = new_index_entries
-            .iter()
-            .filter(|entry| entry.kind == FileKind::Delete)
-            .collect::<Vec<_>>();
-        for deletion in deletions {
-            let global_index = !matches!(
-                deletion.index_file.index_type.as_str(),
-                "HASH" | DELETION_VECTORS_INDEX_TYPE
-            );
-            // Java combines global indexes by type and file name, then checks
-            // the complete current metadata before removing an entry. A stale
-            // removal must not discard metadata-only row-id reassignment.
-            let position = all.iter().position(|entry| {
-                if global_index {
-                    entry.index_file.index_type == deletion.index_file.index_type
-                        && entry.index_file.file_name == deletion.index_file.file_name
-                } else {
-                    same_index_file_entry(entry, deletion)
-                }
-            });
-            if let Some(position) = position {
-                let previous = &all[position];
-                if global_index
-                    && (!same_index_partition(&previous.partition, &deletion.partition)
-                        || previous.bucket != deletion.bucket
-                        || previous.index_file != deletion.index_file)
-                {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!(
-                            "Index file {} metadata does not match the current entry.",
-                            deletion.index_file.file_name
-                        ),
-                        source: None,
-                    });
-                }
-                all.remove(position);
-            } else if global_index {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Trying to delete global index file {} which does not exist.",
-                        deletion.index_file.file_name
-                    ),
-                    source: None,
-                });
-            } else if deletion.index_file.index_type == DELETION_VECTORS_INDEX_TYPE {
-                return Err(crate::Error::DataInvalid {
-                    message: format!("Cannot replace missing deletion vector index '{}'; prepare the DELETE again from the latest snapshot", deletion.index_file.file_name),
-                    source: None,
-                });
-            }
-        }
-
-        let additions = new_index_entries
-            .iter()
-            .filter(|entry| entry.kind == FileKind::Add)
-            .cloned()
-            .collect::<Vec<_>>();
-        let new_hash_keys: HashSet<(Vec<u8>, i32)> = additions
-            .iter()
-            .filter(|e| e.index_file.index_type == "HASH")
-            .map(|e| (e.partition.clone(), e.bucket))
-            .collect();
-        all.retain(|e| {
-            if e.index_file.index_type == "HASH" {
-                !new_hash_keys.contains(&(e.partition.clone(), e.bucket))
-            } else {
-                true
-            }
-        });
-        Self::validate_global_index_overlap(&all, &additions)?;
-        Self::validate_added_global_index_overlap(&additions)?;
-        let mut dv_files = HashSet::new();
-        let mut dv_names = HashSet::new();
-        for entry in all
-            .iter()
-            .chain(&additions)
-            .filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
-        {
-            let partition = if is_empty_partition(&entry.partition) {
-                &[][..]
-            } else {
-                entry.partition.as_slice()
-            };
-            if !dv_names.insert((partition, entry.bucket, entry.index_file.file_name.as_str())) {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Duplicate deletion vector index '{}'",
-                        entry.index_file.file_name
-                    ),
-                    source: None,
-                });
-            }
-            if let Some(ranges) = &entry.index_file.deletion_vectors_ranges {
-                for file in ranges.keys() {
-                    if !dv_files.insert((partition, entry.bucket, file.as_str())) {
-                        return Err(crate::Error::DataInvalid {
-                            message: format!("Conflicting deletion vectors for data file '{file}'; prepare the DELETE again from the latest snapshot"),
-                            source: None,
-                        });
-                    }
-                }
-            }
-        }
-        all.extend(additions);
-        Ok(all)
     }
 
     async fn global_index_update_entries(
@@ -2480,103 +2493,6 @@ impl TableCommit {
                 })
             }
         }
-    }
-
-    fn validate_global_index_overlap(
-        retained_entries: &[IndexManifestEntry],
-        added_entries: &[IndexManifestEntry],
-    ) -> Result<()> {
-        for retained in retained_entries {
-            if retained.kind == FileKind::Delete {
-                continue;
-            }
-            let Some(retained_meta) = retained.index_file.global_index_meta.as_ref() else {
-                continue;
-            };
-            for added in added_entries {
-                if added.kind == FileKind::Delete {
-                    continue;
-                }
-                let Some(added_meta) = added.index_file.global_index_meta.as_ref() else {
-                    continue;
-                };
-                if retained_meta.index_field_id == added_meta.index_field_id
-                    && retained.index_file.index_type == added.index_file.index_type
-                    && same_extra_field_ids(
-                        retained_meta.extra_field_ids.as_deref(),
-                        added_meta.extra_field_ids.as_deref(),
-                    )
-                    && ranges_overlap(
-                        retained_meta.row_range_start,
-                        retained_meta.row_range_end,
-                        added_meta.row_range_start,
-                        added_meta.row_range_end,
-                    )
-                {
-                    return Err(global_index_overlap_error(
-                        retained,
-                        retained_meta,
-                        added,
-                        added_meta,
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_added_global_index_overlap(added_entries: &[IndexManifestEntry]) -> Result<()> {
-        for (left_index, left) in added_entries.iter().enumerate() {
-            if left.kind == FileKind::Delete {
-                continue;
-            }
-            let Some(left_meta) = left.index_file.global_index_meta.as_ref() else {
-                continue;
-            };
-            for right in added_entries.iter().skip(left_index + 1) {
-                if right.kind == FileKind::Delete {
-                    continue;
-                }
-                let Some(right_meta) = right.index_file.global_index_meta.as_ref() else {
-                    continue;
-                };
-                if left_meta.index_field_id == right_meta.index_field_id
-                    && left.index_file.index_type == right.index_file.index_type
-                    && same_extra_field_ids(
-                        left_meta.extra_field_ids.as_deref(),
-                        right_meta.extra_field_ids.as_deref(),
-                    )
-                    && ranges_overlap(
-                        left_meta.row_range_start,
-                        left_meta.row_range_end,
-                        right_meta.row_range_start,
-                        right_meta.row_range_end,
-                    )
-                {
-                    return Err(global_index_overlap_error(
-                        left, left_meta, right, right_meta,
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Read index entries from the previous snapshot's index manifest.
-    async fn read_prev_index_entries(
-        file_io: &FileIO,
-        manifest_dir: &str,
-        latest_snapshot: &Option<Snapshot>,
-    ) -> Result<Vec<IndexManifestEntry>> {
-        if let Some(snap) = latest_snapshot {
-            if let Some(prev_index_manifest) = snap.index_manifest() {
-                let prev_path = format!("{manifest_dir}/{prev_index_manifest}");
-                return Ok(normalize_index_entries(
-                    IndexManifest::read(file_io, &prev_path).await?,
-                ));
-            }
-        }
-        Ok(vec![])
     }
 
     /// Stateful overwrite provider mirroring Python `OverwriteChangesProvider`.
@@ -3887,6 +3803,9 @@ enum CommitEntriesPlan {
     Compact {
         entries: Vec<ManifestEntry>,
         changelog_entries: Vec<ManifestEntry>,
+        deletion_vector_updates:
+            Option<Vec<super::compact::deletion_vectors::DeletionVectorUpdate>>,
+        index_entries: Option<Vec<IndexManifestEntry>>,
         schema_id: i64,
         read_snapshot: Option<Box<Snapshot>>,
         planned_snapshot_id: i64,
@@ -3947,6 +3866,7 @@ fn direct_commit_kind(
 struct ResolvedCommit {
     entries: Vec<ManifestEntry>,
     changelog_entries: Vec<ManifestEntry>,
+    deletion_vector_updates: Vec<super::compact::deletion_vectors::DeletionVectorUpdate>,
     kind: CommitKind,
     index_manifest_name: Option<String>,
     index_manifest_changed: bool,
@@ -3954,8 +3874,14 @@ struct ResolvedCommit {
     base_data_files: Option<Vec<ManifestEntry>>,
 }
 
+enum CommitOutcome {
+    Published(Box<Snapshot>),
+    Filtered,
+    Empty,
+}
+
 enum CommitAttemptResult {
-    Success,
+    Success(Box<Snapshot>),
     Retry(Box<RetryState>),
 }
 
@@ -4121,6 +4047,7 @@ mod tests {
     mod parity {
         use super::*;
         include!("table_commit/parity_tests.rs");
+        include!("table_commit/pk_dv_retry_tests.rs");
         include!("table_commit/recovery_tests.rs");
         include!("table_commit/row_tracking_tests.rs");
         include!("table_commit/abort_tests.rs");
@@ -4238,6 +4165,7 @@ mod tests {
         use crate::spec::{DataType, IntType, Schema, VarCharType};
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
+            .option("write-only", "true")
             .column("name", DataType::VarChar(VarCharType::string_type()))
             .build()
             .unwrap();
@@ -4337,6 +4265,7 @@ mod tests {
             .column("pt", DataType::VarChar(VarCharType::string_type()))
             .column("id", DataType::Int(IntType::new()))
             .partition_keys(["pt"])
+            .option("write-only", "true")
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
@@ -4370,9 +4299,12 @@ mod tests {
     fn test_table_with_options(
         file_io: &FileIO,
         table_path: &str,
-        options: HashMap<String, String>,
+        mut options: HashMap<String, String>,
     ) -> Table {
         use crate::spec::{DataType, IntType, Schema, VarCharType};
+        options
+            .entry("write-only".into())
+            .or_insert_with(|| "true".into());
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column("name", DataType::VarChar(VarCharType::string_type()))
@@ -6466,6 +6398,7 @@ mod tests {
     fn test_data_evolution_schema() -> TableSchema {
         use crate::spec::{DataType, IntType, Schema, VarCharType};
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("name", DataType::VarChar(VarCharType::string_type()))
             .option("row-tracking.enabled", "true")

@@ -59,6 +59,7 @@ pub fn pk_schema(options: &[(&str, &str)]) -> TableSchema {
         .column("id", DataType::Int(IntType::new()))
         .column("value", DataType::Int(IntType::new()))
         .primary_key(["id"])
+        .option("write-only", "true")
         .option("bucket", "1");
     for (k, v) in options {
         builder = builder.option(*k, *v);
@@ -73,6 +74,7 @@ pub fn partitioned_pk_schema(bucket: &str) -> TableSchema {
         .column("value", DataType::Int(IntType::new()))
         .primary_key(["id"])
         .partition_keys(["pt"])
+        .option("write-only", "true")
         .option("bucket", bucket)
         .option("target-file-size", "1b")
         .option("num-sorted-run.compaction-trigger", "2")
@@ -82,6 +84,15 @@ pub fn partitioned_pk_schema(bucket: &str) -> TableSchema {
 }
 
 pub fn memory_table(path: &str, schema: TableSchema) -> (paimon::io::FileIO, Table) {
+    // These fixtures stage files for explicit scan/compaction assertions.
+    let schema = if schema.options().contains_key("write-only") {
+        schema
+    } else {
+        schema.copy_with_options(std::collections::HashMap::from([(
+            "write-only".into(),
+            "true".into(),
+        )]))
+    };
     let file_io = FileIOBuilder::new("memory").build().unwrap();
     let table = Table::new(
         file_io.clone(),

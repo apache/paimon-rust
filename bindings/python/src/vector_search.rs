@@ -662,6 +662,8 @@ for factory, expected in (
         raise AssertionError('Unconfigured query was accepted')
 
 single = table.new_vector_search_builder().with_vector_column('embedding').with_query_vector([1., 0.]).with_limit(1)
+for factory in (table.new_vector_search_builder, table.new_batch_vector_search_builder, table.new_hybrid_search_builder):
+    assert not hasattr(factory(), 'with_vector_index_type')
 assert isinstance(single.execute(), sdk.GlobalIndexResult)
 assert len(single.execute()) == 0
 batch = table.new_batch_vector_search_builder().with_vector_column('embedding').with_query_vectors([[1., 0.], [0., 1.]]).with_limit(1)

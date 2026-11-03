@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(in crate::table) mod deletion_vectors;
+pub(super) mod indexes;
 pub(super) mod lookup;
 pub(super) mod lookup_file;
 pub(super) mod lookup_store;
@@ -22,6 +24,7 @@ pub(in crate::table) mod planner;
 
 use std::sync::Arc;
 
+use arrow_array::{BooleanArray, Int8Array};
 use arrow_schema::SchemaRef;
 use futures::TryStreamExt;
 
@@ -47,7 +50,9 @@ use crate::table::{DataSplit, Plan, Table};
 use crate::Result;
 
 /// Select incremental sorted runs for supported merge modes.
-pub(super) struct PrimaryKeyCompactPlanner;
+pub(super) struct PrimaryKeyCompactPlanner {
+    pub(super) automatic: bool,
+}
 
 impl PrimaryKeyCompactPlanner {
     pub(super) fn plan_tasks(
@@ -56,14 +61,22 @@ impl PrimaryKeyCompactPlanner {
         context: &CompactContext,
     ) -> Result<Vec<CompactTask>> {
         let mut tasks = Vec::new();
+        let options = context.schema.core_options();
+        let force_level_zero = !self.automatic
+            || options.compaction_force_up_level0()?
+            || options.try_changelog_producer()? == ChangelogProducer::Lookup
+            || options.merge_engine()? == MergeEngine::FirstRow
+            || options.deletion_vectors_enabled();
         for ((partition, bucket, total_buckets), files) in split_files_by_bucket(source) {
             for file in &files {
                 validate_file(file, true)?;
             }
             if planner::enabled(&context.schema)? {
-                if let Some((files, output_level)) =
-                    planner::select(files, context.schema.options())?
-                {
+                if let Some((files, output_level)) = planner::select_with_force_level_zero(
+                    files,
+                    context.schema.options(),
+                    force_level_zero,
+                )? {
                     tasks.push(CompactTask {
                         context: context.clone(),
                         task_id: tasks.len(),
@@ -74,6 +87,19 @@ impl PrimaryKeyCompactPlanner {
                         output_level: Some(output_level),
                     });
                 }
+                continue;
+            }
+            // Some stateful reducers only support a complete-bucket rewrite.
+            // Automatic writes still wait for a normal Java trigger rather
+            // than turning every small batch into an explicit full rewrite.
+            if self.automatic
+                && planner::select_with_force_level_zero(
+                    files.clone(),
+                    context.schema.options(),
+                    force_level_zero,
+                )?
+                .is_none()
+            {
                 continue;
             }
             // One positive level is already a non-overlapping sorted run,
@@ -180,9 +206,38 @@ impl MergeFunction for CompactReducer {
     }
 }
 
+struct CompactFirstRow {
+    inner: Box<dyn MergeFunction>,
+    output_level: i32,
+}
+
+impl MergeFunction for CompactFirstRow {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batches: &[BufferedBatch],
+        columns: &[usize],
+        schema: &SchemaRef,
+    ) -> Result<MergeResult> {
+        // Validate all selected records before checking retained history, as
+        // Java FirstRowMergeFunctionWrapper does when feeding its reducer.
+        let result = self.inner.merge(rows, batches, columns, schema)?;
+        for row in rows {
+            // Only a lookup hit can be above the output level. Its accepted
+            // record stays in retained history; selected positive rows must
+            // still be rewritten into this compaction's output.
+            if matches!(row.value_kind, 0 | 2) && row.level(batches)? > self.output_level {
+                return Ok(MergeResult::Omit);
+            }
+        }
+        Ok(result)
+    }
+}
+
 fn new_merge_function(
     config: &KeyValueReadConfig,
     fields: &[DataField],
+    output_level: i32,
 ) -> Result<Box<dyn MergeFunction>> {
     if config.merge_engine == MergeEngine::Deduplicate {
         return Ok(Box::new(CompactDeduplicate));
@@ -218,7 +273,10 @@ fn new_merge_function(
     };
     Ok(if config.merge_engine == MergeEngine::FirstRow {
         // First-row must still reject retracts unless ignore-delete is enabled.
-        inner
+        Box::new(CompactFirstRow {
+            inner,
+            output_level,
+        })
     } else {
         Box::new(CompactReducer {
             inner,
@@ -266,10 +324,17 @@ fn read_type(table: &Table) -> Vec<DataField> {
 }
 
 fn new_reader(table: &Table, resources: Option<ResourceContext>) -> Result<KeyValueFileReader> {
+    new_reader_with_projection(table, resources, read_type(table))
+}
+
+fn new_reader_with_projection(
+    table: &Table,
+    resources: Option<ResourceContext>,
+    read_type: Vec<DataField>,
+) -> Result<KeyValueFileReader> {
     let schema = table.schema();
     let options = schema.core_options();
     let merge_engine = options.merge_engine()?;
-    let read_type = read_type(table);
     let budget = configured_parquet_read_budget(table)?;
     let budget = match &resources {
         Some(resources) => Arc::new(budget.with_resources(resources.clone()).without_prefetch()),
@@ -308,17 +373,20 @@ pub(super) async fn execute(
     split: &DataSplit,
     resources: Option<ResourceContext>,
     lookup: Option<Arc<dyn LookupProvider>>,
+    emit_changelog: bool,
 ) -> Result<(Vec<DataFileMeta>, Vec<DataFileMeta>)> {
     let schema = table.schema();
     let options = schema.core_options();
     let lookup_changelog = options.try_changelog_producer()? == ChangelogProducer::Lookup;
+    let output_level = task.output_level();
+    let drop_delete = options.deletion_vectors_enabled() && output_level > 0;
     let reader = new_reader(table, resources.clone())?.with_lookup(lookup);
     let mut batches =
         reader.read_with_merge_function(std::slice::from_ref(split), move |config, fields| {
             if lookup_changelog {
-                lookup::new_merge_function(config, fields)
+                lookup::new_merge_function(config, fields, output_level)
             } else {
-                new_merge_function(config, fields)
+                new_merge_function(config, fields, output_level)
             }
         })?;
     let keys = schema.trimmed_primary_keys();
@@ -375,11 +443,12 @@ pub(super) async fn execute(
         managed_blob_enabled: false,
         resources: resources.as_ref(),
     };
-    let mut writer = KeyValueRollingWriter::new(
-        file_options,
-        options.target_file_size(),
-        options.target_file_row_num()?,
-    );
+    let mut row_limit = options.target_file_row_num()?;
+    if options.deletion_vectors_enabled() {
+        row_limit = row_limit.min(i64::from(u32::MAX) + 1);
+    }
+    let mut writer =
+        KeyValueRollingWriter::new(file_options, options.target_file_size(), row_limit);
     let changelog_format = options.changelog_file_format();
     let mut changelog_writer = KeyValueRollingWriter::new(
         KeyValueFileOptions {
@@ -401,6 +470,9 @@ pub(super) async fn execute(
                 .metadata()
                 .contains_key(CHANGELOG_BATCH_METADATA_KEY)
             {
+                if !emit_changelog {
+                    continue;
+                }
                 let mut metadata = batch.schema().metadata().clone();
                 metadata.remove(CHANGELOG_BATCH_METADATA_KEY);
                 let batch = arrow_array::RecordBatch::try_new(
@@ -412,6 +484,27 @@ pub(super) async fn execute(
                 })?;
                 changelog_writer.write(&batch).await?;
             } else {
+                // Generate lookup changelog from the winning KV first. In DV
+                // mode the history is physically deleted, so its winning
+                // retract need not remain in the new positive-level data.
+                let batch = if drop_delete {
+                    let kinds = batch
+                        .column_by_name(VALUE_KIND_FIELD_NAME)
+                        .and_then(|column| column.as_any().downcast_ref::<Int8Array>())
+                        .ok_or_else(|| super::invalid("Invalid compaction value-kind column"))?;
+                    let live = kinds
+                        .iter()
+                        .map(|kind| {
+                            let kind =
+                                kind.ok_or_else(|| super::invalid("Null compaction value kind"))?;
+                            Ok(RowKind::from_value(kind)?.is_add())
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    arrow_select::filter::filter_record_batch(&batch, &BooleanArray::from(live))
+                        .map_err(|error| super::invalid(&error.to_string()))?
+                } else {
+                    batch
+                };
                 writer.write(&batch).await?;
             }
         }

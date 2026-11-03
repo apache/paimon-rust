@@ -27,23 +27,32 @@ import pytest
 from pypaimon_rust.datafusion import PaimonCatalog, StreamTableScan, SQLContext
 
 
-@pytest.fixture
-def table(tmp_path):
+def _create_table(tmp_path, name):
     options = {"warehouse": str(tmp_path)}
     ctx = SQLContext()
     ctx.register_catalog("paimon", options)
     ctx.sql("CREATE SCHEMA paimon.snapdb")
-    ctx.sql("CREATE TABLE paimon.snapdb.t (id INT, value INT, PRIMARY KEY (id)) "
-            "WITH ('bucket'='4', 'changelog-producer'='input', "
+    # These cursor tests require one APPEND snapshot per prepared batch.
+    ctx.sql(f"CREATE TABLE paimon.snapdb.{name} (id INT, value INT, PRIMARY KEY (id)) "
+            "WITH ('bucket'='4', 'changelog-producer'='input', 'write-only'='true', "
             "'source.split.target-size'='1 b', 'source.split.open-file-cost'='1 b')")
-    table = PaimonCatalog(options).get_table("snapdb.t")
+    return PaimonCatalog(options).get_table(f"snapdb.{name}")
+
+
+def _write(table, value):
+    builder = table.new_batch_write_builder()
+    writer = builder.new_write()
+    writer.write_arrow(pa.record_batch({'id': pa.array(range(32), type=pa.int32()),
+                                 'value': pa.array(range(value, value + 32), type=pa.int32())}))
+    builder.new_commit().commit(writer.prepare_commit())
+    writer.close()
+
+
+@pytest.fixture
+def table(tmp_path):
+    table = _create_table(tmp_path, "t")
     for value in (100, 200):
-        builder = table.new_batch_write_builder()
-        writer = builder.new_write()
-        writer.write_arrow(pa.record_batch({'id': pa.array(range(32), type=pa.int32()),
-                                     'value': pa.array(range(value, value + 32), type=pa.int32())}))
-        builder.new_commit().commit(writer.prepare_commit())
-        writer.close()
+        _write(table, value)
     return table
 
 
@@ -222,6 +231,61 @@ def test_invalid_configuration_keeps_the_scan_usable(table):
         with pytest.raises(ValueError, match='consumer id'):
             scan.with_consumer_id(value)
     assert scan.plan().snapshot_id() == 2
+
+
+def test_read_builder_options_start_stream_scans_at_the_first_plan(tmp_path, table):
+    following = {'scan.mode': 'from-snapshot', 'scan.snapshot-id': '3'}
+    earlier = {'scan.mode': 'from-timestamp', 'scan.timestamp-millis': '1'}
+    for options in (following, earlier):
+        with pytest.raises(ValueError, match='did not resolve'):
+            table.new_read_builder(options).new_scan()
+
+    plan = table.new_read_builder(earlier).new_stream_scan().plan()
+    assert plan.snapshot_id() == 1
+    assert all(split.is_streaming() for split in plan.splits())
+
+    builder = table.new_read_builder({'scan.mode': 'from-snapshot-full', 'scan.snapshot-id': '1'})
+    scan = builder.new_stream_scan()
+    plan = scan.plan()
+    assert plan.snapshot_id() == 1
+    assert not any(split.is_streaming() for split in plan.splits())
+    assert _rows(builder, plan) == [(i, 100 + i) for i in range(32)]
+    plan = scan.plan()
+    assert plan.snapshot_id() == 2
+    assert _rows(builder, plan) == [(i, 200 + i) for i in range(32)]
+
+    builder = table.new_read_builder(following)
+    scan = builder.new_stream_scan()
+    assert scan.plan() is None
+    assert scan.checkpoint() == 3
+    _write(table, 300)
+    plan = scan.plan()
+    assert plan.snapshot_id() == 3
+    assert all(split.is_streaming() for split in plan.splits())
+    assert _rows(builder, plan) == [(i, 300 + i) for i in range(32)]
+
+    snapshot_dir = tmp_path / 'snapdb.db' / 't' / 'snapshot'
+    (snapshot_dir / 'snapshot-1').unlink()
+    (snapshot_dir / 'EARLIEST').write_text('2')
+    expired = table.new_read_builder({'scan.mode': 'from-snapshot', 'scan.snapshot-id': '1'})
+    with pytest.raises(ValueError, match='did not resolve'):
+        expired.new_incremental_scan(1, 2)
+    assert expired.new_stream_scan().plan().snapshot_id() == 2
+
+
+def test_read_builder_options_start_stream_scans_on_an_empty_table(tmp_path):
+    empty = _create_table(tmp_path, "empty")
+    builder = empty.new_read_builder({'scan.mode': 'from-snapshot-full', 'scan.snapshot-id': '1'})
+    with pytest.raises(ValueError, match='did not resolve'):
+        builder.new_scan()
+    scan = builder.new_stream_scan()
+    assert scan.plan() is None
+    _write(empty, 100)
+    plan = scan.plan()
+    assert plan.snapshot_id() == 1
+    assert not any(split.is_streaming() for split in plan.splits())
+    assert _rows(builder, plan) == [(i, 100 + i) for i in range(32)]
+    assert scan.checkpoint() == 2
 
 
 def test_snapshot_reader_is_an_internal_component():

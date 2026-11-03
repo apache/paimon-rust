@@ -15,27 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Resolve and validate PK vector-search parameters before scan planning.
+//! Resolve PK search options once the captured plan selects a vector format.
 
-use crate::spec::{CoreOptions, DataField, DataType, GlobalIndexSearchMode, Predicate};
+use crate::spec::{
+    CoreOptions, DataField, DataType, GlobalIndexSearchMode, Predicate, VectorIndexOptions,
+};
 use crate::table::bucket_filter::split_partition_and_data_predicates;
-use crate::table::vector_search_common::{configured_refine_factor, indexed_search_limit};
+use crate::table::vector_search_common::{
+    indexed_search_limit, resolve_vector_search_options, resolved_refine_factor,
+};
 use crate::table::Table;
 use crate::vindex::pkvector::exact::validate_query;
 use crate::vindex::pkvector::metric::VectorSearchMetric;
 use crate::vindex::VindexVectorIndexOptions;
 use std::collections::HashMap;
 
-/// Query-level parameters for a primary-key vector search: everything resolvable
-/// from the table schema, the options and the queries alone, independent of which
-/// splits planning yields. Resolved before planning so a malformed query or option
-/// fails loud even when the plan turns out empty.
+#[derive(Clone)]
 pub(super) struct PkVectorSearchParams {
     pub(super) metric: VectorSearchMetric,
-    /// Fan-out limit for bucket orchestration plus ANN and exact-file leaves (Java
-    /// `GLOBAL_INDEX_THREAD_NUM`); `1` reproduces strictly sequential execution.
     pub(super) concurrency: usize,
-    pub(super) index_type: String,
+    pub(super) vector_options: VectorIndexOptions,
     pub(super) vector_field: DataField,
     pub(super) skip_exact_fallback: bool,
     pub(super) refine_factor: usize,
@@ -43,139 +42,129 @@ pub(super) struct PkVectorSearchParams {
 }
 
 impl PkVectorSearchParams {
-    /// Resolve the query-level parameters and reject a query the search cannot answer
-    /// correctly, before any planning or read happens.
-    pub(super) fn resolve(
+    /// Validate inputs independent of the snapshot's actual index format.
+    pub(super) fn validate_inputs(
         table: &Table,
-        query_options: &HashMap<String, String>,
         filter: Option<&Predicate>,
-        pk_col: &str,
+        column: &str,
         queries: &[&[f32]],
         limit: usize,
-    ) -> crate::Result<Self> {
-        let core = CoreOptions::new(table.schema().options());
+    ) -> crate::Result<DataField> {
+        let core = table.schema().core_options();
         core.ensure_read_authorized()?;
-        // Residual pre-filter guard, mirroring Java `PrimaryKeyVectorScan`. A DATA
-        // predicate set via `with_filter` is applied post-recall by re-reading each
-        // candidate file's physical rows during search. That physical-position filtering
-        // only agrees with the bucket search when the table exposes physical rows
-        // directly: deletion vectors enabled and merge-on-read disabled. Under
-        // merge-on-read (or without deletion vectors) a read merges multiple key
-        // versions, so a scalar filter could retain a stale version whose live version
-        // does not match — a silent wrong-read. Reject such queries rather than answer
-        // them incorrectly.
-        //
-        // Guard on the DATA conjuncts, not the whole filter: partition-only conjuncts
-        // are enforced entirely by scan planning (partition pruning) and produce no
-        // per-row residual, so they need no physical-row read. This mirrors Java, where
-        // `BatchVectorSearchBuilderImpl.withFilter` splits at the builder level and
-        // leaves `this.filter == null` for a partition-only filter — the scan guard is
-        // then skipped. No data predicate (partition-only or no filter) → nothing to
-        // guard, so the search-only and read paths are unaffected.
-        let physical_row_read =
-            core.deletion_vectors_enabled() && !core.deletion_vectors_merge_on_read();
         let has_data_predicate = filter.is_some_and(|f| {
-            let (_partition, data) = split_partition_and_data_predicates(
+            let (_, data) = split_partition_and_data_predicates(
                 f.clone(),
                 table.schema().fields(),
                 table.schema().partition_keys(),
             );
             !data.is_empty()
         });
-        if has_data_predicate && !physical_row_read {
+        if has_data_predicate
+            && !(core.deletion_vectors_enabled() && !core.deletion_vectors_merge_on_read())
+        {
             return Err(crate::Error::DataInvalid {
                 message:
                     "primary-key vector pre-filter requires deletion vectors without merge-on-read"
-                        .to_string(),
+                        .into(),
                 source: None,
             });
         }
-        // `primary_key_vector_distance_metric` returns a validated name; re-parse into
-        // the enum for the numeric semantics.
-        let metric = VectorSearchMetric::parse(&core.primary_key_vector_distance_metric(pk_col)?)?;
-        // Fan-out limit for bucket orchestration plus ANN and exact-file leaves (Java
-        // `GLOBAL_INDEX_THREAD_NUM`); `1` reproduces strictly sequential execution.
-        let concurrency = core.global_index_thread_num()?;
-        let index_type = core.primary_key_vector_index_type(pk_col)?;
-        let vector_field = table
+        if limit == 0 {
+            return Err(crate::Error::DataInvalid {
+                message: "vector search limit must be positive".into(),
+                source: None,
+            });
+        }
+        let field = table
             .schema()
             .fields()
             .iter()
-            .find(|f| f.name() == pk_col)
+            .find(|f| f.name() == column)
             .cloned()
             .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!("PK-vector column '{pk_col}' not found in schema"),
+                message: format!("PK-vector column '{column}' not found in schema"),
                 source: None,
             })?;
-
-        let search_mode = core.vector_index_search_mode()?;
-        let skip_exact_fallback = search_mode == GlobalIndexSearchMode::Fast;
-
-        // A non-positive limit is invalid regardless of the plan; reject it before
-        // planning so an empty plan cannot mask it with empty results.
-        if limit == 0 {
-            return Err(crate::Error::DataInvalid {
-                message: "vector search limit must be positive".to_string(),
-                source: None,
-            });
+        for query in queries {
+            let dimension = match field.data_type() {
+                DataType::Vector(vector) => vector.length() as usize,
+                _ => query.len().max(1),
+            };
+            validate_query(query, dimension)?;
         }
+        Ok(field)
+    }
 
-        // Resolve the refine factor from the query options first, then fall back to
-        // the table options; a positive factor over-fetches indexed (approximate)
-        // candidates so the reader's exact rerank has a wider pool to reorder. Factor 0
-        // (unset) leaves `indexed_limit == limit`, byte-identical to the no-rerank
-        // path. The two option maps are kept distinct (query options passed
-        // separately from table options) so a broad query key cannot be overridden
-        // by a more specific table key: query options take precedence as a whole.
-        // Resolved before planning so an invalid factor (e.g. a non-numeric value)
-        // fails loud regardless of whether the table currently has searchable data.
-        let refine_factor =
-            configured_refine_factor(query_options, table.schema().options(), pk_col, &index_type)?;
-        let indexed_limit = indexed_search_limit(limit, refine_factor)?;
-
-        // Validate every query against the vector column's dimension (and finiteness)
-        // before planning or any read, so a malformed query fails loud even when the
-        // plan turns out empty. VECTOR<FLOAT> carries the dimension in its type;
-        // ARRAY<FLOAT> gets the index dimension from the same vindex option resolver
-        // used by index reads. Both valid PK-vector column shapes must reject NaN/Inf
-        // up front, not only after a non-empty plan opens readers.
-        if let Some(dimension) = pk_vector_query_dimension(
+    pub(super) fn resolve(
+        table: &Table,
+        query_options: &HashMap<String, String>,
+        filter: Option<&Predicate>,
+        column: &str,
+        queries: &[&[f32]],
+        limit: usize,
+        metadata_type: Option<&str>,
+    ) -> crate::Result<Self> {
+        let vector_field = Self::validate_inputs(table, filter, column, queries, limit)?;
+        let core = CoreOptions::new(table.schema().options());
+        let configuration = resolve_vector_search_options(
             table.schema().options(),
             query_options,
-            &index_type,
-            &vector_field,
-        )? {
-            for query in queries {
-                validate_query(query, dimension)?;
+            column,
+            metadata_type,
+            true,
+        )?;
+        let mut vector_options = configuration.resolved;
+        // Raw-only PK plans use the table metric. The reader replaces it with
+        // the persisted payload metric when the captured plan has ANN segments.
+        vector_options.metric = configuration.table_metric;
+        let metric = VectorSearchMetric::parse(&vector_options.metric)?;
+        let refine_factor = if let Some(kind) = vector_options.index_type.as_deref() {
+            resolved_refine_factor(
+                &configuration.query_options,
+                &vector_options.options,
+                column,
+                kind,
+            )?
+        } else {
+            0
+        };
+        let indexed_limit = indexed_search_limit(limit, refine_factor)?;
+        if let Some(kind) = vector_options.index_type.as_deref() {
+            if let Some(dimension) = resolved_query_dimension(
+                &vector_options.options,
+                &configuration.query_options,
+                kind,
+                &vector_field,
+            )? {
+                for query in queries {
+                    validate_query(query, dimension)?;
+                }
             }
         }
-
         Ok(Self {
             metric,
-            concurrency,
-            index_type,
+            concurrency: core.global_index_thread_num()?,
+            vector_options,
             vector_field,
-            skip_exact_fallback,
+            skip_exact_fallback: core.vector_index_search_mode()? == GlobalIndexSearchMode::Fast,
             refine_factor,
             indexed_limit,
         })
     }
 }
 
-fn pk_vector_query_dimension(
+fn resolved_query_dimension(
     table_options: &HashMap<String, String>,
     query_options: &HashMap<String, String>,
     index_type: &str,
     vector_field: &DataField,
 ) -> crate::Result<Option<usize>> {
     match vector_field.data_type() {
-        DataType::Vector(vector_type)
-            if matches!(vector_type.element_type(), DataType::Float(_)) =>
-        {
-            Ok(Some(vector_type.length() as usize))
+        DataType::Vector(vector) if matches!(vector.element_type(), DataType::Float(_)) => {
+            Ok(Some(vector.length() as usize))
         }
-        DataType::Array(array_type) if matches!(array_type.element_type(), DataType::Float(_)) => {
-            // ARRAY<FLOAT> carries its dimension in the vindex options.
+        DataType::Array(array) if matches!(array.element_type(), DataType::Float(_)) => {
             let mut dimension_options = HashMap::new();
             for key in [
                 "dimension".to_string(),
@@ -193,18 +182,18 @@ fn pk_vector_query_dimension(
                     dimension_options.insert(key, value.clone());
                 }
             }
-            let mut table_dimension_options = table_options.clone();
+            let mut defaults = table_options.clone();
             if let Some(value) = table_options.get("dimension") {
                 if !table_options.contains_key(&format!("{index_type}.dimension"))
                     && !table_options.contains_key(&format!("{index_type}.index.dimension"))
                 {
-                    table_dimension_options
-                        .insert(format!("{index_type}.dimension"), value.clone());
+                    defaults.insert(format!("{index_type}.dimension"), value.clone());
                 }
             }
             Ok(Some(
-                VindexVectorIndexOptions::new(
-                    &table_dimension_options,
+                VindexVectorIndexOptions::new_with_defaults(
+                    &defaults,
+                    &HashMap::new(),
                     &dimension_options,
                     index_type,
                     vector_field,
@@ -214,6 +203,18 @@ fn pk_vector_query_dimension(
         }
         _ => Ok(None),
     }
+}
+
+#[cfg(test)]
+fn pk_vector_query_dimension(
+    table: &HashMap<String, String>,
+    query: &HashMap<String, String>,
+    kind: &str,
+    field: &DataField,
+) -> crate::Result<Option<usize>> {
+    let table = CoreOptions::new(table).vector_index_options(Some(kind), field.name(), false)?;
+    let query = CoreOptions::new(query).vector_index_options(Some(kind), field.name(), false)?;
+    resolved_query_dimension(&table.options, &query.options, kind, field)
 }
 
 #[cfg(test)]

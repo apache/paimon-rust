@@ -18,8 +18,12 @@
 //! Snapshot-bound append, data-evolution and primary-key compaction.
 
 mod append;
+mod automatic;
+pub(super) use automatic::execute_auto_plan;
 pub(super) mod data_evolution;
-mod primary_key;
+pub(super) mod deletion_vectors;
+pub(super) mod primary_key;
+use deletion_vectors::DeletionVectorUpdate;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -30,14 +34,15 @@ use sha2::{Digest, Sha256};
 
 use super::data_file_index_writer::FileIndexOptions;
 use super::data_file_writer::DataFileWriter;
-use super::partition_filter::validate_partition_filter;
+use super::partition_filter::{validate_partition_filter, PartitionFilter};
 use super::snapshot_manifest::read_snapshot_entries;
 use super::write_builder::{ensure_table_write_authorized, validate_commit_user};
-use super::{DataSplit, Plan, Table, TableCommit};
+use super::{DataSplit, Plan, Table, TableCommit, TableScan};
 use crate::resource::ResourceContext;
 use crate::spec::{
     bucket_path_under, BinaryRow, ChangelogProducer, DataFileMeta, FileKind, IndexManifest,
-    ManifestEntry, MergeEngine, PartitionComputer, Predicate, Snapshot, TableSchema,
+    IndexManifestEntry, ManifestEntry, MergeEngine, PartitionComputer, Predicate, Snapshot,
+    TableSchema,
 };
 use crate::{Error, Result};
 
@@ -99,39 +104,62 @@ impl<'a> CompactBuilder<'a> {
         } else if self.table.schema().primary_keys().is_empty() {
             CompactPlannerKind::Append(append::AppendCompactPlanner::new(&options)?)
         } else {
-            CompactPlannerKind::PrimaryKey(primary_key::PrimaryKeyCompactPlanner)
+            CompactPlannerKind::PrimaryKey(primary_key::PrimaryKeyCompactPlanner {
+                automatic: false,
+            })
         };
         Ok(CompactPlanner {
             table: self.table.clone(),
             kind,
             partition_filter: self.partition_filter.clone(),
+            buckets: None,
         })
     }
 
     /// Executor resources are local; input files and output settings come from each task.
     pub fn new_executor(&self) -> Result<CompactExecutor> {
+        self.new_executor_impl(false)
+    }
+
+    pub(super) fn new_auto_executor(&self) -> Result<CompactExecutor> {
+        self.new_executor_impl(true)
+    }
+
+    fn new_executor_impl(&self, automatic: bool) -> Result<CompactExecutor> {
         ensure_supported(self.table)?;
         let options = self.table.schema().core_options();
-        let lookup = options.try_changelog_producer()? == ChangelogProducer::Lookup;
+        let lookup = options.try_changelog_producer()? == ChangelogProducer::Lookup
+            || (!self.table.schema().primary_keys().is_empty()
+                && options.merge_engine()? == MergeEngine::FirstRow)
+            || (options.deletion_vectors_enabled()
+                && !self.table.schema().primary_keys().is_empty());
         let local_cache = self.table.file_io().local_cache();
-        if lookup && local_cache.is_none() {
+        if lookup && !automatic && local_cache.is_none() {
             return Err(Error::ConfigInvalid {
                 message:
-                    "Lookup compaction requires local-cache.enabled=true on the catalog/FileIO"
+                    "Lookup, first-row or deletion-vector compaction requires local-cache.enabled=true on the catalog/FileIO"
                         .into(),
             });
         }
         Ok(CompactExecutor {
             table: self.table.clone(),
             resources: self.resources.clone(),
-            lookup_cache: if lookup && options.merge_engine()? == MergeEngine::Deduplicate {
-                Some(Arc::new(primary_key::lookup_file::LookupFileCache::new(
-                    local_cache.expect("lookup cache validated above"),
-                    self.table.schema().options(),
-                )?))
+            lookup_cache: if lookup {
+                Some(Arc::new(if automatic {
+                    primary_key::lookup_file::LookupFileCache::automatic(
+                        local_cache,
+                        self.table.schema().options(),
+                    )?
+                } else {
+                    primary_key::lookup_file::LookupFileCache::new(
+                        local_cache.expect("lookup cache validated above"),
+                        self.table.schema().options(),
+                    )?
+                }))
             } else {
                 None
             },
+            emit_changelog: true,
         })
     }
 
@@ -149,7 +177,10 @@ pub struct CompactPlanner {
     table: Table,
     kind: CompactPlannerKind,
     partition_filter: Option<Predicate>,
+    buckets: Option<CompactBuckets>,
 }
+
+pub(super) type CompactBuckets = HashSet<(Vec<u8>, i32, i32)>;
 
 enum CompactPlannerKind {
     Append(append::AppendCompactPlanner),
@@ -233,12 +264,25 @@ impl CompactTask {
         self.bucket
     }
 
+    pub(super) fn total_buckets(&self) -> i32 {
+        self.total_buckets
+    }
+
     pub fn files(&self) -> &[DataFileMeta] {
         &self.files
     }
 }
 
 impl CompactPlanner {
+    /// Restrict automatic work to the buckets owned by one committed write.
+    pub(super) fn for_write(mut self, buckets: CompactBuckets) -> Self {
+        self.buckets = Some(buckets);
+        if let CompactPlannerKind::PrimaryKey(planner) = &mut self.kind {
+            planner.automatic = true;
+        }
+        self
+    }
+
     /// Capture a snapshot without writing data or publishing metadata.
     pub async fn plan(&self) -> Result<CompactPlan> {
         ensure_supported(&self.table)?;
@@ -246,8 +290,38 @@ impl CompactPlanner {
         if let Some(filter) = &self.partition_filter {
             reader.with_filter(filter.clone());
         }
-        let scan = reader.new_scan().with_scan_all_files();
-        let source = scan.plan_all().await?;
+        let scan = if let Some(buckets) = &self.buckets {
+            let fields = self.table.schema().partition_fields();
+            let filter = if fields.is_empty() {
+                None
+            } else {
+                Some(PartitionFilter::from_partition_set(
+                    buckets
+                        .iter()
+                        .map(|(partition, _, _)| partition.clone())
+                        .collect(),
+                    &fields,
+                )?)
+            };
+            TableScan::new(&self.table, filter, Vec::new(), None, None, None)
+        } else {
+            reader.new_scan()
+        }
+        .with_scan_all_files();
+        let source = scan.plan_all().await?.map_splits(|splits| {
+            Ok(splits
+                .into_iter()
+                .filter(|split| {
+                    self.buckets.as_ref().is_none_or(|buckets| {
+                        buckets.contains(&(
+                            split.partition().to_serialized_bytes(),
+                            split.bucket(),
+                            split.total_buckets(),
+                        ))
+                    })
+                })
+                .collect())
+        })?;
         let Some(snapshot_id) = source.snapshot_id() else {
             return Ok(CompactPlan {
                 snapshot_id: None,
@@ -260,6 +334,11 @@ impl CompactPlanner {
             .get_snapshot(snapshot_id)
             .await?;
         validate_snapshot_indexes(&self.table, &snapshot).await?;
+        validate_dv_schemas(
+            &self.table,
+            source.splits().iter().flat_map(|split| split.data_files()),
+        )
+        .await?;
         let context = CompactContext {
             plan_id: uuid::Uuid::new_v4().to_string(),
             location: self.table.location().to_string(),
@@ -272,7 +351,9 @@ impl CompactPlanner {
             CompactPlannerKind::Append(planner) => planner.plan_tasks(&source, &context)?,
             CompactPlannerKind::PrimaryKey(planner) => planner.plan_tasks(&source, &context)?,
             CompactPlannerKind::DataEvolution(planner) => {
-                planner.plan_tasks(&self.table, &scan, &context).await?
+                planner
+                    .plan_tasks(&self.table, &scan, &context, self.buckets.as_ref())
+                    .await?
             }
         };
         Ok(CompactPlan {
@@ -287,9 +368,19 @@ pub struct CompactExecutor {
     table: Table,
     resources: Option<ResourceContext>,
     lookup_cache: Option<Arc<primary_key::lookup_file::LookupFileCache>>,
+    emit_changelog: bool,
 }
 
-/// Prepared files owned by the caller until submitted to `TableCommit::commit_compact`.
+// Valid only for one immutable automatic round. Publication still reads and
+// validates current metadata; manual execution captures fresh inputs each call.
+struct CompactInputs {
+    snapshot: Snapshot,
+    data: HashMap<(Vec<u8>, i32), Vec<ManifestEntry>>,
+    indexes: HashMap<(Vec<u8>, i32), Vec<IndexManifestEntry>>,
+}
+
+/// Prepared data, changelog and index files owned by the caller until submitted
+/// to `TableCommit::commit_compact`.
 /// A failed or uncertain commit must retain these files for retry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactResult {
@@ -297,15 +388,42 @@ pub struct CompactResult {
     files: Vec<DataFileMeta>,
     #[serde(default)]
     changelog_files: Vec<DataFileMeta>,
+    #[serde(default)]
+    deletion_vector_updates: Option<Vec<DeletionVectorUpdate>>,
+    #[serde(default)]
+    index_entries: Option<Vec<crate::spec::IndexManifestEntry>>,
 }
 
 impl CompactResult {
+    /// Atomic index additions and retirements prepared with these data files.
+    pub fn index_entries(&self) -> Option<&[crate::spec::IndexManifestEntry]> {
+        self.index_entries.as_deref()
+    }
+
     pub fn files(&self) -> &[DataFileMeta] {
         &self.files
     }
 
     pub fn changelog_files(&self) -> &[DataFileMeta] {
         &self.changelog_files
+    }
+
+    /// Files created by this result; retired index entries still belong to the table.
+    pub(super) fn abort_message(&self) -> super::CommitMessage {
+        let mut message = super::CommitMessage::new(
+            self.task.partition.clone(),
+            self.task.bucket,
+            self.files.clone(),
+        );
+        message.new_changelog_files = self.changelog_files.clone();
+        message.new_index_files = self
+            .index_entries
+            .iter()
+            .flatten()
+            .filter(|entry| matches!(entry.kind, FileKind::Add))
+            .map(|entry| entry.index_file.clone())
+            .collect();
+        message
     }
 
     pub fn metrics(&self) -> CompactMetrics {
@@ -345,7 +463,17 @@ pub struct CompactMetrics {
 }
 
 impl CompactExecutor {
+    pub(super) fn without_changelog(mut self) -> Self {
+        self.emit_changelog = false;
+        self
+    }
+
     pub async fn execute(&self, task: &CompactTask) -> Result<CompactResult> {
+        let inputs = self.capture_inputs(task).await?;
+        self.execute_captured(task, &inputs).await
+    }
+
+    async fn capture_inputs(&self, task: &CompactTask) -> Result<CompactInputs> {
         ensure_supported(&self.table)?;
         task.validate_target(&self.table)?;
         let manager = self.table.snapshot_manager();
@@ -353,13 +481,60 @@ impl CompactExecutor {
         if !task.context.snapshot.has_same_read_metadata(&snapshot) {
             return Err(invalid("Compaction snapshot was replaced"));
         }
-        validate_snapshot_indexes(&self.table, &snapshot).await?;
+        let indexes = read_snapshot_indexes(&self.table, &snapshot).await?;
+        if !self.table.schema().primary_keys().is_empty()
+            && self
+                .table
+                .schema()
+                .core_options()
+                .deletion_vectors_enabled()
+        {
+            primary_key::deletion_vectors::validate_index_references(&indexes)?;
+        }
         let active = read_snapshot_entries(&manager, &snapshot, None).await?;
-        task.validate_inputs(&active)?;
-        let table = self
-            .table
-            .copy_with_resolved_schema(task.context.schema.clone(), &task.context.branch)?
-            .copy_with_pinned_snapshot(Some(&snapshot));
+        validate_dv_schemas(&self.table, active.iter().map(|entry| entry.file())).await?;
+        let mut data = HashMap::<_, Vec<_>>::new();
+        for entry in active {
+            data.entry((entry.partition().to_vec(), entry.bucket()))
+                .or_default()
+                .push(entry);
+        }
+        let mut by_bucket = HashMap::<_, Vec<_>>::new();
+        for entry in indexes {
+            by_bucket
+                .entry((entry.partition.clone(), entry.bucket))
+                .or_default()
+                .push(entry);
+        }
+        Ok(CompactInputs {
+            snapshot,
+            data,
+            indexes: by_bucket,
+        })
+    }
+
+    async fn execute_captured(
+        &self,
+        task: &CompactTask,
+        inputs: &CompactInputs,
+    ) -> Result<CompactResult> {
+        task.validate_target(&self.table)?;
+        let snapshot = &inputs.snapshot;
+        if !task.context.snapshot.has_same_read_metadata(snapshot) {
+            return Err(invalid("Compaction snapshot was replaced"));
+        }
+        let key = (task.partition.clone(), task.bucket);
+        let active = inputs.data.get(&key).map(Vec::as_slice).unwrap_or_default();
+        let indexes = inputs
+            .indexes
+            .get(&key)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        task.validate_inputs(active)?;
+        // validate_target proved the complete schema and branch are identical.
+        // Preserve already resolved catalog schemas in the shared manager;
+        // rebuilding it here would require REST-only schemas to exist on disk.
+        let table = self.table.copy_with_pinned_snapshot(Some(snapshot));
         let options = table.schema().core_options();
         let partition = BinaryRow::from_serialized_bytes(&task.partition)?;
         let computer = PartitionComputer::new(
@@ -383,6 +558,11 @@ impl CompactExecutor {
             .with_bucket_path(bucket_path)
             .with_data_files(task.files.clone())
             .build()?;
+        let split = if options.deletion_vectors_enabled() && task.is_primary_key() {
+            primary_key::deletion_vectors::with_deletion_entries(&table, &split, indexes)?
+        } else {
+            split
+        };
         if task.is_data_evolution() {
             let files = data_evolution::execute(
                 &table,
@@ -396,9 +576,12 @@ impl CompactExecutor {
                 task: task.clone(),
                 files,
                 changelog_files: vec![],
+                deletion_vector_updates: None,
+                index_entries: None,
             });
         }
         if task.is_primary_key() {
+            let mut deletions = None;
             let lookup = if let Some(cache) = &self.lookup_cache {
                 let history = active
                     .iter()
@@ -413,26 +596,76 @@ impl CompactExecutor {
                 if history.is_empty() {
                     None
                 } else {
-                    Some(
-                        primary_key::lookup_store::provider(
-                            &table,
-                            &split,
-                            history,
-                            cache.clone(),
-                            self.resources.clone(),
-                        )
-                        .await?,
+                    let (provider, collected) = primary_key::lookup_store::provider(
+                        &table,
+                        &split,
+                        history,
+                        cache.clone(),
+                        self.resources.clone(),
+                        indexes,
                     )
+                    .await?;
+                    deletions = collected;
+                    Some(provider)
                 }
             } else {
                 None
             };
-            let (files, changelog_files) =
-                primary_key::execute(&table, task, &split, self.resources.clone(), lookup).await?;
+            let (files, changelog_files) = primary_key::execute(
+                &table,
+                task,
+                &split,
+                self.resources.clone(),
+                lookup,
+                self.emit_changelog,
+            )
+            .await?;
+            let mut deletion_vector_updates = Vec::new();
+            if let Some(deletions) = deletions {
+                for (name, bitmap) in deletions.lock().unwrap().iter() {
+                    let mut bytes = Vec::new();
+                    bitmap
+                        .serialize_into(&mut bytes)
+                        .map_err(|error| invalid(&error.to_string()))?;
+                    deletion_vector_updates.push(DeletionVectorUpdate {
+                        partition: task.partition.clone(),
+                        bucket: task.bucket,
+                        file_name: name.clone(),
+                        bitmap: bytes,
+                    });
+                }
+            }
+            let index_entries = match primary_key::indexes::prepare(
+                &table,
+                task,
+                &split,
+                indexes,
+                active,
+                &files,
+                &deletion_vector_updates,
+                self.resources.clone(),
+            )
+            .await
+            {
+                Ok(entries) => entries,
+                Err(error) => {
+                    let mut message =
+                        super::CommitMessage::new(task.partition.clone(), task.bucket, files);
+                    message.new_changelog_files = changelog_files;
+                    let _ = super::TableCommit::new(table.clone(), "compact-cleanup".into())
+                        .abort(&[message])
+                        .await;
+                    return Err(error);
+                }
+            };
             return Ok(CompactResult {
                 task: task.clone(),
                 files,
                 changelog_files,
+                index_entries: Some(index_entries),
+                deletion_vector_updates: options
+                    .deletion_vectors_enabled()
+                    .then_some(deletion_vector_updates),
             });
         }
         let mut read = table.new_read_builder().new_read()?.with_ordered(true);
@@ -484,6 +717,8 @@ impl CompactExecutor {
                 task: task.clone(),
                 files,
                 changelog_files: vec![],
+                deletion_vector_updates: None,
+                index_entries: None,
             }),
             Err(error) => {
                 writer.abort().await;
@@ -618,6 +853,7 @@ impl CompactTask {
 pub(super) fn validate_primary_key_changes(
     schema: &TableSchema,
     changes: &[ManifestEntry],
+    changelog: &[ManifestEntry],
     captured: &[ManifestEntry],
 ) -> Result<()> {
     fn group(entry: &ManifestEntry) -> (&[u8], i32, i32) {
@@ -678,6 +914,7 @@ pub(super) fn validate_primary_key_changes(
     if changes
         .iter()
         .filter(|entry| *entry.kind() == FileKind::Add)
+        .chain(changelog.iter())
         .any(|entry| output_levels.get(&group(entry)) != Some(&entry.file().level))
     {
         return Err(invalid(
@@ -691,6 +928,8 @@ pub(super) fn validate_primary_key_changes(
 pub(super) struct PreparedCompact {
     pub entries: Vec<ManifestEntry>,
     pub changelog_entries: Vec<ManifestEntry>,
+    pub deletion_vector_updates: Option<Vec<DeletionVectorUpdate>>,
+    pub index_entries: Option<Vec<crate::spec::IndexManifestEntry>>,
     pub schema_id: i64,
     pub snapshot_id: i64,
     pub read_snapshot: Option<Box<Snapshot>>,
@@ -708,6 +947,8 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
     let mut outputs = HashSet::new();
     let mut entries = Vec::new();
     let mut changelog_entries = Vec::new();
+    let mut deletion_vector_updates = Some(Vec::new());
+    let mut index_entries = Some(Vec::new());
     let mut metrics = CompactMetrics::default();
     for result in results {
         let task = &result.task;
@@ -721,6 +962,29 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             return Err(invalid("Compaction results must belong to one plan"));
         }
         ids.push(task.task_id);
+        if task.is_primary_key() {
+            match (&mut index_entries, &result.index_entries) {
+                (Some(all), Some(entries)) => {
+                    if entries
+                        .iter()
+                        .any(|e| e.partition != task.partition || e.bucket != task.bucket)
+                    {
+                        return Err(invalid("PK index output belongs to a different bucket"));
+                    }
+                    all.extend(entries.iter().cloned());
+                }
+                (_, None) => index_entries = None,
+                _ => {}
+            }
+        } else if result
+            .index_entries
+            .as_ref()
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            return Err(invalid(
+                "Only PK compaction can prepare source-backed indexes",
+            ));
+        }
         for file in &task.files {
             if !inputs.insert((task.partition.clone(), task.bucket, file.file_name.clone())) {
                 return Err(invalid("Overlapping compaction results"));
@@ -777,18 +1041,44 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             return Err(invalid("Compaction must preserve the input row count"));
         }
         let options = task.context.schema.core_options();
-        let ignores_retracts = task.is_primary_key()
-            && options.ignore_delete()
-            && matches!(
-                options.merge_engine()?,
-                MergeEngine::FirstRow | MergeEngine::PartialUpdate
-            );
-        if task.is_primary_key()
-            && (output_rows > input_rows
-                || (input_rows > 0 && output_rows == 0 && !ignores_retracts))
+        let dv = task.is_primary_key() && options.deletion_vectors_enabled();
+        // First-row can leave every accepted key in retained history, even
+        // with ignore-delete=false, and therefore produce no data files.
+        let can_omit_keys = dv
+            || (task.is_primary_key()
+                && (options.merge_engine()? == MergeEngine::FirstRow
+                    || (options.ignore_delete()
+                        && options.merge_engine()? == MergeEngine::PartialUpdate)));
+        if dv
+            && result.files.iter().any(|file| {
+                file.delete_row_count != Some(0) || file.row_count > i64::from(u32::MAX) + 1
+            })
         {
             return Err(invalid(
-                "PK compaction must retain each key's merged state unless retracts are ignored",
+                "Deletion-vector compaction data must contain only add records",
+            ));
+        }
+        let updates = result
+            .deletion_vector_updates
+            .as_deref()
+            .unwrap_or_default();
+        if dv && result.deletion_vector_updates.is_none() {
+            // Require this only after already-committed results are recovered.
+            deletion_vector_updates = None;
+        }
+        if !dv && !updates.is_empty() {
+            return Err(invalid(
+                "Only deletion-vector compaction may publish row deletions",
+            ));
+        }
+        if let Some(collected) = &mut deletion_vector_updates {
+            collected.extend(updates.iter().cloned());
+        }
+        if task.is_primary_key()
+            && (output_rows > input_rows || (input_rows > 0 && output_rows == 0 && !can_omit_keys))
+        {
+            return Err(invalid(
+                "PK compaction must retain merged keys unless its merge mode can omit them",
             ));
         }
         let lookup = options.try_changelog_producer()? == ChangelogProducer::Lookup;
@@ -798,17 +1088,12 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             ));
         }
         let mut changelog_rows = 0u64;
-        let changelog_level = output_level.unwrap_or_else(|| {
-            result
-                .files
-                .first()
-                .map_or_else(|| task.output_level(), |file| file.level)
-        });
+        let changelog_level = output_level.or_else(|| result.files.first().map(|file| file.level));
         for file in &result.changelog_files {
             validate_file(file, true)?;
             if file.schema_id != task.context.schema.id()
                 || file.file_source != Some(1)
-                || file.level != changelog_level
+                || changelog_level.is_some_and(|level| file.level != level)
                 || file
                     .delete_row_count
                     .is_none_or(|count| count > file.row_count)
@@ -860,6 +1145,8 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
     Ok(PreparedCompact {
         entries,
         changelog_entries,
+        deletion_vector_updates,
+        index_entries,
         schema_id: first.task.context.schema.id(),
         snapshot_id: first.task.snapshot_id(),
         read_snapshot: first
@@ -876,6 +1163,13 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
     table.ensure_not_branch_reference_for_write()?;
     let options = table.schema().core_options();
     let properties = table.schema().options();
+    if !table.schema().primary_keys().is_empty() {
+        super::pk_index_options::definitions(table.schema()).map_err(|error| {
+            Error::ConfigInvalid {
+                message: format!("Invalid primary-key index declaration: {error}"),
+            }
+        })?;
+    }
     if options.data_evolution_enabled() {
         data_evolution::ensure_supported(table)?;
         return options.validate_data_file_path_directory();
@@ -909,7 +1203,7 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
     if table.is_format_table()
         || options.row_tracking_enabled()
         || options.data_evolution_enabled()
-        || options.deletion_vectors_enabled()
+        || (options.deletion_vectors_enabled() && table.schema().primary_keys().is_empty())
         || options.query_auth_enabled()
         || !options.blob_fields().is_empty()
         || table
@@ -941,17 +1235,56 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
             message: "PK compaction requires fixed or dynamic buckets and changelog-producer=none, input or lookup; first-row requires changelog-producer=none or lookup".into(),
         });
     }
+    if options.deletion_vectors_enabled() && options.merge_engine()? != MergeEngine::Deduplicate {
+        return Err(Error::Unsupported {
+            message: "Primary-key deletion-vector compaction requires deduplicate".into(),
+        });
+    }
     if options.try_changelog_producer()? == ChangelogProducer::Lookup {
         primary_key::lookup::validate_options(properties)?;
     }
     options.validate_data_file_path_directory()
 }
 
+/// Dropping DV tombstones relies on every historical version having used DV.
+/// Switching an existing non-DV table requires a migration Rust does not offer.
+pub(super) async fn validate_dv_schemas<'a>(
+    table: &Table,
+    files: impl Iterator<Item = &'a DataFileMeta>,
+) -> Result<()> {
+    if table.schema().primary_keys().is_empty()
+        || !table.schema().core_options().deletion_vectors_enabled()
+    {
+        return Ok(());
+    }
+    let mut schemas = HashSet::new();
+    for file in files {
+        if file.row_count > i64::from(u32::MAX) + 1 {
+            return Err(invalid(
+                "Deletion-vector compaction file exceeds u32 physical positions",
+            ));
+        }
+        if schemas.insert(file.schema_id)
+            && !table
+                .schema_manager()
+                .schema(file.schema_id)
+                .await?
+                .core_options()
+                .deletion_vectors_enabled()
+        {
+            return Err(Error::Unsupported {
+                message: "Deletion-vector compaction cannot migrate files written without deletion vectors".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn ensure_snapshot_supported(table: &Table, snapshot: &Snapshot) -> Result<()> {
     if snapshot.index_manifest().is_some()
         && !table.schema().core_options().data_evolution_enabled()
-        && (table.schema().primary_keys().is_empty()
-            || table.schema().core_options().bucket() != -1)
+        && !table.schema().core_options().deletion_vectors_enabled()
+        && table.schema().primary_keys().is_empty()
     {
         return Err(Error::Unsupported {
             message: "Compaction only supports dynamic-bucket HASH index manifests".into(),
@@ -961,32 +1294,51 @@ fn ensure_snapshot_supported(table: &Table, snapshot: &Snapshot) -> Result<()> {
 }
 
 /// HASH indexes contain key-to-bucket assignments, independent of data files.
-/// Preserve their manifest verbatim, including hashes of deleted keys. Other
-/// index types may address rewritten files or row positions and cannot be reused.
+/// Preserve their manifest verbatim, including hashes of deleted keys. PK source
+/// indexes and deletion vectors are validated here and maintained at commit.
 pub(super) async fn validate_snapshot_indexes(
     table: &Table,
     snapshot: &Snapshot,
 ) -> Result<Option<String>> {
+    read_snapshot_indexes(table, snapshot).await?;
+    Ok(snapshot.index_manifest().map(str::to_owned))
+}
+
+async fn read_snapshot_indexes(
+    table: &Table,
+    snapshot: &Snapshot,
+) -> Result<Vec<IndexManifestEntry>> {
     ensure_snapshot_supported(table, snapshot)?;
     let Some(name) = snapshot.index_manifest() else {
-        return Ok(None);
+        return Ok(vec![]);
     };
     let path = table.snapshot_manager().manifest_path(name);
     let entries = IndexManifest::read(table.file_io(), &path).await?;
     if table.schema().core_options().data_evolution_enabled() {
         data_evolution::validate_indexes(&entries)?;
-        return Ok(Some(name.to_string()));
+        return Ok(entries);
     }
-    if entries.iter().any(|entry| {
-        entry.index_file.index_type != "HASH"
-            || entry.index_file.deletion_vectors_ranges.is_some()
+    for entry in &entries {
+        if !table.schema().primary_keys().is_empty()
+            && super::pk_index_maintenance::is_source_index(entry)
+        {
+            super::pk_index_maintenance::source(entry)?;
+            continue;
+        }
+        if !(entry.index_file.index_type == "HASH"
+            || (table.schema().core_options().deletion_vectors_enabled()
+                && entry.index_file.index_type == "DELETION_VECTORS"))
+            || (entry.index_file.index_type == "HASH"
+                && entry.index_file.deletion_vectors_ranges.is_some())
             || entry.index_file.global_index_meta.is_some()
-    }) {
-        return Err(Error::Unsupported {
-            message: "Compaction only supports dynamic-bucket HASH index manifests".into(),
-        });
+        {
+            return Err(Error::Unsupported {
+                message: "Compaction requires HASH, deletion-vector or source-backed PK indexes"
+                    .into(),
+            });
+        }
     }
-    Ok(Some(name.to_string()))
+    Ok(entries)
 }
 
 fn validate_file(file: &DataFileMeta, primary_key: bool) -> Result<()> {

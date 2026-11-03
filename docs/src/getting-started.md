@@ -148,6 +148,14 @@ of at most a quarter of the limit and closes the row group once its encoded size
 reaches the limit, so large or skewed batches stay close to it. These options
 affect new writes only.
 
+## Map and Multiset Arrow Values
+
+`MAP<K, V>` and `MULTISET<T>` both use Arrow Map with a non-null entry struct
+and non-null keys. A multiset's values are non-null `Int32` occurrence counts.
+Column and ordinary map value nullability follow the existing schema rules.
+NULL keys are rejected by Arrow's runtime validation.
+Row, Avro, and Parquet retain their Java-compatible file encodings.
+
 ## Parquet Page Pruning
 
 Parquet Page Index pruning is enabled by default. Set

@@ -21,7 +21,7 @@ use super::bucket_filter::split_partition_and_data_predicates;
 use super::global_index_scanner::unindexed_ranges_for_global_index_entries;
 use super::global_index_types::normalize_queryable_global_index_type;
 use super::row_id_predicate::intersect_sorted_ranges;
-use super::vector_search_common::configured_vector_index_type;
+use super::vector_search_common::resolve_vector_search_options;
 use super::{find_field_id_by_name, merge_row_ranges, DataSplit, RowRange, Table};
 use crate::spec::{
     CoreOptions, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifestEntry, Predicate,
@@ -88,8 +88,15 @@ pub(super) async fn global_search_splits(
         .iter()
         .filter(|entry| entry.kind == FileKind::Add && belongs(&entry.index_file))
         .collect::<Vec<_>>();
-    // Full-text admits raw fallback only after finding its index definition.
-    if full_text && selected.is_empty() {
+    // A declaration supplies the definition even before its first payload is published.
+    if full_text
+        && selected.is_empty()
+        && !super::global_index_options::declares_column(
+            table.schema().options(),
+            column,
+            "full-text",
+        )
+    {
         return Ok(vec![]);
     }
     let row_filter = filter.and_then(|filter| {
@@ -200,8 +207,22 @@ pub(super) async fn global_search_splits(
             .values()
             .flat_map(|files| files.iter())
             .next()
-            .map(|file| file.index_type.clone())
-            .or_else(|| configured_vector_index_type(table.schema().options(), options, column));
+            .map(|file| file.index_type.clone());
+        let index_type = match index_type {
+            Some(kind) => Some(kind),
+            None if full_text => None,
+            None => {
+                resolve_vector_search_options(
+                    table.schema().options(),
+                    options,
+                    column,
+                    None,
+                    false,
+                )?
+                .resolved
+                .index_type
+            }
+        };
         result.push(SearchScanSplit::Raw {
             scalar_index_files: intersecting_scalar(&raw_ranges),
             row_ranges: raw_ranges,

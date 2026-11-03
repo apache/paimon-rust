@@ -707,6 +707,75 @@ Writing uses a **write-then-commit** flow:
 5. Pass the messages to `paimon_table_commit_commit`.
 6. Free the messages, writer, committer, and builder.
 
+### Cross-process Commit Messages
+
+Workers can prepare files and export their ordinary commit messages for an
+independent coordinator. The coordinator must have access to the same files.
+Use `paimon_table_new_write_builder_with_commit_user` to configure a stable
+logical job identity on workers and the coordinator.
+
+```c
+/* Worker: messages came from paimon_table_write_prepare_commit. */
+int32_t version = paimon_commit_messages_serializer_version();
+paimon_result_bytes_array exported = paimon_commit_messages_serialize(messages);
+CHECK_RESULT(exported);
+
+/* Send version and each exported.bytes.data[i].data / .len through the
+   application's transport. Preserve the order and boundaries of the bodies.
+   Complete or copy the transport's reads before freeing the buffers. */
+paimon_bytes_array_free(exported.bytes);
+paimon_commit_messages_free(messages);
+```
+
+Each array element is one unframed Java `CommitMessageSerializer` v14 body.
+The version, message count and body lengths are transport metadata, not part
+of those bodies. Do not concatenate bodies or add a header inside a body.
+An empty message list exports an empty array. The buffers are independent of
+the source handle and remain valid after that handle is freed.
+
+On the coordinator, create a standard committer for the intended table and
+operation. Enable overwrite on its builder before creating it if the workers
+prepared an overwrite. Pass the received bodies as borrowed
+`paimon_byte_slice` values:
+
+```c
+paimon_result_prepare_commit restored = paimon_commit_messages_deserialize(
+    committer, received_version, received_bodies, received_count);
+CHECK_RESULT(restored);
+
+/* Input buffers may now be released. Merge the restored handle with other
+   workers' handles using paimon_commit_messages_merge, then commit once. */
+paimon_error *error = paimon_table_commit_commit_with_identifier(
+    committer, restored.messages, checkpoint_id);
+if (error != NULL) {
+    paimon_error_free(error);
+}
+paimon_commit_messages_free(restored.messages);
+```
+
+Deserialization copies the target committer's table location, `commit_user`
+and overwrite mode. These fields are absent from the Java body: the application
+must ensure that the received files belong to the selected table, branch and
+operation. Import does not verify the messages' original identity. Subsequent
+merge, commit and abort calls enforce the copied context. The imported handle
+can outlive both its input buffers and the original committer.
+
+Use `paimon_table_commit_overwrite_with_identifier` for overwrite messages.
+The commit identifier is supplied separately; retain a stable `commit_user`
+and identifier when retrying an uncertain commit. For append retries,
+`paimon_table_commit_filter_and_commit_with_identifier` filters already
+committed identifiers. Merging copies messages and leaves both handles owned
+by the caller; free each handle exactly once. Freeing a handle releases metadata,
+not prepared files; use `paimon_table_commit_abort` for known uncommitted files.
+
+Unsupported versions, malformed bodies and invalid pointer/length combinations
+return errors without a partial output handle. `NULL, 0` is a valid empty list;
+an individual empty body is invalid. Format Table message export and import into
+a Format Table committer are unsupported. These APIs do not accept postpone
+fixed-bucket handles or `CompactTask` / `CompactResult` payloads. Java compact
+increment fields retain the core codec behavior; ordinary commits still reject
+nonempty compact increments.
+
 ### Shared Writer Memory Reservations
 
 Attach an optional resource context to each write builder before creating its
@@ -738,8 +807,10 @@ count, order, names, and types. A non-nullable table field must not contain null
 values.
 
 !!! warning "Write builder consistency"
-    The writer and committer must be created from the same write builder because
-    they share a commit identity. Commit messages must be freed with
+    Local writers and committers must share the table, commit identity and
+    overwrite mode. Use the same builder or set the same explicit identity on
+    separate builders. Imported messages use the target committer's context as
+    described above. Commit messages must be freed with
     `paimon_commit_messages_free` even after a successful commit. The caller
     retains message ownership and may retry a failed commit.
 

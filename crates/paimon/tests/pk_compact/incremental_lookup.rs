@@ -487,3 +487,263 @@ async fn incremental_lookup_prunes_old_schema_history_by_unchanged_keys() {
         );
     }
 }
+
+#[tokio::test]
+async fn incremental_first_row_preserves_history_and_only_materializes_new_keys() {
+    for producer in ["none", "lookup"] {
+        for bucket in ["1", "-1"] {
+            let (table, probe) = probed_table_with_options(&[
+                ("merge-engine", "first-row"),
+                ("changelog-producer", producer),
+                ("bucket", bucket),
+                ("read.batch-size", "7"),
+            ])
+            .await;
+            let anchor = seed(&table).await;
+            let snapshot = table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap();
+            let original = (0..1000).map(|key| (2 * key, 2 * key)).collect::<Vec<_>>();
+            *probe.history.lock().unwrap() = anchor.file_name.clone();
+            write_batch(
+                &table,
+                &make_batch_with_kinds(
+                    vec![42, 43, 45, 42],
+                    vec![9999, 4300, 4500, 9998],
+                    vec![0, 2, 0, 0],
+                ),
+            )
+            .await;
+            let builder = table.new_compact_builder();
+            let plan = builder.new_planner().unwrap().plan().await.unwrap();
+            assert_eq!(plan.tasks().len(), 1);
+            assert!(
+                plan.tasks()[0].files().iter().all(|file| file.level == 0),
+                "large accepted history must remain in place"
+            );
+            let (cold, hot) = cold_and_hot(&table, &plan, &probe, &anchor).await;
+            for results in [&cold, &hot] {
+                assert_eq!(
+                    results[0]
+                        .files()
+                        .iter()
+                        .map(|file| file.row_count)
+                        .sum::<i64>(),
+                    2,
+                    "lookup hits must not be copied into a lower level"
+                );
+                assert!(results[0].files().iter().all(|file| file.level == 4));
+            }
+            let commit = builder.new_commit().unwrap();
+            commit.commit_compact(hot).await.unwrap();
+            let end = latest(&table).await;
+            commit.commit_compact(cold).await.unwrap();
+            assert_eq!(latest(&table).await, end);
+            let mut expected = original.clone();
+            expected.extend([(43, 4300), (45, 4500)]);
+            expected.sort();
+            assert_eq!(rows(&table).await, expected);
+            assert_eq!(
+                rows(&table.copy_with_pinned_snapshot(Some(&snapshot))).await,
+                original
+            );
+            let files = table
+                .new_read_builder()
+                .new_scan()
+                .with_scan_all_files()
+                .plan()
+                .await
+                .unwrap();
+            assert!(files
+                .splits()
+                .iter()
+                .flat_map(|split| split.data_files())
+                .any(|file| file == &anchor));
+            if producer == "lookup" {
+                let mut expected_events =
+                    vec![("+U".into(), 43, 4300, 1001), ("+I".into(), 45, 4500, 1002)];
+                expected_events.sort();
+                assert_eq!(events(&table, snapshot.id(), end).await, expected_events);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn incremental_first_row_empty_results_support_legacy_metadata_and_concurrent_l0() {
+    for producer in ["none", "lookup"] {
+        let (table, _) = probed_table_with_options(&[
+            ("merge-engine", "first-row"),
+            ("changelog-producer", producer),
+        ])
+        .await;
+        let anchor = seed(&table).await;
+        write_batch(&table, &make_batch(vec![42, 44], vec![4200, 4400])).await;
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        assert!(plan.tasks()[0].files().iter().all(|file| file.level == 0));
+        let results = execute(&table, &plan).await;
+        assert!(results[0].files().is_empty());
+        assert!(results[0].changelog_files().is_empty());
+        write_batch(&table, &make_batch(vec![43], vec![4300])).await;
+        let mut legacy = serde_json::to_value(&results).unwrap();
+        for result in legacy.as_array_mut().unwrap() {
+            result["task"]
+                .as_object_mut()
+                .unwrap()
+                .remove("output_level");
+        }
+        let commit = builder.new_commit().unwrap();
+        let metrics = commit
+            .commit_compact(serde_json::from_value(legacy).unwrap())
+            .await
+            .unwrap();
+        let published = latest(&table).await;
+        assert_eq!(commit.commit_compact(results).await.unwrap(), metrics);
+        assert_eq!(latest(&table).await, published);
+        assert_eq!(
+            rows(&table).await.len(),
+            1000,
+            "concurrent L0 is not accepted before its own compaction"
+        );
+        let next = table
+            .new_compact_builder()
+            .new_planner()
+            .unwrap()
+            .plan()
+            .await
+            .unwrap();
+        assert_eq!(next.tasks().len(), 1);
+        assert!(next.tasks()[0].files().iter().all(|file| file.level == 0));
+        compact(&table).await;
+        let visible = rows(&table).await;
+        assert_eq!(visible.len(), 1001);
+        assert!(
+            visible.contains(&(42, 42))
+                && visible.contains(&(44, 44))
+                && visible.contains(&(43, 4300))
+        );
+        let files = table
+            .new_read_builder()
+            .new_scan()
+            .with_scan_all_files()
+            .plan()
+            .await
+            .unwrap();
+        assert!(files
+            .splits()
+            .iter()
+            .flat_map(|split| split.data_files())
+            .any(|file| file == &anchor));
+        if producer == "lookup" {
+            let changes = events(&table, published, latest(&table).await).await;
+            assert_eq!(changes.len(), 1);
+            assert_eq!(
+                (changes[0].0.as_str(), changes[0].1, changes[0].2),
+                ("+I", 43, 4300)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn incremental_first_row_rewrites_selected_history_and_looks_up_retained_history() {
+    let (table, _) = probed_table_with_options(&[("merge-engine", "first-row")]).await;
+    let anchor = seed(&table).await;
+    write_batch(&table, &make_batch(vec![43], vec![4300])).await;
+    let accepted = compact(&table).await;
+    assert_eq!(accepted[0].files()[0].level, 4);
+    let before = latest(&table).await;
+    write_batch(&table, &make_batch(vec![43, 45], vec![9999, 4500])).await;
+    let builder = table.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    assert!(plan.tasks()[0].files().iter().any(|file| file.level == 4));
+    assert!(plan.tasks()[0]
+        .files()
+        .iter()
+        .all(|file| file.file_name != anchor.file_name));
+    let result = execute(&table, &plan).await;
+    assert_eq!(
+        result[0].metrics().rows_written,
+        2,
+        "selected positive rows must stay in the compact output"
+    );
+    builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(result)
+        .await
+        .unwrap();
+    let visible = rows(&table).await;
+    assert_eq!(visible.len(), 1002);
+    assert!(visible.contains(&(43, 4300)) && visible.contains(&(45, 4500)));
+    let changes = events(&table, before, latest(&table).await).await;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        (changes[0].0.as_str(), changes[0].1, changes[0].2),
+        ("+I", 45, 4500)
+    );
+}
+
+#[tokio::test]
+async fn stateful_lookup_reuses_cached_history_for_sparse_rows_and_changelog() {
+    for engine in ["partial-update", "aggregation"] {
+        for bucket in ["1", "-1"] {
+            let mut options = vec![
+                ("merge-engine", engine),
+                ("bucket", bucket),
+                ("read.batch-size", "7"),
+            ];
+            if engine == "aggregation" {
+                options.push(("fields.value.aggregate-function", "sum"));
+            }
+            let (table, probe) = probed_table_with_options(&options).await;
+            let anchor = seed(&table).await;
+            let start = latest(&table).await;
+            *probe.history.lock().unwrap() = anchor.file_name.clone();
+            let input = RecordBatch::try_from_iter([
+                (
+                    "id",
+                    Arc::new(Int32Array::from(vec![42, 44, 43])) as arrow_array::ArrayRef,
+                ),
+                (
+                    "value",
+                    Arc::new(Int32Array::from(vec![Some(4200), None, Some(4300)]))
+                        as arrow_array::ArrayRef,
+                ),
+            ])
+            .unwrap();
+            write_batch(&table, &input).await;
+            let expected = rows(&table).await;
+            let new_value = if engine == "aggregation" { 4242 } else { 4200 };
+            assert!(expected.contains(&(42, new_value)) && expected.contains(&(44, 44)));
+            let builder = table.new_compact_builder();
+            let plan = builder.new_planner().unwrap().plan().await.unwrap();
+            assert!(plan.tasks()[0].files().iter().all(|file| file.level == 0));
+            let (cold, hot) = cold_and_hot(&table, &plan, &probe, &anchor).await;
+            assert_eq!(hot[0].metrics().rows_written, 3);
+            let commit = builder.new_commit().unwrap();
+            commit.commit_compact(hot).await.unwrap();
+            let end = latest(&table).await;
+            commit.commit_compact(cold).await.unwrap();
+            assert_eq!(latest(&table).await, end);
+            assert_eq!(rows(&table).await, expected);
+            let mut changes = vec![
+                ("-U".into(), 42, 42, 21),
+                ("+U".into(), 42, i64::from(new_value), 1000),
+                ("-U".into(), 44, 44, 22),
+                ("+U".into(), 44, 44, 1001),
+                ("+I".into(), 43, 4300, 1002),
+            ];
+            changes.sort();
+            assert_eq!(events(&table, start, end).await, changes);
+            write_batch(&table, &make_batch(vec![42], vec![1])).await;
+            let next_expected = rows(&table).await;
+            compact(&table).await;
+            assert_eq!(rows(&table).await, next_expected);
+        }
+    }
+}

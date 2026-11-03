@@ -16,6 +16,7 @@
 // under the License.
 
 mod audit_log;
+mod range_partitioning;
 pub(crate) mod scan;
 mod search_score;
 pub(crate) mod sink;

@@ -226,6 +226,7 @@ mod tests {
 
     fn table(name: &str) -> Table {
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])

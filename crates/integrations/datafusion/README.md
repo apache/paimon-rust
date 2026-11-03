@@ -24,6 +24,22 @@
 
 This crate contains the integration of [Apache DataFusion](https://datafusion.apache.org/) and [Apache Paimon](https://paimon.apache.org/).
 
+## Spark-compatible functions
+
+`SQLContext` enables the matching `datafusion-spark` function packages and Spark
+EXTRACT/SUBSTRING expression planner by default. Spark functions replace native
+functions with the same name; application registrations made afterward take
+priority. Paimon-specific Variant functions, metadata SQL and compatibility
+extensions remain available.
+
+Additional adapters cover binary length and slicing. The separate `split_index`
+extension follows Flink's zero-based contract.
+
+The [SQL guide](../../../docs/src/sql.md#spark-compatible-functions) describes
+the supported subset and migration differences, including legacy `size(NULL)`
+behavior, ANSI remainder handling and date-difference result types. This package
+does not provide every Spark SQL syntax or cast mode.
+
 ## External engine snapshots
 
 Implement `TableEngineResolver::resolve_table_snapshot` to support
@@ -99,6 +115,14 @@ RETURN scalar_expression;
   and non-SQL functions are also not supported.
 
 Use `SQLContext::sql` for function expansion:
+
+Bare calls to registered DataFusion scalar, higher-order, aggregate, and window functions
+(including aliases and session UDFs) resolve locally without a REST function
+lookup. Use `catalog.database.function(...)` to explicitly call a catalog
+function with a colliding name. Catalog lookup errors, including permission
+denials, are preserved for those explicit calls and for unknown bare names.
+SQL lambda syntax for higher-order functions follows DataFusion's configured
+SQL dialect, such as DuckDB.
 
 ```rust,ignore
 let mut ctx = paimon_datafusion::SQLContext::new();

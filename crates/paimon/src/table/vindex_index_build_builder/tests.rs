@@ -107,6 +107,124 @@ fn test_table(options: HashMap<String, String>) -> Table {
     )
 }
 
+#[test]
+fn echoed_schema_keeps_table_semantics_and_procedure_overrides() {
+    for kind in ["ivf-flat", "diskann"] {
+        let mut options = table_options("100");
+        options.extend(HashMap::from([
+            (format!("{kind}.dimension"), "2".into()),
+            (format!("{kind}.metric"), "cosine".into()),
+            ("nlist".into(), "ignored table property".into()),
+            ("index.type".into(), "ignored table property".into()),
+            ("vindex.build.granule.enabled".into(), "true".into()),
+        ]));
+        let table = test_table(options.clone());
+        let field = find_index_field(&table, "embedding").unwrap();
+        let mut builder = super::VindexIndexBuildBuilder::new(&table, kind);
+        let (_, expected) = builder.configured_options("embedding", field).unwrap();
+        builder.with_options(options.clone());
+        let (_, actual) = builder.configured_options("embedding", field).unwrap();
+        assert_eq!(actual.native_options, expected.native_options);
+        assert!(!actual.native_options.contains_key("nlist"));
+        assert_eq!(actual.native_options["metric"], "cosine");
+        // A canonical declaration alone cannot inject a procedure metric default.
+        options.insert(
+            format!("global-index.{kind}.index-columns"),
+            "embedding".into(),
+        );
+        builder.with_options(options.clone());
+        assert_eq!(
+            builder
+                .configured_options("embedding", field)
+                .unwrap()
+                .1
+                .native_options["metric"],
+            "cosine"
+        );
+        options.insert(format!("{kind}.metric"), "l2".into());
+        builder.with_options(options);
+        let (_, actual) = builder.configured_options("embedding", field).unwrap();
+        assert_eq!(actual.native_options["metric"], "l2");
+        assert!(!actual.native_options.contains_key("nlist"));
+        // Direct SDK calls keep native aliases, including values equal to schema properties.
+        builder.with_options(HashMap::from([
+            ("metric".into(), "l2".into()),
+            ("dimension".into(), "2".into()),
+        ]));
+        assert_eq!(
+            builder
+                .configured_options("embedding", field)
+                .unwrap()
+                .1
+                .native_options["metric"],
+            "l2"
+        );
+        if kind == "ivf-flat" {
+            builder.with_options(HashMap::from([(
+                "nlist".into(),
+                "ignored table property".into(),
+            )]));
+            assert_eq!(
+                builder
+                    .configured_options("embedding", field)
+                    .unwrap()
+                    .1
+                    .native_options["nlist"],
+                "ignored table property"
+            );
+        }
+    }
+}
+
+#[test]
+fn procedure_legacy_family_keeps_its_metric_default_and_flat_override() {
+    let table = test_table(HashMap::from([("ivf-flat.metric".into(), "cosine".into())]));
+    let field = find_index_field(&table, "embedding").unwrap();
+    let mut builder = super::VindexIndexBuildBuilder::new(&table, "ivf-flat");
+    let mut options = HashMap::from([
+        (
+            "global-index.vector.index-columns".into(),
+            "embedding".into(),
+        ),
+        (
+            "fields.embedding.global-index.vector.index-type".into(),
+            "ivf-flat".into(),
+        ),
+        (
+            "fields.embedding.global-index.vector.index-options".into(),
+            r#"{"metric":"cosine"}"#.into(),
+        ),
+    ]);
+    builder.with_options(options.clone());
+    assert_eq!(
+        builder
+            .configured_options("embedding", field)
+            .unwrap()
+            .1
+            .native_options["metric"],
+        "inner_product"
+    );
+    options.insert("ivf-flat.metric".into(), "l2".into());
+    builder.with_options(options);
+    assert_eq!(
+        builder
+            .configured_options("embedding", field)
+            .unwrap()
+            .1
+            .native_options["metric"],
+        "inner_product"
+    );
+    builder.with_options(HashMap::from([("ivf-flat.metric".into(), "l2".into())]));
+    assert_eq!(
+        builder
+            .configured_options("embedding", field)
+            .unwrap()
+            .1
+            .native_options["metric"],
+        "l2"
+    );
+}
+
 fn plan(entries: Vec<ManifestEntry>, rows_per_shard: i64) -> Result<Vec<VindexIndexShard>> {
     plan_with_indexed(entries, rows_per_shard, &[])
 }
@@ -406,6 +524,7 @@ fn test_table_with_io(file_io: FileIO, table_path: &str, schema: Schema) -> Tabl
 
 fn vindex_schema_builder(options: HashMap<String, String>) -> crate::spec::SchemaBuilder {
     Schema::builder()
+        .option("write-only", "true")
         .column("id", DataType::Int(IntType::new()))
         .column(
             "embedding",

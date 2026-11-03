@@ -4591,6 +4591,7 @@ pub(in crate::table) mod tests {
 
     fn test_pk_schema() -> TableSchema {
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])
@@ -4612,6 +4613,7 @@ pub(in crate::table) mod tests {
 
     fn pk_changelog_schema(options: &[(&str, &str)]) -> TableSchema {
         let mut builder = Schema::builder()
+            .option("write-only", "true")
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])
@@ -4639,6 +4641,7 @@ pub(in crate::table) mod tests {
 
     fn ordinary_dynamic_pk_changelog_schema() -> TableSchema {
         let schema = Schema::builder()
+            .option("write-only", "true")
             .column("pt", DataType::VarChar(VarCharType::string_type()))
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))

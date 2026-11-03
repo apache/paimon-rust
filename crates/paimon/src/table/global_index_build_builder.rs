@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use super::full_text_index_build_builder::FullTextIndexBuildBuilder;
-use super::global_index_build_common::{resolve_index_fields, IndexColumns};
+use super::global_index_build_common::{resolve_index_fields, GlobalIndexBuildView, IndexColumns};
 use super::global_index_build_plan::{GlobalIndexBuildPlan, GlobalIndexBuildShard};
 use super::global_index_types::{
     normalize_global_index_type, normalize_queryable_global_index_type, BTREE_GLOBAL_INDEX_TYPE,
@@ -103,6 +103,29 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
     pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
         self.options = options;
         self
+    }
+
+    fn configured_table(&self, columns: &[&str], index_type: &str) -> Result<Table> {
+        if columns.len() != 1 || crate::vindex::is_vindex_index_type(index_type) {
+            return Ok(self.table.clone());
+        }
+        // Native vector builders keep declarations in their own option layer.
+        let overrides = super::global_index_options::build_table_options(
+            self.table.schema().options(),
+            &self.options,
+            columns[0],
+        )
+        .into_iter()
+        .filter(|(key, value)| self.table.schema().options().get(key) != Some(value))
+        .collect();
+        let effective = self.table.copy_with_options(overrides);
+        let defaults = super::global_index_options::declared_options(
+            effective.schema().options(),
+            columns[0],
+            index_type,
+            index_type,
+        )?;
+        Ok(effective.copy_with_options(defaults))
     }
 
     /// Restrict the build to partitions. Repeated calls combine filters with AND.
@@ -197,6 +220,24 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
     }
 
     async fn prepare(&self) -> Result<PreparedBuild> {
+        self.prepare_with_view(None).await
+    }
+
+    /// Check the complete writer configuration without scanning or creating files.
+    pub(crate) async fn validate(&self) -> Result<()> {
+        self.prepare_with_view(Some(GlobalIndexBuildView::default()))
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn build_with_view(
+        &self,
+        view: GlobalIndexBuildView,
+    ) -> Result<Vec<CommitMessage>> {
+        Ok(self.prepare_with_view(Some(view)).await?.messages)
+    }
+
+    async fn prepare_with_view(&self, view: Option<GlobalIndexBuildView>) -> Result<PreparedBuild> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
         let index_type = normalize_global_index_type(self.index_type.trim()).ok_or_else(|| {
@@ -210,26 +251,38 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
         })?;
         let fields = resolve_index_fields(self.table, columns, index_type)?;
         let columns = fields.iter().map(|field| field.name()).collect::<Vec<_>>();
+        let table = self.configured_table(&columns, index_type)?;
         if normalize_queryable_global_index_type(index_type).is_some() {
-            let mut builder = SortedGlobalIndexBuildBuilder::new(self.table);
+            let mut builder = SortedGlobalIndexBuildBuilder::new(&table);
+            builder.view = view;
             builder
                 .with_index_columns(&columns)
                 .with_index_type(index_type)
-                .with_options(self.options.clone());
+                .with_options(if columns.len() == 1 {
+                    super::global_index_options::build_options(
+                        &self.options,
+                        columns[0],
+                        index_type,
+                    )?
+                } else {
+                    self.options.clone()
+                });
             if let Some(filter) = &self.partition_filter {
                 builder.with_partition_filter(filter.clone())?;
             }
             return Ok(builder.prepare().await?.into());
         }
         if index_type == FULL_TEXT_GLOBAL_INDEX_TYPE {
-            let mut builder = FullTextIndexBuildBuilder::new(self.table);
-            builder
-                .with_index_column(columns[0])
-                .with_options(self.options.clone());
+            let mut builder = FullTextIndexBuildBuilder::new(&table);
+            builder.view = view;
+            builder.with_index_column(columns[0]).with_options(
+                super::global_index_options::build_options(&self.options, columns[0], index_type)?,
+            );
             builder.partition_filter = self.partition_filter.clone();
             return Ok(builder.prepare().await?.into());
         }
-        let mut builder = VindexIndexBuildBuilder::new(self.table, index_type);
+        let mut builder = VindexIndexBuildBuilder::new(&table, index_type);
+        builder.view = view;
         builder
             .with_index_column(columns[0])
             .with_options(self.options.clone());
@@ -319,6 +372,42 @@ mod tests {
             table.schema().copy_with_replaced_options(options),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn vector_build_ignores_opaque_parameters_and_validates_known_parameters() {
+        let table = empty_table();
+        for kind in ["ivf-flat", "ivf-pq"] {
+            let mut options = HashMap::from([
+                (format!("{kind}.index.dimension"), "2".into()),
+                (format!("{kind}.ignored-option"), "ignored".into()),
+                ("fields.vector.metric".into(), "l2".into()),
+                ("metric".into(), "invalid".into()),
+                ("dimension".into(), "999".into()),
+            ]);
+            let mut builder = table.new_global_index_build_builder();
+            builder
+                .with_index_column("vector")
+                .with_index_type(kind)
+                .with_options(options.clone());
+            assert!(builder.build().await.unwrap().is_empty());
+            options.insert("fields.vector.metric".into(), "invalid".into());
+            let error = builder
+                .with_options(options.clone())
+                .build()
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("metric"), "{error}");
+            if kind == "ivf-flat" {
+                options.insert("fields.vector.metric".into(), "l2".into());
+                options.insert("ivf-flat.ivf.pq-encoding".into(), "canonical".into());
+                let error = builder.with_options(options).build().await.unwrap_err();
+                assert!(
+                    error.to_string().contains("ivf-flat.ivf.pq-encoding"),
+                    "{error}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -17,6 +17,9 @@
 
 mod common;
 
+#[path = "pk_compact/indexes.rs"]
+mod index_tests;
+
 #[path = "pk_compact/merge_engines.rs"]
 mod engine_tests;
 
@@ -29,8 +32,14 @@ mod incremental_planning_tests;
 #[path = "pk_compact/incremental_lookup.rs"]
 mod incremental_lookup_tests;
 
+#[path = "pk_compact/incremental_stateful.rs"]
+mod incremental_stateful_tests;
+
 #[path = "pk_compact/dynamic_bucket.rs"]
 mod dynamic_tests;
+
+#[path = "pk_compact/deletion_vectors.rs"]
+mod deletion_vector_tests;
 
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use common::incremental_helpers::{
@@ -48,6 +57,11 @@ async fn table_with_schema(schema: TableSchema) -> Table {
 }
 
 async fn table_with_cache(schema: TableSchema, cache_options: &[(&str, &str)]) -> Table {
+    // These tests explicitly control planning, execution and publication.
+    let schema = schema.copy_with_options(std::collections::HashMap::from([(
+        "write-only".into(),
+        "true".into(),
+    )]));
     let path = format!("memory:/pk_compact/{}", uuid::Uuid::new_v4());
     let mut options = paimon::Options::new();
     options.set("warehouse", &path);

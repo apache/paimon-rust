@@ -17,7 +17,7 @@
 
 //! Reads global vector indexes, scores raw vectors, and materializes global-row-ID results.
 
-use crate::io::{FileIO, FileRead};
+use crate::io::FileIO;
 use crate::spec::{
     row_id_data_field, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode,
     IndexFileMeta, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
@@ -37,8 +37,8 @@ use crate::table::search_task::{
 };
 use crate::table::vector_read::Read;
 use crate::table::vector_search_common::{
-    configured_refine_factor, configured_vector_index_type, indexed_search_limit,
-    log_vindex_range_io_stats, normalize_metric, resolve_materialize_read_type,
+    indexed_search_limit, log_vindex_range_io_stats, normalize_metric, read_index_vector_metric,
+    resolve_materialize_read_type, resolve_vector_search_options,
     validate_global_vector_index_types, vindex_concurrency_limits,
 };
 use crate::table::{
@@ -56,9 +56,7 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray
 use arrow_select::interleave::interleave_record_batch;
 use futures::{stream, TryStreamExt};
 use paimon_vindex_core::blas::sgemm_a_bt;
-use paimon_vindex_core::diskann_io::DISKANN_HEADER_SIZE;
 use paimon_vindex_core::distance::MetricType;
-use paimon_vindex_core::index::VectorIndexReader as VIndexReader;
 use paimon_vindex_core::io::SeekRead;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
@@ -325,8 +323,21 @@ async fn execute_vector_index_work(
     let index_meta_bytes = global_meta.index_meta.clone().unwrap_or_default();
     let row_range_start = global_meta.row_range_start;
     let vector_searches = work.queries;
-    let mut options = evaluation.table_options.clone();
-    options.extend(vector_searches[0].options.clone());
+    let options = if let Some(resolved) = work.resolved {
+        if resolved.index_type.as_deref() != Some(work.entry.index_file.index_type.as_str()) {
+            return Err(crate::table::search_task::invalid(
+                "Captured vector configuration does not match payload type",
+            ));
+        }
+        resolved.options
+    } else {
+        super::vector_search_common::vector_read_options(
+            evaluation.table_options,
+            &vector_searches[0].options,
+            &vector_searches[0].field_name,
+            &work.entry.index_file.index_type,
+        )?
+    };
     let input = evaluation.file_io.new_input(&path);
     if vector_searches.iter().all(|search| {
         search
@@ -576,7 +587,6 @@ async fn scalar_matched_row_ids(
     vector_ranges: &[RowRange],
     filter: &Predicate,
 ) -> crate::Result<Option<RoaringTreemap>> {
-    let core = CoreOptions::new(evaluation.table_options);
     // Java search pre-filters use per-column coverage and exclude multi-field
     // definitions, even though ordinary table scans can use composite indexes.
     let scalar_entries: Vec<_> = entries
@@ -590,6 +600,12 @@ async fn scalar_matched_row_ids(
         })
         .cloned()
         .collect();
+    let resolved = GlobalIndexScanner::read_defaults(
+        evaluation.table_options,
+        &scalar_entries,
+        evaluation.schema_fields,
+    )?;
+    let core = CoreOptions::new(&resolved);
     let scanner = GlobalIndexScanner::create_with_fm_options(
         evaluation.file_io,
         evaluation.table_path,
@@ -603,7 +619,7 @@ async fn scalar_matched_row_ids(
             .iter()
             .any(|entry| entry.index_file.index_type.eq_ignore_ascii_case("fm"))
         {
-            crate::fm_index::FMOptions::from_options(evaluation.table_options)?.read
+            crate::fm_index::FMOptions::from_options(&resolved)?.read
         } else {
             crate::fm_index::FMReadOptions::default()
         },
@@ -611,6 +627,7 @@ async fn scalar_matched_row_ids(
     let Some(scanner) = scanner else {
         return Ok(None);
     };
+    let scanner = scanner.with_field_options(evaluation.table_options, &scalar_entries)?;
     let Some((ranges, exact)) = scanner.matching_ranges_with_exactness(filter).await? else {
         return Ok(None);
     };
@@ -729,6 +746,24 @@ async fn evaluate_batch_vector_search_with_executor(
         return Ok(vec![ScoredRowIds::empty(); vector_searches.len()]);
     }
 
+    let raw_index_type = sources
+        .into_iter()
+        .flatten()
+        .find_map(|source| match source {
+            crate::table::SearchScanSplit::Raw { index_type, .. } => index_type.as_deref(),
+            _ => None,
+        });
+    let configuration = resolve_vector_search_options(
+        evaluation.table_options,
+        &search_options,
+        field_name,
+        vector_entries
+            .first()
+            .map(|entry| entry.index_file.index_type.as_str())
+            .or(raw_index_type),
+        false,
+    )?;
+    let index_type = configuration.resolved.index_type.as_deref();
     let vector_ranges = merge_row_ranges(
         vector_entries
             .iter()
@@ -854,9 +889,9 @@ async fn evaluate_batch_vector_search_with_executor(
         .max()
         .unwrap_or(0);
     let refine_factor = match vector_entries.first() {
-        Some(entry) => configured_refine_factor(
-            &search_options,
-            evaluation.table_options,
+        Some(entry) => super::vector_search_common::resolved_refine_factor(
+            &configuration.query_options,
+            &configuration.resolved.options,
             field_name,
             &entry.index_file.index_type,
         )?,
@@ -899,15 +934,13 @@ async fn evaluate_batch_vector_search_with_executor(
             .map(|entry| (entry, None))
             .collect::<Vec<_>>()
     };
-    let configured_index_type =
-        configured_vector_index_type(evaluation.table_options, &search_options, field_name);
-    let index_type = vector_entries
-        .first()
-        .map(|entry| entry.index_file.index_type.as_str())
-        .or(configured_index_type.as_deref());
     let metric_check = VectorMetricCheck {
         persisted: Arc::new(std::sync::Mutex::new(None)),
-        requested: vector_metric_override(&search_options, field_name, index_type)?,
+        requested: resolved_vector_metric_override(
+            &configuration.query_options,
+            field_name,
+            index_type,
+        )?,
     };
     let mut permit_wait = Duration::ZERO;
     let mut file_reader_open = Duration::ZERO;
@@ -968,6 +1001,7 @@ async fn evaluate_batch_vector_search_with_executor(
                 Ok::<_, crate::Error>(VectorIndexWork {
                     entry: entry.clone(),
                     queries: searches,
+                    resolved: Some(configuration.resolved.clone()),
                 })
             });
         let results = if let Some(executor) = executor {
@@ -984,6 +1018,7 @@ async fn evaluate_batch_vector_search_with_executor(
                         let work = VectorIndexTask {
                             entry: work.entry,
                             queries: TaskVectorQueries::capture(&work.queries)?,
+                            resolved: work.resolved,
                         };
                         SearchTask::new(
                             table,
@@ -1053,6 +1088,7 @@ async fn evaluate_batch_vector_search_with_executor(
             merged,
             index_search_limit,
             executor,
+            &configuration,
         )
         .await?;
         refine = refine_start.map_or(Duration::ZERO, |start| start.elapsed());
@@ -1124,29 +1160,11 @@ async fn evaluate_batch_vector_search_with_executor(
                 source: None,
             })?;
             let metric_start = timing_enabled.then(Instant::now);
-            let mut metric_options = vector_searches[0].options.clone();
-            if configured_vector_index_type(evaluation.table_options, &metric_options, field_name)
-                .is_none()
-            {
-                if let Some(index_type) =
-                    sources
-                        .into_iter()
-                        .flatten()
-                        .find_map(|source| match source {
-                            crate::table::SearchScanSplit::Raw { index_type, .. } => {
-                                index_type.as_ref()
-                            }
-                            _ => None,
-                        })
-                {
-                    metric_options.insert("index_type".into(), index_type.clone());
-                }
-            }
-            let metric = resolve_raw_vector_metric(
+            let metric = resolve_raw_vector_metric_resolved(
                 evaluation.file_io,
                 table_path,
                 evaluation.table_options,
-                &metric_options,
+                &configuration,
                 index_entries,
                 field_id,
                 field_name,
@@ -1394,6 +1412,7 @@ async fn maybe_rerank_indexed_batch_results(
     results: Vec<ScoredRowIds>,
     index_search_limit: usize,
     executor: Option<&dyn SearchTaskExecutor>,
+    configuration: &super::vector_search_common::VectorSearchOptions,
 ) -> crate::Result<Vec<ScoredRowIds>> {
     let timing_enabled = vector_search_timing_enabled();
     let total_start = timing_enabled.then(Instant::now);
@@ -1429,11 +1448,11 @@ async fn maybe_rerank_indexed_batch_results(
     let raw_ranges = sorted_row_ids_to_row_ranges(union_candidates.iter())?;
     let metric_start = timing_enabled.then(Instant::now);
     let field_name = &vector_searches[0].field_name;
-    let metric = resolve_raw_vector_metric(
+    let metric = resolve_raw_vector_metric_resolved(
         evaluation.file_io,
         evaluation.table_path.trim_end_matches('/'),
         evaluation.table_options,
-        &vector_searches[0].options,
+        configuration,
         index_entries,
         field_id,
         field_name,
@@ -1664,6 +1683,8 @@ impl RawVectorMetric {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn resolve_raw_vector_metric(
     file_io: &FileIO,
     table_path: &str,
@@ -1672,9 +1693,9 @@ async fn resolve_raw_vector_metric(
     index_entries: &[IndexManifestEntry],
     field_id: i32,
     field_name: &str,
+    source_index_type: Option<&str>,
 ) -> crate::Result<RawVectorMetric> {
-    let configured_type = configured_vector_index_type(table_options, search_options, field_name);
-    let index_type = index_entries
+    let persisted_type = index_entries
         .iter()
         .filter(|entry| entry.kind == FileKind::Add)
         .find(|entry| {
@@ -1685,11 +1706,43 @@ async fn resolve_raw_vector_metric(
                     .as_ref()
                     .is_some_and(|meta| meta.index_field_id == field_id)
         })
-        .map(|entry| entry.index_file.index_type.as_str())
-        .or(configured_type.as_deref());
+        .map(|entry| entry.index_file.index_type.as_str());
+    let configuration = resolve_vector_search_options(
+        table_options,
+        search_options,
+        field_name,
+        persisted_type.or(source_index_type),
+        false,
+    )?;
+    resolve_raw_vector_metric_resolved(
+        file_io,
+        table_path,
+        table_options,
+        &configuration,
+        index_entries,
+        field_id,
+        field_name,
+    )
+    .await
+}
+
+async fn resolve_raw_vector_metric_resolved(
+    file_io: &FileIO,
+    table_path: &str,
+    table_options: &HashMap<String, String>,
+    configuration: &super::vector_search_common::VectorSearchOptions,
+    index_entries: &[IndexManifestEntry],
+    field_id: i32,
+    field_name: &str,
+) -> crate::Result<RawVectorMetric> {
+    let index_type = configuration.resolved.index_type.as_deref();
     let check = VectorMetricCheck {
         persisted: Arc::new(std::sync::Mutex::new(None)),
-        requested: vector_metric_override(search_options, field_name, index_type)?,
+        requested: resolved_vector_metric_override(
+            &configuration.query_options,
+            field_name,
+            index_type,
+        )?,
     };
     let mut persisted = None;
     for entry in index_entries {
@@ -1703,6 +1756,7 @@ async fn resolve_raw_vector_metric(
             continue;
         }
         if let Some(metric) = read_index_vector_metric(file_io, table_path, entry).await? {
+            let metric = RawVectorMetric::from_vindex(metric);
             check.check(metric)?;
             persisted = Some(metric);
         }
@@ -1713,84 +1767,39 @@ async fn resolve_raw_vector_metric(
     if let Some(metric) = check.requested {
         return Ok(metric);
     }
-    let table_metric = vector_metric_override(table_options, field_name, index_type)?;
+    if index_type.is_some() {
+        return RawVectorMetric::parse(&configuration.resolved.metric);
+    }
+    let table_metric = resolved_vector_metric_override(table_options, field_name, None)?;
     if let Some(metric) = table_metric {
         return Ok(metric);
     }
-    // Before files exist, Java creates the configured indexer for raw search.
-    // The vindex option resolver defaults to inner product.
-    Ok(if index_type.is_some_and(is_vindex_index_type) {
-        RawVectorMetric::InnerProduct
-    } else {
-        RawVectorMetric::L2
-    })
+    // Preserve the historical untyped raw-search default.
+    Ok(RawVectorMetric::L2)
 }
 
-/// Rerouted raw searches still validate each shard's persisted metric.
-async fn read_index_vector_metric(
-    file_io: &FileIO,
-    table_path: &str,
-    entry: &IndexManifestEntry,
-) -> crate::Result<Option<RawVectorMetric>> {
-    let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
-        return Ok(None);
-    };
-    if !is_vindex_index_type(&entry.index_file.index_type) {
-        return Ok(None);
-    }
-    if let Some(index_meta) = global_meta.index_meta.as_ref() {
-        if let Ok(options) = serde_json::from_slice::<HashMap<String, String>>(index_meta) {
-            if let Some(metric) = options.get("metric") {
-                if let Some(metric) = RawVectorMetric::parse_normalized(&normalize_metric(metric)) {
-                    return Ok(Some(metric));
-                }
-            }
-        }
-    }
-    let path = IndexFileLocation::Global { table_path }.resolve(
-        &entry.index_file.file_name,
-        entry.index_file.external_path.as_deref(),
-    );
-    let input = file_io.new_input(&path)?;
-    let read_error = |e| crate::Error::DataInvalid {
-        message: format!(
-            "Failed to read vindex index file '{}' for raw search metric: {}",
-            entry.index_file.file_name, e
-        ),
-        source: Some(Box::new(e)),
-    };
-    let header_size = if entry.index_file.file_size > 0 {
-        (entry.index_file.file_size as u64).min(DISKANN_HEADER_SIZE as u64)
-    } else {
-        input
-            .metadata()
-            .await
-            .map_err(&read_error)?
-            .size
-            .min(DISKANN_HEADER_SIZE as u64)
-    };
-    let file_reader = input.reader().await.map_err(&read_error)?;
-    let bytes = file_reader.read(0..header_size).await.map_err(read_error)?;
-    let reader = VIndexReader::open(Cursor::new(bytes)).map_err(|e| crate::Error::DataInvalid {
-        message: format!(
-            "Failed to open paimon-vindex-core reader for raw search metric: {}",
-            e
-        ),
-        source: Some(Box::new(e)),
-    })?;
-    Ok(Some(RawVectorMetric::from_vindex(reader.metadata().metric)))
-}
-
-fn vector_metric_override(
+fn resolved_vector_metric_override(
     options: &HashMap<String, String>,
     field_name: &str,
     index_type: Option<&str>,
 ) -> crate::Result<Option<RawVectorMetric>> {
     // A known index family determines its own defaults and option namespace.
     // Only a search without a family may infer a metric from suffixes.
-    if index_type.is_some() {
-        direct_raw_vector_metric_override(options, field_name, index_type)
+    if let Some(kind) = index_type {
+        direct_raw_vector_metric_override(options, field_name, Some(kind))
     } else {
+        if options.contains_key(&format!("fields.{field_name}.index-options")) {
+            // Like Java, use the logical family only to parse explicit field
+            // parameters. It does not select a native backend or default metric.
+            let resolved = CoreOptions::new(options).vector_index_options(
+                Some("vector"),
+                field_name,
+                false,
+            )?;
+            if let Some(metric) = resolved.options.get("vector.metric") {
+                return RawVectorMetric::parse(metric).map(Some);
+            }
+        }
         configured_raw_vector_metric_override(options, field_name)
     }
 }
@@ -2742,10 +2751,13 @@ impl TaskVectorQueries {
 struct VectorIndexTask {
     entry: IndexManifestEntry,
     queries: TaskVectorQueries,
+    #[serde(default)]
+    resolved: Option<crate::spec::VectorIndexOptions>,
 }
 struct VectorIndexWork {
     entry: IndexManifestEntry,
     queries: Vec<VectorSearch>,
+    resolved: Option<crate::spec::VectorIndexOptions>,
 }
 #[derive(Serialize, Deserialize)]
 struct VectorRowsTask {
@@ -2831,6 +2843,7 @@ pub(super) async fn execute_search_task(
                 VectorIndexWork {
                     entry: work.entry,
                     queries: work.queries.restore()?,
+                    resolved: work.resolved,
                 },
                 metric_check.clone(),
                 RangeReadLimiter::new(range_concurrency),

@@ -358,6 +358,36 @@ impl SnapshotManager {
         Ok(result)
     }
 
+    /// Returns the id of the first listed snapshot committed at or after
+    /// `timestamp_millis`, or `latest + 1` when every snapshot is older.
+    /// Returns `None` when the table has no snapshot.
+    ///
+    /// Unlike `later_or_equal_time_millis`, the result is the first of several
+    /// snapshots sharing a commit time. Unlike Java, which adds one to
+    /// `earlierThanTimeMills`, it skips ids missing from the listing.
+    ///
+    /// Reference: [TimeTravelUtil.earlierThanTimeMills](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/snapshot/TimeTravelUtil.java)
+    pub(crate) async fn first_id_at_or_after_time_millis(
+        &self,
+        timestamp_millis: i64,
+    ) -> crate::Result<Option<i64>> {
+        let ids = self.list_all_ids().await?;
+        let Some(&latest) = ids.last() else {
+            return Ok(None);
+        };
+        let (mut lo, mut hi) = (0usize, ids.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let commit_time = self.get_snapshot(ids[mid]).await?.time_millis() as i64;
+            if commit_time < timestamp_millis {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(Some(ids.get(lo).copied().unwrap_or(latest + 1)))
+    }
+
     /// Returns the first snapshot whose watermark is later than or equal to the given
     /// `watermark`. Snapshots without a watermark — `None`, or `Some(i64::MIN)`,
     /// Flink's no-watermark sentinel — are skipped. If no such snapshot exists,
@@ -716,6 +746,43 @@ mod tests {
             fixture.requests.lock().unwrap().last().unwrap(),
             "/v1/test/databases/database/tables/table/snapshot"
         );
+    }
+
+    #[tokio::test]
+    async fn test_first_id_at_or_after_time_millis_keeps_ties_and_skips_holes() {
+        let (_, sm) = setup("memory:/test_first_id_at_or_after_time").await;
+        assert_eq!(sm.first_id_at_or_after_time_millis(0).await.unwrap(), None);
+        for (id, time) in [(2, 1000), (3, 2000), (4, 2000), (6, 3000)] {
+            let snapshot = Snapshot::builder()
+                .version(3)
+                .id(id)
+                .schema_id(0)
+                .base_manifest_list("base-list".to_string())
+                .delta_manifest_list("delta-list".to_string())
+                .commit_user("test-user".to_string())
+                .commit_identifier(0)
+                .commit_kind(CommitKind::APPEND)
+                .time_millis(time)
+                .build();
+            sm.commit_snapshot(&snapshot).await.unwrap();
+        }
+        for (timestamp, expected) in [
+            (500, 2),
+            (1000, 2),
+            (1001, 3),
+            (2000, 3),
+            (2001, 6),
+            (3000, 6),
+            (3001, 7),
+        ] {
+            assert_eq!(
+                sm.first_id_at_or_after_time_millis(timestamp)
+                    .await
+                    .unwrap(),
+                Some(expected),
+                "timestamp {timestamp}"
+            );
+        }
     }
 
     fn test_snapshot_with_watermark(id: i64, watermark: Option<i64>) -> Snapshot {

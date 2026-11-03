@@ -18,16 +18,20 @@
 //! Stateful snapshot selection and progress for continuous table reads.
 
 use super::table_scan::SnapshotScanMode;
-use super::{Plan, TableScan};
-use crate::spec::{ChangelogProducer, CommitKind, CoreOptions, Snapshot};
+use super::{Plan, SnapshotManager, TableScan};
+use crate::spec::{ChangelogProducer, CommitKind, CoreOptions, Snapshot, TimeTravelSelector};
 use crate::{Error, Result};
+use std::collections::HashMap;
 
 /// Continuous table scan. `checkpoint` is the next snapshot to consume.
 ///
-/// The first plan reads the latest full state. Follow-up plans read APPEND
-/// deltas when no changelog producer is configured, or physical changelogs
-/// otherwise. Empty follow-up plans and irrelevant commits are skipped, as in
-/// Java. `None` means there is no available next snapshot; clients can poll.
+/// Without a checkpoint or consumer progress, the first plan resolves its
+/// start from `scan.mode`; every plan still validates the scan options. A
+/// full state holds the merged live rows of its snapshot as inserts. Follow-up
+/// plans keep the physical events of APPEND deltas when no changelog producer
+/// is configured, or of changelogs otherwise. Empty follow-up plans and
+/// irrelevant commits are skipped, as in Java. `None` means there is no
+/// available next snapshot; clients can poll.
 /// Progress is persisted only by an explicit `notify_checkpoint_complete`.
 /// Clones retain the current progress and read configuration; subsequent
 /// planning, restoration and configuration changes are independent.
@@ -42,29 +46,110 @@ pub struct StreamTableScan {
     missing_snapshot_polls: usize,
 }
 
+/// Where a stream starts without a checkpoint or consumer progress, as Java
+/// `AbstractDataTableScan#createStartingScanner` in streaming mode.
+#[derive(Debug, Clone, Copy)]
+enum StartupMode {
+    /// The latest full state, then follow-ups.
+    LatestFull,
+    /// Follow-ups after the latest snapshot.
+    Latest,
+    /// Follow-ups from this snapshot, without an initial state.
+    FromSnapshot(i64),
+    /// This snapshot's full state, then follow-ups.
+    FromSnapshotFull(i64),
+    /// Follow-ups from the first snapshot committed at or after this time, or
+    /// from the next commit, whatever its time, when every snapshot is older.
+    FromTimestamp(i64),
+}
+
+/// Where the first plan starts: a full state, or follow-ups from a snapshot.
+enum StartingPosition {
+    Full(Box<Snapshot>),
+    Next(i64),
+}
+
+impl StartupMode {
+    /// Resolve `scan.mode` and its selector as Java `CoreOptions#startupMode`.
+    /// Options a stream cannot honor fail instead of reading the latest state.
+    fn resolve(options: &HashMap<String, String>) -> Result<Self> {
+        let core = CoreOptions::new(options);
+        core.validate_scan_options()?;
+        // A stream supports neither option, even next to a selector.
+        for key in [
+            "scan.file-creation-time-millis",
+            "scan.creation-time-millis",
+        ] {
+            if options.contains_key(key) {
+                return Err(Error::Unsupported {
+                    message: format!("Stream scans do not yet support {key}"),
+                });
+            }
+        }
+        let selector = core.try_time_travel_selector()?;
+        let mode = options
+            .get("scan.mode")
+            .map(|mode| mode.to_ascii_lowercase());
+        // Validation guarantees each remaining mode's selector; in particular,
+        // from-snapshot-full has only scan.snapshot-id.
+        let snapshot_id_mode: fn(i64) -> Self = match mode.as_deref().unwrap_or("default") {
+            "latest-full" => return Ok(Self::LatestFull),
+            "latest" => return Ok(Self::Latest),
+            "incremental" => return Err(incremental_in_streaming()),
+            "from-snapshot-full" => Self::FromSnapshotFull,
+            "default" | "from-snapshot" | "from-timestamp" => Self::FromSnapshot,
+            other => {
+                return Err(Error::Unsupported {
+                    message: format!("Stream scans do not yet support scan.mode={other}"),
+                })
+            }
+        };
+        match selector {
+            Some(TimeTravelSelector::TimestampMillis(timestamp)) => {
+                Ok(Self::FromTimestamp(timestamp))
+            }
+            Some(TimeTravelSelector::SnapshotId { value, option_name }) => {
+                parse_snapshot_id(value, option_name).map(snapshot_id_mode)
+            }
+            Some(TimeTravelSelector::TagName { .. }) => Err(Error::DataInvalid {
+                message: "Cannot scan from tag in streaming mode.".into(),
+                source: None,
+            }),
+            Some(TimeTravelSelector::Watermark(_)) => Err(Error::DataInvalid {
+                message: "Cannot scan from watermark in streaming mode.".into(),
+                source: None,
+            }),
+            // Java resolves scan.version against tags before choosing a mode.
+            Some(TimeTravelSelector::Version { .. }) => Err(Error::Unsupported {
+                message: "Stream scans do not yet support scan.version; use scan.snapshot-id"
+                    .into(),
+            }),
+            None if core.incremental_timestamp_window()?.is_some() => {
+                Err(incremental_in_streaming())
+            }
+            None => Ok(Self::LatestFull),
+        }
+    }
+}
+
+fn parse_snapshot_id(value: &str, option_name: &str) -> Result<i64> {
+    value.parse().map_err(|_| Error::DataInvalid {
+        message: format!("{option_name} '{value}' is not a valid snapshot id."),
+        source: None,
+    })
+}
+
+fn incremental_in_streaming() -> Error {
+    Error::DataInvalid {
+        message: "Cannot read incremental in streaming mode.".into(),
+        source: None,
+    }
+}
+
 impl StreamTableScan {
     pub(super) fn new(scan: TableScan<'_>) -> Result<Self> {
         let mut scan = scan.into_owned_paimon_scan()?;
         let options = CoreOptions::new(scan.snapshot_table().schema().options());
-        // These aliases are supported by the batch starting scanner. A
-        // continuous reader needs a different starting position: latest must
-        // skip the initial state, and from-snapshot-full must start at that
-        // snapshot. Keep rejecting them until those stream policies exist.
-        if scan
-            .snapshot_table()
-            .schema()
-            .options()
-            .get("scan.mode")
-            .is_some_and(|mode| {
-                mode.eq_ignore_ascii_case("latest")
-                    || mode.eq_ignore_ascii_case("from-snapshot-full")
-            })
-        {
-            return Err(Error::Unsupported {
-                message: "Stream scans do not yet support scan.mode=latest or from-snapshot-full"
-                    .into(),
-            });
-        }
         let producer = options.try_changelog_producer()?;
         let follow_up_mode = if producer == ChangelogProducer::None {
             SnapshotScanMode::Delta
@@ -152,6 +237,10 @@ impl StreamTableScan {
                     .get(consumer_id)
                     .await?;
                 if let Some(next) = next {
+                    log::info!(
+                        "Stream scan of {} resumes consumer '{consumer_id}' at snapshot {next}",
+                        self.scan.snapshot_table().identifier().full_name()
+                    );
                     self.restore(Some(next))?;
                 }
             }
@@ -159,15 +248,20 @@ impl StreamTableScan {
         }
         let manager = self.scan.snapshot_table().snapshot_manager();
         if self.next_snapshot_id.is_none() {
-            let Some(snapshot) = manager.get_latest_snapshot().await? else {
-                return Ok(None);
-            };
-            let next = snapshot.id() + 1;
-            let watermark = snapshot.watermark();
-            let plan = self.plan_initial_snapshot(snapshot, scan).await?;
-            self.next_snapshot_id = Some(next);
-            self.watermark = watermark;
-            return Ok(Some(plan));
+            match self.starting_position(&manager).await? {
+                None => return Ok(None),
+                Some(StartingPosition::Full(snapshot)) => {
+                    let next = snapshot.id() + 1;
+                    let watermark = snapshot.watermark();
+                    let plan = self.plan_initial_snapshot(*snapshot, scan).await?;
+                    self.next_snapshot_id = Some(next);
+                    self.watermark = watermark;
+                    return Ok(Some(plan));
+                }
+                // Record the position so a checkpoint taken before data
+                // arrives restores to it, then read follow-ups.
+                Some(StartingPosition::Next(next)) => self.next_snapshot_id = Some(next),
+            }
         }
         let mode = self.follow_up_mode;
         loop {
@@ -216,6 +310,59 @@ impl StreamTableScan {
         }
     }
 
+    /// Resolve the starting position from `scan.mode`, or `None` to wait for a
+    /// snapshot. A start below the earliest snapshot moves up to it, as in Java.
+    async fn starting_position(
+        &self,
+        manager: &SnapshotManager,
+    ) -> Result<Option<StartingPosition>> {
+        let table = self.scan.snapshot_table();
+        let startup = StartupMode::resolve(table.schema().options())?;
+        let position = match startup {
+            StartupMode::LatestFull => manager
+                .get_latest_snapshot()
+                .await?
+                .map(|snapshot| StartingPosition::Full(Box::new(snapshot))),
+            StartupMode::FromSnapshotFull(id) => match manager.earliest_snapshot_id().await? {
+                Some(earliest) => Some(StartingPosition::Full(Box::new(
+                    manager.get_snapshot(id.max(earliest)).await?,
+                ))),
+                None => None,
+            },
+            // A table without snapshots streams everything from the first one.
+            StartupMode::Latest => Some(StartingPosition::Next(
+                manager
+                    .get_latest_snapshot_id()
+                    .await?
+                    .map_or(1, |id| id + 1),
+            )),
+            StartupMode::FromSnapshot(id) => manager
+                .earliest_snapshot_id()
+                .await?
+                .map(|earliest| StartingPosition::Next(id.max(earliest))),
+            StartupMode::FromTimestamp(timestamp) => manager
+                .first_id_at_or_after_time_millis(timestamp)
+                .await?
+                .map(StartingPosition::Next),
+        };
+        match &position {
+            Some(StartingPosition::Full(snapshot)) => log::info!(
+                "Stream scan of {} starts from {startup:?} with the full state of snapshot {}",
+                table.identifier().full_name(),
+                snapshot.id()
+            ),
+            Some(StartingPosition::Next(next)) => log::info!(
+                "Stream scan of {} starts from {startup:?} at snapshot {next}",
+                table.identifier().full_name()
+            ),
+            None => {}
+        }
+        Ok(position)
+    }
+
+    /// Plan the full state of `snapshot`. Lookup tables skip level 0 and
+    /// full-compaction tables read only the last level, as in Java; rows in
+    /// the other levels arrive later as changelogs from compaction.
     async fn plan_initial_snapshot(
         &self,
         snapshot: Snapshot,

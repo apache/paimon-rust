@@ -126,6 +126,25 @@ fn malformed_metadata_and_error_mapping() {
     }
 }
 
+#[test]
+fn metadata_preserves_file_size_directory_mode_and_modification_time() {
+    let modified = "2025-01-01T00:00:00Z";
+    let expected_time = Timestamp::from_millisecond(1_735_689_600_000).unwrap();
+    let file = metadata(17, modified, false).unwrap();
+    assert!(file.is_file());
+    assert_eq!(file.content_length(), 17);
+    assert_eq!(file.last_modified(), Some(expected_time));
+
+    let directory = metadata(0, modified, true).unwrap();
+    assert!(directory.is_dir());
+    assert_eq!(directory.last_modified(), Some(expected_time));
+
+    let empty_file = metadata(0, "", false).unwrap();
+    assert!(empty_file.is_file());
+    assert_eq!(empty_file.content_length(), 0);
+    assert_eq!(empty_file.last_modified(), None);
+}
+
 #[derive(Clone, Default)]
 struct Mock {
     retries: Arc<AtomicUsize>,

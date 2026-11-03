@@ -133,12 +133,11 @@ async fn collect_row_ids(sql_context: &SQLContext, sql: &str) -> Vec<(i64, i32)>
 }
 
 async fn assert_merge_error(sql_context: &SQLContext, sql: &str, expected_substring: &str) {
-    let result = sql_context.sql(sql).await;
-    assert!(
-        result.is_err(),
-        "Expected error containing '{expected_substring}', but got Ok"
-    );
-    let err_msg = result.unwrap_err().to_string();
+    let result = match sql_context.sql(sql).await {
+        Ok(df) => df.collect().await,
+        Err(err) => Err(err),
+    };
+    let err_msg = result.expect_err("Expected MERGE to fail").to_string();
     assert!(
         err_msg.contains(expected_substring),
         "Error message '{err_msg}' does not contain '{expected_substring}'"
@@ -269,7 +268,7 @@ async fn test_merge_insert_rejects_unknown_and_duplicate_columns() {
             .unwrap();
 
         for (columns, expected_error) in [
-            ("id, missing", "Unknown column 'missing' in MERGE INSERT"),
+            ("id, missing", "No field named missing"),
             ("id, ID", "Duplicate column 'id' in MERGE INSERT"),
         ] {
             let sql = format!(
@@ -320,8 +319,11 @@ async fn test_merge_update_rejects_unknown_and_duplicate_target_columns() {
             .unwrap();
 
         for (assignments, expected_error) in [
-            ("\"VALUE\" = 3", "Unknown column 'VALUE' in UPDATE"),
-            ("value = 3, VALUE = 4", "Duplicate column 'value' in UPDATE"),
+            ("\"VALUE\" = 3", "No field named \"VALUE\""),
+            (
+                "value = 3, VALUE = 4",
+                "Duplicate column 'value' in MERGE UPDATE",
+            ),
         ] {
             let sql = format!(
                 "MERGE INTO paimon.test_db.{table_name} t

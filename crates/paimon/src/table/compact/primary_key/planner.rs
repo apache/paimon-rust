@@ -19,48 +19,149 @@
 //! before forcing L0 progress, as ForceUpLevel0Compaction does, without a
 //! full-bucket override.
 
-use crate::spec::{ChangelogProducer, DataFileMeta, MergeEngine, TableSchema};
-use crate::{Error, Result};
-use std::collections::BTreeMap;
+use crate::spec::{
+    AggregationConfig, ChangelogProducer, DataField, DataFileMeta, DataType, MergeEngine,
+    PartialUpdateConfig, TableSchema,
+};
+use crate::table::universal_compaction::{integer_option, Run, UniversalCompaction};
+use crate::Result;
+use std::collections::{BTreeMap, HashSet};
 
 pub(in crate::table::compact) fn enabled(schema: &TableSchema) -> Result<bool> {
     let options = schema.core_options();
-    Ok(options.merge_engine()? == MergeEngine::Deduplicate
-        && !options.deletion_vectors_enabled()
-        && matches!(
-            options.try_changelog_producer()?,
+    let producer = options.try_changelog_producer()?;
+    Ok(match options.merge_engine()? {
+        MergeEngine::Deduplicate => matches!(
+            producer,
             ChangelogProducer::None | ChangelogProducer::Input | ChangelogProducer::Lookup
-        ))
+        ),
+        MergeEngine::FirstRow => {
+            !options.deletion_vectors_enabled()
+                && matches!(
+                    producer,
+                    ChangelogProducer::None | ChangelogProducer::Lookup
+                )
+        }
+        MergeEngine::PartialUpdate | MergeEngine::Aggregation => {
+            !options.deletion_vectors_enabled()
+                && match producer {
+                    ChangelogProducer::Lookup => true,
+                    ChangelogProducer::None | ChangelogProducer::Input => {
+                        plain_state_mergeable(schema)?
+                    }
+                    _ => false,
+                }
+        }
+    })
 }
 
-fn number(
-    options: &std::collections::HashMap<String, String>,
-    key: &str,
-    default: i32,
-    minimum: i32,
-) -> Result<i32> {
-    let value = options
-        .get(key)
-        .map(|value| value.parse::<i32>())
-        .transpose()
-        .map_err(|_| Error::ConfigInvalid {
-            message: format!("Invalid {key}"),
-        })?
-        .unwrap_or(default);
-    if value < minimum {
-        return Err(Error::ConfigInvalid {
-            message: format!("{key} must be at least {minimum}"),
-        });
+// Plain queries combine all positive levels. Only states that can be folded
+// again without depending on the original row order may leave history behind.
+fn plain_state_mergeable(schema: &TableSchema) -> Result<bool> {
+    let options = schema.core_options();
+    let keys = schema.primary_keys();
+    match options.merge_engine()? {
+        MergeEngine::Aggregation => {
+            let config = AggregationConfig::new(schema.options());
+            // Global sequence fields use last_value, whose retract clears the
+            // sequence tuple. A materialized subset can then sort before older
+            // retained states and change the visible sequence fields.
+            if config.remove_record_on_delete() || !options.sequence_fields().is_empty() {
+                return Ok(false);
+            }
+            Ok(schema
+                .fields()
+                .iter()
+                .filter(|field| !keys.iter().any(|key| key == field.name()))
+                .all(|field| {
+                    mergeable_field(
+                        schema,
+                        field,
+                        config
+                            .agg_function_for_field(field.name())
+                            .or_else(|| config.default_agg_function())
+                            .unwrap_or("last_non_null_value"),
+                    )
+                }))
+        }
+        MergeEngine::PartialUpdate => {
+            if !options.ignore_delete() || !options.sequence_fields().is_empty() {
+                return Ok(false);
+            }
+            let config = PartialUpdateConfig::new(schema.options());
+            let functions = config.validated_aggregate_functions(schema.fields(), keys)?;
+            let groups = config.validated_sequence_groups(schema.fields(), keys)?;
+            let ordering = groups
+                .iter()
+                .flat_map(|group| group.sequence_fields.iter().cloned())
+                .collect::<HashSet<_>>();
+            // Another group can overwrite an ordering field with NULL, making
+            // its aggregate state impossible to replay into retained history.
+            if groups.iter().any(|group| {
+                group
+                    .protected_fields
+                    .iter()
+                    .any(|field| ordering.contains(field))
+            }) {
+                return Ok(false);
+            }
+            Ok(schema
+                .fields()
+                .iter()
+                .filter(|field| !keys.iter().any(|key| key == field.name()))
+                .all(|field| {
+                    ordering.contains(field.name())
+                        || functions
+                            .get(field.name())
+                            .is_some_and(|function| mergeable_field(schema, field, function))
+                }))
+        }
+        _ => Ok(false),
     }
-    Ok(value)
+}
+
+fn mergeable_field(schema: &TableSchema, field: &DataField, function: &str) -> bool {
+    match crate::spec::canonical_aggregator_name(function) {
+        "min" | "max" | "bool_and" | "bool_or" => true,
+        // Floating sums can round differently when regrouped. Checked integer
+        // sums can fail in a subset even if the complete merge does not overflow.
+        "sum" => {
+            matches!(
+                field.data_type(),
+                DataType::TinyInt(_)
+                    | DataType::SmallInt(_)
+                    | DataType::Int(_)
+                    | DataType::BigInt(_)
+            ) && !schema
+                .options()
+                .get(&format!("fields.{}.sum.fail-on-overflow", field.name()))
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        }
+        _ => false,
+    }
 }
 
 pub(in crate::table::compact) fn select(
     files: Vec<DataFileMeta>,
     properties: &std::collections::HashMap<String, String>,
 ) -> Result<Option<(Vec<DataFileMeta>, i32)>> {
-    let trigger = number(properties, "num-sorted-run.compaction-trigger", 5, 1)?;
-    let configured_levels = number(properties, "num-levels", trigger.saturating_add(1), 2)?;
+    select_with_force_level_zero(files, properties, true)
+}
+
+/// Automatic writes honor Java's normal triggers; explicit compaction can
+/// always force L0 progress. Both paths choose normal triggered runs first.
+pub(in crate::table::compact) fn select_with_force_level_zero(
+    files: Vec<DataFileMeta>,
+    properties: &std::collections::HashMap<String, String>,
+    force_level_zero: bool,
+) -> Result<Option<(Vec<DataFileMeta>, i32)>> {
+    let strategy = UniversalCompaction::from_options(properties, "")?;
+    let configured_levels = integer_option(
+        properties,
+        "num-levels",
+        strategy.trigger.saturating_add(1),
+        2,
+    )?;
     let levels = configured_levels.max(
         files
             .iter()
@@ -68,13 +169,6 @@ pub(in crate::table::compact) fn select(
             .max()
             .unwrap_or(2),
     );
-    let ratio = number(properties, "compaction.size-ratio", 1, 0)?;
-    let amplification = number(
-        properties,
-        "compaction.max-size-amplification-percent",
-        200,
-        0,
-    )?;
     let mut l0 = files
         .iter()
         .filter(|file| file.level == 0)
@@ -107,36 +201,14 @@ pub(in crate::table::compact) fn select(
     if runs.is_empty() {
         return Ok(None);
     }
-    let sizes = runs
+    let candidates = runs
         .iter()
-        .map(|(_, files)| {
-            files
-                .iter()
-                .map(|file| file.file_size as u128)
-                .sum::<u128>()
+        .map(|(level, files)| Run {
+            size: files.iter().map(|file| file.file_size as u128).sum(),
+            stop_before_large: *level > 1,
         })
         .collect::<Vec<_>>();
-    let mut count = None;
-    if runs.len() >= trigger as usize {
-        let additional = sizes[..sizes.len() - 1].iter().sum::<u128>();
-        if additional * 100 > amplification as u128 * sizes[sizes.len() - 1] {
-            count = Some(runs.len());
-        } else {
-            count = pick_for_size_ratio(&runs, &sizes, ratio, 1, false);
-        }
-        if count.is_none() && runs.len() > trigger as usize {
-            count = pick_for_size_ratio(
-                &runs,
-                &sizes,
-                ratio,
-                runs.len() - trigger as usize + 1,
-                false,
-            );
-        }
-    }
-    if count.is_none() && l0_count > 0 {
-        count = pick_for_size_ratio(&runs, &sizes, ratio, l0_count, true);
-    }
+    let count = strategy.pick(&candidates, if force_level_zero { l0_count } else { 0 });
     let Some(count) = count else {
         return Ok(None);
     };
@@ -155,34 +227,11 @@ pub(in crate::table::compact) fn select(
     Ok(Some((selected, output_level)))
 }
 
-fn pick_for_size_ratio(
-    runs: &[(i32, Vec<DataFileMeta>)],
-    sizes: &[u128],
-    ratio: i32,
-    mut count: usize,
-    force: bool,
-) -> Option<usize> {
-    let mut size = sizes[..count].iter().sum::<u128>();
-    let mut triggered = force || count > 1;
-    while count < runs.len() {
-        // Match Java's double arithmetic, including threshold rounding for
-        // large runs, rather than comparing exact integer cross-products.
-        if size as f64 * (100.0 + f64::from(ratio)) / 100.0 < sizes[count] as f64
-            && (!triggered || runs[count].0 > 1)
-        {
-            break;
-        }
-        size += sizes[count];
-        count += 1;
-        triggered = true;
-    }
-    triggered.then_some(count)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spec::stats::BinaryTableStats;
+    use crate::Error;
     use std::collections::HashMap;
     fn file(name: &str, level: i32, size: i64) -> DataFileMeta {
         DataFileMeta {

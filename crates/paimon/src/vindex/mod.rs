@@ -122,33 +122,29 @@ impl VindexVectorIndexOptions {
         index_type: &str,
         field: &DataField,
     ) -> crate::Result<Self> {
-        let native_index_type =
-            native_index_type(index_type).ok_or_else(|| crate::Error::DataInvalid {
-                message: format!("Unsupported vindex index type: {index_type}"),
-                source: None,
-            })?;
-
-        validate_user_option_keys(user_options, index_type, field.name())?;
-        validate_index_type_option(user_options, native_index_type)?;
-        let mut native_options = HashMap::new();
-        // Source precedence is build > table; within each source, field > index
-        // > native keys. Table options follow Java; explicit builder options
-        // also accept the documented Rust/SQL native aliases.
-        collect_native_options(
-            &mut native_options,
+        Self::new_with_defaults(
             table_options,
+            &HashMap::new(),
+            user_options,
             index_type,
-            field.name(),
-            false,
-        )?;
-        collect_native_options(
-            &mut native_options,
+            field,
+        )
+    }
+
+    pub(crate) fn new_with_defaults(
+        table_options: &HashMap<String, String>,
+        defaults: &HashMap<String, String>,
+        user_options: &HashMap<String, String>,
+        index_type: &str,
+        field: &DataField,
+    ) -> crate::Result<Self> {
+        let mut native_options = Self::resolve_native_options(
+            table_options,
+            defaults,
             user_options,
             index_type,
             field.name(),
-            true,
         )?;
-        native_options.insert("index.type".into(), native_index_type.into());
         let dimension = match field.data_type() {
             DataType::Vector(vector) => vector.length().to_string(),
             _ => native_options
@@ -157,10 +153,6 @@ impl VindexVectorIndexOptions {
                 .unwrap_or_else(|| DEFAULT_DIMENSION.into()),
         };
         native_options.insert("dimension".into(), dimension);
-        let metric = native_options
-            .entry("metric".into())
-            .or_insert_with(|| DEFAULT_METRIC.into());
-        *metric = normalize_metric(metric);
 
         // Like Java, compile the native configuration only when training begins.
         // A synthetic count can reject budgets satisfied by the real vector count.
@@ -173,15 +165,62 @@ impl VindexVectorIndexOptions {
                 message: "vindex vector dimension must be a positive integer".into(),
                 source: None,
             })?;
-        let train_sample_ratio =
-            resolve_train_sample_ratio(table_options, user_options, index_type, field.name())?;
-        let granule_build_enabled = resolve_granule_build_enabled(table_options, user_options)?;
+        let mut default_options = table_options.clone();
+        default_options.extend(defaults.clone());
+        let train_sample_ratio = resolve_train_sample_ratio(
+            table_options,
+            defaults,
+            user_options,
+            index_type,
+            field.name(),
+        )?;
+        let granule_build_enabled = resolve_granule_build_enabled(&default_options, user_options)?;
         Ok(Self {
             dimension,
             native_options,
             train_sample_ratio,
             granule_build_enabled,
         })
+    }
+
+    /// Resolve the same option precedence and metric defaults for builders and raw queries.
+    pub(crate) fn resolve_native_options(
+        table_options: &HashMap<String, String>,
+        defaults: &HashMap<String, String>,
+        user_options: &HashMap<String, String>,
+        index_type: &str,
+        column: &str,
+    ) -> crate::Result<HashMap<String, String>> {
+        let native_index_type =
+            native_index_type(index_type).ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("Unsupported vindex index type: {index_type}"),
+                source: None,
+            })?;
+
+        validate_user_option_keys(user_options, index_type, column)?;
+        validate_index_type_option(user_options, native_index_type)?;
+        validate_user_option_keys(defaults, index_type, column)?;
+        validate_index_type_option(defaults, native_index_type)?;
+        let mut native_options = HashMap::new();
+        // Source precedence is build > declarations > table; within each source, field > index
+        // > native keys. Table options follow Java; explicit builder options
+        // also accept the documented Rust/SQL native aliases.
+        collect_native_options(
+            &mut native_options,
+            table_options,
+            index_type,
+            column,
+            false,
+        )?;
+        collect_native_options(&mut native_options, defaults, index_type, column, true)?;
+        collect_native_options(&mut native_options, user_options, index_type, column, true)?;
+        native_options.insert("index.type".into(), native_index_type.into());
+        let metric = native_options
+            .entry("metric".into())
+            .or_insert_with(|| DEFAULT_METRIC.into());
+        *metric = normalize_metric(metric);
+
+        Ok(native_options)
     }
 
     pub(crate) fn needs_vector_count(&self) -> bool {
@@ -227,6 +266,31 @@ fn compile_training_config(
     })
 }
 
+/// The generic build API accepts a complete table option map. Native parameters
+/// remain scoped to this implementation/column. Recognized parameters reach the
+/// strict validator; opaque properties stay in the captured plan, as in Java.
+pub(crate) fn build_parameters(
+    options: &HashMap<String, String>,
+    kind: &str,
+    column: &str,
+) -> HashMap<String, String> {
+    let prefix = format!("{kind}.");
+    let field = format!("fields.{column}.");
+    options
+        .iter()
+        .filter(|(key, _)| {
+            key.strip_prefix(&prefix).is_some_and(|suffix| {
+                native_option_key(suffix).is_some() || suffix == "train.sample-ratio"
+            }) || native_option_key(key).is_some()
+                || matches!(key.as_str(), "index.type" | "vindex.build.granule.enabled")
+                || key.strip_prefix(&field).is_some_and(|suffix| {
+                    native_option_key(suffix).is_some() || suffix == "train.sample-ratio"
+                })
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 fn validate_user_option_keys(
     options: &HashMap<String, String>,
     index_type: &str,
@@ -240,6 +304,9 @@ fn validate_user_option_keys(
                 "index.type"
                     | "global-index.row-count-per-shard"
                     | "global-index.build.parallelism"
+                    | "global-index.num-sorted-run.compaction-trigger"
+                    | "global-index.compaction.size-ratio"
+                    | "global-index.compaction.max-size-amplification-percent"
             ) {
                 return false;
             }
@@ -250,6 +317,15 @@ fn validate_user_option_keys(
                 .strip_prefix(&format!("{index_type}."))
                 .or_else(|| key.strip_prefix(&format!("fields.{field}.")))
                 .unwrap_or(key);
+            if matches!(
+                suffix,
+                "refine-factor" | "refine_factor" | "rerank-factor" | "rerank_factor"
+            ) || (index_type != DISKANN_IDENTIFIER && matches!(suffix, "nprobe" | "ivf.nprobe"))
+                || (index_type == DISKANN_IDENTIFIER
+                    && matches!(suffix, "l_search" | "diskann.l_search"))
+            {
+                return false;
+            }
             if suffix == "train.sample-ratio" {
                 return key.as_str() == suffix;
             }
@@ -373,6 +449,11 @@ fn collect_native_options(
             let Some(native_key) = native_option_key(suffix) else {
                 continue;
             };
+            // DLF prefers dimension over index.dimension within each source.
+            // Iterating alias keys in hash order must not choose the dimension.
+            if suffix == "index.dimension" && options.contains_key(&format!("{prefix}dimension")) {
+                continue;
+            }
             // Schema options follow Java. Explicit Rust/SQL builder options also
             // accept the documented native aliases.
             if prefix.is_empty()
@@ -418,12 +499,13 @@ fn resolve_granule_build_enabled(
 
 fn resolve_train_sample_ratio(
     table_options: &HashMap<String, String>,
+    defaults: &HashMap<String, String>,
     user_options: &HashMap<String, String>,
     index_type: &str,
     field_name: &str,
 ) -> crate::Result<f64> {
     let mut value = None;
-    for options in [user_options, table_options] {
+    for options in [user_options, defaults, table_options] {
         for key in [
             format!("fields.{field_name}.train.sample-ratio"),
             format!("{index_type}.train.sample-ratio"),
@@ -891,6 +973,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options.train_sample_ratio, 0.1);
+
+        let declared = VindexVectorIndexOptions::new_with_defaults(
+            &table_options,
+            &user_options,
+            &HashMap::new(),
+            IVF_FLAT_IDENTIFIER,
+            &array_float_field(),
+        )
+        .unwrap();
+        assert_eq!(
+            declared.train_sample_ratio, 0.1,
+            "declarations override legacy field aliases"
+        );
+        let explicit = VindexVectorIndexOptions::new_with_defaults(
+            &table_options,
+            &user_options,
+            &HashMap::from([("ivf-flat.train.sample-ratio".into(), "0.75".into())]),
+            IVF_FLAT_IDENTIFIER,
+            &array_float_field(),
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.train_sample_ratio, 0.75,
+            "explicit options override declarations"
+        );
 
         let field_user_options = HashMap::from([
             ("ivf-flat.train.sample-ratio".to_string(), "0.5".to_string()),
