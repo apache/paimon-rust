@@ -939,9 +939,23 @@ impl PaimonTableScan {
         case_sensitive: bool,
         parquet_read_budget: Arc<ReadBudget>,
     ) -> Self {
+        let partition_count = planned_partitions.len();
+        let (planned_partitions, partitioning) =
+            super::range_partitioning::range_partitioned_splits(
+                &table,
+                &schema,
+                &read_type,
+                &planned_partitions,
+            )
+            .unwrap_or_else(|| {
+                (
+                    planned_partitions,
+                    Partitioning::UnknownPartitioning(partition_count),
+                )
+            });
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
-            Partitioning::UnknownPartitioning(planned_partitions.len()),
+            partitioning,
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
@@ -1350,6 +1364,9 @@ impl DisplayAs for PaimonTableScan {
                 ", partitions={}, splits={total_splits}, files={total_files}",
                 self.planned_partitions.len()
             )?;
+            if let Partitioning::Range(range) = self.plan_properties.output_partitioning() {
+                write!(f, ", partitioning={range}")?;
+            }
         }
 
         let columns = self
