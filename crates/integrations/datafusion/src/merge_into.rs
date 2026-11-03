@@ -40,6 +40,8 @@ use crate::sql_context::SQLContext;
 
 mod native;
 pub(crate) use native::plan_merge;
+mod normalize;
+pub(crate) use normalize::qualify_not_matched_exprs;
 
 /// Maximum number of retries when DML conflicts with concurrent compaction.
 const DML_MAX_RETRIES: u32 = 5;

@@ -1182,6 +1182,83 @@ impl ExecutionPlan for PaimonTableScan {
         vec![]
     }
 
+    fn try_swapping_with_projection(
+        &self,
+        projection: &datafusion::physical_plan::projection::ProjectionExec,
+    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+        use datafusion::physical_plan::projection::ProjectionExec;
+        let Some(indices) = projection
+            .expr()
+            .iter()
+            .map(|expr| {
+                expr.expr
+                    .downcast_ref::<Column>()
+                    .map(|column| column.index())
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let mut required = indices.clone();
+        for filter in self.runtime_filters.iter().chain(&self.decoder_filters) {
+            required.extend(collect_columns(filter).iter().map(|column| column.index()));
+        }
+        required.sort_unstable();
+        required.dedup();
+        if required.len() == self.read_type.len() {
+            return Ok(None);
+        }
+
+        // Keep predicate dependencies in the reader schema. A projection above
+        // the scan removes them only after filtering, and applies any aliases.
+        let schema = self.schema();
+        let reader_projection = ProjectionExec::try_new(
+            required.iter().map(|index| {
+                (
+                    Arc::new(Column::new(schema.field(*index).name(), *index))
+                        as Arc<dyn PhysicalExpr>,
+                    schema.field(*index).name().clone(),
+                )
+            }),
+            Arc::new(self.clone()),
+        )?;
+        let mut scan = self.clone();
+        scan.read_type = required
+            .iter()
+            .map(|index| self.read_type[*index].clone())
+            .collect();
+        scan.plan_properties = reader_projection.properties().clone();
+        scan.runtime_filters = self
+            .runtime_filters
+            .iter()
+            .map(|filter| reassign_expr_columns(filter.clone(), scan.schema().as_ref()))
+            .collect::<DFResult<Vec<_>>>()?;
+        scan.decoder_filters = self
+            .decoder_filters
+            .iter()
+            .map(|filter| reassign_expr_columns(filter.clone(), scan.schema().as_ref()))
+            .collect::<DFResult<Vec<_>>>()?;
+        let output = projection
+            .expr()
+            .iter()
+            .zip(indices)
+            .map(|(expr, index)| {
+                let index = required
+                    .binary_search(&index)
+                    .expect("projection field retained");
+                (
+                    Arc::new(Column::new(scan.schema().field(index).name(), index))
+                        as Arc<dyn PhysicalExpr>,
+                    expr.alias.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(Arc::new(ProjectionExec::try_new(
+            output,
+            Arc::new(scan),
+        )?)))
+    }
+
     fn apply_expressions(
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,

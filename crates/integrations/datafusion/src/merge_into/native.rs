@@ -32,9 +32,13 @@ use datafusion::common::{Column, DFSchema, DFSchemaRef};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::dml::{MergeIntoAction, MergeIntoClause, MergeIntoClauseKind};
+use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::{col, expr::Case, lit, Expr, JoinType, Operator};
+use datafusion::physical_expr::{expressions::Column as PhysicalColumn, PhysicalExpr};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan};
 use datafusion::prelude::{DataFrame, SessionContext};
 use futures::TryStreamExt;
@@ -62,12 +66,17 @@ fn column_name(index: usize, target_len: usize) -> String {
 
 /// Bind columns by their position in the native target+source schema. SQL aliases
 /// and quoted names have already been resolved by DataFusion's SQL planner.
-fn bind_expr(expr: Expr, schema: &DFSchema, target_len: usize) -> Result<Expr> {
+fn bind_expr(expr: Expr, schema: &DFSchema, target_len: usize, source_only: bool) -> Result<Expr> {
     expr.transform(|expr| match expr {
-        Expr::Column(column) => Ok(Transformed::yes(col(column_name(
-            schema.index_of_column(&column)?,
-            target_len,
-        )))),
+        Expr::Column(column) => {
+            let index = schema.index_of_column(&column)?;
+            if source_only && index < target_len {
+                return Err(DataFusionError::Plan(
+                    "MERGE NOT MATCHED expressions may only reference source columns".into(),
+                ));
+            }
+            Ok(Transformed::yes(col(column_name(index, target_len))))
+        }
         Expr::ScalarSubquery(_)
         | Expr::Exists(_)
         | Expr::InSubquery(_)
@@ -80,9 +89,10 @@ fn bind_expr(expr: Expr, schema: &DFSchema, target_len: usize) -> Result<Expr> {
 }
 
 pub(crate) fn plan_merge(
+    state: &dyn Session,
     table: Table,
-    source: Arc<dyn ExecutionPlan>,
-    merge_schema: DFSchemaRef,
+    mut source: Arc<dyn ExecutionPlan>,
+    mut merge_schema: DFSchemaRef,
     on: Expr,
     mut clauses: Vec<MergeIntoClause>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -104,6 +114,60 @@ pub(crate) fn plan_merge(
         ));
     }
     let target_len = merge_schema.fields().len() - source.schema().fields().len();
+    // DataFusion 55 retains every DML input field. Add a physical projection
+    // before executing the source so scan pushdown can avoid unused payloads.
+    let mut required = on.column_refs();
+    for clause in &clauses {
+        if let Some(predicate) = &clause.predicate {
+            required.extend(predicate.column_refs());
+        }
+        match &clause.action {
+            MergeIntoAction::Update(assignments) => {
+                for (_, value) in assignments {
+                    required.extend(value.column_refs());
+                }
+            }
+            MergeIntoAction::Insert { values, .. } => {
+                for value in values {
+                    required.extend(value.column_refs());
+                }
+            }
+            MergeIntoAction::Delete => {}
+        }
+    }
+    let mut source_indices = required
+        .into_iter()
+        .map(|column| merge_schema.index_of_column(column))
+        .collect::<Result<Vec<_>>>()?;
+    source_indices.retain(|index| *index >= target_len);
+    source_indices.sort_unstable();
+    source_indices.dedup();
+    if source_indices.len() < source.schema().fields().len() {
+        let physical_schema = source.schema();
+        let expressions = source_indices
+            .iter()
+            .map(|index| {
+                let source_index = index - target_len;
+                let name = physical_schema.field(source_index).name().clone();
+                (
+                    Arc::new(PhysicalColumn::new(&name, source_index)) as Arc<dyn PhysicalExpr>,
+                    name,
+                )
+            })
+            .collect::<Vec<_>>();
+        source = Arc::new(ProjectionExec::try_new(expressions, source)?);
+        let fields = (0..target_len)
+            .chain(source_indices)
+            .map(|index| {
+                let (qualifier, field) = merge_schema.qualified_field(index);
+                (qualifier.cloned(), field.clone())
+            })
+            .collect();
+        merge_schema = Arc::new(DFSchema::new_with_metadata(
+            fields,
+            merge_schema.metadata().clone(),
+        )?);
+    }
     let mut update_columns = Vec::new();
     let mut matched_count = 0;
     for clause in &mut clauses {
@@ -130,7 +194,12 @@ pub(crate) fn plan_merge(
             _ => {}
         }
         if let Some(predicate) = clause.predicate.take() {
-            clause.predicate = Some(bind_expr(predicate, &merge_schema, target_len)?);
+            clause.predicate = Some(bind_expr(
+                predicate,
+                &merge_schema,
+                target_len,
+                clause.kind != MergeIntoClauseKind::Matched,
+            )?);
         }
         match &mut clause.action {
             MergeIntoAction::Update(assignments) => {
@@ -150,7 +219,7 @@ pub(crate) fn plan_merge(
                     if !update_columns.contains(name) {
                         update_columns.push(name.clone());
                     }
-                    *value = bind_expr(value.clone(), &merge_schema, target_len)?;
+                    *value = bind_expr(value.clone(), &merge_schema, target_len, false)?;
                 }
             }
             MergeIntoAction::Insert { columns, values } => {
@@ -164,7 +233,7 @@ pub(crate) fn plan_merge(
                 }
                 validate_update_columns(columns, table.schema().fields())?;
                 for value in values {
-                    *value = bind_expr(value.clone(), &merge_schema, target_len)?;
+                    *value = bind_expr(value.clone(), &merge_schema, target_len, true)?;
                 }
             }
             MergeIntoAction::Delete if de => {
@@ -176,7 +245,7 @@ pub(crate) fn plan_merge(
             MergeIntoAction::Delete => {}
         }
     }
-    let on = bind_expr(on, &merge_schema, target_len)?;
+    let on = bind_expr(on, &merge_schema, target_len, false)?;
     let sink = PaimonMergeSink {
         table,
         schema: source.schema(),
@@ -186,6 +255,7 @@ pub(crate) fn plan_merge(
         clauses,
         update_columns,
         de,
+        execution_props: state.execution_props().clone(),
     };
     Ok(Arc::new(DataSinkExec::new(source, Arc::new(sink), None)))
 }
@@ -200,6 +270,7 @@ struct PaimonMergeSink {
     clauses: Vec<MergeIntoClause>,
     update_columns: Vec<String>,
     de: bool,
+    execution_props: ExecutionProps,
 }
 
 impl DisplayAs for PaimonMergeSink {
@@ -249,9 +320,13 @@ impl PaimonMergeSink {
         source: &[RecordBatch],
         context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        let ctx = SessionContext::new_with_config_rt(
-            context.session_config().clone(),
-            context.runtime_env(),
+        let ctx = SessionContext::new_with_state(
+            SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(context.session_config().clone())
+                .with_runtime_env(context.runtime_env())
+                .with_execution_props(self.execution_props.clone())
+                .build(),
         );
         let target_schema = Arc::new(Schema::new(
             self.merge_schema.fields()[..self.target_len].to_vec(),
@@ -327,10 +402,19 @@ impl PaimonMergeSink {
                     } else {
                         col(PRESENT).is_null()
                     };
-                    let condition = clause
-                        .predicate
-                        .clone()
-                        .map_or(applicable.clone(), |p| applicable.and(p));
+                    // AND does not guarantee short-circuit evaluation for mixed
+                    // Arrow batches. CASE keeps predicates in their row scope.
+                    let condition =
+                        clause
+                            .predicate
+                            .clone()
+                            .map_or(applicable.clone(), |predicate| {
+                                Expr::Case(Case::new(
+                                    None,
+                                    vec![(Box::new(applicable), Box::new(predicate))],
+                                    Some(Box::new(lit(false))),
+                                ))
+                            });
                     (Box::new(condition), Box::new(lit(index as i32)))
                 })
                 .collect(),
@@ -339,6 +423,14 @@ impl PaimonMergeSink {
         let action = state.create_physical_expr(action, &schema)?;
         let mut selected = vec![Vec::new(); self.clauses.len()];
         let mut seen_targets = HashSet::new();
+        let matched = self
+            .clauses
+            .iter()
+            .filter(|c| c.kind == MergeIntoClauseKind::Matched)
+            .collect::<Vec<_>>();
+        let deduplicate_delete = matched.len() == 1
+            && matched[0].predicate.is_none()
+            && matches!(matched[0].action, MergeIntoAction::Delete);
         for batch in joined.collect().await? {
             let actions = action.evaluate(&batch)?.into_array(batch.num_rows())?;
             let actions = actions
@@ -349,11 +441,12 @@ impl PaimonMergeSink {
                 let mask = BooleanArray::from_iter(
                     (0..batch.num_rows()).map(|row| Some(actions.value(row) == index as i32)),
                 );
-                let batch = filter_record_batch(&batch, &mask)?;
+                let mut batch = filter_record_batch(&batch, &mask)?;
                 if batch.num_rows() == 0 {
                     continue;
                 }
                 if clause.kind == MergeIntoClauseKind::Matched {
+                    let mut keep = Vec::with_capacity(batch.num_rows());
                     for row in 0..batch.num_rows() {
                         let key = if self.de {
                             let row_id = batch
@@ -372,12 +465,18 @@ impl PaimonMergeSink {
                             (file.value(row), offset.value(row) as u64)
                         };
                         if !seen_targets.insert(key) {
+                            if deduplicate_delete {
+                                keep.push(false);
+                                continue;
+                            }
                             return Err(DataFusionError::Execution(
                                 "MERGE INTO found duplicate UPDATE/DELETE matches for a target row"
                                     .into(),
                             ));
                         }
+                        keep.push(true);
                     }
+                    batch = filter_record_batch(&batch, &BooleanArray::from(keep))?;
                 }
                 selected[index].push(batch);
             }
@@ -454,76 +553,92 @@ impl PaimonMergeSink {
         }
         let wb = self.table.new_write_builder();
         let mut messages = Vec::new();
-        if let Some(mut writer) = cow_writer {
-            for (batch_index, (tracking, _)) in updates.iter().enumerate() {
-                let (files, offsets) = extract_tracking_columns(tracking)?;
-                for row in 0..tracking.num_rows() {
-                    writer.add_matched_update(
-                        files.value(row) as usize,
-                        offsets.value(row) as usize,
-                        batch_index,
-                        row,
-                    );
+        let commit = wb.try_new_commit().map_err(to_datafusion_error)?;
+        let staged: Result<()> = async {
+            if let Some(mut writer) = cow_writer {
+                for (batch_index, (tracking, _)) in updates.iter().enumerate() {
+                    let (files, offsets) = extract_tracking_columns(tracking)?;
+                    for row in 0..tracking.num_rows() {
+                        writer.add_matched_update(
+                            files.value(row) as usize,
+                            offsets.value(row) as usize,
+                            batch_index,
+                            row,
+                        );
+                    }
                 }
-            }
-            for batch in deletes {
-                let (files, offsets) = extract_tracking_columns(&batch)?;
-                for row in 0..batch.num_rows() {
-                    writer
-                        .add_matched_delete(files.value(row) as usize, offsets.value(row) as usize);
-                }
-            }
-            writer.set_update_batches(updates.into_iter().map(|(_, values)| values).collect());
-            messages.extend(writer.prepare_commit().await.map_err(to_datafusion_error)?);
-        } else {
-            if !updates.is_empty() {
-                let mut writer = wb
-                    .new_data_evolution_writer(self.update_columns.clone())
-                    .map_err(to_datafusion_error)?;
-                if let Some(snapshot) = read_snapshot {
-                    writer.pin_read_snapshot(snapshot);
-                }
-                for (_, values) in updates {
-                    writer
-                        .add_matched_batch(values)
-                        .map_err(to_datafusion_error)?;
-                }
-                messages.extend(writer.prepare_commit().await.map_err(to_datafusion_error)?);
-            }
-            if !deletes.is_empty() {
-                let mut writer =
-                    DataEvolutionDeleteWriter::new(&read_table).map_err(to_datafusion_error)?;
                 for batch in deletes {
-                    let row_id = batch
-                        .column_by_name(&column_name(self.target_len - 1, self.target_len))
-                        .unwrap();
-                    let ids = row_id
-                        .as_any()
-                        .downcast_ref::<datafusion::arrow::array::Int64Array>()
-                        .unwrap();
-                    writer
-                        .add_row_ids(ids.values().iter().copied())
-                        .map_err(to_datafusion_error)?;
+                    let (files, offsets) = extract_tracking_columns(&batch)?;
+                    for row in 0..batch.num_rows() {
+                        writer.add_matched_delete(
+                            files.value(row) as usize,
+                            offsets.value(row) as usize,
+                        );
+                    }
                 }
+                writer.set_update_batches(updates.into_iter().map(|(_, values)| values).collect());
                 messages.extend(writer.prepare_commit().await.map_err(to_datafusion_error)?);
+            } else {
+                if !updates.is_empty() {
+                    let mut writer = wb
+                        .new_data_evolution_writer(self.update_columns.clone())
+                        .map_err(to_datafusion_error)?;
+                    if let Some(snapshot) = read_snapshot {
+                        writer.pin_read_snapshot(snapshot);
+                    }
+                    for (_, values) in updates {
+                        writer
+                            .add_matched_batch(values)
+                            .map_err(to_datafusion_error)?;
+                    }
+                    messages.extend(writer.prepare_commit().await.map_err(to_datafusion_error)?);
+                }
+                if !deletes.is_empty() {
+                    let mut writer =
+                        DataEvolutionDeleteWriter::new(&read_table).map_err(to_datafusion_error)?;
+                    for batch in deletes {
+                        let row_id = batch
+                            .column_by_name(&column_name(self.target_len - 1, self.target_len))
+                            .unwrap();
+                        let ids = row_id
+                            .as_any()
+                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                            .unwrap();
+                        writer
+                            .add_row_ids(ids.values().iter().copied())
+                            .map_err(to_datafusion_error)?;
+                    }
+                    messages.extend(writer.prepare_commit().await.map_err(to_datafusion_error)?);
+                }
             }
+            if !inserts.is_empty() {
+                let mut writer = wb.new_write().map_err(to_datafusion_error)?;
+                let result = async {
+                    for batch in inserts {
+                        writer
+                            .write_arrow_batch(&batch)
+                            .await
+                            .map_err(to_datafusion_error)?;
+                    }
+                    writer.prepare_commit().await.map_err(to_datafusion_error)
+                }
+                .await;
+                writer.close().await;
+                messages.extend(result?);
+            }
+            Ok(())
         }
-        if !inserts.is_empty() {
-            let mut writer = wb.new_write().map_err(to_datafusion_error)?;
-            for batch in inserts {
-                writer
-                    .write_arrow_batch(&batch)
-                    .await
-                    .map_err(to_datafusion_error)?;
+        .await;
+        if let Err(error) = staged {
+            // These files have never been submitted. Once commit starts, its
+            // outcome may be unknown and deleting output would be unsafe.
+            if let Err(cleanup) = commit.abort(&messages).await {
+                log::warn!("Failed to abort unsubmitted MERGE files: {cleanup}");
             }
-            messages.extend(writer.prepare_commit().await.map_err(to_datafusion_error)?);
+            return Err(error);
         }
         if !messages.is_empty() {
-            wb.try_new_commit()
-                .map_err(to_datafusion_error)?
-                .commit(messages)
-                .await
-                .map_err(to_datafusion_error)?;
+            commit.commit(messages).await.map_err(to_datafusion_error)?;
         }
         Ok(count)
     }

@@ -1052,8 +1052,9 @@ For append-only tables, `MERGE INTO` uses Copy-on-Write file rewriting and suppo
 The source is captured once per execution. On row-ID or CoW delete conflicts,
 the operation retries up to five attempts, refreshing the target scan and
 writers while replaying the captured source. Update, delete, and insert messages
-are published in one commit. Multiple source rows selecting an update or delete
-for the same target row fail without publishing any actions.
+are published in one commit. Multiple source rows selecting conflicting actions
+for the same target row fail without publishing any actions. A sole unconditional
+matched DELETE collapses duplicate matches and counts each deleted target once.
 
 Append-only tables support multiple conditional matched clauses with the first
 true clause taking effect; NULL predicates fall through. Data-evolution tables

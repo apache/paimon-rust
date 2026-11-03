@@ -536,13 +536,13 @@ impl TableProvider for PaimonTableProvider {
 
     async fn merge_into(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         source: Arc<dyn ExecutionPlan>,
         merge_schema: DFSchemaRef,
         on: Expr,
         clauses: Vec<MergeIntoClause>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        crate::merge_into::plan_merge(self.table.clone(), source, merge_schema, on, clauses)
+        crate::merge_into::plan_merge(state, self.table.clone(), source, merge_schema, on, clauses)
     }
 
     fn supports_filters_pushdown(

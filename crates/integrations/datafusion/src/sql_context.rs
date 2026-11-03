@@ -1821,49 +1821,27 @@ impl SQLContext {
             }
         };
         Self::ensure_main_branch_write_target(&table_name, "MERGE INTO")?;
-        let mut merge = merge.clone();
-        // Existing not-matched expressions resolve unqualified columns against
-        // the source. DataFusion 55 resolves them against the combined schema,
-        // which can make common column names ambiguous. Preserve source scope
-        // while leaving name/type validation to the native planner.
-        let source_qualifier = match &merge.source {
-            TableFactor::Table {
-                alias: Some(alias), ..
-            }
-            | TableFactor::Derived {
-                alias: Some(alias), ..
-            } => vec![alias.name.clone()],
-            TableFactor::Table { name, .. } => name
-                .0
-                .iter()
-                .filter_map(|p| p.as_ident().cloned())
-                .collect(),
-            _ => vec![],
+        // Use the configured native dialect for local expression scopes; the
+        // front parser treats lambda arrows as ordinary binary operators.
+        let state = self.ctx.state();
+        let parsed = state.sql_to_statement(
+            &merge.to_string(),
+            &state.config_options().sql_parser.dialect,
+        )?;
+        let datafusion::sql::parser::Statement::Statement(statement) = parsed else {
+            return Err(DataFusionError::Plan(
+                "Expected a native MERGE statement".into(),
+            ));
         };
-        if !source_qualifier.is_empty() {
-            for clause in &mut merge.clauses {
-                if let datafusion::sql::sqlparser::ast::MergeAction::Insert(insert) =
-                    &mut clause.action
-                {
-                    let qualify = |expr: &mut SqlExpr| {
-                        if let SqlExpr::Identifier(ident) = expr {
-                            let mut parts = source_qualifier.clone();
-                            parts.push(ident.clone());
-                            *expr = SqlExpr::CompoundIdentifier(parts);
-                        }
-                        std::ops::ControlFlow::<()>::Continue(())
-                    };
-                    let _ = datafusion::sql::sqlparser::ast::visit_expressions_mut(
-                        &mut insert.kind,
-                        qualify,
-                    );
-                    let _ = datafusion::sql::sqlparser::ast::visit_expressions_mut(
-                        &mut clause.predicate,
-                        qualify,
-                    );
-                }
-            }
-        }
+        let Statement::Merge(mut merge) = *statement else {
+            return Err(DataFusionError::Plan(
+                "Expected a native MERGE statement".into(),
+            ));
+        };
+        crate::merge_into::qualify_not_matched_exprs(
+            &mut merge,
+            self.ctx.enable_ident_normalization(),
+        );
         // `_ROW_ID` is a query-visible virtual column, but positional INSERTs
         // still map to the persisted user columns. Make that list explicit
         // before handing the statement to DataFusion's native planner.
