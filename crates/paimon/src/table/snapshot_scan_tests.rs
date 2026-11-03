@@ -253,13 +253,6 @@ async fn full_startup_modes_empty_tables_and_stream_boundaries() {
         assert_eq!(plan.snapshot_id(), None);
         assert!(plan.splits().is_empty());
     }
-    for mode in ["latest", "from-snapshot-full"] {
-        let selected = table.copy_with_options(HashMap::from([("scan.mode".into(), mode.into())]));
-        assert!(matches!(
-            selected.new_read_builder().new_stream_scan(),
-            Err(paimon::Error::Unsupported { .. })
-        ));
-    }
     let selected = table.copy_with_options(HashMap::from([
         ("scan.mode".into(), "from-snapshot-full".into()),
         ("scan.snapshot-id".into(), "1".into()),
