@@ -368,12 +368,20 @@ async fn native_merge_retains_session_variable_providers() {
             "INSERT INTO paimon.test_db.target (id, value) VALUES (1, 10)",
         )
         .await;
+        // Data-evolution tables only support unconditional matched clauses.
+        let matched_predicate = if options.is_empty() {
+            " AND @delta = 7"
+        } else {
+            ""
+        };
         assert_eq!(
             common::dml_count(
                 &ctx,
-                "MERGE INTO paimon.test_db.target t USING (VALUES (1)) AS s(id) \
+                &format!(
+                    "MERGE INTO paimon.test_db.target t USING (VALUES (1)) AS s(id) \
              ON t.id = s.id AND @@flag = 7 \
-             WHEN MATCHED THEN UPDATE SET value = @delta"
+             WHEN MATCHED{matched_predicate} THEN UPDATE SET value = @delta"
+                )
             )
             .await,
             1
@@ -393,6 +401,21 @@ async fn native_merge_retains_session_variable_providers() {
             common::collect_id_value(&ctx, "SELECT id, value FROM paimon.test_db.target").await,
             vec![(1, 7), (2, 7)]
         );
+        if options.is_empty() {
+            assert_eq!(
+                common::dml_count(
+                    &ctx,
+                    "MERGE INTO paimon.test_db.target t USING (VALUES (1)) AS s(id) \
+             ON t.id = s.id WHEN MATCHED AND @delta <> 7 THEN UPDATE SET value = 0"
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                common::collect_id_value(&ctx, "SELECT id, value FROM paimon.test_db.target").await,
+                vec![(1, 7), (2, 7)]
+            );
+        }
     }
 }
 
@@ -476,29 +499,48 @@ async fn failed_merge_insert_discards_prepared_cow_files() {
 
 #[tokio::test]
 async fn merge_insert_preserves_lambda_scopes() {
-    let (_tmp, catalog) = create_test_env();
-    let ctx = create_sql_context(catalog).await;
-    exec(&ctx, "SET datafusion.sql_parser.dialect = 'spark'").await;
-    exec(&ctx, "CREATE SCHEMA paimon.test_db").await;
-    exec(
-        &ctx,
-        "CREATE TABLE paimon.test_db.target (id INT, value INT)",
-    )
-    .await;
-    assert_eq!(
-        common::dml_count(
+    for (dialect, expression, expected) in [
+        (
+            "spark",
+            "array_length(array_filter([1, 2, 3], x -> x > 1))",
+            2,
+        ),
+        (
+            "duckdb",
+            "array_element(array_transform(s.arr, x -> x + 1), 1)",
+            2,
+        ),
+    ] {
+        let (_tmp, catalog) = create_test_env();
+        let ctx = create_sql_context(catalog).await;
+        exec(
             &ctx,
-            "MERGE INTO paimon.test_db.target t USING (SELECT 1 AS id) s ON t.id = s.id \
-         WHEN NOT MATCHED THEN INSERT (id, value) \
-         VALUES (id, array_length(array_filter([1, 2, 3], x -> x > 1)))"
+            &format!("SET datafusion.sql_parser.dialect = '{dialect}'"),
         )
-        .await,
-        1
-    );
-    assert_eq!(
-        common::collect_id_value(&ctx, "SELECT id, value FROM paimon.test_db.target").await,
-        vec![(1, 2)]
-    );
+        .await;
+        exec(&ctx, "CREATE SCHEMA paimon.test_db").await;
+        exec(
+            &ctx,
+            "CREATE TABLE paimon.test_db.target (id INT, value INT)",
+        )
+        .await;
+        assert_eq!(
+            common::dml_count(
+                &ctx,
+                &format!(
+                    "MERGE INTO paimon.test_db.target t \
+                 USING (SELECT 1 AS id, [1, 2, 3] AS arr) s ON t.id = s.id \
+                 WHEN NOT MATCHED THEN INSERT (id, value) VALUES (id, {expression})"
+                )
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            common::collect_id_value(&ctx, "SELECT id, value FROM paimon.test_db.target").await,
+            vec![(1, expected)]
+        );
+    }
 }
 
 #[tokio::test]
