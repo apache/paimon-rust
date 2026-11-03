@@ -17,9 +17,47 @@
 
 #![cfg(feature = "storage-fs")]
 
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
 use paimon::catalog::FileSystemCatalog;
-use paimon::io::FileRead;
+use paimon::io::{FileBlockCache, FileRead};
 use paimon::{CatalogOptions, Error, Options};
+
+#[derive(Debug, Default)]
+struct TestBlockCache(Mutex<HashMap<(String, u64), Bytes>>);
+
+#[async_trait::async_trait]
+impl FileBlockCache for TestBlockCache {
+    async fn get(&self, path: &str, range: Range<u64>) -> Option<Bytes> {
+        self.0
+            .lock()
+            .unwrap()
+            .get(&(path.to_string(), range.start))
+            .filter(|data| data.len() as u64 == range.end - range.start)
+            .cloned()
+    }
+
+    async fn put(&self, path: &str, offset: u64, data: Bytes) {
+        self.0
+            .lock()
+            .unwrap()
+            .insert((path.to_string(), offset), data);
+    }
+
+    async fn invalidate_path(&self, path: &str) {
+        self.0.lock().unwrap().retain(|(key, _), _| key != path);
+    }
+
+    async fn invalidate_prefix(&self, prefix: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .retain(|(key, _), _| !key.starts_with(prefix));
+    }
+}
 
 async fn assert_cache_selection(
     whitelist: &str,
@@ -27,17 +65,20 @@ async fn assert_cache_selection(
     files: &[(&str, bool)],
 ) {
     let mut mismatches = Vec::new();
-    for backend in ["memory", "disk", "shared"] {
+    for backend in ["memory", "disk", "shared", "external"] {
         for range_read in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let warehouse = directory.path().join("warehouse");
             std::fs::create_dir(&warehouse).unwrap();
             let mut options = Options::new();
             options.set(CatalogOptions::WAREHOUSE, warehouse.to_string_lossy());
-            options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+            options.set(
+                CatalogOptions::LOCAL_CACHE_ENABLED,
+                (backend != "external").to_string(),
+            );
             options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4");
             options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, whitelist);
-            if backend != "memory" {
+            if matches!(backend, "disk" | "shared") {
                 options.set(
                     CatalogOptions::LOCAL_CACHE_DIR,
                     directory.path().join("cache").to_string_lossy(),
@@ -51,6 +92,16 @@ async fn assert_cache_selection(
                 options.set(CatalogOptions::LOCAL_CACHE_EXCLUDE_EXTENSIONS, extensions);
             }
             let catalog = FileSystemCatalog::new(options).unwrap();
+            let mut file_io = catalog.file_io().clone();
+            if backend == "external" {
+                let cache = Arc::new(TestBlockCache::default());
+                file_io = match excluded_extensions {
+                    Some(exclusions) => file_io
+                        .with_file_block_cache_and_exclusions(cache, 4, whitelist, exclusions),
+                    None => file_io.with_file_block_cache(cache, 4, whitelist),
+                }
+                .unwrap();
+            }
             for &(name, expected_cached) in files {
                 let path = warehouse.join(name);
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -58,7 +109,7 @@ async fn assert_cache_selection(
                 std::fs::write(&path, b"abcdefgh").unwrap();
                 // Cache classification uses slash-separated FileIO paths on every platform.
                 let io_path = path.to_str().unwrap().replace('\\', "/");
-                let input = catalog.file_io().new_input(&io_path).unwrap();
+                let input = file_io.new_input(&io_path).unwrap();
                 let expected: &[u8] = if range_read { b"bcdefg" } else { b"abcdefgh" };
                 let cold = if range_read {
                     input.reader().await.unwrap().read(1..7).await.unwrap()
@@ -197,7 +248,7 @@ async fn test_exclusions_do_not_expand_the_whitelist() {
 
 #[tokio::test]
 async fn test_exclusions_bypass_existing_blocks_and_preserve_invalidation() {
-    for shared in [false, true] {
+    for backend in ["disk", "shared", "external"] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("data.blob");
         let io_path = path.to_str().unwrap().replace('\\', "/");
@@ -207,24 +258,43 @@ async fn test_exclusions_bypass_existing_blocks_and_preserve_invalidation() {
             CatalogOptions::WAREHOUSE,
             directory.path().to_string_lossy(),
         );
-        options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_ENABLED,
+            (backend != "external").to_string(),
+        );
         options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, "data");
         options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4");
         options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB");
-        options.set(CatalogOptions::LOCAL_CACHE_SHARED, shared.to_string());
+        options.set(
+            CatalogOptions::LOCAL_CACHE_SHARED,
+            (backend == "shared").to_string(),
+        );
         options.set(
             CatalogOptions::LOCAL_CACHE_DIR,
             directory.path().join("cache").to_string_lossy(),
         );
         let catalog = FileSystemCatalog::new(options.clone()).unwrap();
-        let cached_input = catalog.file_io().new_input(&io_path).unwrap();
+        let external_cache = Arc::new(TestBlockCache::default());
+        let mut file_io = catalog.file_io().clone();
+        if backend == "external" {
+            file_io = file_io
+                .with_file_block_cache(external_cache.clone(), 4, "data")
+                .unwrap();
+        }
+        let cached_input = file_io.new_input(&io_path).unwrap();
         assert_eq!(cached_input.read().await.unwrap().as_ref(), b"abcdefgh");
         std::fs::write(&path, b"12345678").unwrap();
         assert_eq!(cached_input.read().await.unwrap().as_ref(), b"abcdefgh");
 
         options.set(CatalogOptions::LOCAL_CACHE_EXCLUDE_EXTENSIONS, "blob");
         let excluded_catalog = FileSystemCatalog::new(options).unwrap();
-        let input = excluded_catalog.file_io().new_input(&io_path).unwrap();
+        let mut excluded_io = excluded_catalog.file_io().clone();
+        if backend == "external" {
+            excluded_io = excluded_io
+                .with_file_block_cache_and_exclusions(external_cache, 4, "data", "blob")
+                .unwrap();
+        }
+        let input = excluded_io.new_input(&io_path).unwrap();
         assert_eq!(input.read().await.unwrap().as_ref(), b"12345678");
         assert_eq!(
             input
@@ -238,7 +308,7 @@ async fn test_exclusions_bypass_existing_blocks_and_preserve_invalidation() {
             b"234567"
         );
 
-        let output = excluded_catalog.file_io().new_output(&io_path).unwrap();
+        let output = excluded_io.new_output(&io_path).unwrap();
         output
             .write(bytes::Bytes::from_static(b"updated!"))
             .await
@@ -250,11 +320,7 @@ async fn test_exclusions_bypass_existing_blocks_and_preserve_invalidation() {
             b"changed!"
         );
 
-        excluded_catalog
-            .file_io()
-            .delete_file(&io_path)
-            .await
-            .unwrap();
+        excluded_io.delete_file(&io_path).await.unwrap();
         assert!(matches!(
             cached_input.read().await,
             Err(Error::IoUnexpected { source, .. })

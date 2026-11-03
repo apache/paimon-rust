@@ -41,7 +41,7 @@ use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use paimon::catalog::Identifier;
-use paimon::io::FileIOBuilder;
+use paimon::io::{FileIOBuilder, FileRead};
 use paimon::spec::{
     BlobDescriptor, CommitKind, DataType, IntType, Schema, TableSchema, VarCharType,
 };
@@ -573,6 +573,85 @@ fn test_file_io_external_cache_miss_populates_and_hit_reuses_blocks() {
 
         paimon_file_io_free(result.file_io);
         assert_eq!(state.destroys.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn test_file_io_external_cache_extension_exclusions() {
+    for exclusions in [None, Some(""), Some(" , "), Some(" .BLOB, video, ")] {
+        for name in ["data.blob", "data.parquet", "snapshot-1.blob"] {
+            for range_read in [false, true] {
+                let state = Arc::new(TestFileCacheState::default());
+                let callbacks = test_file_cache_callbacks(state.clone());
+                let root = CString::new("memory:/ffi_cache_exclusions").unwrap();
+                let whitelist = CString::new("meta,data").unwrap();
+                let key =
+                    CString::new(paimon::CatalogOptions::LOCAL_CACHE_EXCLUDE_EXTENSIONS).unwrap();
+                let value = exclusions.map(|value| CString::new(value).unwrap());
+                let options: Vec<_> = value
+                    .iter()
+                    .map(|value| paimon_option {
+                        key: key.as_ptr(),
+                        value: value.as_ptr(),
+                    })
+                    .collect();
+                let excluded = exclusions == Some(" .BLOB, video, ") && name.ends_with(".blob");
+
+                unsafe {
+                    let result = paimon_file_io_create_with_cache_v1(
+                        root.as_ptr(),
+                        options.as_ptr(),
+                        options.len(),
+                        &callbacks,
+                        4,
+                        whitelist.as_ptr(),
+                    );
+                    assert!(result.error.is_null());
+                    let file_io = file_io_ref(result.file_io);
+                    let path = format!("memory:/ffi_cache_exclusions/{name}");
+                    crate::runtime().block_on(async {
+                        let output = file_io.new_output(&path).unwrap();
+                        output
+                            .write(bytes::Bytes::from_static(b"abcdefgh"))
+                            .await
+                            .unwrap();
+                        let input = file_io.new_input(&path).unwrap();
+                        for _ in 0..2 {
+                            let actual = if range_read {
+                                input.reader().await.unwrap().read(1..7).await.unwrap()
+                            } else {
+                                input.read().await.unwrap()
+                            };
+                            let expected: &[u8] = if range_read { b"bcdefg" } else { b"abcdefgh" };
+                            assert_eq!(actual.as_ref(), expected);
+                        }
+                        assert_eq!(
+                            state.puts.load(Ordering::SeqCst),
+                            if excluded { 0 } else { 2 },
+                            "exclusions={exclusions:?}, name={name}, range_read={range_read}"
+                        );
+                        assert_eq!(
+                            state.hits.load(Ordering::SeqCst),
+                            if excluded { 0 } else { 2 }
+                        );
+                        if excluded {
+                            assert_eq!(state.misses.load(Ordering::SeqCst), 0);
+                        }
+                        assert_eq!(state.invalidations.load(Ordering::SeqCst), 1);
+                        output
+                            .write(bytes::Bytes::from_static(b"updated!"))
+                            .await
+                            .unwrap();
+                        assert_eq!(input.read().await.unwrap().as_ref(), b"updated!");
+                        assert_eq!(state.invalidations.load(Ordering::SeqCst), 2);
+                        file_io.delete_file(&path).await.unwrap();
+                        assert_eq!(state.invalidations.load(Ordering::SeqCst), 3);
+                    });
+                    paimon_file_io_free(result.file_io);
+                    assert_eq!(state.destroys.load(Ordering::SeqCst), 1);
+                }
+            }
+        }
     }
 }
 

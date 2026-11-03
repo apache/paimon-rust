@@ -72,6 +72,7 @@ impl LocalCache {
         cache: Arc<dyn FileBlockCache>,
         block_size: u64,
         whitelist: &str,
+        excluded_extensions: &str,
     ) -> crate::Result<Self> {
         if block_size == 0 {
             return Err(crate::Error::ConfigInvalid {
@@ -85,7 +86,7 @@ impl LocalCache {
             block_size,
             whitelist: FileType::parse_whitelist(whitelist),
             file_size_capacity: DEFAULT_FILE_SIZE_CAPACITY,
-            excluded_extensions: HashSet::new(),
+            excluded_extensions: parse_excluded_extensions(excluded_extensions),
             fill_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             _temporary_directory: None,
         })
@@ -556,17 +557,23 @@ impl LocalCacheConfig {
             max_size,
             block_size,
             whitelist: FileType::parse_whitelist(whitelist),
-            excluded_extensions: options
-                .get(CatalogOptions::LOCAL_CACHE_EXCLUDE_EXTENSIONS)
-                .map(String::as_str)
-                .unwrap_or_default()
-                .split(',')
-                .map(|extension| extension.trim().trim_start_matches('.'))
-                .filter(|extension| !extension.is_empty())
-                .map(str::to_ascii_lowercase)
-                .collect(),
+            excluded_extensions: parse_excluded_extensions(
+                options
+                    .get(CatalogOptions::LOCAL_CACHE_EXCLUDE_EXTENSIONS)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            ),
         }))
     }
+}
+
+fn parse_excluded_extensions(value: &str) -> HashSet<String> {
+    value
+        .split(',')
+        .map(|extension| extension.trim().trim_start_matches('.'))
+        .filter(|extension| !extension.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 fn catalog_namespace(options: &Options) -> String {

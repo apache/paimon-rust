@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use paimon::io::{FileBlockCache, FileIO};
+use paimon::CatalogOptions;
 
 use crate::error::{paimon_error, validate_cstr, PaimonErrorCode};
 use crate::result::paimon_result_file_io_new;
@@ -169,11 +170,9 @@ unsafe fn parse_options(
 
 unsafe fn create_file_io(
     path: *const c_char,
-    options: *const paimon_option,
-    options_len: usize,
+    options: HashMap<String, String>,
 ) -> Result<FileIO, *mut paimon_error> {
     let path = validate_cstr(path, "path")?;
-    let options = parse_options(options, options_len)?;
     FileIO::from_path(path)
         .and_then(|builder| builder.with_props(options).build())
         .map_err(paimon_error::from_paimon)
@@ -201,7 +200,9 @@ pub unsafe extern "C" fn paimon_file_io_create(
     options: *const paimon_option,
     options_len: usize,
 ) -> paimon_result_file_io_new {
-    file_io_result(create_file_io(path, options, options_len))
+    file_io_result(
+        parse_options(options, options_len).and_then(|options| create_file_io(path, options)),
+    )
 }
 
 /// Create a reusable FileIO backed by a caller-managed block cache.
@@ -210,6 +211,8 @@ pub unsafe extern "C" fn paimon_file_io_create(
 /// `whitelist` may be null to use `meta,global-index`. Once validation and
 /// storage construction succeed, Rust owns `callbacks->context` and invokes
 /// `destroy` exactly once after the last derived FileIO/table is dropped.
+/// `options` may include `local-cache.exclude-extensions` to bypass cache reads
+/// and fills for selected extensions while retaining write/delete invalidation.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_file_io_create_with_cache_v1(
     path: *const c_char,
@@ -240,7 +243,15 @@ pub unsafe extern "C" fn paimon_file_io_create_with_cache_v1(
             Err(error) => return file_io_result(Err(error)),
         }
     };
-    let file_io = match create_file_io(path, options, options_len) {
+    let options = match parse_options(options, options_len) {
+        Ok(options) => options,
+        Err(error) => return file_io_result(Err(error)),
+    };
+    let excluded_extensions = options
+        .get(CatalogOptions::LOCAL_CACHE_EXCLUDE_EXTENSIONS)
+        .cloned()
+        .unwrap_or_default();
+    let file_io = match create_file_io(path, options) {
         Ok(file_io) => file_io,
         Err(error) => return file_io_result(Err(error)),
     };
@@ -255,7 +266,12 @@ pub unsafe extern "C" fn paimon_file_io_create_with_cache_v1(
     };
     file_io_result(
         file_io
-            .with_file_block_cache(cache, block_size, &whitelist)
+            .with_file_block_cache_and_exclusions(
+                cache,
+                block_size,
+                &whitelist,
+                &excluded_extensions,
+            )
             .map_err(paimon_error::from_paimon),
     )
 }

@@ -462,6 +462,10 @@ list preserves existing behavior. This option only filters source-file block
 caching; it does not change parsed metadata caches or generated lookup files.
 Extension exclusions do not suppress write or delete cache invalidation.
 
+For caller-managed Rust block caches, use
+`FileIO::with_file_block_cache_and_exclusions` to supply the same exclusion list.
+The existing `with_file_block_cache` method continues to use an empty list.
+
 The protected and regular LRUs share one total budget; either can use idle
 capacity. Catalogs or processes sharing a disk cache must use the same ratio.
 

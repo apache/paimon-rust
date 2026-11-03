@@ -216,6 +216,13 @@ CHECK_RESULT(table_result);
 paimon_file_io_free(io_result.file_io);
 ```
 
+To cache data while excluding BLOB bodies, pass `meta,global-index,data` as
+`whitelist` and include `local-cache.exclude-extensions=blob` in `storage_options`.
+The exclusion uses the same extension matching rules as the catalog local cache
+and does not require `local-cache.enabled=true`. An omitted or empty list keeps
+the existing behavior. Excluded files bypass `get` and `put`, but writes and
+deletes still invoke invalidation callbacks for whitelisted files.
+
 `get` receives an output buffer with exactly `length` writable bytes. It returns
 the number of bytes copied, `-1` for a miss, or any other negative value for a
 fail-open error. A nonnegative value different from `length` is also treated as

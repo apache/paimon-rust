@@ -444,14 +444,37 @@ impl FileIO {
     /// `whitelist` uses the same comma-separated values as
     /// `local-cache.whitelist`: `meta`, `global-index`, `bucket-index`, `data`,
     /// `structured-data`, and `file-index`, or `*` for all of them.
+    /// No extensions are excluded. Use [`Self::with_file_block_cache_and_exclusions`]
+    /// to exclude selected file extensions.
     pub fn with_file_block_cache(
-        mut self,
+        self,
         cache: Arc<dyn FileBlockCache>,
         block_size: u64,
         whitelist: &str,
     ) -> crate::Result<Self> {
+        self.with_file_block_cache_and_exclusions(cache, block_size, whitelist, "")
+    }
+
+    /// Attach an externally managed block cache with extension exclusions.
+    ///
+    /// `block_size` and `whitelist` have the same meaning as in
+    /// [`Self::with_file_block_cache`]. `excluded_extensions` uses the
+    /// `local-cache.exclude-extensions` rules: comma-separated last extensions,
+    /// ignoring ASCII case, surrounding whitespace, optional leading dots, and
+    /// empty entries. An empty list preserves the whitelist behavior.
+    /// Exclusions bypass cache reads and fills, but retain write/delete invalidation.
+    pub fn with_file_block_cache_and_exclusions(
+        mut self,
+        cache: Arc<dyn FileBlockCache>,
+        block_size: u64,
+        whitelist: &str,
+        excluded_extensions: &str,
+    ) -> crate::Result<Self> {
         self.cache = Some(Arc::new(LocalCache::external(
-            cache, block_size, whitelist,
+            cache,
+            block_size,
+            whitelist,
+            excluded_extensions,
         )?));
         Ok(self)
     }
