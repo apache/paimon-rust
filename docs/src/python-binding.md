@@ -499,6 +499,34 @@ for stat in table.partition_stats():
     print(stat.partition(), stat.record_count(), stat.total_size_bytes())
 ```
 
+## Table Maintenance
+
+### Compaction
+
+`table.new_compact_builder()` plans, executes and commits table compaction in
+one call, mirroring the `CALL sys.compact` SQL procedure. Nothing is committed
+when planning yields no task. A failed task aborts the files already produced
+by earlier tasks, so no unreferenced files are left behind.
+
+```python
+metrics = table.new_compact_builder().execute()
+print(metrics["tasks"], metrics["files_removed"], metrics["files_added"])
+
+# Restrict compaction to partitions matching a predicate (same predicate
+# format as read filters), and set the commit identity.
+metrics = (
+    table.new_compact_builder()
+    .with_partition_filter({"method": "equal", "field": "dt", "literals": ["2026-11-01"]})
+    .with_commit_user("my-compactor")
+    .execute()
+)
+```
+
+The returned metrics are a dictionary with the task count and the write
+statistics of the compaction commit: `tasks`, `files_removed`, `files_added`,
+`rows_written`, `bytes_written`, `changelog_files_added`,
+`changelog_rows_written` and `changelog_bytes_written`.
+
 ## Python UDF
 
 Register Python scalar UDFs into a `SQLContext`:
