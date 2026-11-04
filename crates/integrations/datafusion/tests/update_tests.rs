@@ -458,6 +458,59 @@ async fn test_update_with_null_values() {
     drop(tmp);
 }
 
+// ======================= Fixed-bucket table =======================
+
+/// Rows of a fixed-bucket table are placed by hashing `bucket-key`, and a filter on
+/// that column reads only the matching bucket. An updated bucket key must move the
+/// row, or such queries no longer find it.
+#[tokio::test]
+async fn test_update_bucket_key_moves_row_to_new_bucket() {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap();
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, age INT) \
+             WITH ('bucket' = '4', 'bucket-key' = 'name')",
+        )
+        .await
+        .unwrap();
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t VALUES \
+         (1, 'alice', 10), (2, 'bob', 20), (3, 'carol', 30), (4, 'dave', 40)",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "UPDATE paimon.test_db.t SET name = 'erin' WHERE id = 1",
+    )
+    .await;
+
+    assert_eq!(
+        query_int_str_int(
+            &sql_context,
+            "SELECT id, name, age FROM paimon.test_db.t WHERE name = 'erin'",
+        )
+        .await,
+        vec![(1, "erin".into(), 10)]
+    );
+    assert_eq!(
+        query(&sql_context).await,
+        vec![
+            (1, "erin".into(), 10),
+            (2, "bob".into(), 20),
+            (3, "carol".into(), 30),
+            (4, "dave".into(), 40),
+        ]
+    );
+    drop(tmp);
+}
+
 // ======================= Empty table =======================
 
 #[tokio::test]

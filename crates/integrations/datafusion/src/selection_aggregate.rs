@@ -222,11 +222,18 @@ impl GroupsAccumulator for SelectionGroupsAccumulator {
         &mut self,
         values: &[ArrayRef],
         group_indices: &[usize],
-        opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
         self.native
-            .merge_batch(values, group_indices, opt_filter, total_num_groups)
+            .merge_batch(values, group_indices, total_num_groups)
+    }
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        opt_filter: Option<&BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
+        let mask = eligibility(values, self.ignore_null_values, opt_filter)?;
+        self.native.convert_to_state(values, mask.as_ref())
     }
     fn size(&self) -> usize {
         self.native.size() + std::mem::size_of::<Self>()

@@ -21,7 +21,10 @@
 //! Unaffected files remain untouched. The writer produces [`CommitMessage`]s with
 //! `deleted_files` (old files) and `new_files` (rewritten files) for atomic commit.
 
-use crate::spec::{BinaryRow, CoreOptions, DataFileMeta, PartitionComputer};
+use crate::spec::{
+    BinaryRow, BucketFunctionType, CoreOptions, DataField, DataFileMeta, PartitionComputer,
+};
+use crate::table::bucket_function::batch_bucket_ids;
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::partition_filter::PartitionFilter;
@@ -31,7 +34,7 @@ use crate::Result;
 use arrow_array::RecordBatch;
 use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Metadata for a single data file in the target table.
 pub struct FileInfo {
@@ -244,6 +247,25 @@ impl CopyOnWriteMergeWriter {
         let schema_id = schema.id();
         let write_fields = schema.fields().to_vec();
 
+        // A fixed-bucket append table places each row by hashing its `bucket-key`,
+        // and scans prune buckets by that hash. A row whose bucket-key column is
+        // updated must move to its new bucket, as Java's writer does; left in the
+        // old bucket, it is skipped by every query that filters on the new value.
+        let total_buckets = core_options.bucket();
+        let rebucket = match core_options.bucket_key() {
+            Some(keys)
+                if total_buckets > 1
+                    && keys.iter().any(|key| self.update_columns.contains(key)) =>
+            {
+                let key_indices: Vec<usize> = keys
+                    .iter()
+                    .filter_map(|key| write_fields.iter().position(|field| field.name() == key))
+                    .collect();
+                Some((key_indices, core_options.bucket_function_type()?))
+            }
+            _ => None,
+        };
+
         let update_columns = &self.update_columns;
         let update_batches = &self.update_batches;
         let file_index = &self.file_index;
@@ -253,6 +275,7 @@ impl CopyOnWriteMergeWriter {
         let write_fields = &write_fields;
         let file_compression = file_compression.as_str();
         let file_format = file_format.as_str();
+        let rebucket = rebucket.as_ref();
 
         // Process each affected file in parallel
         let rewrite_futures: Vec<_> = self
@@ -303,12 +326,27 @@ impl CopyOnWriteMergeWriter {
 
                 let deleted_file = file_info.file_meta.clone();
 
-                let new_files = if rewritten.num_rows() > 0 {
+                let groups = match rebucket {
+                    Some((key_indices, function)) => split_by_bucket(
+                        &rewritten,
+                        key_indices,
+                        write_fields,
+                        *function,
+                        total_buckets,
+                    )?,
+                    None => vec![(file_info.bucket, rewritten)],
+                };
+
+                let mut new_files = Vec::with_capacity(groups.len());
+                for (bucket, batch) in groups {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
                     let mut writer = DataFileWriter::new(
                         table.file_io().clone(),
                         table.location().to_string(),
-                        partition_path,
-                        file_info.bucket,
+                        partition_path.clone(),
+                        bucket,
                         schema_id,
                         target_file_size,
                         file_compression.to_string(),
@@ -322,11 +360,9 @@ impl CopyOnWriteMergeWriter {
                         None,
                     )?
                     .with_target_file_row_num(target_file_row_num);
-                    writer.write(&rewritten).await?;
-                    writer.prepare_commit().await?
-                } else {
-                    vec![]
-                };
+                    writer.write(&batch).await?;
+                    new_files.push((bucket, writer.prepare_commit().await?));
+                }
 
                 Ok(Some((
                     file_info.partition.clone(),
@@ -346,11 +382,18 @@ impl CopyOnWriteMergeWriter {
 
         for result in results.into_iter().flatten() {
             let (partition, bucket, deleted_file, new_files) = result;
-            let entry = grouped
-                .entry((partition, bucket))
-                .or_insert_with(|| (Vec::new(), Vec::new()));
-            entry.0.push(deleted_file);
-            entry.1.extend(new_files);
+            grouped
+                .entry((partition.clone(), bucket))
+                .or_default()
+                .0
+                .push(deleted_file);
+            for (new_bucket, files) in new_files {
+                grouped
+                    .entry((partition.clone(), new_bucket))
+                    .or_default()
+                    .1
+                    .extend(files);
+            }
         }
 
         let mut messages = Vec::new();
@@ -361,6 +404,34 @@ impl CopyOnWriteMergeWriter {
         }
         Ok(messages)
     }
+}
+
+/// Split `batch` by the fixed bucket each row hashes to, keeping row order within a bucket.
+fn split_by_bucket(
+    batch: &RecordBatch,
+    key_indices: &[usize],
+    fields: &[DataField],
+    function: BucketFunctionType,
+    total_buckets: i32,
+) -> Result<Vec<(i32, RecordBatch)>> {
+    let buckets = batch_bucket_ids(batch, key_indices, fields, function, total_buckets)?;
+    let mut rows_by_bucket: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+    for (row, bucket) in buckets.into_iter().enumerate() {
+        rows_by_bucket.entry(bucket).or_default().push(row as u32);
+    }
+    rows_by_bucket
+        .into_iter()
+        .map(|(bucket, rows)| {
+            let rows = arrow_array::UInt32Array::from(rows);
+            let taken = arrow_select::take::take_record_batch(batch, &rows).map_err(|e| {
+                crate::Error::DataInvalid {
+                    message: format!("Failed to split rows by bucket: {e}"),
+                    source: None,
+                }
+            })?;
+            Ok((bucket, taken))
+        })
+        .collect()
 }
 
 /// Apply row operations (update/delete) to a batch, producing a new batch.
