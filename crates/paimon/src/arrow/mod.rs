@@ -125,7 +125,7 @@ pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType>
                     "entries",
                     ArrowDataType::Struct(
                         vec![
-                            ArrowField::new("key", element_type, m.element_type().is_nullable()),
+                            ArrowField::new("key", element_type, false),
                             ArrowField::new("value", ArrowDataType::Int32, false),
                         ]
                         .into(),
@@ -435,7 +435,7 @@ pub(crate) fn paimon_type_to_arrow_for_read(dt: &PaimonDataType) -> crate::Resul
                         ArrowField::new(
                             "key",
                             paimon_type_to_arrow_for_read(multiset.element_type())?,
-                            multiset.element_type().is_nullable(),
+                            false,
                         ),
                         ArrowField::new("value", ArrowDataType::Int32, false),
                     ]
@@ -553,6 +553,42 @@ mod tests {
             ArrowDataType::BinaryView,
         ] {
             assert_arrow_to_paimon(arrow, true, &varbinary);
+        }
+    }
+
+    #[test]
+    fn map_and_multiset_keys_are_non_nullable_in_read_and_write_schemas() {
+        for (data_type, value_nullable) in [
+            (
+                PaimonDataType::Map(MapType::new(
+                    PaimonDataType::Int(IntType::new()),
+                    PaimonDataType::Int(IntType::new()),
+                )),
+                true,
+            ),
+            (
+                PaimonDataType::Multiset(crate::spec::MultisetType::new(PaimonDataType::Int(
+                    IntType::new(),
+                ))),
+                false,
+            ),
+        ] {
+            let fields = vec![DataField::new(0, "values".into(), data_type)];
+            for schema in [
+                build_target_arrow_schema(&fields).unwrap(),
+                build_read_arrow_schema(&fields).unwrap(),
+            ] {
+                assert!(schema.field(0).is_nullable());
+                let ArrowDataType::Map(entries, _) = schema.field(0).data_type() else {
+                    panic!("MAP and MULTISET must both use Arrow Map storage");
+                };
+                assert!(!entries.is_nullable());
+                let ArrowDataType::Struct(fields) = entries.data_type() else {
+                    panic!("map entries must be a struct");
+                };
+                assert!(!fields[0].is_nullable());
+                assert_eq!(fields[1].is_nullable(), value_nullable);
+            }
         }
     }
 

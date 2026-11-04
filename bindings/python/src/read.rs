@@ -155,13 +155,13 @@ impl PyReadBuilder {
 
     /// Build on a table copy resolved from scan options. Resolves time travel
     /// (may do IO) so `with_filter` later validates against the travelled
-    /// schema. Raises if a selector is set but resolves to no snapshot, so a
-    /// mistyped snapshot-id can never silently read latest.
+    /// schema. A selector that resolves to no snapshot raises from batch scans
+    /// only; stream scans resolve their start from `scan.mode`.
     pub fn from_options(table: Arc<Table>, opts: HashMap<String, String>) -> PyResult<Self> {
         // Reject conflicting time-travel selectors here. The core swallows the
-        // conflict error via its Java-parity silent fallback, so the strict
-        // gate below would otherwise misattribute the failure to a single
-        // selector. Surface the real conflict, listing the keys the user set.
+        // conflict error via its Java-parity silent fallback, so the batch scan
+        // check would otherwise misattribute the failure to a single selector.
+        // Surface the real conflict, listing the keys the user set.
         // scan.version must first be adapted by the core: Java allows it to
         // overwrite a selector of the same kind after resolving tag precedence.
         let present: Vec<&str> = TIME_TRAVEL_SELECTORS
@@ -175,31 +175,52 @@ impl PyReadBuilder {
                 present.join(", ")
             )));
         }
-        let selector =
-            find_time_travel_selector(&opts).map(|(n, v)| (n.to_string(), v.to_string()));
         let rt = runtime();
         let traveled = rt
             .block_on(async { table.copy_with_time_travel(opts).await })
             .map_err(to_py_err)?;
-        if let Some((name, value)) = selector {
-            if !traveled.has_resolved_travel_snapshot() {
-                return Err(PyValueError::new_err(format!(
-                    "time-travel selector {name}={value} did not resolve to any snapshot"
-                )));
-            }
+        Ok(Self::new(Arc::new(traveled)))
+    }
+
+    /// Raise if the table's time-travel selector resolves to no snapshot. A
+    /// selector the table has not resolved, e.g. one in a resolved schema, is
+    /// resolved here as its plan would.
+    fn ensure_time_travel_resolved(&self, py: Python<'_>) -> PyResult<()> {
+        let Some((name, value)) = find_time_travel_selector(self.table.schema().options()) else {
+            return Ok(());
+        };
+        if self.table.has_resolved_travel_snapshot() {
+            return Ok(());
         }
-        Ok(Self {
-            table: Arc::new(traveled),
-            projection: None,
-            read_type: None,
-            limit: None,
-            filter: None,
-            partition_filter: None,
-            row_ranges: None,
-            case_sensitive: true,
-            blob_parallelism: None,
-            include_row_kind: false,
-        })
+        py.detach(|| runtime().block_on(self.table.resolve_read_snapshot()))
+            .map(|_| ())
+            .map_err(|e| {
+                PyValueError::new_err(format!(
+                    "time-travel selector {name}={value} did not resolve to any snapshot: {e}"
+                ))
+            })
+    }
+
+    /// Build a scan without checking the time-travel selector, which stream
+    /// scans resolve themselves.
+    fn table_scan(&self) -> PyTableScan {
+        PyTableScan {
+            table: Arc::clone(&self.table),
+            projection: self.projection.clone(),
+            read_type: self.read_type.clone(),
+            limit: self.limit,
+            filter: self.filter.clone(),
+            partition_filter: self.partition_filter.clone(),
+            row_ranges: self.row_ranges.clone(),
+            case_sensitive: self.case_sensitive,
+            incremental_scan: None,
+            global_index_result: None,
+            row_position_slice: None,
+            row_position_shard: None,
+            chunk_shuffle: None,
+            shard: None,
+            file_filters: None,
+        }
     }
 }
 
@@ -336,31 +357,18 @@ impl PyReadBuilder {
         Ok(slf)
     }
 
-    fn new_scan(&self) -> PyTableScan {
-        PyTableScan {
-            table: Arc::clone(&self.table),
-            projection: self.projection.clone(),
-            read_type: self.read_type.clone(),
-            limit: self.limit,
-            filter: self.filter.clone(),
-            partition_filter: self.partition_filter.clone(),
-            row_ranges: self.row_ranges.clone(),
-            case_sensitive: self.case_sensitive,
-            incremental_scan: None,
-            global_index_result: None,
-            row_position_slice: None,
-            row_position_shard: None,
-            chunk_shuffle: None,
-            shard: None,
-            file_filters: None,
-        }
+    /// Raises if a time-travel selector resolves to no snapshot.
+    fn new_scan(&self, py: Python<'_>) -> PyResult<PyTableScan> {
+        self.ensure_time_travel_resolved(py)?;
+        Ok(self.table_scan())
     }
 
-    /// Create a stateful Java-compatible stream scan.
+    /// Create a stateful Java-compatible stream scan. Its first plan resolves
+    /// the start from `scan.mode`, so selectors need not resolve here.
     pub(crate) fn new_stream_scan(&self) -> PyResult<PyStreamTableScan> {
         Ok(PyStreamTableScan {
             scan: self
-                .new_scan()
+                .table_scan()
                 .read_builder()?
                 .new_stream_scan()
                 .map_err(to_py_err)?,
@@ -374,11 +382,12 @@ impl PyReadBuilder {
     #[pyo3(signature = (start_snapshot_id, end_snapshot_id, mode = "delta"))]
     fn new_incremental_scan(
         &self,
+        py: Python<'_>,
         start_snapshot_id: i64,
         end_snapshot_id: i64,
         mode: &str,
     ) -> PyResult<PyTableScan> {
-        let mut scan = self.new_scan();
+        let mut scan = self.new_scan(py)?;
         scan.incremental_scan = Some(PyIncrementalScan {
             start_snapshot_id,
             end_snapshot_id,
@@ -1559,7 +1568,7 @@ assert routing.plan().snapshot_id() == 2
             });
             let mut builder = PyReadBuilder::new(Arc::clone(&table));
             builder.limit = Some(0);
-            let scan = Py::new(py, builder.new_scan()).unwrap();
+            let scan = Py::new(py, builder.new_scan(py).unwrap()).unwrap();
             for name in ["skip_level0", "only_read_real_buckets"] {
                 let kwargs = PyDict::new(py);
                 kwargs.set_item(name, true).unwrap();
@@ -1638,7 +1647,7 @@ assert routing.plan().snapshot_id() == 2
             assert_eq!(restored.new_files, vec![expected.files()[0].file().clone()]);
 
             builder.limit = None;
-            let scan = Py::new(py, builder.new_scan()).unwrap();
+            let scan = Py::new(py, builder.new_scan(py).unwrap()).unwrap();
             assert_eq!(
                 scan.bind(py).call_method0("plan").unwrap().len().unwrap(),
                 0
@@ -1682,7 +1691,7 @@ assert routing.plan().snapshot_id() == 2
                     "plan_all includes L0 even when explicit file filters exclude it"
                 );
             }
-            let fresh = Py::new(py, builder.new_scan()).unwrap();
+            let fresh = Py::new(py, builder.new_scan(py).unwrap()).unwrap();
             assert_eq!(
                 fresh.bind(py).call_method0("plan").unwrap().len().unwrap(),
                 0,

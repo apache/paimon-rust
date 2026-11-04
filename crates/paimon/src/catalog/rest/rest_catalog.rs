@@ -75,12 +75,6 @@ impl RESTCatalog {
     /// # Errors
     /// Returns an error if required options are missing or if initialization fails.
     pub async fn new(options: Options, config_required: bool) -> Result<Self> {
-        let warehouse = options
-            .get(CatalogOptions::WAREHOUSE)
-            .cloned()
-            .ok_or_else(|| RestError::BadRequest {
-                message: format!("Missing required option: {}", CatalogOptions::WAREHOUSE),
-            })?;
         let api = Arc::new(RESTApi::new(options.clone(), config_required).await?);
 
         let data_token_enabled = api
@@ -90,6 +84,10 @@ impl RESTCatalog {
             .unwrap_or(false);
 
         let api_options = api.options().clone();
+        let warehouse = api_options
+            .get(CatalogOptions::WAREHOUSE)
+            .cloned()
+            .unwrap_or_default();
         let local_cache = create_local_cache_with_namespace_async(&options, &api_options).await?;
         let file_io_cache = FileIOCacheContext::from_props(api_options.to_map())?;
 
@@ -1214,6 +1212,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_rest_catalog_optional_warehouse() {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/v1/config",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                if let Some(warehouse) = query.get("warehouse") {
+                    assert_eq!(warehouse, "explicit");
+                }
+                Json(serde_json::json!({
+                    "defaults": {"warehouse": "server-default"}, "overrides": {}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for warehouse in [None, Some(""), Some("explicit")] {
+            let mut options = Options::new();
+            options.set(CatalogOptions::URI, format!("http://{address}"));
+            options.set("token.provider", "bear");
+            options.set("token", "test-token");
+            if let Some(value) = warehouse {
+                options.set(CatalogOptions::WAREHOUSE, value);
+            }
+            let catalog = RESTCatalog::new(options, true).await.unwrap();
+            assert_eq!(catalog.warehouse(), warehouse.unwrap_or("server-default"));
+        }
+        server.abort();
+    }
 
     #[tokio::test]
     async fn test_rest_catalog_builds_local_cache_from_client_options() {

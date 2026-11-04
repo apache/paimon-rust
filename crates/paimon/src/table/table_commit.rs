@@ -501,6 +501,28 @@ impl TableCommit {
         Ok(prepared.metrics)
     }
 
+    /// Delete files prepared by compaction results that were never submitted.
+    /// Every file is attempted; the error names each file left behind.
+    /// Never call it after `commit_compact` starts: an uncertain commit may
+    /// already reference them.
+    pub async fn abort_compact(&self, results: &[super::CompactResult]) -> Result<()> {
+        let messages: Vec<_> = results
+            .iter()
+            .map(super::CompactResult::abort_message)
+            .collect();
+        let failed = self.delete_new_files(&messages).await?;
+        if failed.is_empty() {
+            return Ok(());
+        }
+        Err(crate::Error::UnexpectedError {
+            message: format!(
+                "Failed to delete files of unsubmitted compaction results: {}",
+                failed.join(", ")
+            ),
+            source: None,
+        })
+    }
+
     /// Commit new files with a caller-provided commit identifier.
     ///
     /// Identifiers must increase monotonically for a given `commit_user`.
@@ -1078,6 +1100,13 @@ impl TableCommit {
                 .abort(commit_messages)
                 .await;
         }
+        self.delete_new_files(commit_messages).await?;
+        Ok(())
+    }
+
+    /// Delete new files of known-uncommitted messages, continuing past failures.
+    /// Returns each path that could not be deleted with its error.
+    async fn delete_new_files(&self, commit_messages: &[CommitMessage]) -> Result<Vec<String>> {
         CoreOptions::new(self.table.schema().options())
             .ensure_type_paimon_served(&self.table.identifier().full_name())?;
         super::write_builder::ensure_table_write_allowed(&self.table)?;
@@ -1086,6 +1115,7 @@ impl TableCommit {
         let index_file_in_data_file_dir =
             CoreOptions::new(self.table.schema().options()).index_file_in_data_file_dir();
 
+        let mut failed = Vec::new();
         for message in commit_messages {
             let bucket_path = self.bucket_path(&message.partition, message.bucket)?;
             for file in message
@@ -1096,7 +1126,9 @@ impl TableCommit {
                 .chain(message.compact_changelog_files.iter())
             {
                 for path in file.collect_files(&bucket_path) {
-                    let _ = self.table.file_io().delete_file(&path).await;
+                    if let Err(error) = self.table.file_io().delete_file(&path).await {
+                        failed.push(format!("{path}: {error}"));
+                    }
                 }
             }
             // An index file must be deleted where it was written: at its external
@@ -1121,10 +1153,12 @@ impl TableCommit {
                     index_file_in_data_file_dir,
                     file,
                 );
-                let _ = self.table.file_io().delete_file(&path).await;
+                if let Err(error) = self.table.file_io().delete_file(&path).await {
+                    failed.push(format!("{path}: {error}"));
+                }
             }
         }
-        Ok(())
+        Ok(failed)
     }
 
     fn bucket_path(&self, partition: &[u8], bucket: i32) -> Result<String> {

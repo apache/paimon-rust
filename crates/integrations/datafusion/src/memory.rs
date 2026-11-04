@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Connect reader working-memory reservations to the executing DataFusion task.
+//! Connect read, write and compaction working-memory reservations to the
+//! executing DataFusion task.
 
 use std::sync::Arc;
 
@@ -48,16 +49,22 @@ pub(crate) fn reader_resources(
 ) -> paimon::Result<ResourceContext> {
     // Register per execution, not on the reusable plan. Reader working state
     // cannot spill; downstream operators account for batches they retain.
-    let reservation = MemoryConsumer::new(format!("PaimonTableScan[{partition}]"))
-        .with_can_spill(false)
-        .register(context.memory_pool());
-    ResourceContext::builder()
-        .memory_pool(Arc::new(DataFusionMemoryPool { reservation }))
-        .build()
+    resources(context, format!("PaimonTableScan[{partition}]"))
 }
 
 pub(crate) fn writer_resources(context: &TaskContext) -> paimon::Result<ResourceContext> {
-    let reservation = MemoryConsumer::new("PaimonTableWrite")
+    resources(context, "PaimonTableWrite")
+}
+
+pub(crate) fn compact_resources(context: &TaskContext) -> paimon::Result<ResourceContext> {
+    resources(context, "PaimonTableCompact")
+}
+
+fn resources(
+    context: &TaskContext,
+    consumer: impl Into<String>,
+) -> paimon::Result<ResourceContext> {
+    let reservation = MemoryConsumer::new(consumer)
         .with_can_spill(false)
         .register(context.memory_pool());
     ResourceContext::builder()

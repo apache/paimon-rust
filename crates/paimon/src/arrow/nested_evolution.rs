@@ -779,11 +779,7 @@ fn evolve_multiset(
         &map,
         elements,
         counts,
-        ArrowField::new(
-            "key",
-            paimon_type_to_arrow_for_read(target_element)?,
-            target_element.is_nullable(),
-        ),
+        ArrowField::new("key", paimon_type_to_arrow_for_read(target_element)?, false),
         ArrowField::new("value", ArrowDataType::Int32, false),
     )
 }
@@ -1911,7 +1907,7 @@ mod tests {
             Arc::new(StructArray::try_new(element_fields.clone(), vec![x], None).unwrap());
         let counts: ArrayRef = Arc::new(Int32Array::from(vec![Some(1)]));
         let entry_fields = Fields::from(vec![
-            ArrowField::new("key", ArrowDataType::Struct(element_fields.clone()), true),
+            ArrowField::new("key", ArrowDataType::Struct(element_fields.clone()), false),
             ArrowField::new("value", ArrowDataType::Int32, false),
         ]);
         let entries =

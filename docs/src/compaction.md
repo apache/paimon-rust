@@ -24,7 +24,8 @@ compaction for Data Evolution tables, and sorted-run compaction for primary-key
 tables with fixed or dynamic buckets. `CompactBuilder` creates
 a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
 execution do not publish snapshots; `commit_compact` atomically publishes the
-selected results in a `COMPACT` snapshot.
+selected results in a `COMPACT` snapshot. DataFusion SQL runs this flow through
+[`CALL sys.compact`](sql.md#compact).
 
 The builder selects a dedicated append, primary-key or Data Evolution planner
 for the table mode. They share snapshot capture and the public plan/task types;
@@ -359,6 +360,9 @@ created after the plan's captured snapshot. To retry after restarting
 the coordinator, configure `with_commit_user(...)` with the original value
 and retain the serialized results. A commit error can mean publication is
 uncertain: retain submitted files rather than deleting them on error.
+To abandon results that were never submitted, such as after a later task fails,
+pass them to `abort_compact`. It attempts every prepared file and returns an
+error naming the files it could not delete.
 
 Append compaction preserves duplicate and null rows. Original files remain readable
 through old snapshots, and append incremental scans skip `COMPACT` snapshots.

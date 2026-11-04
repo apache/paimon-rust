@@ -19,7 +19,7 @@
 //!
 //! DataFusion's `aggregate_statistics` optimizer rule can replace a
 //! scan+aggregate subtree with a literal projection when the source
-//! reports `Precision::Exact(num_rows)` from `partition_statistics()`.
+//! reports `Precision::Exact(num_rows)` from `statistics_from_inputs()`.
 //!
 //! These tests verify that:
 //! - COUNT(*) pushdown succeeds when statistics are exact (no PaimonTableScan in plan)
