@@ -17,14 +17,13 @@
 #
 
 import re
+from importlib.metadata import version
 
 import pypaimon_rust
 
 
-def test_module_exposes_version():
-    version = pypaimon_rust.__version__
-    assert isinstance(version, str)
-    # Wheels are versioned by maturin from the Cargo manifest, so the runtime
-    # value is a plain semver string like "0.6.0"; release-candidate suffixes
-    # exist only in the wheel metadata, never here.
-    assert re.fullmatch(r"\d+\.\d+\.\d+(-[\w.]+)?(\+[\w.]+)?", version), version
+def test_module_exposes_installed_version():
+    # Release candidates add an `rcN` suffix to the distribution version only,
+    # so compare against the installed distribution with that suffix removed.
+    expected = re.sub(r"rc\d+$", "", version("pypaimon-rust"))
+    assert pypaimon_rust.__version__ == expected
