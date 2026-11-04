@@ -98,44 +98,59 @@ async fn selection_aggregates_merge_native_state_across_batches_and_partitions()
     };
     use datafusion::datasource::MemTable;
     use std::sync::Arc;
-    let ctx = SQLContext::new();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("g", DataType::Int64, false),
-        Field::new("v", DataType::Int64, true),
-        Field::new("k", DataType::Int64, true),
-    ]));
-    let batch = |g: Vec<i64>, v: Vec<Option<i64>>, k: Vec<Option<i64>>| {
-        RecordBatch::try_new(
-            Arc::clone(&schema),
+    // Exercise both ordinary partial aggregation and direct state conversion.
+    for bypass in [false, true] {
+        let ctx = SQLContext::new();
+        ctx.sql("SET datafusion.execution.target_partitions = 2")
+            .await
+            .unwrap();
+        if bypass {
+            ctx.sql(
+                "SET datafusion.execution.skip_partial_aggregation_probe_ratio_threshold = 0.0",
+            )
+            .await
+            .unwrap();
+            ctx.sql("SET datafusion.execution.skip_partial_aggregation_probe_rows_threshold = 0")
+                .await
+                .unwrap();
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("k", DataType::Int64, true),
+        ]));
+        let batch = |g: Vec<i64>, v: Vec<Option<i64>>, k: Vec<Option<i64>>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(g)),
+                    Arc::new(Int64Array::from(v)),
+                    Arc::new(Int64Array::from(k)),
+                ],
+            )
+            .unwrap()
+        };
+        let partitions = vec![
             vec![
-                Arc::new(Int64Array::from(g)),
-                Arc::new(Int64Array::from(v)),
-                Arc::new(Int64Array::from(k)),
+                batch(vec![1, 2], vec![Some(10), Some(200)], vec![Some(1), None]),
+                batch(vec![1, 3], vec![None, Some(300)], vec![Some(4), Some(10)]),
             ],
-        )
-        .unwrap()
-    };
-    let partitions = vec![
-        vec![
-            batch(vec![1, 2], vec![Some(10), Some(200)], vec![Some(1), None]),
-            batch(vec![1, 3], vec![None, Some(300)], vec![Some(4), Some(10)]),
-        ],
-        vec![
-            batch(
-                vec![1, 2, 3],
-                vec![Some(30), Some(201), None],
-                vec![Some(3), None, Some(11)],
-            ),
-            batch(vec![1, 3], vec![Some(999), Some(301)], vec![None, Some(12)]),
-        ],
-    ];
-    ctx.ctx()
-        .register_table(
-            "selection_inputs",
-            Arc::new(MemTable::try_new(schema, partitions).unwrap()),
-        )
-        .unwrap();
-    assert_eq!(
+            vec![
+                batch(
+                    vec![1, 2, 3],
+                    vec![Some(30), Some(201), None],
+                    vec![Some(3), None, Some(11)],
+                ),
+                batch(vec![1, 3], vec![Some(999), Some(301)], vec![None, Some(12)]),
+            ],
+        ];
+        ctx.ctx()
+            .register_table(
+                "selection_inputs",
+                Arc::new(MemTable::try_new(schema, partitions).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
         rows(
             &ctx,
             "SELECT g,arg_max(CAST(NULL AS BIGINT),1) FROM selection_inputs GROUP BY g ORDER BY g"
@@ -143,15 +158,18 @@ async fn selection_aggregates_merge_native_state_across_batches_and_partitions()
         .await,
         vec![vec!["1", "NULL"], vec!["2", "NULL"], vec!["3", "NULL"]]
     );
-    assert_eq!(rows(&ctx,"SELECT g,max_by(v,k),min_by(v,k),arg_max(v,k),max_by(v,k) FILTER (WHERE v<300 OR v IS NULL) FROM selection_inputs GROUP BY g ORDER BY g").await,vec![vec!["1","NULL","10","30","NULL"],vec!["2","NULL","NULL","NULL","NULL"],vec!["3","301","300","301","NULL"]]);
-    assert_eq!(
-        rows(
-            &ctx,
-            "SELECT max_by(v,k),min_by(v,k),arg_max(v,k) FROM selection_inputs"
-        )
-        .await,
-        vec![vec!["301", "10", "301"]]
-    );
+        assert_eq!(rows(&ctx,"SELECT g,max_by(v,k),min_by(v,k),arg_max(v,k),max_by(v,k) FILTER (WHERE v<300 OR v IS NULL) FROM selection_inputs GROUP BY g ORDER BY g").await,vec![vec!["1","NULL","10","30","NULL"],vec!["2","NULL","NULL","NULL","NULL"],vec!["3","301","300","301","NULL"]]);
+        assert_eq!(
+            rows(
+                &ctx,
+                "SELECT max_by(v,k),min_by(v,k),arg_max(v,k) FROM selection_inputs"
+            )
+            .await,
+            vec![vec!["301", "10", "301"]]
+        );
+        assert_eq!(rows(&ctx, "SELECT g,arg_max(v,k) FILTER (WHERE k>2) FROM selection_inputs GROUP BY g ORDER BY g").await,
+        vec![vec!["1", "30"],vec!["2", "NULL"],vec!["3", "301"]]);
+    }
 }
 
 #[tokio::test]
@@ -229,17 +247,25 @@ async fn aggregate_rewrites_keep_filters_constant_keys_and_local_registrations()
         vec![vec!["a", "a", "a"]]
     );
     assert_eq!(rows(&ctx,"SELECT array_length(collect_list(p OR q)) FROM (VALUES (NULL,FALSE),(FALSE,TRUE)) t(p,q)").await,vec![vec!["1"]]);
-    ctx.ctx().register_udf(create_udf(
-        "first",
-        vec![DataType::Int64],
-        DataType::Int64,
-        Volatility::Immutable,
-        Arc::new(|args| Ok(args[0].clone())),
-    ));
-    assert_eq!(
-        rows(&ctx, "SELECT first(v) FROM (VALUES (1),(2)) t(v)").await,
-        vec![vec!["1"], vec!["2"]]
-    );
+    assert_eq!(rows(&ctx, "SELECT any_value(v),any_value(v,false),any_value(v,true) FROM (VALUES (CAST(NULL AS BIGINT)),(7)) t(v)").await,
+        vec![vec!["NULL", "NULL", "7"]]);
+    for name in ["first", "any_value"] {
+        ctx.ctx().register_udf(create_udf(
+            name,
+            vec![DataType::Int64],
+            DataType::Int64,
+            Volatility::Immutable,
+            Arc::new(|args| Ok(args[0].clone())),
+        ));
+        assert_eq!(
+            rows(
+                &ctx,
+                &format!("SELECT {name}(v) FROM (VALUES (1),(2)) t(v)")
+            )
+            .await,
+            vec![vec!["1"], vec!["2"]]
+        );
+    }
 }
 
 #[tokio::test]

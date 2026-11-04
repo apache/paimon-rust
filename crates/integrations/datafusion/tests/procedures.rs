@@ -22,11 +22,14 @@ use common::{
     setup_sql_context, string_value,
 };
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
+use datafusion::execution::memory_pool::GreedyMemoryPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use paimon::catalog::Identifier;
 use paimon::table::BranchManager;
 use paimon::Catalog;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 async fn setup_table_with_snapshots() -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
     let (tmp, sql_context) = setup_sql_context().await;
@@ -53,6 +56,25 @@ async fn setup_table_with_snapshots() -> (tempfile::TempDir, paimon_datafusion::
         "INSERT INTO paimon.test_db.t1 VALUES (3, 'charlie')",
     )
     .await;
+    (tmp, sql_context)
+}
+
+const SNAPSHOT_TIMES: [u64; 3] = [1_700_000_000_000, 1_700_000_001_000, 1_700_000_002_000];
+
+async fn setup_table_with_snapshot_times() -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
+    let (tmp, sql_context) = setup_table_with_snapshots().await;
+    // Procedure arguments are epoch milliseconds. `$snapshots.commit_time` is
+    // a local TIMESTAMP, whose Arrow values include the system timezone offset.
+    // Explicit metadata times also keep boundary tests independent of the clock.
+    for (index, time_millis) in SNAPSHOT_TIMES.into_iter().enumerate() {
+        let path = tmp
+            .path()
+            .join(format!("test_db.db/t1/snapshot/snapshot-{}", index + 1));
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snapshot["timeMillis"] = serde_json::json!(time_millis);
+        std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    }
     (tmp, sql_context)
 }
 
@@ -2690,73 +2712,83 @@ async fn test_rollback_to_tag() {
 
 #[tokio::test]
 async fn test_rollback_to_timestamp() {
-    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+    for (timestamp, expected_snapshot) in [
+        (SNAPSHOT_TIMES[0], 1),
+        (SNAPSHOT_TIMES[1] - 1, 1),
+        (SNAPSHOT_TIMES[1], 2),
+    ] {
+        let (_tmp, sql_context) = setup_table_with_snapshot_times().await;
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.rollback_to_timestamp(table => 'test_db.t1', timestamp => '{timestamp}')"
+            ),
+        )
+        .await;
 
-    // Get the timestamp of snapshot 1 from $snapshots system table
-    let batches = sql_context
-        .sql("SELECT snapshot_id, commit_time FROM paimon.test_db.`t1$snapshots` ORDER BY snapshot_id")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
-    // Use a timestamp between snapshot 1 and snapshot 2
-    let snap1_time = batches[0]
-        .column_by_name("commit_time")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<datafusion::arrow::array::TimestampMillisecondArray>()
-        .unwrap()
-        .value(0);
-
-    exec(
-        &sql_context,
-        &format!(
-            "CALL sys.rollback_to_timestamp(table => 'test_db.t1', timestamp => '{snap1_time}')"
-        ),
-    )
-    .await;
-
-    let count = row_count(&sql_context, "SELECT * FROM paimon.test_db.t1").await;
-    assert_eq!(count, 1);
+        let rows = collect_id_name(&sql_context, "SELECT id, name FROM paimon.test_db.t1").await;
+        let expected = [(1, "alice".to_string()), (2, "bob".to_string())];
+        assert_eq!(rows, expected[..expected_snapshot], "timestamp {timestamp}");
+        let snapshots = sql_context
+            .sql("SELECT snapshot_id FROM paimon.test_db.`t1$snapshots` ORDER BY snapshot_id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let ids = snapshots
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, (1..=expected_snapshot as i64).collect::<Vec<_>>());
+    }
 }
 
 #[tokio::test]
 async fn test_create_tag_from_timestamp() {
-    let (_tmp, sql_context) = setup_table_with_snapshots().await;
-
-    // Get the timestamp of snapshot 2
-    let batches = sql_context
-        .sql("SELECT snapshot_id, commit_time FROM paimon.test_db.`t1$snapshots` ORDER BY snapshot_id")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
-    let snap2_time = batches[0]
-        .column_by_name("commit_time")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<datafusion::arrow::array::TimestampMillisecondArray>()
-        .unwrap()
-        .value(1);
-
-    exec(
-        &sql_context,
-        &format!(
-            "CALL sys.create_tag_from_timestamp(table => 'test_db.t1', tag => 'ts_tag', timestamp => '{snap2_time}')"
-        ),
-    )
-    .await;
-
-    let count = row_count(
-        &sql_context,
-        "SELECT * FROM paimon.test_db.`t1$tags` WHERE tag_name = 'ts_tag'",
-    )
-    .await;
-    assert_eq!(count, 1);
+    let (tmp, sql_context) = setup_table_with_snapshot_times().await;
+    for (tag, timestamp, expected_snapshot) in [
+        ("before_first", SNAPSHOT_TIMES[0] - 1, 1),
+        ("between", SNAPSHOT_TIMES[1] - 1, 2),
+        ("exact", SNAPSHOT_TIMES[1], 2),
+    ] {
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag_from_timestamp(table => 'test_db.t1', tag => '{tag}', timestamp => '{timestamp}')"
+            ),
+        )
+        .await;
+        assert_eq!(read_tag(tmp.path(), tag)["id"], expected_snapshot);
+        let batches = sql_context
+            .sql(&format!(
+                "SELECT snapshot_id FROM paimon.test_db.`t1$tags` WHERE tag_name = '{tag}'"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            expected_snapshot
+        );
+    }
 }
 
 #[tokio::test]
@@ -3040,4 +3072,345 @@ async fn test_rollback_cleans_newer_tags() {
 
     let count = row_count(&sql_context, "SELECT * FROM paimon.test_db.`t1$tags`").await;
     assert_eq!(count, 0);
+}
+
+async fn compact_counts(
+    sql_context: &paimon_datafusion::SQLContext,
+    sql: &str,
+) -> (i64, i64, i64, i64) {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+    let value = |name: &str| {
+        batches[0]
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    (
+        value("tasks"),
+        value("files_removed"),
+        value("files_added"),
+        value("rows_written"),
+    )
+}
+
+async fn latest_commit_kind(sql_context: &paimon_datafusion::SQLContext, table: &str) -> String {
+    let batches = sql_context
+        .sql(&format!(
+            "SELECT commit_kind FROM paimon.test_db.`{table}$snapshots` ORDER BY snapshot_id DESC LIMIT 1"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    string_value(batches[0].column(0).as_ref(), 0).to_string()
+}
+
+#[tokio::test]
+async fn test_compact_append_table() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t (id INT, name VARCHAR(100)) WITH (\
+            'write-only' = 'true',\
+            'compaction.min.file-num' = '2'\
+         )",
+    )
+    .await;
+    for (id, name) in [(1, "a"), (2, "b"), (3, "c")] {
+        exec(
+            &sql_context,
+            &format!("INSERT INTO paimon.test_db.t VALUES ({id}, '{name}')"),
+        )
+        .await;
+    }
+    let files = "SELECT * FROM paimon.test_db.`t$files`";
+    assert_eq!(row_count(&sql_context, files).await, 3);
+
+    let (tasks, removed, added, rows) =
+        compact_counts(&sql_context, "CALL sys.compact(table => 'test_db.t')").await;
+    assert_eq!((tasks, removed, added, rows), (1, 3, 1, 3));
+    assert_eq!(row_count(&sql_context, files).await, 1);
+    assert_eq!(latest_commit_kind(&sql_context, "t").await, "COMPACT");
+    assert_eq!(
+        collect_id_name(&sql_context, "SELECT id, name FROM paimon.test_db.t").await,
+        vec![(1, "a".into()), (2, "b".into()), (3, "c".into())]
+    );
+
+    let snapshots = "SELECT * FROM paimon.test_db.`t$snapshots`";
+    let before = row_count(&sql_context, snapshots).await;
+    let (tasks, removed, added, rows) =
+        compact_counts(&sql_context, "CALL sys.compact(table => 'test_db.t')").await;
+    assert_eq!((tasks, removed, added, rows), (0, 0, 0, 0));
+    assert_eq!(row_count(&sql_context, snapshots).await, before);
+}
+
+#[tokio::test]
+async fn test_compact_primary_key_table_merges_updates() {
+    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice2')",
+    )
+    .await;
+    let files = "SELECT * FROM paimon.test_db.`t1$files`";
+    assert_eq!(row_count(&sql_context, files).await, 4);
+
+    let (tasks, removed, added, rows) =
+        compact_counts(&sql_context, "CALL sys.compact(table => 'test_db.t1')").await;
+    assert_eq!((tasks, removed, added, rows), (1, 4, 1, 3));
+    assert_eq!(row_count(&sql_context, files).await, 1);
+    assert_eq!(latest_commit_kind(&sql_context, "t1").await, "COMPACT");
+    assert_eq!(
+        collect_id_name(&sql_context, "SELECT id, name FROM paimon.test_db.t1").await,
+        vec![
+            (1, "alice2".into()),
+            (2, "bob".into()),
+            (3, "charlie".into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_compact_partitions_preserve_other_partitions() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+    for (table, primary_key, options, kept_in_a) in [
+        (
+            "append_t",
+            "",
+            "'write-only' = 'true', 'compaction.min.file-num' = '2'",
+            0,
+        ),
+        ("pk_t", ", PRIMARY KEY (id, dt)", "'bucket' = '1'", 1),
+    ] {
+        exec(
+            &sql_context,
+            &format!(
+                "CREATE TABLE paimon.test_db.{table} (id INT, name VARCHAR(100), dt VARCHAR(10)\
+                 {primary_key}) PARTITIONED BY (dt) WITH ({options})"
+            ),
+        )
+        .await;
+        for dt in ["a", "b"] {
+            for id in [1, 2] {
+                exec(
+                    &sql_context,
+                    &format!("INSERT INTO paimon.test_db.{table} VALUES ({id}, 'n{id}', '{dt}')"),
+                )
+                .await;
+            }
+        }
+        let files_in = |dt: &str| {
+            format!("SELECT * FROM paimon.test_db.`{table}$files` WHERE partition = '{{{dt}}}'")
+        };
+        assert_eq!(row_count(&sql_context, &files_in("a")).await, 2);
+        assert_eq!(row_count(&sql_context, &files_in("b")).await, 2);
+
+        let (tasks, removed, added, _) = compact_counts(
+            &sql_context,
+            &format!("CALL sys.compact(table => 'test_db.{table}', partitions => 'dt=a')"),
+        )
+        .await;
+        assert_eq!((tasks, removed, added), (1, 2, 1), "{table}");
+        assert_eq!(row_count(&sql_context, &files_in("a")).await, 1);
+        assert_eq!(row_count(&sql_context, &files_in("b")).await, 2);
+
+        exec(
+            &sql_context,
+            &format!("INSERT INTO paimon.test_db.{table} VALUES (3, 'n3', 'a')"),
+        )
+        .await;
+        let snapshots = format!("SELECT * FROM paimon.test_db.`{table}$snapshots`");
+        let before = row_count(&sql_context, &snapshots).await;
+        let (tasks, removed, added, _) = compact_counts(
+            &sql_context,
+            &format!("CALL sys.compact(table => 'test_db.{table}', partitions => 'dt=a;dt=b')"),
+        )
+        .await;
+        assert_eq!((tasks, removed, added), (2, 4 - kept_in_a, 2), "{table}");
+        assert_eq!(row_count(&sql_context, &snapshots).await, before + 1);
+        assert_eq!(
+            row_count(&sql_context, &files_in("a")).await,
+            1 + kept_in_a as usize
+        );
+        assert_eq!(row_count(&sql_context, &files_in("b")).await, 1);
+    }
+}
+
+#[tokio::test]
+async fn test_compact_task_failure_deletes_unsubmitted_files() {
+    let (tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t (id INT, dt VARCHAR(10)) PARTITIONED BY (dt) WITH (\
+            'write-only' = 'true',\
+            'compaction.min.file-num' = '2'\
+         )",
+    )
+    .await;
+    for dt in ["a", "b"] {
+        for id in [1, 2] {
+            exec(
+                &sql_context,
+                &format!("INSERT INTO paimon.test_db.t VALUES ({id}, '{dt}')"),
+            )
+            .await;
+        }
+    }
+    let bucket = |dt: &str| tmp.path().join(format!("test_db.db/t/dt={dt}/bucket-0"));
+    let corrupted = std::fs::read_dir(bucket("b"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(corrupted, b"corrupted").unwrap();
+    let snapshots = "SELECT * FROM paimon.test_db.`t$snapshots`";
+    let before = row_count(&sql_context, snapshots).await;
+
+    let result = match sql_context
+        .sql("CALL sys.compact(table => 'test_db.t')")
+        .await
+    {
+        Ok(df) => df.collect().await.map(|_| ()),
+        Err(error) => Err(error),
+    };
+    assert!(result.is_err());
+    assert_eq!(row_count(&sql_context, snapshots).await, before);
+    assert_eq!(std::fs::read_dir(bucket("a")).unwrap().count(), 2);
+}
+
+#[tokio::test]
+async fn test_compact_honors_session_memory_limit() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t (id INT) WITH (\
+            'write-only' = 'true',\
+            'compaction.min.file-num' = '2'\
+         )",
+    )
+    .await;
+    for id in [1, 2] {
+        exec(
+            &sql_context,
+            &format!("INSERT INTO paimon.test_db.t VALUES ({id})"),
+        )
+        .await;
+    }
+    let runtime_env = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(GreedyMemoryPool::new(1)))
+        .build_arc()
+        .unwrap();
+    let mut limited = paimon_datafusion::SQLContext::builder()
+        .with_runtime_env(runtime_env)
+        .build();
+    limited.register_catalog("paimon", catalog).await.unwrap();
+    let snapshots = "SELECT * FROM paimon.test_db.`t$snapshots`";
+    let before = row_count(&sql_context, snapshots).await;
+
+    assert_sql_error(
+        &limited,
+        "CALL sys.compact(table => 'test_db.t')",
+        "Resources exhausted",
+    )
+    .await;
+    assert_eq!(row_count(&sql_context, snapshots).await, before);
+}
+
+#[tokio::test]
+async fn test_compact_data_evolution_table_keeps_deletions() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t (id INT NOT NULL, name VARCHAR(100)) WITH (\
+            'row-tracking.enabled' = 'true',\
+            'data-evolution.enabled' = 'true',\
+            'deletion-vectors.enabled' = 'true',\
+            'write-only' = 'true',\
+            'compaction.min.file-num' = '2'\
+         )",
+    )
+    .await;
+    for (id, name) in [(1, "a"), (2, "b"), (3, "c")] {
+        exec(
+            &sql_context,
+            &format!("INSERT INTO paimon.test_db.t (id, name) VALUES ({id}, '{name}')"),
+        )
+        .await;
+    }
+    exec(&sql_context, "DELETE FROM paimon.test_db.t WHERE id = 2").await;
+
+    let (tasks, removed, added, rows) =
+        compact_counts(&sql_context, "CALL sys.compact(table => 'test_db.t')").await;
+    assert_eq!((tasks, removed, added, rows), (1, 3, 1, 3));
+    assert_eq!(latest_commit_kind(&sql_context, "t").await, "COMPACT");
+    assert_eq!(
+        collect_id_name(&sql_context, "SELECT id, name FROM paimon.test_db.t").await,
+        vec![(1, "a".into()), (3, "c".into())]
+    );
+}
+
+#[tokio::test]
+async fn test_compact_lookup_table_requires_local_cache() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH (\
+            'bucket' = '1',\
+            'changelog-producer' = 'lookup',\
+            'write-only' = 'true'\
+         )",
+    )
+    .await;
+    for (id, name) in [(1, "a"), (2, "b")] {
+        exec(
+            &sql_context,
+            &format!("INSERT INTO paimon.test_db.t VALUES ({id}, '{name}')"),
+        )
+        .await;
+    }
+    let snapshots = "SELECT * FROM paimon.test_db.`t$snapshots`";
+    let before = row_count(&sql_context, snapshots).await;
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.compact(table => 'test_db.t')",
+        "requires local-cache.enabled=true",
+    )
+    .await;
+    assert_eq!(row_count(&sql_context, snapshots).await, before);
+}
+
+#[tokio::test]
+async fn test_compact_rejects_invalid_arguments() {
+    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+    let snapshots = "SELECT * FROM paimon.test_db.`t1$snapshots`";
+    let before = row_count(&sql_context, snapshots).await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.compact(table => 'test_db.t1', partitions => 'id=1')",
+        "Cannot filter partitions on an unpartitioned table",
+    )
+    .await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.compact(table => 'test_db.t1', order_by => 'id')",
+        "Argument order_by is unknown. Expected one of [table, partitions].",
+    )
+    .await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.compact()",
+        "Missing required argument: 'table'",
+    )
+    .await;
+    assert_eq!(row_count(&sql_context, snapshots).await, before);
 }

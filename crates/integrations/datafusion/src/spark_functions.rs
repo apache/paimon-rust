@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::arrow::array::{new_empty_array, ArrayRef, BooleanArray};
-use datafusion::arrow::compute::filter;
+use datafusion::arrow::array::{new_empty_array, Array, ArrayRef, BooleanArray, Int32Array};
+use datafusion::arrow::compute::kernels::length::length;
+use datafusion::arrow::compute::{cast, filter};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, TimeUnit};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::utils::SingleRowListArrayBuilder;
@@ -33,9 +34,18 @@ use datafusion::logical_expr::{
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 
-// Adapt input and return types while retaining upstream evaluation and simplification.
+// Adapt input and return types while retaining upstream behavior.
 pub(crate) fn apply_compatibility_fixes(ctx: &SessionContext) {
+    // Use the compatibility rewrite for Spark's optional ignoreNulls argument
+    // and default RESPECT NULLS semantics. DataFusion 55's native UDAF ignores nulls.
+    ctx.deregister_udaf("any_value");
     ctx.register_udf(date_part().as_ref().clone());
+    for bits in [false, true] {
+        ctx.register_udf(ScalarUDF::from(ByteLength {
+            bits,
+            signature: Signature::user_defined(datafusion::logical_expr::Volatility::Immutable),
+        }));
+    }
     for name in [
         "base64",
         "sha2",
@@ -48,6 +58,8 @@ pub(crate) fn apply_compatibility_fixes(ctx: &SessionContext) {
         "unhex",
         "hour",
         "size",
+        "length",
+        "substring",
     ] {
         let inner = Arc::clone(&ctx.state().scalar_functions()[name]);
         ctx.register_udf(ScalarUDF::from(Inputs::new(inner)));
@@ -65,13 +77,94 @@ fn date_part() -> Arc<ScalarUDF> {
 }
 
 #[derive(Debug)]
-pub(crate) struct DatePartPlanner;
+pub(crate) struct FunctionPlanner;
 
-impl ExprPlanner for DatePartPlanner {
+impl ExprPlanner for FunctionPlanner {
     fn plan_extract(&self, args: Vec<Expr>) -> Result<PlannerResult<Vec<Expr>>> {
         Ok(PlannerResult::Planned(Expr::ScalarFunction(
             ScalarFunction::new_udf(date_part(), args),
         )))
+    }
+    fn plan_substring(&self, args: Vec<Expr>) -> Result<PlannerResult<Vec<Expr>>> {
+        Ok(PlannerResult::Planned(Expr::ScalarFunction(
+            ScalarFunction::new_udf(
+                Arc::new(ScalarUDF::from(Inputs::new(
+                    datafusion_spark::function::string::substring(),
+                ))),
+                args,
+            ),
+        )))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ByteLength {
+    bits: bool,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for ByteLength {
+    fn name(&self) -> &str {
+        if self.bits {
+            "bit_length"
+        } else {
+            "octet_length"
+        }
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn coerce_types(&self, types: &[DataType]) -> Result<Vec<DataType>> {
+        let [ty] = types else {
+            return Err(DataFusionError::Plan(format!(
+                "{} expects one argument",
+                self.name()
+            )));
+        };
+        Ok(vec![match decoded(ty) {
+            DataType::Null => DataType::Utf8,
+            DataType::FixedSizeBinary(_) => DataType::Binary,
+            ty if ty.is_binary()
+                || matches!(
+                    ty,
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                ) =>
+            {
+                ty.clone()
+            }
+            ty => {
+                return Err(DataFusionError::Plan(format!(
+                    "{} requires string or binary, got {ty}",
+                    self.name()
+                )))
+            }
+        }])
+    }
+    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Int32)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let arrays = ColumnarValue::values_to_arrays(&args.args)?;
+        let lengths = cast(&length(arrays[0].as_ref())?, &DataType::Int32)?;
+        let output: ArrayRef = if self.bits {
+            let lengths = lengths.as_any().downcast_ref::<Int32Array>().unwrap();
+            Arc::new(
+                lengths
+                    .iter()
+                    .map(|v| v.map(|n| n.wrapping_mul(8)))
+                    .collect::<Int32Array>(),
+            )
+        } else {
+            lengths
+        };
+        if matches!(args.args[0], ColumnarValue::Scalar(_)) {
+            Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                output.as_ref(),
+                0,
+            )?))
+        } else {
+            Ok(ColumnarValue::Array(output))
+        }
     }
 }
 
@@ -207,9 +300,6 @@ impl FilteredGroups {
     }
 }
 impl GroupsAccumulator for FilteredGroups {
-    fn supports_convert_to_state(&self) -> bool {
-        self.0.supports_convert_to_state()
-    }
     fn convert_to_state(
         &self,
         values: &[ArrayRef],
@@ -231,19 +321,8 @@ impl GroupsAccumulator for FilteredGroups {
             self.0.update_batch(values, groups, None, total)
         }
     }
-    fn merge_batch(
-        &mut self,
-        values: &[ArrayRef],
-        groups: &[usize],
-        predicate: Option<&BooleanArray>,
-        total: usize,
-    ) -> Result<()> {
-        if let Some(predicate) = predicate {
-            let (values, groups) = Self::filter(values, groups, predicate)?;
-            self.0.merge_batch(&values, &groups, None, total)
-        } else {
-            self.0.merge_batch(values, groups, None, total)
-        }
+    fn merge_batch(&mut self, values: &[ArrayRef], groups: &[usize], total: usize) -> Result<()> {
+        self.0.merge_batch(values, groups, total)
     }
     fn evaluate(&mut self, emit: EmitTo) -> Result<ArrayRef> {
         self.0.evaluate(emit)
@@ -262,17 +341,19 @@ struct Inputs {
 }
 impl Inputs {
     fn new(inner: Arc<ScalarUDF>) -> Self {
-        Self {
-            signature: Signature::user_defined(inner.signature().volatility),
-            inner,
-        }
+        let mut signature = Signature::user_defined(inner.signature().volatility);
+        signature.parameter_names = inner.signature().parameter_names.clone();
+        Self { signature, inner }
     }
 }
 fn decoded(mut ty: &DataType) -> &DataType {
-    while let DataType::Dictionary(_, value) = ty {
-        ty = value;
+    loop {
+        ty = match ty {
+            DataType::Dictionary(_, value) => value,
+            DataType::RunEndEncoded(_, value) => value.data_type(),
+            _ => return ty,
+        };
     }
-    ty
 }
 impl ScalarUDFImpl for Inputs {
     fn name(&self) -> &str {
@@ -290,6 +371,11 @@ impl ScalarUDFImpl for Inputs {
             .map(|ty| decoded(ty).clone())
             .collect::<Vec<_>>();
         match (self.name(), types.as_mut_slice()) {
+            ("length" | "substring", [value, ..])
+                if matches!(value, DataType::FixedSizeBinary(_)) =>
+            {
+                *value = DataType::Binary;
+            }
             ("hex", [value]) if *value == DataType::BinaryView => *value = DataType::Binary,
             ("sha2", [value, _]) if matches!(value, DataType::FixedSizeBinary(_)) => {
                 *value = DataType::Binary;

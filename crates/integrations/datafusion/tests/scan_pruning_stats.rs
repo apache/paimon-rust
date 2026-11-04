@@ -355,9 +355,8 @@ async fn test_physical_plan_displays_scan_stats_summary() {
 /// files here are exactly the shapes the writer produces for the two ways the
 /// rule breaks: `[1.0, NaN]` reports `min == max == 1.0` over two rows because
 /// NaN goes into neither min/max nor the null count, and a file holding only
-/// `-0.0` reports `min = -0.0, max = 0.0`, which `Datum` sees as equal to `0.0`
-/// while the row-level filter does not. Pruning either file drops a row the
-/// filter would have returned.
+/// `-0.0` reports `min = -0.0, max = 0.0`. Keep pruning conservative for both
+/// layouts and let DataFusion apply its own NaN and signed-zero semantics.
 #[tokio::test]
 async fn test_not_equal_keeps_float_files_with_nan_or_signed_zero() {
     let (_tmp, catalog) = common::create_test_env();
@@ -395,11 +394,11 @@ async fn test_not_equal_keeps_float_files_with_nan_or_signed_zero() {
             "SELECT id FROM paimon.test_db.stats_float WHERE d <> 1.0 ORDER BY id",
             vec![2, 3],
         ),
-        // `-0.0` is not `0.0` to the filter, so row 3 survives; rows 1 and 2 are
-        // kept as well because `1.0 <> 0.0` and NaN is not `0.0` either.
+        // DataFusion 55 treats signed zeroes as equal, matching its native
+        // in-memory reader; NaN and 1.0 still differ from zero.
         (
             "SELECT id FROM paimon.test_db.stats_float WHERE d <> 0.0 ORDER BY id",
-            vec![1, 2, 3],
+            vec![1, 2],
         ),
         (
             "SELECT id FROM paimon.test_db.stats_float WHERE d NOT IN (1.0, 2.0) ORDER BY id",
@@ -421,5 +420,129 @@ async fn test_not_equal_keeps_float_files_with_nan_or_signed_zero() {
             }
         }
         assert_eq!(ids, expected, "wrong rows for `{sql}`");
+    }
+}
+
+/// DataFusion 55 compares both zero signs as equal. Paimon's own predicates
+/// retain Arrow/Java total-order semantics, including when pruning partitions.
+/// Compare against an unfiltered in-memory copy so an inexact pushdown cannot
+/// silently remove rows before DataFusion applies its residual.
+#[tokio::test]
+async fn test_float_zero_pushdown_matches_native_datafusion() {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::Int32Array;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+
+    fn ids(batches: &[RecordBatch]) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    let (_tmp, catalog) = common::create_test_env();
+    let sql_context = common::create_sql_context(catalog).await;
+    common::exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    for (name, partitioning) in [
+        ("zero_data", ""),
+        ("zero_partitions", "PARTITIONED BY (f, d)"),
+    ] {
+        common::exec(
+            &sql_context,
+            &format!(
+                "CREATE TABLE paimon.test_db.{name} \
+                 (id INT, f FLOAT, d DOUBLE, items ARRAY<DOUBLE>) {partitioning}"
+            ),
+        )
+        .await;
+        common::exec(
+            &sql_context,
+            &format!(
+                "INSERT INTO paimon.test_db.{name} VALUES \
+                 (1, CAST(-0.0 AS FLOAT), CAST(-0.0 AS DOUBLE), [CAST(-0.0 AS DOUBLE)]), \
+                 (2, CAST(0.0 AS FLOAT), CAST(0.0 AS DOUBLE), [CAST(0.0 AS DOUBLE)]), \
+                 (3, -1.0, -1.0, [-1.0]), (4, 1.0, 1.0, [1.0]), \
+                 (5, CAST('NaN' AS FLOAT), CAST('NaN' AS DOUBLE), [CAST('NaN' AS DOUBLE)]), \
+                 (6, NULL, NULL, NULL)"
+            ),
+        )
+        .await;
+        let batches = sql_context
+            .sql(&format!("SELECT * FROM paimon.test_db.{name}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let native = SessionContext::new();
+        native
+            .register_table(
+                "native",
+                Arc::new(MemTable::try_new(batches[0].schema(), vec![batches]).unwrap()),
+            )
+            .unwrap();
+
+        let mut predicates = Vec::new();
+        for column in ["f", "d"] {
+            for zero in ["0.0", "-0.0"] {
+                for operator in ["=", "<>", "<", "<=", ">", ">="] {
+                    predicates.push(format!("{column} {operator} {zero}"));
+                }
+                predicates.extend([
+                    format!("{zero} = {column}"),
+                    format!("{column} IN ({zero}, 1.0)"),
+                    format!("{column} NOT IN ({zero}, 1.0)"),
+                    format!("{column} BETWEEN {zero} AND 1.0"),
+                    format!("{column} BETWEEN -1.0 AND {zero}"),
+                    format!("{column} NOT BETWEEN {zero} AND 1.0"),
+                    format!("{column} NOT BETWEEN -1.0 AND {zero}"),
+                    format!("NOT ({column} = {zero})"),
+                    format!("NOT ({column} <= {zero})"),
+                    format!("{column} = {zero} AND id > 0"),
+                    format!("{column} = {zero} OR id = 4"),
+                ]);
+            }
+        }
+        // Array membership continues to distinguish zero signs in DataFusion 55.
+        for function in ["array_has", "array_has_any", "array_has_all"] {
+            let needle = if function == "array_has" {
+                "0.0"
+            } else {
+                "[0.0]"
+            };
+            predicates.push(format!("{function}(items, {needle})"));
+        }
+        for predicate in predicates {
+            let actual = sql_context
+                .sql(&format!(
+                    "SELECT id FROM paimon.test_db.{name} WHERE {predicate} ORDER BY id"
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let expected = native
+                .sql(&format!(
+                    "SELECT id FROM native WHERE {predicate} ORDER BY id"
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(ids(&actual), ids(&expected), "{name}: {predicate}");
+        }
     }
 }

@@ -169,21 +169,13 @@ impl RESTApi {
         )?;
 
         let options = if config_required {
-            let warehouse = options.get(CatalogOptions::WAREHOUSE).ok_or_else(|| {
-                crate::Error::ConfigInvalid {
-                    message: "Warehouse name cannot be empty".to_string(),
-                }
-            })?;
-
-            if warehouse.trim().is_empty() {
-                return Err(crate::Error::ConfigInvalid {
-                    message: "Warehouse name cannot be empty".to_string(),
-                });
-            }
-
-            // Pass the warehouse raw: the client and the signer each encode it once.
-            let query_params: Vec<(&str, String)> =
-                vec![(CatalogOptions::WAREHOUSE, warehouse.to_string())];
+            // Match Java: omit missing or empty warehouse query parameters.
+            let query_params: Vec<(&str, String)> = options
+                .get(CatalogOptions::WAREHOUSE)
+                .filter(|warehouse| !warehouse.is_empty())
+                .map(|warehouse| (CatalogOptions::WAREHOUSE, warehouse.clone()))
+                .into_iter()
+                .collect();
             let config_response: ConfigResponse = client
                 .get(&ResourcePaths::config(), Some(&query_params))
                 .await?;

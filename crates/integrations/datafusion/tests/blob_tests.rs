@@ -565,6 +565,10 @@ async fn test_merge_into_updates_non_blob_on_descriptor_table() {
     )
     .await;
 
+    // Updating name must not resolve unrelated external BLOB payloads.
+    std::fs::remove_file(tmp.path().join("first.bin")).unwrap();
+    std::fs::remove_file(tmp.path().join("second.bin")).unwrap();
+
     exec(
         &sql_context,
         "CREATE TEMPORARY TABLE paimon.test_db.src AS SELECT * FROM (VALUES (1, 'Updated')) AS t(id, name)",

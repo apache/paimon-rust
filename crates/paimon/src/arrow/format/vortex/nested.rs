@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Read complete ROWs without Vortex 0.75's recursive StructReader projection.
-//! Each ROW has independent validity; a null child must not null its parent.
+//! Read complete ROWs with independent validity, including older Vortex layouts.
+//! A null child must not null its parent during recursive field projection.
 
 use super::CurrentThreadRuntime;
 use crate::{Error, Result};
@@ -54,6 +54,13 @@ pub(super) fn read_array(
         file.footer().layout(),
         Some(names),
     )
+}
+
+fn child(layout: &LayoutRef, slot: usize) -> Result<LayoutRef> {
+    layout
+        .slot(slot)
+        .map_err(invalid)?
+        .ok_or_else(|| invalid(format!("missing layout child slot {slot}")))
 }
 
 fn projected_dtype(dtype: &DType, names: Option<&[String]>) -> Result<DType> {
@@ -101,7 +108,7 @@ fn read_layout(
                 runtime,
                 session,
                 source.clone(),
-                &layout.child(0).map_err(invalid)?,
+                &child(layout, 0)?,
                 None,
             )?)
         } else {
@@ -112,9 +119,7 @@ fn read_layout(
             let index = original
                 .find(name)
                 .ok_or_else(|| invalid(format!("missing root field {name}")))?;
-            let child = layout
-                .child(index + usize::from(nullable))
-                .map_err(invalid)?;
+            let child = child(layout, index + 1)?;
             columns.push(read_layout(runtime, session, source.clone(), &child, None)?);
         }
         return StructArray::try_new(
@@ -133,7 +138,7 @@ fn read_layout(
                 runtime,
                 session,
                 source.clone(),
-                &layout.child(index).map_err(invalid)?,
+                &child(layout, index)?,
                 roots,
             )?);
         }
@@ -143,28 +148,19 @@ fn read_layout(
     }
     if layout.is::<Dict>() {
         // Values use dictionary coordinates, codes use row coordinates.
-        let values = read_layout(
-            runtime,
-            session,
-            source.clone(),
-            &layout.child(0).map_err(invalid)?,
-            roots,
-        )?;
-        let codes = read_layout(
-            runtime,
-            session,
-            source,
-            &layout.child(1).map_err(invalid)?,
-            None,
-        )?;
+        let values = read_layout(runtime, session, source.clone(), &child(layout, 0)?, roots)?;
+        let codes = read_layout(runtime, session, source, &child(layout, 1)?, None)?;
         return DictArray::try_new(codes, values)
             .map(IntoArray::into_array)
             .map_err(invalid);
     }
     // Zone maps wrap data without changing its schema or row coordinates.
-    for (index, kind) in layout.child_types().enumerate() {
-        if matches!(kind, LayoutChildType::Transparent(_)) {
-            let child = layout.child(index).map_err(invalid)?;
+    for index in 0..layout.nslots() {
+        if matches!(
+            layout.slot_type(index),
+            Some(LayoutChildType::Transparent(_))
+        ) {
+            let child = child(layout, index)?;
             if child.dtype() == layout.dtype() && child.row_count() == layout.row_count() {
                 return read_layout(runtime, session, source, &child, roots);
             }
@@ -217,11 +213,10 @@ fn read_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vortex::array::dtype::arrow::FromArrowType;
+    use vortex::arrow::ArrowSessionExt;
     use vortex::io::session::RuntimeSessionExt;
     use vortex::layout::layouts::chunked::ChunkedLayout;
     use vortex::layout::segments::{SegmentFuture, SegmentId};
-    use vortex::layout::IntoLayout;
     use vortex::layout::LayoutChildren;
     use vortex::VortexSessionDefault;
 
@@ -258,10 +253,14 @@ mod tests {
                 true,
             ),
         ]));
-        let layout =
-            ChunkedLayout::new(0, DType::from_arrow(schema.clone()), Arc::new(Empty)).into_layout();
         let runtime = CurrentThreadRuntime::new();
         let session = VortexSession::default().with_handle(runtime.handle());
+        let layout = ChunkedLayout::new(
+            0,
+            session.arrow().from_arrow_schema(&schema).unwrap(),
+            Arc::new(Empty),
+        )
+        .into_layout();
         let array = read_layout(
             &runtime,
             &session,

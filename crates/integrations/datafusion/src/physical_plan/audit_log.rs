@@ -19,10 +19,16 @@
 
 use std::sync::Arc;
 
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{stats::Precision, Statistics};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_plan::{DisplayAs, ExecutionPlan, PlanProperties};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, DisplayAs, ExecutionPlan, PlanProperties, ReplaceChildrenOptions,
+    StatisticsArgs,
+};
 use paimon::table::AuditLogRead;
 
 use super::PaimonTableScan;
@@ -52,9 +58,31 @@ impl ExecutionPlan for PaimonAuditLogScan {
         vec![]
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.inner.metrics()
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        self.inner.apply_expressions(f)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
@@ -69,8 +97,12 @@ impl ExecutionPlan for PaimonAuditLogScan {
         })
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
-        let mut statistics = self.inner.partition_statistics(partition)?;
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> DFResult<Arc<Statistics>> {
+        let mut statistics = self.inner.statistics_from_inputs(&[], args)?;
         Arc::make_mut(&mut statistics).num_rows = Precision::Absent;
         Ok(statistics)
     }
@@ -202,7 +234,9 @@ mod tests {
         ));
         assert!(result.updated_node.is_none());
         assert_eq!(
-            scan.partition_statistics(None).unwrap().num_rows,
+            scan.statistics_from_inputs(&[], &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
             Precision::Absent
         );
     }
