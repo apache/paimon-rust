@@ -15,8 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import gc
 import io
 import struct
+import sys
+import threading
+import weakref
 
 import pyarrow as pa
 import pytest
@@ -106,6 +110,134 @@ def test_custom_uri_read_error_preserves_original_exception_and_closes_once(tmp_
     finally:
         writer.close()
     assert not list(tmp_path.rglob('*.blob'))
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('source', ['unused', 'shared_reader', 'separate_reader'])
+def test_uri_callback_cycles_release_every_reference_and_close_once(
+        tmp_path, monkeypatch, stream, source):
+    context, table = _table(tmp_path)
+    references = []
+    closes = []
+    unraisable = []
+    monkeypatch.setattr(sys, 'unraisablehook',
+                        lambda event: unraisable.append(str(event.exc_value)))
+
+    class Stream:
+        def __init__(self):
+            self.buffer = io.BytesIO(b'0123456789')
+
+        def read(self, length):
+            return self.buffer.read(length)
+
+        def seek(self, offset):
+            return self.buffer.seek(offset)
+
+        def close(self):
+            closes.append(threading.get_ident())
+            # Cleanup callbacks may call Native without nesting its runtime.
+            context.sql('SELECT 1')
+            self.buffer.close()
+
+    class Reader:
+        def __init__(self, writer):
+            self.writer = writer
+            references.append(weakref.ref(self))
+
+        def new_input_stream(self, uri):
+            value = Stream()
+            value.writer = self.writer
+            references.append(weakref.ref(value))
+            return value
+
+    class Factory(Reader):
+        def create(self, uri):
+            return Reader(self.writer) if source == 'separate_reader' else self
+
+    def cycle():
+        builder = (table.new_stream_write_builder() if stream
+                   else table.new_batch_write_builder())
+        writer = builder.new_write()
+        factory = Factory(writer)
+        writer.with_blob_uri_reader_factory(factory)
+        if source != 'unused':
+            writer.write_arrow(_batch([1], [descriptor(0, 3)]))
+
+    gc.collect()
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        cycle()
+        collector = threading.Thread(target=gc.collect)
+        collector.start()
+        collector.join()
+        assert unraisable == []
+        assert all(reference() is None for reference in references)
+        assert closes == ([] if source == 'unused' else [collector.ident])
+    finally:
+        for reference in references:
+            value = reference()
+            if value is not None:
+                value.writer.close()
+        gc.collect()
+        if enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_uri_references_retire_after_prepare_and_rejected_replacement(tmp_path, stream):
+    _, table = _table(tmp_path)
+    builder = (table.new_stream_write_builder() if stream
+               else table.new_batch_write_builder())
+    writer = builder.new_write()
+    readers = []
+    streams = []
+
+    class Reader(ReaderFactory):
+        def new_input_stream(self, uri):
+            value = super().new_input_stream(uri)
+            streams.append(weakref.ref(value))
+            return value
+
+    class Factory:
+        def create(self, uri):
+            reader = Reader()
+            readers.append(weakref.ref(reader))
+            return reader
+
+    factory = Factory()
+    writer.with_blob_uri_reader_factory(factory)
+    try:
+        replacement = Factory()
+        retired = weakref.ref(factory)
+        del factory
+        writer.with_blob_uri_reader_factory(replacement)
+        assert retired() is None
+        retired = weakref.ref(replacement)
+        del replacement
+        writer.with_blob_uri_reader_factory(None)
+        assert retired() is None
+        writer.with_blob_uri_reader_factory(Factory())
+        writer.write_arrow(_batch([1], [descriptor(0, 3)]))
+        assert readers[0]() is not None
+        assert streams[0]() is not None
+        rejected = Factory()
+        retired = weakref.ref(rejected)
+        with pytest.raises(ValueError, match='before any write'):
+            writer.with_blob_uri_reader_factory(rejected)
+        del rejected
+        assert retired() is None
+        writer.prepare_commit(True, 1) if stream else writer.prepare_commit()
+        gc.collect()
+        assert all(reference() is None for reference in readers + streams)
+    finally:
+        writer.close()
+    rejected = Factory()
+    retired = weakref.ref(rejected)
+    with pytest.raises(RuntimeError, match='closed'):
+        writer.with_blob_uri_reader_factory(rejected)
+    del rejected
+    assert retired() is None
 
 
 def _update_table(tmp_path):

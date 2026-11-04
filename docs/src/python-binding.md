@@ -180,6 +180,25 @@ Builder filters, projections, and limits still apply.
 both batch and streaming splits to Java binary encoding, preserving the streaming
 flag.
 
+For continuous reads, `new_stream_scan()` returns a stateful scan that starts
+from `scan.mode`. See [Streaming Reading](streaming-reading.md) for startup
+modes, checkpoints, and row kinds:
+
+```python
+rb = table.new_read_builder({"scan.mode": "from-snapshot", "scan.snapshot-id": "5"})
+scan = rb.new_stream_scan()
+read = rb.with_include_row_kind(True).new_read()
+plan = scan.plan()
+if plan is not None:
+    batches = read.read(plan.splits())
+    # Process batches, then acknowledge the progress.
+    scan.notify_checkpoint_complete(scan.checkpoint())
+```
+
+`new_scan()` and `new_incremental_scan()` raise when a time-travel selector
+resolves to no snapshot, while `new_stream_scan()` resolves its start at the
+first plan, so snapshot 5 may also be the next commit or an expired one.
+
 For append and Data Evolution tables, select half-open row positions or one
 balanced shard on a scan:
 
@@ -456,6 +475,7 @@ rb = table.new_read_builder({"scan.tag-name": "release-1.0"})
 
 !!! warning
     Only one time-travel selector may be set. Providing multiple selectors will raise a `ValueError`.
+    A selector that resolves to no snapshot raises a `ValueError` from `new_scan()` and `new_incremental_scan()`.
 
 `scan.timestamp` selects the latest snapshot committed at or before the given
 local time. It accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS[.fraction]`, or

@@ -34,14 +34,16 @@ use datafusion::arrow::array::{
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::default_table_source::source_as_provider;
+use datafusion::catalog::Session;
 use datafusion::common::stats::Precision;
-use datafusion::common::tree_node::Transformed;
+use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
 use datafusion::common::{
     internal_err, DFSchemaRef, DataFusionError, JoinType, Result as DFResult, Statistics,
 };
 use datafusion::datasource::TableProvider;
-use datafusion::execution::context::{QueryPlanner, SessionState};
+use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
     Expr, Extension, Filter, LogicalPlan, Projection, TableScan, UserDefinedLogicalNode,
@@ -51,8 +53,8 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    PlanProperties, RecordBatchStream,
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
+    Partitioning, PlanProperties, RecordBatchStream, ReplaceChildrenOptions, StatisticsArgs,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::SessionConfig;
@@ -80,7 +82,7 @@ impl QueryPlanner for PaimonQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &SessionState,
+        session_state: &dyn Session,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let planner = DefaultPhysicalPlanner::with_extension_planners(vec![
             Arc::new(LateralVectorSearchExtensionPlanner),
@@ -418,7 +420,8 @@ impl ExtensionPlanner for LateralVectorSearchExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session_state: &SessionState,
+        session_state: &dyn Session,
+        planning_ctx: &PhysicalPlanningContext,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
         let Some(node) = node.as_any().downcast_ref::<LateralVectorSearchNode>() else {
             return Ok(None);
@@ -431,6 +434,7 @@ impl ExtensionPlanner for LateralVectorSearchExtensionPlanner {
             node.query_vector_expr(),
             logical_inputs[0].schema(),
             session_state,
+            planning_ctx,
         )?;
         let mut exec = LateralVectorSearchExec::new(
             Arc::clone(&physical_inputs[0]),
@@ -475,7 +479,7 @@ struct ExecutionPreparedFilterEntry {
 struct ExecutionPreparedFilterCache {
     // DataFusion passes the same TaskContext Arc to every partition of one
     // execution. Keep the prepared filter alive for that TaskContext so
-    // sequential partitions resolve the same target snapshot. DataFusion 54
+    // sequential partitions resolve the same target snapshot. DataFusion
     // exposes no TaskContext drop hook, so one cache-level reaper observes the
     // weak contexts and removes subset executions after their context dies.
     entries: Mutex<Vec<ExecutionPreparedFilterEntry>>,
@@ -857,9 +861,27 @@ impl ExecutionPlan for LateralVectorSearchExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        datafusion::physical_plan::apply_expression_roots([&self.query_vector_expr], f)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return internal_err!("LateralVectorSearchExec expects one child");
@@ -920,7 +942,11 @@ impl ExecutionPlan for LateralVectorSearchExec {
         })
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Arc<Statistics>> {
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DFResult<Arc<Statistics>> {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,

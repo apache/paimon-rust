@@ -35,7 +35,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 use pyo3::{PyTraverseError, PyVisit};
 
-use crate::blob_uri_reader::{callback_error, optional_uri_reader_factory, to_callback_error};
+use crate::blob_uri_reader::{
+    callback_error, optional_uri_reader_factory, to_callback_error, PythonUriReaderFactory,
+    PythonUriReferences,
+};
 use crate::commit_callback::PyCommitCallbackContext;
 use crate::error::to_py_err;
 use crate::predicate::{dict_to_table_predicate, py_to_datum};
@@ -154,12 +157,13 @@ impl WriteContext {
             None => builder,
         };
         Ok(WriteState {
-            inner: Some(WriteTarget::Table(Box::new(
+            inner: Mutex::new(Some(WriteTarget::Table(Box::new(
                 builder.new_write().map_err(to_py_err)?,
-            ))),
+            )))),
             table_location: self.table.location().to_string(),
             commit_user: self.commit_user.clone(),
             blob_consumers: Vec::new(),
+            uri_references: None,
         })
     }
 }
@@ -559,12 +563,13 @@ impl PyPostponeFixedBucketWriteBuilder {
         }
         Ok(PyBatchTableWrite {
             state: WriteState {
-                inner: Some(WriteTarget::PostponeFixed(Box::new(
+                inner: Mutex::new(Some(WriteTarget::PostponeFixed(Box::new(
                     builder.new_write().map_err(to_py_err)?,
-                ))),
+                )))),
                 table_location: context.table.location().to_string(),
                 commit_user: context.commit_user.clone(),
                 blob_consumers: Vec::new(),
+                uri_references: None,
             },
             prepared: false,
         })
@@ -576,12 +581,15 @@ impl PyPostponeFixedBucketWriteBuilder {
 }
 
 struct WriteState {
-    inner: Option<WriteTarget>,
+    // Encoders are Send but not Sync. PyO3's exclusive borrow protects methods;
+    // get_mut keeps that access lock-free while allowing GC/drop on any thread.
+    inner: Mutex<Option<WriteTarget>>,
     table_location: String,
     commit_user: String,
     // Core keeps prior consumers in captured partition/bucket settings. Expose
     // every owned Python reference to GC, including replaced consumers.
     blob_consumers: Vec<Arc<PythonBlobConsumer>>,
+    uri_references: Option<Arc<PythonUriReferences>>,
 }
 
 /// Descriptor serialization and exception transport only; record boundaries,
@@ -974,17 +982,37 @@ impl UpdateContext {
 }
 
 impl WriteState {
+    fn writer_mut(&mut self) -> PyResult<&mut WriteTarget> {
+        self.inner
+            .get_mut()
+            .unwrap()
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))
+    }
+
     fn with_blob_uri_reader_factory(
         &mut self,
         factory: Option<Py<PyAny>>,
         py: Python<'_>,
     ) -> PyResult<()> {
-        let factory = optional_uri_reader_factory(factory, py)?;
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?
-            .with_blob_uri_reader_factory(factory)
-            .map_err(to_py_err)
+        let factory = factory
+            .map(|factory| {
+                let references = self
+                    .uri_references
+                    .get_or_insert_with(Default::default)
+                    .clone();
+                PythonUriReaderFactory::tracked(factory, py, references)
+                    .map(|factory| Arc::new(factory) as Arc<dyn paimon::io::UriReaderFactory>)
+            })
+            .transpose()?;
+        let result = self.writer_mut().and_then(|writer| {
+            writer
+                .with_blob_uri_reader_factory(factory)
+                .map_err(to_py_err)
+        });
+        // A rejected replacement must release its newly registered Python refs too.
+        self.prune_callbacks();
+        result
     }
 
     fn with_blob_consumer(&mut self, callback: Option<Py<PyAny>>, py: Python<'_>) -> PyResult<()> {
@@ -998,9 +1026,7 @@ impl WriteState {
                 }))
             })
             .transpose()?;
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?
+        self.writer_mut()?
             .with_blob_consumer(
                 consumer
                     .clone()
@@ -1009,18 +1035,21 @@ impl WriteState {
             .map_err(to_py_err)?;
         // Release replaced callbacks which no bucket has captured. A snapshot
         // retained by core contributes another Arc, without another Py ref.
-        self.prune_blob_consumers();
+        self.prune_callbacks();
         if let Some(consumer) = consumer {
             self.blob_consumers.push(consumer);
         }
         Ok(())
     }
 
-    fn prune_blob_consumers(&mut self) {
+    fn prune_callbacks(&mut self) {
         let (retained, retired): (Vec<_>, Vec<_>) = std::mem::take(&mut self.blob_consumers)
             .into_iter()
             .partition(|consumer| Arc::strong_count(consumer) > 1);
         self.blob_consumers = retained;
+        if let Some(references) = &self.uri_references {
+            references.prune();
+        }
         // Python destructors can re-enter Native. No callback mutex is held,
         // and the retained references are restored before any destructor runs.
         drop(retired);
@@ -1029,6 +1058,9 @@ impl WriteState {
     fn traverse_callbacks(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         for consumer in &self.blob_consumers {
             visit.call(&*consumer.callback.lock().unwrap())?;
+        }
+        if let Some(references) = &self.uri_references {
+            references.traverse(visit)?;
         }
         Ok(())
     }
@@ -1039,6 +1071,9 @@ impl WriteState {
             .iter()
             .map(|consumer| consumer.callback.lock().unwrap().take())
             .collect::<Vec<_>>();
+        if let Some(references) = &self.uri_references {
+            references.clear();
+        }
         // Destructors may re-enter Native. Drop Python references outside locks.
         drop(references);
     }
@@ -1048,9 +1083,7 @@ impl WriteState {
     }
 
     fn with_write_type(&mut self, columns: Vec<String>) -> PyResult<()> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?
+        self.writer_mut()?
             .with_write_type(columns)
             .map_err(to_py_err)
     }
@@ -1062,11 +1095,9 @@ impl WriteState {
         bucket: Option<i32>,
     ) -> PyResult<()> {
         let batch = crate::arrow_input::write_batch_from_pyarrow(batch)?;
-        let inner = self
-            .inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?;
+        let inner = self.writer_mut()?;
         let result = py.detach(|| runtime().block_on(inner.write_arrow(&batch, bucket)));
+        self.prune_callbacks();
         self.write_result(result)
     }
 
@@ -1075,12 +1106,9 @@ impl WriteState {
         py: Python<'_>,
         commit_identifier: i64,
     ) -> PyResult<Vec<PyCommitMessage>> {
-        let inner = self
-            .inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?;
+        let inner = self.writer_mut()?;
         let result = py.detach(|| runtime().block_on(inner.prepare_commit(commit_identifier)));
-        self.prune_blob_consumers();
+        self.prune_callbacks();
         let messages = result.map_err(to_callback_error)?;
         Ok(wrap_messages(
             messages,
@@ -1090,11 +1118,7 @@ impl WriteState {
     }
 }
 
-#[pyclass(
-    name = "BatchTableWrite",
-    module = "pypaimon_rust.datafusion",
-    unsendable
-)]
+#[pyclass(name = "BatchTableWrite", module = "pypaimon_rust.datafusion")]
 pub struct PyBatchTableWrite {
     state: WriteState,
     prepared: bool,
@@ -1452,7 +1476,7 @@ impl PyBatchTableWrite {
     }
 
     fn close(&mut self, py: Python<'_>) {
-        if let Some(mut writer) = self.state.inner.take() {
+        if let Some(mut writer) = self.state.inner.get_mut().unwrap().take() {
             py.detach(|| runtime().block_on(writer.close()));
         }
         self.state.clear_callbacks();
@@ -1479,11 +1503,7 @@ impl PyBatchTableWrite {
     }
 }
 
-#[pyclass(
-    name = "StreamTableWrite",
-    module = "pypaimon_rust.datafusion",
-    unsendable
-)]
+#[pyclass(name = "StreamTableWrite", module = "pypaimon_rust.datafusion")]
 pub struct PyStreamTableWrite {
     state: WriteState,
 }
@@ -1527,7 +1547,7 @@ impl PyStreamTableWrite {
     }
 
     fn close(&mut self, py: Python<'_>) {
-        if let Some(mut writer) = self.state.inner.take() {
+        if let Some(mut writer) = self.state.inner.get_mut().unwrap().take() {
             py.detach(|| runtime().block_on(writer.close()));
         }
         self.state.clear_callbacks();
@@ -2428,14 +2448,14 @@ writer.with_blob_consumer(Callback(writer, 'first'))
                 let object = locals.get_item("writer").unwrap().unwrap();
                 if batch {
                     let mut writer = object.extract::<PyRefMut<'_, PyBatchTableWrite>>().unwrap();
-                    let inner = writer.state.inner.as_mut().unwrap();
+                    let inner = writer.state.writer_mut().unwrap();
                     py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
                         .unwrap();
                 } else {
                     let mut writer = object
                         .extract::<PyRefMut<'_, PyStreamTableWrite>>()
                         .unwrap();
-                    let inner = writer.state.inner.as_mut().unwrap();
+                    let inner = writer.state.writer_mut().unwrap();
                     py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
                         .unwrap();
                 }
@@ -2522,7 +2542,7 @@ first = install('first')
                 ])
                 .unwrap();
                 let mut borrowed = writer.borrow_mut(py);
-                let inner = borrowed.state.inner.as_mut().unwrap();
+                let inner = borrowed.state.writer_mut().unwrap();
                 py.detach(|| runtime().block_on(inner.write_arrow(&input, None)))
                     .unwrap();
             };
