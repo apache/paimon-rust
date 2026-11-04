@@ -403,6 +403,32 @@ async fn bitmap_candidates_keep_exact_btree_hits_in_full_text_filters() {
             "refine={refine}"
         );
     }
+
+    // `f < 0` makes rows 0/1 candidates and `f = 1` proves row 1, so row 1
+    // stays even without refinement, in either arm order.
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let below = pb.less_than("f", Datum::Double(0.0)).unwrap();
+    let one = pb.equal("f", Datum::Double(1.0)).unwrap();
+    for filter in [
+        crate::spec::Predicate::or(vec![below.clone(), one.clone()]),
+        crate::spec::Predicate::or(vec![one, below]),
+    ] {
+        for refine in [false, true] {
+            let table = table.copy_with_options(HashMap::from([(
+                "global-index.filter.refine-from-data".into(),
+                refine.to_string(),
+            )]));
+            assert_eq!(
+                ids(query(&table)
+                    .with_filter(filter.clone())
+                    .execute()
+                    .await
+                    .unwrap()),
+                vec![1],
+                "refine={refine} {filter:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

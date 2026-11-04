@@ -43,6 +43,7 @@ use crate::table::bitmap_global_index_format::is_bitmap_floating_residual_sensit
 use crate::table::bitmap_global_index_format::{
     make_bitmap_key_comparator, serialize_bitmap_datum,
 };
+use crate::table::source::exclude_row_ranges;
 use crate::table::RowRange;
 use crate::{Error, Result};
 use futures::{StreamExt, TryStreamExt};
@@ -379,6 +380,9 @@ impl GlobalIndexScanner {
                 Predicate::Or(children) => {
                     let mut all_ranges: Vec<RowRange> = Vec::new();
                     let mut candidate_ranges = Vec::new();
+                    // Rows some arm proves match. Another arm's candidates must not
+                    // turn them back into candidates.
+                    let mut exact_ranges = Vec::new();
                     let mut fully_evaluated = true;
                     let mut evaluated_field_ids = HashSet::new();
                     let mut indexed_coverage: Option<Vec<RowRange>> = None;
@@ -390,6 +394,12 @@ impl GlobalIndexScanner {
                         match result {
                             Some(child_result) => {
                                 fully_evaluated &= child_result.fully_evaluated;
+                                if child_result.fully_evaluated {
+                                    exact_ranges.extend(exclude_row_ranges(
+                                        &child_result.row_ranges,
+                                        &child_result.candidate_ranges,
+                                    ));
+                                }
                                 all_ranges.extend(child_result.row_ranges);
                                 candidate_ranges.extend(child_result.candidate_ranges);
                                 evaluated_field_ids.extend(child_result.evaluated_field_ids);
@@ -410,7 +420,10 @@ impl GlobalIndexScanner {
                         crate::table::merge_row_ranges(all_ranges)
                     };
                     Ok(Some(GlobalIndexScanResult {
-                        candidate_ranges: candidates_within(candidate_ranges, &row_ranges),
+                        candidate_ranges: exclude_row_ranges(
+                            &candidates_within(candidate_ranges, &row_ranges),
+                            &exact_ranges,
+                        ),
                         row_ranges,
                         evaluated_field_ids,
                         indexed_coverage: indexed_coverage.unwrap_or_default(),

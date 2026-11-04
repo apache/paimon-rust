@@ -1142,6 +1142,28 @@ async fn bitmap_candidates_keep_exact_btree_hits_without_refinement() {
 }
 
 #[tokio::test]
+async fn or_keeps_exact_hit_when_another_arm_returns_candidates() {
+    // `f < 0` makes bitmap rows 0/1 candidates and `f = 1` proves row 1. The
+    // proven row must stay without refinement, in either arm order.
+    let ids = top1_after_bitmap_then_btree(vec![Some(0.0), Some(1.0)], |pb| {
+        crate::spec::Predicate::or(vec![
+            pb.less_than("f", crate::spec::Datum::Double(0.0)).unwrap(),
+            pb.equal("f", crate::spec::Datum::Double(1.0)).unwrap(),
+        ])
+    })
+    .await;
+    assert_eq!(ids, vec![1]);
+    let ids = top1_after_bitmap_then_btree(vec![Some(0.0), Some(1.0)], |pb| {
+        crate::spec::Predicate::or(vec![
+            pb.equal("f", crate::spec::Datum::Double(1.0)).unwrap(),
+            pb.less_than("f", crate::spec::Datum::Double(0.0)).unwrap(),
+        ])
+    })
+    .await;
+    assert_eq!(ids, vec![1]);
+}
+
+#[tokio::test]
 async fn pruned_null_bitmap_keeps_btree_answer_exact() {
     // The bitmap shard covers only NULL rows, so `f > 1.5` prunes it and the
     // BTree answer stays exact even without refinement.
