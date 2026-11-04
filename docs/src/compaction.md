@@ -25,7 +25,8 @@ tables with fixed or dynamic buckets. `CompactBuilder` creates
 a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
 execution do not publish snapshots; `commit_compact` atomically publishes the
 selected results in a `COMPACT` snapshot. DataFusion SQL runs this flow through
-[`CALL sys.compact`](sql.md#compact).
+[`CALL sys.compact`](sql.md#compact), and Python through
+[`table.new_compact_builder()`](python-binding.md#compaction).
 
 The builder selects a dedicated append, primary-key or Data Evolution planner
 for the table mode. They share snapshot capture and the public plan/task types;

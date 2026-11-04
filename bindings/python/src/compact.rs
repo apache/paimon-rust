@@ -21,6 +21,7 @@ use std::sync::Arc;
 use paimon::spec::Predicate;
 use paimon::table::{CompactMetrics, Table};
 use paimon_datafusion::runtime::runtime;
+use pyo3::exceptions::PyRuntimeWarning;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -32,7 +33,7 @@ use crate::predicate::dict_to_table_predicate;
 /// commit. No commit is made when planning yields no task.
 ///
 /// The builder only captures configuration; the core `CompactBuilder` is
-/// created per execution, so the handle never borrows the table.
+/// created per call, so the handle never borrows the table.
 #[pyclass(name = "CompactBuilder", module = "pypaimon_rust.datafusion")]
 pub struct PyCompactBuilder {
     table: Arc<Table>,
@@ -75,61 +76,102 @@ impl PyCompactBuilder {
         predicate: &Bound<'_, PyDict>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let predicate = dict_to_table_predicate(predicate, slf.table.schema(), true)?;
+        // Validation belongs to the core builder; each filter is checked alone.
+        slf.table
+            .new_compact_builder()
+            .with_partition_filter(predicate.clone())
+            .map_err(to_py_err)?;
         slf.partition_filters.push(predicate);
         Ok(slf)
     }
 
     /// Set the commit identity of the compaction commit. Defaults to a
-    /// generated UUID, like the other one-shot maintenance paths.
-    fn with_commit_user(mut slf: PyRefMut<'_, Self>, user: String) -> PyRefMut<'_, Self> {
-        slf.commit_user = Some(user);
-        slf
+    /// generated UUID. The snapshot records it as `<commit_user>-compact-<suffix>`.
+    fn with_commit_user(
+        mut slf: PyRefMut<'_, Self>,
+        commit_user: String,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.table
+            .new_compact_builder()
+            .with_commit_user(commit_user.clone())
+            .map_err(to_py_err)?;
+        slf.commit_user = Some(commit_user);
+        Ok(slf)
     }
 
     /// Plan, execute and commit all compaction tasks.
     ///
-    /// Execution failure aborts the files already produced by earlier tasks,
-    /// so nothing unreferenced is left behind. Returns the task count and the
-    /// write metrics of the compaction commit.
+    /// When a task fails, the files written by earlier tasks are deleted on a
+    /// best-effort basis; a failed deletion is reported as a `RuntimeWarning`
+    /// and the task's error is raised. Returns the task count and the write
+    /// metrics of the compaction commit.
     fn execute(&self, py: Python<'_>) -> PyResult<HashMap<&'static str, u64>> {
-        let table = self.table.clone();
-        let partition_filters = self.partition_filters.clone();
-        let commit_user = self.commit_user.clone();
-        py.detach(|| {
-            runtime().block_on(async move {
-                let mut builder = table.new_compact_builder();
-                for filter in &partition_filters {
-                    builder = builder.with_partition_filter(filter.clone())?;
-                }
-                if let Some(user) = &commit_user {
-                    builder = builder.with_commit_user(user.clone())?;
-                }
+        let mut abort_error = None;
+        let result = py.detach(|| {
+            runtime().block_on(compact(
+                &self.table,
+                &self.partition_filters,
+                self.commit_user.as_deref(),
+                &mut abort_error,
+            ))
+        });
+        if let Some(error) = abort_error {
+            warn_abort_failure(py, &self.table, &error);
+        }
+        result.map_err(to_py_err)
+    }
+}
 
-                let plan = builder.new_planner()?.plan().await?;
-                let metrics = if plan.tasks().is_empty() {
-                    CompactMetrics::default()
-                } else {
-                    let executor = builder.new_executor()?;
-                    let commit = builder.new_commit()?;
-                    let mut results = Vec::with_capacity(plan.tasks().len());
-                    for task in plan.tasks() {
-                        match executor.execute(task).await {
-                            Ok(result) => results.push(result),
-                            Err(error) => {
-                                // Nothing has been submitted yet, so earlier
-                                // outputs are unreferenced. An abort failure
-                                // must not mask the execution error, like the
-                                // sys.compact procedure.
-                                let _ = commit.abort_compact(&results).await;
-                                return Err(error);
-                            }
-                        }
-                    }
-                    commit.commit_compact(results).await?
-                };
-                Ok(metrics_to_map(plan.tasks().len(), &metrics))
-            })
-        })
-        .map_err(to_py_err)
+async fn compact(
+    table: &Table,
+    partition_filters: &[Predicate],
+    commit_user: Option<&str>,
+    abort_error: &mut Option<paimon::Error>,
+) -> paimon::Result<HashMap<&'static str, u64>> {
+    let mut builder = table.new_compact_builder();
+    for filter in partition_filters {
+        builder = builder.with_partition_filter(filter.clone())?;
+    }
+    if let Some(user) = commit_user {
+        builder = builder.with_commit_user(user)?;
+    }
+
+    let plan = builder.new_planner()?.plan().await?;
+    let metrics = if plan.tasks().is_empty() {
+        CompactMetrics::default()
+    } else {
+        let executor = builder.new_executor()?;
+        let commit = builder.new_commit()?;
+        let mut results = Vec::with_capacity(plan.tasks().len());
+        for task in plan.tasks() {
+            match executor.execute(task).await {
+                Ok(result) => results.push(result),
+                Err(error) => {
+                    // Nothing has been submitted yet, so earlier outputs are
+                    // unreferenced. Keep the task error as the one raised.
+                    *abort_error = commit.abort_compact(&results).await.err();
+                    return Err(error);
+                }
+            }
+        }
+        commit.commit_compact(results).await?
+    };
+    Ok(metrics_to_map(plan.tasks().len(), &metrics))
+}
+
+/// The task error is still raised, so a failing `warnings.warn` (for example
+/// under `-W error`) is ignored rather than replacing it.
+fn warn_abort_failure(py: Python<'_>, table: &Table, error: &paimon::Error) {
+    if let Ok(warnings) = py.import("warnings") {
+        let _ = warnings.call_method1(
+            "warn",
+            (
+                format!(
+                    "Failed to delete unsubmitted compaction files of table {}: {error}",
+                    table.identifier().full_name()
+                ),
+                py.get_type::<PyRuntimeWarning>(),
+            ),
+        );
     }
 }
