@@ -27,6 +27,7 @@
 //! runtime only for Rust-API setup (write_data_rust, setup_table_dirs).
 
 mod commit_messages;
+mod table_arrow_schema;
 
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
@@ -1920,7 +1921,22 @@ fn test_write_commit_read_roundtrip() {
         assert!(tw_result.error.is_null());
         let tw = tw_result.write;
 
-        let batch = make_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+        let mut exported = FFI_ArrowSchema::empty();
+        assert!(paimon_table_export_arrow_schema(
+            handle,
+            (&mut exported as *mut FFI_ArrowSchema).cast(),
+        )
+        .is_null());
+        let schema = ArrowSchema::try_from(&exported).unwrap();
+        exported.release.unwrap()(&mut exported);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
         let (array_box, schema_box) = export_batch_to_ffi(batch);
         let array_ptr = (&**array_box) as *const FFI_ArrowArray as *mut c_void;
         let schema_ptr = (&**schema_box) as *const FFI_ArrowSchema as *mut c_void;
