@@ -17,15 +17,18 @@
 
 use super::*;
 use crate::io::FileIOBuilder;
+use bytes::Bytes;
 use opendal::raw::{
-    oio, OpCopier, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite,
-    RpCreateDir, RpPresign, RpRename, RpStat, Service, ServiceInfo,
+    oio, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite, RpCreateDir,
+    RpPresign, RpRename, RpStat, Service, ServiceInfo,
 };
-use opendal::{Buffer, Capability, Metadata, OperationContext};
+use opendal::{Buffer, Capability, Metadata, MetadataBuilder, OperationContext, Operator};
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
+use url::Url;
 
 const CHUNK: usize = 8 * 1024 * 1024;
 
@@ -37,7 +40,7 @@ pub(crate) enum Fault {
     Close,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct UploadState {
     pub(crate) fault: Fault,
     pub(crate) fail_on_index: usize,
@@ -45,6 +48,30 @@ pub(crate) struct UploadState {
     pub(crate) concurrency: Vec<usize>,
     pub(crate) uploads: BTreeMap<String, BTreeMap<usize, Bytes>>,
     pub(crate) completed_parts: Vec<usize>,
+    pub(crate) part_attempts: Vec<usize>,
+    /// When false, stored part bytes are copies so payload owners can drop.
+    pub(crate) share_payloads: bool,
+    /// Delay part 0 until part 1 is accepted. Tests that retry part 0 turn this off.
+    pub(crate) reorder: bool,
+    /// Fail part 0 this many times with a temporary error, then accept it.
+    pub(crate) temporary_failures: usize,
+}
+
+impl Default for UploadState {
+    fn default() -> Self {
+        Self {
+            fault: Fault::None,
+            fail_on_index: 0,
+            index_writes: 0,
+            concurrency: Vec::new(),
+            uploads: BTreeMap::new(),
+            completed_parts: Vec::new(),
+            part_attempts: Vec::new(),
+            share_payloads: true,
+            reorder: true,
+            temporary_failures: 0,
+        }
+    }
 }
 
 /// Exercise OpenDAL's real multipart scheduler, storing completed objects in memory.
@@ -92,6 +119,7 @@ impl Service for MultipartProvider {
     type Lister = oio::Lister;
     type Deleter = oio::Deleter;
     type Copier = oio::Copier;
+    type Composer = ();
 
     fn info(&self) -> ServiceInfo {
         self.memory.service().info()
@@ -122,13 +150,14 @@ impl Service for MultipartProvider {
         } else {
             Fault::None
         };
+        let reorder = state.reorder && args.concurrent() > 1;
         Ok(Box::new(oio::MultipartWriter::new(
             ctx.executor().clone(),
             Upload {
                 provider: self.clone(),
                 path: path.to_string(),
                 fault,
-                reorder: args.concurrent() > 1,
+                reorder,
                 second_part: Notify::new(),
             },
             args.concurrent(),
@@ -137,11 +166,13 @@ impl Service for MultipartProvider {
 
     async fn create_dir(
         &self,
-        ctx: &OperationContext,
-        path: &str,
-        args: OpCreateDir,
+        _ctx: &OperationContext,
+        _path: &str,
+        _args: OpCreateDir,
     ) -> opendal::Result<RpCreateDir> {
-        self.memory.service().create_dir(ctx, path, args).await
+        // The in-memory map is flat. Directory creation only needs to succeed so
+        // index writers can prepare `index/` before the multipart upload.
+        Ok(RpCreateDir::default())
     }
     async fn stat(
         &self,
@@ -176,9 +207,8 @@ impl Service for MultipartProvider {
         from: &str,
         to: &str,
         args: OpCopy,
-        opts: OpCopier,
     ) -> opendal::Result<Self::Copier> {
-        self.memory.service().copy(ctx, from, to, args, opts)
+        self.memory.service().copy(ctx, from, to, args)
     }
     async fn rename(
         &self,
@@ -211,10 +241,14 @@ fn injected_error() -> opendal::Error {
     opendal::Error::new(opendal::ErrorKind::Unexpected, "injected multipart failure")
 }
 
+fn file_metadata(size: u64) -> Metadata {
+    MetadataBuilder::file(size).build()
+}
+
 impl oio::MultipartWrite for Upload {
     async fn write_once(&self, size: u64, body: Buffer) -> opendal::Result<Metadata> {
         self.provider.memory.write(&self.path, body).await?;
-        Ok(Metadata::default().with_content_length(size))
+        Ok(file_metadata(size))
     }
 
     async fn initiate_part(&self) -> opendal::Result<String> {
@@ -237,17 +271,31 @@ impl oio::MultipartWrite for Upload {
         if self.reorder && part_number == 0 {
             self.second_part.notified().await;
         }
+        let mut temporary = false;
         {
             let mut state = self.provider.state.lock().unwrap();
+            state.part_attempts.push(part_number);
             state.completed_parts.push(part_number);
+            let stored = if state.share_payloads {
+                body.to_bytes()
+            } else {
+                Bytes::copy_from_slice(&body.to_bytes())
+            };
             state
                 .uploads
                 .get_mut(upload_id)
                 .unwrap()
-                .insert(part_number, body.to_bytes());
+                .insert(part_number, stored);
+            if part_number == 0 && state.temporary_failures > 0 {
+                state.temporary_failures -= 1;
+                temporary = true;
+            }
         }
         if part_number == 1 {
             self.second_part.notify_one();
+        }
+        if temporary {
+            return Err(injected_error().set_temporary());
         }
         if self.fault == Fault::Part && part_number == 0 {
             return Err(injected_error());
@@ -278,7 +326,7 @@ impl oio::MultipartWrite for Upload {
         }
         let size = bytes.len() as u64;
         self.provider.memory.write(&self.path, bytes).await?;
-        Ok(Metadata::default().with_content_length(size))
+        Ok(file_metadata(size))
     }
 
     async fn abort_part(&self, upload_id: &str) -> opendal::Result<()> {
@@ -358,6 +406,199 @@ async fn streaming_upload_preserves_out_of_order_parts() {
         }
         assert!(state.uploads.is_empty());
     }
+}
+
+struct TrackedChunk {
+    data: Vec<u8>,
+    live: Arc<AtomicUsize>,
+}
+
+impl AsRef<[u8]> for TrackedChunk {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for TrackedChunk {
+    fn drop(&mut self) {
+        self.live.fetch_sub(self.data.len(), Ordering::SeqCst);
+    }
+}
+
+fn rss_bytes() -> u64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in status.lines() {
+        let Some(rest) = line.strip_prefix("VmRSS:") else {
+            continue;
+        };
+        let kb = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("0")
+            .parse::<u64>()
+            .unwrap_or(0);
+        return kb.saturating_mul(1024);
+    }
+    0
+}
+
+async fn settle(live: &AtomicUsize) -> usize {
+    let mut stable = 0;
+    let mut last = live.load(Ordering::SeqCst);
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        let now = live.load(Ordering::SeqCst);
+        if now == last {
+            stable += 1;
+            if stable >= 5 {
+                return now;
+            }
+        } else {
+            stable = 0;
+            last = now;
+        }
+    }
+    last
+}
+
+/// OpenDAL 0.59 releases a successful part's input when that part task finishes,
+/// instead of retaining it until `close` collects the result. Twelve 8 MiB parts
+/// at concurrency 8 must therefore keep only the unsent tail, not the whole upload.
+#[tokio::test]
+async fn streaming_upload_releases_completed_part_buffers() {
+    const PARTS: usize = 12;
+    const CONCURRENCY: usize = 8;
+    let provider = MultipartProvider::new(CHUNK);
+    provider.state.lock().unwrap().share_payloads = false;
+    let (op, relative) = FileIOProvider::create(&provider, "memory:/release.index")
+        .await
+        .unwrap();
+    let live = Arc::new(AtomicUsize::new(0));
+    let rss_before = rss_bytes();
+    let mut rss_peak = rss_before;
+    let mut writer = op
+        .writer_with(&relative)
+        .chunk(CHUNK)
+        .concurrent(CONCURRENCY)
+        .await
+        .unwrap();
+
+    let mut peak = 0usize;
+    for part in 0..PARTS {
+        live.fetch_add(CHUNK, Ordering::SeqCst);
+        let bytes = Bytes::from_owner(TrackedChunk {
+            data: vec![part as u8; CHUNK],
+            live: Arc::clone(&live),
+        });
+        writer.write(bytes).await.unwrap();
+        if part == 0 {
+            let held = settle(&live).await;
+            assert_eq!(
+                held, CHUNK,
+                "the first chunk stays buffered until the next part arrives"
+            );
+        }
+        peak = peak.max(settle(&live).await);
+        rss_peak = rss_peak.max(rss_bytes());
+    }
+    let before_close = settle(&live).await;
+    let completed = provider.state.lock().unwrap().completed_parts.len();
+    writer.close().await.unwrap();
+    let after_close = settle(&live).await;
+    rss_peak = rss_peak.max(rss_bytes());
+
+    let scheduled = PARTS.saturating_sub(2);
+    assert_eq!(
+        completed, scheduled,
+        "all but the generator tail and multipart cache should already have been uploaded"
+    );
+    assert!(
+        before_close <= 4 * CHUNK,
+        "completed part payloads were still live before close: {before_close} bytes, peak {peak}"
+    );
+    assert!(
+        peak <= (CONCURRENCY + 3) * CHUNK,
+        "peak live part payloads {peak} exceeded concurrency {CONCURRENCY}"
+    );
+    assert!(
+        peak < PARTS * CHUNK,
+        "peak live part payloads {peak} retained the whole {} byte upload",
+        PARTS * CHUNK
+    );
+    assert_eq!(after_close, 0, "close must drop every part payload");
+
+    let got = provider.memory.read(&relative).await.unwrap().to_vec();
+    assert_eq!(got.len(), PARTS * CHUNK);
+    for part in 0..PARTS {
+        let start = part * CHUNK;
+        assert_eq!(got[start], part as u8);
+        assert_eq!(got[start + CHUNK - 1], part as u8);
+    }
+    eprintln!(
+        "part-buffer release: parts={PARTS} chunk={CHUNK} concurrency={CONCURRENCY} \
+         scheduled_before_close={completed} live_before_close={before_close} \
+         peak_live={peak} rss_before={rss_before} rss_peak={rss_peak}"
+    );
+}
+
+/// A temporary part failure keeps that part's bytes for the scheduler retry.
+/// The caller only retries `close`; it does not submit the payload again.
+#[tokio::test]
+async fn streaming_upload_retries_temporary_part_failure() {
+    const PARTS: usize = 4;
+    const PART: usize = 64 * 1024;
+    let provider = MultipartProvider::new(PART);
+    {
+        let mut state = provider.state.lock().unwrap();
+        state.reorder = false;
+        state.temporary_failures = 1;
+        state.share_payloads = false;
+    }
+    let (op, relative) = FileIOProvider::create(&provider, "memory:/retry.index")
+        .await
+        .unwrap();
+    let mut writer = op
+        .writer_with(&relative)
+        .chunk(PART)
+        .concurrent(8)
+        .await
+        .unwrap();
+    let mut data = Vec::with_capacity(PARTS * PART);
+    for part in 0..PARTS {
+        let chunk = vec![part as u8 + 1; PART];
+        data.extend_from_slice(&chunk);
+        writer.write(chunk).await.unwrap();
+    }
+
+    let mut closes = 0;
+    loop {
+        closes += 1;
+        match writer.close().await {
+            Ok(_) => break,
+            Err(error) if error.is_temporary() && closes < 5 => continue,
+            Err(error) => panic!("multipart close failed: {error}"),
+        }
+    }
+    assert!(
+        closes >= 2,
+        "the first close must observe the temporary part failure, closes={closes}"
+    );
+    let attempts = provider
+        .state
+        .lock()
+        .unwrap()
+        .part_attempts
+        .iter()
+        .filter(|part| **part == 0)
+        .count();
+    assert_eq!(
+        attempts, 2,
+        "part 0 must be sent again from the retained input"
+    );
+    let got = provider.memory.read(&relative).await.unwrap().to_vec();
+    assert_eq!(got, data);
 }
 
 #[tokio::test]
