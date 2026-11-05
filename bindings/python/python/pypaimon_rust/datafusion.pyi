@@ -582,8 +582,9 @@ class CompactBuilder:
         raised after a best-effort deletion of earlier tasks' files; a failed
         deletion is reported as a ``RuntimeWarning``.
 
-        Warning: This method blocks on a DataFusion runtime.
-        Calling this from an active asyncio event loop will result in a panic.
+        Warning: This method blocks the calling thread until it returns, with the
+        GIL released. Called from an asyncio event loop, it blocks the loop; use
+        ``await asyncio.to_thread(builder.execute)`` to keep the loop running.
         """
         ...
 
