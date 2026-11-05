@@ -1029,6 +1029,54 @@ async fn test_scoped_show_accepts_temp_only_database_and_shadowing() {
 }
 
 #[tokio::test]
+async fn test_update_and_delete_reject_shadowed_temporary_targets() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    ctx.sql("CREATE TABLE default.shadowed (id INT)")
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO default.shadowed VALUES (1), (2)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    for kind in ["TABLE", "VIEW"] {
+        ctx.sql(&format!(
+            "CREATE TEMPORARY {kind} default.shadowed AS SELECT CAST(999 AS INT) AS id"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            collect_ids(&ctx, "SELECT id FROM shadowed").await,
+            vec![999]
+        );
+
+        assert_sql_error_contains(
+            &ctx,
+            "UPDATE shadowed SET id = 10 WHERE id = 1",
+            "UPDATE on temporary tables or views is not supported",
+        )
+        .await;
+        assert_sql_error_contains(
+            &ctx,
+            "DELETE FROM paimon.default.shadowed WHERE id = 2",
+            "DELETE on temporary tables or views is not supported",
+        )
+        .await;
+
+        ctx.sql(&format!("DROP TEMPORARY {kind} default.shadowed"))
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_ids(&ctx, "SELECT id FROM shadowed ORDER BY id").await,
+            vec![1, 2]
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_scoped_show_accepts_information_schema() {
     let (_tmp, catalog) = create_test_env();
     let ctx = create_sql_context(catalog).await;
