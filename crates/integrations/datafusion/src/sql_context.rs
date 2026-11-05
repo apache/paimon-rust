@@ -1881,6 +1881,11 @@ impl SQLContext {
             }
         };
         Self::ensure_main_branch_write_target(&table_name, "UPDATE")?;
+        if self.temp_table_for(&table_name).await?.is_some() {
+            return Err(DataFusionError::NotImplemented(
+                "UPDATE on temporary tables or views is not supported".into(),
+            ));
+        }
         let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
 
         let table = catalog
@@ -1909,6 +1914,11 @@ impl SQLContext {
             }
         };
         Self::ensure_main_branch_write_target(&table_name, "DELETE")?;
+        if self.temp_table_for(&table_name).await?.is_some() {
+            return Err(DataFusionError::NotImplemented(
+                "DELETE on temporary tables or views is not supported".into(),
+            ));
+        }
         let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
 
         let table = catalog
