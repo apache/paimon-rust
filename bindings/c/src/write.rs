@@ -861,6 +861,31 @@ pub extern "C" fn paimon_commit_messages_serializer_version() -> i32 {
     COMMIT_MESSAGE_SERIALIZER_VERSION
 }
 
+/// Write the number of messages in a standard message handle to count.
+/// The handle is borrowed; count is unchanged on error.
+///
+/// # Safety
+/// msgs must be a live standard message handle and count must point to writable
+/// storage, or either may be null (returns an error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_commit_messages_count(
+    msgs: *const paimon_commit_messages,
+    count: *mut usize,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(msgs, "msgs") {
+        return error;
+    }
+    if let Err(error) = check_non_null(count, "count") {
+        return error;
+    }
+    if let Err(error) = check_non_null((*msgs).inner, "msgs.inner") {
+        return error;
+    }
+    let state = &*((*msgs).inner as *const CommitMessagesState);
+    *count = state.messages.len();
+    ptr::null_mut()
+}
+
 /// Export one unframed Java v14 body per message, preserving message order.
 /// Table identity, commit_user and overwrite mode are not part of the bodies.
 /// Format Table messages are unsupported. No postpone-specific handle is accepted.
@@ -875,15 +900,56 @@ pub extern "C" fn paimon_commit_messages_serializer_version() -> i32 {
 pub unsafe extern "C" fn paimon_commit_messages_serialize(
     msgs: *const paimon_commit_messages,
 ) -> paimon_result_bytes_array {
+    serialize_commit_messages(msgs, None, usize::MAX)
+}
+
+/// Export count messages starting at offset, in order, limiting the sum of
+/// their unframed Java body lengths to max_bytes. No list or RPC framing is added.
+/// The output uses the same version and ownership as paimon_commit_messages_serialize.
+///
+/// An empty range at or before the end is valid, including with a zero limit.
+/// Invalid ranges return InvalidInput; an exceeded limit returns ResourceExhausted.
+/// Errors return no partial output and leave the messages usable for a smaller
+/// range retry. This bounds output length, not temporary allocations or peak memory.
+///
+/// # Safety
+/// msgs must be a live standard message handle, or null (returns an error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_commit_messages_serialize_range(
+    msgs: *const paimon_commit_messages,
+    offset: usize,
+    count: usize,
+    max_bytes: usize,
+) -> paimon_result_bytes_array {
+    serialize_commit_messages(msgs, Some((offset, count)), max_bytes)
+}
+
+unsafe fn serialize_commit_messages(
+    msgs: *const paimon_commit_messages,
+    range: Option<(usize, usize)>,
+    max_bytes: usize,
+) -> paimon_result_bytes_array {
     let encode = || -> Result<Vec<Vec<u8>>, *mut paimon_error> {
         check_non_null(msgs, "msgs")?;
         check_non_null((*msgs).inner, "msgs.inner")?;
         let state = &*((*msgs).inner as *const CommitMessagesState);
-        state
-            .messages
-            .iter()
-            .map(|message| message.serialize().map_err(paimon_error::from_paimon))
-            .collect()
+        let selected = match range {
+            Some((offset, count)) => offset
+                .checked_add(count)
+                .and_then(|end| state.messages.get(offset..end))
+                .ok_or_else(|| invalid_input("Invalid commit message range"))?,
+            None => &state.messages,
+        };
+        let mut remaining = max_bytes;
+        let mut bodies = Vec::new();
+        for message in selected {
+            let body = message
+                .serialize_with_limit(remaining)
+                .map_err(paimon_error::from_paimon)?;
+            remaining -= body.len();
+            bodies.push(body);
+        }
+        Ok(bodies)
     };
     match encode() {
         Ok(bytes) => paimon_result_bytes_array {
@@ -1513,8 +1579,16 @@ const _: unsafe extern "C" fn(
 const _: unsafe extern "C" fn(*mut paimon_table_write) -> paimon_result_prepare_commit =
     paimon_table_write_prepare_commit;
 const _: extern "C" fn() -> i32 = paimon_commit_messages_serializer_version;
+const _: unsafe extern "C" fn(*const paimon_commit_messages, *mut usize) -> *mut paimon_error =
+    paimon_commit_messages_count;
 const _: unsafe extern "C" fn(*const paimon_commit_messages) -> paimon_result_bytes_array =
     paimon_commit_messages_serialize;
+const _: unsafe extern "C" fn(
+    *const paimon_commit_messages,
+    usize,
+    usize,
+    usize,
+) -> paimon_result_bytes_array = paimon_commit_messages_serialize_range;
 const _: unsafe extern "C" fn(
     *const paimon_table_commit,
     i32,

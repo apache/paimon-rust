@@ -119,6 +119,107 @@ unsafe fn copy_bodies(array: &paimon_bytes_array) -> Vec<Vec<u8>> {
         .collect()
 }
 
+#[test]
+fn bounded_range_export_preserves_java_bytes_and_ownership() {
+    unsafe {
+        let table = memory_table("memory:/bounded-commit-export");
+        let commit = new_committer(table, "coordinator", false);
+        let bodies = java_bodies();
+        let messages = import(commit, &bodies);
+        let mut count = 0;
+        assert_ok(paimon_commit_messages_count(messages, &mut count));
+        assert_eq!(count, bodies.len());
+        let total = bodies.iter().map(Vec::len).sum::<usize>();
+        let all = paimon_commit_messages_serialize_range(messages, 0, count, total);
+        assert_ok(all.error);
+        assert_eq!(copy_bodies(&all.bytes), bodies);
+        paimon_bytes_array_free(all.bytes);
+
+        // Every prefix is rolled back on a cumulative limit error. The same
+        // source remains available for a smaller-range retry.
+        let rejected = paimon_commit_messages_serialize_range(messages, 0, count, total - 1);
+        assert_error(rejected.error, PaimonErrorCode::ResourceExhausted);
+        assert!(rejected.bytes.data.is_null());
+        assert_eq!(rejected.bytes.len, 0);
+        paimon_bytes_array_free(rejected.bytes);
+
+        for (offset, body) in bodies.iter().enumerate() {
+            let rejected =
+                paimon_commit_messages_serialize_range(messages, offset, 1, body.len() - 1);
+            assert_error(rejected.error, PaimonErrorCode::ResourceExhausted);
+            assert!(rejected.bytes.data.is_null());
+            assert_eq!(rejected.bytes.len, 0);
+            paimon_bytes_array_free(rejected.bytes);
+            let result = paimon_commit_messages_serialize_range(messages, offset, 1, body.len());
+            assert_ok(result.error);
+            assert_eq!(copy_bodies(&result.bytes), vec![body.clone()]);
+            paimon_bytes_array_free(result.bytes);
+        }
+        let tail = paimon_commit_messages_serialize_range(messages, 1, 2, total - bodies[0].len());
+        assert_ok(tail.error);
+        paimon_commit_messages_free(messages);
+        paimon_table_commit_free(commit);
+        unwrap_table(table);
+        assert_eq!(copy_bodies(&tail.bytes), bodies[1..]);
+        paimon_bytes_array_free(tail.bytes);
+    }
+}
+
+#[test]
+fn bounded_range_export_validates_ranges_and_pointers() {
+    unsafe {
+        let table = memory_table("memory:/invalid-commit-range");
+        let commit = new_committer(table, "coordinator", false);
+        let messages = import(commit, &java_bodies());
+        for (offset, count) in [(4, 0), (3, 1), (usize::MAX, 1), (1, usize::MAX)] {
+            let result =
+                paimon_commit_messages_serialize_range(messages, offset, count, usize::MAX);
+            assert_error(result.error, PaimonErrorCode::InvalidInput);
+            assert_eq!(result.bytes.len, 0);
+            assert!(result.bytes.data.is_null());
+            paimon_bytes_array_free(result.bytes);
+        }
+        for offset in [0, 1, 3] {
+            let result = paimon_commit_messages_serialize_range(messages, offset, 0, 0);
+            assert_ok(result.error);
+            assert_eq!(result.bytes.len, 0);
+            paimon_bytes_array_free(result.bytes);
+        }
+        let uninitialized = paimon_commit_messages {
+            inner: ptr::null_mut(),
+        };
+        for handle in [ptr::null(), &uninitialized] {
+            let result = paimon_commit_messages_serialize_range(handle, 0, 0, 0);
+            assert_error(result.error, PaimonErrorCode::InvalidInput);
+            assert_eq!(result.bytes.len, 0);
+            assert!(result.bytes.data.is_null());
+            paimon_bytes_array_free(result.bytes);
+            let mut count = 42;
+            assert_error(
+                paimon_commit_messages_count(handle, &mut count),
+                PaimonErrorCode::InvalidInput,
+            );
+            assert_eq!(count, 42);
+        }
+        assert_error(
+            paimon_commit_messages_count(messages, ptr::null_mut()),
+            PaimonErrorCode::InvalidInput,
+        );
+        let empty = import(commit, &[]);
+        let mut count = 42;
+        assert_ok(paimon_commit_messages_count(empty, &mut count));
+        assert_eq!(count, 0);
+        let result = paimon_commit_messages_serialize_range(empty, 0, 0, 0);
+        assert_ok(result.error);
+        assert_eq!(result.bytes.len, 0);
+        paimon_bytes_array_free(result.bytes);
+        paimon_commit_messages_free(empty);
+        paimon_commit_messages_free(messages);
+        paimon_table_commit_free(commit);
+        unwrap_table(table);
+    }
+}
+
 unsafe fn import(
     commit: *const paimon_table_commit,
     bodies: &[Vec<u8>],
@@ -469,6 +570,11 @@ fn format_table_messages_are_unsupported_and_remain_owned_by_caller() {
         ));
         let messages = prepare(table, "worker", false, make_batch(vec![1], vec!["a"]));
         let exported = paimon_commit_messages_serialize(messages);
+        assert_error(exported.error, PaimonErrorCode::Unsupported);
+        assert!(exported.bytes.data.is_null());
+        assert_eq!(exported.bytes.len, 0);
+        paimon_bytes_array_free(exported.bytes);
+        let exported = paimon_commit_messages_serialize_range(messages, 0, 1, usize::MAX);
         assert_error(exported.error, PaimonErrorCode::Unsupported);
         assert!(exported.bytes.data.is_null());
         assert_eq!(exported.bytes.len, 0);
