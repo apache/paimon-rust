@@ -266,6 +266,39 @@ impl FileIOProvider for FixedPathProvider {
     async fn create(&self, _path: &str) -> Result<(Operator, String)> {
         Ok((self.op.clone(), self.relative.clone()))
     }
+
+    async fn create_with_cache_namespace(
+        &self,
+        path: &str,
+    ) -> Result<(Operator, String, Option<String>)> {
+        let (op, relative) = self.create(path).await?;
+        Ok((op, relative, Some("fixed".to_string())))
+    }
+}
+
+#[tokio::test]
+async fn provider_cache_excludes_the_resolved_file_extension() {
+    use crate::io::cache::create_local_cache;
+    use crate::{CatalogOptions, Options};
+
+    let op = memory_operator();
+    let mut options = Options::new();
+    options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+    options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, "data");
+    options.set(CatalogOptions::LOCAL_CACHE_EXCLUDE_EXTENSIONS, "blob");
+    let io = FileIOBuilder::new("unused")
+        .with_provider(Arc::new(FixedPathProvider {
+            op: op.clone(),
+            relative: "payload.blob".to_string(),
+        }))
+        .with_local_cache(create_local_cache(&options).unwrap().unwrap())
+        .build()
+        .unwrap();
+    let input = io.new_input("s3://bucket/logical.parquet").unwrap();
+    for value in ["first", "later"] {
+        op.write("payload.blob", value).await.unwrap();
+        assert_eq!(input.read().await.unwrap(), value);
+    }
 }
 
 #[tokio::test]

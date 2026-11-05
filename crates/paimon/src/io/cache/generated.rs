@@ -192,7 +192,7 @@ pub(crate) fn colliding_cached_source(
                 == head_key.components().next()
         })
         .unwrap();
-    assert!(cache.is_cacheable(&path));
+    assert!(cache.is_whitelisted(&path) && !cache.excludes_extension(&path));
     assert!(data.len() as u64 <= cache.generated_block_size());
     Arc::new(super::reader::CachedFileReader::new(
         Arc::new(Source(data.clone())),

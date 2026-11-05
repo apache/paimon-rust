@@ -198,15 +198,13 @@ impl LocalCache {
         !FileType::is_mutable(path) && self.whitelist.contains(&FileType::classify(path))
     }
 
-    pub(super) fn is_cacheable(&self, path: &str) -> bool {
-        if !self.is_whitelisted(path) {
+    pub(super) fn excludes_extension(&self, relative_path: &str) -> bool {
+        if self.excluded_extensions.is_empty() {
             return false;
         }
-        if self.excluded_extensions.is_empty() {
-            return true;
-        }
-        let name = path.rsplit('/').next().unwrap_or(path);
-        !std::path::Path::new(name)
+        let path = opendal::raw::normalize_path(relative_path);
+        let name = path.rsplit('/').next().unwrap_or(&path);
+        std::path::Path::new(name)
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| {
@@ -775,8 +773,8 @@ mod tests {
         options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
         options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, "structured-data");
         let cache = create_local_cache(&options).unwrap().unwrap();
-        assert!(cache.is_cacheable("s3://bucket/data.parquet"));
-        assert!(cache.is_cacheable("s3://bucket/data.unknown"));
+        assert!(cache.is_whitelisted("s3://bucket/data.parquet"));
+        assert!(cache.is_whitelisted("s3://bucket/data.unknown"));
         for path in [
             "s3://bucket/data.parquet.tmp",
             "s3://bucket/.data.parquet.123e4567-e89b-12d3-a456-426614174000.tmp",
@@ -787,7 +785,7 @@ mod tests {
             "s3://bucket/data.video",
             "s3://bucket/data.vector.vortex",
         ] {
-            assert!(!cache.is_cacheable(path), "{path}");
+            assert!(!cache.is_whitelisted(path), "{path}");
         }
     }
 
@@ -872,12 +870,12 @@ mod tests {
         })
         .unwrap();
 
-        assert!(cache.is_cacheable("s3://bucket/table/snapshot/snapshot-1"));
-        assert!(!cache.is_cacheable("s3://bucket/table/data/data-1.parquet"));
-        assert!(!cache.is_cacheable("s3://bucket/table/snapshot/LATEST"));
-        assert!(!cache.is_cacheable("s3://bucket/table/tag/tag-production"));
-        assert!(cache.is_cacheable("s3://bucket/table/changelog/changelog-1"));
-        assert!(!cache.is_cacheable("s3://bucket/table/dt=1/_SUCCESS"));
+        assert!(cache.is_whitelisted("s3://bucket/table/snapshot/snapshot-1"));
+        assert!(!cache.is_whitelisted("s3://bucket/table/data/data-1.parquet"));
+        assert!(!cache.is_whitelisted("s3://bucket/table/snapshot/LATEST"));
+        assert!(!cache.is_whitelisted("s3://bucket/table/tag/tag-production"));
+        assert!(cache.is_whitelisted("s3://bucket/table/changelog/changelog-1"));
+        assert!(!cache.is_whitelisted("s3://bucket/table/dt=1/_SUCCESS"));
     }
 
     #[test]

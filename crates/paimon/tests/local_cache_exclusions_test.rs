@@ -181,6 +181,45 @@ async fn test_issue_971_excluded_blob_bypasses_cache() {
 }
 
 #[tokio::test]
+async fn test_excluded_extension_uses_the_opened_filesystem_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("payload.blob");
+    let canonical = path.to_str().unwrap().replace('\\', "/");
+    let alias = format!("{canonical} ");
+    let mut options = Options::new();
+    options.set(
+        CatalogOptions::WAREHOUSE,
+        directory.path().to_string_lossy(),
+    );
+    options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+    options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, "data");
+    options.set(CatalogOptions::LOCAL_CACHE_EXCLUDE_EXTENSIONS, "blob");
+    let catalog = FileSystemCatalog::new(options).unwrap();
+    let io = catalog.file_io();
+    let canonical_input = io.new_input(&canonical).unwrap();
+    let alias_input = io.new_input(&alias).unwrap();
+    let output_input = io.new_output(&alias).unwrap().to_input_file();
+
+    for (full, range) in [(b"abcdefgh", b"bcdefg"), (b"12345678", b"234567")] {
+        std::fs::write(&path, full).unwrap();
+        for input in [&canonical_input, &alias_input, &output_input] {
+            assert_eq!(input.read().await.unwrap().as_ref(), full);
+            assert_eq!(
+                input
+                    .reader()
+                    .await
+                    .unwrap()
+                    .read(1..7)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                range
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_exclusions_normalize_entries_and_match_only_the_last_extension() {
     assert_cache_selection(
         "*",

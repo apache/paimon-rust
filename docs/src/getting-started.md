@@ -454,7 +454,9 @@ retain their broader behavior.
 To exclude only BLOB files while keeping other data eligible, use
 `local-cache.whitelist=meta,global-index,data` with
 `local-cache.exclude-extensions=blob`. Extensions match the last extension of
-the file name, ignoring ASCII case and an optional leading dot in each entry.
+the normalized storage path that FileIO reads, ignoring ASCII case and an
+optional leading dot in each entry. For example, a filesystem path ending in
+`payload.blob ` opens `payload.blob` and is also excluded.
 Surrounding whitespace and empty entries are ignored. For example, `blob, .VIDEO`
 excludes `.blob` and `.video` files; `gz` excludes `data.csv.gz`, while `csv`
 does not. Directory names do not participate in matching. An omitted or empty

@@ -666,7 +666,7 @@ impl FileIO {
             cache: self
                 .cache
                 .as_ref()
-                .filter(|cache| cache.is_cacheable(path))
+                .filter(|cache| cache.is_whitelisted(path))
                 .cloned(),
         })
     }
@@ -1798,6 +1798,12 @@ pub struct InputFile {
 }
 
 impl InputFile {
+    fn cache_for_read(&self, relative_path: &str) -> Option<&Arc<LocalCache>> {
+        self.cache
+            .as_ref()
+            .filter(|cache| !cache.excludes_extension(relative_path))
+    }
+
     pub fn location(&self) -> &str {
         &self.path
     }
@@ -1823,7 +1829,8 @@ impl InputFile {
 
     pub async fn read(&self) -> crate::Result<Bytes> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
-        let (Some(cache), Some(cache_path)) = (&self.cache, cache_path) else {
+        let (Some(cache), Some(cache_path)) = (self.cache_for_read(&relative_path), cache_path)
+        else {
             return Ok(op.read(&relative_path).await?.to_bytes());
         };
         let read_token = cache.read_token(&cache_path);
@@ -1865,7 +1872,9 @@ impl InputFile {
             }
         });
         let reader = op.reader(&relative_path).await?;
-        let (Some(cache), Some(cache_path)) = (&self.cache, cache_path.as_ref()) else {
+        let (Some(cache), Some(cache_path)) =
+            (self.cache_for_read(&relative_path), cache_path.as_ref())
+        else {
             return Ok(InputFileReader::Direct {
                 reader,
                 cache_key,
@@ -1918,13 +1927,12 @@ impl OutputFile {
     }
 
     pub fn to_input_file(self) -> InputFile {
-        let cache = self.cache.filter(|cache| cache.is_cacheable(&self.path));
         InputFile {
             source: self.source,
             path: self.path,
             file_format_metadata_cache: self.file_format_metadata_cache,
             blob_index_cache: self.blob_index_cache,
-            cache,
+            cache: self.cache,
         }
     }
 
