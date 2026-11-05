@@ -395,10 +395,15 @@ impl GlobalIndexScanner {
                             Some(child_result) => {
                                 fully_evaluated &= child_result.fully_evaluated;
                                 if child_result.fully_evaluated {
-                                    exact_ranges.extend(exclude_row_ranges(
-                                        &child_result.row_ranges,
-                                        &child_result.candidate_ranges,
-                                    ));
+                                    if child_result.candidate_ranges.is_empty() {
+                                        exact_ranges
+                                            .extend(child_result.row_ranges.iter().cloned());
+                                    } else {
+                                        exact_ranges.extend(exclude_row_ranges(
+                                            &child_result.row_ranges,
+                                            &child_result.candidate_ranges,
+                                        ));
+                                    }
                                 }
                                 all_ranges.extend(child_result.row_ranges);
                                 candidate_ranges.extend(child_result.candidate_ranges);
