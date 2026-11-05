@@ -281,6 +281,10 @@ impl PyTable {
         PyBatchWriteBuilder::new(Arc::clone(&self.inner))
     }
 
+    fn new_compact_builder(&self) -> crate::compact::PyCompactBuilder {
+        crate::compact::PyCompactBuilder::new(Arc::clone(&self.inner))
+    }
+
     fn new_stream_scan(&self) -> PyResult<crate::read::PyStreamTableScan> {
         PyReadBuilder::new(Arc::clone(&self.inner)).new_stream_scan()
     }
