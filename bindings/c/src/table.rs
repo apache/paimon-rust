@@ -62,6 +62,54 @@ unsafe fn box_table_read_state(state: TableReadState) -> *mut paimon_table_read 
 
 // ======================= Table ===============================
 
+/// Export the pinned table's write schema through the Arrow C Data Interface.
+/// Uses the core Paimon-to-Arrow mapping without querying the catalog.
+///
+/// The table is borrowed. The output remains valid after the table is freed.
+/// Release it with its ArrowSchema release callback, not paimon_arrow_batch_free.
+/// Errors leave the output unchanged. A live output must be released before reuse.
+///
+/// # Safety
+/// table must be a live table handle. schema must point to an initialized,
+/// writable, empty ArrowSchema (release is null). Null pointers return an error.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_export_arrow_schema(
+    table: *const paimon_table,
+    schema: *mut c_void,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(table, "table") {
+        return error;
+    }
+    if let Err(error) = check_non_null((*table).inner, "table.inner") {
+        return error;
+    }
+    if let Err(error) = check_non_null(schema, "schema") {
+        return error;
+    }
+    let output = schema.cast::<FFI_ArrowSchema>();
+    if (*output).release.is_some() {
+        return paimon_error::new(
+            PaimonErrorCode::InvalidInput,
+            "ArrowSchema output must be empty".into(),
+        );
+    }
+    let table = &*((*table).inner as *const Table);
+    let schema = match paimon::arrow::build_target_arrow_schema(table.schema().fields()) {
+        Ok(schema) => schema,
+        Err(error) => return paimon_error::from_paimon(error),
+    };
+    match FFI_ArrowSchema::try_from(schema.as_ref()) {
+        Ok(schema) => {
+            std::ptr::write(output, schema);
+            std::ptr::null_mut()
+        }
+        Err(error) => paimon_error::from_paimon(paimon::Error::UnexpectedError {
+            message: format!("Failed to export Arrow schema: {error}"),
+            source: Some(Box::new(error)),
+        }),
+    }
+}
+
 fn resolved_table_result(
     file_io: FileIO,
     table_path: String,

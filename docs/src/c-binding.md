@@ -707,6 +707,32 @@ Writing uses a **write-then-commit** flow:
 5. Pass the messages to `paimon_table_commit_commit`.
 6. Free the messages, writer, committer, and builder.
 
+### Exporting the Table's Write Schema
+
+Use `paimon_table_export_arrow_schema` to construct batches with the pinned
+table's field order, names, nullability and core Arrow types. The function does
+not query the catalog or refresh the table schema. Include your Arrow
+implementation's C Data Interface declarations for `struct ArrowSchema`:
+
+```c
+struct ArrowSchema schema = {0};
+paimon_error *error = paimon_table_export_arrow_schema(table, &schema);
+if (error != NULL) {
+    paimon_error_free(error);
+    return -1;
+}
+/* Import schema into the Arrow implementation and construct matching batches.
+   An importing consumer may move ownership and set schema.release to NULL. */
+if (schema.release != NULL) schema.release(&schema);
+```
+
+The table handle is borrowed; the exported schema remains valid after it is
+freed. Release the schema through its callback, rather than
+`paimon_arrow_batch_free` (which frees a library-owned batch allocation).
+The output must be initialized with a null release callback. Reusing a live
+schema returns an error without replacing it; release it before reuse.
+The core type mapping remains authoritative, including for unsupported types.
+
 ### Cross-process Commit Messages
 
 Workers can prepare files and export their ordinary commit messages for an
