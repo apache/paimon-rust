@@ -30,16 +30,27 @@ fn invalid(message: impl Into<String>) -> crate::Error {
     }
 }
 
+fn append(out: &mut Vec<u8>, bytes: &[u8], max_bytes: usize) -> crate::Result<()> {
+    if bytes.len() > max_bytes.saturating_sub(out.len()) {
+        return Err(crate::Error::ResourceExhausted {
+            message: "Serialized commit message exceeds its output limit".into(),
+        });
+    }
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
 fn write_rows<T>(
     out: &mut Vec<u8>,
     values: &[T],
     encode: impl Fn(&T) -> crate::Result<Vec<u8>>,
+    max_bytes: usize,
 ) -> crate::Result<()> {
-    out.extend_from_slice(&(values.len() as i32).to_be_bytes());
+    append(out, &(values.len() as i32).to_be_bytes(), max_bytes)?;
     for value in values {
         let row = encode(value)?;
-        out.extend_from_slice(&(row.len() as i32).to_be_bytes());
-        out.extend_from_slice(&row);
+        append(out, &(row.len() as i32).to_be_bytes(), max_bytes)?;
+        append(out, &row, max_bytes)?;
     }
     Ok(())
 }
@@ -137,6 +148,16 @@ impl CommitMessage {
 
     /// Write the unframed Java v14 `CommitMessageSerializer.serialize` body.
     pub fn serialize(&self) -> crate::Result<Vec<u8>> {
+        self.serialize_with_limit(usize::MAX)
+    }
+
+    /// Encode the same body as [`Self::serialize`], limiting its output length.
+    /// Returns [`crate::Error::ResourceExhausted`] before appending bytes that
+    /// exceed `max_bytes`, without modifying this message.
+    ///
+    /// This is not a peak-memory limit: temporary metadata rows are encoded by
+    /// their existing serializers, and vector capacity may exceed its length.
+    pub fn serialize_with_limit(&self, max_bytes: usize) -> crate::Result<Vec<u8>> {
         if self.format_file.is_some() {
             return Err(crate::Error::Unsupported {
                 message: "Format Table two-phase file messages use a different Java serializer"
@@ -153,39 +174,67 @@ impl CommitMessage {
             BinaryRow::from_serialized_bytes(&self.partition)?;
             self.partition.clone()
         };
-        out.extend_from_slice(&(partition.len() as i32).to_be_bytes());
-        out.extend_from_slice(&partition);
-        out.extend_from_slice(&self.bucket.to_be_bytes());
-        out.push(u8::from(self.total_buckets.is_some()));
+        append(&mut out, &(partition.len() as i32).to_be_bytes(), max_bytes)?;
+        append(&mut out, &partition, max_bytes)?;
+        append(&mut out, &self.bucket.to_be_bytes(), max_bytes)?;
+        append(
+            &mut out,
+            &[u8::from(self.total_buckets.is_some())],
+            max_bytes,
+        )?;
         if let Some(value) = self.total_buckets {
-            out.extend_from_slice(&value.to_be_bytes());
+            append(&mut out, &value.to_be_bytes(), max_bytes)?;
         }
         for files in [
             &self.new_files,
             &self.deleted_files,
             &self.new_changelog_files,
         ] {
-            write_rows(&mut out, files, DataFileMeta::to_serialized_row_data)?;
+            write_rows(
+                &mut out,
+                files,
+                DataFileMeta::to_serialized_row_data,
+                max_bytes,
+            )?;
         }
         for files in [&self.new_index_files, &self.deleted_index_files] {
-            write_rows(&mut out, files, IndexFileMeta::to_serialized_row_data)?;
+            write_rows(
+                &mut out,
+                files,
+                IndexFileMeta::to_serialized_row_data,
+                max_bytes,
+            )?;
         }
         for files in [
             &self.compact_before,
             &self.compact_after,
             &self.compact_changelog_files,
         ] {
-            write_rows(&mut out, files, DataFileMeta::to_serialized_row_data)?;
+            write_rows(
+                &mut out,
+                files,
+                DataFileMeta::to_serialized_row_data,
+                max_bytes,
+            )?;
         }
         for files in [
             &self.compact_new_index_files,
             &self.compact_deleted_index_files,
         ] {
-            write_rows(&mut out, files, IndexFileMeta::to_serialized_row_data)?;
+            write_rows(
+                &mut out,
+                files,
+                IndexFileMeta::to_serialized_row_data,
+                max_bytes,
+            )?;
         }
-        out.push(u8::from(self.check_from_snapshot.is_some()));
+        append(
+            &mut out,
+            &[u8::from(self.check_from_snapshot.is_some())],
+            max_bytes,
+        )?;
         if let Some(value) = self.check_from_snapshot {
-            out.extend_from_slice(&value.to_be_bytes());
+            append(&mut out, &value.to_be_bytes(), max_bytes)?;
         }
         Ok(out)
     }
@@ -368,6 +417,21 @@ mod tests {
             index.global_index_meta.as_ref().unwrap().extra_field_ids,
             Some(vec![1, 4])
         );
+    }
+
+    #[test]
+    fn bounded_encoding_matches_the_upstream_protocol() {
+        for fixture in [EMPTY, INDEXED, RICH_INDEXED] {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(fixture)
+                .unwrap();
+            let message = CommitMessage::deserialize(14, &bytes).unwrap();
+            assert_eq!(message.serialize_with_limit(bytes.len()).unwrap(), bytes);
+            assert!(matches!(
+                message.serialize_with_limit(bytes.len() - 1),
+                Err(crate::Error::ResourceExhausted { .. })
+            ));
+        }
     }
 
     #[test]
