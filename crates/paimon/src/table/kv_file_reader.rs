@@ -40,14 +40,14 @@ use crate::file_index::file_index_result::FileIndexResult;
 use crate::io::FileIO;
 use crate::spec::{
     is_variant_extraction_row, BigIntType, CoreOptions, DataField, DataFileMeta,
-    DataType as PaimonDataType, MergeEngine, PartialUpdateConfig, Predicate, TinyIntType,
+    DataType as PaimonDataType, MergeEngine, PartialUpdateConfig, Predicate, RowKind, TinyIntType,
     KEY_FIELD_ID_START, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
     VALUE_KIND_FIELD_NAME,
 };
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
 use crate::{DataSplit, DeletionFile, Error};
-use arrow_array::{RecordBatch, RecordBatchOptions};
+use arrow_array::{Array, BooleanArray, Int8Array, RecordBatch, RecordBatchOptions};
 
 use async_stream::try_stream;
 use futures::StreamExt;
@@ -185,6 +185,86 @@ fn ensure_merge_input_limit(input_stream_count: usize, limit: Option<usize>) -> 
         });
     }
     Ok(())
+}
+
+/// Handles retract rows of an unmerged single run the way the merge path
+/// handles a lone version of a key: first-row without `ignore-delete` rejects
+/// them, otherwise they are omitted.
+fn drop_lone_retracts(
+    batch: RecordBatch,
+    value_kind_index: usize,
+    reject: bool,
+) -> crate::Result<RecordBatch> {
+    // The merge cursor reads a missing or NULL `_VALUE_KIND` as INSERT.
+    let Some(kinds) = batch
+        .column(value_kind_index)
+        .as_any()
+        .downcast_ref::<Int8Array>()
+    else {
+        return Ok(batch);
+    };
+    if kinds.null_count() == 0 && kinds.values().iter().all(|&kind| kind == 0 || kind == 2) {
+        return Ok(batch);
+    }
+    let mut keep = Vec::with_capacity(kinds.len());
+    for kind in kinds.iter() {
+        let is_add = RowKind::from_value(kind.unwrap_or(0))?.is_add();
+        if !is_add && reject {
+            return Err(Error::Unsupported {
+                message: "merge-engine=first-row does not support DELETE or UPDATE_BEFORE rows; set ignore-delete=true to ignore them".to_string(),
+            });
+        }
+        keep.push(is_add);
+    }
+    arrow_select::filter::filter_record_batch(&batch, &BooleanArray::from(keep)).map_err(|e| {
+        Error::DataInvalid {
+            message: format!("Failed to drop retract rows: {e}"),
+            source: Some(Box::new(e)),
+        }
+    })
+}
+
+/// Whether `batch` repeats a primary key, either in two adjacent rows or in its
+/// first row and the last row of `previous`. A key type the comparison kernel
+/// does not support counts as repeated, so the caller merges.
+fn repeats_a_key(
+    previous: Option<&RecordBatch>,
+    batch: &RecordBatch,
+    key_indices: &[usize],
+) -> bool {
+    let rows = batch.num_rows();
+    if rows == 0 {
+        return false;
+    }
+    let previous = previous.filter(|previous| previous.num_rows() > 0);
+    let mut at_boundary = previous.is_some();
+    let mut adjacent: Option<BooleanArray> = None;
+    for &index in key_indices {
+        let column = batch.column(index);
+        if let Some(previous) = previous.filter(|_| at_boundary) {
+            let last = previous.column(index).slice(previous.num_rows() - 1, 1);
+            match arrow_ord::cmp::not_distinct(&last, &column.slice(0, 1)) {
+                Ok(equal) => at_boundary = equal.true_count() == 1,
+                Err(_) => return true,
+            }
+        }
+        if rows > 1 {
+            let Ok(equal) = arrow_ord::cmp::not_distinct(
+                &column.slice(0, rows - 1),
+                &column.slice(1, rows - 1),
+            ) else {
+                return true;
+            };
+            adjacent = Some(match adjacent {
+                None => equal,
+                Some(so_far) => match arrow_arith::boolean::and(&so_far, &equal) {
+                    Ok(both) => both,
+                    Err(_) => return true,
+                },
+            });
+        }
+    }
+    at_boundary || adjacent.is_some_and(|equal| equal.true_count() > 0)
 }
 
 /// Java's `KeyValueFieldsExtractor` builds the physical file layout from the
@@ -493,15 +573,28 @@ impl KeyValueFileReader {
     }
 
     pub fn read(self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
-        self.read_with_merge_function(data_splits, Self::new_merge_function)
+        self.read_merged(data_splits, Self::new_merge_function, true)
     }
 
+    /// Always merges, so a custom merge function (e.g. the audit log, which
+    /// keeps retract rows) sees every row.
     pub(super) fn read_with_merge_function(
         self,
         data_splits: &[DataSplit],
         merge_function: impl Fn(&KeyValueReadConfig, &[DataField]) -> crate::Result<Box<dyn MergeFunction>>
             + Send
             + 'static,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_merged(data_splits, merge_function, false)
+    }
+
+    fn read_merged(
+        self,
+        data_splits: &[DataSplit],
+        merge_function: impl Fn(&KeyValueReadConfig, &[DataField]) -> crate::Result<Box<dyn MergeFunction>>
+            + Send
+            + 'static,
+        skip_single_runs: bool,
     ) -> crate::Result<ArrowRecordBatchStream> {
         // A projected `_ROW_ID` is synthesized as all-nulls here, so the residual
         // would silently drop every row rather than hit its missing-column guard.
@@ -814,6 +907,20 @@ impl KeyValueFileReader {
                             .map(|budget| Arc::new(budget.without_prefetch()))
                     };
                     let mut file_streams: Vec<ArrowRecordBatchStream> = Vec::new();
+                    // One sorted run should not repeat a key, so under these
+                    // engines every key is a lone version and needs no merge.
+                    // Retract rows are still dropped per batch below: older Rust
+                    // writers recorded `delete_row_count = 0` for files holding
+                    // them.
+                    let skip_merge = skip_single_runs
+                        && lookup.is_none()
+                        && input_stream_count == 1
+                        && matches!(
+                            config.merge_engine,
+                            MergeEngine::Deduplicate | MergeEngine::FirstRow
+                        );
+                    let reject_retracts = config.merge_engine == MergeEngine::FirstRow
+                        && !CoreOptions::new(&config.table_options).ignore_delete();
 
                     for MergeRun { files } in merge_group {
                         let reader = DataFileReader::new(
@@ -921,27 +1028,98 @@ impl KeyValueFileReader {
                         file_streams.push(run_stream);
                     }
 
-                    // Always go through sort-merge even for a single file: files
-                    // written before the writer merged key groups at flush may
-                    // still contain duplicate keys.
-                    let mut merge_stream = SortMergeReaderBuilder::new(
-                        file_streams,
-                        merge_input_schema.clone(),
-                        key_indices.clone(),
-                        seq_index,
-                        value_kind_index,
-                        user_sequence_indices.clone(),
-                        value_indices.clone(),
-                        merge_output_schema.clone(),
-                        merge_function(&config, &merge_output_fields)?,
-                    )
-                    .with_lookup(lookup.clone())
-                    .with_user_sequence_descending(
-                        !CoreOptions::new(&config.table_options)
-                            .sequence_field_sort_order_is_ascending(),
-                    )
-                    .with_batch_size(config.read_batch_size)
-                    .build()?;
+                    let mut merge_stream = if skip_merge {
+                        let mut input = file_streams.pop().expect("one input stream");
+                        let columns: Vec<usize> =
+                            key_indices.iter().chain(&value_indices).copied().collect();
+                        let schema = merge_output_schema.clone();
+                        let project = move |batch: RecordBatch| -> crate::Result<RecordBatch> {
+                            let batch =
+                                drop_lone_retracts(batch, value_kind_index, reject_retracts)?;
+                            let columns =
+                                columns.iter().map(|&i| batch.column(i).clone()).collect();
+                            RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
+                                Error::UnexpectedError {
+                                    message: format!("Failed to project unmerged batch: {e}"),
+                                    source: Some(Box::new(e)),
+                                }
+                            })
+                        };
+                        // Files written before #839 can repeat a key inside one
+                        // run, whatever engine the schemas name now. Hold one
+                        // batch back, and once a key repeats, merge from there.
+                        let fallback = SortMergeReaderBuilder::new(
+                            Vec::new(),
+                            merge_input_schema.clone(),
+                            key_indices.clone(),
+                            seq_index,
+                            value_kind_index,
+                            user_sequence_indices.clone(),
+                            value_indices.clone(),
+                            merge_output_schema.clone(),
+                            merge_function(&config, &merge_output_fields)?,
+                        )
+                        .with_user_sequence_descending(
+                            !CoreOptions::new(&config.table_options)
+                                .sequence_field_sort_order_is_ascending(),
+                        )
+                        .with_batch_size(config.read_batch_size);
+                        let key_indices = key_indices.clone();
+                        let stream: ArrowRecordBatchStream = try_stream! {
+                            let mut held: Option<RecordBatch> = None;
+                            let mut rest: Option<ArrowRecordBatchStream> = None;
+                            while let Some(batch) = input.next().await {
+                                let batch = batch?;
+                                if repeats_a_key(held.as_ref(), &batch, &key_indices) {
+                                    let pending: Vec<crate::Result<RecordBatch>> = held
+                                        .take()
+                                        .into_iter()
+                                        .chain(std::iter::once(batch))
+                                        .map(Ok)
+                                        .collect();
+                                    rest = Some(futures::stream::iter(pending).chain(input).boxed());
+                                    break;
+                                }
+                                if let Some(previous) = held.replace(batch) {
+                                    yield project(previous)?;
+                                }
+                            }
+                            match rest {
+                                Some(rest) => {
+                                    let mut merged = fallback.with_streams(vec![rest]).build()?;
+                                    while let Some(batch) = merged.next().await {
+                                        yield batch?;
+                                    }
+                                }
+                                None => {
+                                    if let Some(previous) = held {
+                                        yield project(previous)?;
+                                    }
+                                }
+                            }
+                        }
+                        .boxed();
+                        stream
+                    } else {
+                        SortMergeReaderBuilder::new(
+                            file_streams,
+                            merge_input_schema.clone(),
+                            key_indices.clone(),
+                            seq_index,
+                            value_kind_index,
+                            user_sequence_indices.clone(),
+                            value_indices.clone(),
+                            merge_output_schema.clone(),
+                            merge_function(&config, &merge_output_fields)?,
+                        )
+                        .with_lookup(lookup.clone())
+                        .with_user_sequence_descending(
+                            !CoreOptions::new(&config.table_options)
+                                .sequence_field_sort_order_is_ascending(),
+                        )
+                        .with_batch_size(config.read_batch_size)
+                        .build()?
+                    };
 
                     while let Some(batch) = merge_stream.next().await {
                         let batch = batch?;
@@ -2082,6 +2260,7 @@ mod tests {
                 ("deletion-vectors.merge-on-read", "true"),
             ],
         );
+        write_schema_file(&table, table.schema()).await;
 
         let mut files = Vec::new();
         for i in 0..10 {
@@ -2127,7 +2306,9 @@ mod tests {
             .await
             .expect("the first output batch")
             .expect("a late deletion vector must be loaded lazily");
-        assert_eq!(first.num_rows(), 128);
+        // These delete-free files form one run, which streams without the
+        // merge, so the first batch is one input batch.
+        assert!(first.num_rows() > 0);
 
         let err = stream.try_collect::<Vec<_>>().await.unwrap_err();
         assert!(
@@ -2140,6 +2321,17 @@ mod tests {
         let mut builder = crate::spec::BinaryRowBuilder::new(1);
         builder.write_int(0, value);
         builder.build_serialized()
+    }
+
+    fn nullable_int_key(value: Option<i32>) -> Vec<u8> {
+        match value {
+            Some(value) => int_key(value),
+            None => {
+                let mut builder = crate::spec::BinaryRowBuilder::new(1);
+                builder.set_null_at(0);
+                builder.build_serialized()
+            }
+        }
     }
 
     async fn write_multi_row_group_kv_file(
@@ -2695,6 +2887,7 @@ mod tests {
                 ("read.parquet.row-group.parallelism", "1"),
             ],
         );
+        write_schema_file(&table, table.schema()).await;
         let low =
             write_multi_row_group_kv_file(&file_io, table_path, "low.parquet", 0, 0, 10).await;
         let high =
@@ -2751,6 +2944,7 @@ mod tests {
                 ("read.parquet.row-group.parallelism", "1"),
             ],
         );
+        write_schema_file(&table, table.schema()).await;
         let first_low =
             write_multi_row_group_kv_file(&file_io, table_path, "first-low.parquet", 0, 0, 10)
                 .await;
@@ -2813,11 +3007,520 @@ mod tests {
         );
     }
 
+    /// Writes one KV file with the given keys and row kinds, recorded with
+    /// `delete_row_count = Some(0)` as Rust writers did before #318.
+    async fn write_legacy_kv_file(
+        file_io: &FileIO,
+        table_path: &str,
+        file_name: &str,
+        rows: &[(i32, i8)],
+    ) -> DataFileMeta {
+        let schema = crate::arrow::build_target_arrow_schema(&[
+            DataField::new(
+                SEQUENCE_NUMBER_FIELD_ID,
+                SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+                DataType::BigInt(BigIntType::new()),
+            ),
+            DataField::new(
+                VALUE_KIND_FIELD_ID,
+                VALUE_KIND_FIELD_NAME.to_string(),
+                DataType::TinyInt(TinyIntType::new()),
+            ),
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
+        ])
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_value(0, rows.len())),
+                Arc::new(Int8Array::from_iter_values(rows.iter().map(|row| row.1))),
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.0))),
+                Arc::new(Int32Array::from_value(0, rows.len())),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = AsyncArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+            writer.write(&batch).await.unwrap();
+            writer.close().await.unwrap();
+        }
+        let bucket_path = format!("{table_path}/bucket-0");
+        file_io.mkdirs(&format!("{bucket_path}/")).await.unwrap();
+        file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap()
+            .write(bytes::Bytes::from(bytes.clone()))
+            .await
+            .unwrap();
+
+        let mut file = dummy_data_file(file_name.to_string());
+        file.file_size = bytes.len() as i64;
+        file.row_count = rows.len() as i64;
+        file.min_key = int_key(rows[0].0);
+        file.max_key = int_key(rows[rows.len() - 1].0);
+        file
+    }
+
+    #[tokio::test]
+    async fn single_run_read_drops_retracts_hidden_by_legacy_metadata() {
+        let file_io = test_file_io();
+        let adds = [(1, 0), (2, 0)];
+        let retract = [(3, 3)];
+        for (options, expected) in [
+            (vec![], Some(vec![1, 2])),
+            (vec![("merge-engine", "first-row")], None),
+            (
+                vec![("merge-engine", "first-row"), ("ignore-delete", "true")],
+                Some(vec![1, 2]),
+            ),
+        ] {
+            let table_path = "memory:/kv_legacy_retract";
+            let table = pk_table(&file_io, table_path, &options);
+            write_schema_file(&table, table.schema()).await;
+            let a = write_legacy_kv_file(&file_io, table_path, "a.parquet", &adds).await;
+            let b = write_legacy_kv_file(&file_io, table_path, "b.parquet", &retract).await;
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(format!("{table_path}/bucket-0"))
+                .with_total_buckets(1)
+                .with_data_files(vec![a, b])
+                .build()
+                .unwrap();
+            let core_options = table.schema().core_options();
+            let result = KeyValueFileReader::new(
+                table.file_io().clone(),
+                KeyValueReadConfig {
+                    table_name: table.identifier().full_name(),
+                    table_options: table.schema().options().clone(),
+                    schema_manager: table.schema_manager().clone(),
+                    table_schema_id: table.schema().id(),
+                    table_fields: table.schema().fields().to_vec(),
+                    read_type: table.schema().fields().to_vec(),
+                    predicates: Vec::new(),
+                    primary_keys: table.schema().trimmed_primary_keys(),
+                    table_primary_keys: table.schema().primary_keys().to_vec(),
+                    merge_engine: core_options.merge_engine().unwrap(),
+                    sequence_fields: Vec::new(),
+                    read_batch_size: core_options.read_batch_size().unwrap(),
+                    merge_splits: false,
+                    max_merge_input_streams: None,
+                    parquet_read_budget: None,
+                    mosaic_prefetch: MosaicPrefetchOptions::default(),
+                },
+            )
+            .read(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await;
+            match expected {
+                Some(ids) => assert_eq!(int_column(&result.unwrap(), "id"), ids, "{options:?}"),
+                None => assert!(result.is_err(), "{options:?}"),
+            }
+        }
+    }
+
+    /// Writes one KV file with `(id, sequence, value)` rows, under schema 0.
+    async fn write_kv_versions(
+        file_io: &FileIO,
+        table_path: &str,
+        file_name: &str,
+        rows: &[(i32, i64, i32)],
+    ) -> DataFileMeta {
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|&(id, seq, value)| (Some(id), seq, value))
+            .collect();
+        write_kv_nullable_versions(file_io, table_path, file_name, &rows).await
+    }
+
+    /// Like `write_kv_versions`, with a nullable `id`.
+    async fn write_kv_nullable_versions(
+        file_io: &FileIO,
+        table_path: &str,
+        file_name: &str,
+        rows: &[(Option<i32>, i64, i32)],
+    ) -> DataFileMeta {
+        let schema = crate::arrow::build_target_arrow_schema(&[
+            DataField::new(
+                SEQUENCE_NUMBER_FIELD_ID,
+                SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+                DataType::BigInt(BigIntType::new()),
+            ),
+            DataField::new(
+                VALUE_KIND_FIELD_ID,
+                VALUE_KIND_FIELD_NAME.to_string(),
+                DataType::TinyInt(TinyIntType::new()),
+            ),
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
+        ])
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.1))),
+                Arc::new(Int8Array::from_value(0, rows.len())),
+                Arc::new(Int32Array::from_iter(rows.iter().map(|row| row.0))),
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.2))),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = AsyncArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+            writer.write(&batch).await.unwrap();
+            writer.close().await.unwrap();
+        }
+        let bucket_path = format!("{table_path}/bucket-0");
+        file_io.mkdirs(&format!("{bucket_path}/")).await.unwrap();
+        file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap()
+            .write(bytes::Bytes::from(bytes.clone()))
+            .await
+            .unwrap();
+
+        let mut file = dummy_data_file(file_name.to_string());
+        file.file_size = bytes.len() as i64;
+        file.row_count = rows.len() as i64;
+        file.min_key = nullable_int_key(rows[0].0);
+        file.max_key = nullable_int_key(rows[rows.len() - 1].0);
+        file.min_sequence_number = rows.iter().map(|row| row.1).min().unwrap();
+        file.max_sequence_number = rows.iter().map(|row| row.1).max().unwrap();
+        file
+    }
+
+    async fn read_kv_split(table: &Table, split: DataSplit) -> Vec<RecordBatch> {
+        let core_options = table.schema().core_options();
+        KeyValueFileReader::new(
+            table.file_io().clone(),
+            KeyValueReadConfig {
+                table_name: table.identifier().full_name(),
+                table_options: table.schema().options().clone(),
+                schema_manager: table.schema_manager().clone(),
+                table_schema_id: table.schema().id(),
+                table_fields: table.schema().fields().to_vec(),
+                read_type: table.schema().fields().to_vec(),
+                predicates: Vec::new(),
+                primary_keys: table.schema().trimmed_primary_keys(),
+                table_primary_keys: table.schema().primary_keys().to_vec(),
+                merge_engine: core_options.merge_engine().unwrap(),
+                sequence_fields: Vec::new(),
+                read_batch_size: core_options.read_batch_size().unwrap(),
+                merge_splits: false,
+                max_merge_input_streams: None,
+                parquet_read_budget: None,
+                mosaic_prefetch: MosaicPrefetchOptions::default(),
+            },
+        )
+        .read(&[split])
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_files_written_under_aggregation() {
+        // Before #839 the aggregation writer kept several versions of a key in
+        // one file. After ALTER to deduplicate, such a file still needs merging.
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_engine_change";
+        let old = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("merge-engine", "aggregation"),
+                ("fields.value.aggregate-function", "sum"),
+            ],
+        );
+        write_schema_file(&old, old.schema()).await;
+        let mut json = serde_json::to_value(old.schema()).unwrap();
+        json["id"] = 1.into();
+        json["options"]["merge-engine"] = "deduplicate".into();
+        let schema: TableSchema = serde_json::from_value(json).unwrap();
+        write_schema_file(&old, &schema).await;
+        let table = old.copy_with_resolved_schema(schema, "main").unwrap();
+        let a =
+            write_kv_versions(&file_io, table_path, "a.parquet", &[(1, 0, 10), (1, 1, 11)]).await;
+        let b = write_kv_versions(&file_io, table_path, "b.parquet", &[(2, 2, 20)]).await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![a, b])
+            .build()
+            .unwrap();
+        let batches = read_kv_split(&table, split).await;
+        assert_eq!(int_column(&batches, "id"), vec![1, 2]);
+        assert_eq!(int_column(&batches, "value"), vec![11, 20]);
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_repeated_keys_under_the_stored_engine() {
+        // Before #839, copy_with_options could switch the writer to aggregation
+        // under the same schema ID, so a file can repeat a key even though every
+        // schema says deduplicate.
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_repeated_keys";
+        let table = pk_table(&file_io, table_path, &[]);
+        write_schema_file(&table, table.schema()).await;
+        let a =
+            write_kv_versions(&file_io, table_path, "a.parquet", &[(1, 0, 10), (1, 1, 11)]).await;
+        let b = write_kv_versions(&file_io, table_path, "b.parquet", &[(2, 2, 20)]).await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![a, b])
+            .build()
+            .unwrap();
+        let batches = read_kv_split(&table, split).await;
+        assert_eq!(int_column(&batches, "id"), vec![1, 2]);
+        assert_eq!(int_column(&batches, "value"), vec![11, 20]);
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_a_key_repeated_across_batches() {
+        // One-row batches: key 1 is emitted before key 2 repeats across a batch
+        // boundary, and key 3 comes after the switch to merging.
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_repeated_across_batches";
+        let table = pk_table(&file_io, table_path, &[("read.batch-size", "1")]);
+        write_schema_file(&table, table.schema()).await;
+        let a = write_kv_versions(
+            &file_io,
+            table_path,
+            "a.parquet",
+            &[(1, 0, 10), (2, 1, 20), (2, 2, 21), (3, 3, 30)],
+        )
+        .await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![a])
+            .build()
+            .unwrap();
+        let batches = read_kv_split(&table, split).await;
+        assert_eq!(int_column(&batches, "id"), vec![1, 2, 3]);
+        assert_eq!(int_column(&batches, "value"), vec![10, 21, 30]);
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_repeated_keys_under_first_row() {
+        // First-row reads carry the file level next to the merge input, so the
+        // switch to merging has to use that schema too. The first version wins.
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_repeated_keys_first_row";
+        let table = pk_table(&file_io, table_path, &[("merge-engine", "first-row")]);
+        write_schema_file(&table, table.schema()).await;
+        let a = write_kv_versions(
+            &file_io,
+            table_path,
+            "a.parquet",
+            &[(1, 0, 10), (2, 1, 20), (2, 2, 21), (3, 3, 30)],
+        )
+        .await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![a])
+            .build()
+            .unwrap();
+        let batches = read_kv_split(&table, split).await;
+        assert_eq!(int_column(&batches, "id"), vec![1, 2, 3]);
+        assert_eq!(int_column(&batches, "value"), vec![10, 20, 30]);
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_repeated_null_keys() {
+        // NULL == NULL is NULL under plain equality, so a repeated NULL key needs
+        // the null-safe comparison. Batch size 64 repeats it inside one batch, 1
+        // repeats it across a batch boundary.
+        for batch_size in ["64", "1"] {
+            let file_io = test_file_io();
+            let table_path = format!("memory:/kv_repeated_null_keys_{batch_size}");
+            let table = pk_table(
+                &file_io,
+                &table_path,
+                &[
+                    ("primary-key.nullable", "true"),
+                    ("read.batch-size", batch_size),
+                ],
+            );
+            write_schema_file(&table, table.schema()).await;
+            let a = write_kv_nullable_versions(
+                &file_io,
+                &table_path,
+                "a.parquet",
+                &[(None, 0, 10), (None, 1, 11), (Some(2), 2, 20)],
+            )
+            .await;
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(format!("{table_path}/bucket-0"))
+                .with_total_buckets(1)
+                .with_data_files(vec![a])
+                .build()
+                .unwrap();
+            let batches = read_kv_split(&table, split).await;
+            let ids: Vec<Option<i32>> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch.column(batch.schema().index_of("id").unwrap());
+                    let ids = column.as_any().downcast_ref::<Int32Array>().unwrap();
+                    ids.iter().collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(ids, vec![None, Some(2)], "batch size {batch_size}");
+            assert_eq!(
+                int_column(&batches, "value"),
+                vec![11, 20],
+                "batch size {batch_size}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_after_time_travel_past_an_engine_alter() {
+        // aggregation (schema 0) -> ALTER to deduplicate (schema 1). Reading
+        // snapshot 1 resolves schema 0 but keeps the current engine option.
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_engine_time_travel";
+        let old = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("merge-engine", "aggregation"),
+                ("fields.value.aggregate-function", "sum"),
+            ],
+        );
+        write_schema_file(&old, old.schema()).await;
+        let mut json = serde_json::to_value(old.schema()).unwrap();
+        json["id"] = 1.into();
+        json["options"]["merge-engine"] = "deduplicate".into();
+        let schema: TableSchema = serde_json::from_value(json).unwrap();
+        write_schema_file(&old, &schema).await;
+        let table = old.copy_with_resolved_schema(schema, "main").unwrap();
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        let snapshot = crate::spec::Snapshot::builder()
+            .version(3)
+            .id(1)
+            .schema_id(0)
+            .base_manifest_list("base-list".to_string())
+            .delta_manifest_list("delta-list".to_string())
+            .commit_user("test-user".to_string())
+            .commit_identifier(0)
+            .commit_kind(crate::spec::CommitKind::APPEND)
+            .time_millis(1000)
+            .build();
+        assert!(table
+            .snapshot_manager()
+            .commit_snapshot(&snapshot)
+            .await
+            .unwrap());
+        let historical = table
+            .copy_with_time_travel_strict(HashMap::from([(
+                "scan.version".to_string(),
+                "1".to_string(),
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(historical.schema().id(), 0);
+        assert_eq!(
+            historical.schema().core_options().merge_engine().unwrap(),
+            MergeEngine::Deduplicate
+        );
+
+        let a =
+            write_kv_versions(&file_io, table_path, "a.parquet", &[(1, 0, 10), (1, 1, 11)]).await;
+        let b = write_kv_versions(&file_io, table_path, "b.parquet", &[(2, 2, 20)]).await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![a, b])
+            .build()
+            .unwrap();
+        let batches = read_kv_split(&historical, split).await;
+        assert_eq!(int_column(&batches, "id"), vec![1, 2]);
+        assert_eq!(int_column(&batches, "value"), vec![11, 20]);
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_when_the_read_schema_names_another_engine() {
+        // Dynamic options and time travel can give the read schema another
+        // engine under the files' schema ID; the stored engine is aggregation.
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_engine_override";
+        let old = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("merge-engine", "aggregation"),
+                ("fields.value.aggregate-function", "sum"),
+            ],
+        );
+        write_schema_file(&old, old.schema()).await;
+        let overridden = old.copy_with_options(HashMap::from([(
+            "merge-engine".to_string(),
+            "deduplicate".to_string(),
+        )]));
+        // Same read schema as a historical read after an ALTER to deduplicate.
+        let rewrapped = old
+            .copy_with_resolved_schema(overridden.schema().clone(), "main")
+            .unwrap();
+        let a =
+            write_kv_versions(&file_io, table_path, "a.parquet", &[(1, 0, 10), (1, 1, 11)]).await;
+        let b = write_kv_versions(&file_io, table_path, "b.parquet", &[(2, 2, 20)]).await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![a, b])
+            .build()
+            .unwrap();
+        for table in [&overridden, &rewrapped] {
+            assert_eq!(table.schema().id(), old.schema().id());
+            assert_eq!(
+                table.schema().core_options().merge_engine().unwrap(),
+                MergeEngine::Deduplicate
+            );
+            let batches = read_kv_split(table, split.clone()).await;
+            assert_eq!(int_column(&batches, "id"), vec![1, 2]);
+            assert_eq!(int_column(&batches, "value"), vec![11, 20]);
+        }
+    }
+
     #[tokio::test]
     async fn sorted_run_read_matches_per_file_fan_out() {
         let file_io = test_file_io();
         let table_path = "memory:/kv_sorted_run";
         let table = pk_table(&file_io, table_path, &[]);
+        write_schema_file(&table, table.schema()).await;
         let low =
             write_multi_row_group_kv_file(&file_io, table_path, "low.parquet", 0, 0, 10).await;
         let high =
