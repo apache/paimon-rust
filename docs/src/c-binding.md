@@ -759,6 +759,47 @@ of those bodies. Do not concatenate bodies or add a header inside a body.
 An empty message list exports an empty array. The buffers are independent of
 the source handle and remain valid after that handle is freed.
 
+For a size-limited transport, query the message count and export ranges. The
+limit applies to the sum of body lengths, excluding array overhead and the
+application's framing. Reserve space for that framing in the transport budget.
+This example reduces a range after `ResourceExhausted` (code `6`):
+
+```c
+size_t total = 0;
+paimon_error *count_error = paimon_commit_messages_count(messages, &total);
+if (count_error != NULL) {
+    /* Report the error before releasing it. */
+    paimon_error_free(count_error);
+    return -1;
+}
+for (size_t offset = 0; offset < total; ) {
+    size_t count = total - offset;
+    paimon_result_bytes_array chunk;
+    for (;;) {
+        chunk = paimon_commit_messages_serialize_range(
+            messages, offset, count, body_limit);
+        if (chunk.error == NULL) break;
+        int retry = chunk.error->code == 6 && count > 1;
+        paimon_error_free(chunk.error);
+        paimon_bytes_array_free(chunk.bytes); /* Empty on error. */
+        if (!retry) return -1; /* A single body may exceed the limit. */
+        count /= 2;
+    }
+    /* Send or copy chunk.bytes, preserving the bodies' order and boundaries. */
+    paimon_bytes_array_free(chunk.bytes);
+    offset += count;
+}
+```
+
+Errors do not consume messages or expose a partial array, so a smaller range
+can be retried against the same handle. `offset + count` must not overflow or
+exceed the message count. Empty ranges at or before the end succeed even with
+a zero-byte limit. The existing full-list export remains available.
+
+The byte limit is not a peak-memory or RSS bound: individual metadata rows
+still use temporary encoding buffers, and vector capacity and result ownership
+conversion can allocate additional memory.
+
 On the coordinator, create a standard committer for the intended table and
 operation. Enable overwrite on its builder before creating it if the workers
 prepared an overwrite. Pass the received bodies as borrowed
