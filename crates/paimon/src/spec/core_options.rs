@@ -105,6 +105,10 @@ const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
 const MANIFEST_TARGET_SIZE_OPTION: &str = "manifest.target-size";
 const MANIFEST_SIDECAR_ENABLED_OPTION: &str = "manifest.sidecar.enabled";
 const MANIFEST_SORT_ENABLED_OPTION: &str = "manifest-sort.enabled";
+const MANIFEST_MERGE_MIN_COUNT_OPTION: &str = "manifest.merge-min-count";
+const MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION: &str =
+    "manifest.full-compaction-threshold-size";
+const MANIFEST_MERGE_SKIP_ON_WRITE_ONLY_OPTION: &str = "manifest.merge.skip-on-write-only";
 const SCAN_MANIFEST_PARALLELISM_OPTION: &str = "scan.manifest.parallelism";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
@@ -157,6 +161,8 @@ const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 const DEFAULT_MANIFEST_COMPRESSION: &str = "zstd";
 const DEFAULT_MANIFEST_TARGET_FILE_SIZE: i64 = 8 * 1024 * 1024;
+const DEFAULT_MANIFEST_MERGE_MIN_COUNT: usize = 30;
+const DEFAULT_MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE: i64 = 16 * 1024 * 1024;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
 const DEFAULT_CHANGELOG_FILE_PREFIX: &str = "changelog-";
 const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
@@ -1576,6 +1582,53 @@ impl<'a> CoreOptions<'a> {
             .or_else(|| self.options.get(MANIFEST_TARGET_SIZE_OPTION))
             .and_then(|v| parse_memory_size(v))
             .unwrap_or(DEFAULT_MANIFEST_TARGET_FILE_SIZE)
+    }
+
+    /// Minimum number of trailing manifests merged together at commit.
+    /// Default is 30, as in Java.
+    pub fn manifest_merge_min_count(&self) -> crate::Result<usize> {
+        let Some(raw) = self.options.get(MANIFEST_MERGE_MIN_COUNT_OPTION) else {
+            return Ok(DEFAULT_MANIFEST_MERGE_MIN_COUNT);
+        };
+        raw.trim()
+            .parse::<usize>()
+            .map_err(|_| crate::Error::ConfigInvalid {
+                message: format!(
+                    "{MANIFEST_MERGE_MIN_COUNT_OPTION} must be a non-negative integer, got '{raw}'"
+                ),
+            })
+    }
+
+    /// Total size of manifests that must change before a commit rewrites them
+    /// in a full manifest compaction. Default is 16 MiB, as in Java.
+    pub fn manifest_full_compaction_threshold_size(&self) -> crate::Result<i64> {
+        let Some(raw) = self
+            .options
+            .get(MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION)
+        else {
+            return Ok(DEFAULT_MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE);
+        };
+        parse_memory_size(raw)
+            .filter(|size| *size > 0)
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: format!(
+                    "{MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION} must be a positive memory size, got '{raw}'"
+                ),
+            })
+    }
+
+    /// Whether `write-only` commits skip manifest merging. Default is false.
+    pub fn manifest_merge_skip_on_write_only(&self) -> crate::Result<bool> {
+        match self.options.get(MANIFEST_MERGE_SKIP_ON_WRITE_ONLY_OPTION) {
+            None => Ok(false),
+            Some(raw) if raw.eq_ignore_ascii_case("true") => Ok(true),
+            Some(raw) if raw.eq_ignore_ascii_case("false") => Ok(false),
+            Some(raw) => Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "{MANIFEST_MERGE_SKIP_ON_WRITE_ONLY_OPTION} must be true or false, got '{raw}'"
+                ),
+            }),
+        }
     }
 
     /// Whether manifest block sidecars are read and written.
@@ -3745,6 +3798,60 @@ mod tests {
         let core = CoreOptions::new(&options);
 
         assert_eq!(core.manifest_target_size(), 2 * 1024);
+    }
+
+    #[test]
+    fn test_manifest_merge_options() {
+        let defaults = HashMap::new();
+        let core = CoreOptions::new(&defaults);
+        assert_eq!(core.manifest_merge_min_count().unwrap(), 30);
+        assert_eq!(
+            core.manifest_full_compaction_threshold_size().unwrap(),
+            16 * 1024 * 1024
+        );
+        assert!(!core.manifest_merge_skip_on_write_only().unwrap());
+
+        let options = HashMap::from([
+            (MANIFEST_MERGE_MIN_COUNT_OPTION.to_string(), "2".to_string()),
+            (
+                MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION.to_string(),
+                "1 kb".to_string(),
+            ),
+            (
+                MANIFEST_MERGE_SKIP_ON_WRITE_ONLY_OPTION.to_string(),
+                "TRUE".to_string(),
+            ),
+        ]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.manifest_merge_min_count().unwrap(), 2);
+        assert_eq!(
+            core.manifest_full_compaction_threshold_size().unwrap(),
+            1024
+        );
+        assert!(core.manifest_merge_skip_on_write_only().unwrap());
+    }
+
+    #[test]
+    fn test_manifest_merge_options_reject_invalid_values() {
+        for (key, value) in [
+            (MANIFEST_MERGE_MIN_COUNT_OPTION, "-1"),
+            (MANIFEST_MERGE_MIN_COUNT_OPTION, "many"),
+            (MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION, "0"),
+            (MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION, "large"),
+            (MANIFEST_MERGE_SKIP_ON_WRITE_ONLY_OPTION, "yes"),
+        ] {
+            let options = HashMap::from([(key.to_string(), value.to_string())]);
+            let core = CoreOptions::new(&options);
+            let result = match key {
+                MANIFEST_MERGE_MIN_COUNT_OPTION => core.manifest_merge_min_count().map(drop),
+                MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION => {
+                    core.manifest_full_compaction_threshold_size().map(drop)
+                }
+                _ => core.manifest_merge_skip_on_write_only().map(drop),
+            };
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains(key), "{key}={value}: {error}");
+        }
     }
 
     #[test]
