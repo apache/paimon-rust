@@ -202,7 +202,15 @@ impl TableCommit {
             None
         } else {
             let partitions = deleted.keys().map(|id| id.partition.clone()).collect();
-            PartitionFilter::from_partition_set(partitions, &partition_fields).ok()
+            match PartitionFilter::from_partition_set(partitions, &partition_fields) {
+                Ok(filter) => Some(filter),
+                Err(error) => {
+                    log::warn!(
+                        "Manifest full compaction reads every manifest: no filter for the deleted partitions: {error}"
+                    );
+                    None
+                }
+            }
         };
         let any_deleted = !deleted.is_empty();
         move |manifest: &ManifestFileMeta| {
@@ -216,7 +224,8 @@ impl TableCommit {
     /// Read the manifests to merge and return the entries to rewrite. A manifest
     /// that neither must change nor holds a deleted ADD is kept in `result`.
     /// Returns `None`, before anything is written, when one of them is not
-    /// rewritable.
+    /// rewritable, adds a deleted file a second time, or holds a DELETE that
+    /// `read_deleted_entries` did not see.
     async fn rewrite_entries(
         &self,
         to_be_merged: &[ManifestFileMeta],
@@ -252,17 +261,32 @@ impl TableCommit {
             }
             let mut require_change = config.must_change(manifest);
             let mut adds = Vec::new();
-            for entry in content
-                .entries
-                .into_iter()
-                .filter(|e| *e.kind() == FileKind::Add)
-            {
+            for entry in content.entries {
                 let identifier = entry.identifier();
-                if deleted.contains_key(&identifier) {
-                    matched.insert(identifier);
-                    require_change = true;
-                } else {
-                    adds.push(entry);
+                match *entry.kind() {
+                    FileKind::Add if deleted.contains_key(&identifier) => {
+                        // [ADD x, DELETE x, ADD x] leaves x live for an ordered
+                        // reader; dropping every ADD of x would remove it.
+                        if !matched.insert(identifier) {
+                            log::warn!(
+                                "Skipping manifest full compaction: {} adds a deleted file that is already added",
+                                manifest.file_name()
+                            );
+                            return Ok(None);
+                        }
+                        require_change = true;
+                    }
+                    FileKind::Add => adds.push(entry),
+                    // Only an understated `num_deleted_files` hides a DELETE
+                    // from `read_deleted_entries`; a rewrite would drop it.
+                    FileKind::Delete if !deleted.contains_key(&identifier) => {
+                        log::warn!(
+                            "Skipping manifest full compaction: {} holds more DELETE entries than its metadata counts",
+                            manifest.file_name()
+                        );
+                        return Ok(None);
+                    }
+                    FileKind::Delete => {}
                 }
             }
             if require_change {
