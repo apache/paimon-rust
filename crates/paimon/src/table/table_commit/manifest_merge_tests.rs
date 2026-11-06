@@ -744,9 +744,10 @@ async fn full_compaction_keeps_a_delete_whose_add_was_pruned() {
 
 #[tokio::test]
 async fn full_compaction_skips_a_manifest_with_an_unknown_field() {
-    // Under the default target the new-writer manifest must change; under a
-    // one-byte target it is read only because it holds the deleted ADD. The
-    // default target runs first so a regression fails on the lost files.
+    // Under the default target the new-writer manifest must change. Under a
+    // one-byte target it need not, but it is still read: an unpartitioned
+    // table reads every manifest once any DELETE exists. The default target
+    // runs first so a regression fails on the lost files.
     for target in [None, Some("1 b")] {
         let io = test_file_io();
         let case = if target.is_some() {
@@ -956,6 +957,65 @@ async fn full_compaction_of_a_single_manifest_falls_back_to_minor_merging() {
         .merge_manifests(input.clone(), &mut created)
         .await
         .unwrap();
+    assert_eq!(merged, input);
+    assert!(created.is_empty());
+}
+
+#[tokio::test]
+async fn full_compaction_keeps_manifests_whose_delete_count_is_understated() {
+    // `read_deleted_entries` skips a manifest listed without DELETEs, so
+    // rewriting it would drop the DELETE of x and bring x back.
+    let io = test_file_io();
+    let path = "memory:/manifest-full-compaction-understated-deletes";
+    setup_dirs(&io, path).await;
+    let writer = merge_table(&io, path, &[("manifest.merge-min-count", "1000")]);
+    let mut deletion = CommitMessage::new(vec![], 0, vec![]);
+    deletion.deleted_files.push(test_data_file("x.parquet", 10));
+    for message in [
+        append_message("x.parquet"),
+        deletion,
+        append_message("y.parquet"),
+    ] {
+        writer.commit(vec![message]).await.unwrap();
+    }
+    let mut input = base_manifests(&io, path).await;
+    input.extend(delta_manifests(&io, path).await);
+    let [_, deletion, _] = input.as_slice() else {
+        panic!("expected three manifests, got {input:?}");
+    };
+    assert_eq!(deletion.num_deleted_files(), 1);
+    input[1] = ManifestFileMeta::new(
+        deletion.file_name().to_string(),
+        deletion.file_size(),
+        deletion.num_added_files(),
+        0,
+        deletion.partition_stats().clone(),
+        deletion.schema_id(),
+    );
+
+    let merger = merge_table(
+        &io,
+        path,
+        &[
+            ("manifest.merge-min-count", "1000"),
+            ("manifest.full-compaction-threshold-size", "1 b"),
+        ],
+    );
+    let mut created = Vec::new();
+    let merged = merger
+        .merge_manifests(input.clone(), &mut created)
+        .await
+        .unwrap();
+    let mut entries = Vec::new();
+    for manifest in &merged {
+        let manifest_path = format!("{path}/manifest/{}", manifest.file_name());
+        entries.extend(Manifest::read(&io, &manifest_path).await.unwrap());
+    }
+    let live = merge_active_entries(entries)
+        .into_iter()
+        .map(|entry| entry.file().file_name.clone())
+        .collect::<HashSet<_>>();
+    assert_eq!(live, HashSet::from(["y.parquet".to_string()]));
     assert_eq!(merged, input);
     assert!(created.is_empty());
 }
