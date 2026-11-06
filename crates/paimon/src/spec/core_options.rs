@@ -1585,18 +1585,21 @@ impl<'a> CoreOptions<'a> {
     }
 
     /// Minimum number of trailing manifests merged together at commit.
-    /// Default is 30, as in Java.
+    /// Default is 30, as in Java. Java accepts any int and a negative value
+    /// always merges, so negatives are read as 0.
     pub fn manifest_merge_min_count(&self) -> crate::Result<usize> {
         let Some(raw) = self.options.get(MANIFEST_MERGE_MIN_COUNT_OPTION) else {
             return Ok(DEFAULT_MANIFEST_MERGE_MIN_COUNT);
         };
-        raw.trim()
-            .parse::<usize>()
+        let value = raw
+            .trim()
+            .parse::<i32>()
             .map_err(|_| crate::Error::ConfigInvalid {
                 message: format!(
-                    "{MANIFEST_MERGE_MIN_COUNT_OPTION} must be a non-negative integer, got '{raw}'"
+                    "{MANIFEST_MERGE_MIN_COUNT_OPTION} must be an integer, got '{raw}'"
                 ),
-            })
+            })?;
+        Ok(value.max(0) as usize)
     }
 
     /// Total size of manifests that must change before a commit rewrites them
@@ -3829,12 +3832,23 @@ mod tests {
             1024
         );
         assert!(core.manifest_merge_skip_on_write_only().unwrap());
+
+        // Java accepts a negative count, which always merges.
+        let options = HashMap::from([(
+            MANIFEST_MERGE_MIN_COUNT_OPTION.to_string(),
+            "-1".to_string(),
+        )]);
+        assert_eq!(
+            CoreOptions::new(&options)
+                .manifest_merge_min_count()
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
     fn test_manifest_merge_options_reject_invalid_values() {
         for (key, value) in [
-            (MANIFEST_MERGE_MIN_COUNT_OPTION, "-1"),
             (MANIFEST_MERGE_MIN_COUNT_OPTION, "many"),
             (MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION, "0"),
             (MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION, "large"),

@@ -18,9 +18,10 @@
 //! Commit-time manifest merging, ported from Java `ManifestFileLegacyMerger`.
 //!
 //! In a merged group, a DELETE entry leaves the manifest set only together
-//! with the ADD it cancels, so the merged manifests resolve to the same live
-//! files as their input. Groups that cannot be merged this way are kept as
-//! they are.
+//! with the ADD it cancels. When each file is added at most once across the
+//! manifest list, as Java `FileEntry.mergeEntries` requires, the merged
+//! manifests resolve to the same live files as their input. Groups that cannot
+//! be merged this way are kept as they are.
 
 use super::*;
 use crate::spec::avro::from_avro_bytes_fast;
@@ -101,29 +102,36 @@ impl TableCommit {
             return Ok(candidates);
         }
         let manifest_dir = self.snapshot_manager.manifest_dir();
-        let contents: Vec<ManifestContents> = read_manifests(
+        let mut contents = std::pin::pin!(read_manifests(
             self.snapshot_manager.file_io(),
             &manifest_dir,
             &candidates,
             config.read_parallelism,
-        )
-        .try_collect()
-        .await?;
-        let names = candidates
-            .iter()
-            .map(ManifestFileMeta::file_name)
-            .collect::<Vec<_>>();
-        if let Some(index) = contents.iter().position(|content| !content.rewritable) {
-            log::warn!(
-                "Keeping manifests {names:?} unmerged: {} has fields that a rewrite would drop",
-                names[index]
-            );
-            return Ok(candidates);
+        ));
+        let names = || {
+            candidates
+                .iter()
+                .map(ManifestFileMeta::file_name)
+                .collect::<Vec<_>>()
+        };
+        let mut entries = Vec::new();
+        let mut read = 0;
+        while let Some(manifest) = contents.try_next().await? {
+            if !manifest.rewritable {
+                log::warn!(
+                    "Keeping manifests {:?} unmerged: {} has fields that a rewrite would drop",
+                    names(),
+                    candidates[read].file_name()
+                );
+                return Ok(candidates);
+            }
+            entries.extend(manifest.entries);
+            read += 1;
         }
-        let entries = contents.into_iter().flat_map(|content| content.entries);
-        let Some(merged) = merge_group_entries(entries.collect()) else {
+        let Some(merged) = merge_group_entries(entries) else {
             log::warn!(
-                "Keeping manifests {names:?} unmerged: they add a file that is already added or deleted among them"
+                "Keeping manifests {:?} unmerged: they add a file that is already added or deleted among them",
+                names()
             );
             return Ok(candidates);
         };
@@ -149,6 +157,7 @@ impl TableCommit {
 }
 
 /// The entries of one manifest, and whether rewriting them keeps every field.
+/// `entries` is left empty when the manifest is not rewritable.
 struct ManifestContents {
     entries: Vec<ManifestEntry>,
     rewritable: bool,
@@ -178,14 +187,17 @@ fn read_manifests(
 async fn read_manifest(file_io: &FileIO, path: &str) -> Result<ManifestContents> {
     let bytes = file_io.new_input(path)?.read().await?;
     let (header, _) = parse_ocf_streaming(&bytes)?;
-    let rewritable = fields_known(
-        &WriterSchema::parse(&header.schema_json)?,
-        &RUST_MANIFEST_SCHEMA,
-    );
+    let writer_schema = WriterSchema::parse(&header.schema_json)?;
+    if !fields_known(&writer_schema, &RUST_MANIFEST_SCHEMA) {
+        return Ok(ManifestContents {
+            entries: vec![],
+            rewritable: false,
+        });
+    }
     let entries = from_avro_bytes_fast::<ManifestEntry>(&bytes)?;
     Ok(ManifestContents {
         entries,
-        rewritable,
+        rewritable: true,
     })
 }
 
@@ -194,8 +206,9 @@ static RUST_MANIFEST_SCHEMA: LazyLock<WriterSchema> = LazyLock::new(|| {
     WriterSchema::parse(MANIFEST_ENTRY_SCHEMA).expect("MANIFEST_ENTRY_SCHEMA is a valid schema")
 });
 
-/// Whether every field of `writer`, at any depth, has a field of the same name
-/// in `known`. The decoder skips other fields, so a rewrite would drop them.
+/// Whether every field of `writer` has a field of the same name in `known`,
+/// recursing through records, arrays, maps and union branches. The decoder
+/// skips other fields, so a rewrite would drop them.
 fn fields_known(writer: &WriterSchema, known: &WriterSchema) -> bool {
     writer.fields.iter().all(|field| {
         known
@@ -207,12 +220,21 @@ fn fields_known(writer: &WriterSchema, known: &WriterSchema) -> bool {
 }
 
 fn schema_known(writer: &FieldSchema, known: &FieldSchema) -> bool {
+    use FieldSchema::{Array, Map, Record, Union};
     match (writer, known) {
-        (FieldSchema::Record(writer), FieldSchema::Record(known)) => fields_known(writer, known),
-        (FieldSchema::Array(writer), FieldSchema::Array(known))
-        | (FieldSchema::Map(writer), FieldSchema::Map(known)) => schema_known(writer, known),
-        (FieldSchema::Record(_) | FieldSchema::Array(_) | FieldSchema::Map(_), _)
-        | (_, FieldSchema::Record(_) | FieldSchema::Array(_) | FieldSchema::Map(_)) => false,
+        (Record(writer), Record(known)) => fields_known(writer, known),
+        (Array(writer), Array(known)) | (Map(writer), Map(known)) => schema_known(writer, known),
+        // The parser unwraps only `["null", T]` field types; array items such
+        // as `_NULL_COUNTS` keep their union.
+        (Union(writer), Union(known)) => {
+            writer.len() == known.len()
+                && writer
+                    .iter()
+                    .zip(known)
+                    .all(|(writer, known)| schema_known(writer, known))
+        }
+        (Record(_) | Array(_) | Map(_) | Union(_), _)
+        | (_, Record(_) | Array(_) | Map(_) | Union(_)) => false,
         _ => true,
     }
 }
@@ -435,6 +457,28 @@ mod tests {
             r#"{"name": "_FILE_NAME", "type": "string"},"#,
             r#"{"name": "_NEW", "type": ["null", "long"], "default": null}"#,
         );
+        assert!(!rewritable(&schema));
+    }
+
+    #[test]
+    fn manifest_with_an_unknown_field_in_a_nullable_record_is_not_rewritable() {
+        // `_KEY_STATS` is written as `["null", {record}]`; its first
+        // `_MIN_VALUES` is the one this anchor matches.
+        let schema = with_field_after(
+            r#"{"name": "_MIN_VALUES", "type": "bytes"},"#,
+            r#"{"name": "_NEW", "type": ["null", "long"], "default": null}"#,
+        );
+        assert!(!rewritable(&schema));
+    }
+
+    #[test]
+    fn manifest_with_a_multi_branch_union_is_not_rewritable() {
+        let schema = MANIFEST_ENTRY_SCHEMA.replacen(
+            r#"{"name": "_FILE_NAME", "type": "string"}"#,
+            r#"{"name": "_FILE_NAME", "type": ["null", "string", "bytes"]}"#,
+            1,
+        );
+        assert_ne!(schema, MANIFEST_ENTRY_SCHEMA);
         assert!(!rewritable(&schema));
     }
 

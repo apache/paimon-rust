@@ -136,6 +136,46 @@ mod tests {
         assert_eq!(t2.bucket(), 2);
     }
 
+    #[tokio::test]
+    async fn test_fully_populated_entry_survives_write_and_read() {
+        use crate::io::FileIOBuilder;
+        use crate::spec::data_file::DataFileMeta;
+        use crate::spec::stats::BinaryTableStats;
+
+        let file = DataFileMeta {
+            file_name: "data-0.parquet".into(),
+            file_size: 1024,
+            row_count: 10,
+            min_key: vec![1, 2],
+            max_key: vec![3, 4],
+            key_stats: BinaryTableStats::new(vec![5], vec![6], vec![Some(0), None]),
+            value_stats: BinaryTableStats::new(vec![7], vec![8], vec![Some(1)]),
+            min_sequence_number: 1,
+            max_sequence_number: 9,
+            schema_id: 2,
+            level: 3,
+            extra_files: vec!["data-0.index".into()],
+            creation_time: chrono::DateTime::from_timestamp_millis(1_700_000_000_123),
+            delete_row_count: Some(4),
+            embedded_index: Some(vec![9, 9]),
+            file_source: Some(1),
+            value_stats_cols: Some(vec!["id".into()]),
+            external_path: Some("oss://bucket/data-0.parquet".into()),
+            first_row_id: Some(100),
+            write_cols: Some(vec!["id".into(), "name".into()]),
+            column_max_sequence_numbers: Some(vec![7, 8]),
+        };
+        let mut partition = crate::spec::BinaryRowBuilder::new(1);
+        partition.write_int(0, 7);
+        let entry = ManifestEntry::new(FileKind::Add, partition.build_serialized(), 5, 8, file, 2);
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/manifest-round-trip/manifest-0";
+        Manifest::write(&file_io, path, std::slice::from_ref(&entry))
+            .await
+            .unwrap();
+        assert_eq!(Manifest::read(&file_io, path).await.unwrap(), [entry]);
+    }
+
     #[test]
     fn test_merge_active_entries_cancels_add_then_delete() {
         use crate::spec::data_file::DataFileMeta;
