@@ -17,13 +17,21 @@
 
 //! Commit-time manifest merging, ported from Java `ManifestFileLegacyMerger`.
 //!
-//! A DELETE entry leaves the manifest set only together with the ADD it
-//! cancels, so merged manifests resolve to the same live files as their input.
+//! In a merged group, a DELETE entry leaves the manifest set only together
+//! with the ADD it cancels, so the merged manifests resolve to the same live
+//! files as their input. Groups that cannot be merged this way are kept as
+//! they are.
 
 use super::*;
+use crate::spec::avro::from_avro_bytes_fast;
+use crate::spec::avro::ocf::parse_ocf_streaming;
+use crate::spec::avro::schema::{FieldSchema, WriterSchema};
 use futures::{Stream, StreamExt, TryStreamExt};
+use std::sync::LazyLock;
 
-/// Commit-time merge settings, read from table options on every merge.
+/// Commit-time merge settings. `target_size` comes from the
+/// `manifest_target_size` field; the other two are read from table options on
+/// every merge.
 struct MergeConfig {
     target_size: i64,
     min_count: usize,
@@ -93,7 +101,7 @@ impl TableCommit {
             return Ok(candidates);
         }
         let manifest_dir = self.snapshot_manager.manifest_dir();
-        let groups: Vec<Vec<ManifestEntry>> = read_manifests(
+        let contents: Vec<ManifestContents> = read_manifests(
             self.snapshot_manager.file_io(),
             &manifest_dir,
             &candidates,
@@ -101,7 +109,24 @@ impl TableCommit {
         )
         .try_collect()
         .await?;
-        let merged = merge_group_entries(groups.into_iter().flatten().collect())?;
+        let names = candidates
+            .iter()
+            .map(ManifestFileMeta::file_name)
+            .collect::<Vec<_>>();
+        if let Some(index) = contents.iter().position(|content| !content.rewritable) {
+            log::warn!(
+                "Keeping manifests {names:?} unmerged: {} has fields that a rewrite would drop",
+                names[index]
+            );
+            return Ok(candidates);
+        }
+        let entries = contents.into_iter().flat_map(|content| content.entries);
+        let Some(merged) = merge_group_entries(entries.collect()) else {
+            log::warn!(
+                "Keeping manifests {names:?} unmerged: they add a file that is already added or deleted among them"
+            );
+            return Ok(candidates);
+        };
         self.write_merged_manifests(&merged, created_files).await
     }
 
@@ -123,13 +148,19 @@ impl TableCommit {
     }
 }
 
-/// Read manifests with bounded concurrency, yielding their entries in input order.
+/// The entries of one manifest, and whether rewriting them keeps every field.
+struct ManifestContents {
+    entries: Vec<ManifestEntry>,
+    rewritable: bool,
+}
+
+/// Read manifests with bounded concurrency, yielding their contents in input order.
 fn read_manifests(
     file_io: &FileIO,
     manifest_dir: &str,
     manifests: &[ManifestFileMeta],
     parallelism: usize,
-) -> impl Stream<Item = Result<Vec<ManifestEntry>>> + Send {
+) -> impl Stream<Item = Result<ManifestContents>> + Send + use<> {
     let file_io = file_io.clone();
     let paths = manifests
         .iter()
@@ -139,60 +170,104 @@ fn read_manifests(
     futures::stream::iter(paths)
         .map(move |path| {
             let file_io = file_io.clone();
-            async move { Manifest::read(&file_io, &path).await }
+            async move { read_manifest(&file_io, &path).await }
         })
         .buffered(parallelism.max(1))
 }
 
-/// Merge one group of manifest entries. For well-formed input this matches
-/// Java `FileEntry.mergeEntries`, including the entry order.
+async fn read_manifest(file_io: &FileIO, path: &str) -> Result<ManifestContents> {
+    let bytes = file_io.new_input(path)?.read().await?;
+    let (header, _) = parse_ocf_streaming(&bytes)?;
+    let rewritable = fields_known(
+        &WriterSchema::parse(&header.schema_json)?,
+        &RUST_MANIFEST_SCHEMA,
+    );
+    let entries = from_avro_bytes_fast::<ManifestEntry>(&bytes)?;
+    Ok(ManifestContents {
+        entries,
+        rewritable,
+    })
+}
+
+/// The schema merged manifests are written with.
+static RUST_MANIFEST_SCHEMA: LazyLock<WriterSchema> = LazyLock::new(|| {
+    WriterSchema::parse(MANIFEST_ENTRY_SCHEMA).expect("MANIFEST_ENTRY_SCHEMA is a valid schema")
+});
+
+/// Whether every field of `writer`, at any depth, has a field of the same name
+/// in `known`. The decoder skips other fields, so a rewrite would drop them.
+fn fields_known(writer: &WriterSchema, known: &WriterSchema) -> bool {
+    writer.fields.iter().all(|field| {
+        known
+            .fields
+            .iter()
+            .find(|known_field| known_field.name == field.name)
+            .is_some_and(|known_field| schema_known(&field.schema, &known_field.schema))
+    })
+}
+
+fn schema_known(writer: &FieldSchema, known: &FieldSchema) -> bool {
+    match (writer, known) {
+        (FieldSchema::Record(writer), FieldSchema::Record(known)) => fields_known(writer, known),
+        (FieldSchema::Array(writer), FieldSchema::Array(known))
+        | (FieldSchema::Map(writer), FieldSchema::Map(known)) => schema_known(writer, known),
+        (FieldSchema::Record(_) | FieldSchema::Array(_) | FieldSchema::Map(_), _)
+        | (_, FieldSchema::Record(_) | FieldSchema::Array(_) | FieldSchema::Map(_)) => false,
+        _ => true,
+    }
+}
+
+/// Merge one group of manifest entries. Well-formed groups match Java
+/// `FileEntry.mergeEntries`, including the entry order: an ADD and a DELETE of
+/// the same file cancel, and a DELETE whose ADD is outside the group is kept.
 ///
-/// An ADD and a DELETE of the same file inside the group cancel. A DELETE whose
-/// ADD is in another group is kept; dropping it would make the file live again.
-fn merge_group_entries(entries: Vec<ManifestEntry>) -> Result<Vec<ManifestEntry>> {
+/// Returns `None` when the group adds a file that it already adds or deletes.
+/// The caller keeps such a group unmerged.
+fn merge_group_entries(entries: Vec<ManifestEntry>) -> Option<Vec<ManifestEntry>> {
+    let identifiers = entries
+        .iter()
+        .map(ManifestEntry::identifier)
+        .collect::<Vec<_>>();
     let mut added = HashSet::new();
     let mut deleted = HashSet::new();
-    for entry in &entries {
+    for (entry, identifier) in entries.iter().zip(&identifiers) {
         match entry.kind() {
             FileKind::Add => {
-                if !added.insert(entry.identifier()) {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!(
-                            "Trying to add file '{}' in bucket {} which is already in the merged manifests",
-                            entry.file().file_name,
-                            entry.bucket(),
-                        ),
-                        source: None,
-                    });
+                if deleted.contains(identifier) || !added.insert(identifier) {
+                    return None;
                 }
             }
             FileKind::Delete => {
-                deleted.insert(entry.identifier());
+                deleted.insert(identifier);
             }
         }
     }
     let mut emitted_deletes = HashSet::new();
-    Ok(entries
-        .into_iter()
-        .filter(|entry| {
-            let identifier = entry.identifier();
-            match entry.kind() {
-                FileKind::Add => !deleted.contains(&identifier),
-                // A repeated DELETE removes nothing more; keep one.
-                FileKind::Delete => {
-                    !added.contains(&identifier) && emitted_deletes.insert(identifier)
-                }
-            }
+    let keep = entries
+        .iter()
+        .zip(&identifiers)
+        .map(|(entry, identifier)| match entry.kind() {
+            FileKind::Add => !deleted.contains(identifier),
+            // A repeated DELETE removes nothing more; keep one.
+            FileKind::Delete => !added.contains(identifier) && emitted_deletes.insert(identifier),
         })
-        .collect())
+        .collect::<Vec<_>>();
+    Some(
+        entries
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(entry, keep)| keep.then_some(entry))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::EMPTY_SERIALIZED_ROW;
 
-    fn entry(kind: FileKind, name: &str, level: i32) -> ManifestEntry {
-        let file = DataFileMeta {
+    fn file(name: &str, level: i32) -> DataFileMeta {
+        DataFileMeta {
             file_name: name.to_string(),
             file_size: 100,
             row_count: 1,
@@ -214,8 +289,11 @@ mod tests {
             first_row_id: None,
             write_cols: None,
             column_max_sequence_numbers: None,
-        };
-        ManifestEntry::new(kind, vec![], 0, 1, file, 2)
+        }
+    }
+
+    fn entry(kind: FileKind, name: &str, level: i32) -> ManifestEntry {
+        ManifestEntry::new(kind, vec![], 0, 1, file(name, level), 2)
     }
 
     fn keys(entries: &[ManifestEntry]) -> Vec<(FileKind, &str, i32)> {
@@ -273,17 +351,111 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_add_is_rejected() {
-        let error = merge_group_entries(vec![
-            entry(FileKind::Add, "a", 0),
-            entry(FileKind::Add, "a", 0),
-        ])
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("already in the merged manifests"),
-            "{error}"
+    fn group_that_adds_a_file_again_is_not_merged() {
+        use FileKind::{Add, Delete};
+        for kinds in [vec![Add, Add], vec![Add, Delete, Add], vec![Delete, Add]] {
+            let entries = kinds.iter().map(|kind| entry(*kind, "x", 0)).collect();
+            assert!(merge_group_entries(entries).is_none(), "{kinds:?}");
+        }
+    }
+
+    /// Merging must use the scan's identity, `ManifestEntry::identifier()`:
+    /// entries that the scan tells apart must not cancel.
+    #[test]
+    fn entries_with_different_identity_do_not_cancel() {
+        let added = || file("x", 0);
+        let mut extra_files = added();
+        extra_files.extra_files = vec!["x.index".into()];
+        let mut external_path = added();
+        external_path.external_path = Some("oss://bucket/x".into());
+        let pairs = [
+            (
+                ManifestEntry::new(
+                    FileKind::Add,
+                    EMPTY_SERIALIZED_ROW.clone(),
+                    0,
+                    1,
+                    added(),
+                    2,
+                ),
+                ManifestEntry::new(FileKind::Delete, vec![], 0, 1, added(), 2),
+            ),
+            (
+                ManifestEntry::new(FileKind::Add, vec![], 0, 1, added(), 2),
+                ManifestEntry::new(FileKind::Delete, vec![], 0, 1, extra_files, 2),
+            ),
+            (
+                ManifestEntry::new(FileKind::Add, vec![], 0, 1, added(), 2),
+                ManifestEntry::new(FileKind::Delete, vec![], 0, 1, external_path, 2),
+            ),
+            (
+                ManifestEntry::new(FileKind::Add, vec![], 0, 2, added(), 2),
+                ManifestEntry::new(FileKind::Delete, vec![], 1, 2, added(), 2),
+            ),
+        ];
+        for (add, delete) in pairs {
+            let merged = merge_group_entries(vec![add.clone(), delete.clone()]).unwrap();
+            assert_eq!(merged, [add, delete]);
+        }
+    }
+
+    fn rewritable(schema_json: &str) -> bool {
+        fields_known(
+            &WriterSchema::parse(schema_json).unwrap(),
+            &RUST_MANIFEST_SCHEMA,
+        )
+    }
+
+    fn with_field_after(anchor: &str, field: &str) -> String {
+        let schema = MANIFEST_ENTRY_SCHEMA.replacen(anchor, &format!("{anchor} {field},"), 1);
+        assert_ne!(schema, MANIFEST_ENTRY_SCHEMA);
+        schema
+    }
+
+    #[test]
+    fn rust_manifest_schema_is_rewritable() {
+        assert!(rewritable(MANIFEST_ENTRY_SCHEMA));
+    }
+
+    #[tokio::test]
+    async fn java_written_manifest_with_fewer_fields_is_rewritable() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/manifest/manifest-8ded1f09-fcda-489e-9167-582ac0f9f846-0"
         );
+        let file_io = FileIO::from_url("file://").unwrap().build().unwrap();
+        let contents = read_manifest(&file_io, path).await.unwrap();
+        assert!(contents.rewritable);
+        assert_eq!(contents.entries.len(), 2);
+    }
+
+    #[test]
+    fn manifest_with_an_unknown_file_field_is_not_rewritable() {
+        let schema = with_field_after(
+            r#"{"name": "_FILE_NAME", "type": "string"},"#,
+            r#"{"name": "_NEW", "type": ["null", "long"], "default": null}"#,
+        );
+        assert!(!rewritable(&schema));
+    }
+
+    #[test]
+    fn manifest_with_an_unknown_top_level_field_is_not_rewritable() {
+        let schema = with_field_after(
+            r#"{"name": "_VERSION", "type": "int"},"#,
+            r#"{"name": "_NEW", "type": "int"}"#,
+        );
+        assert!(!rewritable(&schema));
+    }
+
+    #[test]
+    fn record_against_a_non_record_is_not_rewritable() {
+        let file_as_bytes = r#"{"type": "record", "name": "r", "fields": [
+            {"name": "_FILE", "type": "bytes"}
+        ]}"#;
+        let kind_as_record = r#"{"type": "record", "name": "r", "fields": [
+            {"name": "_KIND", "type": {"type": "record", "name": "k", "fields": []}}
+        ]}"#;
+        assert!(!rewritable(file_as_bytes));
+        assert!(!rewritable(kind_as_record));
     }
 }
