@@ -26,22 +26,25 @@ fn dv_message(name: &str, data_file: &str) -> CommitMessage {
 }
 
 #[tokio::test]
-async fn small_manifests_remain_unchanged_across_many_commits() {
+async fn small_manifests_below_merge_min_count_remain_unchanged() {
     let io = test_file_io();
     let path = "memory:/no-small-manifest-merge";
     setup_dirs(&io, path).await;
     let table = test_table_with_options(
         &io,
         path,
-        HashMap::from([("manifest.target-file-size".into(), "8 mb".into())]),
+        HashMap::from([
+            ("manifest.target-file-size".into(), "8 mb".into()),
+            ("manifest.merge-min-count".into(), "1000".into()),
+        ]),
     );
     let commit = TableCommit::new(table, "test-user".into());
     let manifest_dir = format!("{path}/manifest");
     let mut original_manifests = Vec::new();
     let mut original_bytes = HashMap::new();
 
-    // Every previous delta must remain an unchanged base manifest across
-    // repeated commits, even though all these files fit within the target size.
+    // Below manifest.merge-min-count, every previous delta remains an unchanged
+    // base manifest even though all these files fit within the target size.
     for id in 0..35 {
         commit
             .commit(vec![append_message(&format!("data-{id}.parquet"))])

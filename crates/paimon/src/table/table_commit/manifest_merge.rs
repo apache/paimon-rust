@@ -21,6 +21,128 @@
 //! cancels, so merged manifests resolve to the same live files as their input.
 
 use super::*;
+use futures::{Stream, StreamExt, TryStreamExt};
+
+/// Commit-time merge settings, read from table options on every merge.
+struct MergeConfig {
+    target_size: i64,
+    min_count: usize,
+    read_parallelism: usize,
+}
+
+impl TableCommit {
+    /// Merge the previous snapshot's manifests before they become the new base list.
+    ///
+    /// New manifests are recorded in `created_files`. Input manifests are
+    /// neither modified nor deleted.
+    pub(super) async fn merge_manifests(
+        &self,
+        input: Vec<ManifestFileMeta>,
+        created_files: &mut Vec<String>,
+    ) -> Result<Vec<ManifestFileMeta>> {
+        if input.is_empty() {
+            return Ok(input);
+        }
+        let options = self.table.schema().core_options();
+        let config = MergeConfig {
+            target_size: self.manifest_target_size.max(1),
+            min_count: options.manifest_merge_min_count()?,
+            read_parallelism: options.scan_manifest_parallelism()?,
+        };
+        self.compact_minor(input, &config, created_files).await
+    }
+
+    /// Java `compactMinor`: merge consecutive manifests once their total size
+    /// reaches the target, and the trailing group only with `min_count` files.
+    async fn compact_minor(
+        &self,
+        input: Vec<ManifestFileMeta>,
+        config: &MergeConfig,
+        created_files: &mut Vec<String>,
+    ) -> Result<Vec<ManifestFileMeta>> {
+        let mut result = Vec::new();
+        let mut candidates = Vec::new();
+        let mut total_size = 0i64;
+        for manifest in input {
+            total_size += manifest.file_size();
+            candidates.push(manifest);
+            if total_size >= config.target_size {
+                let group = std::mem::take(&mut candidates);
+                result.extend(self.merge_candidates(group, config, created_files).await?);
+                total_size = 0;
+            }
+        }
+        if candidates.len() >= config.min_count {
+            result.extend(
+                self.merge_candidates(candidates, config, created_files)
+                    .await?,
+            );
+        } else {
+            result.extend(candidates);
+        }
+        Ok(result)
+    }
+
+    async fn merge_candidates(
+        &self,
+        candidates: Vec<ManifestFileMeta>,
+        config: &MergeConfig,
+        created_files: &mut Vec<String>,
+    ) -> Result<Vec<ManifestFileMeta>> {
+        if candidates.len() <= 1 {
+            return Ok(candidates);
+        }
+        let manifest_dir = self.snapshot_manager.manifest_dir();
+        let groups: Vec<Vec<ManifestEntry>> = read_manifests(
+            self.snapshot_manager.file_io(),
+            &manifest_dir,
+            &candidates,
+            config.read_parallelism,
+        )
+        .try_collect()
+        .await?;
+        let merged = merge_group_entries(groups.into_iter().flatten().collect())?;
+        self.write_merged_manifests(&merged, created_files).await
+    }
+
+    async fn write_merged_manifests(
+        &self,
+        entries: &[ManifestEntry],
+        created_files: &mut Vec<String>,
+    ) -> Result<Vec<ManifestFileMeta>> {
+        let manifest_dir = self.snapshot_manager.manifest_dir();
+        let prefix = format!("manifest-{}", uuid::Uuid::new_v4());
+        self.write_manifest_files(
+            self.snapshot_manager.file_io(),
+            &manifest_dir,
+            &prefix,
+            entries,
+            created_files,
+        )
+        .await
+    }
+}
+
+/// Read manifests with bounded concurrency, yielding their entries in input order.
+fn read_manifests(
+    file_io: &FileIO,
+    manifest_dir: &str,
+    manifests: &[ManifestFileMeta],
+    parallelism: usize,
+) -> impl Stream<Item = Result<Vec<ManifestEntry>>> + Send {
+    let file_io = file_io.clone();
+    let paths = manifests
+        .iter()
+        .map(|manifest| format!("{manifest_dir}/{}", manifest.file_name()))
+        .collect::<Vec<_>>();
+    // Each read owns its inputs so the commit future stays `Send`.
+    futures::stream::iter(paths)
+        .map(move |path| {
+            let file_io = file_io.clone();
+            async move { Manifest::read(&file_io, &path).await }
+        })
+        .buffered(parallelism.max(1))
+}
 
 /// Merge one group of manifest entries. For well-formed input this matches
 /// Java `FileEntry.mergeEntries`, including the entry order.

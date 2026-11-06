@@ -1631,11 +1631,15 @@ impl TableCommit {
             vec![]
         };
 
+        let base_manifest_files = self
+            .merge_manifests(existing_manifest_files, created_files)
+            .await?;
+
         created_files.push(base_manifest_list_path.clone());
         ManifestList::write_with_compression(
             file_io,
             &base_manifest_list_path,
-            &existing_manifest_files,
+            &base_manifest_files,
             &self.manifest_compression,
         )
         .await?;
@@ -4056,6 +4060,7 @@ mod tests {
         include!("table_commit/callback_tests.rs");
         include!("table_commit/index_delete_tests.rs");
         include!("table_commit/row_id_conflict_tests.rs");
+        include!("table_commit/manifest_merge_tests.rs");
     }
 
     #[tokio::test]
