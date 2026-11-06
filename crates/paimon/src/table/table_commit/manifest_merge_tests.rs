@@ -409,20 +409,10 @@ async fn group_that_re_adds_a_file_it_deletes_stays_unmerged() {
     assert_eq!(active_names(&io, path).await, live);
 }
 
-#[tokio::test]
-async fn manifest_with_an_unknown_field_stays_unmerged() {
-    let io = test_file_io();
-    let path = "memory:/manifest-merge-unknown-field";
-    setup_dirs(&io, path).await;
-    let commit = merge_table(&io, path, &[("manifest.merge-min-count", "2")]);
-    commit
-        .commit(vec![append_message("data-0.parquet")])
-        .await
-        .unwrap();
-    // Rewrite the manifest as a newer writer with one more `_FILE` field would.
-    let newer = delta_manifests(&io, path).await.remove(0);
-    let newer_path = format!("{path}/manifest/{}", newer.file_name());
-    let entries = Manifest::read(&io, &newer_path).await.unwrap();
+/// Rewrite a manifest as a newer writer with one more `_FILE` field would.
+async fn rewrite_with_unknown_field(io: &FileIO, path: &str, manifest: &ManifestFileMeta) {
+    let manifest_path = format!("{path}/manifest/{}", manifest.file_name());
+    let entries = Manifest::read(io, &manifest_path).await.unwrap();
     let file_name_field = r#"{"name": "_FILE_NAME", "type": "string"},"#;
     let schema_json = MANIFEST_ENTRY_SCHEMA.replacen(
         file_name_field,
@@ -446,11 +436,25 @@ async fn manifest_with_an_unknown_field_stays_unmerged() {
             .unwrap();
         writer.append(value).unwrap();
     }
-    io.new_output(&newer_path)
+    io.new_output(&manifest_path)
         .unwrap()
         .write(writer.into_inner().unwrap().into())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn manifest_with_an_unknown_field_stays_unmerged() {
+    let io = test_file_io();
+    let path = "memory:/manifest-merge-unknown-field";
+    setup_dirs(&io, path).await;
+    let commit = merge_table(&io, path, &[("manifest.merge-min-count", "2")]);
+    commit
+        .commit(vec![append_message("data-0.parquet")])
+        .await
+        .unwrap();
+    let newer = delta_manifests(&io, path).await.remove(0);
+    rewrite_with_unknown_field(&io, path, &newer).await;
 
     commit
         .commit(vec![append_message("data-1.parquet")])
@@ -584,4 +588,198 @@ async fn skip_on_write_only_does_not_apply_to_write_enabled_tables() {
     let merged = merger.merge_manifests(input, &mut created).await.unwrap();
     assert_eq!(merged.len(), 1);
     assert!(!created.is_empty());
+}
+
+#[tokio::test]
+async fn full_compaction_drops_resolved_deletes_and_keeps_unrelated_manifests() {
+    let io = test_file_io();
+    let path = "memory:/manifest-full-compaction";
+    setup_dirs(&io, path).await;
+    // A one-byte target keeps minor merging idle; a one-byte threshold starts
+    // a full compaction as soon as any manifest holds a DELETE.
+    let commit = merge_table(
+        &io,
+        path,
+        &[
+            ("manifest.target-file-size", "1 b"),
+            ("manifest.full-compaction-threshold-size", "1 b"),
+        ],
+    );
+    let removed = test_data_file("removed.parquet", 1);
+    let mut first = vec![removed.clone()];
+    first.extend((0..199).map(|id| test_data_file(&format!("first-{id}.parquet"), 1)));
+    let second = (0..200)
+        .map(|id| test_data_file(&format!("second-{id}.parquet"), 1))
+        .collect();
+    commit
+        .commit(vec![CommitMessage::new(vec![], 0, first)])
+        .await
+        .unwrap();
+    commit
+        .commit(vec![CommitMessage::new(vec![], 0, second)])
+        .await
+        .unwrap();
+    let mut deletion = CommitMessage::new(vec![], 0, vec![]);
+    deletion.deleted_files.push(removed);
+    commit.commit(vec![deletion]).await.unwrap();
+    let mut previous = base_manifests(&io, path).await;
+    previous.extend(delta_manifests(&io, path).await);
+    let [first, second, deletion] = previous.as_slice() else {
+        panic!("expected three manifests, got {previous:?}");
+    };
+
+    let unrelated = test_data_file("unrelated.parquet", 1);
+    commit
+        .commit(vec![CommitMessage::new(vec![], 0, vec![unrelated])])
+        .await
+        .unwrap();
+
+    let base = base_manifests(&io, path).await;
+    let names = base
+        .iter()
+        .map(ManifestFileMeta::file_name)
+        .collect::<HashSet<_>>();
+    assert!(names.contains(second.file_name()));
+    assert!(!names.contains(first.file_name()));
+    assert!(!names.contains(deletion.file_name()));
+    assert!(base
+        .iter()
+        .all(|manifest| manifest.num_deleted_files() == 0));
+    assert_eq!(
+        base.iter()
+            .map(ManifestFileMeta::num_added_files)
+            .sum::<i64>(),
+        399
+    );
+    let live = active_names(&io, path).await;
+    assert_eq!(live.len(), 400);
+    assert!(!live.contains("removed.parquet"));
+}
+#[tokio::test]
+async fn full_compaction_keeps_a_delete_whose_add_was_pruned() {
+    let io = test_file_io();
+    let path = "memory:/manifest-full-compaction-pruned-add";
+    setup_dirs(&io, path).await;
+    let writer = partitioned_merge_table(&io, path, &[("manifest.target-file-size", "1 b")]);
+    let pt = partition_bytes("a");
+    let removed = test_data_file("removed.parquet", 1);
+    let mut first = vec![removed.clone()];
+    first.extend((0..199).map(|id| test_data_file(&format!("first-{id}.parquet"), 1)));
+    writer
+        .commit(vec![CommitMessage::new(pt.clone(), 0, first)])
+        .await
+        .unwrap();
+    let mut deletion = CommitMessage::new(pt.clone(), 0, vec![]);
+    deletion.deleted_files.push(removed);
+    writer.commit(vec![deletion]).await.unwrap();
+    let small = vec![test_data_file("small.parquet", 1)];
+    writer
+        .commit(vec![CommitMessage::new(pt, 0, small)])
+        .await
+        .unwrap();
+    let mut input = base_manifests(&io, path).await;
+    input.extend(delta_manifests(&io, path).await);
+    let [first, deletion, small] = input.as_slice() else {
+        panic!("expected three manifests, got {input:?}");
+    };
+
+    let other_partition = ManifestEntry::new(
+        FileKind::Add,
+        partition_bytes("b"),
+        0,
+        1,
+        test_data_file("other.parquet", 1),
+        2,
+    );
+    let wrong_stats = writer.compute_partition_stats(&[other_partition]).unwrap();
+    let mislabeled = ManifestFileMeta::new(
+        first.file_name().to_string(),
+        first.file_size(),
+        first.num_added_files(),
+        first.num_deleted_files(),
+        wrong_stats,
+        first.schema_id(),
+    );
+    let merger = partitioned_merge_table(
+        &io,
+        path,
+        &[
+            ("manifest.target-file-size", "1 b"),
+            ("manifest.full-compaction-threshold-size", "1 b"),
+        ],
+    );
+    let mut created = Vec::new();
+    let merged = merger
+        .merge_manifests(
+            vec![mislabeled, deletion.clone(), small.clone()],
+            &mut created,
+        )
+        .await
+        .unwrap();
+
+    // deletion was rewritten; its DELETE survives in a new manifest because
+    // the manifest holding the matching ADD was skipped.
+    assert!(!created.is_empty());
+    assert!(merged.iter().all(|m| m.file_name() != deletion.file_name()));
+    let rewritten = merged
+        .iter()
+        .find(|m| m.num_deleted_files() == 1)
+        .expect("the unmatched DELETE must be kept");
+    assert_eq!(rewritten.num_added_files(), 0);
+    let mut entries = Vec::new();
+    for manifest in &merged {
+        let manifest_path = format!("{path}/manifest/{}", manifest.file_name());
+        entries.extend(Manifest::read(&io, &manifest_path).await.unwrap());
+    }
+    let live = merge_active_entries(entries)
+        .into_iter()
+        .map(|entry| entry.file().file_name.clone())
+        .collect::<HashSet<_>>();
+    assert_eq!(live.len(), 200);
+    assert!(!live.contains("removed.parquet"));
+}
+
+#[tokio::test]
+async fn full_compaction_skips_a_manifest_with_an_unknown_field() {
+    let io = test_file_io();
+    let path = "memory:/manifest-full-compaction-unknown-field";
+    setup_dirs(&io, path).await;
+    let commit = merge_table(
+        &io,
+        path,
+        &[
+            ("manifest.target-file-size", "1 b"),
+            ("manifest.full-compaction-threshold-size", "1 b"),
+        ],
+    );
+    let removed = test_data_file("removed.parquet", 1);
+    let mut first = vec![removed.clone()];
+    first.extend((0..9).map(|id| test_data_file(&format!("first-{id}.parquet"), 1)));
+    commit
+        .commit(vec![CommitMessage::new(vec![], 0, first)])
+        .await
+        .unwrap();
+    rewrite_with_unknown_field(&io, path, &delta_manifests(&io, path).await[0]).await;
+    let mut deletion = CommitMessage::new(vec![], 0, vec![]);
+    deletion.deleted_files.push(removed);
+    commit.commit(vec![deletion]).await.unwrap();
+    let mut previous = base_manifests(&io, path).await;
+    previous.extend(delta_manifests(&io, path).await);
+    assert_eq!(previous.len(), 2);
+
+    commit
+        .commit(vec![CommitMessage::new(
+            vec![],
+            0,
+            vec![test_data_file("unrelated.parquet", 1)],
+        )])
+        .await
+        .unwrap();
+
+    // Neither manifest was rewritten: the new-writer one would lose its field,
+    // and dropping the DELETE alone would bring removed.parquet back.
+    assert_eq!(base_manifests(&io, path).await, previous);
+    let live = active_names(&io, path).await;
+    assert_eq!(live.len(), 10);
+    assert!(!live.contains("removed.parquet"));
 }

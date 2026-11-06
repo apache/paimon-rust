@@ -27,16 +27,26 @@ use super::*;
 use crate::spec::avro::from_avro_bytes_fast;
 use crate::spec::avro::ocf::parse_ocf_streaming;
 use crate::spec::avro::schema::{FieldSchema, WriterSchema};
+use crate::spec::Identifier;
 use futures::{Stream, StreamExt, TryStreamExt};
+use indexmap::IndexMap;
 use std::sync::LazyLock;
 
 /// Commit-time merge settings. `target_size` comes from the
-/// `manifest_target_size` field; the other two are read from table options on
+/// `manifest_target_size` field; the others are read from table options on
 /// every merge.
 struct MergeConfig {
     target_size: i64,
+    full_compaction_threshold: i64,
     min_count: usize,
     read_parallelism: usize,
+}
+
+impl MergeConfig {
+    /// Java `mustChange`: manifests with DELETE entries or below the target size.
+    fn must_change(&self, manifest: &ManifestFileMeta) -> bool {
+        manifest.num_deleted_files() > 0 || manifest.file_size() < self.target_size
+    }
 }
 
 impl TableCommit {
@@ -57,9 +67,16 @@ impl TableCommit {
         }
         let config = MergeConfig {
             target_size: self.manifest_target_size.max(1),
+            full_compaction_threshold: options.manifest_full_compaction_threshold_size()?,
             min_count: options.manifest_merge_min_count()?,
             read_parallelism: options.scan_manifest_parallelism()?,
         };
+        if let Some(merged) = self
+            .try_full_compaction(&input, &config, created_files)
+            .await?
+        {
+            return Ok(merged);
+        }
         self.compact_minor(input, &config, created_files).await
     }
 
@@ -92,6 +109,178 @@ impl TableCommit {
             result.extend(candidates);
         }
         Ok(result)
+    }
+
+    /// Java `tryFullCompaction`: once the manifests that must change reach the
+    /// threshold, rewrite them with every manifest holding a deleted file.
+    async fn try_full_compaction(
+        &self,
+        input: &[ManifestFileMeta],
+        config: &MergeConfig,
+        created_files: &mut Vec<String>,
+    ) -> Result<Option<Vec<ManifestFileMeta>>> {
+        let (delta_size, delta_deletes) = input
+            .iter()
+            .filter(|manifest| config.must_change(manifest))
+            .fold((0i64, 0i64), |(size, deletes), manifest| {
+                (
+                    size + manifest.file_size(),
+                    deletes + manifest.num_deleted_files(),
+                )
+            });
+        if delta_size < config.full_compaction_threshold {
+            return Ok(None);
+        }
+        log::info!(
+            "Start manifest full compaction: {} manifests, {delta_deletes} deleted files in {delta_size} bytes that must change",
+            input.len()
+        );
+        let Some(deleted) = self.read_deleted_entries(input, config).await? else {
+            return Ok(None);
+        };
+        let may_hold_deleted = self.deleted_partition_matcher(&deleted);
+        let (mut result, to_be_merged): (Vec<_>, Vec<_>) = input
+            .iter()
+            .cloned()
+            .partition(|manifest| !config.must_change(manifest) && !may_hold_deleted(manifest));
+        if to_be_merged.len() <= 1 {
+            return Ok(None);
+        }
+        let Some(entries) = self
+            .rewrite_entries(&to_be_merged, deleted, config, &mut result)
+            .await?
+        else {
+            return Ok(None);
+        };
+        result.extend(self.write_merged_manifests(&entries, created_files).await?);
+        Ok(Some(result))
+    }
+
+    /// Every DELETE entry of the input, keyed by file identity in first-seen
+    /// order, or `None` when a manifest holding DELETEs is not rewritable.
+    async fn read_deleted_entries(
+        &self,
+        input: &[ManifestFileMeta],
+        config: &MergeConfig,
+    ) -> Result<Option<IndexMap<Identifier, ManifestEntry>>> {
+        let with_deletes = input
+            .iter()
+            .filter(|manifest| manifest.num_deleted_files() > 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        let manifest_dir = self.snapshot_manager.manifest_dir();
+        let mut contents = std::pin::pin!(read_manifests(
+            self.snapshot_manager.file_io(),
+            &manifest_dir,
+            &with_deletes,
+            config.read_parallelism,
+        ));
+        let mut deleted = IndexMap::new();
+        while let Some(content) = contents.try_next().await? {
+            // A manifest with DELETEs must change, so it would be rewritten.
+            if !content.rewritable {
+                return Ok(None);
+            }
+            for entry in content.entries {
+                if *entry.kind() == FileKind::Delete {
+                    deleted.entry(entry.identifier()).or_insert(entry);
+                }
+            }
+        }
+        Ok(Some(deleted))
+    }
+
+    /// Whether a manifest may hold the ADD of a deleted file. Like Java, only
+    /// manifests whose partition stats exclude every deleted partition are
+    /// skipped; any doubt reads the manifest.
+    fn deleted_partition_matcher(
+        &self,
+        deleted: &IndexMap<Identifier, ManifestEntry>,
+    ) -> impl Fn(&ManifestFileMeta) -> bool {
+        let partition_fields = self.table.schema().partition_fields();
+        let filter = if deleted.is_empty() || partition_fields.is_empty() {
+            None
+        } else {
+            let partitions = deleted.keys().map(|id| id.partition.clone()).collect();
+            PartitionFilter::from_partition_set(partitions, &partition_fields).ok()
+        };
+        let any_deleted = !deleted.is_empty();
+        move |manifest: &ManifestFileMeta| {
+            any_deleted
+                && filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.matches_manifest(manifest, &partition_fields))
+        }
+    }
+
+    /// Read the manifests to merge and return the entries to rewrite. A manifest
+    /// that neither must change nor holds a deleted ADD is kept in `result`.
+    /// Returns `None`, before anything is written, when one of them is not
+    /// rewritable.
+    async fn rewrite_entries(
+        &self,
+        to_be_merged: &[ManifestFileMeta],
+        deleted: IndexMap<Identifier, ManifestEntry>,
+        config: &MergeConfig,
+        result: &mut Vec<ManifestFileMeta>,
+    ) -> Result<Option<Vec<ManifestEntry>>> {
+        let manifest_dir = self.snapshot_manager.manifest_dir();
+        let mut contents = std::pin::pin!(read_manifests(
+            self.snapshot_manager.file_io(),
+            &manifest_dir,
+            to_be_merged,
+            config.read_parallelism,
+        ));
+        let mut kept = Vec::new();
+        let mut matched = HashSet::new();
+        let mut rewritten = Vec::new();
+        for manifest in to_be_merged {
+            let content =
+                contents
+                    .try_next()
+                    .await?
+                    .ok_or_else(|| crate::Error::UnexpectedError {
+                        message: format!("manifest '{}' was not read", manifest.file_name()),
+                        source: None,
+                    })?;
+            if !content.rewritable {
+                log::warn!(
+                    "Skipping manifest full compaction: {} has fields that a rewrite would drop",
+                    manifest.file_name()
+                );
+                return Ok(None);
+            }
+            let mut require_change = config.must_change(manifest);
+            let mut adds = Vec::new();
+            for entry in content
+                .entries
+                .into_iter()
+                .filter(|e| *e.kind() == FileKind::Add)
+            {
+                let identifier = entry.identifier();
+                if deleted.contains_key(&identifier) {
+                    matched.insert(identifier);
+                    require_change = true;
+                } else {
+                    adds.push(entry);
+                }
+            }
+            if require_change {
+                rewritten.extend(adds);
+            } else {
+                kept.push(manifest.clone());
+            }
+        }
+        // Java drops every DELETE here and relies on partition pruning to find
+        // the ADD it cancels. Keeping unmatched DELETEs makes a missed ADD harmless.
+        rewritten.extend(
+            deleted
+                .into_iter()
+                .filter(|(identifier, _)| !matched.contains(identifier))
+                .map(|(_, entry)| entry),
+        );
+        result.extend(kept);
+        Ok(Some(rewritten))
     }
 
     async fn merge_candidates(
