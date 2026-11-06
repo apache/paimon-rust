@@ -252,43 +252,11 @@ impl TableCommit {
                         message: format!("manifest '{}' was not read", manifest.file_name()),
                         source: None,
                     })?;
-            if !content.rewritable {
-                log::warn!(
-                    "Skipping manifest full compaction: {} has fields that a rewrite would drop",
-                    manifest.file_name()
-                );
+            let Some((require_change, adds)) =
+                classify_entries(manifest, content, &deleted, &mut matched, config)
+            else {
                 return Ok(None);
-            }
-            let mut require_change = config.must_change(manifest);
-            let mut adds = Vec::new();
-            for entry in content.entries {
-                let identifier = entry.identifier();
-                match *entry.kind() {
-                    FileKind::Add if deleted.contains_key(&identifier) => {
-                        // [ADD x, DELETE x, ADD x] leaves x live for an ordered
-                        // reader; dropping every ADD of x would remove it.
-                        if !matched.insert(identifier) {
-                            log::warn!(
-                                "Skipping manifest full compaction: {} adds a deleted file that is already added",
-                                manifest.file_name()
-                            );
-                            return Ok(None);
-                        }
-                        require_change = true;
-                    }
-                    FileKind::Add => adds.push(entry),
-                    // Only an understated `num_deleted_files` hides a DELETE
-                    // from `read_deleted_entries`; a rewrite would drop it.
-                    FileKind::Delete if !deleted.contains_key(&identifier) => {
-                        log::warn!(
-                            "Skipping manifest full compaction: {} holds more DELETE entries than its metadata counts",
-                            manifest.file_name()
-                        );
-                        return Ok(None);
-                    }
-                    FileKind::Delete => {}
-                }
-            }
+            };
             if require_change {
                 rewritten.extend(adds);
             } else {
@@ -369,6 +337,55 @@ impl TableCommit {
         )
         .await
     }
+}
+
+/// Classify one manifest read by `rewrite_entries`: whether it must be
+/// rewritten, and the ADDs a rewrite keeps. `None` aborts the full compaction.
+fn classify_entries(
+    manifest: &ManifestFileMeta,
+    content: ManifestContents,
+    deleted: &IndexMap<Identifier, ManifestEntry>,
+    matched: &mut HashSet<Identifier>,
+    config: &MergeConfig,
+) -> Option<(bool, Vec<ManifestEntry>)> {
+    if !content.rewritable {
+        log::warn!(
+            "Skipping manifest full compaction: {} has fields that a rewrite would drop",
+            manifest.file_name()
+        );
+        return None;
+    }
+    let mut require_change = config.must_change(manifest);
+    let mut adds = Vec::new();
+    for entry in content.entries {
+        let identifier = entry.identifier();
+        match *entry.kind() {
+            FileKind::Add if deleted.contains_key(&identifier) => {
+                // [ADD x, DELETE x, ADD x] leaves x live for an ordered
+                // reader; dropping every ADD of x would remove it.
+                if !matched.insert(identifier) {
+                    log::warn!(
+                        "Skipping manifest full compaction: {} adds a deleted file that is already added",
+                        manifest.file_name()
+                    );
+                    return None;
+                }
+                require_change = true;
+            }
+            FileKind::Add => adds.push(entry),
+            // Only an understated `num_deleted_files` hides a DELETE
+            // from `read_deleted_entries`; a rewrite would drop it.
+            FileKind::Delete if !deleted.contains_key(&identifier) => {
+                log::warn!(
+                    "Skipping manifest full compaction: {} holds more DELETE entries than its metadata counts",
+                    manifest.file_name()
+                );
+                return None;
+            }
+            FileKind::Delete => {}
+        }
+    }
+    Some((require_change, adds))
 }
 
 /// The entries of one manifest, and whether rewriting them keeps every field.
