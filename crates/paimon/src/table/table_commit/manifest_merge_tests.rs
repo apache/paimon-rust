@@ -278,7 +278,8 @@ async fn merged_manifests_survive_an_uncertain_publication() {
             if publish_first { 1 } else { 2 }
         );
         let base = base_manifests(&io, &path).await;
-        assert_eq!(base.len(), 1);
+        // An unpublished first attempt leaves a retry, which does not merge.
+        assert_eq!(base.len(), if publish_first { 1 } else { 2 });
         for manifest in &base {
             let manifest_path = format!("{path}/manifest/{}", manifest.file_name());
             assert!(io.exists(&manifest_path).await.unwrap(), "{manifest_path}");
@@ -464,4 +465,72 @@ async fn manifest_with_an_unknown_field_stays_unmerged() {
     assert_eq!(base_manifests(&io, path).await, previous);
     assert_eq!(previous[0].file_name(), newer.file_name());
     assert_eq!(active_names(&io, path).await.len(), 3);
+}
+
+struct RejectFirstPublication {
+    manager: SnapshotManager,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SnapshotCommit for RejectFirstPublication {
+    async fn commit(
+        &self,
+        _: Option<&str>,
+        snapshot: &Snapshot,
+        _: &str,
+        _: &[PartitionStatistics],
+    ) -> Result<bool> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Ok(false);
+        }
+        self.manager.commit_snapshot(snapshot).await
+    }
+}
+
+#[tokio::test]
+async fn commit_retry_carries_manifests_forward_without_merging() {
+    let io = test_file_io();
+    let path = "memory:/manifest-merge-retry";
+    setup_dirs(&io, path).await;
+    let mut commit = merge_table(&io, path, &[("manifest.merge-min-count", "2")]);
+    commit.commit_min_retry_wait_ms = 0;
+    commit.commit_max_retry_wait_ms = 0;
+    for name in ["first", "second"] {
+        commit.commit(vec![append_message(name)]).await.unwrap();
+    }
+    let mut carried = base_manifests(&io, path).await;
+    carried.extend(delta_manifests(&io, path).await);
+    assert_eq!(carried.len(), 2);
+
+    commit.snapshot_commit = Arc::new(RejectFirstPublication {
+        manager: commit.snapshot_manager.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    commit.commit(vec![append_message("third")]).await.unwrap();
+    // The rejected first attempt merged; the retry carries both manifests forward.
+    assert_eq!(base_manifests(&io, path).await, carried);
+
+    commit.commit(vec![append_message("fourth")]).await.unwrap();
+    assert_eq!(base_manifests(&io, path).await.len(), 1);
+}
+
+#[tokio::test]
+async fn write_only_commits_skip_merging_when_configured() {
+    let io = test_file_io();
+    let path = "memory:/manifest-merge-skip-write-only";
+    setup_dirs(&io, path).await;
+    // test_table_with_options sets write-only=true unless a test overrides it.
+    let commit = merge_table(
+        &io,
+        path,
+        &[
+            ("manifest.merge-min-count", "2"),
+            ("manifest.merge.skip-on-write-only", "true"),
+        ],
+    );
+    for name in ["first", "second", "third"] {
+        commit.commit(vec![append_message(name)]).await.unwrap();
+    }
+    assert_eq!(base_manifests(&io, path).await.len(), 2);
 }

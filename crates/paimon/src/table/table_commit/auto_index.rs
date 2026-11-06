@@ -190,7 +190,7 @@ impl TableCommit {
                 // One atomic attempt: a definite CAS conflict requires a fresh
                 // coverage plan, rather than rebasing overlapping index files.
                 match commit
-                    .try_commit_once(resolved, &latest, written.id())
+                    .try_commit_once(resolved, &latest, written.id(), retries == 0)
                     .await?
                 {
                     CommitAttemptResult::Success(_) => return Ok(()),

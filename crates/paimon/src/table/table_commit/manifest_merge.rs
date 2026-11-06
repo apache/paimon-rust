@@ -49,10 +49,12 @@ impl TableCommit {
         input: Vec<ManifestFileMeta>,
         created_files: &mut Vec<String>,
     ) -> Result<Vec<ManifestFileMeta>> {
-        if input.is_empty() {
+        let options = self.table.schema().core_options();
+        if input.is_empty()
+            || (options.write_only()? && options.manifest_merge_skip_on_write_only()?)
+        {
             return Ok(input);
         }
-        let options = self.table.schema().core_options();
         let config = MergeConfig {
             target_size: self.manifest_target_size.max(1),
             min_count: options.manifest_merge_min_count()?,

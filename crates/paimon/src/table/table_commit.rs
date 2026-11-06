@@ -1272,8 +1272,15 @@ impl TableCommit {
                     break CommitOutcome::Empty;
                 }
 
+                // Like Java when it cannot reuse a merge result, a retry
+                // carries the manifests forward instead of merging them again.
                 let result = self
-                    .try_commit_once(resolved, &latest_snapshot, commit_identifier)
+                    .try_commit_once(
+                        resolved,
+                        &latest_snapshot,
+                        commit_identifier,
+                        retry_state.is_none(),
+                    )
                     .await?;
 
                 match result {
@@ -1403,6 +1410,7 @@ impl TableCommit {
         mut resolved: ResolvedCommit,
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
+        allow_manifest_merge: bool,
     ) -> Result<CommitAttemptResult> {
         let mut created_files = Vec::new();
         let prepared = self
@@ -1410,6 +1418,7 @@ impl TableCommit {
                 &mut resolved,
                 latest_snapshot,
                 commit_identifier,
+                allow_manifest_merge,
                 &mut created_files,
             )
             .await;
@@ -1490,6 +1499,7 @@ impl TableCommit {
         resolved: &mut ResolvedCommit,
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
+        allow_manifest_merge: bool,
         created_files: &mut Vec<String>,
     ) -> Result<(Snapshot, Vec<PartitionStatistics>)> {
         let new_snapshot_id = latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1);
@@ -1631,9 +1641,12 @@ impl TableCommit {
             vec![]
         };
 
-        let base_manifest_files = self
-            .merge_manifests(existing_manifest_files, created_files)
-            .await?;
+        let base_manifest_files = if allow_manifest_merge {
+            self.merge_manifests(existing_manifest_files, created_files)
+                .await?
+        } else {
+            existing_manifest_files
+        };
 
         created_files.push(base_manifest_list_path.clone());
         ManifestList::write_with_compression(
