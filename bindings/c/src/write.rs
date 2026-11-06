@@ -571,7 +571,9 @@ pub unsafe extern "C" fn paimon_postpone_fixed_bucket_write_builder_new_write(
     }
 }
 
-/// Close a standard TableWrite, discarding outstanding output without preparing a commit.
+/// Close a standard TableWrite with best-effort cleanup of unprepared output.
+/// May flush buffered output to storage before attempting deletion.
+/// Deletion failures are not reported and may leave uncommitted files.
 ///
 /// Previously prepared commit messages remain owned by the caller. This does not free
 /// the handle; call `paimon_table_write_free` after closing it.
