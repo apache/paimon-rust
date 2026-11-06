@@ -1129,6 +1129,143 @@ async fn top1_after_bitmap_then_btree(
         .collect()
 }
 
+/// Writes ids 0/1 with f = [1, 2] once, builds a bitmap and a BTree on `f`
+/// over the same rows plus IVF-flat, and returns the Top-1 ids for `f > 1.5`
+/// without refinement from data.
+async fn top1_with_overlapping_bitmap_and_btree(mode: &str) -> Vec<i32> {
+    use crate::spec::{ArrayType, DataType, DoubleType, FloatType, IntType};
+    use arrow_array::types::Float32Type;
+    use arrow_array::{Float64Array, ListArray};
+
+    let schema = crate::spec::Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("f", DataType::Double(DoubleType::new()))
+        .column(
+            "embedding",
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        )
+        .options(HashMap::from([
+            ("bucket".into(), "-1".into()),
+            ("row-tracking.enabled".into(), "true".into()),
+            ("data-evolution.enabled".into(), "true".into()),
+            ("global-index.enabled".into(), "true".into()),
+        ]))
+        .build()
+        .unwrap();
+    let table = Table::new(
+        crate::io::FileIOBuilder::new("memory").build().unwrap(),
+        crate::catalog::Identifier::new("default", "overlapping_bitmap"),
+        format!("memory:/overlapping-bitmap-{}", uuid::Uuid::new_v4()),
+        crate::spec::TableSchema::new(0, &schema),
+        None,
+    );
+    let write = |ids: Vec<i32>, f: Vec<Option<f64>>, embedding: Vec<Vec<f32>>| {
+        let table = table.clone();
+        async move {
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Float64Array::from(f)),
+                Arc::new(ListArray::from_iter_primitive::<Float32Type, _, _>(
+                    embedding
+                        .into_iter()
+                        .map(|v| Some(v.into_iter().map(Some).collect::<Vec<_>>())),
+                )),
+            ];
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, true),
+                ArrowField::new("f", ArrowDataType::Float64, true),
+                ArrowField::new("embedding", columns[2].data_type().clone(), true),
+            ]));
+            let mut writer = TableWrite::new(&table, "test".to_string()).unwrap();
+            writer
+                .write_arrow_batch(&RecordBatch::try_new(arrow_schema, columns).unwrap())
+                .await
+                .unwrap();
+            TableCommit::new(table.clone(), "test".to_string())
+                .commit(writer.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+        }
+    };
+    write(
+        vec![0, 1],
+        vec![Some(1.0), Some(2.0)],
+        vec![vec![0.0, 1.0], vec![1.0, 0.0]],
+    )
+    .await;
+    let mut builder = table.new_global_index_build_builder();
+    builder.with_index_type("bitmap").with_index_column("f");
+    builder.execute().await.unwrap();
+    let mut builder = table.new_global_index_build_builder();
+    builder.with_index_type("btree").with_index_column("f");
+    builder.execute().await.unwrap();
+    let mut builder = table.new_global_index_build_builder();
+    builder
+        .with_index_type("ivf-flat")
+        .with_index_column("embedding")
+        .with_options(HashMap::from([
+            ("ivf-flat.dimension".into(), "2".into()),
+            ("ivf-flat.nlist".into(), "1".into()),
+            ("ivf-flat.distance.metric".into(), "l2".into()),
+        ]));
+    builder.execute().await.unwrap();
+
+    let table = table.copy_with_options(HashMap::from([
+        (
+            "global-index.filter.refine-from-data".to_string(),
+            "false".to_string(),
+        ),
+        ("scalar-index.search-mode".to_string(), mode.to_string()),
+        ("vector-index.search-mode".to_string(), mode.to_string()),
+    ]));
+    let pb = crate::spec::PredicateBuilder::new(table.schema().fields());
+    let batches: Vec<RecordBatch> = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1.0, 0.0])
+        .with_limit(1)
+        .with_filter(
+            pb.greater_than("f", crate::spec::Datum::Double(1.5))
+                .unwrap(),
+        )
+        .execute()
+        .await
+        .unwrap()
+        .new_read_builder()
+        .read()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn overlapping_bitmap_keeps_btree_hits_without_refinement() {
+    // Bitmap and BTree both cover rows 0/1. For `f > 1.5` the bitmap returns
+    // both rows as candidates while the BTree proves row 1, which must stay.
+    for mode in ["fast", "full", "detail"] {
+        assert_eq!(
+            top1_with_overlapping_bitmap_and_btree(mode).await,
+            vec![1],
+            "{mode}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn bitmap_candidates_keep_exact_btree_hits_without_refinement() {
     // Bitmap rows 0/1 are only candidates for `f > 1.5`, BTree row 2 is an

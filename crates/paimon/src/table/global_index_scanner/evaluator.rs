@@ -660,6 +660,9 @@ impl GlobalIndexScanner {
             is_floating_point(data_type) && is_bitmap_floating_residual_sensitive_op(*op)
         });
         let mut bitmap_ranges = Vec::new();
+        // Rows a BTree proves. A bitmap may cover the same rows, and its
+        // candidates must not undo these.
+        let mut exact_ranges = Vec::new();
         let mut query_plans = Vec::with_capacity(entries.len());
         let mut all_matching_ranges = Vec::new();
         let mut fully_evaluated = true;
@@ -669,10 +672,13 @@ impl GlobalIndexScanner {
                     .iter()
                     .all(|matches| matches[entry_idx])
             {
-                if matches!(entry.index_type, GlobalIndexFileKind::Bitmap) {
-                    bitmap_ranges.push(RowRange::new(entry.row_range_start, entry.row_range_end));
+                let range = RowRange::new(entry.row_range_start, entry.row_range_end);
+                match entry.index_type {
+                    GlobalIndexFileKind::Bitmap => bitmap_ranges.push(range.clone()),
+                    GlobalIndexFileKind::BTree => exact_ranges.push(range.clone()),
+                    GlobalIndexFileKind::Multivalue | GlobalIndexFileKind::FM => {}
                 }
-                all_matching_ranges.push(RowRange::new(entry.row_range_start, entry.row_range_end));
+                all_matching_ranges.push(range);
                 continue;
             }
             // Also check if between range may match
@@ -742,10 +748,13 @@ impl GlobalIndexScanner {
                 // Only a proven identity remains (other conjuncts may have
                 // declined their budget). Preserve its indexed domain and
                 // leave the residual filter to the ordinary table reader.
-                if matches!(entry.index_type, GlobalIndexFileKind::Bitmap) {
-                    bitmap_ranges.push(RowRange::new(entry.row_range_start, entry.row_range_end));
+                let range = RowRange::new(entry.row_range_start, entry.row_range_end);
+                match entry.index_type {
+                    GlobalIndexFileKind::Bitmap => bitmap_ranges.push(range.clone()),
+                    GlobalIndexFileKind::BTree => exact_ranges.push(range.clone()),
+                    GlobalIndexFileKind::Multivalue | GlobalIndexFileKind::FM => {}
                 }
-                all_matching_ranges.push(RowRange::new(entry.row_range_start, entry.row_range_end));
+                all_matching_ranges.push(range);
                 continue;
             }
             query_plans.push(EntryQueryPlan {
@@ -799,13 +808,15 @@ impl GlobalIndexScanner {
                         .collect::<Vec<_>>()
                 });
                 let is_bitmap = matches!(entry.index_type, GlobalIndexFileKind::Bitmap);
-                Ok((ranges, result.declined, is_bitmap))
+                let is_btree = matches!(entry.index_type, GlobalIndexFileKind::BTree);
+                Ok((ranges, result.declined, is_bitmap, is_btree))
             });
-        let (all_ranges, declined, bitmap_ranges) = try_fold_bounded(
+        let (all_ranges, declined, bitmap_ranges, exact_ranges) = try_fold_bounded(
             futures,
             self.global_index_thread_num,
-            (all_matching_ranges, false, bitmap_ranges),
-            |(all_ranges, declined, bitmap_ranges), (ranges, file_declined, is_bitmap)| {
+            (all_matching_ranges, false, bitmap_ranges, exact_ranges),
+            |(all_ranges, declined, bitmap_ranges, exact_ranges),
+             (ranges, file_declined, is_bitmap, is_btree)| {
                 if file_declined {
                     *declined = true;
                     return;
@@ -813,6 +824,8 @@ impl GlobalIndexScanner {
                 if let Some(ranges) = ranges {
                     if is_bitmap {
                         bitmap_ranges.extend(ranges.iter().cloned());
+                    } else if is_btree {
+                        exact_ranges.extend(ranges.iter().cloned());
                     }
                     all_ranges.extend(ranges);
                 }
@@ -828,10 +841,12 @@ impl GlobalIndexScanner {
             crate::table::merge_row_ranges(all_ranges),
             coverage(),
             fully_evaluated,
-            if bitmap_superset_ops && !bitmap_ranges.is_empty() {
-                crate::table::merge_row_ranges(bitmap_ranges)
-            } else {
+            if !bitmap_superset_ops || bitmap_ranges.is_empty() {
                 Vec::new()
+            } else if fully_evaluated {
+                exclude_row_ranges(&bitmap_ranges, &exact_ranges)
+            } else {
+                crate::table::merge_row_ranges(bitmap_ranges)
             },
         )))
     }
