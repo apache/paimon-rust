@@ -3514,10 +3514,31 @@ the normal physical format without wrapping the writer.
 | `'row-tracking.enabled' = 'true'` | Enable stable row ids |
 | `'data-evolution.enabled' = 'true'` | Enable data evolution (partial-column writes, row-level UPDATE/MERGE/DELETE) |
 | `'manifest.sidecar.enabled' = 'true'` | Write and read manifest block sidecars for partition, row-id, and bucket pruning; when unset, inherits `manifest-sort.enabled` |
+| `'manifest.merge-min-count' = '30'` | Minimum number of trailing small manifests a commit merges into one; the default matches Java |
+| `'manifest.full-compaction-threshold-size' = '16 mb'` | Total size of manifests that must change (those with deleted files or below `manifest.target-file-size`) before a commit rewrites them in a full manifest compaction |
+| `'manifest.merge.skip-on-write-only' = 'true'` | Skip commit-time manifest merging when `write-only` is true |
 | `'global-index.enabled' = 'true'` | Enable global index metadata and reads |
 | `'deletion-vectors.enabled' = 'true'` | Enable deletion vectors |
 | `'deletion-vectors.merge-on-read' = 'true'` | Include and key-merge uncompacted level-0 files in DV-enabled deduplicate batch reads |
 | `'changelog-producer' = 'input'` | Changelog producer; primary-key tables support reads and writes in this mode |
+
+Each commit merges the previous snapshot's manifests before it writes the new
+base manifest list. The rules follow Java Paimon's full-entry merger
+(`ManifestFileLegacyMerger`). Consecutive manifests form a group until their
+total size reaches `manifest.target-file-size`; the last group is merged only if
+it has at least `manifest.merge-min-count` manifests. In a merged group, an ADD
+and a DELETE of the same file cancel, and a DELETE whose ADD is outside the
+group is kept. When the manifests that must change (those with deleted files or
+smaller than the target size) add up to
+`manifest.full-compaction-threshold-size`, the commit runs a full compaction
+instead: it rewrites them together with every manifest that may hold a deleted
+file.
+
+The commit leaves manifests unchanged when a rewrite could change the table,
+that is, when a manifest has fields this version does not know or when the
+entries add the same file more than once. A commit retry carries the previous
+manifests forward without merging them. `manifest.merge-optimize.enabled` and
+`manifest-sort.enabled` do not affect this merge.
 
 Manifest sidecars use the Java-compatible `<manifest-name>.avro.sidecar`
 format and are published through the manifest metadata's `_EXTRA_FILES` list.
