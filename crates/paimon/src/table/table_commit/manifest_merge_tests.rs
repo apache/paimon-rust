@@ -507,9 +507,30 @@ async fn commit_retry_carries_manifests_forward_without_merging() {
         manager: commit.snapshot_manager.clone(),
         calls: std::sync::atomic::AtomicUsize::new(0),
     });
+    let before = manifest_paths(&io, path).await;
     commit.commit(vec![append_message("third")]).await.unwrap();
-    // The rejected first attempt merged; the retry carries both manifests forward.
+    // The retry carries both manifests forward.
     assert_eq!(base_manifests(&io, path).await, carried);
+    // The rejected first attempt merged them. Each attempt also left a delta
+    // manifest holding "third", so the merged one is found by its content.
+    let mut new_manifests = Vec::new();
+    for manifest_path in manifest_paths(&io, path).await.difference(&before) {
+        let name = manifest_path.rsplit('/').next().unwrap();
+        if name.starts_with("manifest-") && !name.starts_with("manifest-list-") {
+            let mut files = Manifest::read(&io, manifest_path)
+                .await
+                .unwrap()
+                .iter()
+                .map(|entry| entry.file().file_name.clone())
+                .collect::<Vec<_>>();
+            files.sort();
+            new_manifests.push(files);
+        }
+    }
+    assert!(
+        new_manifests.contains(&vec!["first".to_string(), "second".to_string()]),
+        "{new_manifests:?}"
+    );
 
     commit.commit(vec![append_message("fourth")]).await.unwrap();
     assert_eq!(base_manifests(&io, path).await.len(), 1);
@@ -533,4 +554,34 @@ async fn write_only_commits_skip_merging_when_configured() {
         commit.commit(vec![append_message(name)]).await.unwrap();
     }
     assert_eq!(base_manifests(&io, path).await.len(), 2);
+}
+
+#[tokio::test]
+async fn skip_on_write_only_does_not_apply_to_write_enabled_tables() {
+    let io = test_file_io();
+    let path = "memory:/manifest-merge-skip-write-enabled";
+    setup_dirs(&io, path).await;
+    // Commit through a write-only table: a write-enabled commit would start
+    // compaction on data files that do not exist.
+    let writer = merge_table(&io, path, &[]);
+    for name in ["first", "second"] {
+        writer.commit(vec![append_message(name)]).await.unwrap();
+    }
+    let mut input = base_manifests(&io, path).await;
+    input.extend(delta_manifests(&io, path).await);
+    assert_eq!(input.len(), 2);
+
+    let merger = merge_table(
+        &io,
+        path,
+        &[
+            ("write-only", "false"),
+            ("manifest.merge-min-count", "2"),
+            ("manifest.merge.skip-on-write-only", "true"),
+        ],
+    );
+    let mut created = Vec::new();
+    let merged = merger.merge_manifests(input, &mut created).await.unwrap();
+    assert_eq!(merged.len(), 1);
+    assert!(!created.is_empty());
 }
