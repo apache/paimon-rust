@@ -2452,6 +2452,46 @@ async fn test_create_temporary_view_fully_qualified() {
 }
 
 #[tokio::test]
+async fn test_create_temporary_view_preserves_quoted_names() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+
+    for qualifier in ["", "default.", "paimon.default."] {
+        for name in [
+            "\"MixedView\"",
+            "\"view.dot\"",
+            "\"view name\"",
+            "\"view\"\"quote\"",
+        ] {
+            let view = format!("{qualifier}{name}");
+            ctx.sql(&format!(
+                "CREATE TEMPORARY VIEW {view} AS SELECT CAST(1 AS INT) AS id"
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                collect_ids(&ctx, &format!("SELECT id FROM {view}")).await,
+                vec![1]
+            );
+
+            ctx.sql(&format!(
+                "CREATE TEMPORARY VIEW IF NOT EXISTS {view} AS SELECT CAST(2 AS INT) AS id"
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                collect_ids(&ctx, &format!("SELECT id FROM {view}")).await,
+                vec![1]
+            );
+
+            ctx.sql(&format!("DROP TEMPORARY VIEW {view}"))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_create_temporary_view_database_qualified() {
     let (_tmp, catalog) = create_test_env();
     let ctx = create_sql_context(catalog.clone()).await;
