@@ -63,7 +63,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan, Volatility};
 use datafusion::prelude::{DataFrame, SessionContext};
-use datafusion::sql::planner::IdentNormalizer;
+use datafusion::sql::planner::{object_name_to_table_reference, IdentNormalizer};
 use datafusion::sql::sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, BinaryLength, CharacterLength, ColumnDef,
     ColumnOption, CommentDef, CommentObject, CreateFunction, CreateFunctionBody, CreateTable,
@@ -2162,19 +2162,18 @@ impl SQLContext {
         let query_sql = create_view.query.to_string();
 
         if create_view.temporary {
-            let view_name = create_view.name.to_string();
-            let table_ref: TableReference = view_name.as_str().into();
-            let (catalog, database, name) = self.resolve_temp_table_name(table_ref)?;
+            let table_ref = object_name_to_table_reference(
+                create_view.name.clone(),
+                self.ctx.enable_ident_normalization(),
+            )?;
             let df = self.ctx.sql_with_options(&query_sql, sql_options).await?;
             let logical_plan = df.logical_plan().clone();
-            if create_view.if_not_exists
-                && self.temp_table_exist(format!("{catalog}.{database}.{name}"))?
-            {
+            if create_view.if_not_exists && self.temp_table_exist(table_ref.clone())? {
                 return ok_result(&self.ctx);
             }
             // Create a ViewTable and register it as a temp table
             let view_table = datafusion::datasource::ViewTable::new(logical_plan, Some(query_sql));
-            self.register_temp_table(format!("{catalog}.{database}.{name}"), Arc::new(view_table))?;
+            self.register_temp_table(table_ref, Arc::new(view_table))?;
             ok_result(&self.ctx)
         } else {
             validate_persistent_create_view(create_view)?;
