@@ -1045,7 +1045,9 @@ async fn manifest_merges_preserve_live_files_across_random_commits() {
         setup_dirs(&io, &path).await;
         // A manifest of a few entries is about 2.4 kb. A merged manifest that
         // reaches the 3 kb target closes a group by itself, so later groups
-        // hold DELETEs whose ADD is outside them.
+        // hold DELETEs whose ADD is outside them. Full compaction ran about 32
+        // times per seed with these values (tuned 2026-11-06); the 5 kb
+        // threshold is what makes it run.
         let commit = partitioned_merge_table(
             &io,
             &path,
@@ -1066,6 +1068,7 @@ async fn manifest_merges_preserve_live_files_across_random_commits() {
         let mut live: Vec<(&'static str, String, i32)> = Vec::new();
         let mut seen_deltas = HashSet::new();
         let mut merged = false;
+        let mut kept_cross_group_delete = false;
         for step in 0..150 {
             let mut changes = std::collections::BTreeMap::new();
             if live.len() > 1 && random(3) == 0 {
@@ -1118,12 +1121,20 @@ async fn manifest_merges_preserve_live_files_across_random_commits() {
             }
             let deltas = delta_manifests(&io, &path).await;
             seen_deltas.extend(deltas.iter().map(|m| m.file_name().to_string()));
-            merged |= base_manifests(&io, &path)
-                .await
-                .iter()
-                .any(|manifest| !seen_deltas.contains(manifest.file_name()));
+            for manifest in base_manifests(&io, &path).await {
+                if !seen_deltas.contains(manifest.file_name()) {
+                    merged = true;
+                    // A merged manifest keeps a DELETE only when its ADD is
+                    // outside the group.
+                    kept_cross_group_delete |= manifest.num_deleted_files() > 0;
+                }
+            }
         }
         assert!(merged, "seed {seed} never merged manifests");
+        assert!(
+            kept_cross_group_delete,
+            "seed {seed} never merged a DELETE whose ADD is outside its group (the #899 case); retune the parameters"
+        );
         assert!(base_manifests(&io, &path).await.len() < 50, "seed {seed}");
     }
 }
