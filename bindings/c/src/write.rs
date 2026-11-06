@@ -571,6 +571,28 @@ pub unsafe extern "C" fn paimon_postpone_fixed_bucket_write_builder_new_write(
     }
 }
 
+/// Close a standard TableWrite with best-effort cleanup of unprepared output.
+/// May flush buffered output to storage before attempting deletion.
+/// Deletion failures are not reported and may leave uncommitted files.
+///
+/// Previously prepared commit messages remain owned by the caller. This does not free
+/// the handle; call `paimon_table_write_free` after closing it.
+///
+/// # Safety
+/// `tw` must be a live standard TableWrite handle, or null (returns an error).
+/// The handle must not be used concurrently.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_write_close(
+    tw: *mut paimon_table_write,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(tw, "tw") {
+        return error;
+    }
+    let state = &mut *((*tw).inner as *mut TableWriteState);
+    runtime().block_on(state.write.close());
+    ptr::null_mut()
+}
+
 /// Free a standard TableWrite.
 ///
 /// # Safety
@@ -1576,6 +1598,8 @@ const _: unsafe extern "C" fn(
     *mut c_void,
     *mut c_void,
 ) -> *mut paimon_error = paimon_postpone_fixed_bucket_write_builder_with_bucket_plan;
+const _: unsafe extern "C" fn(*mut paimon_table_write) -> *mut paimon_error =
+    paimon_table_write_close;
 const _: unsafe extern "C" fn(*mut paimon_table_write) -> paimon_result_prepare_commit =
     paimon_table_write_prepare_commit;
 const _: extern "C" fn() -> i32 = paimon_commit_messages_serializer_version;
