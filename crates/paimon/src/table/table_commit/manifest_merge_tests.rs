@@ -1019,3 +1019,111 @@ async fn full_compaction_keeps_manifests_whose_delete_count_is_understated() {
     assert_eq!(merged, input);
     assert!(created.is_empty());
 }
+
+fn file_at_level(name: &str, level: i32) -> DataFileMeta {
+    let mut file = test_data_file(name, 1);
+    file.level = level;
+    file
+}
+
+fn message_for<'a>(
+    changes: &'a mut std::collections::BTreeMap<&'static str, CommitMessage>,
+    pt: &'static str,
+) -> &'a mut CommitMessage {
+    changes
+        .entry(pt)
+        .or_insert_with(|| CommitMessage::new(partition_bytes(pt), 0, vec![]))
+}
+
+/// Seeded random commits checked against a model of the live files. Small
+/// targets and thresholds make commits merge and full-compact often.
+#[tokio::test]
+async fn manifest_merges_preserve_live_files_across_random_commits() {
+    for seed in [1u64, 7, 42] {
+        let io = test_file_io();
+        let path = format!("memory:/manifest-merge-model-{seed}");
+        setup_dirs(&io, &path).await;
+        // A manifest of a few entries is about 2.4 kb. A merged manifest that
+        // reaches the 3 kb target closes a group by itself, so later groups
+        // hold DELETEs whose ADD is outside them.
+        let commit = partitioned_merge_table(
+            &io,
+            &path,
+            &[
+                ("manifest.target-file-size", "3 kb"),
+                ("manifest.merge-min-count", "3"),
+                ("manifest.full-compaction-threshold-size", "5 kb"),
+            ],
+        );
+        let mut state = seed;
+        let mut random = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        // (partition, file name, level) of every live file.
+        let mut live: Vec<(&'static str, String, i32)> = Vec::new();
+        let mut seen_deltas = HashSet::new();
+        let mut merged = false;
+        for step in 0..150 {
+            let mut changes = std::collections::BTreeMap::new();
+            if live.len() > 1 && random(3) == 0 {
+                let (pt, name, level) = live.swap_remove(random(live.len()));
+                message_for(&mut changes, pt)
+                    .deleted_files
+                    .push(file_at_level(&name, level));
+            }
+            if !live.is_empty() && random(5) == 0 {
+                let position = random(live.len());
+                let (pt, name, level) = live[position].clone();
+                let message = message_for(&mut changes, pt);
+                message.deleted_files.push(file_at_level(&name, level));
+                message.new_files.push(file_at_level(&name, level + 1));
+                live[position].2 = level + 1;
+            }
+            let pt = ["a", "b", "c"][random(3)];
+            for index in 0..=random(4) {
+                let name = format!("f-{step}-{index}.parquet");
+                message_for(&mut changes, pt)
+                    .new_files
+                    .push(file_at_level(&name, 0));
+                live.push((pt, name, 0));
+            }
+            commit
+                .commit(changes.into_values().collect())
+                .await
+                .unwrap();
+
+            let snapshot = latest_snapshot(&io, &path).await.unwrap();
+            let expected = live
+                .iter()
+                .map(|(_, name, level)| (name.clone(), *level))
+                .collect::<HashSet<_>>();
+            // Ordered reconciliation (snapshot_manifest) and the scan's
+            // order-independent one must both agree with the model.
+            let listed = active_entries(&io, &path, &snapshot).await;
+            let scanned = TableScan::new(&commit.table, None, vec![], None, None, None)
+                .with_scan_all_files()
+                .plan_manifest_entries(&snapshot)
+                .await
+                .unwrap();
+            for entries in [listed, scanned] {
+                let actual = entries
+                    .iter()
+                    .map(|entry| (entry.file().file_name.clone(), entry.file().level))
+                    .collect::<HashSet<_>>();
+                assert_eq!(entries.len(), expected.len(), "seed {seed}, step {step}");
+                assert_eq!(actual, expected, "seed {seed}, step {step}");
+            }
+            let deltas = delta_manifests(&io, &path).await;
+            seen_deltas.extend(deltas.iter().map(|m| m.file_name().to_string()));
+            merged |= base_manifests(&io, &path)
+                .await
+                .iter()
+                .any(|manifest| !seen_deltas.contains(manifest.file_name()));
+        }
+        assert!(merged, "seed {seed} never merged manifests");
+        assert!(base_manifests(&io, &path).await.len() < 50, "seed {seed}");
+    }
+}
