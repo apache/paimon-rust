@@ -55,6 +55,7 @@ mod auto_index_tests;
 mod auto_maintenance;
 mod global_index_source_check;
 mod index_commit;
+mod manifest_merge;
 
 use index_commit::IndexChanges;
 mod row_tracking;
