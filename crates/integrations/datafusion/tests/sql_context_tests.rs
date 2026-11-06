@@ -1077,6 +1077,64 @@ async fn test_update_and_delete_reject_shadowed_temporary_targets() {
 }
 
 #[tokio::test]
+async fn test_truncate_rejects_shadowed_temporary_targets() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    ctx.sql("CREATE TABLE default.\"TruncateTarget\" (id INT, pt INT) PARTITIONED BY (pt)")
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO default.\"TruncateTarget\" VALUES (1, 1), (2, 2)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    for kind in ["TABLE", "VIEW"] {
+        ctx.sql(&format!(
+            "CREATE TEMPORARY {kind} default.\"TruncateTarget\" AS SELECT CAST(999 AS INT) AS id"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            collect_ids(&ctx, "SELECT id FROM \"TruncateTarget\"").await,
+            vec![999]
+        );
+        for sql in [
+            "TRUNCATE TABLE \"TruncateTarget\"",
+            "TRUNCATE TABLE IF EXISTS default.\"TruncateTarget\"",
+            "TRUNCATE TABLE paimon.default.\"TruncateTarget\" PARTITION (pt = 1)",
+        ] {
+            assert_sql_error_contains(
+                &ctx,
+                sql,
+                "TRUNCATE TABLE on temporary tables or views is not supported",
+            )
+            .await;
+        }
+        ctx.sql(&format!("DROP TEMPORARY {kind} default.\"TruncateTarget\""))
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_ids(&ctx, "SELECT id FROM \"TruncateTarget\"").await,
+            vec![1, 2]
+        );
+    }
+
+    ctx.sql("TRUNCATE TABLE \"TruncateTarget\" PARTITION (pt = 1)")
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_ids(&ctx, "SELECT id FROM \"TruncateTarget\"").await,
+        vec![2]
+    );
+    ctx.sql("TRUNCATE TABLE \"TruncateTarget\"").await.unwrap();
+    assert!(collect_ids(&ctx, "SELECT id FROM \"TruncateTarget\"")
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
 async fn test_scoped_show_accepts_information_schema() {
     let (_tmp, catalog) = create_test_env();
     let ctx = create_sql_context(catalog).await;
