@@ -2102,6 +2102,11 @@ impl SQLContext {
             DataFusionError::Plan("TRUNCATE TABLE requires a table name".to_string())
         })?;
         Self::ensure_main_branch_write_target(&target.name, "TRUNCATE TABLE")?;
+        if self.temp_table_for(&target.name).await?.is_some() {
+            return Err(DataFusionError::NotImplemented(
+                "TRUNCATE TABLE on temporary tables or views is not supported".into(),
+            ));
+        }
         let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&target.name)?;
         let table = match catalog.get_table(&identifier).await {
             Ok(t) => t,
