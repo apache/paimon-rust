@@ -56,9 +56,10 @@ struct PickValueAgg {
     policy: PickPolicy,
     arrow_type: ArrowDataType,
     initialized: bool,
-    /// 1-row Arrow array holding the currently-winning value; `None` means
-    /// no winning row has been observed yet for the current group.
-    winner: Option<ArrayRef>,
+    /// The winning cell as (array, row); `None` means no winning row has been
+    /// observed yet for the current group. Keeping the input array avoids a
+    /// one-row slice for every row of the group; `result` slices once.
+    winner: Option<(ArrayRef, usize)>,
 }
 
 impl PickValueAgg {
@@ -76,25 +77,36 @@ impl PickValueAgg {
         self.winner = None;
     }
 
-    fn agg(&mut self, array: &dyn Array, row_idx: usize) {
-        let is_null = array.is_null(row_idx);
+    fn winner_is_null(&self) -> Option<bool> {
+        self.winner.as_ref().map(|(array, row)| array.is_null(*row))
+    }
+
+    fn pick(&mut self, is_null: bool, cell: impl FnOnce() -> (ArrayRef, usize)) {
         match self.policy {
             PickPolicy::Last => {
-                self.winner = Some(array.slice(row_idx, 1));
+                self.winner = Some(cell());
             }
             PickPolicy::First if !self.initialized => {
                 self.initialized = true;
-                self.winner = Some(array.slice(row_idx, 1));
+                self.winner = Some(cell());
             }
             PickPolicy::LastNonNull if !is_null => {
-                self.winner = Some(array.slice(row_idx, 1));
+                self.winner = Some(cell());
             }
             PickPolicy::FirstNonNull if !self.initialized && !is_null => {
                 self.initialized = true;
-                self.winner = Some(array.slice(row_idx, 1));
+                self.winner = Some(cell());
             }
             _ => {}
         }
+    }
+
+    fn agg(&mut self, array: &dyn Array, row_idx: usize) {
+        self.pick(array.is_null(row_idx), || (array.slice(row_idx, 1), 0));
+    }
+
+    fn agg_array(&mut self, array: &ArrayRef, row_idx: usize) {
+        self.pick(array.is_null(row_idx), || (ArrayRef::clone(array), row_idx));
     }
 
     fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) {
@@ -107,7 +119,7 @@ impl PickValueAgg {
             // already been initialized by the current accumulator.
             PickPolicy::First => {
                 if self.initialized {
-                    self.winner = Some(array.slice(row_idx, 1));
+                    self.winner = Some((array.slice(row_idx, 1), 0));
                 } else {
                     self.initialized = true;
                 }
@@ -115,21 +127,18 @@ impl PickValueAgg {
             // Java last_non_null_value keeps a non-null accumulator, otherwise
             // it falls back to the older input.
             PickPolicy::LastNonNull => {
-                if self.winner.as_ref().is_none_or(|winner| winner.is_null(0)) && !is_null {
-                    self.winner = Some(array.slice(row_idx, 1));
+                if self.winner_is_null().is_none_or(|null| null) && !is_null {
+                    self.winner = Some((array.slice(row_idx, 1), 0));
                 }
             }
             // Preserve Java's stateful first_non_null_value behavior for
             // aggReversed(accumulator, input) == agg(input, accumulator).
             PickPolicy::FirstNonNull => {
-                let current_is_non_null = self
-                    .winner
-                    .as_ref()
-                    .is_some_and(|winner| !winner.is_null(0));
+                let current_is_non_null = self.winner_is_null() == Some(false);
                 if !self.initialized && current_is_non_null {
                     self.initialized = true;
                 } else {
-                    self.winner = Some(array.slice(row_idx, 1));
+                    self.winner = Some((array.slice(row_idx, 1), 0));
                 }
             }
         }
@@ -137,7 +146,8 @@ impl PickValueAgg {
 
     fn result(&self) -> ArrayRef {
         match &self.winner {
-            Some(arr) => arr.clone(),
+            Some((array, 0)) if array.len() == 1 => array.clone(),
+            Some((array, row)) => array.slice(*row, 1),
             None => new_null_array(&self.arrow_type, 1),
         }
     }
@@ -165,12 +175,16 @@ macro_rules! pick_agg {
                 self.0.agg(array, row_idx);
                 Ok(())
             }
+            fn agg_array(&mut self, array: &ArrayRef, row_idx: usize) -> crate::Result<()> {
+                self.0.agg_array(array, row_idx);
+                Ok(())
+            }
             fn replace_with_delete(
                 &mut self,
                 array: &dyn Array,
                 row_idx: usize,
             ) -> crate::Result<()> {
-                self.0.winner = Some(array.slice(row_idx, 1));
+                self.0.winner = Some((array.slice(row_idx, 1), 0));
                 Ok(())
             }
             fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
@@ -261,6 +275,10 @@ impl FieldAggregator for PrimaryKeyAgg {
         self.0.agg(array, row_idx);
         Ok(())
     }
+    fn agg_array(&mut self, array: &ArrayRef, row_idx: usize) -> crate::Result<()> {
+        self.0.agg_array(array, row_idx);
+        Ok(())
+    }
     fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
         self.0.agg_reversed(array, row_idx);
         Ok(())
@@ -287,6 +305,70 @@ mod tests {
         } else {
             Some(a.value(0))
         }
+    }
+
+    #[test]
+    fn agg_array_matches_agg_for_every_policy() {
+        // agg_array keeps (array, row) instead of a one-row slice; the result
+        // must match agg for each policy, with NULLs among the inputs.
+        let input: ArrayRef =
+            std::sync::Arc::new(Int32Array::from(vec![None, Some(1), None, Some(2), None]));
+        let dt = DataType::Int(IntType::new());
+        type Make = fn(&DataType) -> Box<dyn FieldAggregator>;
+        let makers: [(&str, Make); 5] = [
+            ("last_value", |d| {
+                Box::new(LastValueAgg::new("v", d).unwrap())
+            }),
+            ("first_value", |d| {
+                Box::new(FirstValueAgg::new("v", d).unwrap())
+            }),
+            ("last_non_null_value", |d| {
+                Box::new(LastNonNullValueAgg::new("v", d).unwrap())
+            }),
+            ("first_non_null_value", |d| {
+                Box::new(FirstNonNullValueAgg::new("v", d).unwrap())
+            }),
+            ("primary-key", |d| {
+                Box::new(PrimaryKeyAgg::new("v", d).unwrap())
+            }),
+        ];
+        for (name, make) in makers {
+            for rows in [vec![0, 1, 2, 3, 4], vec![1, 2], vec![0, 2, 4], vec![3]] {
+                let mut by_ref = make(&dt);
+                let mut by_slice = make(&dt);
+                for &row in &rows {
+                    by_ref.agg_array(&input, row).unwrap();
+                    by_slice.agg(input.as_ref(), row).unwrap();
+                }
+                let (by_ref, by_slice) = (by_ref.result().unwrap(), by_slice.result().unwrap());
+                assert_eq!(by_ref.len(), 1, "{name} {rows:?}");
+                assert_eq!(
+                    collect_i32(by_ref),
+                    collect_i32(by_slice),
+                    "{name} {rows:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agg_array_winner_feeds_reversed_and_delete_paths() {
+        // agg_reversed and replace_with_delete read the winner kept by agg_array.
+        let input: ArrayRef = std::sync::Arc::new(Int32Array::from(vec![Some(7), None, Some(9)]));
+        let dt = DataType::Int(IntType::new());
+        let mut last = LastNonNullValueAgg::new("v", &dt).unwrap();
+        last.agg_array(&input, 1).unwrap();
+        last.agg_reversed(input.as_ref(), 0).unwrap();
+        assert_eq!(collect_i32(last.result().unwrap()), Some(7));
+        last.reset();
+        last.agg_array(&input, 2).unwrap();
+        last.agg_reversed(input.as_ref(), 0).unwrap();
+        assert_eq!(collect_i32(last.result().unwrap()), Some(9));
+
+        let mut first = FirstNonNullValueAgg::new("v", &dt).unwrap();
+        first.agg_array(&input, 0).unwrap();
+        first.replace_with_delete(input.as_ref(), 1).unwrap();
+        assert_eq!(collect_i32(first.result().unwrap()), None);
     }
 
     fn collect_str(arr: ArrayRef) -> Option<String> {
