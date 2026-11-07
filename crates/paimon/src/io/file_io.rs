@@ -664,11 +664,10 @@ impl FileIO {
     /// Whether requests on `path` must use origin: a table's view routes only its own files.
     fn origin_only_for(&self, path: &str) -> bool {
         self.origin_only
-            || self.table_location.as_deref().is_some_and(|location| {
-                !path
-                    .strip_prefix(location)
-                    .is_some_and(|rest| rest.starts_with('/'))
-            })
+            || self
+                .table_location
+                .as_deref()
+                .is_some_and(|location| !path_is_under_location(location, path))
     }
 
     /// Whether some request through this view may use an io-cache target.
@@ -702,12 +701,12 @@ impl FileIO {
         path: &str,
         file_prefixes: &[String],
     ) -> crate::Result<(RoutedOperator, String)> {
-        let (op, relative_path) = self.storage()?.create_routed(path, file_prefixes)?;
-        let op = if self.origin_only_for(path) {
-            op.without_cache()
-        } else {
-            op
-        };
+        let storage = self.storage()?;
+        if self.origin_only_for(path) {
+            let (op, relative_path) = storage.create(path)?;
+            return Ok((RoutedOperator::origin(op), relative_path.into_owned()));
+        }
+        let (op, relative_path) = storage.create_routed(path, file_prefixes)?;
         Ok((op, relative_path.into_owned()))
     }
 
@@ -1427,6 +1426,24 @@ impl FileIO {
 
         Ok(())
     }
+}
+
+fn path_is_under_location(location: &str, path: &str) -> bool {
+    if let (Ok(location_url), Ok(path_url)) = (Url::parse(location), Url::parse(path)) {
+        if location_url.scheme() == path_url.scheme()
+            && location_url.host_str() == path_url.host_str()
+            && location_url.port() == path_url.port()
+        {
+            return path_has_location_prefix(location_url.path(), path_url.path());
+        }
+        return false;
+    }
+    path_has_location_prefix(location, path)
+}
+
+fn path_has_location_prefix(location: &str, path: &str) -> bool {
+    path.strip_prefix(location.trim_end_matches('/'))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 async fn resolve_provider(

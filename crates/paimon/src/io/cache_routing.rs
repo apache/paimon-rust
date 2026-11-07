@@ -476,10 +476,6 @@ impl RoutedOperator {
         }
     }
 
-    pub(crate) fn without_cache(self) -> Self {
-        Self::origin(self.origin)
-    }
-
     pub(crate) fn origin_operator(&self) -> &Operator {
         &self.origin
     }

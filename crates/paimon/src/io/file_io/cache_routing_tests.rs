@@ -461,6 +461,58 @@ async fn test_origin_only_view_skips_the_target() {
 }
 
 #[tokio::test]
+async fn test_origin_only_view_skips_an_invalid_target() {
+    let origin = TestOss::start().await;
+    let file_io = oss_file_io(&[
+        ("fs.oss.endpoint", origin.endpoint()),
+        ("io-cache.enabled", "true"),
+        ("io-cache.endpoint", "ftp://cache.invalid"),
+        ("io-cache.policy", "meta,read"),
+    ])
+    .origin_only();
+
+    write(&file_io, DATA, b"data").await;
+    assert_eq!(read(&file_io, DATA).await, "data");
+    assert_eq!(origin.take_requests().len(), 2);
+}
+
+#[tokio::test]
+async fn test_dot_segments_outside_table_use_origin() {
+    let origin = TestOss::start().await;
+    let target = TestOss::start().await;
+    let path = "oss://bkt/db.db/t/../outside/data-123e4567-e89b-12d3-a456-426614174000-1.parquet";
+
+    write(
+        &oss_file_io(&[("fs.oss.endpoint", origin.endpoint())]),
+        path,
+        b"new",
+    )
+    .await;
+    write(
+        &oss_file_io(&[("fs.oss.endpoint", target.endpoint())]),
+        path,
+        b"old",
+    )
+    .await;
+    origin.take_requests();
+    target.take_requests();
+
+    let file_io = oss_file_io(&[
+        ("fs.oss.endpoint", target.endpoint()),
+        ("io-cache.enabled", "true"),
+        ("io-cache.endpoint", target.endpoint()),
+        ("io-cache.target.default.path-style-access", "true"),
+        ("io-cache.origin.endpoint", origin.endpoint()),
+        ("io-cache.policy", "meta,read"),
+    ])
+    .with_table_location("oss://bkt/db.db/t");
+
+    assert_eq!(read(&file_io, path).await, "new");
+    assert!(target.take_requests().is_empty());
+    assert_eq!(origin.take_requests().len(), 1);
+}
+
+#[tokio::test]
 async fn test_dlf_oss_endpoint_disables_routing() {
     let target = TestOss::start().await;
     let cache = TestOss::start_sharing(&target).await;
