@@ -477,6 +477,29 @@ async fn test_origin_only_view_skips_an_invalid_target() {
 }
 
 #[tokio::test]
+async fn test_policy_only_constructs_target_for_selected_operations() {
+    let origin = TestOss::start().await;
+    let file_io = oss_file_io(&[
+        ("fs.oss.endpoint", origin.endpoint()),
+        ("io-cache.enabled", "true"),
+        ("io-cache.endpoint", "ftp://cache.invalid"),
+        ("io-cache.policy", "read"),
+    ])
+    .with_table_location("oss://bkt/db.db/t");
+
+    let input = file_io.new_input(DATA).unwrap();
+    assert!(!input.exists().await.unwrap());
+    file_io
+        .new_output(DATA)
+        .unwrap()
+        .write(Bytes::from_static(b"data"))
+        .await
+        .unwrap();
+    assert!(file_io.new_input(DATA).unwrap().read().await.is_err());
+    assert_eq!(origin.take_requests().len(), 2);
+}
+
+#[tokio::test]
 async fn test_dot_segments_outside_table_use_origin() {
     let origin = TestOss::start().await;
     let target = TestOss::start().await;
@@ -541,7 +564,9 @@ async fn test_routing_is_off_unless_enabled() {
         ("io-cache.policy", "meta,read"),
     ]);
 
-    let (op, _) = file_io.create_routed_static(DATA, &[]).unwrap();
+    let (op, _) = file_io
+        .create_routed_static(DATA, &[], OpClass::Read)
+        .unwrap();
     assert!(op.target().is_none());
     write(&file_io, DATA, b"data").await;
     assert_eq!(read(&file_io, DATA).await, "data");
@@ -552,7 +577,9 @@ async fn test_routing_is_off_unless_enabled() {
 async fn test_cache_key_is_identical_on_target_and_origin() {
     let (_origin, _cache, file_io) = routed("read").await;
 
-    let (op, relative_path) = file_io.create_routed_static(DATA, &[]).unwrap();
+    let (op, relative_path) = file_io
+        .create_routed_static(DATA, &[], OpClass::Read)
+        .unwrap();
     let target = op.target().unwrap();
     let namespace = file_io.cache_namespace_for_path(DATA).unwrap();
     assert_eq!(

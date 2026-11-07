@@ -79,8 +79,9 @@ static GLOBAL_INDEX_FILE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Operation class of a FileIO request; only `Meta`, `Exists`, `Read` and `Write` can leave origin.
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum OpClass {
+pub enum OpClass {
     /// File status lookups, including the size lookup before a cached read.
     Meta,
     /// Existence checks, which ask whether a file is still there.

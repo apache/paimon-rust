@@ -87,7 +87,7 @@ use url::Url;
 
 use crate::error;
 
-use super::cache_routing::RoutedOperator;
+use super::cache_routing::{OpClass, RoutedOperator};
 use super::FileIOBuilder;
 
 /// The storage carries all supported storage services in paimon
@@ -437,10 +437,11 @@ impl Storage {
         &self,
         path: &'a str,
         file_prefixes: &[String],
+        op: OpClass,
     ) -> crate::Result<(RoutedOperator, Cow<'a, str>)> {
         #[cfg(feature = "storage-oss")]
         if let Storage::Oss { config, operators } = self {
-            if let Some(target) = config.target_route(path, file_prefixes) {
+            if let Some(target) = config.target_route(path, file_prefixes, op) {
                 let (bucket, relative_path) =
                     Self::bucket_and_relative_path(path, "OSS", &["oss"])?;
                 let operator = |route| {

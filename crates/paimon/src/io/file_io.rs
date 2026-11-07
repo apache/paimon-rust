@@ -128,6 +128,17 @@ pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
         Ok((RoutedOperator::origin(op), relative_path, namespace))
     }
 
+    /// Like [`Self::create_routed`], selecting a target only for `op`.
+    #[doc(hidden)]
+    async fn create_routed_for_op(
+        &self,
+        path: &str,
+        file_prefixes: &[String],
+        _op: OpClass,
+    ) -> crate::Result<(RoutedOperator, String, Option<String>)> {
+        self.create_routed(path, file_prefixes).await
+    }
+
     /// Whether some request may use an io-cache target.
     #[doc(hidden)]
     async fn routes_to_io_cache(&self) -> crate::Result<bool> {
@@ -700,13 +711,14 @@ impl FileIO {
         &self,
         path: &str,
         file_prefixes: &[String],
+        op: OpClass,
     ) -> crate::Result<(RoutedOperator, String)> {
         let storage = self.storage()?;
         if self.origin_only_for(path) {
             let (op, relative_path) = storage.create(path)?;
             return Ok((RoutedOperator::origin(op), relative_path.into_owned()));
         }
-        let (op, relative_path) = storage.create_routed(path, file_prefixes)?;
+        let (op, relative_path) = storage.create_routed(path, file_prefixes, op)?;
         Ok((op, relative_path.into_owned()))
     }
 
@@ -748,7 +760,11 @@ impl FileIO {
         Ok((op, relative_path, cache_path))
     }
 
-    async fn create_routed(&self, path: &str) -> crate::Result<(RoutedOperator, String)> {
+    async fn create_routed(
+        &self,
+        path: &str,
+        op: OpClass,
+    ) -> crate::Result<(RoutedOperator, String)> {
         let file_prefixes = self.routing_file_prefixes(path).await?;
         match &self.backend {
             FileIOBackend::Provider(provider) => {
@@ -757,11 +773,12 @@ impl FileIO {
                     path,
                     self.origin_only_for(path),
                     &file_prefixes,
+                    op,
                 )
                 .await?;
                 Ok((op, relative_path))
             }
-            FileIOBackend::Storage(_) => self.create_routed_static(path, &file_prefixes),
+            FileIOBackend::Storage(_) => self.create_routed_static(path, &file_prefixes, op),
         }
     }
 
@@ -769,6 +786,7 @@ impl FileIO {
     async fn resolve_routed(
         &self,
         path: &str,
+        op: OpClass,
     ) -> crate::Result<(RoutedOperator, String, Option<String>)> {
         let file_prefixes = self.routing_file_prefixes(path).await?;
         match &self.backend {
@@ -778,6 +796,7 @@ impl FileIO {
                     path,
                     self.origin_only_for(path),
                     &file_prefixes,
+                    op,
                 )
                 .await?;
                 let cache_path = namespace.map(|namespace| {
@@ -786,7 +805,7 @@ impl FileIO {
                 Ok((op, relative_path, cache_path))
             }
             FileIOBackend::Storage(_) => {
-                let (op, relative_path) = self.create_routed_static(path, &file_prefixes)?;
+                let (op, relative_path) = self.create_routed_static(path, &file_prefixes, op)?;
                 let namespace = self.cache_namespace_for_path(path)?;
                 let cache_path =
                     cache_object_path(&namespace, op.origin_operator(), &relative_path);
@@ -799,11 +818,11 @@ impl FileIO {
         match &self.backend {
             FileIOBackend::Provider(_) => Ok(FileSource::Routed(self.clone())),
             FileIOBackend::Storage(storage) => {
-                if self.awaits_schema_file_prefixes(path) && storage.routes_to_io_cache() {
+                if storage.routes_to_io_cache() {
                     return Ok(FileSource::Routed(self.clone()));
                 }
                 let (op, relative_path) =
-                    self.create_routed_static(path, &self.loaded_file_prefixes())?;
+                    self.create_routed_static(path, &self.loaded_file_prefixes(), OpClass::Origin)?;
                 let namespace = self.cache_namespace_for_path(path)?;
                 let cache_path =
                     cache_object_path(&namespace, op.origin_operator(), &relative_path);
@@ -928,7 +947,7 @@ impl FileIO {
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L97>
     pub async fn get_status(&self, path: &str) -> Result<FileStatus> {
-        let (op, relative_path) = self.create_routed(path).await?;
+        let (op, relative_path) = self.create_routed(path, OpClass::Meta).await?;
         let meta = op
             .operator(OpClass::Meta)
             .stat(relative_path.as_ref())
@@ -954,7 +973,7 @@ impl FileIO {
     /// status requests for subsequent reads through the same cache context.
     pub(crate) async fn immutable_row_sidecar_size(&self, path: &str) -> Result<u64> {
         // The status request follows the meta rule like `get_status`; the cache key stays origin's.
-        let (op, relative_path, cache_key) = self.resolve_routed(path).await?;
+        let (op, relative_path, cache_key) = self.resolve_routed(path, OpClass::Meta).await?;
         if let Some(size) = cache_key
             .as_deref()
             .and_then(|key| self.file_format_metadata_cache.row_sidecar_size(key))
@@ -1102,7 +1121,7 @@ impl FileIO {
     ///
     /// References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L128>
     pub async fn exists(&self, path: &str) -> Result<bool> {
-        let (op, relative_path) = self.create_routed(path).await?;
+        let (op, relative_path) = self.create_routed(path, OpClass::Exists).await?;
 
         op.operator(OpClass::Exists)
             .exists(relative_path.as_ref())
@@ -1226,7 +1245,7 @@ impl FileIO {
             }
         }
         let source = self.file_source(path)?;
-        let (op, relative_path, _) = source.resolve(path).await?;
+        let (op, relative_path, _) = source.resolve(path, OpClass::Origin).await?;
         let origin = op.origin_operator();
 
         #[cfg(feature = "storage-fs")]
@@ -1469,12 +1488,15 @@ async fn resolve_provider_routed(
     path: &str,
     origin_only: bool,
     file_prefixes: &[String],
+    op: OpClass,
 ) -> crate::Result<(RoutedOperator, String, Option<String>)> {
     let (op, relative_path, namespace) = if origin_only {
         let (op, relative_path, namespace) = provider.create_with_cache_namespace(path).await?;
         (RoutedOperator::origin(op), relative_path, namespace)
     } else {
-        provider.create_routed(path, file_prefixes).await?
+        provider
+            .create_routed_for_op(path, file_prefixes, op)
+            .await?
     };
     validate_provider_path(path, &relative_path)?;
     Ok((op, relative_path, namespace))
@@ -2055,9 +2077,13 @@ enum FileSource {
 }
 
 impl FileSource {
-    async fn resolve(&self, path: &str) -> crate::Result<(RoutedOperator, String, Option<String>)> {
+    async fn resolve(
+        &self,
+        path: &str,
+        op: OpClass,
+    ) -> crate::Result<(RoutedOperator, String, Option<String>)> {
         match self {
-            Self::Routed(file_io) => file_io.resolve_routed(path).await,
+            Self::Routed(file_io) => file_io.resolve_routed(path, op).await,
             Self::Static {
                 op,
                 relative_path,
@@ -2083,12 +2109,12 @@ impl InputFile {
     }
 
     pub async fn exists(&self) -> crate::Result<bool> {
-        let (op, relative_path, _) = self.source.resolve(&self.path).await?;
+        let (op, relative_path, _) = self.source.resolve(&self.path, OpClass::Exists).await?;
         Ok(op.operator(OpClass::Exists).exists(&relative_path).await?)
     }
 
     pub async fn metadata(&self) -> crate::Result<FileStatus> {
-        let (op, relative_path, _) = self.source.resolve(&self.path).await?;
+        let (op, relative_path, _) = self.source.resolve(&self.path, OpClass::Meta).await?;
         let meta = op.operator(OpClass::Meta).stat(&relative_path).await?;
 
         Ok(FileStatus {
@@ -2102,7 +2128,8 @@ impl InputFile {
     }
 
     pub async fn read(&self) -> crate::Result<Bytes> {
-        let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
+        let (op, relative_path, cache_path) =
+            self.source.resolve(&self.path, OpClass::Read).await?;
         let (Some(cache), Some(cache_path)) = (&self.cache, cache_path) else {
             return Ok(op
                 .operator(OpClass::Read)
@@ -2141,7 +2168,8 @@ impl InputFile {
     }
 
     async fn reader_with_size_hint(&self, size: Option<u64>) -> crate::Result<impl FileRead> {
-        let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
+        let (op, relative_path, cache_path) =
+            self.source.resolve(&self.path, OpClass::Read).await?;
         let read_operator = op.operator(OpClass::Read);
         let cache_key = cache_path.as_ref().map(|path| {
             if read_operator.info().scheme() == "memory" {
@@ -2206,7 +2234,7 @@ impl OutputFile {
     }
 
     pub async fn exists(&self) -> crate::Result<bool> {
-        let (op, relative_path, _) = self.source.resolve(&self.path).await?;
+        let (op, relative_path, _) = self.source.resolve(&self.path, OpClass::Origin).await?;
         Ok(op.origin_operator().exists(&relative_path).await?)
     }
 
@@ -2228,7 +2256,8 @@ impl OutputFile {
     }
 
     pub async fn writer(&self) -> crate::Result<Box<dyn FileWrite>> {
-        let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
+        let (op, relative_path, cache_path) =
+            self.source.resolve(&self.path, OpClass::Write).await?;
         let writer: Box<dyn FileWrite> = Box::new(
             op.operator(OpClass::Write)
                 .writer_with(&relative_path)
@@ -2242,7 +2271,8 @@ impl OutputFile {
     /// bulk output path unchanged; do not install OpenDAL's fixed-size chunk
     /// queue here because it cannot drain a partial chunk before close.
     pub(crate) async fn flushable_writer(&self) -> crate::Result<Box<dyn FileWrite>> {
-        let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
+        let (op, relative_path, cache_path) =
+            self.source.resolve(&self.path, OpClass::Write).await?;
         let op = op.operator(OpClass::Write);
         let writer: Box<dyn FileWrite> =
             if matches!(self.source, FileSource::Static { local_fs: true, .. }) {
@@ -2275,7 +2305,8 @@ impl OutputFile {
 
     /// Get an async streaming writer for format-level writes (e.g. parquet).
     pub(crate) async fn async_writer(&self) -> crate::Result<Box<dyn AsyncFileWrite>> {
-        let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
+        let (op, relative_path, cache_path) =
+            self.source.resolve(&self.path, OpClass::Write).await?;
         let writer: Box<dyn AsyncFileWrite> = Box::new(
             op.operator(OpClass::Write)
                 .writer_with(&relative_path)
@@ -3392,7 +3423,8 @@ mod input_output_test {
                     let reader = input.reader().await.unwrap();
                     assert_eq!(reader.read(1..7).await.unwrap(), b"bcdefg"[..]);
                     drop(reader);
-                    let (op, relative_path, _) = input.source.resolve(&path).await.unwrap();
+                    let (op, relative_path, _) =
+                        input.source.resolve(&path, OpClass::Origin).await.unwrap();
                     op.origin_operator().delete(&relative_path).await.unwrap();
                     let data_file = name.starts_with("data.") && !name.ends_with(".index");
                     let dedicated =

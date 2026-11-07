@@ -23,7 +23,7 @@ use opendal_layer_retry::RetryLayer;
 use opendal_service_oss::OssConfig;
 use url::Url;
 
-use super::cache_routing::{IoCacheRouting, OpClasses, OSS_ENDPOINT};
+use super::cache_routing::{IoCacheRouting, OpClass, OpClasses, OSS_ENDPOINT};
 use crate::error::Error;
 use crate::Result;
 
@@ -95,9 +95,13 @@ impl OssStorageConfig {
         &self,
         path: &str,
         file_prefixes: &[String],
+        op: OpClass,
     ) -> Option<OssTargetRoute> {
         let cache = self.cache.as_ref()?;
         let (index, classes) = cache.routing.cache_target(path, file_prefixes)?;
+        if !classes.contains(op) {
+            return None;
+        }
         Some(OssTargetRoute {
             route: OssRoute::Target(index),
             classes,

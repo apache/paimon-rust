@@ -31,7 +31,9 @@ use crate::api::rest_util::RESTUtil;
 use crate::catalog::Identifier;
 use crate::common::{CatalogOptions, Options};
 use crate::io::cache::LocalCache;
-use crate::io::{FileIO, FileIOCacheContext, FileIOProvider, RoutedOperator, IO_CACHE_ENABLED};
+use crate::io::{
+    FileIO, FileIOCacheContext, FileIOProvider, OpClass, RoutedOperator, IO_CACHE_ENABLED,
+};
 use crate::Result;
 
 use super::rest_token::RESTToken;
@@ -206,14 +208,15 @@ impl FileIOProvider for RESTTokenFileIO {
         Ok((op, relative_path, Some(cache_namespace)))
     }
 
-    async fn create_routed(
+    async fn create_routed_for_op(
         &self,
         path: &str,
         file_prefixes: &[String],
+        op: OpClass,
     ) -> Result<(RoutedOperator, String, Option<String>)> {
         let file_io = self.current_file_io().await?;
         let namespace = file_io.cache_namespace_for_path(path)?;
-        let (op, relative_path) = file_io.create_routed_static(path, file_prefixes)?;
+        let (op, relative_path) = file_io.create_routed_static(path, file_prefixes, op)?;
         Ok((op, relative_path, Some(namespace)))
     }
 
