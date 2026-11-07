@@ -4074,6 +4074,7 @@ mod tests {
         include!("table_commit/index_delete_tests.rs");
         include!("table_commit/row_id_conflict_tests.rs");
         include!("table_commit/manifest_merge_tests.rs");
+        include!("table_commit/manifest_merge_model_tests.rs");
         include!("table_commit/manifest_full_compaction_tests.rs");
     }
 

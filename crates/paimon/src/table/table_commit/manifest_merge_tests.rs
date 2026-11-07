@@ -55,6 +55,47 @@ async fn active_names(io: &FileIO, path: &str) -> HashSet<String> {
         .collect()
 }
 
+/// The sorted (file name, level) pairs that are live in the latest snapshot,
+/// first as the scan resolves them, ignoring entry order, then as the ordered
+/// `active_entries` does.
+async fn live_files_by_reader(
+    commit: &TableCommit,
+    io: &FileIO,
+    path: &str,
+) -> [Vec<(String, i32)>; 2] {
+    let snapshot = latest_snapshot(io, path).await.unwrap();
+    let scanned = TableScan::new(&commit.table, None, vec![], None, None, None)
+        .with_scan_all_files()
+        .plan_manifest_entries(&snapshot)
+        .await
+        .unwrap();
+    let listed = active_entries(io, path, &snapshot).await;
+    [scanned, listed].map(|entries| {
+        let mut files = entries
+            .iter()
+            .map(|entry| (entry.file().file_name.clone(), entry.file().level))
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    })
+}
+
+/// Assert that the last commit changed neither reader's live files except by
+/// adding `unrelated.parquet`.
+async fn assert_only_unrelated_added(
+    commit: &TableCommit,
+    io: &FileIO,
+    path: &str,
+    before: [Vec<(String, i32)>; 2],
+) {
+    let after = live_files_by_reader(commit, io, path).await;
+    for ((mut expected, actual), reader) in before.into_iter().zip(after).zip(["scan", "ordered"]) {
+        expected.push(("unrelated.parquet".to_string(), 0));
+        expected.sort();
+        assert_eq!(actual, expected, "{reader} reader");
+    }
+}
+
 #[tokio::test]
 async fn commit_merges_thirty_small_manifests_like_java() {
     let io = test_file_io();
@@ -177,7 +218,7 @@ async fn group_reaching_exactly_the_target_size_merges_below_min_count() {
 }
 
 #[tokio::test]
-async fn fully_cancelled_group_leaves_the_base_list() {
+async fn group_that_deletes_its_own_add_keeps_only_the_delete() {
     let io = test_file_io();
     let path = "memory:/manifest-merge-cancelled";
     setup_dirs(&io, path).await;
@@ -195,10 +236,96 @@ async fn fully_cancelled_group_leaves_the_base_list() {
         .unwrap();
 
     let base = base_manifests(&io, path).await;
-    assert!(base.is_empty(), "{base:?}");
+    assert_eq!(base.len(), 1, "{base:?}");
+    assert_eq!(
+        (base[0].num_added_files(), base[0].num_deleted_files()),
+        (0, 1)
+    );
     assert_eq!(
         active_names(&io, path).await,
         HashSet::from(["y.parquet".to_string()])
+    );
+}
+
+#[tokio::test]
+async fn merging_an_add_with_its_delete_keeps_the_delete_of_a_re_added_file() {
+    // [ADD old, DELETE old] merges while a later manifest adds old.parquet
+    // again. Dropping the DELETE would make that ADD live for the scan.
+    let io = test_file_io();
+    let path = "memory:/manifest-merge-delete-before-re-add";
+    setup_dirs(&io, path).await;
+    let mut commit = merge_table(&io, path, &[("manifest.merge-min-count", "1000")]);
+    let re_add = replacement_message(&[], "old.parquet");
+    let [retained, deletion, re_add] =
+        commit_retained_deletion_replacement(&io, path, &mut commit, &[], re_add).await;
+    // [retained, deletion] reaches the target and merges; re_add stays alone.
+    commit.manifest_target_size = retained.file_size() + deletion.file_size();
+    let before = live_files_by_reader(&commit, &io, path).await;
+    let old = ("old.parquet".to_string(), 0);
+    assert!(!before[0].contains(&old) && before[1].contains(&old));
+    commit
+        .commit(vec![append_message("unrelated.parquet")])
+        .await
+        .unwrap();
+
+    assert_only_unrelated_added(&commit, &io, path, before).await;
+    let base = base_manifests(&io, path).await;
+    let names = base
+        .iter()
+        .map(ManifestFileMeta::file_name)
+        .collect::<Vec<_>>();
+    assert!(!names.contains(&retained.file_name()), "{names:?}");
+    assert!(!names.contains(&deletion.file_name()), "{names:?}");
+    assert_eq!(names.last(), Some(&re_add.file_name()));
+}
+
+#[tokio::test]
+async fn merging_a_repeated_add_with_its_delete_keeps_the_first_add_deleted() {
+    // old.parquet is added twice and then deleted. Merging the second ADD
+    // with the DELETE must keep the DELETE, or the first ADD becomes live.
+    let io = test_file_io();
+    let path = "memory:/manifest-merge-add-twice-then-delete";
+    setup_dirs(&io, path).await;
+    let mut commit = merge_table(&io, path, &[("manifest.merge-min-count", "2")]);
+    // A one-byte target closes a group after every manifest, so these
+    // commits merge nothing.
+    commit.manifest_target_size = 1;
+    let old_file = test_data_file("old.parquet", 1);
+    let mut initial = vec![old_file.clone()];
+    // Random names compress poorly, so this manifest stays larger than the
+    // other two combined.
+    initial.extend(
+        (0..128).map(|_| test_data_file(&format!("filler-{}.parquet", uuid::Uuid::new_v4()), 1)),
+    );
+    let mut deletion = CommitMessage::new(vec![], 0, vec![]);
+    deletion.deleted_files.push(old_file);
+    let messages = [
+        CommitMessage::new(vec![], 0, initial),
+        replacement_message(&[], "old.parquet"),
+        deletion,
+    ];
+    for message in messages {
+        commit.commit(vec![message]).await.unwrap();
+    }
+    let mut manifests = base_manifests(&io, path).await;
+    manifests.extend(delta_manifests(&io, path).await);
+    let [first, second, deletion]: [ManifestFileMeta; 3] = manifests.try_into().unwrap();
+    // first closes its own group; [second, deletion] is the trailing group.
+    commit.manifest_target_size = second.file_size() + deletion.file_size() + 1;
+    assert!(first.file_size() >= commit.manifest_target_size);
+    let before = live_files_by_reader(&commit, &io, path).await;
+    commit
+        .commit(vec![append_message("unrelated.parquet")])
+        .await
+        .unwrap();
+
+    assert_only_unrelated_added(&commit, &io, path, before).await;
+    let base = base_manifests(&io, path).await;
+    assert_eq!(base.len(), 2);
+    assert_eq!(base[0].file_name(), first.file_name());
+    assert_eq!(
+        (base[1].num_added_files(), base[1].num_deleted_files()),
+        (0, 1)
     );
 }
 
@@ -387,8 +514,8 @@ async fn group_that_adds_a_file_twice_stays_unmerged() {
 
 #[tokio::test]
 async fn group_that_re_adds_a_file_it_deletes_stays_unmerged() {
-    // Cancelling the DELETE against the later ADD would leave the retained ADD
-    // of old.parquet without its DELETE.
+    // Merging would drop the ADD that follows the DELETE, and the ordered
+    // reader would stop listing old.parquet.
     let io = test_file_io();
     let path = "memory:/manifest-merge-re-add";
     setup_dirs(&io, path).await;
@@ -588,123 +715,4 @@ async fn skip_on_write_only_does_not_apply_to_write_enabled_tables() {
     let merged = merger.merge_manifests(input, &mut created).await.unwrap();
     assert_eq!(merged.len(), 1);
     assert!(!created.is_empty());
-}
-
-fn file_at_level(name: &str, level: i32) -> DataFileMeta {
-    let mut file = test_data_file(name, 1);
-    file.level = level;
-    file
-}
-
-fn message_for<'a>(
-    changes: &'a mut std::collections::BTreeMap<&'static str, CommitMessage>,
-    pt: &'static str,
-) -> &'a mut CommitMessage {
-    changes
-        .entry(pt)
-        .or_insert_with(|| CommitMessage::new(partition_bytes(pt), 0, vec![]))
-}
-
-/// Seeded random commits checked against a model of the live files. Small
-/// targets and thresholds make commits merge and full-compact often.
-#[tokio::test]
-async fn manifest_merges_preserve_live_files_across_random_commits() {
-    for seed in [1u64, 7, 42] {
-        let io = test_file_io();
-        let path = format!("memory:/manifest-merge-model-{seed}");
-        setup_dirs(&io, &path).await;
-        // A manifest of a few entries is about 2.4 kb. A merged manifest that
-        // reaches the 3 kb target closes a group by itself, so later groups
-        // hold DELETEs whose ADD is outside them. Full compaction ran about 32
-        // times per seed with these values (tuned 2026-11-06); the 5 kb
-        // threshold is what makes it run.
-        let commit = partitioned_merge_table(
-            &io,
-            &path,
-            &[
-                ("manifest.target-file-size", "3 kb"),
-                ("manifest.merge-min-count", "3"),
-                ("manifest.full-compaction-threshold-size", "5 kb"),
-            ],
-        );
-        let mut state = seed;
-        let mut random = move |bound: usize| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state % bound as u64) as usize
-        };
-        // (partition, file name, level) of every live file.
-        let mut live: Vec<(&'static str, String, i32)> = Vec::new();
-        let mut seen_deltas = HashSet::new();
-        let mut merged = false;
-        let mut kept_cross_group_delete = false;
-        for step in 0..150 {
-            let mut changes = std::collections::BTreeMap::new();
-            if live.len() > 1 && random(3) == 0 {
-                let (pt, name, level) = live.swap_remove(random(live.len()));
-                message_for(&mut changes, pt)
-                    .deleted_files
-                    .push(file_at_level(&name, level));
-            }
-            if !live.is_empty() && random(5) == 0 {
-                let position = random(live.len());
-                let (pt, name, level) = live[position].clone();
-                let message = message_for(&mut changes, pt);
-                message.deleted_files.push(file_at_level(&name, level));
-                message.new_files.push(file_at_level(&name, level + 1));
-                live[position].2 = level + 1;
-            }
-            let pt = ["a", "b", "c"][random(3)];
-            for index in 0..=random(4) {
-                let name = format!("f-{step}-{index}.parquet");
-                message_for(&mut changes, pt)
-                    .new_files
-                    .push(file_at_level(&name, 0));
-                live.push((pt, name, 0));
-            }
-            commit
-                .commit(changes.into_values().collect())
-                .await
-                .unwrap();
-
-            let snapshot = latest_snapshot(&io, &path).await.unwrap();
-            let expected = live
-                .iter()
-                .map(|(_, name, level)| (name.clone(), *level))
-                .collect::<HashSet<_>>();
-            // Ordered reconciliation (snapshot_manifest) and the scan's
-            // order-independent one must both agree with the model.
-            let listed = active_entries(&io, &path, &snapshot).await;
-            let scanned = TableScan::new(&commit.table, None, vec![], None, None, None)
-                .with_scan_all_files()
-                .plan_manifest_entries(&snapshot)
-                .await
-                .unwrap();
-            for entries in [listed, scanned] {
-                let actual = entries
-                    .iter()
-                    .map(|entry| (entry.file().file_name.clone(), entry.file().level))
-                    .collect::<HashSet<_>>();
-                assert_eq!(entries.len(), expected.len(), "seed {seed}, step {step}");
-                assert_eq!(actual, expected, "seed {seed}, step {step}");
-            }
-            let deltas = delta_manifests(&io, &path).await;
-            seen_deltas.extend(deltas.iter().map(|m| m.file_name().to_string()));
-            for manifest in base_manifests(&io, &path).await {
-                if !seen_deltas.contains(manifest.file_name()) {
-                    merged = true;
-                    // A merged manifest keeps a DELETE only when its ADD is
-                    // outside the group.
-                    kept_cross_group_delete |= manifest.num_deleted_files() > 0;
-                }
-            }
-        }
-        assert!(merged, "seed {seed} never merged manifests");
-        assert!(
-            kept_cross_group_delete,
-            "seed {seed} never merged a DELETE whose ADD is outside its group (the #899 case); retune the parameters"
-        );
-        assert!(base_manifests(&io, &path).await.len() < 50, "seed {seed}");
-    }
 }

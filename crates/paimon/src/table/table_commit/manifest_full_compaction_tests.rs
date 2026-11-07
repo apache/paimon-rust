@@ -82,89 +82,48 @@ async fn full_compaction_drops_resolved_deletes_and_keeps_unrelated_manifests() 
 }
 
 #[tokio::test]
-async fn full_compaction_keeps_a_delete_whose_add_was_pruned() {
+async fn full_compaction_drops_deletes_whose_add_is_gone() {
     let io = test_file_io();
-    let path = "memory:/manifest-full-compaction-pruned-add";
+    let path = "memory:/manifest-full-compaction-lone-delete";
     setup_dirs(&io, path).await;
-    let writer = partitioned_merge_table(&io, path, &[("manifest.target-file-size", "1 b")]);
-    let pt = partition_bytes("a");
-    let removed = test_data_file("removed.parquet", 1);
-    let mut first = vec![removed.clone()];
-    first.extend((0..199).map(|id| test_data_file(&format!("first-{id}.parquet"), 1)));
-    writer
-        .commit(vec![CommitMessage::new(pt.clone(), 0, first)])
-        .await
-        .unwrap();
-    let mut deletion = CommitMessage::new(pt.clone(), 0, vec![]);
-    deletion.deleted_files.push(removed);
-    writer.commit(vec![deletion]).await.unwrap();
-    // `small` gives the full compaction two manifests to merge; with
-    // `deletion` alone it would fall back to minor merging.
-    let small = vec![test_data_file("small.parquet", 1)];
-    writer
-        .commit(vec![CommitMessage::new(pt, 0, small)])
-        .await
-        .unwrap();
-    let mut input = base_manifests(&io, path).await;
-    input.extend(delta_manifests(&io, path).await);
-    let [first, deletion, small] = input.as_slice() else {
-        panic!("expected three manifests, got {input:?}");
-    };
+    // The third commit merges [ADD x, DELETE x], which leaves only the DELETE.
+    let writer = merge_table(&io, path, &[("manifest.merge-min-count", "2")]);
+    let mut deletion = CommitMessage::new(vec![], 0, vec![]);
+    deletion.deleted_files.push(test_data_file("x.parquet", 10));
+    for message in [
+        append_message("x.parquet"),
+        deletion,
+        append_message("y.parquet"),
+    ] {
+        writer.commit(vec![message]).await.unwrap();
+    }
+    let lone_delete = base_manifests(&io, path).await.remove(0);
+    assert_eq!(lone_delete.num_added_files(), 0);
+    assert_eq!(lone_delete.num_deleted_files(), 1);
 
-    let other_partition = ManifestEntry::new(
-        FileKind::Add,
-        partition_bytes("b"),
-        0,
-        1,
-        test_data_file("other.parquet", 1),
-        2,
-    );
-    let wrong_stats = writer.compute_partition_stats(&[other_partition]).unwrap();
-    let mislabeled = ManifestFileMeta::new(
-        first.file_name().to_string(),
-        first.file_size(),
-        first.num_added_files(),
-        first.num_deleted_files(),
-        wrong_stats,
-        first.schema_id(),
-    );
-    let merger = partitioned_merge_table(
+    let merger = merge_table(
         &io,
         path,
-        &[
-            ("manifest.target-file-size", "1 b"),
-            ("manifest.full-compaction-threshold-size", "1 b"),
-        ],
+        &[("manifest.full-compaction-threshold-size", "1 b")],
     );
-    let mut created = Vec::new();
-    let merged = merger
-        .merge_manifests(
-            vec![mislabeled, deletion.clone(), small.clone()],
-            &mut created,
-        )
+    let before = live_files_by_reader(&merger, &io, path).await;
+    merger
+        .commit(vec![append_message("unrelated.parquet")])
         .await
         .unwrap();
 
-    // deletion was rewritten; its DELETE survives in a new manifest because
-    // the manifest holding the matching ADD was skipped.
-    assert!(!created.is_empty());
-    assert!(merged.iter().all(|m| m.file_name() != deletion.file_name()));
-    let rewritten = merged
-        .iter()
-        .find(|m| m.num_deleted_files() == 1)
-        .expect("the unmatched DELETE must be kept");
-    assert_eq!(rewritten.num_added_files(), 0);
-    let mut entries = Vec::new();
-    for manifest in &merged {
+    assert_only_unrelated_added(&merger, &io, path, before).await;
+    let base = base_manifests(&io, path).await;
+    for manifest in &base {
+        assert_ne!(manifest.file_name(), lone_delete.file_name());
         let manifest_path = format!("{path}/manifest/{}", manifest.file_name());
-        entries.extend(Manifest::read(&io, &manifest_path).await.unwrap());
+        let entries = Manifest::read(&io, &manifest_path).await.unwrap();
+        assert!(
+            entries.iter().all(|entry| *entry.kind() == FileKind::Add),
+            "{}",
+            manifest.file_name()
+        );
     }
-    let live = merge_active_entries(entries)
-        .into_iter()
-        .map(|entry| entry.file().file_name.clone())
-        .collect::<HashSet<_>>();
-    assert_eq!(live.len(), 200);
-    assert!(!live.contains("removed.parquet"));
 }
 
 #[tokio::test]

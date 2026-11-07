@@ -189,6 +189,8 @@ impl TableCommit {
                 };
                 // One atomic attempt: a definite CAS conflict requires a fresh
                 // coverage plan, rather than rebasing overlapping index files.
+                // `retries` also counts rounds that aborted before publishing,
+                // so later rounds skip the manifest merge; skipping is always safe.
                 match commit
                     .try_commit_once(resolved, &latest, written.id(), retries == 0)
                     .await?
