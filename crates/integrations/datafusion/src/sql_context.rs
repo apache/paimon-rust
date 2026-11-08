@@ -778,9 +778,7 @@ impl SQLContext {
                     // Only intercept DROP TABLE for Paimon catalogs; fall through for others
                     let table_ref: TableReference = names[0].to_string().as_str().into();
                     if self.is_paimon_catalog_ref(&table_ref) {
-                        let (catalog, _catalog_name, _) =
-                            self.resolve_catalog_and_table(&names[0])?;
-                        self.handle_drop_table(&catalog, names, *if_exists).await
+                        self.handle_drop_table(names, *if_exists).await
                     } else {
                         self.ctx.sql_with_options(sql, options).await
                     }
@@ -1354,12 +1352,14 @@ impl SQLContext {
 
     async fn handle_drop_table(
         &self,
-        catalog: &Arc<dyn Catalog>,
         names: &[ObjectName],
         if_exists: bool,
     ) -> DFResult<DataFrame> {
-        for name in names {
-            let identifier = self.resolve_table_name(name)?;
+        let targets = names
+            .iter()
+            .map(|name| self.resolve_catalog_and_table(name))
+            .collect::<DFResult<Vec<_>>>()?;
+        for (catalog, _, identifier) in targets {
             catalog
                 .drop_table(&identifier, if_exists)
                 .await

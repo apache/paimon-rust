@@ -1623,6 +1623,41 @@ async fn test_drop_table() {
     );
 }
 
+#[tokio::test]
+async fn test_drop_table_resolves_each_catalog() {
+    let (_tmp1, catalog1) = create_test_env();
+    let (_tmp2, catalog2) = create_test_env();
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("cat1", catalog1.clone())
+        .await
+        .unwrap();
+    ctx.register_catalog("cat2", catalog2.clone())
+        .await
+        .unwrap();
+
+    for sql in [
+        "CREATE TABLE cat1.default.a (id INT)",
+        "CREATE TABLE cat1.default.b (id INT)",
+        "CREATE TABLE cat2.default.b (id INT)",
+    ] {
+        ctx.sql(sql).await.unwrap();
+    }
+
+    ctx.sql("DROP TABLE cat1.default.a, cat2.default.b")
+        .await
+        .unwrap();
+    assert_eq!(catalog1.list_tables("default").await.unwrap(), vec!["b"]);
+    assert!(catalog2.list_tables("default").await.unwrap().is_empty());
+
+    assert_sql_error_contains(
+        &ctx,
+        "DROP TABLE cat1.default.b, missing.default.b",
+        "Unknown catalog 'missing'",
+    )
+    .await;
+    assert_eq!(catalog1.list_tables("default").await.unwrap(), vec!["b"]);
+}
+
 // ======================= ALTER TABLE =======================
 
 #[tokio::test]
