@@ -456,6 +456,50 @@ async fn test_rename_branch_rejects_unopenable_source_and_target() {
 }
 
 #[tokio::test]
+async fn test_fast_forward_validates_arguments_and_rejects_filesystem_tables() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(&sql_context, "CREATE TABLE paimon.test_db.t1 (id INT)").await;
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+
+    for (arguments, error) in [
+        (
+            "table => 'test_db.t1'",
+            "Missing required argument: 'branch'",
+        ),
+        ("branch => 'b1'", "Missing required argument: 'table'"),
+        (
+            "table => 'test_db.t1', branch => 'b1', tag => 'release'",
+            "Argument tag is unknown.",
+        ),
+        (
+            "table => 'test_db.t1', branch => 'b1', branch => 'b2'",
+            "Procedure argument branch is duplicated.",
+        ),
+    ] {
+        assert_sql_error(
+            &sql_context,
+            &format!("CALL sys.fast_forward({arguments})"),
+            error,
+        )
+        .await;
+    }
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.fast_forward(table => 'test_db.t1', branch => 'b1')",
+        "fast_forward is only supported for tables managed by a REST catalog",
+    )
+    .await;
+    assert!(bm.branch_exists("b1").await.unwrap());
+}
+
+#[tokio::test]
 async fn test_delete_branch() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;

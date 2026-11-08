@@ -20,7 +20,8 @@ mod common;
 #[path = "../../../paimon/tests/mock_server.rs"]
 mod mock_server;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch};
@@ -714,43 +715,340 @@ async fn test_replace_tag_rejected_on_rest_catalog_without_changing_metadata() {
     }
 }
 
-#[tokio::test]
-async fn test_create_branch_rejects_rest_tables_even_when_target_exists() {
-    let (tmp, server, context) = setup().await;
+fn register_rest_table(
+    tmp: &tempfile::TempDir,
+    server: &RESTServer,
+    options: &[(&str, &str)],
+) -> PathBuf {
     let schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
+        .options(
+            options
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+        )
         .build()
         .unwrap();
     let root = tmp.path().join(format!("{DATABASE}.db/{TABLE}"));
     let schema_path = root.join("schema/schema-0");
-    let branch_path = root.join("branch/branch-existing/schema/schema-0");
-    let schema_bytes = serde_json::to_vec(&paimon::spec::TableSchema::new(0, &schema)).unwrap();
-    for path in [&schema_path, &branch_path] {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, &schema_bytes).unwrap();
-    }
+    std::fs::create_dir_all(schema_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &schema_path,
+        serde_json::to_vec(&paimon::spec::TableSchema::new(0, &schema)).unwrap(),
+    )
+    .unwrap();
     server.add_table_with_schema(
         DATABASE,
         TABLE,
         schema,
         &format!("file://{}", root.display()),
     );
+    root
+}
 
-    for branch in ["new", "existing"] {
-        for tag in ["", ", tag => 'missing'"] {
+fn error_response(code: i32, message: &str) -> paimon::api::ErrorResponse {
+    paimon::api::ErrorResponse::new(None, None, Some(message.to_string()), Some(code))
+}
+
+fn table_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(table_files(&path));
+        } else {
+            let content = std::fs::read(&path).unwrap();
+            files.insert(path, content);
+        }
+    }
+    files
+}
+
+#[tokio::test]
+async fn test_create_branch_goes_through_rest_catalog() {
+    let (tmp, server, context) = setup().await;
+    let root = register_rest_table(&tmp, &server, &[]);
+    let storage_only = root.join("branch/branch-stale/schema/schema-0");
+    std::fs::create_dir_all(storage_only.parent().unwrap()).unwrap();
+    std::fs::write(&storage_only, b"stale").unwrap();
+    let original_files = table_files(&root);
+    let tag = " release +一";
+    server.add_tag(DATABASE, TABLE, tag);
+    let create =
+        |args: &str| format!("CALL sys.create_branch(table => '{DATABASE}.{TABLE}', {args})");
+
+    assert_ok_row(&context, &create("branch => 'dev'")).await;
+    assert_ok_row(&context, &create("branch => 'stale'")).await;
+    assert_ok_row(
+        &context,
+        &create("branch => 'fresh', ignore_if_exists => true"),
+    )
+    .await;
+    for branch in [" dev", "dev ", "dev+", "一"] {
+        assert_ok_row(
+            &context,
+            &create(&format!("branch => '{branch}', tag => '{tag}'")),
+        )
+        .await;
+    }
+
+    server.set_list_branches_error(Some(error_response(403, "denied")));
+    for branch in ["dev", "new"] {
+        common::assert_sql_error(
+            &context,
+            &create(&format!("branch => '{branch}', ignore_if_exists => true")),
+            "Forbidden: denied",
+        )
+        .await;
+    }
+    assert_ok_row(&context, &create("branch => 'new'")).await;
+    server.set_list_branches_error(None);
+    let expected = ["dev", "stale", "fresh", " dev", "dev ", "dev+", "一", "new"];
+    assert_eq!(server.branches(DATABASE, TABLE), expected);
+
+    common::assert_sql_error(&context, &create("branch => 'dev'"), "already exists").await;
+    for ignore in ["false", "true"] {
+        common::assert_sql_error(
+            &context,
+            &create(&format!(
+                "branch => 'other', tag => 'missing', ignore_if_exists => {ignore}"
+            )),
+            "Tag missing does not exist",
+        )
+        .await;
+    }
+
+    server.set_branch_mutation_error(Some(error_response(409, "conflict")));
+    assert_ok_row(
+        &context,
+        &create("branch => 'raced', ignore_if_exists => true"),
+    )
+    .await;
+
+    server.set_branch_mutation_error(Some(error_response(403, "denied")));
+    for ignore in ["false", "true"] {
+        common::assert_sql_error(
+            &context,
+            &create(&format!("branch => 'denied', ignore_if_exists => {ignore}")),
+            "Forbidden: denied",
+        )
+        .await;
+    }
+    assert_ok_row(
+        &context,
+        &create("branch => 'dev', tag => 'missing', ignore_if_exists => true"),
+    )
+    .await;
+    assert_eq!(server.branches(DATABASE, TABLE), expected);
+    assert_eq!(table_files(&root), original_files);
+}
+
+#[tokio::test]
+async fn test_delete_branch_goes_through_rest_catalog() {
+    let (tmp, server, context) = setup().await;
+    let root = register_rest_table(
+        &tmp,
+        &server,
+        &[
+            ("scan.primary-branch", "primary"),
+            ("scan.fallback-branch", "fallback"),
+        ],
+    );
+    for branch in ["dev", "qa", "keep", "primary", "fallback", "keep ", "keep+"] {
+        server.add_branch(DATABASE, TABLE, branch);
+    }
+    let dev_dir = root.join("branch/branch-dev");
+    std::fs::create_dir_all(&dev_dir).unwrap();
+    std::fs::write(dev_dir.join("marker"), b"catalog-owned").unwrap();
+    let original_files = table_files(&root);
+    let delete = |branches: &str| {
+        format!("CALL sys.delete_branch(table => '{DATABASE}.{TABLE}', branch => '{branches}')")
+    };
+
+    assert_ok_row(&context, &delete("dev,missing,,qa,dev,keep ,keep+")).await;
+    assert_eq!(
+        server.branches(DATABASE, TABLE),
+        ["keep", "primary", "fallback"]
+    );
+    let expected_calls = ["dev", "missing", "qa", "dev", "keep ", "keep+"]
+        .map(|branch| (DATABASE.to_string(), TABLE.to_string(), branch.to_string()));
+    assert_eq!(server.drop_branch_calls(), expected_calls);
+
+    for (branch, option) in [
+        ("primary", "scan.primary-branch"),
+        ("fallback", "scan.fallback-branch"),
+    ] {
+        common::assert_sql_error(&context, &delete(branch), option).await;
+    }
+    assert_eq!(server.drop_branch_calls(), expected_calls);
+
+    server.set_branch_mutation_error(Some(error_response(403, "denied")));
+    common::assert_sql_error(&context, &delete("keep,missing"), "Forbidden: denied").await;
+    let mut expected_calls = expected_calls.to_vec();
+    expected_calls.push((DATABASE.to_string(), TABLE.to_string(), "keep".to_string()));
+    assert_eq!(server.drop_branch_calls(), expected_calls);
+    assert_eq!(
+        server.branches(DATABASE, TABLE),
+        ["keep", "primary", "fallback"]
+    );
+
+    server.set_branch_mutation_error(None);
+    common::assert_sql_error(
+        &context,
+        &delete("keep,primary,fallback"),
+        "scan.primary-branch",
+    )
+    .await;
+    assert_eq!(server.branches(DATABASE, TABLE), ["primary", "fallback"]);
+    expected_calls.push((DATABASE.to_string(), TABLE.to_string(), "keep".to_string()));
+    assert_eq!(server.drop_branch_calls(), expected_calls);
+    assert_eq!(table_files(&root), original_files);
+}
+
+#[tokio::test]
+async fn test_fast_forward_goes_through_rest_catalog() {
+    let (tmp, server, context) = setup().await;
+    let root = register_rest_table(&tmp, &server, &[]);
+    let original_files = table_files(&root);
+    let forward = |branch: &str| {
+        format!("CALL sys.fast_forward(table => '{DATABASE}.{TABLE}', branch => '{branch}')")
+    };
+
+    let mut expected = Vec::new();
+    for branch in ["dev", "dev +一", "forward"] {
+        server.add_branch(DATABASE, TABLE, branch);
+        assert_ok_row(&context, &forward(branch)).await;
+        expected.push((DATABASE.to_string(), TABLE.to_string(), branch.to_string()));
+    }
+    assert_eq!(server.fast_forward_calls(), expected);
+
+    common::assert_sql_error(
+        &context,
+        &forward("missing"),
+        "Branch missing of table sales.orders does not exist",
+    )
+    .await;
+
+    server.set_branch_mutation_error(Some(error_response(403, "denied")));
+    common::assert_sql_error(&context, &forward("dev"), "Forbidden: denied").await;
+    assert_eq!(server.fast_forward_calls(), expected);
+    assert_eq!(table_files(&root), original_files);
+}
+
+#[tokio::test]
+async fn test_branch_procedures_validate_names_on_rest_catalog() {
+    let (tmp, server, context) = setup().await;
+    let root = register_rest_table(&tmp, &server, &[]);
+    let original_files = table_files(&root);
+    server.add_branch(DATABASE, TABLE, "main");
+    for procedure in ["create_branch", "delete_branch", "fast_forward"] {
+        for (branch, error) in [
+            ("main", "default branch"),
+            (" ", "cannot be empty or whitespace"),
+            ("123", "pure numeric"),
+            ("..", "cannot be '.' or '..'"),
+            ("dev/schema", "path separators"),
+            ("dev\\schema", "path separators"),
+            ("dev\n", "control characters"),
+        ] {
             common::assert_sql_error(
                 &context,
                 &format!(
-                    "CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => '{branch}'{tag}, ignore_if_exists => true)"
+                    "CALL sys.{procedure}(table => '{DATABASE}.{TABLE}', branch => '{branch}')"
                 ),
-                "create_branch is not supported for tables managed by a REST catalog",
+                error,
             )
             .await;
-            assert_eq!(std::fs::read(&schema_path).unwrap(), schema_bytes);
-            assert_eq!(std::fs::read(&branch_path).unwrap(), schema_bytes);
-            assert_eq!(std::fs::read_dir(root.join("branch")).unwrap().count(), 1);
         }
     }
+    common::assert_sql_error(
+        &context,
+        &format!("CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => 'main', ignore_if_exists => true)"),
+        "default branch",
+    )
+    .await;
+    common::assert_sql_error(
+        &context,
+        &format!("CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => 'dev$tags', ignore_if_exists => true)"),
+        "cannot contain the SQL suffix delimiter",
+    )
+    .await;
+    assert_eq!(server.branches(DATABASE, TABLE), ["main"]);
+    assert!(server.drop_branch_calls().is_empty());
+    assert!(server.fast_forward_calls().is_empty());
+    assert_eq!(table_files(&root), original_files);
+}
+
+#[tokio::test]
+async fn test_branch_procedures_reject_unsupported_rest_tables() {
+    let (tmp, server, context) = setup().await;
+    server.add_branch(DATABASE, TABLE, "dev");
+    let procedure_sql = |procedure: &str, table: &str| {
+        let extra = if procedure == "create_branch" {
+            ", ignore_if_exists => true"
+        } else {
+            ""
+        };
+        format!("CALL sys.{procedure}(table => '{DATABASE}.{table}', branch => 'dev'{extra})")
+    };
+
+    for procedure in ["create_branch", "delete_branch", "fast_forward"] {
+        common::assert_sql_error(
+            &context,
+            &procedure_sql(procedure, "missing"),
+            "Table sales.missing does not exist",
+        )
+        .await;
+    }
+
+    let root = register_rest_table(&tmp, &server, &[]);
+    let branch_table = format!("{TABLE}$branch_dev");
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    server.add_table_with_schema(
+        DATABASE,
+        &branch_table,
+        schema,
+        &format!("file://{}", root.display()),
+    );
+    for procedure in ["create_branch", "delete_branch", "fast_forward"] {
+        common::assert_sql_error(
+            &context,
+            &procedure_sql(procedure, &branch_table),
+            &format!("{procedure} requires a main-branch source table"),
+        )
+        .await;
+    }
+
+    for table_type in ["object-table", "lance-table", "iceberg-table"] {
+        let root = register_rest_table(&tmp, &server, &[("type", table_type)]);
+        let original_files = table_files(&root);
+        for procedure in ["create_branch", "delete_branch", "fast_forward"] {
+            common::assert_sql_error(
+                &context,
+                &procedure_sql(procedure, TABLE),
+                &format!("is declared '{table_type}' and cannot be read as a Paimon table"),
+            )
+            .await;
+        }
+        assert_eq!(table_files(&root), original_files);
+    }
+
+    let root = register_rest_table(&tmp, &server, &[("type", "format-table")]);
+    let original_files = table_files(&root);
+    common::assert_sql_error(
+        &context,
+        &procedure_sql("create_branch", TABLE),
+        "format-table is not supported",
+    )
+    .await;
+    assert_eq!(table_files(&root), original_files);
+    assert!(server.branches(DATABASE, "missing").is_empty());
+    assert_eq!(server.branches(DATABASE, TABLE), ["dev"]);
+    assert!(server.drop_branch_calls().is_empty());
+    assert!(server.fast_forward_calls().is_empty());
 }
 
 #[tokio::test]
@@ -925,32 +1223,6 @@ async fn test_create_tag_from_watermark_rejects_readable_rest_catalog_table() {
         .iter()
         .all(|(method, path)| method == Method::GET && path == table_path));
     server.abort();
-}
-
-#[tokio::test]
-async fn test_delete_branch_rejected_on_rest_catalog() {
-    // A REST catalog owns branch metadata and the Rust REST catalog has no
-    // branch-drop endpoint yet, so `delete_branch` must refuse rather than delete
-    // a physical branch directory while the catalog still lists it. Without the
-    // guard the filesystem `BranchManager` runs and reports a different error, so
-    // this assertion is non-vacuous.
-    let (tmp, server, context) = setup().await;
-
-    // `get_table` needs a schema-bearing response; register one so resolution
-    // reaches the REST guard rather than failing earlier on a missing schema.
-    let schema = Schema::builder()
-        .column("id", DataType::Int(IntType::new()))
-        .build()
-        .unwrap();
-    let path = format!("file://{}/{DATABASE}.db/{TABLE}", tmp.path().display());
-    server.add_table_with_schema(DATABASE, TABLE, schema, &path);
-
-    common::assert_sql_error(
-        &context,
-        &format!("CALL sys.delete_branch(table => '{DATABASE}.{TABLE}', branch => 'b1')"),
-        "REST catalog",
-    )
-    .await;
 }
 
 #[tokio::test]

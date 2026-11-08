@@ -19,6 +19,8 @@
 //!
 //! Supported procedures:
 //! - `CALL sys.create_branch(table => '...', branch => '...'[, tag => '...', ignore_if_exists => true])`
+//! - `CALL sys.delete_branch(table => '...', branch => 'branch1,branch2')`
+//! - `CALL sys.fast_forward(table => '...', branch => '...')` (REST catalogs only)
 //! - `CALL sys.create_tag(table => '...', tag => '...', snapshot_id => ..., time_retained => '...')`
 //! - `CALL sys.replace_tag(table => '...', tag => '...', snapshot_id => ..., time_retained => '...')`
 //! - `CALL sys.delete_tag(table => '...', tag => '...')`
@@ -223,6 +225,7 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
         "create_tag_from_watermark" => &["table", "tag", "watermark", "time_retained"],
         "rename_branch" => &["table", "from_branch", "to_branch"],
         "delete_branch" => &["table", "branch"],
+        "fast_forward" => &["table", "branch"],
         "create_global_index" => &["table", "index_column", "index_type", "options"],
         "drop_global_index" => &[
             "table",
@@ -353,6 +356,7 @@ pub async fn execute_procedure(
         }
         "rename_branch" => proc_rename_branch(ctx, catalog, catalog_name, &args).await,
         "delete_branch" => proc_delete_branch(ctx, catalog, catalog_name, &args).await,
+        "fast_forward" => proc_fast_forward(ctx, catalog, catalog_name, &args).await,
         "create_global_index" => proc_create_global_index(ctx, catalog, catalog_name, &args).await,
         "drop_global_index" => proc_drop_global_index(ctx, catalog, catalog_name, &args).await,
         "compact" => proc_compact(ctx, catalog, catalog_name, &args).await,
@@ -765,8 +769,7 @@ async fn proc_create_branch(
 ) -> DFResult<DataFrame> {
     let branch = require_arg(args, "branch")?;
     let ignore_if_exists = bool_arg(args, "ignore_if_exists")?;
-    // Validate before the existence check: an invalid name must not become a
-    // successful no-op just because it resolves to an existing directory.
+    // Validate before checking existence so invalid names cannot become no-ops.
     BranchManager::validate_branch_name(branch).map_err(to_datafusion_error)?;
     if branch.contains('$') {
         return Err(DataFusionError::Plan(format!(
@@ -774,11 +777,6 @@ async fn proc_create_branch(
         )));
     }
     let table = get_table(catalog, catalog_name, args).await?;
-    if table.rest_env().is_some() {
-        return Err(DataFusionError::NotImplemented(
-            "create_branch is not supported for tables managed by a REST catalog".to_string(),
-        ));
-    }
     if table.schema().core_options().is_format_table() {
         return Err(DataFusionError::NotImplemented(
             "create_branch requires a FileStoreTable; format-table is not supported".to_string(),
@@ -788,6 +786,30 @@ async fn proc_create_branch(
         return Err(DataFusionError::NotImplemented(
             "create_branch requires a main-branch source table".to_string(),
         ));
+    }
+
+    // The REST catalog owns branch metadata and must handle the mutation.
+    if let Some(rest_env) = table.rest_env() {
+        let identifier = rest_env.identifier();
+        // Check existence first, as the filesystem path does, so an existing
+        // branch is a no-op without resolving the tag.
+        if ignore_if_exists
+            && catalog
+                .list_branches(identifier)
+                .await
+                .map_err(to_datafusion_error)?
+                .iter()
+                .any(|name| name == branch)
+        {
+            return ok_result(ctx);
+        }
+        let tag = args.get("tag").map(String::as_str);
+        return match catalog.create_branch(identifier, branch, tag).await {
+            Ok(()) => ok_result(ctx),
+            // The branch may have been created concurrently after the check.
+            Err(paimon::Error::BranchAlreadyExist { .. }) if ignore_if_exists => ok_result(ctx),
+            Err(error) => Err(to_datafusion_error(error)),
+        };
     }
 
     let manager = BranchManager::new(table.file_io().clone(), table.location().to_string());
@@ -845,14 +867,11 @@ async fn proc_delete_branch(
     let table = get_table(catalog, catalog_name, args).await?;
     let branch_str = require_arg(args, "branch")?;
 
-    // A REST catalog owns branch metadata and the Rust REST catalog has no
-    // branch-drop endpoint yet (Java `RESTCatalog.dropBranch` DELETEs through the
-    // catalog). Dropping the physical branch directory here would leave the
-    // catalog still listing the branch while its data is gone. Refuse before
-    // deleting anything, until a catalog-aware path exists.
-    if table.rest_env().is_some() {
+    // REST branch endpoints address branches through the main table.
+    let rest_identifier = table.rest_env().map(|env| env.identifier());
+    if rest_identifier.is_some() && !table.is_main_branch() {
         return Err(DataFusionError::NotImplemented(
-            "delete_branch is not yet supported for tables managed by a REST catalog".to_string(),
+            "delete_branch requires a main-branch source table".to_string(),
         ));
     }
 
@@ -874,17 +893,50 @@ async fn proc_delete_branch(
         BranchManager::validate_branch_name(branch_name).map_err(to_datafusion_error)?;
         BranchManager::ensure_branch_deletable(options, branch_name)
             .map_err(to_datafusion_error)?;
-        if !bm
+        if let Some(identifier) = rest_identifier {
+            // Skip missing branches, as the filesystem path does.
+            match catalog.drop_branch(identifier, branch_name).await {
+                Ok(()) | Err(paimon::Error::BranchNotExist { .. }) => {}
+                Err(error) => return Err(to_datafusion_error(error)),
+            }
+        } else if bm
             .branch_exists(branch_name)
             .await
             .map_err(to_datafusion_error)?
         {
-            continue;
+            bm.drop_branch(branch_name)
+                .await
+                .map_err(to_datafusion_error)?;
         }
-        bm.drop_branch(branch_name)
-            .await
-            .map_err(to_datafusion_error)?;
     }
+    ok_result(ctx)
+}
+
+async fn proc_fast_forward(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let branch = require_arg(args, "branch")?;
+    BranchManager::validate_branch_name(branch).map_err(to_datafusion_error)?;
+    let table = get_table(catalog, catalog_name, args).await?;
+    // Fast-forwarding requires coordinated snapshot, schema and tag changes;
+    // REST tables delegate those changes to the server.
+    let Some(rest_env) = table.rest_env() else {
+        return Err(DataFusionError::NotImplemented(
+            "fast_forward is only supported for tables managed by a REST catalog".to_string(),
+        ));
+    };
+    if !table.is_main_branch() {
+        return Err(DataFusionError::NotImplemented(
+            "fast_forward requires a main-branch source table".to_string(),
+        ));
+    }
+    catalog
+        .fast_forward(rest_env.identifier(), branch)
+        .await
+        .map_err(to_datafusion_error)?;
     ok_result(ctx)
 }
 

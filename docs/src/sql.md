@@ -1381,20 +1381,62 @@ names, pure ASCII numeric names, `.`, `..`, path separators, and control
 characters are rejected. SQL also rejects `$` in target branch names because it
 separates branch and system-table suffixes in object names. Branch names preserve
 leading and trailing spaces.
-When creating a branch, tag names are passed unchanged to Core; trailing
-whitespace is invalid.
+Tag names are passed unchanged. The REST server validates them for REST tables;
+Core validates them for filesystem-managed tables and rejects trailing whitespace.
 Branch-name and source-table validation also apply when `ignore_if_exists` is
 `true`.
 
-Only non-REST FileStore tables resolved on `main` are supported. REST tables,
-format tables, external engine tables, and already resolved non-main source
-tables are rejected. The procedure does not resolve `$branch_<name>` or system
-table suffixes in its `table` argument and does not create from another branch.
+Only FileStore tables resolved on `main` are supported. Format tables, external
+engine tables, and non-main source tables are rejected. The `table` argument is
+passed to the selected catalog without additional branch or system-table suffix
+resolution. The procedure does not create from another branch.
 
-Creation reuses the Core metadata-copy path. Existence checks and file copies
-are not transactional; storage errors are returned and can leave partial branch
-metadata. `ignore_if_exists` checks name existence and does not repair a partial
-creation.
+For tables managed by a REST catalog, the branch is created through the catalog,
+which owns branch metadata, and the procedure does not write table storage
+itself. `ignore_if_exists` checks the catalog's branch list. An existing branch
+reported by a concurrent creation is also ignored when this option is `true`.
+Other catalog errors are returned to the caller.
+
+For filesystem-managed tables, creation reuses the Core metadata-copy path.
+Existence checks and file copies are not transactional; storage errors are
+returned and can leave partial branch metadata. `ignore_if_exists` checks name
+existence and does not repair a partial creation.
+
+### delete_branch
+
+Delete one or more branches:
+
+```sql
+CALL sys.delete_branch(table => 'paimon.my_db.my_table', branch => 'dev,release_branch');
+```
+
+`table` and `branch` are required. `table` accepts `database.table` or
+`catalog.database.table`. The comma-separated branch names are processed in
+order, empty entries are skipped, and leading and trailing spaces are
+preserved. Missing branches are ignored. Names must pass the Core name validator;
+`main` and branches configured by `scan.primary-branch` or `scan.fallback-branch`
+cannot be deleted. Unset the corresponding option before deleting such a branch.
+
+REST tables require a main-branch source table and delete branches through the
+catalog without writing table storage. Filesystem-managed tables use Core's
+branch manager. The operation returns one row with `result = 'OK'`. A validation
+or catalog/storage error stops the batch; earlier deletions are not rolled back.
+
+### fast_forward
+
+Fast-forward the main branch to a branch:
+
+```sql
+CALL sys.fast_forward(table => 'paimon.my_db.my_table', branch => 'release_branch');
+```
+
+`table` and `branch` are required. `table` accepts `database.table` or
+`catalog.database.table`. Only tables managed by a REST catalog are supported:
+the REST server performs the fast-forward, and the procedure does not write
+table storage itself. Filesystem-managed tables are rejected. The `table`
+argument must resolve to the main branch, and the branch name must pass the Core
+name validator, so `main` is rejected. A missing branch returns an error. Success
+returns one row with `result = 'OK'`.
 
 ### create_tag
 
