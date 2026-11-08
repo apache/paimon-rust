@@ -714,6 +714,141 @@ async fn test_replace_tag_rejected_on_rest_catalog_without_changing_metadata() {
     }
 }
 
+/// Register a schema-bearing REST table and seed an unreadable storage tag file.
+/// The file must stay untouched: REST tag procedures may not read or write `tag/`.
+fn add_table_with_storage_tag(
+    tmp: &tempfile::TempDir,
+    server: &RESTServer,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    let path = format!("file://{}/{DATABASE}.db/{TABLE}", tmp.path().display());
+    server.add_table_with_schema(DATABASE, TABLE, schema, &path);
+    let tag_dir = tmp.path().join(format!("{DATABASE}.db/{TABLE}/tag"));
+    std::fs::create_dir_all(&tag_dir).unwrap();
+    let tag_path = tag_dir.join("tag-release");
+    std::fs::write(&tag_path, b"{").unwrap();
+    (tag_dir, tag_path)
+}
+
+async fn rest_catalog(server: &RESTServer) -> RESTCatalog {
+    let mut options = Options::new();
+    options.set(CatalogOptions::URI, server.url().unwrap());
+    options.set(CatalogOptions::WAREHOUSE, WAREHOUSE);
+    options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+    options.set(CatalogOptions::TOKEN, "test-token");
+    RESTCatalog::new(options, true).await.unwrap()
+}
+
+#[tokio::test]
+async fn test_create_and_delete_tag_go_through_rest_catalog() {
+    use paimon::catalog::Identifier;
+    use paimon::Catalog;
+
+    let (tmp, server, context) = setup().await;
+    let (tag_dir, tag_path) = add_table_with_storage_tag(&tmp, &server);
+    let catalog = rest_catalog(&server).await;
+    let identifier = Identifier::new(DATABASE, TABLE);
+    let assert_storage_unchanged = || {
+        assert_eq!(std::fs::read(&tag_path).unwrap(), b"{");
+        assert_eq!(std::fs::read_dir(&tag_dir).unwrap().count(), 1);
+    };
+
+    // The storage tag file must not make the catalog tag look like it exists.
+    assert_ok_row(
+        &context,
+        &format!(
+            "CALL sys.create_tag(table => '{DATABASE}.{TABLE}', tag => 'release', time_retained => '1d')"
+        ),
+    )
+    .await;
+    let tag = catalog.get_tag(&identifier, "release").await.unwrap();
+    assert_eq!(tag.snapshot.id(), 1);
+    assert_eq!(tag.tag_time_retained.as_deref(), Some("1d"));
+    assert_storage_unchanged();
+
+    assert_ok_row(
+        &context,
+        &format!(
+            "CALL sys.create_tag(table => '{DATABASE}.{TABLE}', tag => 'pinned', snapshot_id => 1)"
+        ),
+    )
+    .await;
+    assert_eq!(
+        catalog
+            .get_tag(&identifier, "pinned")
+            .await
+            .unwrap()
+            .snapshot
+            .id(),
+        1
+    );
+    assert_storage_unchanged();
+
+    common::assert_sql_error(
+        &context,
+        &format!("CALL sys.create_tag(table => '{DATABASE}.{TABLE}', tag => 'release')"),
+        "Tag 'release' already exists",
+    )
+    .await;
+    // The mock catalog only knows snapshot 1.
+    common::assert_sql_error(
+        &context,
+        &format!(
+            "CALL sys.create_tag(table => '{DATABASE}.{TABLE}', tag => 'other', snapshot_id => 2)"
+        ),
+        "Snapshot 2 does not exist",
+    )
+    .await;
+    assert!(matches!(
+        catalog.get_tag(&identifier, "other").await,
+        Err(paimon::Error::TagNotExist { .. })
+    ));
+
+    // A tag missing from the catalog is skipped, as on filesystem tables.
+    assert_ok_row(
+        &context,
+        &format!(
+            "CALL sys.delete_tag(table => '{DATABASE}.{TABLE}', tag => 'release, missing,pinned')"
+        ),
+    )
+    .await;
+    for tag in ["release", "pinned"] {
+        assert!(matches!(
+            catalog.get_tag(&identifier, tag).await,
+            Err(paimon::Error::TagNotExist { .. })
+        ));
+    }
+    assert_storage_unchanged();
+}
+
+#[tokio::test]
+async fn test_storage_only_tag_procedures_rejected_on_rest_catalog() {
+    let (tmp, server, context) = setup().await;
+    let (tag_dir, tag_path) = add_table_with_storage_tag(&tmp, &server);
+
+    for (sql, message) in [
+        (
+            format!("CALL sys.rename_tag(table => '{DATABASE}.{TABLE}', tag => 'release', target_tag => 'renamed')"),
+            "rename_tag is not supported for tables managed by a REST catalog",
+        ),
+        (
+            format!("CALL sys.create_tag_from_timestamp(table => '{DATABASE}.{TABLE}', tag => 'at', timestamp => 0)"),
+            "create_tag_from_timestamp is not supported for tables managed by a REST catalog",
+        ),
+        (
+            format!("CALL sys.rollback_to_timestamp(table => '{DATABASE}.{TABLE}', timestamp => 0)"),
+            "rollback_to_timestamp is not supported for tables managed by a REST catalog",
+        ),
+    ] {
+        common::assert_sql_error(&context, &sql, message).await;
+        assert_eq!(std::fs::read(&tag_path).unwrap(), b"{");
+        assert_eq!(std::fs::read_dir(&tag_dir).unwrap().count(), 1);
+    }
+}
+
 #[tokio::test]
 async fn test_create_branch_rejects_rest_tables_even_when_target_exists() {
     let (tmp, server, context) = setup().await;

@@ -668,6 +668,28 @@ async fn proc_create_tag(
         .transpose()?;
     let time_retained = args.get("time_retained").map(String::as_str);
 
+    // A REST catalog owns tag and snapshot metadata. Writing `tag/tag-<name>`
+    // to storage would leave a tag the catalog never sees, so create it through
+    // the catalog, which also resolves the snapshot (latest when unspecified).
+    if let Some(rest_env) = table.rest_env() {
+        return match catalog
+            .create_tag_with_retention(
+                rest_env.identifier(),
+                tag_name,
+                snapshot_id,
+                time_retained,
+                false,
+            )
+            .await
+        {
+            Ok(()) => ok_result(ctx),
+            Err(paimon::Error::TagAlreadyExist { .. }) => Err(DataFusionError::Plan(format!(
+                "Tag '{tag_name}' already exists"
+            ))),
+            Err(error) => Err(to_datafusion_error(error)),
+        };
+    }
+
     let (sm, tm) = managers(&table);
     if tm.tag_exists(tag_name).await.map_err(to_datafusion_error)? {
         return Err(DataFusionError::Plan(format!(
@@ -897,6 +919,22 @@ async fn proc_delete_tag(
     let table = get_table(catalog, catalog_name, args).await?;
     let tag_str = require_arg(args, "tag")?;
 
+    // A REST catalog owns tag metadata: delete through the catalog so it stops
+    // listing the tag. A missing tag stays a no-op, as on filesystem tables.
+    if let Some(rest_env) = table.rest_env() {
+        for tag_name in tag_str.split(',') {
+            let tag_name = tag_name.trim();
+            if tag_name.is_empty() {
+                continue;
+            }
+            catalog
+                .delete_tag(rest_env.identifier(), tag_name, true)
+                .await
+                .map_err(to_datafusion_error)?;
+        }
+        return ok_result(ctx);
+    }
+
     let (_, tm) = managers(&table);
     for tag_name in tag_str.split(',') {
         let tag_name = tag_name.trim();
@@ -920,6 +958,14 @@ async fn proc_rename_tag(
     let table = get_table(catalog, catalog_name, args).await?;
     let tag_name = require_arg(args, "tag")?;
     let target_tag_name = require_arg(args, "target_tag")?;
+
+    // The REST API has no rename-tag endpoint. Renaming the storage files would
+    // leave the catalog listing the old name, so refuse like `rename_branch`.
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "rename_tag is not supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
 
     let (_, tm) = managers(&table);
     tm.rename(tag_name, target_tag_name)
@@ -1063,27 +1109,22 @@ async fn proc_rollback_to_timestamp(
         .parse()
         .map_err(|_| DataFusionError::Plan(format!("Invalid timestamp: '{ts_str}'")))?;
 
+    // REST snapshots may exist only in the catalog; storage listings cannot
+    // enumerate the authoritative history needed to pick the rollback target.
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "rollback_to_timestamp is not supported for tables managed by a REST catalog"
+                .to_string(),
+        ));
+    }
+
     let (sm, tm) = managers(&table);
     let snapshot = earlier_or_equal_from_all(&sm, &tm, timestamp)
         .await?
         .ok_or_else(|| {
             DataFusionError::Plan(format!("No snapshot found with commit time <= {timestamp}"))
         })?;
-
-    if let Some(rest_env) = table.rest_env() {
-        rest_env
-            .api()
-            .rollback_to(
-                rest_env.identifier(),
-                &paimon::table::Instant::snapshot(snapshot.id()),
-                None,
-                Some(rest_env.uuid()),
-            )
-            .await
-            .map_err(to_datafusion_error)?;
-    } else {
-        clean_larger_than(&sm, &tm, snapshot.id()).await?;
-    }
+    clean_larger_than(&sm, &tm, snapshot.id()).await?;
     ok_result(ctx)
 }
 
@@ -1099,6 +1140,15 @@ async fn proc_create_tag_from_timestamp(
     let timestamp: i64 = ts_str
         .parse()
         .map_err(|_| DataFusionError::Plan(format!("Invalid timestamp: '{ts_str}'")))?;
+
+    // Same as `create_tag_from_watermark`: the snapshot would be picked from
+    // storage listings and the tag written to storage, bypassing the catalog.
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "create_tag_from_timestamp is not supported for tables managed by a REST catalog"
+                .to_string(),
+        ));
+    }
 
     let (sm, tm) = managers(&table);
     let snapshot = later_or_equal_from_all(&sm, &tm, timestamp)

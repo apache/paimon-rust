@@ -1422,6 +1422,9 @@ the tag file. For example, `'1d'` appears as `PT24H` in the `time_retained` colu
 of `$tags`. Omitting `time_retained` creates a tag without these metadata fields.
 This procedure does not automatically delete expired tags.
 
+For tables managed by a REST catalog, the tag is created through the catalog,
+which also resolves the snapshot; the table's storage is not modified.
+
 ### replace_tag
 
 Replace an existing manual tag's snapshot and retention without changing its name:
@@ -1471,6 +1474,9 @@ Create a named tag from an epoch timestamp in milliseconds (finds the earliest r
 CALL sys.create_tag_from_timestamp(table => 'paimon.my_db.my_table', tag => 'my_tag', timestamp => 1234567890000);
 ```
 
+This procedure is not supported for tables managed by a REST catalog, for the
+same reason as `create_tag_from_watermark`.
+
 ### create_tag_from_watermark
 
 This procedure is not supported for tables managed by a REST catalog. Their
@@ -1512,6 +1518,20 @@ Delete a named tag:
 CALL sys.delete_tag(table => 'paimon.my_db.my_table', tag => 'my_tag');
 ```
 
+`tag` may list several comma-separated names; missing tags are skipped. For
+tables managed by a REST catalog, tags are deleted through the catalog.
+
+### rename_tag
+
+Rename a tag:
+
+```sql
+CALL sys.rename_tag(table => 'paimon.my_db.my_table', tag => 'my_tag', target_tag => 'new_tag');
+```
+
+This procedure is not supported for tables managed by a REST catalog, which has
+no rename-tag endpoint.
+
 ### rollback_to
 
 Rollback a table to a specific snapshot or tag:
@@ -1531,6 +1551,10 @@ Rollback a table to an epoch timestamp in milliseconds (selects the latest retai
 ```sql
 CALL sys.rollback_to_timestamp(table => 'paimon.my_db.my_table', timestamp => 1234567890000);
 ```
+
+This procedure is not supported for tables managed by a REST catalog: their
+snapshots may exist only in the catalog, so the target cannot be chosen from
+storage listings. Use `rollback_to` with a snapshot ID or tag instead.
 
 Both timestamp procedures take epoch milliseconds. The `$snapshots.commit_time`
 column is a local `TIMESTAMP`; its raw Arrow value includes the local timezone
