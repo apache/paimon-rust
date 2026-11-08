@@ -80,16 +80,18 @@ async fn live_files_by_reader(
     })
 }
 
-/// Assert that the last commit changed neither reader's live files except by
-/// adding `unrelated.parquet`.
-async fn assert_only_unrelated_added(
+/// Assert that the scan lists `expected[0]` and the ordered reader
+/// `expected[1]`, each with `unrelated.parquet` added.
+async fn assert_live_files_plus_unrelated(
     commit: &TableCommit,
     io: &FileIO,
     path: &str,
-    before: [Vec<(String, i32)>; 2],
+    expected: [Vec<(String, i32)>; 2],
 ) {
-    let after = live_files_by_reader(commit, io, path).await;
-    for ((mut expected, actual), reader) in before.into_iter().zip(after).zip(["scan", "ordered"]) {
+    let actual = live_files_by_reader(commit, io, path).await;
+    for ((mut expected, actual), reader) in
+        expected.into_iter().zip(actual).zip(["scan", "ordered"])
+    {
         expected.push(("unrelated.parquet".to_string(), 0));
         expected.sort();
         assert_eq!(actual, expected, "{reader} reader");
@@ -268,7 +270,7 @@ async fn merging_an_add_with_its_delete_keeps_the_delete_of_a_re_added_file() {
         .await
         .unwrap();
 
-    assert_only_unrelated_added(&commit, &io, path, before).await;
+    assert_live_files_plus_unrelated(&commit, &io, path, before).await;
     let base = base_manifests(&io, path).await;
     let names = base
         .iter()
@@ -319,7 +321,7 @@ async fn merging_a_repeated_add_with_its_delete_keeps_the_first_add_deleted() {
         .await
         .unwrap();
 
-    assert_only_unrelated_added(&commit, &io, path, before).await;
+    assert_live_files_plus_unrelated(&commit, &io, path, before).await;
     let base = base_manifests(&io, path).await;
     assert_eq!(base.len(), 2);
     assert_eq!(base[0].file_name(), first.file_name());
@@ -484,20 +486,14 @@ async fn partition_filtered_scan_sees_a_merged_delete() {
 }
 
 #[tokio::test]
-async fn group_that_adds_a_file_twice_stays_unmerged() {
+async fn group_that_adds_a_file_twice_without_deleting_it_stays_unmerged() {
     // Failing here would fail this commit and every later one.
     let io = test_file_io();
     let path = "memory:/manifest-merge-add-twice";
     setup_dirs(&io, path).await;
     let commit = merge_table(&io, path, &[("manifest.merge-min-count", "3")]);
-    let mut deletion = CommitMessage::new(vec![], 0, vec![]);
-    deletion.deleted_files.push(test_data_file("x.parquet", 10));
-    for message in [
-        append_message("x.parquet"),
-        deletion,
-        append_message("x.parquet"),
-    ] {
-        commit.commit(vec![message]).await.unwrap();
+    for name in ["x.parquet", "x.parquet", "z.parquet"] {
+        commit.commit(vec![append_message(name)]).await.unwrap();
     }
     let mut previous = base_manifests(&io, path).await;
     previous.extend(delta_manifests(&io, path).await);
@@ -513,27 +509,77 @@ async fn group_that_adds_a_file_twice_stays_unmerged() {
 }
 
 #[tokio::test]
-async fn group_that_re_adds_a_file_it_deletes_stays_unmerged() {
-    // Merging would drop the ADD that follows the DELETE, and the ordered
-    // reader would stop listing old.parquet.
+async fn group_that_re_adds_a_file_it_deletes_drops_the_re_add() {
+    // [DELETE old, ADD old] merges to [DELETE old]. Scans already treat
+    // old.parquet as deleted, and the ordered reader then agrees with them.
     let io = test_file_io();
     let path = "memory:/manifest-merge-re-add";
     setup_dirs(&io, path).await;
     let mut commit = merge_table(&io, path, &[("manifest.merge-min-count", "2")]);
     let re_add = replacement_message(&[], "old.parquet");
-    let previous = commit_retained_deletion_replacement(&io, path, &mut commit, &[], re_add).await;
-    let [retained, deletion, re_add] = &previous;
+    let [retained, deletion, re_add] =
+        commit_retained_deletion_replacement(&io, path, &mut commit, &[], re_add).await;
     commit.manifest_target_size = deletion.file_size() + re_add.file_size() + 1;
     assert!(retained.file_size() >= commit.manifest_target_size);
-    let mut live = active_names(&io, path).await;
+    let [scanned, listed] = live_files_by_reader(&commit, &io, path).await;
+    let old = ("old.parquet".to_string(), 0);
+    assert!(!scanned.contains(&old) && listed.contains(&old));
 
     commit
         .commit(vec![append_message("unrelated.parquet")])
         .await
         .unwrap();
-    assert_eq!(base_manifests(&io, path).await, previous);
-    live.insert("unrelated.parquet".into());
-    assert_eq!(active_names(&io, path).await, live);
+    assert_live_files_plus_unrelated(&commit, &io, path, [scanned.clone(), scanned]).await;
+    let base = base_manifests(&io, path).await;
+    assert_eq!(base.len(), 2);
+    assert_eq!(base[0].file_name(), retained.file_name());
+    assert_eq!(
+        (base[1].num_added_files(), base[1].num_deleted_files()),
+        (0, 1)
+    );
+}
+
+#[tokio::test]
+async fn re_added_file_does_not_keep_later_groups_unmerged() {
+    // After [ADD x, DELETE x] merges to [DELETE x], each trailing group holds
+    // that DELETE. A group holding it and the re-ADD of x must still merge,
+    // or the base list grows by one manifest per commit.
+    let io = test_file_io();
+    let path = "memory:/manifest-merge-re-add-growth";
+    setup_dirs(&io, path).await;
+    let commit = merge_table(&io, path, &[("manifest.merge-min-count", "2")]);
+    let mut deletion = CommitMessage::new(vec![], 0, vec![]);
+    deletion.deleted_files.push(test_data_file("x.parquet", 10));
+    for message in [
+        append_message("x.parquet"),
+        deletion,
+        append_message("y.parquet"),
+        append_message("x.parquet"),
+    ] {
+        commit.commit(vec![message]).await.unwrap();
+        assert!(base_manifests(&io, path).await.len() <= 1);
+    }
+    // Scans treat the re-added x.parquet as deleted. The ordered reader lists
+    // it until a merge drops the re-ADD.
+    let [mut scanned, listed] = live_files_by_reader(&commit, &io, path).await;
+    let (x, y) = (("x.parquet".to_string(), 0), ("y.parquet".to_string(), 0));
+    assert_eq!(scanned, std::slice::from_ref(&y));
+    assert_eq!(listed, [x, y]);
+
+    for id in 0..12 {
+        let name = format!("data-{id}.parquet");
+        commit.commit(vec![append_message(&name)]).await.unwrap();
+        let base = base_manifests(&io, path).await;
+        assert!(base.len() <= 1, "commit {id}: {base:?}");
+        scanned.push((name, 0));
+        scanned.sort();
+        let expected = [scanned.clone(), scanned.clone()];
+        assert_eq!(
+            live_files_by_reader(&commit, &io, path).await,
+            expected,
+            "commit {id}"
+        );
+    }
 }
 
 /// Rewrite a manifest as a newer writer with one more `_FILE` field would.

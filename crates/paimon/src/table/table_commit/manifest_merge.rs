@@ -17,13 +17,15 @@
 
 //! Commit-time manifest merging, ported from Java `ManifestFileLegacyMerger`.
 //!
-//! A minor merge drops an ADD whose file the same group deletes but keeps the
-//! DELETE, where Java drops both: Rust commits can add a file more than once,
-//! and an ADD of that file outside the group would otherwise become live.
-//! Scans, which ignore entry order, and the ordered `merge_active_entries` see
-//! the same live files before and after a minor merge. A full compaction drops
-//! every DELETE and, like Java, relies on partition statistics to find the
-//! manifests that may hold the ADD of a deleted file.
+//! A minor merge drops every ADD of a file that the same group deletes but
+//! keeps one DELETE, where Java drops both: Rust commits can add a file more
+//! than once, and an ADD of that file outside the group would otherwise become
+//! live. Scans, which ignore entry order, see the same live files before and
+//! after a minor merge. The ordered `merge_active_entries` does too, unless the
+//! group adds a file again after deleting it; it can then stop listing that
+//! file, which scans already treat as deleted. A full compaction drops every
+//! DELETE and, like Java, relies on partition statistics to find the manifests
+//! that may hold the ADD of a deleted file.
 
 use super::*;
 use crate::spec::avro::from_avro_bytes_fast;
@@ -117,8 +119,8 @@ impl TableCommit {
     /// of a deleted file, dropping every DELETE entry and those ADDs. Like
     /// Java, it finds those manifests through partition statistics; when the
     /// statistics are correct, scans see the same live files afterwards. The
-    /// ordered reader stops listing a deleted file whose ADD comes after its
-    /// last DELETE; scans already treat that file as deleted.
+    /// ordered reader stops listing a deleted file with an ADD after its last
+    /// DELETE; scans already treat that file as deleted.
     async fn try_full_compaction(
         &self,
         input: &[ManifestFileMeta],
@@ -239,8 +241,8 @@ impl TableCommit {
     /// Read the manifests to merge and return the ADDs to rewrite; no DELETE
     /// entry is rewritten. A manifest that neither must change nor holds a
     /// deleted ADD is kept in `result`. Returns `None`, before anything is
-    /// written, when one of them is not rewritable, adds a deleted file a
-    /// second time, or holds a DELETE that `read_deleted_entries` did not see.
+    /// written, when one of them is not rewritable or holds a DELETE that
+    /// `read_deleted_entries` did not see.
     async fn rewrite_entries(
         &self,
         to_be_merged: &[ManifestFileMeta],
@@ -256,7 +258,6 @@ impl TableCommit {
             config.read_parallelism,
         ));
         let mut kept = Vec::new();
-        let mut matched = HashSet::new();
         let mut rewritten = Vec::new();
         for manifest in to_be_merged {
             let content =
@@ -267,8 +268,7 @@ impl TableCommit {
                         message: format!("manifest '{}' was not read", manifest.file_name()),
                         source: None,
                     })?;
-            let Some((require_change, adds)) =
-                classify_entries(manifest, content, deleted, &mut matched, config)
+            let Some((require_change, adds)) = classify_entries(manifest, content, deleted, config)
             else {
                 return Ok(None);
             };
@@ -320,7 +320,7 @@ impl TableCommit {
         }
         let Some(merged) = merge_group_entries(entries) else {
             log::warn!(
-                "Keeping manifests {:?} unmerged: they add a file that is already added or deleted among them",
+                "Keeping manifests {:?} unmerged: they add a file twice without deleting it",
                 names()
             );
             return Ok(candidates);
@@ -352,7 +352,6 @@ fn classify_entries(
     manifest: &ManifestFileMeta,
     content: ManifestContents,
     deleted: &HashSet<Identifier>,
-    matched: &mut HashSet<Identifier>,
     config: &MergeConfig,
 ) -> Option<(bool, Vec<ManifestEntry>)> {
     if !content.rewritable {
@@ -367,18 +366,9 @@ fn classify_entries(
     for entry in content.entries {
         let identifier = entry.identifier();
         match *entry.kind() {
-            FileKind::Add if deleted.contains(&identifier) => {
-                // [ADD x, DELETE x, ADD x] leaves x live for an ordered
-                // reader; dropping every ADD of x would remove it.
-                if !matched.insert(identifier) {
-                    log::warn!(
-                        "Skipping manifest full compaction: {} adds a deleted file that is already added",
-                        manifest.file_name()
-                    );
-                    return None;
-                }
-                require_change = true;
-            }
+            // Every ADD of a deleted file is dropped, including one that
+            // follows its DELETE.
+            FileKind::Add if deleted.contains(&identifier) => require_change = true,
             FileKind::Add => adds.push(entry),
             // Only an understated `num_deleted_files` hides a DELETE from
             // `read_deleted_entries`; a rewrite would drop it but keep its
@@ -479,45 +469,48 @@ fn schema_known(writer: &FieldSchema, known: &FieldSchema) -> bool {
     }
 }
 
-/// Merge one group of manifest entries, keeping their order. An ADD of a file
-/// that the group also deletes is dropped, and each deleted file keeps one
-/// DELETE. Java `FileEntry.mergeEntries` drops that DELETE too, but then an ADD
-/// of the same file outside the group would become live. The set of deleted
-/// files does not change, so the scan's order-independent result stays the
-/// same for any group.
+/// Merge one group of manifest entries, keeping their order. Every ADD of a
+/// file that the group deletes is dropped, wherever it is, and each deleted
+/// file keeps one DELETE. Java `FileEntry.mergeEntries` drops that DELETE too,
+/// but then an ADD of the same file outside the group would become live. The
+/// set of deleted files does not change, so the scan's order-independent
+/// result stays the same for any group.
 ///
-/// Returns `None` when the group adds a file that it already adds or deletes;
-/// the caller keeps such a group unmerged. For every other group the ordered
-/// result of `merge_active_entries` stays the same too.
+/// The ordered result of `merge_active_entries` stays the same when each
+/// deleted file's ADDs in the group come before its first DELETE in the group.
+/// For a file added again after its DELETE, the ordered reader can stop listing
+/// it, as scans already do.
+///
+/// Returns `None` when the group adds a file twice without deleting it; the
+/// caller keeps such a group unmerged.
 fn merge_group_entries(entries: Vec<ManifestEntry>) -> Option<Vec<ManifestEntry>> {
     let identifiers = entries
         .iter()
         .map(ManifestEntry::identifier)
         .collect::<Vec<_>>();
-    let mut added = HashSet::new();
-    let mut deleted = HashSet::new();
-    for (entry, identifier) in entries.iter().zip(&identifiers) {
-        match entry.kind() {
-            FileKind::Add => {
-                if deleted.contains(identifier) || !added.insert(identifier) {
-                    return None;
-                }
-            }
-            FileKind::Delete => {
-                deleted.insert(identifier);
-            }
-        }
-    }
-    let mut emitted_deletes = HashSet::new();
-    let keep = entries
+    let deleted = entries
         .iter()
         .zip(&identifiers)
-        .map(|(entry, identifier)| match entry.kind() {
-            FileKind::Add => !deleted.contains(identifier),
+        .filter(|(entry, _)| *entry.kind() == FileKind::Delete)
+        .map(|(_, identifier)| identifier)
+        .collect::<HashSet<_>>();
+    let mut added = HashSet::new();
+    let mut emitted_deletes = HashSet::new();
+    let mut keep = Vec::with_capacity(entries.len());
+    for (entry, identifier) in entries.iter().zip(&identifiers) {
+        keep.push(match entry.kind() {
+            FileKind::Add if deleted.contains(identifier) => false,
+            FileKind::Add => {
+                // Scans return both ADDs; dropping either would change that.
+                if !added.insert(identifier) {
+                    return None;
+                }
+                true
+            }
             // A repeated DELETE removes nothing more; keep one.
             FileKind::Delete => emitted_deletes.insert(identifier),
-        })
-        .collect::<Vec<_>>();
+        });
+    }
     Some(
         entries
             .into_iter()
@@ -634,11 +627,22 @@ mod tests {
     }
 
     #[test]
-    fn group_that_adds_a_file_again_is_not_merged() {
+    fn group_that_adds_a_file_twice_without_deleting_it_is_not_merged() {
+        let entries = vec![entry(FileKind::Add, "x", 0), entry(FileKind::Add, "x", 0)];
+        assert!(merge_group_entries(entries).is_none());
+    }
+
+    #[test]
+    fn every_add_of_a_deleted_file_is_dropped_whatever_the_order() {
         use FileKind::{Add, Delete};
-        for kinds in [vec![Add, Add], vec![Add, Delete, Add], vec![Delete, Add]] {
+        for kinds in [
+            vec![Add, Delete, Add],
+            vec![Delete, Add],
+            vec![Add, Add, Delete],
+        ] {
             let entries = kinds.iter().map(|kind| entry(*kind, "x", 0)).collect();
-            assert!(merge_group_entries(entries).is_none(), "{kinds:?}");
+            let merged = merge_group_entries(entries).expect("merged");
+            assert_eq!(keys(&merged), [(Delete, "x", 0)], "{kinds:?}");
         }
     }
 

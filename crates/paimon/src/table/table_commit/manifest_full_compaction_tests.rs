@@ -112,18 +112,12 @@ async fn full_compaction_drops_deletes_whose_add_is_gone() {
         .await
         .unwrap();
 
-    assert_only_unrelated_added(&merger, &io, path, before).await;
+    assert_live_files_plus_unrelated(&merger, &io, path, before).await;
     let base = base_manifests(&io, path).await;
-    for manifest in &base {
-        assert_ne!(manifest.file_name(), lone_delete.file_name());
-        let manifest_path = format!("{path}/manifest/{}", manifest.file_name());
-        let entries = Manifest::read(&io, &manifest_path).await.unwrap();
-        assert!(
-            entries.iter().all(|entry| *entry.kind() == FileKind::Add),
-            "{}",
-            manifest.file_name()
-        );
-    }
+    assert!(base
+        .iter()
+        .all(|m| m.file_name() != lone_delete.file_name()));
+    assert_no_delete_entries(&io, path, &base).await;
 }
 
 #[tokio::test]
@@ -180,27 +174,26 @@ async fn full_compaction_skips_a_manifest_with_an_unknown_field() {
 }
 
 #[tokio::test]
-async fn full_compaction_keeps_manifests_that_re_add_a_deleted_file() {
-    // An ordered reader keeps x live after [ADD x, DELETE x, ADD x]; dropping
-    // every ADD of a deleted file would remove it.
+async fn full_compaction_drops_a_deleted_file_that_was_added_again() {
+    // After [ADD x, DELETE x, ADD x] scans treat x as deleted and the ordered
+    // reader lists it. Full compaction drops every ADD of x, so both readers
+    // then list what the scan listed.
     let io = test_file_io();
     let path = "memory:/manifest-full-compaction-re-add";
     setup_dirs(&io, path).await;
-    // The default threshold keeps these commits from compacting the first
-    // ADD and DELETE away.
+    // The default threshold and a min-count of 1000 keep these commits from
+    // merging.
     let writer = merge_table(&io, path, &[("manifest.merge-min-count", "1000")]);
+    let first = ["x.parquet", "w.parquet"].map(|name| test_data_file(name, 10));
     let mut deletion = CommitMessage::new(vec![], 0, vec![]);
     deletion.deleted_files.push(test_data_file("x.parquet", 10));
     for message in [
-        append_message("x.parquet"),
+        CommitMessage::new(vec![], 0, first.to_vec()),
         deletion,
         append_message("x.parquet"),
     ] {
         writer.commit(vec![message]).await.unwrap();
     }
-    let mut previous = base_manifests(&io, path).await;
-    previous.extend(delta_manifests(&io, path).await);
-    assert_eq!(previous.len(), 3);
 
     let merger = merge_table(
         &io,
@@ -210,15 +203,78 @@ async fn full_compaction_keeps_manifests_that_re_add_a_deleted_file() {
             ("manifest.full-compaction-threshold-size", "1 b"),
         ],
     );
+    let [scanned, listed] = live_files_by_reader(&merger, &io, path).await;
+    let x = ("x.parquet".to_string(), 0);
+    assert!(!scanned.contains(&x) && listed.contains(&x));
     merger
-        .commit(vec![append_message("y.parquet")])
+        .commit(vec![append_message("unrelated.parquet")])
         .await
         .unwrap();
-    assert_eq!(base_manifests(&io, path).await, previous);
-    assert_eq!(
-        active_names(&io, path).await,
-        HashSet::from(["x.parquet".to_string(), "y.parquet".to_string()])
+
+    assert_live_files_plus_unrelated(&merger, &io, path, [scanned.clone(), scanned]).await;
+    assert_no_delete_entries(&io, path, &base_manifests(&io, path).await).await;
+}
+
+/// Assert that none of `manifests` holds a DELETE entry.
+async fn assert_no_delete_entries(io: &FileIO, path: &str, manifests: &[ManifestFileMeta]) {
+    for manifest in manifests {
+        let manifest_path = format!("{path}/manifest/{}", manifest.file_name());
+        let entries = Manifest::read(io, &manifest_path).await.unwrap();
+        assert!(
+            entries.iter().all(|entry| *entry.kind() == FileKind::Add),
+            "{}",
+            manifest.file_name()
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_compaction_does_not_read_manifests_outside_deleted_partitions() {
+    let io = test_file_io();
+    let path = "memory:/manifest-full-compaction-partition-pruning";
+    setup_dirs(&io, path).await;
+    // A one-byte target keeps minor merging idle, and only the manifest
+    // holding the DELETE must change.
+    let writer = partitioned_merge_table(&io, path, &[("manifest.target-file-size", "1 b")]);
+    let (a, b) = (partition_bytes("a"), partition_bytes("b"));
+    let x = test_data_file("x.parquet", 1);
+    let mut deletion = CommitMessage::new(a.clone(), 0, vec![]);
+    deletion.deleted_files.push(x.clone());
+    for message in [
+        CommitMessage::new(b, 0, vec![test_data_file("b.parquet", 1)]),
+        CommitMessage::new(a, 0, vec![x, test_data_file("z.parquet", 1)]),
+        deletion,
+    ] {
+        writer.commit(vec![message]).await.unwrap();
+    }
+    let mut input = base_manifests(&io, path).await;
+    input.extend(delta_manifests(&io, path).await);
+    let in_b = input[0].clone();
+    assert_eq!((in_b.num_added_files(), in_b.num_deleted_files()), (1, 0));
+    // Partition statistics show that in_b holds no file of partition a.
+    // Deleting it makes any read of it fail.
+    io.delete_file(&format!("{path}/manifest/{}", in_b.file_name()))
+        .await
+        .unwrap();
+
+    let merger = partitioned_merge_table(
+        &io,
+        path,
+        &[
+            ("manifest.target-file-size", "1 b"),
+            ("manifest.full-compaction-threshold-size", "1 b"),
+        ],
     );
+    let mut created = Vec::new();
+    let merged = merger.merge_manifests(input, &mut created).await.unwrap();
+    assert!(!created.is_empty());
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged[0].file_name(), in_b.file_name());
+    assert_eq!(
+        (merged[1].num_added_files(), merged[1].num_deleted_files()),
+        (1, 0)
+    );
+    assert_no_delete_entries(&io, path, &merged[1..]).await;
 }
 
 #[tokio::test]
