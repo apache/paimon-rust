@@ -18,11 +18,12 @@
 //! Commit-time manifest merging, ported from Java `ManifestFileLegacyMerger`.
 //!
 //! A minor merge drops every ADD of a file that the same group deletes but
-//! keeps one DELETE, where Java drops both: Rust commits can add a file more
-//! than once, and an ADD of that file outside the group would otherwise become
-//! live. Scans, which ignore entry order, see the same live files before and
-//! after a minor merge. The ordered `merge_active_entries` does too, unless the
-//! group adds a file again after deleting it; it can then stop listing that
+//! keeps one DELETE. Java `FileEntry.mergeEntries` drops both when the ADD comes
+//! first, and throws when an ADD follows the DELETE. Rust commits can add a file
+//! more than once, and an ADD of that file outside the group would otherwise
+//! become live. Scans, which ignore entry order, see the same live files before
+//! and after a minor merge. The ordered `merge_active_entries` does too, unless
+//! the group adds a file again after deleting it; it can then stop listing that
 //! file, which scans already treat as deleted. A full compaction drops every
 //! DELETE and, like Java, relies on partition statistics to find the manifests
 //! that may hold the ADD of a deleted file.
@@ -471,10 +472,11 @@ fn schema_known(writer: &FieldSchema, known: &FieldSchema) -> bool {
 
 /// Merge one group of manifest entries, keeping their order. Every ADD of a
 /// file that the group deletes is dropped, wherever it is, and each deleted
-/// file keeps one DELETE. Java `FileEntry.mergeEntries` drops that DELETE too,
-/// but then an ADD of the same file outside the group would become live. The
-/// set of deleted files does not change, so the scan's order-independent
-/// result stays the same for any group.
+/// file keeps one DELETE. For an ADD before its DELETE, Java
+/// `FileEntry.mergeEntries` drops that DELETE too, but then an ADD of the same
+/// file outside the group would become live. For an ADD after its DELETE, Java
+/// throws. The set of deleted files does not change, so the scan's
+/// order-independent result stays the same for any group.
 ///
 /// The ordered result of `merge_active_entries` stays the same when each
 /// deleted file's ADDs in the group come before its first DELETE in the group.

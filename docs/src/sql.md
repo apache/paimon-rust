@@ -3528,9 +3528,8 @@ base manifest list. The rules follow Java Paimon's full-entry merger
 group until their total size reaches `manifest.target-file-size`; the last group
 is merged only if it has at least `manifest.merge-min-count` manifests. In a
 merged group, every ADD of a file that the group deletes is dropped, and one
-DELETE of the file is kept. A file that is added again after its DELETE is
-treated as deleted, as scans already do. When the manifests that must change
-(those with deleted files or smaller than the target size) add up to
+DELETE of the file is kept. When the manifests that must change (those with
+deleted files or smaller than the target size) add up to
 `manifest.full-compaction-threshold-size`, the commit runs a full compaction
 instead. It rewrites the manifests that must change or hold a deleted file,
 keeps the others, and drops every DELETE entry and every ADD of a deleted file.
@@ -3538,6 +3537,16 @@ Like Java, it uses partition statistics to find the manifests that may hold a
 deleted file, so it relies on those statistics being correct. When fewer than
 two manifests qualify, or a check below fails, the commit runs the minor merge
 instead.
+
+A file can be added again after it was deleted. Scans treat such a file as
+deleted. The ordered snapshot listing does too once a minor merge puts the
+DELETE and the new ADD in one group, or a full compaction runs. Until then, Java
+operations that replay manifest entries in order can reject the snapshot. These
+are Java's legacy manifest merger with `manifest.merge-optimize.enabled=false`,
+rollback to a snapshot, branch merge, and tag-aware file cleanup during snapshot
+expiry, which then skips cleaning. Java scans, conflict checks and the default
+block merger are not affected. Tables that never add a file again after deleting
+it do not reach this state.
 
 DELETE entries kept by minor merges stay until a full compaction removes them,
 so they grow with every delete. Scans and commits read them. A lower
