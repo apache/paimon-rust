@@ -3527,27 +3527,31 @@ base manifest list. The rules follow Java Paimon's full-entry merger
 (`ManifestFileLegacyMerger`). In a minor merge, consecutive manifests form a
 group until their total size reaches `manifest.target-file-size`; the last group
 is merged only if it has at least `manifest.merge-min-count` manifests. In a
-merged group, an ADD whose file is deleted in the same group is dropped. The
-DELETE is kept until a full compaction removes it. When the manifests that must
-change (those with deleted files or smaller than the target size) add up to
+merged group, every ADD of a file that the group deletes is dropped, and one
+DELETE of the file is kept. A file that is added again after its DELETE is
+treated as deleted, as scans already do. When the manifests that must change
+(those with deleted files or smaller than the target size) add up to
 `manifest.full-compaction-threshold-size`, the commit runs a full compaction
 instead. It rewrites the manifests that must change or hold a deleted file,
-keeps the others, and drops every DELETE entry. Like Java, it uses partition
-statistics to find the manifests that may hold a deleted file, so it relies on
-those statistics being correct. When fewer than two manifests qualify, or a
-check below fails, the commit runs the minor merge instead.
+keeps the others, and drops every DELETE entry and every ADD of a deleted file.
+Like Java, it uses partition statistics to find the manifests that may hold a
+deleted file, so it relies on those statistics being correct. When fewer than
+two manifests qualify, or a check below fails, the commit runs the minor merge
+instead.
+
+DELETE entries kept by minor merges stay until a full compaction removes them,
+so they grow with every delete. Scans and commits read them. A lower
+`manifest.full-compaction-threshold-size` keeps fewer of them. A higher one
+makes full compactions rarer but lets DELETE entries pile up longer.
 
 A minor merge keeps a group as it is when a manifest in it has fields this
-version does not know, or when the group adds a file that it already adds or
-deletes. A full compaction is skipped when a manifest it reads has unknown
-fields or holds more DELETE entries than its metadata counts, or when the
-manifests it reads add a deleted file more than once. Manifests left unchanged
-by these checks are read again by later commits. A full compaction also keeps
-the rewritten entries in memory. Raising
-`manifest.full-compaction-threshold-size` makes full compactions run less often.
-A commit retry carries the previous manifests forward without merging them.
-`manifest.merge-optimize.enabled` and `manifest-sort.enabled` do not affect this
-merge.
+version does not know, or when the group adds the same file twice without
+deleting it. A full compaction is skipped when a manifest it reads has unknown
+fields or holds more DELETE entries than its metadata counts. Manifests left
+unchanged by these checks are read again by later commits. A full compaction
+also keeps the rewritten entries in memory. A commit retry carries the previous
+manifests forward without merging them. `manifest.merge-optimize.enabled` and
+`manifest-sort.enabled` do not affect this merge.
 
 Manifest sidecars use the Java-compatible `<manifest-name>.avro.sidecar`
 format and are published through the manifest metadata's `_EXTRA_FILES` list.
