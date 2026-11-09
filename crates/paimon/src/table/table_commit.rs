@@ -3001,6 +3001,45 @@ impl TableCommit {
         Ok(())
     }
 
+    /// Format conflict diagnostics without letting partition decoding hide the conflict.
+    fn partition_to_string(&self, partition: &[u8]) -> String {
+        let schema = self.table.schema();
+        if schema.partition_keys().is_empty() {
+            return "<non-partitioned>".to_string();
+        }
+
+        let format_partition = || -> Result<String> {
+            let options = schema.core_options();
+            let computer = PartitionComputer::new(
+                schema.partition_keys(),
+                schema.fields(),
+                options.partition_default_name(),
+                options.legacy_partition_name(),
+            )?;
+            let row = BinaryRow::from_serialized_bytes(partition)?;
+            if !options.legacy_partition_name() {
+                // Keep out-of-range DATE diagnostics out of the shared formatter,
+                // which can panic or silently substitute 1970-01-01.
+                for (pos, field) in schema.partition_fields().iter().enumerate() {
+                    if matches!(field.data_type(), DataType::Date(_)) && !row.is_null_at(pos) {
+                        let days = row.get_int(pos)?;
+                        days.checked_add(719_163)
+                            .and_then(chrono::NaiveDate::from_num_days_from_ce_opt)
+                            .ok_or_else(|| crate::Error::DataInvalid {
+                                message: format!(
+                                    "Date partition value {days} is outside the supported range"
+                                ),
+                                source: None,
+                            })?;
+                    }
+                }
+            }
+            let path = computer.generate_partition_path(&row)?;
+            Ok(path.trim_end_matches('/').to_string())
+        };
+        format_partition().unwrap_or_else(|_| format!("{partition:?}"))
+    }
+
     fn check_delete_entries_against_base(
         &self,
         base_entries: &[ManifestEntry],
@@ -3019,8 +3058,9 @@ impl TableCommit {
                 FileKind::Delete if !active_identifiers.remove(&identifier) => {
                     return Err(crate::Error::DataInvalid {
                         message: format!(
-                            "Delete conflict: file '{}' in bucket {} does not exist in the current snapshot.",
+                            "Delete conflict: file '{}' (partition={}, bucket={}) does not exist in the current snapshot.",
                             entry.file().file_name,
+                            self.partition_to_string(entry.partition()),
                             entry.bucket(),
                         ),
                         source: None,
@@ -7260,6 +7300,162 @@ mod tests {
             err_msg.contains("Delete conflict"),
             "Expected 'Delete conflict' error, got: {err_msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_repeated_file_delete_reports_partition_and_bucket() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_delete_conflict_partition";
+        setup_dirs(&file_io, table_path).await;
+        let commit = setup_partitioned_commit(&file_io, table_path);
+        let partition = partition_bytes("2026-11-09");
+        let file = test_data_file("data-0.parquet", 1);
+        commit
+            .commit(vec![CommitMessage::new(
+                partition.clone(),
+                0,
+                vec![file.clone()],
+            )])
+            .await
+            .unwrap();
+
+        let mut deletion = CommitMessage::new(partition, 0, vec![]);
+        deletion.deleted_files = vec![file];
+        let first = TableCommit::new(commit.table.clone(), "delete-a".into());
+        let second = TableCommit::new(commit.table.clone(), "delete-b".into());
+        first.commit(vec![deletion.clone()]).await.unwrap();
+        let error = second.commit(vec![deletion]).await.unwrap_err();
+        assert!(matches!(&error, crate::Error::DataInvalid { .. }));
+        assert!(
+            error.to_string().contains(
+                "Delete conflict: file 'data-0.parquet' (partition=pt=2026-11-09, bucket=0)"
+            ),
+            "{error}"
+        );
+    }
+
+    mod file_deletion_conflict_diagnostics {
+        use super::*;
+        use crate::spec::{DateType, IntType, Schema, VarCharType};
+
+        fn missing_file_conflict(
+            fields: &[(&str, &DataType, Option<Datum>)],
+            legacy: bool,
+        ) -> crate::Error {
+            let mut schema = Schema::builder()
+                .partition_keys(fields.iter().map(|(name, _, _)| *name))
+                .option("partition.default-name", "MISSING")
+                .option("partition.legacy-name", legacy.to_string());
+            for (name, data_type, _) in fields {
+                schema = schema.column(*name, (*data_type).clone());
+            }
+            let datums = fields
+                .iter()
+                .map(|(_, data_type, value)| (value.as_ref(), *data_type))
+                .collect::<Vec<_>>();
+            let partition = BinaryRow::from_datums(&datums).to_serialized_bytes();
+            let table = Table::new(
+                test_file_io(),
+                Identifier::new("default", "test"),
+                "memory:/test_delete_conflict_diagnostics".into(),
+                TableSchema::new(0, &schema.build().unwrap()),
+                None,
+            );
+            let entry = ManifestEntry::new(
+                FileKind::Delete,
+                partition,
+                3,
+                1,
+                test_data_file("missing.parquet", 1),
+                2,
+            );
+            TableCommit::new(table, "test-user".into())
+                .check_delete_entries_against_base(&[], &[entry])
+                .unwrap_err()
+        }
+
+        #[test]
+        fn test_missing_file_reports_partition_and_bucket() {
+            let string_type = DataType::VarChar(VarCharType::string_type());
+            let int_type = DataType::Int(IntType::new());
+            let date_type = DataType::Date(DateType::new());
+            let dt = ("dt", &string_type, Some(Datum::String("2026-10-26".into())));
+            // Match Python TestFileDeletionConflictDiagnostics's eight cases.
+            for (case, fields, legacy, expected) in [
+                ("string", vec![dt.clone()], false, "dt=2026-10-26"),
+                (
+                    "multiple",
+                    vec![dt, ("hr", &int_type, Some(Datum::Int(12)))],
+                    false,
+                    "dt=2026-10-26/hr=12",
+                ),
+                (
+                    "escaped",
+                    vec![
+                        ("a/b", &string_type, Some(Datum::String("x/y=z".into()))),
+                        ("hr", &string_type, None),
+                    ],
+                    false,
+                    "a%2Fb=x%2Fy%3Dz/hr=MISSING",
+                ),
+                (
+                    "null",
+                    vec![("dt", &string_type, None)],
+                    false,
+                    "dt=MISSING",
+                ),
+                (
+                    "empty",
+                    vec![("dt", &string_type, Some(Datum::String(String::new())))],
+                    false,
+                    "dt=MISSING",
+                ),
+                (
+                    "date",
+                    vec![("dt", &date_type, Some(Datum::Date(20_752)))],
+                    false,
+                    "dt=2026-10-26",
+                ),
+                (
+                    "legacy_date",
+                    vec![("dt", &date_type, Some(Datum::Date(1)))],
+                    true,
+                    "dt=1",
+                ),
+                ("non_partitioned", vec![], false, "<non-partitioned>"),
+            ] {
+                let error = missing_file_conflict(&fields, legacy);
+                assert!(matches!(&error, crate::Error::DataInvalid { .. }));
+                assert!(
+                    error.to_string().contains(&format!(
+                        "Delete conflict: file 'missing.parquet' (partition={expected}, bucket=3)"
+                    )),
+                    "{case}: {error}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_partition_formatting_failure_preserves_conflict() {
+            let date_type = DataType::Date(DateType::new());
+            // Python injects a formatting error; use a real failing value in Rust.
+            let value = Some(Datum::Date(i32::MAX));
+            let partition =
+                BinaryRow::from_datums(&[(value.as_ref(), &date_type)]).to_serialized_bytes();
+            let error = missing_file_conflict(&[("dt", &date_type, value)], false);
+            assert!(matches!(&error, crate::Error::DataInvalid { .. }));
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!(
+                    "Delete conflict: file 'missing.parquet' (partition={partition:?}, bucket=3)"
+                )),
+                "{message}"
+            );
+            assert!(
+                !message.contains("outside the supported range"),
+                "{message}"
+            );
+        }
     }
 
     #[tokio::test]
