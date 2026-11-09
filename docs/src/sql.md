@@ -1386,15 +1386,37 @@ whitespace is invalid.
 Branch-name and source-table validation also apply when `ignore_if_exists` is
 `true`.
 
-Only non-REST FileStore tables resolved on `main` are supported. REST tables,
-format tables, external engine tables, and already resolved non-main source
-tables are rejected. The procedure does not resolve `$branch_<name>` or system
+Only FileStore tables resolved on `main` are supported. Format tables, external
+engine tables, and already resolved non-main source tables are rejected. The procedure does not resolve `$branch_<name>` or system
 table suffixes in its `table` argument and does not create from another branch.
 
 Creation reuses the Core metadata-copy path. Existence checks and file copies
 are not transactional; storage errors are returned and can leave partial branch
 metadata. `ignore_if_exists` checks name existence and does not repair a partial
 creation.
+
+For tables managed by a REST catalog, the branch is created through the catalog,
+which owns branch metadata, and table storage is not written. With
+`ignore_if_exists => true`, the catalog's branch list is checked first, so an
+existing branch is still a no-op without resolving the tag; a branch created
+concurrently is also treated as success. Missing tags, existing branches, and
+permission errors reported by the catalog are returned.
+
+### fast_forward
+
+Replace the main branch's metadata with that of a branch:
+
+```sql
+CALL sys.fast_forward(table => 'paimon.my_db.my_table', branch => 'release_branch');
+```
+
+`table` and `branch` are required, and the source table must be resolved on
+`main`. Branch names are validated as for `create_branch`, so `main` is
+rejected. Success returns one row with `result = 'OK'`.
+
+Only tables managed by a REST catalog are supported: the catalog performs the
+fast-forward and no files are changed locally. Filesystem tables are rejected
+for now.
 
 ### create_tag
 

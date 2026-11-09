@@ -35,10 +35,10 @@ use tokio::task::JoinHandle;
 
 use paimon::api::{
     AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, AuthTableQueryResponse,
-    ConfigResponse, CreateFunctionRequest, CreatePartitionsRequest, CreateTagRequest,
-    CreateViewRequest, DataPolicy, DropPartitionsRequest, DropPolicyRequest, ErrorResponse,
-    GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetTagResponse, GetViewResponse,
-    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsByFilterRequest,
+    ConfigResponse, CreateBranchRequest, CreateFunctionRequest, CreatePartitionsRequest,
+    CreateTagRequest, CreateViewRequest, DataPolicy, DropPartitionsRequest, DropPolicyRequest,
+    ErrorResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetTagResponse,
+    GetViewResponse, ListDatabasesResponse, ListFunctionsResponse, ListPartitionsByFilterRequest,
     ListPartitionsByNamesRequest, ListPartitionsResponse, ListPermissionsResponse,
     ListPoliciesResponse, ListTablesResponse, ListViewsResponse, PermissionAssignment,
     PermissionResource, PolicyRequest, PolicyType, RenameTableRequest, ResourcePaths, ResourceType,
@@ -58,6 +58,12 @@ struct MockState {
     views: HashMap<String, GetViewResponse>,
     functions: HashMap<String, GetFunctionResponse>,
     tags: HashMap<String, GetTagResponse>,
+    /// Branch names per `"{db}.{table}"`, in creation order.
+    branches: HashMap<String, Vec<String>>,
+    /// Every branch request as `(method, "{db}.{table}", branch)`.
+    branch_requests: Vec<(String, String, Option<String>)>,
+    /// Fail every branch request with this status and message.
+    branch_error: Option<(StatusCode, String)>,
     partitions: HashMap<String, Vec<Partition>>,
     partition_page_responses: HashMap<String, Vec<PartitionPageResponse>>,
     partition_list_call_counts: HashMap<String, usize>,
@@ -1163,6 +1169,119 @@ impl RESTServer {
         }
     }
 
+    fn branch_injected_error(state: &MockState) -> Option<axum::response::Response> {
+        let (status, message) = state.branch_error.clone()?;
+        let error = ErrorResponse::new(None, None, Some(message), Some(status.as_u16() as i32));
+        Some((status, Json(error)).into_response())
+    }
+
+    /// Handle GET /databases/:db/tables/:table/branches.
+    pub async fn list_branches(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut state = state.inner.lock().unwrap();
+        let key = format!("{db}.{table}");
+        state
+            .branch_requests
+            .push(("LIST".to_string(), key.clone(), None));
+        if let Some(response) = Self::branch_injected_error(&state) {
+            return response;
+        }
+        if !state.tables.contains_key(&key) {
+            return resource_error(StatusCode::NOT_FOUND, "TABLE", &table);
+        }
+        let branches = state.branches.get(&key).cloned().unwrap_or_default();
+        (StatusCode::OK, Json(json!({ "branches": branches }))).into_response()
+    }
+
+    /// Handle POST /databases/:db/tables/:table/branches.
+    pub async fn create_branch(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<CreateBranchRequest>,
+    ) -> impl IntoResponse {
+        let mut state = state.inner.lock().unwrap();
+        let key = format!("{db}.{table}");
+        state.branch_requests.push((
+            "CREATE".to_string(),
+            key.clone(),
+            Some(request.branch.clone()),
+        ));
+        if let Some(response) = Self::branch_injected_error(&state) {
+            return response;
+        }
+        if !state.tables.contains_key(&key) {
+            return resource_error(StatusCode::NOT_FOUND, "TABLE", &table);
+        }
+        if state
+            .branches
+            .get(&key)
+            .is_some_and(|branches| branches.contains(&request.branch))
+        {
+            return resource_error(StatusCode::CONFLICT, "BRANCH", &request.branch);
+        }
+        if let Some(tag) = &request.from_tag {
+            if !state.tags.contains_key(&format!("{key}.{tag}")) {
+                return resource_error(StatusCode::NOT_FOUND, "TAG", tag);
+            }
+        }
+        state.branches.entry(key).or_default().push(request.branch);
+        (StatusCode::OK, Json(json!(""))).into_response()
+    }
+
+    /// Handle DELETE /databases/:db/tables/:table/branches/:branch.
+    pub async fn drop_branch(
+        Path((db, table, branch)): Path<(String, String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut state = state.inner.lock().unwrap();
+        let key = format!("{db}.{table}");
+        state
+            .branch_requests
+            .push(("DROP".to_string(), key.clone(), Some(branch.clone())));
+        if let Some(response) = Self::branch_injected_error(&state) {
+            return response;
+        }
+        if !state.tables.contains_key(&key) {
+            return resource_error(StatusCode::NOT_FOUND, "TABLE", &table);
+        }
+        let branches = state.branches.entry(key).or_default();
+        match branches.iter().position(|existing| existing == &branch) {
+            Some(index) => {
+                branches.remove(index);
+                (StatusCode::OK, Json(json!(""))).into_response()
+            }
+            None => resource_error(StatusCode::NOT_FOUND, "BRANCH", &branch),
+        }
+    }
+
+    /// Handle POST /databases/:db/tables/:table/branches/:branch/forward.
+    pub async fn fast_forward_branch(
+        Path((db, table, branch)): Path<(String, String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut state = state.inner.lock().unwrap();
+        let key = format!("{db}.{table}");
+        state
+            .branch_requests
+            .push(("FORWARD".to_string(), key.clone(), Some(branch.clone())));
+        if let Some(response) = Self::branch_injected_error(&state) {
+            return response;
+        }
+        if !state.tables.contains_key(&key) {
+            return resource_error(StatusCode::NOT_FOUND, "TABLE", &table);
+        }
+        if !state
+            .branches
+            .get(&key)
+            .is_some_and(|branches| branches.contains(&branch))
+        {
+            return resource_error(StatusCode::NOT_FOUND, "BRANCH", &branch);
+        }
+        (StatusCode::OK, Json(json!(""))).into_response()
+    }
+
     /// Handle POST /databases/:db/tables/:table/partitions - create partitions.
     pub async fn create_partitions(
         Path((db, table)): Path<(String, String)>,
@@ -1936,6 +2055,49 @@ impl RESTServer {
     }
 
     /// Force list-view and list-function handlers to paginate at this size.
+    pub fn add_tag(&self, database: &str, table: &str, tag: &str) {
+        let mut state = self.inner.lock().unwrap();
+        state.tags.insert(
+            format!("{database}.{table}.{tag}"),
+            GetTagResponse {
+                tag_name: tag.to_string(),
+                snapshot: tag_snapshot(1),
+                tag_create_time: None,
+                tag_time_retained: None,
+            },
+        );
+    }
+
+    pub fn add_branch(&self, database: &str, table: &str, branch: &str) {
+        let mut state = self.inner.lock().unwrap();
+        state
+            .branches
+            .entry(format!("{database}.{table}"))
+            .or_default()
+            .push(branch.to_string());
+    }
+
+    pub fn branches(&self, database: &str, table: &str) -> Vec<String> {
+        let state = self.inner.lock().unwrap();
+        state
+            .branches
+            .get(&format!("{database}.{table}"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Branch requests as `(kind, "{db}.{table}", branch)`, where kind is one of
+    /// `LIST`, `CREATE`, `DROP` and `FORWARD`.
+    pub fn branch_requests(&self) -> Vec<(String, String, Option<String>)> {
+        self.inner.lock().unwrap().branch_requests.clone()
+    }
+
+    /// Make every branch request fail with `status` and `message`.
+    pub fn set_branch_error(&self, error: Option<(StatusCode, &str)>) {
+        self.inner.lock().unwrap().branch_error =
+            error.map(|(status, message)| (status, message.to_string()));
+    }
+
     pub fn set_list_page_size(&self, page_size: usize) {
         self.inner.lock().unwrap().list_page_size = Some(page_size.max(1));
     }
@@ -2456,6 +2618,18 @@ pub async fn start_mock_server(
         .route(
             &format!("{prefix}/databases/:db/tables/:table/tags/:tag"),
             get(RESTServer::get_tag).delete(RESTServer::delete_tag),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/branches"),
+            get(RESTServer::list_branches).post(RESTServer::create_branch),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/branches/:branch"),
+            axum::routing::delete(RESTServer::drop_branch),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/branches/:branch/forward"),
+            post(RESTServer::fast_forward_branch),
         )
         .route(
             &format!("{prefix}/databases/:db/tables/:table/partitions"),

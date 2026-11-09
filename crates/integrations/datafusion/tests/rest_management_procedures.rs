@@ -714,43 +714,216 @@ async fn test_replace_tag_rejected_on_rest_catalog_without_changing_metadata() {
     }
 }
 
-#[tokio::test]
-async fn test_create_branch_rejects_rest_tables_even_when_target_exists() {
-    let (tmp, server, context) = setup().await;
+/// Register a schema-bearing REST table whose storage holds only `schema-0`, and
+/// return the table root so tests can assert that storage is left untouched.
+fn add_branch_test_table(tmp: &tempfile::TempDir, server: &RESTServer) -> std::path::PathBuf {
     let schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .build()
         .unwrap();
     let root = tmp.path().join(format!("{DATABASE}.db/{TABLE}"));
     let schema_path = root.join("schema/schema-0");
-    let branch_path = root.join("branch/branch-existing/schema/schema-0");
     let schema_bytes = serde_json::to_vec(&paimon::spec::TableSchema::new(0, &schema)).unwrap();
-    for path in [&schema_path, &branch_path] {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, &schema_bytes).unwrap();
-    }
+    std::fs::create_dir_all(schema_path.parent().unwrap()).unwrap();
+    std::fs::write(&schema_path, &schema_bytes).unwrap();
     server.add_table_with_schema(
         DATABASE,
         TABLE,
         schema,
         &format!("file://{}", root.display()),
     );
+    root
+}
 
-    for branch in ["new", "existing"] {
-        for tag in ["", ", tag => 'missing'"] {
-            common::assert_sql_error(
-                &context,
-                &format!(
-                    "CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => '{branch}'{tag}, ignore_if_exists => true)"
-                ),
-                "create_branch is not supported for tables managed by a REST catalog",
-            )
-            .await;
-            assert_eq!(std::fs::read(&schema_path).unwrap(), schema_bytes);
-            assert_eq!(std::fs::read(&branch_path).unwrap(), schema_bytes);
-            assert_eq!(std::fs::read_dir(root.join("branch")).unwrap().count(), 1);
+/// Every relative file path under `root`, sorted.
+fn storage_files(root: &std::path::Path) -> Vec<String> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else {
+                out.push(path.strip_prefix(root).unwrap().display().to_string());
+            }
         }
     }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+fn branch_request(kind: &str, branch: Option<&str>) -> (String, String, Option<String>) {
+    (
+        kind.to_string(),
+        format!("{DATABASE}.{TABLE}"),
+        branch.map(str::to_string),
+    )
+}
+
+#[tokio::test]
+async fn test_create_branch_on_rest_table_goes_through_catalog() {
+    let (tmp, server, context) = setup().await;
+    let root = add_branch_test_table(&tmp, &server);
+    server.add_tag(DATABASE, TABLE, "release");
+
+    assert_ok_row(
+        &context,
+        &format!("CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => 'empty')"),
+    )
+    .await;
+    assert_ok_row(
+        &context,
+        &format!(
+            "CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => 'tagged', tag => 'release')"
+        ),
+    )
+    .await;
+    assert_eq!(server.branches(DATABASE, TABLE), vec!["empty", "tagged"]);
+    assert_eq!(
+        server.branch_requests(),
+        vec![
+            branch_request("CREATE", Some("empty")),
+            branch_request("CREATE", Some("tagged")),
+        ]
+    );
+    // The catalog owns branch metadata: no branch directory is written.
+    assert_eq!(storage_files(&root), vec!["schema/schema-0"]);
+}
+
+#[tokio::test]
+async fn test_create_branch_on_rest_table_existing_and_missing_targets() {
+    let (tmp, server, context) = setup().await;
+    let root = add_branch_test_table(&tmp, &server);
+    server.add_branch(DATABASE, TABLE, "existing");
+
+    // Without ignore_if_exists, the catalog's conflict is returned.
+    common::assert_sql_error(
+        &context,
+        &format!("CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => 'existing')"),
+        "Branch existing of table sales.orders already exists",
+    )
+    .await;
+    // With ignore_if_exists, an existing branch is a no-op without resolving the tag.
+    assert_ok_row(
+        &context,
+        &format!(
+            "CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => 'existing', tag => 'missing', ignore_if_exists => true)"
+        ),
+    )
+    .await;
+    // A missing tag is reported, also when ignore_if_exists is set.
+    for ignore in ["", ", ignore_if_exists => true"] {
+        common::assert_sql_error(
+            &context,
+            &format!(
+                "CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => 'new', tag => 'missing'{ignore})"
+            ),
+            "Tag missing does not exist",
+        )
+        .await;
+    }
+    assert_eq!(server.branches(DATABASE, TABLE), vec!["existing"]);
+    assert_eq!(
+        server.branch_requests(),
+        vec![
+            branch_request("CREATE", Some("existing")),
+            branch_request("LIST", None),
+            branch_request("CREATE", Some("new")),
+            branch_request("LIST", None),
+            branch_request("CREATE", Some("new")),
+        ]
+    );
+    assert_eq!(storage_files(&root), vec!["schema/schema-0"]);
+}
+
+#[tokio::test]
+async fn test_rest_branch_procedures_report_forbidden() {
+    let (tmp, server, context) = setup().await;
+    let root = add_branch_test_table(&tmp, &server);
+    server.add_branch(DATABASE, TABLE, "dev");
+    server.set_branch_error(Some((
+        axum::http::StatusCode::FORBIDDEN,
+        "no branch access",
+    )));
+
+    for sql in [
+        format!("CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => 'b1')"),
+        format!(
+            "CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => 'b1', ignore_if_exists => true)"
+        ),
+        format!("CALL sys.delete_branch(table => '{DATABASE}.{TABLE}', branch => 'dev')"),
+        format!("CALL sys.fast_forward(table => '{DATABASE}.{TABLE}', branch => 'dev')"),
+    ] {
+        common::assert_sql_error(&context, &sql, "Forbidden: no branch access").await;
+    }
+    assert_eq!(server.branches(DATABASE, TABLE), vec!["dev"]);
+    assert_eq!(storage_files(&root), vec!["schema/schema-0"]);
+}
+
+#[tokio::test]
+async fn test_rest_branch_procedures_validate_locally_before_requests() {
+    let (tmp, server, context) = setup().await;
+    let root = add_branch_test_table(&tmp, &server);
+
+    for (sql, message) in [
+        (
+            format!("CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => 'main')"),
+            "main",
+        ),
+        (
+            format!("CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => 'a$b')"),
+            "SQL suffix delimiter",
+        ),
+        (
+            format!("CALL sys.delete_branch(table => '{DATABASE}.{TABLE}', branch => 'a/b')"),
+            "a/b",
+        ),
+        (
+            format!("CALL sys.delete_branch(table => '{DATABASE}.{TABLE}', branch => 'main')"),
+            "main",
+        ),
+        (
+            format!("CALL sys.fast_forward(table => '{DATABASE}.{TABLE}', branch => 'main')"),
+            "main",
+        ),
+        (
+            format!("CALL sys.fast_forward(table => '{DATABASE}.{TABLE}')"),
+            "Missing required argument: 'branch'",
+        ),
+    ] {
+        common::assert_sql_error(&context, &sql, message).await;
+    }
+    assert!(server.branch_requests().is_empty());
+    assert_eq!(storage_files(&root), vec!["schema/schema-0"]);
+}
+
+#[tokio::test]
+async fn test_fast_forward_on_rest_table_goes_through_catalog() {
+    let (tmp, server, context) = setup().await;
+    let root = add_branch_test_table(&tmp, &server);
+    server.add_branch(DATABASE, TABLE, "dev");
+
+    assert_ok_row(
+        &context,
+        &format!("CALL sys.fast_forward(table => '{DATABASE}.{TABLE}', branch => 'dev')"),
+    )
+    .await;
+    common::assert_sql_error(
+        &context,
+        &format!("CALL sys.fast_forward(table => '{DATABASE}.{TABLE}', branch => 'missing')"),
+        "Branch missing of table sales.orders does not exist",
+    )
+    .await;
+    assert_eq!(
+        server.branch_requests(),
+        vec![
+            branch_request("FORWARD", Some("dev")),
+            branch_request("FORWARD", Some("missing")),
+        ]
+    );
+    assert_eq!(server.branches(DATABASE, TABLE), vec!["dev"]);
+    assert_eq!(storage_files(&root), vec!["schema/schema-0"]);
 }
 
 #[tokio::test]
@@ -928,29 +1101,31 @@ async fn test_create_tag_from_watermark_rejects_readable_rest_catalog_table() {
 }
 
 #[tokio::test]
-async fn test_delete_branch_rejected_on_rest_catalog() {
-    // A REST catalog owns branch metadata and the Rust REST catalog has no
-    // branch-drop endpoint yet, so `delete_branch` must refuse rather than delete
-    // a physical branch directory while the catalog still lists it. Without the
-    // guard the filesystem `BranchManager` runs and reports a different error, so
-    // this assertion is non-vacuous.
+async fn test_delete_branch_on_rest_table_goes_through_catalog() {
     let (tmp, server, context) = setup().await;
+    let root = add_branch_test_table(&tmp, &server);
+    for branch in ["b1", "b2", "keep"] {
+        server.add_branch(DATABASE, TABLE, branch);
+    }
 
-    // `get_table` needs a schema-bearing response; register one so resolution
-    // reaches the REST guard rather than failing earlier on a missing schema.
-    let schema = Schema::builder()
-        .column("id", DataType::Int(IntType::new()))
-        .build()
-        .unwrap();
-    let path = format!("file://{}/{DATABASE}.db/{TABLE}", tmp.path().display());
-    server.add_table_with_schema(DATABASE, TABLE, schema, &path);
-
-    common::assert_sql_error(
+    // Comma-separated names; a missing branch is skipped and empty tokens ignored.
+    assert_ok_row(
         &context,
-        &format!("CALL sys.delete_branch(table => '{DATABASE}.{TABLE}', branch => 'b1')"),
-        "REST catalog",
+        &format!(
+            "CALL sys.delete_branch(table => '{DATABASE}.{TABLE}', branch => 'b1,,missing,b2')"
+        ),
     )
     .await;
+    assert_eq!(server.branches(DATABASE, TABLE), vec!["keep"]);
+    assert_eq!(
+        server.branch_requests(),
+        vec![
+            branch_request("DROP", Some("b1")),
+            branch_request("DROP", Some("missing")),
+            branch_request("DROP", Some("b2")),
+        ]
+    );
+    assert_eq!(storage_files(&root), vec!["schema/schema-0"]);
 }
 
 #[tokio::test]
