@@ -15,32 +15,47 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Tag manager for reading and writing tag metadata using FileIO.
+//! Tag metadata from table files or the owning REST catalog.
 //!
 //! Reference: [org.apache.paimon.utils.TagManager](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/TagManager.java)
 //! and [pypaimon.tag.tag_manager.TagManager](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/tag/tag_manager.py).
 
+use crate::catalog::DEFAULT_MAIN_BRANCH;
 use crate::io::FileIO;
 use crate::spec::Snapshot;
+use crate::table::RESTEnv;
 use chrono::{Datelike, Timelike};
-use futures::future::try_join_all;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use opendal::raw::get_basename;
 use std::time::Duration;
 
 const TAG_DIR: &str = "tag";
 const TAG_PREFIX: &str = "tag-";
+// A large tag listing must not issue an unbounded number of catalog requests.
+const TAG_READ_CONCURRENCY: usize = 32;
 
-/// Manager for tag files using unified FileIO.
+/// Manager for tag metadata in table files or a REST catalog.
 ///
-/// Tags are named snapshots stored as JSON files at `{table_path}/tag/tag-{name}`.
+/// Filesystem tags are named snapshots stored as JSON at `{table_path}/tag/tag-{name}`.
 /// Tags without retention use Snapshot JSON. Retained tags also include Java-compatible
 /// creation time and retention metadata.
+///
+/// For a table managed by a REST catalog, the catalog owns tags: reads go to
+/// the catalog and storage writes are refused.
 ///
 /// Reference: [org.apache.paimon.utils.TagManager](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/TagManager.java)
 #[derive(Debug, Clone)]
 pub struct TagManager {
     file_io: FileIO,
     table_path: String,
+    rest: Option<RestTags>,
+}
+
+/// The catalog that owns a REST table's tags, and the branch they belong to.
+#[derive(Debug, Clone)]
+struct RestTags {
+    env: RESTEnv,
+    branch: String,
 }
 
 impl TagManager {
@@ -48,7 +63,51 @@ impl TagManager {
         Self {
             file_io,
             table_path,
+            rest: None,
         }
+    }
+
+    pub(crate) fn with_rest_env(mut self, rest_env: Option<RESTEnv>) -> Self {
+        self.rest = rest_env.map(|env| RestTags {
+            env,
+            branch: DEFAULT_MAIN_BRANCH.to_string(),
+        });
+        self
+    }
+
+    fn ensure_storage_owned(&self, action: &str) -> crate::Result<()> {
+        if self.rest.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "cannot {action} a tag in table storage: the REST catalog owns this table's tags"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Omit catalog tags that cannot be addressed safely by the REST API from
+    /// metadata listings. Never substitute a potentially stale storage file.
+    /// Keep these names in `list_all_names` so callers that need a complete tag
+    /// set, such as referenced-file collection, fail rather than undercount.
+    async fn list_readable_names(&self) -> crate::Result<Vec<String>> {
+        let mut names = self.list_all_names().await?;
+        if let Some(rest) = &self.rest {
+            names.retain(|name| {
+                if is_dot_path_segment(name) {
+                    log::warn!(
+                        "Skipping legacy tag {name:?} in the tag listing for table {} on \
+                         branch {:?}: the REST API cannot address a dot path segment",
+                        rest.env.identifier().full_name(),
+                        rest.branch,
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        Ok(names)
     }
 
     /// Path to the tag directory (e.g. `table_path/tag`).
@@ -59,7 +118,14 @@ impl TagManager {
     /// Create a TagManager for a branch of this table.
     pub fn with_branch(&self, branch_name: &str) -> Self {
         let branch_path = format!("{}/branch/branch-{}", self.table_path, branch_name);
-        Self::new(self.file_io.clone(), branch_path)
+        Self {
+            file_io: self.file_io.clone(),
+            table_path: branch_path,
+            rest: self.rest.as_ref().map(|rest| RestTags {
+                env: rest.env.clone(),
+                branch: branch_name.to_string(),
+            }),
+        }
     }
 
     /// Path to the tag file for the given name (e.g. `tag/tag-my_tag`).
@@ -69,17 +135,24 @@ impl TagManager {
 
     /// Check if a tag exists.
     pub async fn tag_exists(&self, tag_name: &str) -> crate::Result<bool> {
+        if let Some(rest) = &self.rest {
+            return Ok(rest.env.get_tag(&rest.branch, tag_name).await?.is_some());
+        }
         validate_tag_name(tag_name)?;
         let path = self.tag_path(tag_name);
         let input = self.file_io.new_input(&path)?;
         input.exists().await
     }
 
-    /// Get the snapshot for a tag, or None if the tag file does not exist.
+    /// Get the snapshot for a tag, or None if the tag does not exist.
     ///
-    /// Tag files are JSON with the same schema as Snapshot.
-    /// Reads directly and catches NotFound to avoid a separate exists() IO round-trip.
+    /// REST tables resolve the tag through the catalog. Filesystem tables read
+    /// snapshot JSON directly, catching NotFound without an exists() IO round-trip.
     pub async fn get(&self, tag_name: &str) -> crate::Result<Option<Snapshot>> {
+        if let Some(rest) = &self.rest {
+            let tag = rest.env.get_tag(&rest.branch, tag_name).await?;
+            return Ok(tag.map(|tag| tag.snapshot));
+        }
         validate_tag_name(tag_name)?;
         let path = self.tag_path(tag_name);
         let input = self.file_io.new_input(&path)?;
@@ -100,10 +173,12 @@ impl TagManager {
         Ok(Some(snapshot))
     }
 
-    /// Get a tag's snapshot together with the two tag-only fields Java writes
-    /// alongside it: the creation time as epoch millis and the retention as
-    /// seconds. Returns `None` when the tag file does not exist; either metadata
-    /// field is `None` when absent or unparsable.
+    /// Get a tag's snapshot, creation time and retention in seconds.
+    ///
+    /// The creation time is local wall-clock time encoded like Arrow's timezone-less
+    /// TIMESTAMP_MILLIS, not a Unix epoch instant: REST epoch millis are converted to
+    /// local time, while tag files already store local time. Returns `None` when the
+    /// tag does not exist; either metadata field is `None` when absent or unparsable.
     pub async fn get_with_metadata(
         &self,
         tag_name: &str,
@@ -129,6 +204,20 @@ impl TagManager {
             Option<serde_json::Number>,
         )>,
     > {
+        if let Some(rest) = &self.rest {
+            let Some(tag) = rest.env.get_tag(&rest.branch, tag_name).await? else {
+                return Ok(None);
+            };
+            let create_time = tag
+                .tag_create_time
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map(|time| time.with_timezone(&chrono::Local).naive_local());
+            let time_retained = tag
+                .tag_time_retained
+                .as_deref()
+                .and_then(rest_time_retained_seconds);
+            return Ok(Some((tag.snapshot, create_time, time_retained)));
+        }
         validate_tag_name(tag_name)?;
         let path = self.tag_path(tag_name);
         let input = self.file_io.new_input(&path)?;
@@ -161,29 +250,37 @@ impl TagManager {
         Ok(Some((snapshot, create_time, time_retained)))
     }
 
-    /// Like [`Self::list_all`], but each row also carries the tag creation time
-    /// in epoch millis and the retention in seconds.
+    /// Like [`Self::list_all`], with the local creation time encoding and
+    /// retention in seconds described by [`Self::get_with_metadata`].
     #[allow(clippy::type_complexity)]
     pub async fn list_all_with_metadata(
         &self,
     ) -> crate::Result<Vec<(String, Snapshot, Option<i64>, Option<f64>)>> {
-        let names = self.list_all_names().await?;
-        try_join_all(names.into_iter().map(|name| async move {
-            let (snap, create_time, retained) =
-                self.get_with_metadata(&name)
+        let names = self.list_readable_names().await?;
+        stream::iter(names)
+            .map(|name| async move {
+                let (snapshot, create_time, retained) = self
+                    .get_with_metadata(&name)
                     .await?
                     .ok_or_else(|| crate::Error::DataInvalid {
                         message: format!("tag '{name}' disappeared during listing"),
                         source: None,
                     })?;
-            Ok::<_, crate::Error>((name, snap, create_time, retained))
-        }))
-        .await
+                Ok::<_, crate::Error>((name, snapshot, create_time, retained))
+            })
+            .buffered(TAG_READ_CONCURRENCY)
+            .try_collect()
+            .await
     }
 
-    /// List all tag names sorted ascending. Returns an empty vector when the
-    /// tag directory does not exist.
+    /// List all tag names sorted ascending, from the catalog for REST tables
+    /// or from tag files otherwise. For filesystem tables, a missing tag directory
+    /// yields an empty list. REST names are returned even if an older client
+    /// created a dot-segment tag that cannot be read through the REST API.
     pub async fn list_all_names(&self) -> crate::Result<Vec<String>> {
+        if let Some(rest) = &self.rest {
+            return rest.env.list_tag_names(&rest.branch).await;
+        }
         let tag_dir = self.tag_directory();
         let statuses = match self.file_io.list_status(&tag_dir).await {
             Ok(s) => s,
@@ -220,6 +317,7 @@ impl TagManager {
         snapshot: &Snapshot,
         time_retained: Option<&str>,
     ) -> crate::Result<()> {
+        self.ensure_storage_owned("create")?;
         validate_tag_name(tag_name)?;
         let path = self.tag_path(tag_name);
         let serialize_error = |e| crate::Error::DataInvalid {
@@ -273,6 +371,7 @@ impl TagManager {
         snapshot: &Snapshot,
         time_retained: Option<&str>,
     ) -> crate::Result<()> {
+        self.ensure_storage_owned("replace")?;
         if !self.tag_exists(tag_name).await? {
             return Err(crate::Error::TagNotExist {
                 tag_name: tag_name.to_string(),
@@ -284,6 +383,7 @@ impl TagManager {
 
     /// Delete a tag file.
     pub async fn delete(&self, tag_name: &str) -> crate::Result<()> {
+        self.ensure_storage_owned("delete")?;
         validate_tag_name(tag_name)?;
         let path = self.tag_path(tag_name);
         self.file_io.delete_file(&path).await
@@ -296,6 +396,7 @@ impl TagManager {
     /// Uses copy-then-delete rather than a native rename: object stores and the
     /// in-memory backend do not support rename.
     pub async fn rename(&self, tag_name: &str, target_tag_name: &str) -> crate::Result<()> {
+        self.ensure_storage_owned("rename")?;
         validate_tag_name(tag_name)?;
         validate_tag_name(target_tag_name)?;
         let src = self.tag_path(tag_name);
@@ -317,19 +418,24 @@ impl TagManager {
     }
 
     /// List all tags as `(name, snapshot)` pairs sorted by name ascending.
+    /// Legacy REST tags named `.` or `..` are skipped with a warning; their
+    /// storage files cannot establish the catalog's snapshot for those tags.
     pub async fn list_all(&self) -> crate::Result<Vec<(String, Snapshot)>> {
-        let names = self.list_all_names().await?;
-        try_join_all(names.into_iter().map(|name| async move {
-            let snap = self
-                .get(&name)
-                .await?
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: format!("tag '{name}' disappeared during listing"),
-                    source: None,
-                })?;
-            Ok::<_, crate::Error>((name, snap))
-        }))
-        .await
+        let names = self.list_readable_names().await?;
+        stream::iter(names)
+            .map(|name| async move {
+                let snapshot = self
+                    .get(&name)
+                    .await?
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!("tag '{name}' disappeared during listing"),
+                        source: None,
+                    })?;
+                Ok::<_, crate::Error>((name, snapshot))
+            })
+            .buffered(TAG_READ_CONCURRENCY)
+            .try_collect()
+            .await
     }
 }
 
@@ -369,6 +475,28 @@ fn parse_tag_time_retained(value: &str) -> Option<Duration> {
         _ => return None,
     };
     (duration.as_secs() <= i64::MAX as u64).then_some(duration)
+}
+
+/// Retention seconds of a catalog tag, in the decimal form tag files use.
+///
+/// Java sends an ISO-8601 `Duration` such as `"PT24H"`; a retention string
+/// such as `"1d"` is also accepted. Anything else is treated as absent, like
+/// an unparsable tag file.
+fn rest_time_retained_seconds(value: &str) -> Option<serde_json::Number> {
+    let value = value.trim();
+    let duration = value
+        .parse::<jiff::SignedDuration>()
+        .ok()
+        .and_then(|duration| Duration::try_from(duration).ok())
+        .or_else(|| parse_tag_time_retained(value))?;
+    format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos())
+        .parse()
+        .ok()
+}
+
+/// `.` and `..` cannot appear as a URL path segment.
+fn is_dot_path_segment(tag_name: &str) -> bool {
+    matches!(tag_name, "." | "..")
 }
 
 fn validate_tag_name(tag_name: &str) -> crate::Result<()> {
@@ -743,6 +871,24 @@ mod tests {
             parse_tag_time_retained("106751991167300d"),
             Some(Duration::from_secs(106_751_991_167_300 * 86_400))
         );
+    }
+
+    #[test]
+    fn test_rest_time_retained_accepts_java_duration_and_retention() {
+        for (value, expected) in [
+            ("PT24H", Some("86400.000000000")),
+            ("PT1.5S", Some("1.500000000")),
+            ("1d", Some("86400.000000000")),
+            (" 12 HOURS ", Some("43200.000000000")),
+            ("-PT1S", None),
+            ("soon", None),
+        ] {
+            assert_eq!(
+                rest_time_retained_seconds(value).map(|seconds| seconds.to_string()),
+                expected.map(str::to_string),
+                "{value}"
+            );
+        }
     }
 
     #[tokio::test]

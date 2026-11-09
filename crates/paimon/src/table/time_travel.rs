@@ -17,6 +17,7 @@
 
 //! Snapshot resolution for time travel, mirroring Java `TimeTravelUtil`.
 
+use crate::api::RestError;
 use crate::spec::{CoreOptions, Snapshot, TimeTravelSelector};
 use crate::table::{SnapshotManager, Table, TagManager};
 use crate::Error;
@@ -35,13 +36,15 @@ pub(crate) async fn travel_to_snapshot(
     tag_manager: &TagManager,
     options: &HashMap<String, String>,
 ) -> crate::Result<Option<Snapshot>> {
+    let mut version_tag = None;
     // Java adapts scan.version before checking mutually exclusive selectors.
     // It overwrites the same selector kind, but preserves conflicts with others.
     let mut adapted;
     let options = if let Some(version) = options.get("scan.version") {
         adapted = options.clone();
         adapted.remove("scan.version");
-        let (key, value) = if tag_manager.tag_exists(version).await? {
+        version_tag = resolve_version_tag(tag_manager, version).await?;
+        let (key, value) = if version_tag.is_some() {
             ("scan.tag-name", version.clone())
         } else if let Some(watermark) = version.strip_prefix(WATERMARK_PREFIX) {
             let value = watermark.parse::<i64>().map_err(|e| Error::DataInvalid {
@@ -49,7 +52,7 @@ pub(crate) async fn travel_to_snapshot(
                 source: Some(Box::new(e)),
             })?;
             ("scan.watermark", value.to_string())
-        } else if !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()) {
+        } else if is_snapshot_id_version(version) {
             ("scan.snapshot-id", version.clone())
         } else {
             return Err(Error::DataInvalid {
@@ -97,18 +100,43 @@ pub(crate) async fn travel_to_snapshot(
             value: v,
             option_name: _,
         }) => {
-            // An explicit tag name: resolve strictly by tag, never as a snapshot id.
-            if tag_manager.tag_exists(v).await? {
-                resolve_tag(tag_manager, v).await.map(Some)
-            } else {
-                Err(Error::DataInvalid {
-                    message: format!("Tag '{v}' doesn't exist."),
-                    source: None,
-                })
+            // Tag selectors never fall back to snapshot ids. Reuse the tag
+            // fetched while adapting scan.version when it selected this tag.
+            match version_tag {
+                Some(snapshot) => Ok(Some(snapshot)),
+                None => resolve_tag(tag_manager, v).await.map(Some),
             }
         }
         None => Ok(None),
     }
+}
+
+/// Resolve a `scan.version` tag before trying a snapshot id or watermark of
+/// the same spelling. Reuse its snapshot rather than fetching the tag twice.
+///
+/// A numeric snapshot id or watermark can use table storage when the tag endpoint
+/// returns HTTP 501. Other catalog errors and tag-only versions propagate.
+async fn resolve_version_tag(
+    tag_manager: &TagManager,
+    version: &str,
+) -> crate::Result<Option<Snapshot>> {
+    match tag_manager.get(version).await {
+        Err(Error::RestApi {
+            source: RestError::NotImplemented { .. },
+        }) if is_snapshot_or_watermark_version(version) => Ok(None),
+        result => result,
+    }
+}
+
+fn is_snapshot_or_watermark_version(version: &str) -> bool {
+    match version.strip_prefix(WATERMARK_PREFIX) {
+        Some(watermark) => watermark.parse::<i64>().is_ok(),
+        None => is_snapshot_id_version(version),
+    }
+}
+
+fn is_snapshot_id_version(version: &str) -> bool {
+    !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit())
 }
 
 async fn resolve_watermark(
@@ -151,7 +179,7 @@ pub(crate) async fn resolve_snapshot(table: &Table) -> crate::Result<Option<Snap
     }
 }
 
-/// Fetch a tag known to exist, mapping an unexpectedly-missing tag to an error.
+/// Fetch a tag's snapshot, failing when the tag does not exist.
 async fn resolve_tag(tag_manager: &TagManager, name: &str) -> crate::Result<Snapshot> {
     match tag_manager.get(name).await? {
         Some(s) => Ok(s),
@@ -172,6 +200,27 @@ mod tests {
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn test_snapshot_or_watermark_version_shape() {
+        for (version, expected) in [
+            ("1", true),
+            ("0042", true),
+            ("watermark-1000", true),
+            ("watermark--5", true),
+            ("", false),
+            ("-1", false),
+            ("release", false),
+            ("watermark-", false),
+            ("watermark-soon", false),
+        ] {
+            assert_eq!(
+                super::is_snapshot_or_watermark_version(version),
+                expected,
+                "{version}"
+            );
+        }
+    }
 
     fn schema_v0() -> TableSchema {
         let schema = Schema::builder()
