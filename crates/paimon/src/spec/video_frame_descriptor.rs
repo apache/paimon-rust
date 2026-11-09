@@ -15,23 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java VideoFrameDescriptor v1, including the persisted keyframe-index range.
+//! Java VideoFrameDescriptor v1: payload location and presentation-order frame ordinal.
 
 use super::BlobDescriptor;
 use crate::{Error, Result};
 
 const VERSION: u8 = 1;
 const MAGIC: i64 = 0x564944454F46524D;
-const FIXED_LENGTH: usize = 1 + 8 + 4 + 5 * 8;
+const FIXED_LENGTH: usize = 1 + 8 + 4 + 3 * 8;
 
-/// One logical frame in an encoded video, with an optional keyframe index.
+/// One logical frame in an encoded video.
 /// The payload is the complete encoded video; `frame_index` locates the frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoFrameDescriptor {
     payload: BlobDescriptor,
     frame_index: i64,
-    keyframe_index_offset: i64,
-    keyframe_index_length: i64,
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -43,27 +41,13 @@ fn invalid(message: impl Into<String>) -> Error {
 
 impl VideoFrameDescriptor {
     /// Construct a descriptor using the same locator validation as Java.
-    pub fn new(
-        uri: String,
-        offset: i64,
-        length: i64,
-        frame_index: i64,
-        keyframe_index_offset: i64,
-        keyframe_index_length: i64,
-    ) -> Result<Self> {
+    pub fn new(uri: String, offset: i64, length: i64, frame_index: i64) -> Result<Self> {
         if frame_index < 0 {
             return Err(invalid("negative frame index"));
-        }
-        if !(keyframe_index_length == 0 && keyframe_index_offset == -1
-            || keyframe_index_length > 0 && keyframe_index_offset >= 0)
-        {
-            return Err(invalid("invalid video keyframe index range"));
         }
         Ok(Self {
             payload: BlobDescriptor::new(uri, offset, length),
             frame_index,
-            keyframe_index_offset,
-            keyframe_index_length,
         })
     }
 
@@ -75,17 +59,6 @@ impl VideoFrameDescriptor {
     pub fn frame_index(&self) -> i64 {
         self.frame_index
     }
-    /// The optional index is stored in the same object as the physical video.
-    pub fn keyframe_index_descriptor(&self) -> Option<BlobDescriptor> {
-        (self.keyframe_index_length > 0).then(|| {
-            BlobDescriptor::new(
-                self.payload.uri().into(),
-                self.keyframe_index_offset,
-                self.keyframe_index_length,
-            )
-        })
-    }
-
     /// Serialize to Java's exact little-endian wire layout.
     pub fn serialize(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(FIXED_LENGTH + self.payload.uri().len());
@@ -97,8 +70,6 @@ impl VideoFrameDescriptor {
             self.payload.offset(),
             self.payload.length(),
             self.frame_index,
-            self.keyframe_index_offset,
-            self.keyframe_index_length,
         ] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
@@ -140,7 +111,7 @@ impl VideoFrameDescriptor {
             .iter()
             .map(|bytes| i64::from_le_bytes(*bytes))
             .collect();
-        Self::new(uri, values[0], values[1], values[2], values[3], values[4])
+        Self::new(uri, values[0], values[1], values[2])
     }
 }
 
@@ -158,24 +129,18 @@ mod tests {
         )
         .unwrap();
         let descriptor =
-            VideoFrameDescriptor::new("s3://bucket/视频.mp4".into(), 7, 99, 42, 106, 8).unwrap();
+            VideoFrameDescriptor::new("s3://bucket/视频.mp4".into(), 7, 99, 42).unwrap();
         assert_eq!(descriptor.serialize(), bytes);
         assert_eq!(
             VideoFrameDescriptor::deserialize(&bytes).unwrap(),
             descriptor
         );
-        assert_eq!(
-            descriptor.keyframe_index_descriptor().unwrap(),
-            BlobDescriptor::new("s3://bucket/视频.mp4".into(), 106, 8)
-        );
         assert!(!BlobDescriptor::is_blob_descriptor(&bytes));
     }
 
     #[test]
-    fn descriptors_without_indexes_and_unknown_payload_lengths_round_trip() {
-        let frame =
-            VideoFrameDescriptor::new("memory:/video".into(), 4, -1, i64::MAX, -1, 0).unwrap();
-        assert!(frame.keyframe_index_descriptor().is_none());
+    fn unknown_payload_lengths_round_trip() {
+        let frame = VideoFrameDescriptor::new("memory:/video".into(), 4, -1, i64::MAX).unwrap();
         assert_eq!(
             frame,
             VideoFrameDescriptor::deserialize(&frame.serialize()).unwrap()
@@ -184,7 +149,7 @@ mod tests {
 
     #[test]
     fn malformed_descriptors_are_rejected_without_overflow() {
-        let original = VideoFrameDescriptor::new("x".into(), 0, 1, 0, -1, 0)
+        let original = VideoFrameDescriptor::new("x".into(), 0, 1, 0)
             .unwrap()
             .serialize();
         for length in 0..original.len() {
@@ -208,8 +173,6 @@ mod tests {
             VideoFrameDescriptor::deserialize(&bytes),
             Err(Error::Unsupported { .. })
         ));
-        for (frame, offset, length) in [(-1, -1, 0), (0, 0, 0), (0, -1, 1), (0, 0, -1)] {
-            assert!(VideoFrameDescriptor::new("x".into(), 0, 1, frame, offset, length).is_err());
-        }
+        assert!(VideoFrameDescriptor::new("x".into(), 0, 1, -1).is_err());
     }
 }

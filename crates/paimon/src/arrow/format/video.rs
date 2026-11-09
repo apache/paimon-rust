@@ -16,7 +16,7 @@
 // under the License.
 
 //! Packed video v1 metadata, matching Java VideoFileMeta and VideoFormatReader.
-//! Reading returns frame descriptors; encoded videos and keyframe indexes stay lazy.
+//! Four Delta-Varint arrays and a 21-byte footer; reading returns lazy frame descriptors.
 
 use super::blob::{build_blob_batch, BlobReadValue};
 use super::delta_varint::decode_delta_varints;
@@ -32,11 +32,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 
-const FOOTER_SIZE: u64 = 25;
+const FOOTER_SIZE: u64 = 21;
 const MAGIC: i32 = 0x4F454449;
 const VERSION: u8 = 1;
-const MAX_KEYFRAME_INDEX_BYTES: i64 = 16 * 1024 * 1024;
-const MAX_TOTAL_KEYFRAME_INDEX_BYTES: i64 = 64 * 1024 * 1024;
 
 fn corrupt(message: impl Into<String>) -> Error {
     Error::DataInvalid {
@@ -48,8 +46,6 @@ fn corrupt(message: impl Into<String>) -> Error {
 struct VideoFileMeta {
     physical_lengths: Vec<i64>,
     physical_offsets: Vec<i64>,
-    keyframe_lengths: Vec<i64>,
-    keyframe_offsets: Vec<i64>,
     run_ends: Vec<usize>,
     run_references: Vec<i64>,
     run_first_frames: Vec<i64>,
@@ -65,15 +61,15 @@ impl VideoFileMeta {
         if footer.len() != FOOTER_SIZE as usize {
             return Err(corrupt("short footer read"));
         }
-        if i32::from_le_bytes(footer[20..24].try_into().unwrap()) != MAGIC {
+        if i32::from_le_bytes(footer[16..20].try_into().unwrap()) != MAGIC {
             return Err(corrupt("invalid footer magic"));
         }
-        if footer[24] != VERSION {
+        if footer[20] != VERSION {
             return Err(Error::Unsupported {
-                message: format!("Unsupported video format version {}", footer[24]),
+                message: format!("Unsupported video format version {}", footer[20]),
             });
         }
-        let lengths: Vec<_> = footer[..20]
+        let lengths: Vec<_> = footer[..16]
             .as_chunks::<4>()
             .0
             .iter()
@@ -91,7 +87,7 @@ impl VideoFileMeta {
             return Err(corrupt("short index read"));
         }
         let mut cursor = 0;
-        let mut indexes = Vec::with_capacity(5);
+        let mut indexes = Vec::with_capacity(4);
         for length in lengths {
             let end = cursor + length as usize;
             indexes.push(decode_delta_varints(&index[cursor..end])?);
@@ -99,49 +95,24 @@ impl VideoFileMeta {
         }
         let mut indexes = indexes.into_iter();
         let physical_lengths = indexes.next().unwrap();
-        let keyframe_lengths = indexes.next().unwrap();
         let run_lengths = indexes.next().unwrap();
         let run_references = indexes.next().unwrap();
         let run_first_frames = indexes.next().unwrap();
-        if physical_lengths.len() != keyframe_lengths.len() {
-            return Err(corrupt("physical video and keyframe index counts differ"));
-        }
-        let mut keyframe_size = 0i64;
-        for length in &keyframe_lengths {
-            if !(0..=MAX_KEYFRAME_INDEX_BYTES).contains(length) {
-                return Err(corrupt(
-                    "invalid keyframe index length or index exceeds the 16 MiB limit",
-                ));
-            }
-            keyframe_size += length;
-            if keyframe_size > MAX_TOTAL_KEYFRAME_INDEX_BYTES {
-                return Err(corrupt("keyframe indexes exceed the 64 MiB limit"));
-            }
-        }
         let index_start =
             i64::try_from(index_start).map_err(|_| corrupt("file offset exceeds i64"))?;
-        let keyframe_start = index_start
-            .checked_sub(keyframe_size)
-            .filter(|offset| *offset >= 0)
-            .ok_or_else(|| corrupt("keyframe indexes exceed file size"))?;
         let mut physical_offsets = Vec::with_capacity(physical_lengths.len());
         let mut offset = 0;
         for length in &physical_lengths {
-            if *length <= 0 || *length > keyframe_start - offset {
+            if *length <= 0 || *length > index_start - offset {
                 return Err(corrupt("invalid physical video length"));
             }
             physical_offsets.push(offset);
             offset += length;
         }
-        if offset != keyframe_start {
+        if offset != index_start {
             return Err(corrupt(
                 "physical video lengths do not match payload region",
             ));
-        }
-        let mut keyframe_offsets = Vec::with_capacity(keyframe_lengths.len());
-        for length in &keyframe_lengths {
-            keyframe_offsets.push(offset);
-            offset += length;
         }
         if run_lengths.len() != run_references.len() || run_lengths.len() != run_first_frames.len()
         {
@@ -171,8 +142,6 @@ impl VideoFileMeta {
         Ok(Self {
             physical_lengths,
             physical_offsets,
-            keyframe_lengths,
-            keyframe_offsets,
             run_ends,
             run_references,
             run_first_frames,
@@ -195,18 +164,11 @@ impl VideoFileMeta {
             _ => {
                 let ordinal = reference as usize;
                 let start = if run == 0 { 0 } else { self.run_ends[run - 1] };
-                let length = self.keyframe_lengths[ordinal];
                 let frame = VideoFrameDescriptor::new(
                     path.into(),
                     self.physical_offsets[ordinal],
                     self.physical_lengths[ordinal],
                     self.run_first_frames[run] + (position - start) as i64,
-                    if length == 0 {
-                        -1
-                    } else {
-                        self.keyframe_offsets[ordinal]
-                    },
-                    length,
                 )?;
                 Ok(BlobReadValue::Value(Bytes::from(frame.serialize())))
             }
@@ -315,6 +277,7 @@ mod tests {
     use super::*;
     use crate::btree::test_util::BytesFileRead;
     use crate::spec::{BlobType, IntType};
+    use arrow_array::{Array, LargeBinaryArray};
     use futures::TryStreamExt;
 
     fn java_fixture() -> Bytes {
@@ -328,7 +291,7 @@ mod tests {
         .into()
     }
 
-    fn file(indexes: [&[i64]; 5], payload: &[u8]) -> Bytes {
+    fn file(indexes: [&[i64]; 4], payload: &[u8]) -> Bytes {
         let mut bytes = payload.to_vec();
         let mut lengths = Vec::new();
         for values in indexes {
@@ -345,8 +308,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_java_fixture_preserves_frames_indexes_nulls_and_placeholders() {
+    async fn latest_java_fixture_preserves_frames_nulls_and_placeholders() {
         let bytes = java_fixture();
+        assert_eq!(
+            bytes,
+            file(
+                [
+                    &[3, 4],
+                    &[2, 1, 1, 2, 1],
+                    &[0, -1, -2, 1, 0],
+                    &[2, 0, 0, 7, 10],
+                ],
+                b"abcWXYZ"
+            )
+        );
         let reader = IndexedVideoReader::open(
             &BytesFileRead(bytes.clone()),
             bytes.len() as u64,
@@ -356,12 +331,12 @@ mod tests {
         .unwrap();
         assert_eq!(reader.num_rows(), 7);
         let values = reader.read_positions(&[0, 1, 2, 3, 4, 5, 6]).unwrap();
-        for (index, frame, offset, length, keyframe) in [
-            (0, 2, 0, 3, true),
-            (1, 3, 0, 3, true),
-            (4, 7, 3, 4, false),
-            (5, 8, 3, 4, false),
-            (6, 10, 0, 3, true),
+        for (index, frame, offset, length) in [
+            (0, 2, 0, 3),
+            (1, 3, 0, 3),
+            (4, 7, 3, 4),
+            (5, 8, 3, 4),
+            (6, 10, 0, 3),
         ] {
             let BlobReadValue::Value(bytes) = &values[index] else {
                 panic!("expected frame")
@@ -370,15 +345,56 @@ mod tests {
             assert_eq!(descriptor.frame_index(), frame);
             assert_eq!(descriptor.payload_descriptor().offset(), offset);
             assert_eq!(descriptor.payload_descriptor().length(), length);
-            assert_eq!(descriptor.keyframe_index_descriptor().is_some(), keyframe);
-            if let Some(mapping) = descriptor.keyframe_index_descriptor() {
-                assert_eq!(mapping.offset(), 7);
-                assert_eq!(mapping.length(), 54);
-            }
         }
         assert!(matches!(values[2], BlobReadValue::Null));
         assert!(matches!(values[3], BlobReadValue::Placeholder));
         assert!(reader.read_positions(&[7]).is_err());
+    }
+
+    #[tokio::test]
+    async fn video_metadata_reads_do_not_fetch_payloads() {
+        struct MetadataOnlyRead {
+            bytes: Bytes,
+            ranges: std::sync::Mutex<Vec<std::ops::Range<u64>>>,
+        }
+        #[async_trait]
+        impl FileRead for MetadataOnlyRead {
+            async fn read(&self, range: std::ops::Range<u64>) -> Result<Bytes> {
+                assert!(range.start >= 7, "must not read video payloads");
+                self.ranges.lock().unwrap().push(range.clone());
+                Ok(self.bytes.slice(range.start as usize..range.end as usize))
+            }
+        }
+        let bytes = java_fixture();
+        let size = bytes.len() as u64;
+        let source = MetadataOnlyRead {
+            bytes,
+            ranges: Default::default(),
+        };
+        let reader = IndexedVideoReader::open(&source, size, "file:/data.video".into())
+            .await
+            .unwrap();
+        reader.read_positions(&[6, 0, 4, 1]).unwrap();
+        assert_eq!(
+            *source.ranges.lock().unwrap(),
+            vec![size - 21..size, 7..size - 21]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_video_file_has_no_rows() {
+        let bytes = file([&[], &[], &[], &[]], b"");
+        assert_eq!(bytes.len(), 21);
+        let reader = IndexedVideoReader::open(
+            &BytesFileRead(bytes.clone()),
+            bytes.len() as u64,
+            "unused".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.num_rows(), 0);
+        assert!(reader.read_positions(&[]).unwrap().is_empty());
+        assert!(reader.read_positions(&[0]).is_err());
     }
 
     #[tokio::test]
@@ -409,6 +425,31 @@ mod tests {
             assert!(batches
                 .iter()
                 .all(|batch| batch.num_columns() == fields.len()));
+            if !fields.is_empty() {
+                let first = batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .unwrap();
+                let last = batches[1]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .unwrap();
+                assert_eq!(
+                    VideoFrameDescriptor::deserialize(first.value(0))
+                        .unwrap()
+                        .frame_index(),
+                    3
+                );
+                assert!(first.is_null(1));
+                assert_eq!(
+                    VideoFrameDescriptor::deserialize(last.value(1))
+                        .unwrap()
+                        .frame_index(),
+                    10
+                );
+            }
         }
         for selection in [vec![RowRange::new(7, 7)], vec![RowRange::new(-1, 0)]] {
             assert!(format
@@ -457,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_footer_and_run_indexes_fail_before_returning_rows() {
-        let good = file([&[3], &[0], &[2], &[0], &[0]], b"abc");
+        let good = file([&[3], &[2], &[0], &[0]], b"abc");
         assert_eq!(
             VideoFileMeta::load(&BytesFileRead(good.clone()), good.len() as u64)
                 .await
@@ -476,21 +517,19 @@ mod tests {
         bad.push(bytes.into());
         let mut bytes = good.to_vec();
         let n = bytes.len();
-        bytes[n - 25..n - 21].copy_from_slice(&(-1i32).to_le_bytes());
+        bytes[n - 21..n - 17].copy_from_slice(&(-1i32).to_le_bytes());
         bad.push(bytes.into());
         for indexes in [
-            [&[0][..], &[0], &[1], &[0], &[0]],
-            [&[4][..], &[0], &[1], &[0], &[0]],
-            [&[3][..], &[], &[1], &[0], &[0]],
-            [&[3][..], &[-1], &[1], &[0], &[0]],
-            [&[3][..], &[16 * 1024 * 1024 + 1], &[1], &[0], &[0]],
-            [&[3][..], &[0], &[0], &[0], &[0]],
-            [&[3][..], &[0], &[1], &[1], &[0]],
-            [&[3][..], &[0], &[1], &[-3], &[0]],
-            [&[3][..], &[0], &[1], &[0], &[-1]],
-            [&[3][..], &[0], &[2], &[0], &[i64::MAX]],
-            [&[3][..], &[0], &[i32::MAX as i64, 1], &[0, 0], &[0, 0]],
-            [&[3][..], &[0], &[1], &[0], &[]],
+            [&[0][..], &[1], &[0], &[0]],
+            [&[4][..], &[1], &[0], &[0]],
+            [&[2][..], &[1], &[0], &[0]],
+            [&[3][..], &[0], &[0], &[0]],
+            [&[3][..], &[1], &[1], &[0]],
+            [&[3][..], &[1], &[-3], &[0]],
+            [&[3][..], &[1], &[0], &[-1]],
+            [&[3][..], &[2], &[0], &[i64::MAX]],
+            [&[3][..], &[i32::MAX as i64, 1], &[0, 0], &[0, 0]],
+            [&[3][..], &[1], &[0], &[]],
         ] {
             bad.push(file(indexes, b"abc"));
         }
@@ -501,7 +540,7 @@ mod tests {
                     .is_err()
             );
         }
-        let nulls = file([&[], &[], &[3], &[-1], &[0]], b"");
+        let nulls = file([&[], &[3], &[-1], &[0]], b"");
         let meta = VideoFileMeta::load(&BytesFileRead(nulls.clone()), nulls.len() as u64)
             .await
             .unwrap();
