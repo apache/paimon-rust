@@ -802,11 +802,12 @@ batches, file indexes, caller-owned Arrow input, and allocation overhead are
 not fully charged. A reservation failure does not automatically flush or retry
 a writer; handle the error as a failed write operation.
 
-For formats that support flushing, a data file also flushes when its own
-retained-input reservation reaches `write-buffer-size`, even if encoding (for
-example, a Parquet dictionary) is much smaller. Other consumers' reservations
-do not trigger that file's flush. This may change row-group boundaries; it does
-not make an individual batch larger than the remaining budget admissible.
+For append and postpone-bucket writes, formats that support flushing also flush
+when the current file's retained-input reservation reaches
+`write.parquet-buffer-size` (default 256 MiB). This accounts for inputs such as
+repeated strings whose Arrow buffers can be much larger than the encoded row
+group. The flush decision uses only that file's reservation. Each batch must
+still fit within the available budget before it can be flushed.
 
 The input Arrow schema must match the table schema exactly, including field
 count, order, names, and types. A non-nullable table field must not contain null
