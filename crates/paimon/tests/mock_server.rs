@@ -21,10 +21,10 @@
 //! for testing purposes.
 
 use axum::{
-    extract::{Extension, Json, Path, Query},
-    http::{HeaderMap, StatusCode},
+    extract::{Extension, Json, OriginalUri, Path, Query},
+    http::{HeaderMap, StatusCode, Uri},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
     serve, Router,
 };
 use serde_json::json;
@@ -35,20 +35,27 @@ use tokio::task::JoinHandle;
 
 use paimon::api::{
     AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, AuthTableQueryResponse,
-    ConfigResponse, CreateFunctionRequest, CreatePartitionsRequest, CreateTagRequest,
-    CreateViewRequest, DataPolicy, DropPartitionsRequest, DropPolicyRequest, ErrorResponse,
-    GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetTagResponse, GetViewResponse,
-    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsByFilterRequest,
-    ListPartitionsByNamesRequest, ListPartitionsResponse, ListPermissionsResponse,
-    ListPoliciesResponse, ListTablesResponse, ListViewsResponse, PermissionAssignment,
-    PermissionResource, PolicyRequest, PolicyType, RenameTableRequest, ResourcePaths, ResourceType,
-    RevokePermissionRequest,
+    ConfigResponse, CreateBranchRequest, CreateFunctionRequest, CreatePartitionsRequest,
+    CreateTagRequest, CreateViewRequest, DataPolicy, DropPartitionsRequest, DropPolicyRequest,
+    ErrorResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetTagResponse,
+    GetViewResponse, ListBranchesResponse, ListDatabasesResponse, ListFunctionsResponse,
+    ListPartitionsByFilterRequest, ListPartitionsByNamesRequest, ListPartitionsResponse,
+    ListPermissionsResponse, ListPoliciesResponse, ListTablesResponse, ListViewsResponse,
+    PermissionAssignment, PermissionResource, PolicyRequest, PolicyType, RESTUtil,
+    RenameTableRequest, ResourcePaths, ResourceType, RevokePermissionRequest,
 };
 use paimon::catalog::{Function, Identifier};
 use paimon::spec::{CommitKind, Partition, Snapshot};
 
 type PartitionPageResponse = (Vec<Partition>, Option<String>);
 type PartitionSpecPageResponse = (Vec<HashMap<String, String>>, Option<String>);
+
+fn branch_name_from_uri(uri: &Uri) -> String {
+    // Branch paths use Java's form encoding. Decode the raw segment so spaces
+    // (`+`) remain distinct from literal plus signs (`%2B`), unlike Axum's Path.
+    let (_, suffix) = uri.path().rsplit_once("/branches/").unwrap();
+    RESTUtil::decode_string(suffix.split('/').next().unwrap())
+}
 
 #[derive(Clone, Debug, Default)]
 struct MockState {
@@ -58,6 +65,11 @@ struct MockState {
     views: HashMap<String, GetViewResponse>,
     functions: HashMap<String, GetFunctionResponse>,
     tags: HashMap<String, GetTagResponse>,
+    branches: HashMap<String, Vec<String>>,
+    drop_branch_calls: Vec<(String, String, String)>,
+    fast_forward_calls: Vec<(String, String, String)>,
+    branch_mutation_error: Option<ErrorResponse>,
+    list_branches_error: Option<ErrorResponse>,
     partitions: HashMap<String, Vec<Partition>>,
     partition_page_responses: HashMap<String, Vec<PartitionPageResponse>>,
     partition_list_call_counts: HashMap<String, usize>,
@@ -1163,6 +1175,104 @@ impl RESTServer {
         }
     }
 
+    pub async fn list_branches(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let state = state.inner.lock().unwrap();
+        if let Some(error) = state.list_branches_error.clone() {
+            return Self::error_response(error);
+        }
+        let key = format!("{db}.{table}");
+        if !state.tables.contains_key(&key) {
+            return resource_error(StatusCode::NOT_FOUND, "TABLE", &table);
+        }
+        let branches = state.branches.get(&key).cloned().unwrap_or_default();
+        let response = ListBranchesResponse {
+            branches: Some(branches),
+        };
+        (StatusCode::OK, Json(response)).into_response()
+    }
+
+    pub async fn create_branch(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<CreateBranchRequest>,
+    ) -> impl IntoResponse {
+        let mut state = state.inner.lock().unwrap();
+        if let Some(error) = state.branch_mutation_error.clone() {
+            return Self::error_response(error);
+        }
+        let key = format!("{db}.{table}");
+        if !state.tables.contains_key(&key) {
+            return resource_error(StatusCode::NOT_FOUND, "TABLE", &table);
+        }
+        if let Some(tag) = &request.from_tag {
+            if !state.tags.contains_key(&format!("{key}.{tag}")) {
+                return resource_error(StatusCode::NOT_FOUND, "TAG", tag);
+            }
+        }
+        let branches = state.branches.entry(key).or_default();
+        if branches.contains(&request.branch) {
+            return resource_error(StatusCode::CONFLICT, "BRANCH", &request.branch);
+        }
+        branches.push(request.branch);
+        (StatusCode::OK, Json(json!(""))).into_response()
+    }
+
+    pub async fn drop_branch(
+        Path((db, table, _)): Path<(String, String, String)>,
+        OriginalUri(uri): OriginalUri,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut state = state.inner.lock().unwrap();
+        let branch = branch_name_from_uri(&uri);
+        state
+            .drop_branch_calls
+            .push((db.clone(), table.clone(), branch.clone()));
+        if let Some(error) = state.branch_mutation_error.clone() {
+            return Self::error_response(error);
+        }
+        let key = format!("{db}.{table}");
+        if !state.tables.contains_key(&key) {
+            return resource_error(StatusCode::NOT_FOUND, "TABLE", &table);
+        }
+        let removed = state.branches.get_mut(&key).is_some_and(|branches| {
+            let before = branches.len();
+            branches.retain(|name| name != &branch);
+            branches.len() < before
+        });
+        if !removed {
+            return resource_error(StatusCode::NOT_FOUND, "BRANCH", &branch);
+        }
+        (StatusCode::OK, Json(json!(""))).into_response()
+    }
+
+    pub async fn fast_forward(
+        Path((db, table, _)): Path<(String, String, String)>,
+        OriginalUri(uri): OriginalUri,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut state = state.inner.lock().unwrap();
+        if let Some(error) = state.branch_mutation_error.clone() {
+            return Self::error_response(error);
+        }
+        let branch = branch_name_from_uri(&uri);
+        let key = format!("{db}.{table}");
+        if !state.tables.contains_key(&key) {
+            return resource_error(StatusCode::NOT_FOUND, "TABLE", &table);
+        }
+        if !state
+            .branches
+            .get(&key)
+            .is_some_and(|branches| branches.contains(&branch))
+        {
+            return resource_error(StatusCode::NOT_FOUND, "BRANCH", &branch);
+        }
+        state.fast_forward_calls.push((db, table, branch));
+        (StatusCode::OK, Json(json!(""))).into_response()
+    }
+
     /// Handle POST /databases/:db/tables/:table/partitions - create partitions.
     pub async fn create_partitions(
         Path((db, table)): Path<(String, String)>,
@@ -1627,14 +1737,14 @@ impl RESTServer {
         )
     }
 
-    fn policy_error(error: ErrorResponse) -> axum::response::Response {
+    fn error_response(error: ErrorResponse) -> axum::response::Response {
         let status = StatusCode::from_u16(error.code.unwrap_or(500) as u16)
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         (status, Json(error)).into_response()
     }
 
     fn table_not_found(table: &str) -> axum::response::Response {
-        Self::policy_error(ErrorResponse::new(
+        Self::error_response(ErrorResponse::new(
             Some("TABLE".to_string()),
             Some(table.to_string()),
             Some("Table not found".to_string()),
@@ -1699,7 +1809,7 @@ impl RESTServer {
         let mut inner = state.inner.lock().unwrap();
         inner.create_policy_bodies.push(body.clone());
         if let Some(error) = inner.create_policy_error.clone() {
-            return Self::policy_error(error);
+            return Self::error_response(error);
         }
         let request: PolicyRequest = match serde_json::from_value(body) {
             Ok(request) => request,
@@ -1733,7 +1843,7 @@ impl RESTServer {
                 Some(column) => format!("{policy_type}:{principal}:{column}"),
                 None => format!("{policy_type}:{principal}"),
             };
-            return Self::policy_error(ErrorResponse::new(
+            return Self::error_response(ErrorResponse::new(
                 Some(ErrorResponse::RESOURCE_TYPE_POLICY.to_string()),
                 Some(name),
                 Some("Policy already exists.".to_string()),
@@ -1753,7 +1863,7 @@ impl RESTServer {
         let mut inner = state.inner.lock().unwrap();
         inner.drop_policy_bodies.push(body.clone());
         if let Some(error) = inner.drop_policy_error.clone() {
-            return Self::policy_error(error);
+            return Self::error_response(error);
         }
         let request: DropPolicyRequest = match serde_json::from_value(body) {
             Ok(request) => request,
@@ -1772,7 +1882,7 @@ impl RESTServer {
         let before = policies.len();
         policies.retain(|policy| Self::policy_identity(policy) != identity);
         if policies.len() == before {
-            return Self::policy_error(ErrorResponse::new(
+            return Self::error_response(ErrorResponse::new(
                 Some(ErrorResponse::RESOURCE_TYPE_POLICY.to_string()),
                 Some(format!("{}:{}", request.policy_type, request.principal)),
                 Some("Policy does not exist.".to_string()),
@@ -2314,6 +2424,61 @@ impl RESTServer {
         self.inner.lock().unwrap().drop_policy_error = error;
     }
 
+    /// Register a tag of `database.table` pointing at snapshot 1.
+    pub fn add_tag(&self, database: &str, table: &str, tag: &str) {
+        self.inner.lock().unwrap().tags.insert(
+            format!("{database}.{table}.{tag}"),
+            GetTagResponse {
+                tag_name: tag.to_string(),
+                snapshot: tag_snapshot(1),
+                tag_create_time: None,
+                tag_time_retained: None,
+            },
+        );
+    }
+
+    /// Register a branch of `database.table` in the catalog.
+    pub fn add_branch(&self, database: &str, table: &str, branch: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .branches
+            .entry(format!("{database}.{table}"))
+            .or_default()
+            .push(branch.to_string());
+    }
+
+    /// Branches of `database.table` known to the catalog, in creation order.
+    pub fn branches(&self, database: &str, table: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .branches
+            .get(&format!("{database}.{table}"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Branch-drop attempts received by the server, including failed requests.
+    pub fn drop_branch_calls(&self) -> Vec<(String, String, String)> {
+        self.inner.lock().unwrap().drop_branch_calls.clone()
+    }
+
+    /// Successful fast-forward calls, as `(db, table, branch)`.
+    pub fn fast_forward_calls(&self) -> Vec<(String, String, String)> {
+        self.inner.lock().unwrap().fast_forward_calls.clone()
+    }
+
+    /// Make every branch mutation answer with `error` (status from its `code`).
+    pub fn set_branch_mutation_error(&self, error: Option<ErrorResponse>) {
+        self.inner.lock().unwrap().branch_mutation_error = error;
+    }
+
+    /// Make every list-branches call answer with `error` (status from its `code`).
+    pub fn set_list_branches_error(&self, error: Option<ErrorResponse>) {
+        self.inner.lock().unwrap().list_branches_error = error;
+    }
+
     /// Return all create-partitions calls received by the server.
     pub fn create_partitions_calls(&self) -> Vec<(String, String, CreatePartitionsRequest)> {
         self.inner.lock().unwrap().create_partitions_calls.clone()
@@ -2456,6 +2621,18 @@ pub async fn start_mock_server(
         .route(
             &format!("{prefix}/databases/:db/tables/:table/tags/:tag"),
             get(RESTServer::get_tag).delete(RESTServer::delete_tag),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/branches"),
+            get(RESTServer::list_branches).post(RESTServer::create_branch),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/branches/:branch"),
+            delete(RESTServer::drop_branch),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/branches/:branch/forward"),
+            post(RESTServer::fast_forward),
         )
         .route(
             &format!("{prefix}/databases/:db/tables/:table/partitions"),
