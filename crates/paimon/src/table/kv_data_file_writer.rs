@@ -436,6 +436,7 @@ pub(super) struct KeyValueRollingWriter<'a> {
     target_size: i64,
     target_rows: usize,
     factory: Option<Arc<dyn FormatWriterFactory>>,
+    first_file_ordinal: usize,
     current: Option<KeyValueDataFileWriter<'a>>,
     files: Vec<DataFileMeta>,
 }
@@ -451,9 +452,21 @@ impl<'a> KeyValueRollingWriter<'a> {
             target_size,
             target_rows: target_rows.try_into().unwrap_or(usize::MAX),
             factory: None,
+            first_file_ordinal: 0,
             current: None,
             files: vec![],
         }
+    }
+
+    /// Continue output file numbering across write-buffer flushes.
+    pub(super) fn with_first_file_ordinal(mut self, first_file_ordinal: usize) -> Self {
+        self.first_file_ordinal = first_file_ordinal;
+        self
+    }
+
+    /// Rows available in the current file, or a new file when none is open.
+    pub(super) fn remaining_rows(&self) -> usize {
+        self.target_rows - self.current.as_ref().map_or(0, |file| file.rows())
     }
 
     pub(super) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -468,7 +481,7 @@ impl<'a> KeyValueRollingWriter<'a> {
                         .open(
                             &batch.schema(),
                             self.factory.as_ref().unwrap().as_ref(),
-                            self.files.len(),
+                            self.first_file_ordinal + self.files.len(),
                         )
                         .await?,
                 );
