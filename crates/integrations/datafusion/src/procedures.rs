@@ -1411,7 +1411,7 @@ fn parse_partitions(table: &Table, partitions: &str) -> DFResult<Predicate> {
     Ok(Predicate::or(alternatives))
 }
 
-fn parse_partition_value(
+pub(crate) fn parse_partition_value(
     value: &str,
     data_type: &DataType,
     legacy_partition_name: bool,
