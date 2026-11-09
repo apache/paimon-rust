@@ -3974,23 +3974,41 @@ enum TimeTravelClause {
     TimestampMillis(i64),
 }
 
-/// Check whether a SQL string contains a time-travel keyword (`VERSION AS OF` or
-/// `TIMESTAMP AS OF`) **outside** of single-quoted string literals, `--` line
-/// comments, and `/* */` block comments.
+/// Locate the table before a time-travel keyword without treating delimiters
+/// inside quoted identifiers as boundaries.
+fn time_travel_table_before(prefix: &str) -> (usize, &str) {
+    let prefix = prefix.trim_end();
+    let mut quote = None;
+    for (index, ch) in prefix.char_indices().rev() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+        } else if matches!(ch, '"' | '`') {
+            // Adjacent escaped quotes toggle the quote state twice.
+            quote = Some(ch);
+        } else if ch.is_whitespace() || matches!(ch, ',' | '(') {
+            let start = index + ch.len_utf8();
+            return (start, &prefix[start..]);
+        }
+    }
+    (0, prefix)
+}
+
+/// Check for a time-travel keyword outside quoted strings, identifiers, and comments.
 fn contains_time_travel_keyword(sql: &str) -> bool {
-    let lower = sql.to_lowercase();
-    let bytes = lower.as_bytes();
+    let bytes = sql.as_bytes();
     let len = bytes.len();
     let mut i = 0;
     while i < len {
         match bytes[i] {
-            b'\'' => {
-                // Skip string literal
+            quote @ (b'\'' | b'"' | b'`') => {
+                // Skip a quoted string or identifier, including doubled quotes.
                 i += 1;
                 while i < len {
-                    if bytes[i] == b'\'' {
+                    if bytes[i] == quote {
                         i += 1;
-                        if i < len && bytes[i] == b'\'' {
+                        if i < len && bytes[i] == quote {
                             i += 1; // escaped quote
                         } else {
                             break;
@@ -4034,24 +4052,22 @@ fn contains_time_travel_keyword(sql: &str) -> bool {
 }
 
 /// Extract **all** `VERSION AS OF <n>` or `VERSION AS OF '<tag>'` clauses from a
-/// SQL string, skipping string literals and comments.
+/// SQL string, skipping quoted strings, identifiers, and comments.
 fn extract_all_version_as_of(sql: &str) -> Vec<VersionAsOfInfo> {
-    let lower = sql.to_lowercase();
-    let bytes = lower.as_bytes();
+    let bytes = sql.as_bytes();
     let len = bytes.len();
-    let sql_bytes = sql.as_bytes();
     let mut i = 0;
     let mut results = Vec::new();
 
     while i < len {
         match bytes[i] {
-            b'\'' => {
-                // Skip string literal
+            quote @ (b'\'' | b'"' | b'`') => {
+                // Skip a quoted string or identifier, including doubled quotes.
                 i += 1;
                 while i < len {
-                    if sql_bytes[i] == b'\'' {
+                    if bytes[i] == quote {
                         i += 1;
-                        if i < len && sql_bytes[i] == b'\'' {
+                        if i < len && bytes[i] == quote {
                             i += 1; // escaped quote
                         } else {
                             break;
@@ -4114,17 +4130,11 @@ fn extract_all_version_as_of(sql: &str) -> Vec<VersionAsOfInfo> {
                         val_start + version.len()
                     };
 
-                    // Walk backwards from kw_start to find the table name boundary
-                    let table_end = sql[..kw_start].trim_end_matches(' ').len();
-                    let table_start = sql[..table_end]
-                        .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(')
-                        .map(|idx| idx + 1)
-                        .unwrap_or(0);
-                    let table_name = sql[table_start..table_end].to_string();
+                    let (table_start, table_name) = time_travel_table_before(&sql[..kw_start]);
 
                     if !table_name.is_empty() {
                         results.push(VersionAsOfInfo {
-                            table_name,
+                            table_name: table_name.to_string(),
                             version,
                             clause_range: (table_start, val_end),
                         });
@@ -4141,25 +4151,23 @@ fn extract_all_version_as_of(sql: &str) -> Vec<VersionAsOfInfo> {
     results
 }
 
-/// Extract **all** `TIMESTAMP AS OF '<ts>'` clauses from a SQL string, skipping
-/// string literals and comments.
+/// Extract all time-travel timestamp clauses outside quoted strings,
+/// identifiers, and comments.
 fn extract_all_timestamp_as_of(sql: &str) -> Vec<TimestampAsOfInfo> {
-    let lower = sql.to_lowercase();
-    let bytes = lower.as_bytes();
+    let bytes = sql.as_bytes();
     let len = bytes.len();
-    let sql_bytes = sql.as_bytes();
     let mut i = 0;
     let mut results = Vec::new();
 
     while i < len {
         match bytes[i] {
-            b'\'' => {
-                // Skip string literal
+            quote @ (b'\'' | b'"' | b'`') => {
+                // Skip a quoted string or identifier, including doubled quotes.
                 i += 1;
                 while i < len {
-                    if sql_bytes[i] == b'\'' {
+                    if bytes[i] == quote {
                         i += 1;
-                        if i < len && sql_bytes[i] == b'\'' {
+                        if i < len && bytes[i] == quote {
                             i += 1; // escaped quote
                         } else {
                             break;
@@ -4202,17 +4210,11 @@ fn extract_all_timestamp_as_of(sql: &str) -> Vec<TimestampAsOfInfo> {
                         let timestamp = remaining[1..close_quote + 1].to_string();
                         let val_end = val_start + close_quote + 2; // skip both quotes
 
-                        // Walk backwards to find the table name boundary
-                        let table_end = sql[..kw_start].trim_end_matches(' ').len();
-                        let table_start = sql[..table_end]
-                            .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(')
-                            .map(|idx| idx + 1)
-                            .unwrap_or(0);
-                        let table_name = sql[table_start..table_end].to_string();
+                        let (table_start, table_name) = time_travel_table_before(&sql[..kw_start]);
 
                         if !table_name.is_empty() {
                             results.push(TimestampAsOfInfo {
-                                table_name,
+                                table_name: table_name.to_string(),
                                 timestamp,
                                 clause_range: (table_start, val_end),
                             });
@@ -9114,6 +9116,28 @@ mod tests {
     }
 
     #[test]
+    fn test_time_travel_keeps_quoted_table_reference() {
+        let table = r#"paimon."my db"."with ""quote"", (space""#;
+        let version_sql = format!("SELECT 'İ' FROM {table} VERSION AS OF 1");
+        let versions = extract_all_version_as_of(&version_sql);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].table_name, table);
+        assert_eq!(
+            &version_sql[versions[0].clause_range.0..versions[0].clause_range.1],
+            format!("{table} VERSION AS OF 1")
+        );
+
+        let timestamp_sql = format!("SELECT 'İ' FROM {table} TIMESTAMP AS OF '2024-01-01'");
+        let timestamps = extract_all_timestamp_as_of(&timestamp_sql);
+        assert_eq!(timestamps.len(), 1);
+        assert_eq!(timestamps[0].table_name, table);
+        assert_eq!(
+            &timestamp_sql[timestamps[0].clause_range.0..timestamps[0].clause_range.1],
+            format!("{table} TIMESTAMP AS OF '2024-01-01'")
+        );
+    }
+
+    #[test]
     fn test_contains_time_travel_keyword() {
         assert!(contains_time_travel_keyword(
             "SELECT * FROM t VERSION AS OF 1"
@@ -9131,6 +9155,12 @@ mod tests {
         ));
         assert!(!contains_time_travel_keyword(
             "SELECT * FROM t /* timestamp as of now */ WHERE id > 0"
+        ));
+        assert!(!contains_time_travel_keyword(
+            r#"SELECT * FROM "version as of 1""#
+        ));
+        assert!(!contains_time_travel_keyword(
+            "SELECT * FROM `timestamp as of now`"
         ));
         // No keyword at all
         assert!(!contains_time_travel_keyword("SELECT * FROM t"));
