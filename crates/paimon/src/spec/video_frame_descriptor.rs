@@ -22,7 +22,7 @@ use crate::{Error, Result};
 
 const VERSION: u8 = 1;
 const MAGIC: i64 = 0x564944454F46524D;
-const FIXED_LENGTH: usize = 1 + 8 + 4 + 3 * 8;
+const FIXED_LENGTH: usize = 1 + 8 + 4 + 5 * 8;
 
 /// One logical frame in an encoded video.
 /// The payload is the complete encoded video; `frame_index` locates the frame.
@@ -30,6 +30,8 @@ const FIXED_LENGTH: usize = 1 + 8 + 4 + 3 * 8;
 pub struct VideoFrameDescriptor {
     payload: BlobDescriptor,
     frame_index: i64,
+    moov_offset: i64,
+    moov_length: i64,
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -48,7 +50,33 @@ impl VideoFrameDescriptor {
         Ok(Self {
             payload: BlobDescriptor::new(uri, offset, length),
             frame_index,
+            moov_offset: 0,
+            moov_length: 0,
         })
+    }
+
+    /// Set the moov range relative to the payload start; zero length means absent.
+    pub fn with_moov(mut self, offset: i64, length: i64) -> Result<Self> {
+        if offset < 0
+            || length < 0
+            || (length == 0 && offset != 0)
+            || (length > 0
+                && (offset > self.payload.length() || length > self.payload.length() - offset))
+        {
+            return Err(invalid("moov range exceeds video payload"));
+        }
+        self.moov_offset = offset;
+        self.moov_length = length;
+        Ok(self)
+    }
+
+    /// Moov offset relative to the payload.
+    pub fn moov_offset(&self) -> i64 {
+        self.moov_offset
+    }
+    /// Moov byte length, or zero when absent.
+    pub fn moov_length(&self) -> i64 {
+        self.moov_length
     }
 
     /// Physical video identity, without the logical frame locator.
@@ -70,6 +98,8 @@ impl VideoFrameDescriptor {
             self.payload.offset(),
             self.payload.length(),
             self.frame_index,
+            self.moov_offset,
+            self.moov_length,
         ] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
@@ -111,7 +141,7 @@ impl VideoFrameDescriptor {
             .iter()
             .map(|bytes| i64::from_le_bytes(*bytes))
             .collect();
-        Self::new(uri, values[0], values[1], values[2])
+        Self::new(uri, values[0], values[1], values[2])?.with_moov(values[3], values[4])
     }
 }
 
