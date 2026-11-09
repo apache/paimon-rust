@@ -207,12 +207,16 @@ hyper-util@0.1.20											X
 iana-time-zone@0.1.65		X									X							
 iana-time-zone-haiku@0.1.2		X									X							
 icu_collections@2.2.0														X				
+icu_locale@2.2.0														X				
 icu_locale_core@2.2.0														X				
+icu_locale_data@2.2.0														X				
 icu_normalizer@2.2.0														X				
 icu_normalizer_data@2.2.0														X				
 icu_properties@2.2.0														X				
 icu_properties_data@2.2.0														X				
 icu_provider@2.2.0														X				
+icu_segmenter@2.2.0														X				
+icu_segmenter_data@2.2.0														X				
 ident_case@1.0.1		X									X							
 idna@1.1.0		X									X							
 idna_adapter@1.2.2		X									X							
@@ -310,7 +314,7 @@ ordered-multimap@0.7.3											X
 ownedbytes@0.9.0											X							
 paimon@0.6.0		X																
 paimon-datafusion@0.6.0		X																
-paimon-ftindex-core@0.1.0		X																
+paimon-ftindex-core@0.2.0		X																
 paimon-mosaic-core@0.3.0		X																
 paimon-tpcds-bench@0.6.0		X																
 paimon-vindex-core@0.5.0		X																
