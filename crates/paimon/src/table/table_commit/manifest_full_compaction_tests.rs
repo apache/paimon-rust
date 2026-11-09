@@ -459,3 +459,175 @@ async fn full_compaction_keeps_manifests_whose_delete_count_is_understated() {
     assert_eq!(merged, input);
     assert!(created.is_empty());
 }
+
+/// A write-only table partitioned by a DOUBLE column.
+fn double_partitioned_table(io: &FileIO, path: &str, options: &[(&str, &str)]) -> TableCommit {
+    let mut builder = crate::spec::Schema::builder()
+        .column("pt", DataType::Double(crate::spec::DoubleType::new()))
+        .column("id", DataType::Int(crate::spec::IntType::new()))
+        .partition_keys(["pt"])
+        .option("write-only", "true");
+    for (key, value) in options {
+        builder = builder.option(*key, *value);
+    }
+    let table = Table::new(
+        io.clone(),
+        Identifier::new("default", "test_table"),
+        path.to_string(),
+        TableSchema::new(0, &builder.build().unwrap()),
+        None,
+    );
+    TableCommit::new(table, "test-user".into())
+}
+
+fn double_partition(value: f64) -> Vec<u8> {
+    let mut builder = BinaryRowBuilder::new(1);
+    let partition_type = DataType::Double(crate::spec::DoubleType::new());
+    builder.write_datum(0, &Datum::Double(value), &partition_type);
+    builder.build_serialized()
+}
+
+fn deletion_of(partition: &[u8], name: &str) -> CommitMessage {
+    let mut deletion = CommitMessage::new(partition.to_vec(), 0, vec![]);
+    deletion.deleted_files.push(test_data_file(name, 1));
+    deletion
+}
+
+#[tokio::test]
+async fn full_compaction_reads_every_manifest_of_a_float_partitioned_table() {
+    // Rust before #1190 wrote the statistics of [3.0, NaN, 5.0] as min = max =
+    // 5.0. The test fakes those statistics. Pruning on them skips the manifest
+    // that adds x, so the compaction would drop the DELETE of x and bring x
+    // back.
+    let io = test_file_io();
+    let path = "memory:/manifest-full-compaction-float-partition";
+    setup_dirs(&io, path).await;
+    // A one-byte target keeps minor merging idle, and only the manifest
+    // holding the DELETE must change.
+    let writer = double_partitioned_table(&io, path, &[("manifest.target-file-size", "1 b")]);
+    let (three, five) = (double_partition(3.0), double_partition(5.0));
+    for messages in [
+        vec![
+            CommitMessage::new(three.clone(), 0, vec![test_data_file("x.parquet", 1)]),
+            CommitMessage::new(five.clone(), 0, vec![test_data_file("y.parquet", 1)]),
+        ],
+        vec![deletion_of(&three, "x.parquet")],
+        // A second manifest in the deleted partition: without it, a compaction
+        // that skips the first manifest has one manifest to merge and falls
+        // back to a minor merge.
+        vec![CommitMessage::new(
+            three,
+            0,
+            vec![test_data_file("z.parquet", 1)],
+        )],
+    ] {
+        writer.commit(messages).await.unwrap();
+    }
+    let mut input = base_manifests(&io, path).await;
+    input.extend(delta_manifests(&io, path).await);
+    assert_eq!(input.len(), 3);
+    let first = &input[0];
+    assert_eq!((first.num_added_files(), first.num_deleted_files()), (2, 0));
+    let in_five = ManifestEntry::new(FileKind::Add, five, 0, 1, test_data_file("y.parquet", 1), 2);
+    input[0] = ManifestFileMeta::new(
+        first.file_name().to_string(),
+        first.file_size(),
+        first.num_added_files(),
+        first.num_deleted_files(),
+        writer.compute_partition_stats(&[in_five]).unwrap(),
+        first.schema_id(),
+    );
+
+    let merger = double_partitioned_table(
+        &io,
+        path,
+        &[
+            ("manifest.target-file-size", "1 b"),
+            ("manifest.full-compaction-threshold-size", "1 b"),
+        ],
+    );
+    let mut created = Vec::new();
+    let merged = merger.merge_manifests(input, &mut created).await.unwrap();
+    let mut entries = Vec::new();
+    for manifest in &merged {
+        let manifest_path = format!("{path}/manifest/{}", manifest.file_name());
+        entries.extend(Manifest::read(&io, &manifest_path).await.unwrap());
+    }
+    let deleted = entries
+        .iter()
+        .filter(|entry| *entry.kind() == FileKind::Delete)
+        .map(ManifestEntry::identifier)
+        .collect::<HashSet<_>>();
+    let scanned = entries
+        .iter()
+        .filter(|entry| *entry.kind() == FileKind::Add && !deleted.contains(&entry.identifier()))
+        .map(|entry| entry.file().file_name.clone())
+        .collect::<HashSet<_>>();
+    let listed = merge_active_entries(entries)
+        .into_iter()
+        .map(|entry| entry.file().file_name.clone())
+        .collect::<HashSet<_>>();
+    let expected = HashSet::from(["y.parquet".to_string(), "z.parquet".to_string()]);
+    assert_eq!(scanned, expected, "scan reader");
+    assert_eq!(listed, expected, "ordered reader");
+    // The full compaction ran: it dropped every DELETE.
+    assert_no_delete_entries(&io, path, &merged).await;
+}
+
+#[tokio::test]
+async fn full_compaction_keeps_a_file_in_a_nan_partition_deleted() {
+    // With x deleted in partition NaN and z in 1.0, pruning bounds depended on
+    // the order of a hash set, and about half the orders skipped the manifest
+    // that adds x. Each run builds a new set.
+    for run in 0..8 {
+        let io = test_file_io();
+        let path = format!("memory:/manifest-full-compaction-nan-partition-{run}");
+        let path = path.as_str();
+        setup_dirs(&io, path).await;
+        let writer = double_partitioned_table(&io, path, &[("manifest.target-file-size", "1 b")]);
+        let (nan, one) = (double_partition(f64::NAN), double_partition(1.0));
+        for messages in [
+            vec![
+                CommitMessage::new(nan.clone(), 0, vec![test_data_file("x.parquet", 1)]),
+                CommitMessage::new(
+                    double_partition(5.0),
+                    0,
+                    vec![test_data_file("y.parquet", 1)],
+                ),
+            ],
+            vec![CommitMessage::new(
+                one.clone(),
+                0,
+                vec![test_data_file("z.parquet", 1)],
+            )],
+            vec![
+                deletion_of(&nan, "x.parquet"),
+                deletion_of(&one, "z.parquet"),
+            ],
+        ] {
+            writer.commit(messages).await.unwrap();
+        }
+
+        let merger = double_partitioned_table(
+            &io,
+            path,
+            &[
+                ("manifest.target-file-size", "1 b"),
+                ("manifest.full-compaction-threshold-size", "1 b"),
+            ],
+        );
+        let unrelated = vec![test_data_file("unrelated.parquet", 1)];
+        merger
+            .commit(vec![CommitMessage::new(one, 0, unrelated)])
+            .await
+            .unwrap();
+
+        let expected = vec![
+            ("unrelated.parquet".to_string(), 0),
+            ("y.parquet".to_string(), 0),
+        ];
+        let actual = live_files_by_reader(&merger, &io, path).await;
+        assert_eq!(actual, [expected.clone(), expected], "run {run}");
+        assert_no_delete_entries(&io, path, &base_manifests(&io, path).await).await;
+    }
+}

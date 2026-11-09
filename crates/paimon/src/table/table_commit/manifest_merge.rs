@@ -16,34 +16,27 @@
 // under the License.
 
 //! Commit-time manifest merging, ported from Java `ManifestFileLegacyMerger`.
-//!
-//! A minor merge drops every ADD of a file that the same group deletes but
-//! keeps one DELETE. Java `FileEntry.mergeEntries` drops both when the ADD comes
-//! first, and throws when an ADD follows the DELETE. Rust commits can add a file
-//! more than once, and an ADD of that file outside the group would otherwise
-//! become live. Scans, which ignore entry order, see the same live files before
-//! and after a minor merge. The ordered `merge_active_entries` does too, unless
-//! the group adds a file again after deleting it; it can then stop listing that
-//! file, which scans already treat as deleted. A full compaction drops every
-//! DELETE and, like Java, relies on partition statistics to find the manifests
-//! that may hold the ADD of a deleted file.
+//! `merge_group_entries` and `try_full_compaction` describe the rules.
 
 use super::*;
-use crate::spec::avro::from_avro_bytes_fast;
 use crate::spec::avro::ocf::parse_ocf_streaming;
 use crate::spec::avro::schema::{FieldSchema, WriterSchema};
+use crate::spec::avro::{
+    from_manifest_bytes_filtered_shared, visit_slim_manifest_entries, SharedSchemaCache,
+};
 use crate::spec::Identifier;
 use futures::{Stream, StreamExt, TryStreamExt};
 use std::sync::LazyLock;
 
-/// Commit-time merge settings. `target_size` comes from the
-/// `manifest_target_size` field; the others are read from table options on
-/// every merge.
+/// Commit-time merge settings, and the schema cache shared by one merge's
+/// reads. `target_size` comes from the `manifest_target_size` field; the
+/// others are read from table options on every merge.
 struct MergeConfig {
     target_size: i64,
     full_compaction_threshold: i64,
     min_count: usize,
     read_parallelism: usize,
+    schema_cache: SharedSchemaCache,
 }
 
 impl MergeConfig {
@@ -74,6 +67,7 @@ impl TableCommit {
             full_compaction_threshold: options.manifest_full_compaction_threshold_size()?,
             min_count: options.manifest_merge_min_count()?,
             read_parallelism: options.scan_manifest_parallelism()?,
+            schema_cache: SharedSchemaCache::new(),
         };
         if let Some(merged) = self
             .try_full_compaction(&input, &config, created_files)
@@ -118,10 +112,11 @@ impl TableCommit {
     /// Java `tryFullCompaction`: once the manifests that must change reach the
     /// threshold, rewrite them together with every manifest that holds the ADD
     /// of a deleted file, dropping every DELETE entry and those ADDs. Like
-    /// Java, it finds those manifests through partition statistics; when the
-    /// statistics are correct, scans see the same live files afterwards. The
-    /// ordered reader stops listing a deleted file with an ADD after its last
-    /// DELETE; scans already treat that file as deleted.
+    /// Java, it finds those manifests through partition statistics; a table
+    /// with a FLOAT or DOUBLE partition key reads every manifest instead. When
+    /// the statistics are correct, scans see the same live files afterwards.
+    /// The ordered reader stops listing a deleted file with an ADD after its
+    /// last DELETE; scans already treat that file as deleted.
     async fn try_full_compaction(
         &self,
         input: &[ManifestFileMeta],
@@ -178,32 +173,19 @@ impl TableCommit {
             .filter(|manifest| manifest.num_deleted_files() > 0)
             .cloned()
             .collect::<Vec<_>>();
-        let manifest_dir = self.snapshot_manager.manifest_dir();
-        let mut contents = std::pin::pin!(read_manifests(
-            self.snapshot_manager.file_io(),
-            &manifest_dir,
+        let mut contents = std::pin::pin!(self.read_manifests(
             &with_deletes,
-            config.read_parallelism,
+            config,
+            |_, bytes, cache| decode_deleted_identifiers(bytes, cache)
         ));
         let mut deleted = HashSet::new();
-        let mut read = 0;
-        while let Some(content) = contents.try_next().await? {
+        while let Some((manifest, content)) = contents.try_next().await? {
             // A manifest with DELETEs must change, so it would be rewritten.
             if !content.rewritable {
-                log::warn!(
-                    "Skipping manifest full compaction: {} has fields that a rewrite would drop",
-                    with_deletes[read].file_name()
-                );
+                warn_full_compaction_skipped(&manifest);
                 return Ok(None);
             }
-            deleted.extend(
-                content
-                    .entries
-                    .into_iter()
-                    .filter(|entry| *entry.kind() == FileKind::Delete)
-                    .map(ManifestEntry::into_identifier),
-            );
-            read += 1;
+            deleted.extend(content.entries);
         }
         Ok(Some(deleted))
     }
@@ -216,12 +198,19 @@ impl TableCommit {
         deleted: &HashSet<Identifier>,
     ) -> impl Fn(&ManifestFileMeta) -> bool {
         let partition_fields = self.table.schema().partition_fields();
-        let filter = if deleted.is_empty() || partition_fields.is_empty() {
+        // The filter and the manifest statistics order NaN differently, and Rust
+        // before #1190 and pypaimon write order-dependent float statistics.
+        // Pruning could skip the ADD of a deleted file and bring that file back.
+        let float_key = partition_fields
+            .iter()
+            .any(|field| matches!(field.data_type(), DataType::Float(_) | DataType::Double(_)));
+        let filter = if deleted.is_empty() || partition_fields.is_empty() || float_key {
             None
         } else {
             let partitions = deleted.iter().map(|id| id.partition.clone()).collect();
             match PartitionFilter::from_partition_set(partitions, &partition_fields) {
                 Ok(filter) => Some(filter),
+                // The filter only prunes; reading every manifest finds a superset.
                 Err(error) => {
                     log::warn!(
                         "Manifest full compaction reads every manifest: no filter for the deleted partitions: {error}"
@@ -251,32 +240,32 @@ impl TableCommit {
         config: &MergeConfig,
         result: &mut Vec<ManifestFileMeta>,
     ) -> Result<Option<Vec<ManifestEntry>>> {
-        let manifest_dir = self.snapshot_manager.manifest_dir();
-        let mut contents = std::pin::pin!(read_manifests(
-            self.snapshot_manager.file_io(),
-            &manifest_dir,
-            to_be_merged,
-            config.read_parallelism,
-        ));
+        let mut contents =
+            std::pin::pin!(
+                self.read_manifests(to_be_merged, config, |manifest, bytes, cache| {
+                    // `read_deleted_entries` read every DELETE of a manifest whose
+                    // metadata counts any. Other manifests are decoded in full so
+                    // that `classify_entries` sees an uncounted DELETE.
+                    let rows = if manifest.num_deleted_files() > 0 {
+                        DecodeRows::SkipDeletes
+                    } else {
+                        DecodeRows::All
+                    };
+                    decode_entries(bytes, cache, rows)
+                })
+            );
         let mut kept = Vec::new();
         let mut rewritten = Vec::new();
-        for manifest in to_be_merged {
-            let content =
-                contents
-                    .try_next()
-                    .await?
-                    .ok_or_else(|| crate::Error::UnexpectedError {
-                        message: format!("manifest '{}' was not read", manifest.file_name()),
-                        source: None,
-                    })?;
-            let Some((require_change, adds)) = classify_entries(manifest, content, deleted, config)
+        while let Some((manifest, content)) = contents.try_next().await? {
+            let Some((require_change, adds)) =
+                classify_entries(&manifest, content, deleted, config)
             else {
                 return Ok(None);
             };
             if require_change {
                 rewritten.extend(adds);
             } else {
-                kept.push(manifest.clone());
+                kept.push(manifest);
             }
         }
         result.extend(kept);
@@ -292,13 +281,10 @@ impl TableCommit {
         if candidates.len() <= 1 {
             return Ok(candidates);
         }
-        let manifest_dir = self.snapshot_manager.manifest_dir();
-        let mut contents = std::pin::pin!(read_manifests(
-            self.snapshot_manager.file_io(),
-            &manifest_dir,
-            &candidates,
-            config.read_parallelism,
-        ));
+        let mut contents =
+            std::pin::pin!(self.read_manifests(&candidates, config, |_, bytes, cache| {
+                decode_entries(bytes, cache, DecodeRows::All)
+            }));
         let names = || {
             candidates
                 .iter()
@@ -306,18 +292,16 @@ impl TableCommit {
                 .collect::<Vec<_>>()
         };
         let mut entries = Vec::new();
-        let mut read = 0;
-        while let Some(manifest) = contents.try_next().await? {
-            if !manifest.rewritable {
+        while let Some((manifest, content)) = contents.try_next().await? {
+            if !content.rewritable {
                 log::warn!(
                     "Keeping manifests {:?} unmerged: {} has fields that a rewrite would drop",
                     names(),
-                    candidates[read].file_name()
+                    manifest.file_name()
                 );
                 return Ok(candidates);
             }
-            entries.extend(manifest.entries);
-            read += 1;
+            entries.extend(content.entries);
         }
         let Some(merged) = merge_group_entries(entries) else {
             log::warn!(
@@ -345,36 +329,68 @@ impl TableCommit {
         )
         .await
     }
+
+    /// Read manifests with bounded concurrency, yielding each one with its
+    /// contents in input order.
+    fn read_manifests<T: Default + Send + 'static>(
+        &self,
+        manifests: &[ManifestFileMeta],
+        config: &MergeConfig,
+        decode: Decode<T>,
+    ) -> impl Stream<Item = Result<(ManifestFileMeta, ManifestContents<T>)>> + Send + use<T> {
+        let file_io = self.snapshot_manager.file_io().clone();
+        let manifest_dir = self.snapshot_manager.manifest_dir();
+        let cache = config.schema_cache.clone();
+        // Each read owns its inputs so the commit future stays `Send`.
+        futures::stream::iter(manifests.to_vec())
+            .map(move |manifest| {
+                let (file_io, cache) = (file_io.clone(), cache.clone());
+                let path = format!("{manifest_dir}/{}", manifest.file_name());
+                async move {
+                    let contents = read_manifest(&file_io, &path, &cache, |bytes| {
+                        decode(&manifest, bytes, &cache)
+                    })
+                    .await?;
+                    Ok((manifest, contents))
+                }
+            })
+            .buffered(config.read_parallelism.max(1))
+    }
+}
+
+fn warn_full_compaction_skipped(manifest: &ManifestFileMeta) {
+    log::warn!(
+        "Skipping manifest full compaction: {} has fields that a rewrite would drop",
+        manifest.file_name()
+    );
 }
 
 /// Classify one manifest read by `rewrite_entries`: whether it must be
 /// rewritten, and the ADDs a rewrite keeps. `None` aborts the full compaction.
 fn classify_entries(
     manifest: &ManifestFileMeta,
-    content: ManifestContents,
+    content: ManifestContents<Vec<ManifestEntry>>,
     deleted: &HashSet<Identifier>,
     config: &MergeConfig,
 ) -> Option<(bool, Vec<ManifestEntry>)> {
     if !content.rewritable {
-        log::warn!(
-            "Skipping manifest full compaction: {} has fields that a rewrite would drop",
-            manifest.file_name()
-        );
+        warn_full_compaction_skipped(manifest);
         return None;
     }
     let mut require_change = config.must_change(manifest);
     let mut adds = Vec::new();
     for entry in content.entries {
-        let identifier = entry.identifier();
         match *entry.kind() {
             // Every ADD of a deleted file is dropped, including one that
             // follows its DELETE.
-            FileKind::Add if deleted.contains(&identifier) => require_change = true,
+            FileKind::Add if !deleted.is_empty() && deleted.contains(&entry.identifier()) => {
+                require_change = true
+            }
             FileKind::Add => adds.push(entry),
             // Only an understated `num_deleted_files` hides a DELETE from
             // `read_deleted_entries`; a rewrite would drop it but keep its
             // ADD. This check sees only the manifests read here.
-            FileKind::Delete if !deleted.contains(&identifier) => {
+            FileKind::Delete if !deleted.contains(&entry.identifier()) => {
                 log::warn!(
                     "Skipping manifest full compaction: {} holds more DELETE entries than its metadata counts",
                     manifest.file_name()
@@ -387,49 +403,79 @@ fn classify_entries(
     Some((require_change, adds))
 }
 
-/// The entries of one manifest, and whether rewriting them keeps every field.
-/// `entries` is left empty when the manifest is not rewritable.
-struct ManifestContents {
-    entries: Vec<ManifestEntry>,
+/// The decoded entries of one manifest, and whether rewriting them keeps every
+/// field. `entries` is left empty when the manifest is not rewritable.
+struct ManifestContents<T> {
+    entries: T,
     rewritable: bool,
 }
 
-/// Read manifests with bounded concurrency, yielding their contents in input order.
-fn read_manifests(
-    file_io: &FileIO,
-    manifest_dir: &str,
-    manifests: &[ManifestFileMeta],
-    parallelism: usize,
-) -> impl Stream<Item = Result<ManifestContents>> + Send + use<> {
-    let file_io = file_io.clone();
-    let paths = manifests
-        .iter()
-        .map(|manifest| format!("{manifest_dir}/{}", manifest.file_name()))
-        .collect::<Vec<_>>();
-    // Each read owns its inputs so the commit future stays `Send`.
-    futures::stream::iter(paths)
-        .map(move |path| {
-            let file_io = file_io.clone();
-            async move { read_manifest(&file_io, &path).await }
-        })
-        .buffered(parallelism.max(1))
-}
+/// Decodes the bytes of one rewritable manifest for a read.
+type Decode<T> = fn(&ManifestFileMeta, &[u8], &SharedSchemaCache) -> Result<T>;
 
-async fn read_manifest(file_io: &FileIO, path: &str) -> Result<ManifestContents> {
+async fn read_manifest<T: Default>(
+    file_io: &FileIO,
+    path: &str,
+    cache: &SharedSchemaCache,
+    decode: impl FnOnce(&[u8]) -> Result<T>,
+) -> Result<ManifestContents<T>> {
     let bytes = file_io.new_input(path)?.read().await?;
     let (header, _) = parse_ocf_streaming(&bytes)?;
-    let writer_schema = WriterSchema::parse(&header.schema_json)?;
+    let writer_schema = cache.get_or_parse(&header.schema_json)?;
     if !fields_known(&writer_schema, &RUST_MANIFEST_SCHEMA) {
         return Ok(ManifestContents {
-            entries: vec![],
+            entries: T::default(),
             rewritable: false,
         });
     }
-    let entries = from_avro_bytes_fast::<ManifestEntry>(&bytes)?;
     Ok(ManifestContents {
-        entries,
+        entries: decode(&bytes)?,
         rewritable: true,
     })
+}
+
+/// Which rows `decode_entries` decodes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecodeRows {
+    All,
+    /// Skips DELETE rows when the writer schema puts `_KIND`, `_PARTITION`,
+    /// `_BUCKET` and `_TOTAL_BUCKETS` before `_FILE`; otherwise they are
+    /// still decoded.
+    SkipDeletes,
+}
+
+fn decode_entries(
+    bytes: &[u8],
+    cache: &SharedSchemaCache,
+    rows: DecodeRows,
+) -> Result<Vec<ManifestEntry>> {
+    from_manifest_bytes_filtered_shared(bytes, cache, &mut |kind, _, _, _| {
+        rows == DecodeRows::All || kind == FileKind::Add
+    })
+}
+
+/// The identities of the DELETE entries in one manifest.
+fn decode_deleted_identifiers(bytes: &[u8], cache: &SharedSchemaCache) -> Result<Vec<Identifier>> {
+    let mut deleted = Vec::new();
+    visit_slim_manifest_entries(bytes, cache, &mut |entry| {
+        if entry.kind == FileKind::Delete {
+            deleted.push(Identifier {
+                partition: entry.partition.to_vec(),
+                bucket: entry.bucket,
+                level: entry.level,
+                file_name: entry.file_name.to_string(),
+                extra_files: entry
+                    .extra_files
+                    .iter()
+                    .map(|file| file.to_string())
+                    .collect(),
+                embedded_index: entry.embedded_index.map(<[u8]>::to_vec),
+                external_path: entry.external_path.map(str::to_string),
+            });
+        }
+        Ok(())
+    })?;
+    Ok(deleted)
 }
 
 /// The schema merged manifests are written with.
@@ -523,250 +569,5 @@ fn merge_group_entries(entries: Vec<ManifestEntry>) -> Option<Vec<ManifestEntry>
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::spec::EMPTY_SERIALIZED_ROW;
-
-    fn file(name: &str, level: i32) -> DataFileMeta {
-        DataFileMeta {
-            file_name: name.to_string(),
-            file_size: 100,
-            row_count: 1,
-            min_key: vec![],
-            max_key: vec![],
-            key_stats: BinaryTableStats::empty(),
-            value_stats: BinaryTableStats::empty(),
-            min_sequence_number: 0,
-            max_sequence_number: 0,
-            schema_id: 0,
-            level,
-            extra_files: vec![],
-            creation_time: None,
-            delete_row_count: None,
-            embedded_index: None,
-            file_source: None,
-            value_stats_cols: None,
-            external_path: None,
-            first_row_id: None,
-            write_cols: None,
-            column_max_sequence_numbers: None,
-        }
-    }
-
-    fn entry(kind: FileKind, name: &str, level: i32) -> ManifestEntry {
-        ManifestEntry::new(kind, vec![], 0, 1, file(name, level), 2)
-    }
-
-    fn keys(entries: &[ManifestEntry]) -> Vec<(FileKind, &str, i32)> {
-        entries
-            .iter()
-            .map(|e| (*e.kind(), e.file().file_name.as_str(), e.file().level))
-            .collect()
-    }
-
-    #[test]
-    fn add_deleted_in_its_group_is_dropped_and_the_delete_kept() {
-        let merged = merge_group_entries(vec![
-            entry(FileKind::Add, "a", 0),
-            entry(FileKind::Delete, "a", 0),
-            entry(FileKind::Add, "b", 0),
-        ])
-        .unwrap();
-        assert_eq!(
-            keys(&merged),
-            [(FileKind::Delete, "a", 0), (FileKind::Add, "b", 0)]
-        );
-    }
-
-    #[test]
-    fn delete_whose_add_is_outside_the_group_is_kept() {
-        // #899: the ADD of "old" lives in an earlier group that is not merged.
-        let merged = merge_group_entries(vec![
-            entry(FileKind::Delete, "old", 0),
-            entry(FileKind::Add, "new", 0),
-        ])
-        .unwrap();
-        assert_eq!(
-            keys(&merged),
-            [(FileKind::Delete, "old", 0), (FileKind::Add, "new", 0)]
-        );
-    }
-
-    #[test]
-    fn level_is_part_of_file_identity() {
-        // An in-place upgrade deletes f@0 and adds f@1 under the same name.
-        let merged = merge_group_entries(vec![
-            entry(FileKind::Add, "f", 0),
-            entry(FileKind::Delete, "f", 0),
-            entry(FileKind::Add, "f", 1),
-        ])
-        .unwrap();
-        assert_eq!(
-            keys(&merged),
-            [(FileKind::Delete, "f", 0), (FileKind::Add, "f", 1)]
-        );
-    }
-
-    #[test]
-    fn repeated_delete_is_kept_once() {
-        let merged = merge_group_entries(vec![
-            entry(FileKind::Delete, "x", 0),
-            entry(FileKind::Delete, "x", 0),
-        ])
-        .unwrap();
-        assert_eq!(keys(&merged), [(FileKind::Delete, "x", 0)]);
-    }
-
-    #[test]
-    fn repeated_delete_of_a_file_added_in_the_group_is_kept_once() {
-        let merged = merge_group_entries(vec![
-            entry(FileKind::Add, "x", 0),
-            entry(FileKind::Delete, "x", 0),
-            entry(FileKind::Delete, "x", 0),
-        ])
-        .unwrap();
-        assert_eq!(keys(&merged), [(FileKind::Delete, "x", 0)]);
-    }
-
-    #[test]
-    fn group_that_adds_a_file_twice_without_deleting_it_is_not_merged() {
-        let entries = vec![entry(FileKind::Add, "x", 0), entry(FileKind::Add, "x", 0)];
-        assert!(merge_group_entries(entries).is_none());
-    }
-
-    #[test]
-    fn every_add_of_a_deleted_file_is_dropped_whatever_the_order() {
-        use FileKind::{Add, Delete};
-        for kinds in [
-            vec![Add, Delete, Add],
-            vec![Delete, Add],
-            vec![Add, Add, Delete],
-        ] {
-            let entries = kinds.iter().map(|kind| entry(*kind, "x", 0)).collect();
-            let merged = merge_group_entries(entries).expect("merged");
-            assert_eq!(keys(&merged), [(Delete, "x", 0)], "{kinds:?}");
-        }
-    }
-
-    /// Merging must use the scan's identity, `ManifestEntry::identifier()`:
-    /// entries that the scan tells apart must not cancel.
-    #[test]
-    fn entries_with_different_identity_do_not_cancel() {
-        let added = || file("x", 0);
-        let mut extra_files = added();
-        extra_files.extra_files = vec!["x.index".into()];
-        let mut external_path = added();
-        external_path.external_path = Some("oss://bucket/x".into());
-        let pairs = [
-            (
-                ManifestEntry::new(
-                    FileKind::Add,
-                    EMPTY_SERIALIZED_ROW.clone(),
-                    0,
-                    1,
-                    added(),
-                    2,
-                ),
-                ManifestEntry::new(FileKind::Delete, vec![], 0, 1, added(), 2),
-            ),
-            (
-                ManifestEntry::new(FileKind::Add, vec![], 0, 1, added(), 2),
-                ManifestEntry::new(FileKind::Delete, vec![], 0, 1, extra_files, 2),
-            ),
-            (
-                ManifestEntry::new(FileKind::Add, vec![], 0, 1, added(), 2),
-                ManifestEntry::new(FileKind::Delete, vec![], 0, 1, external_path, 2),
-            ),
-            (
-                ManifestEntry::new(FileKind::Add, vec![], 0, 2, added(), 2),
-                ManifestEntry::new(FileKind::Delete, vec![], 1, 2, added(), 2),
-            ),
-        ];
-        for (add, delete) in pairs {
-            let merged = merge_group_entries(vec![add.clone(), delete.clone()]).unwrap();
-            assert_eq!(merged, [add, delete]);
-        }
-    }
-
-    fn rewritable(schema_json: &str) -> bool {
-        fields_known(
-            &WriterSchema::parse(schema_json).unwrap(),
-            &RUST_MANIFEST_SCHEMA,
-        )
-    }
-
-    fn with_field_after(anchor: &str, field: &str) -> String {
-        let schema = MANIFEST_ENTRY_SCHEMA.replacen(anchor, &format!("{anchor} {field},"), 1);
-        assert_ne!(schema, MANIFEST_ENTRY_SCHEMA);
-        schema
-    }
-
-    #[test]
-    fn rust_manifest_schema_is_rewritable() {
-        assert!(rewritable(MANIFEST_ENTRY_SCHEMA));
-    }
-
-    #[tokio::test]
-    async fn java_written_manifest_with_fewer_fields_is_rewritable() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/manifest/manifest-8ded1f09-fcda-489e-9167-582ac0f9f846-0"
-        );
-        let file_io = FileIO::from_url("file://").unwrap().build().unwrap();
-        let contents = read_manifest(&file_io, path).await.unwrap();
-        assert!(contents.rewritable);
-        assert_eq!(contents.entries.len(), 2);
-    }
-
-    #[test]
-    fn manifest_with_an_unknown_file_field_is_not_rewritable() {
-        let schema = with_field_after(
-            r#"{"name": "_FILE_NAME", "type": "string"},"#,
-            r#"{"name": "_NEW", "type": ["null", "long"], "default": null}"#,
-        );
-        assert!(!rewritable(&schema));
-    }
-
-    #[test]
-    fn manifest_with_an_unknown_field_in_a_nullable_record_is_not_rewritable() {
-        // `_KEY_STATS` is written as `["null", {record}]`; its first
-        // `_MIN_VALUES` is the one this anchor matches.
-        let schema = with_field_after(
-            r#"{"name": "_MIN_VALUES", "type": "bytes"},"#,
-            r#"{"name": "_NEW", "type": ["null", "long"], "default": null}"#,
-        );
-        assert!(!rewritable(&schema));
-    }
-
-    #[test]
-    fn manifest_with_a_multi_branch_union_is_not_rewritable() {
-        let schema = MANIFEST_ENTRY_SCHEMA.replacen(
-            r#"{"name": "_FILE_NAME", "type": "string"}"#,
-            r#"{"name": "_FILE_NAME", "type": ["null", "string", "bytes"]}"#,
-            1,
-        );
-        assert_ne!(schema, MANIFEST_ENTRY_SCHEMA);
-        assert!(!rewritable(&schema));
-    }
-
-    #[test]
-    fn manifest_with_an_unknown_top_level_field_is_not_rewritable() {
-        let schema = with_field_after(
-            r#"{"name": "_VERSION", "type": "int"},"#,
-            r#"{"name": "_NEW", "type": "int"}"#,
-        );
-        assert!(!rewritable(&schema));
-    }
-
-    #[test]
-    fn record_against_a_non_record_is_not_rewritable() {
-        let file_as_bytes = r#"{"type": "record", "name": "r", "fields": [
-            {"name": "_FILE", "type": "bytes"}
-        ]}"#;
-        let kind_as_record = r#"{"type": "record", "name": "r", "fields": [
-            {"name": "_KIND", "type": {"type": "record", "name": "k", "fields": []}}
-        ]}"#;
-        assert!(!rewritable(file_as_bytes));
-        assert!(!rewritable(kind_as_record));
-    }
-}
+#[path = "manifest_merge_unit_tests.rs"]
+mod tests;

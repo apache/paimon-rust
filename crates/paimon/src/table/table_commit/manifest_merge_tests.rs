@@ -595,23 +595,10 @@ async fn rewrite_with_unknown_field(io: &FileIO, path: &str, manifest: &Manifest
         1,
     );
     assert_ne!(schema_json, MANIFEST_ENTRY_SCHEMA);
-    let schema = apache_avro::Schema::parse_str(&schema_json).unwrap();
-    let mut writer = crate::spec::new_avro_writer(
-        &schema,
-        crate::spec::DEFAULT_AVRO_COMPRESSION,
-        crate::spec::DEFAULT_AVRO_BLOCK_SIZE,
-    )
-    .unwrap();
-    for entry in &entries {
-        let value = apache_avro::to_value(entry)
-            .unwrap()
-            .resolve(&schema)
-            .unwrap();
-        writer.append(value).unwrap();
-    }
+    let bytes = crate::spec::to_avro_bytes(&schema_json, &entries).unwrap();
     io.new_output(&manifest_path)
         .unwrap()
-        .write(writer.into_inner().unwrap().into())
+        .write(bytes.into())
         .await
         .unwrap();
 }
