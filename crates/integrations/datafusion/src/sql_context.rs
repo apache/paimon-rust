@@ -1596,6 +1596,12 @@ impl SQLContext {
                     "ALTER TABLE DROP PARTITION must be used alone".to_string(),
                 ));
             }
+            if self.temp_table_for(name).await?.is_some() {
+                return Err(DataFusionError::NotImplemented(
+                    "ALTER TABLE DROP PARTITION on temporary tables or views is not supported"
+                        .into(),
+                ));
+            }
             return self
                 .handle_drop_partitions(
                     catalog,
