@@ -1147,8 +1147,7 @@ fn test_catalog_tag_lifecycle() {
         assert!(explicit_result.error.is_null());
         let explicit_json =
             std::slice::from_raw_parts(explicit_result.tag.data, explicit_result.tag.len);
-        let explicit: paimon::api::GetTagResponse =
-            serde_json::from_slice(explicit_json).unwrap();
+        let explicit: paimon::api::GetTagResponse = serde_json::from_slice(explicit_json).unwrap();
         assert!(explicit.tag_time_retained.is_none());
         paimon_bytes_free(explicit_result.tag);
 
@@ -1168,8 +1167,7 @@ fn test_catalog_tag_lifecycle() {
         assert!(retained_result.error.is_null());
         let retained_json =
             std::slice::from_raw_parts(retained_result.tag.data, retained_result.tag.len);
-        let retained: paimon::api::GetTagResponse =
-            serde_json::from_slice(retained_json).unwrap();
+        let retained: paimon::api::GetTagResponse = serde_json::from_slice(retained_json).unwrap();
         assert_eq!(retained.tag_name, "release-retained");
         assert_eq!(retained.snapshot.id(), 1);
         assert_eq!(retained.tag_time_retained.as_deref(), Some("PT24H"));
@@ -1190,7 +1188,10 @@ fn test_catalog_tag_lifecycle() {
         paimon_error_free(invalid);
         let missing_invalid =
             paimon_catalog_get_tag(catalog, identifier.identifier, invalid_name.as_ptr());
-        assert_eq!((*missing_invalid.error).code, PaimonErrorCode::NotFound as i32);
+        assert_eq!(
+            (*missing_invalid.error).code,
+            PaimonErrorCode::NotFound as i32
+        );
         paimon_error_free(missing_invalid.error);
 
         let missing_snapshot_id = 2;
