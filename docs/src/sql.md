@@ -2462,6 +2462,12 @@ Python's `SQLContext.read_video()` streams a read-only query and returns one
 MP4 as `bytes`. Use `ORDER BY` with a unique tie-breaker if needed to
 define playback order. Each result row contributes one frame.
 
+On Data Evolution tables, a filter such as `"_ROW_ID" >= 100 AND "_ROW_ID" < 200`
+prunes the scan to matching row ranges. With `ORDER BY "_ROW_ID"`, the scan can
+stream rows in order when the selected file groups have disjoint row-ID ranges.
+The ordinary SQL sort remains available when the metadata cannot establish
+that order.
+
 ```python
 mp4 = ctx.read_video(
     """

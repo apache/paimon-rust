@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::BooleanArray;
-use datafusion::arrow::compute::{cast, filter_record_batch};
+use datafusion::arrow::compute::{cast, filter_record_batch, SortOptions};
 use datafusion::arrow::datatypes::{
     DataType as ArrowDataType, SchemaRef as ArrowSchemaRef, TimeUnit,
 };
@@ -39,7 +39,9 @@ use datafusion::physical_expr::utils::{
     collect_columns, conjunction, reassign_expr_columns, split_conjunction,
 };
 use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_expr::{PhysicalExpr, PhysicalExprSimplifier, ScalarFunctionExpr};
+use datafusion::physical_expr::{
+    LexOrdering, PhysicalExpr, PhysicalExprSimplifier, PhysicalSortExpr, ScalarFunctionExpr,
+};
 use datafusion::physical_expr_adapter::{
     DefaultPhysicalExprAdapterFactory, PhysicalExprAdapterFactory,
 };
@@ -979,6 +981,17 @@ impl PaimonTableScan {
 
     pub fn table(&self) -> &Table {
         &self.table
+    }
+
+    pub(crate) fn with_row_id_ordering(mut self, index: usize) -> Self {
+        let schema = self.schema();
+        let ordering = LexOrdering::new([PhysicalSortExpr::new(
+            Arc::new(Column::new(schema.field(index).name(), index)),
+            SortOptions::new(false, false),
+        )]);
+        let properties = EquivalenceProperties::new_with_orderings(schema, ordering);
+        Arc::make_mut(&mut self.plan_properties).set_eq_properties(properties);
+        self
     }
 
     #[cfg(test)]

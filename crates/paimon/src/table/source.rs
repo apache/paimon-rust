@@ -1718,6 +1718,53 @@ impl Plan {
         &self.splits
     }
 
+    /// Arrange selected Data Evolution splits for a sequential row-ID-ordered
+    /// read. Overlapping column files stay together in their original order.
+    /// Returns `None` when the metadata cannot prove disjoint output ranges.
+    #[doc(hidden)]
+    pub fn data_evolution_in_row_id_order(&self) -> Option<Self> {
+        let mut groups = Vec::new();
+        for split in &self.splits {
+            if split.query_auth_required || split.scores().is_some() {
+                return None;
+            }
+            let selected = merge_row_ranges(split.row_ranges()?.to_vec());
+            for files in group_by_overlapping_row_id(split.data_files().to_vec()) {
+                let (first, last) =
+                    files
+                        .iter()
+                        .try_fold((i64::MAX, i64::MIN), |(first, last), file| {
+                            let (start, end) = file.row_id_range()?;
+                            Some((first.min(start), last.max(end)))
+                        })?;
+                let ranges: Vec<_> = selected
+                    .iter()
+                    .filter_map(|range| range.intersect_inclusive(first, last))
+                    .collect();
+                if let (Some(first), Some(last)) = (ranges.first(), ranges.last()) {
+                    groups.push((
+                        first.from(),
+                        last.to(),
+                        split
+                            .for_data_evolution_files(files)
+                            .with_selected_row_ranges(ranges),
+                    ));
+                }
+            }
+        }
+        groups.sort_unstable_by_key(|(first, _, _)| *first);
+        if groups.windows(2).any(|pair| pair[0].1 >= pair[1].0) {
+            return None;
+        }
+        let mut plan = Self {
+            splits: groups.into_iter().map(|(_, _, split)| split).collect(),
+            snapshot_id: self.snapshot_id,
+            scan_stats: self.scan_stats.clone(),
+        };
+        plan.refresh_final_stats();
+        Some(plan)
+    }
+
     /// Lightweight statistics collected in the same planning pass.
     pub fn stats(&self) -> &super::ScanStats {
         &self.scan_stats

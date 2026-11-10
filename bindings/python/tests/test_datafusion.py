@@ -846,6 +846,79 @@ def test_read_video_remuxes_only_safe_ranges(tmp_path, monkeypatch, mode):
     assert encoded_ranges == [(start, end) for start, end, copied in ranges if not copied]
 
 
+def test_read_video_prunes_row_id_range_and_remuxes_in_order(tmp_path, monkeypatch):
+    av = pytest.importorskip("av")
+    from pypaimon_rust import _video_assembly
+
+    source = tmp_path / "sample.mp4"
+    write_sample_video(
+        source,
+        colors=tuple((20 + 13 * index, 180 - 12 * index, 45 + 8 * index) for index in range(16)),
+        codec="libx264",
+        codec_options={"g": "4", "sc_threshold": "0", "bf": "2", "b_strategy": "0"},
+    )
+    video = source.read_bytes()
+    moov_offset = video.index(b"moov") - 4
+    moov_size = struct.unpack_from(">I", video, moov_offset)[0]
+
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("SET datafusion.execution.target_partitions = 4")
+    ctx.sql("""
+        CREATE TABLE paimon.default.frames (ordinal INT, frame BINARY, part STRING)
+        PARTITIONED BY (part) WITH (
+            'bucket' = '-1', 'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true'
+        )
+    """)
+    packed = tmp_path / "default.db" / "frames" / "frames.video"
+    prefix = b"other payload"
+    packed.write_bytes(prefix + video + b"packed index")
+    descriptors = [
+        serialize_video_frame_descriptor(
+            str(packed), len(prefix), len(video), ordinal, (moov_offset, moov_size)
+        )
+        for ordinal in range(16)
+    ]
+    ctx.register_batch(
+        "source_frames",
+        pa.record_batch(
+            [list(range(16)), descriptors, ["z"] * 4 + ["a"] * 4 + ["z"] * 4 + ["a"] * 4],
+            names=["ordinal", "frame", "part"],
+        ),
+    )
+    for start in range(0, 16, 4):
+        ctx.sql(
+            "INSERT INTO paimon.default.frames (ordinal, frame, part) "
+            "SELECT ordinal, frame, part FROM paimon.default.source_frames "
+            f"WHERE ordinal >= {start} AND ordinal < {start + 4}"
+        )
+
+    selection = '''
+        FROM paimon.default.frames
+        WHERE "_ROW_ID" >= 4 AND "_ROW_ID" < 16
+        ORDER BY "_ROW_ID"
+    '''
+    sql = "SELECT frame " + selection
+    explain = pa.Table.from_batches(ctx.sql("EXPLAIN " + sql)).to_pylist()
+    plan = next(row["plan"] for row in explain if row["plan_type"] == "physical_plan")
+    assert re.search(r"PaimonTableScan:.*files=3\b", plan), plan
+    assert "SortExec" not in plan and "SortPreservingMergeExec" not in plan, plan
+    rows = pa.Table.from_batches(ctx.sql('SELECT "_ROW_ID", ordinal ' + selection))
+    assert rows["_ROW_ID"].to_pylist() == rows["ordinal"].to_pylist() == list(range(4, 16))
+    reverse = pa.Table.from_batches(ctx.sql('SELECT ordinal ' + selection.rstrip() + " DESC"))
+    assert reverse["ordinal"].to_pylist() == list(range(15, 3, -1))
+
+    def unexpected_encode(*args):
+        pytest.fail("The ordered IDR range should copy the compressed packets")
+
+    monkeypatch.setattr(_video_assembly, "_encode_video_range", unexpected_encode)
+    clip = ctx.read_video(sql)
+    with av.open(str(source)) as original:
+        packets = [bytes(packet) for packet in original.demux(video=0) if packet.size]
+    with av.open(io.BytesIO(clip)) as output:
+        assert [bytes(packet) for packet in output.demux(video=0) if packet.size] == packets[4:16]
+
+
 def test_media_info_returns_json_for_image_and_video():
     with tempfile.TemporaryDirectory() as warehouse:
         video_path = Path(warehouse) / "sample.mp4"

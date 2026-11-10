@@ -386,6 +386,14 @@ impl PaimonScanBuilder<'_> {
     }
 
     pub(crate) fn build_scan(self, read_fields: Vec<DataField>) -> DFResult<PaimonTableScan> {
+        self.build_scan_with_row_id_ordering(read_fields, false)
+    }
+
+    fn build_scan_with_row_id_ordering(
+        self,
+        read_fields: Vec<DataField>,
+        allow_row_id_ordering: bool,
+    ) -> DFResult<PaimonTableScan> {
         let (projected_schema, read_type) = if let Some(indices) = self.projection {
             let fields: Vec<Field> = indices
                 .iter()
@@ -400,10 +408,26 @@ impl PaimonScanBuilder<'_> {
             (self.schema.clone(), read_fields)
         };
 
-        let scan_stats = Some(self.plan.stats().clone());
-        let splits = self.plan.into_splits();
-        let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
-            vec![Arc::from(Vec::new())]
+        let options = self.table.schema().core_options();
+        let ordered_row_id = read_type
+            .iter()
+            .position(|field| field.id() == ROW_ID_FIELD_ID);
+        let ordered_plan = if allow_row_id_ordering
+            && ordered_row_id.is_some()
+            && options.data_evolution_enabled()
+            && !options.query_auth_enabled()
+            && self.table.schema().primary_keys().is_empty()
+        {
+            self.plan.data_evolution_in_row_id_order()
+        } else {
+            None
+        };
+        let row_id_ordering = ordered_plan.as_ref().and(ordered_row_id);
+        let plan = ordered_plan.unwrap_or(self.plan);
+        let scan_stats = Some(plan.stats().clone());
+        let splits = plan.into_splits();
+        let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() || row_id_ordering.is_some() {
+            vec![Arc::from(splits)]
         } else {
             let num_partitions = splits.len().min(self.target_partitions.max(1));
             bucket_round_robin(splits, num_partitions)
@@ -412,7 +436,7 @@ impl PaimonScanBuilder<'_> {
                 .collect()
         };
 
-        PaimonTableScan::try_new(
+        let scan = PaimonTableScan::try_new(
             projected_schema,
             self.table.clone(),
             read_type,
@@ -423,7 +447,11 @@ impl PaimonScanBuilder<'_> {
             scan_stats,
             None,
             self.case_sensitive,
-        )
+        )?;
+        Ok(match row_id_ordering {
+            Some(index) => scan.with_row_id_ordering(index),
+            None => scan,
+        })
     }
 }
 
@@ -461,12 +489,16 @@ impl TableProvider for PaimonTableProvider {
         // direct ReadBuilder API (core / C / Python), not via SQL.
         let case_sensitive = true;
         // Plan splits eagerly so we know partition count upfront.
-        let filter_analysis =
-            analyze_filters(filters, self.table.schema().fields(), case_sensitive);
+        let read_fields = datafusion_read_fields(&self.table);
+        let filter_fields = if self.table.schema().core_options().query_auth_enabled() {
+            self.table.schema().fields()
+        } else {
+            &read_fields
+        };
+        let filter_analysis = analyze_filters(filters, filter_fields, case_sensitive);
         let mut read_builder = self.table.new_read_builder();
         read_builder.with_case_sensitive(case_sensitive);
         if let Some(indices) = projection {
-            let read_fields = datafusion_read_fields(&self.table);
             let read_type = indices
                 .iter()
                 .map(|&i| read_fields[i].clone())
@@ -495,7 +527,7 @@ impl TableProvider for PaimonTableProvider {
                 .pushed_predicate
                 .as_ref()
                 .is_none_or(|p| read_builder.is_exact_filter_pushdown(p));
-        PaimonScanBuilder {
+        let scan = PaimonScanBuilder {
             table: &self.table,
             schema: &self.schema,
             plan,
@@ -506,7 +538,8 @@ impl TableProvider for PaimonTableProvider {
             filter_exact,
             case_sensitive,
         }
-        .build()
+        .build_scan_with_row_id_ordering(read_fields, true)?;
+        Ok(Arc::new(scan))
     }
 
     async fn insert_into(
@@ -549,7 +582,12 @@ impl TableProvider for PaimonTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        let fields = self.table.schema().fields();
+        let read_fields = datafusion_read_fields(&self.table);
+        let fields = if self.table.schema().core_options().query_auth_enabled() {
+            self.table.schema().fields()
+        } else {
+            &read_fields
+        };
         // SQL reads resolve columns case-sensitively (see `scan`), so classify
         // pushdown the same way.
         let case_sensitive = true;
