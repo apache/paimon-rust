@@ -53,24 +53,25 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::{plan_datafusion_err, TableReference};
+use datafusion::common::{plan_datafusion_err, DFSchema, ScalarValue, TableReference};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::context::SQLOptions;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::session_state::SessionState;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan, Volatility};
+use datafusion::logical_expr::{ColumnarValue, Expr as LogicalExpr, LogicalPlan, Volatility};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::planner::{object_name_to_table_reference, IdentNormalizer};
 use datafusion::sql::sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, BinaryLength, CharacterLength, ColumnDef,
     ColumnOption, CommentDef, CommentObject, CreateFunction, CreateFunctionBody, CreateTable,
-    CreateTableOptions, CreateView, DataType as SqlDataType, Delete, Expr as SqlExpr, FromTable,
-    FunctionBehavior, FunctionReturnType, Ident, Insert, Merge, ObjectName, ObjectType,
-    RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject, SqlOption, Statement,
-    TableFactor, TableObject, Truncate, Update, Use, Value as SqlValue,
+    CreateTableOptions, CreateView, DataType as SqlDataType, Delete, Expr as SqlExpr,
+    ExprWithAlias, FromTable, FunctionBehavior, FunctionReturnType, Ident, Insert, Merge,
+    ObjectName, ObjectType, RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject,
+    SqlOption, Statement, TableFactor, TableObject, Truncate, Update, Use, Value as SqlValue,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
@@ -1961,7 +1962,7 @@ impl SQLContext {
             &partition_fields,
             table.schema().fields(),
             enable_ident_normalization,
-            CoreOptions::new(table.schema().options()).legacy_partition_name(),
+            &self.ctx.state(),
         )?;
 
         let source = insert.source.as_ref().ok_or_else(|| {
@@ -2142,7 +2143,7 @@ impl SQLContext {
                 table.schema().fields(),
                 table.schema().partition_keys(),
                 enable_ident_normalization,
-                CoreOptions::new(table.schema().options()).legacy_partition_name(),
+                &self.ctx.state(),
             )?;
             commit
                 .truncate_partitions(partition_values)
@@ -2451,7 +2452,7 @@ impl SQLContext {
                 table.schema().fields(),
                 table.schema().partition_keys(),
                 enable_ident_normalization,
-                CoreOptions::new(table.schema().options()).legacy_partition_name(),
+                &self.ctx.state(),
             )?);
         }
         let commit = table
@@ -3663,7 +3664,7 @@ fn parse_partition_values(
     all_fields: &[PaimonDataField],
     partition_keys: &[String],
     enable_ident_normalization: bool,
-    legacy_partition_name: bool,
+    state: &SessionState,
 ) -> DFResult<Vec<HashMap<String, Option<Datum>>>> {
     let field_map: HashMap<&str, &PaimonDataField> =
         all_fields.iter().map(|f| (f.name(), f)).collect();
@@ -3687,7 +3688,7 @@ fn parse_partition_values(
         let field = field_map.get(col_name.as_str()).ok_or_else(|| {
             DataFusionError::Plan(format!("Column '{col_name}' not found in table schema"))
         })?;
-        let datum = sql_expr_to_datum(val_expr, field.data_type(), legacy_partition_name)?;
+        let datum = sql_expr_to_datum(val_expr, field.data_type(), state)?;
         partition.insert(col_name, Some(datum));
     }
 
@@ -3714,7 +3715,7 @@ fn parse_static_partitions(
     partition_fields: &[PaimonDataField],
     all_fields: &[PaimonDataField],
     enable_ident_normalization: bool,
-    legacy_partition_name: bool,
+    state: &SessionState,
 ) -> DFResult<HashMap<String, Option<Datum>>> {
     let mut result = HashMap::new();
     let mut seen_columns = HashSet::new();
@@ -3770,7 +3771,7 @@ fn parse_static_partitions(
         let field = field_map.get(col_name.as_str()).ok_or_else(|| {
             DataFusionError::Plan(format!("Column '{col_name}' not found in table schema"))
         })?;
-        let datum = sql_expr_to_datum(val_expr, field.data_type(), legacy_partition_name)?;
+        let datum = sql_expr_to_datum(val_expr, field.data_type(), state)?;
         result.insert(col_name, Some(datum));
     }
 
@@ -3781,34 +3782,33 @@ fn parse_static_partitions(
 fn sql_expr_to_datum(
     expr: &SqlExpr,
     data_type: &PaimonDataType,
-    legacy_partition_name: bool,
+    state: &SessionState,
 ) -> DFResult<Datum> {
-    let parse_text = |text: &str| {
-        crate::procedures::parse_partition_value(text, data_type, legacy_partition_name).ok_or_else(
-            || {
-                DataFusionError::Plan(format!(
-                    "Invalid partition value '{text}' for type {data_type:?}"
-                ))
-            },
-        )
+    let literal = match expr {
+        SqlExpr::Value(_) | SqlExpr::TypedString(_) => true,
+        SqlExpr::UnaryOp {
+            op: datafusion::sql::sqlparser::ast::UnaryOperator::Minus,
+            expr: inner,
+        } => matches!(inner.as_ref(), SqlExpr::Value(_)),
+        _ => false,
     };
+    let typed_date = matches!(
+        (expr, data_type),
+        (SqlExpr::TypedString(typed), PaimonDataType::Date(_)) if typed.data_type == SqlDataType::Date
+    );
+    if literal
+        && (typed_date
+            || matches!(
+                data_type,
+                PaimonDataType::Decimal(_)
+                    | PaimonDataType::Timestamp(_)
+                    | PaimonDataType::LocalZonedTimestamp(_)
+            ))
+    {
+        return eval_partition_value(expr, data_type, state);
+    }
     let (value, negate) = match expr {
         SqlExpr::Value(v) => (&v.value, false),
-        SqlExpr::TypedString(typed)
-            if matches!(
-                (&typed.data_type, data_type),
-                (SqlDataType::Date, PaimonDataType::Date(_))
-                    | (
-                        SqlDataType::Timestamp(..),
-                        PaimonDataType::Timestamp(_) | PaimonDataType::LocalZonedTimestamp(_)
-                    )
-            ) =>
-        {
-            let text = typed.value.value.clone().into_string().ok_or_else(|| {
-                DataFusionError::Plan(format!("Unsupported partition value expression: {expr}"))
-            })?;
-            return parse_text(&text);
-        }
         SqlExpr::UnaryOp {
             op: datafusion::sql::sqlparser::ast::UnaryOperator::Minus,
             expr: inner,
@@ -3829,20 +3829,18 @@ fn sql_expr_to_datum(
     };
 
     match (value, data_type) {
-        (SqlValue::Number(n, _), PaimonDataType::Decimal(_)) => {
-            parse_text(&if negate { format!("-{n}") } else { n.clone() })
-        }
         (SqlValue::Number(n, _), _) => parse_number_datum(n, data_type, negate),
         (SqlValue::SingleQuotedString(s), PaimonDataType::VarChar(_)) if !negate => {
             Ok(Datum::String(s.clone()))
         }
-        (
-            SqlValue::SingleQuotedString(s),
-            PaimonDataType::Char(_)
-            | PaimonDataType::Decimal(_)
-            | PaimonDataType::Timestamp(_)
-            | PaimonDataType::LocalZonedTimestamp(_),
-        ) if !negate => parse_text(s),
+        (SqlValue::SingleQuotedString(s), PaimonDataType::Char(typ)) if !negate => {
+            if s.chars().count() > typ.length() {
+                return Err(DataFusionError::Plan(format!(
+                    "Invalid partition value '{s}' for type {data_type:?}"
+                )));
+            }
+            Ok(Datum::String(s.clone()))
+        }
         (SqlValue::SingleQuotedString(s), PaimonDataType::Date(_)) if !negate => {
             let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                 .map_err(|e| DataFusionError::Plan(format!("Invalid DATE '{s}': {e}")))?;
@@ -3857,6 +3855,45 @@ fn sql_expr_to_datum(
             "Cannot convert {value} to {data_type:?}"
         ))),
     }
+}
+
+/// Evaluates a partition value the way INSERT evaluates a value for the column: planned with
+/// the session's SQL semantics, such as its time zone, and cast to the column's Arrow type.
+/// The written column and the partition predicate then hold the same value.
+fn eval_partition_value(
+    expr: &SqlExpr,
+    data_type: &PaimonDataType,
+    state: &SessionState,
+) -> DFResult<Datum> {
+    let invalid = || {
+        DataFusionError::Plan(format!(
+            "Invalid partition value {expr} for type {data_type:?}"
+        ))
+    };
+    let arrow_type = paimon::arrow::paimon_type_to_arrow(data_type).map_err(to_datafusion_error)?;
+    let schema = DFSchema::empty();
+    let value = state.create_logical_expr_from_sql_expr(
+        ExprWithAlias {
+            expr: expr.clone(),
+            alias: None,
+        },
+        &schema,
+    )?;
+    let value = datafusion::logical_expr::cast(value, arrow_type);
+    let batch = RecordBatch::try_new_with_options(
+        Arc::new(Schema::empty()),
+        vec![],
+        &RecordBatchOptions::new().with_row_count(Some(1)),
+    )?;
+    let scalar = match state
+        .create_physical_expr(value, &schema)?
+        .evaluate(&batch)
+        .map_err(|e| DataFusionError::Plan(format!("{}: {e}", invalid())))?
+    {
+        ColumnarValue::Scalar(scalar) => scalar,
+        ColumnarValue::Array(array) => ScalarValue::try_from_array(&array, 0)?,
+    };
+    crate::filter_pushdown::scalar_to_datum(&scalar, data_type).ok_or_else(invalid)
 }
 
 fn parse_number_datum(n: &str, data_type: &PaimonDataType, negate: bool) -> DFResult<Datum> {
@@ -8810,6 +8847,63 @@ mod tests {
             .collect()
     }
 
+    /// Writes rows 1 (`value`) and 2 (`other`) to a table partitioned by `k`, then checks that
+    /// `INSERT OVERWRITE`, `TRUNCATE` and `DROP PARTITION` with `spec` all target row 1.
+    async fn check_partition_spec(
+        sql_context: &SQLContext,
+        table: &str,
+        data_type: &str,
+        value: &str,
+        other: &str,
+        spec: &str,
+    ) {
+        sql_context
+            .sql(&format!(
+                "CREATE TABLE {table} (id INT, k {data_type}) PARTITIONED BY (k)"
+            ))
+            .await
+            .unwrap();
+        sql_context
+            .sql(&format!(
+                "INSERT INTO {table} VALUES (1, {value}), (2, {other})"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        sql_context
+            .sql(&format!(
+                "INSERT OVERWRITE {table} PARTITION (k = {spec}) VALUES (9)"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(ordered_ids(sql_context, table).await, [2, 9], "{spec}");
+
+        sql_context
+            .sql(&format!("TRUNCATE TABLE {table} PARTITION (k = {spec})"))
+            .await
+            .unwrap();
+        assert_eq!(ordered_ids(sql_context, table).await, [2], "{spec}");
+
+        sql_context
+            .sql(&format!("INSERT INTO {table} VALUES (3, {value})"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        sql_context
+            .sql(&format!("ALTER TABLE {table} DROP PARTITION (k = {spec})"))
+            .await
+            .unwrap();
+        assert_eq!(ordered_ids(sql_context, table).await, [2], "{spec}");
+    }
+
     #[tokio::test]
     async fn test_partition_specs_on_char_decimal_timestamp_and_typed_literals() {
         let (_tmp, sql_context) = setup_fs_sql_context().await;
@@ -8837,51 +8931,46 @@ mod tests {
         ];
         for (index, (data_type, value, spec)) in cases.iter().enumerate() {
             let table = format!("paimon.test_db.spec_{index}");
-            sql_context
-                .sql(&format!(
-                    "CREATE TABLE {table} (id INT, k {data_type}) PARTITIONED BY (k)"
-                ))
-                .await
-                .unwrap();
-            sql_context
-                .sql(&format!(
-                    "INSERT INTO {table} VALUES (1, {value}), (2, NULL)"
-                ))
-                .await
-                .unwrap()
-                .collect()
-                .await
-                .unwrap();
+            check_partition_spec(&sql_context, &table, data_type, value, "NULL", spec).await;
+        }
+    }
 
-            sql_context
-                .sql(&format!(
-                    "INSERT OVERWRITE {table} PARTITION (k = {spec}) VALUES (9)"
-                ))
-                .await
-                .unwrap()
-                .collect()
-                .await
-                .unwrap();
-            assert_eq!(ordered_ids(&sql_context, &table).await, [2, 9], "{spec}");
-
-            sql_context
-                .sql(&format!("TRUNCATE TABLE {table} PARTITION (k = {spec})"))
-                .await
-                .unwrap();
-            assert_eq!(ordered_ids(&sql_context, &table).await, [2], "{spec}");
-
-            sql_context
-                .sql(&format!("INSERT INTO {table} VALUES (3, {value})"))
-                .await
-                .unwrap()
-                .collect()
-                .await
-                .unwrap();
-            sql_context
-                .sql(&format!("ALTER TABLE {table} DROP PARTITION (k = {spec})"))
-                .await
-                .unwrap();
-            assert_eq!(ordered_ids(&sql_context, &table).await, [2], "{spec}");
+    /// A partition value means what the same literal means in INSERT, so the statement never
+    /// targets the neighbouring partition that a different reading would pick.
+    #[tokio::test]
+    async fn test_partition_specs_evaluate_values_like_insert() {
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
+        sql_context
+            .sql("SET datafusion.execution.time_zone = '+08:00'")
+            .await
+            .unwrap();
+        let cases = [
+            // Read in the session time zone: 02:00 UTC, while 10:00 UTC is row 2.
+            (
+                "TIMESTAMP WITH TIME ZONE",
+                "TIMESTAMP WITH TIME ZONE '2024-03-01 10:00:00'",
+                "TIMESTAMP WITH TIME ZONE '2024-03-01 18:00:00'",
+                "TIMESTAMP WITH TIME ZONE '2024-03-01 10:00:00'",
+            ),
+            // Stored as .123: digits past the column precision are dropped, not rounded.
+            (
+                "TIMESTAMP(3)",
+                "TIMESTAMP '2024-03-01 10:11:12.123856'",
+                "TIMESTAMP '2024-03-01 10:11:12.124'",
+                "TIMESTAMP '2024-03-01 10:11:12.123856'",
+            ),
+            (
+                "TIMESTAMP(3)",
+                "TIMESTAMP '2024-03-01 10:11:12.123'",
+                "TIMESTAMP '2024-03-01 10:11:12.124'",
+                "TIMESTAMP '2024-03-01 10:11:12.123'",
+            ),
+            // Stored as 12.51: the third decimal digit is rounded half up.
+            ("DECIMAL(10, 2)", "'12.505'", "'12.50'", "'12.505'"),
+        ];
+        for (index, (data_type, value, other, spec)) in cases.iter().enumerate() {
+            let table = format!("paimon.test_db.insert_semantics_{index}");
+            check_partition_spec(&sql_context, &table, data_type, value, other, spec).await;
         }
     }
 
