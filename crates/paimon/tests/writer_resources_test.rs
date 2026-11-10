@@ -17,14 +17,17 @@
 
 mod common;
 
-use arrow_array::{Array, Int8Array, RecordBatch};
+use arrow_array::{Array, Int32Array, Int8Array, RecordBatch, StringArray};
 use common::incremental_helpers::{
     make_batch, make_batch_with_kinds, make_partitioned_batch, memory_table, partitioned_pk_schema,
     pk_schema, setup_dirs,
 };
 use paimon::resource::{MemoryPool, ResourceContext};
-use paimon::spec::{DataType, IntType, RowKind, Schema, TableSchema, VALUE_KIND_FIELD_NAME};
+use paimon::spec::{
+    DataType, IntType, RowKind, Schema, TableSchema, VarCharType, VALUE_KIND_FIELD_NAME,
+};
 use paimon::Error;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -146,6 +149,85 @@ async fn append_writer_reserves_until_commit_preparation() {
     let messages = write.prepare_commit().await.unwrap();
     assert_eq!(resources.metrics().reserved_memory_bytes, 0);
     assert_eq!(messages.len(), 1);
+}
+
+#[tokio::test]
+async fn append_writer_flushes_dictionary_batches_at_configured_threshold() {
+    assert_dictionary_batches_flush(false).await;
+}
+
+#[tokio::test]
+async fn postpone_writer_flushes_dictionary_batches_at_configured_threshold() {
+    assert_dictionary_batches_flush(true).await;
+}
+
+async fn assert_dictionary_batches_flush(postpone: bool) {
+    let path = "memory:/writer_resources_dictionary";
+    let mut schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::VarChar(VarCharType::string_type()))
+        .option("file.format", "parquet")
+        .option("write.parquet-buffer-size", "1 mb");
+    if postpone {
+        schema = schema.primary_key(["id"]).option("bucket", "-2");
+    }
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema.build().unwrap()));
+    setup_dirs(&io, path).await;
+    let arrow_schema = paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap();
+    let resources = ResourceContext::builder()
+        .memory_limit(6 * 1024 * 1024)
+        .build()
+        .unwrap();
+    let builder = table.new_write_builder().with_resources(resources.clone());
+    let mut writer = builder.new_write().unwrap();
+    let value = "x".repeat(4096);
+    for start in (0..4096).step_by(1024) {
+        // Allocate distinct Arrow buffers for each batch. Two unflushed batches
+        // would exceed the budget even though each dictionary is small.
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(start..start + 1024)),
+                Arc::new(StringArray::from(vec![value.as_str(); 1024])),
+            ],
+        )
+        .unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+    }
+    assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+    let messages = writer.prepare_commit().await.unwrap();
+    builder.new_commit().commit(messages).await.unwrap();
+
+    // Read the committed file directly because table scans skip postpone files
+    // until compaction.
+    let files = io.list_status_recursive(path).await.unwrap();
+    let mut parquet = files.iter().filter(|file| file.path.ends_with(".parquet"));
+    let file = parquet.next().unwrap();
+    assert!(parquet.next().is_none());
+    let bytes = io.new_input(&file.path).unwrap().read().await.unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut ids = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let batch_ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        ids.extend(batch_ids.iter().map(Option::unwrap));
+        assert!(values.iter().all(|v| v == Some(value.as_str())));
+    }
+    assert_eq!(ids, (0..4096).collect::<Vec<_>>());
 }
 
 #[tokio::test]

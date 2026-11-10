@@ -130,6 +130,12 @@ pub(crate) trait FormatFileWriter: Send {
     /// Number of bytes buffered in the current row group (not yet flushed).
     fn in_progress_size(&self) -> usize;
 
+    /// Estimated input bytes reserved by this file writer. This excludes
+    /// reservations held by other consumers of the same resource context.
+    fn retained_input_size(&self) -> usize {
+        0
+    }
+
     /// Whether this writer still retains batch data. This can differ from
     /// `in_progress_size` while a format is inferring its physical schema.
     fn retains_batch_data(&self) -> bool {
@@ -264,6 +270,10 @@ impl FormatFileWriter for ResourceFormatWriter {
 
     fn in_progress_size(&self) -> usize {
         self.inner.in_progress_size()
+    }
+
+    fn retained_input_size(&self) -> usize {
+        self.reservation.size()
     }
 
     fn retains_batch_data(&self) -> bool {
@@ -758,6 +768,57 @@ mod tests {
     use super::*;
     use crate::io::FileIOBuilder;
     use crate::spec::{DataType, IntType};
+
+    struct FailingFlushWriter;
+
+    #[async_trait]
+    impl FormatFileWriter for FailingFlushWriter {
+        async fn write(&mut self, _batch: &RecordBatch) -> crate::Result<()> {
+            Ok(())
+        }
+        fn num_bytes(&self) -> usize {
+            0
+        }
+        fn in_progress_size(&self) -> usize {
+            1
+        }
+        async fn flush(&mut self) -> crate::Result<()> {
+            Err(Error::Unsupported {
+                message: "injected flush failure".into(),
+            })
+        }
+        async fn close(self: Box<Self>) -> crate::Result<FormatWriteResult> {
+            Err(Error::Unsupported {
+                message: "injected close failure".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_input_survives_flush_failure_until_close_or_drop() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(arrow_array::Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        for close in [false, true] {
+            let resources = crate::resource::ResourceContext::builder().build().unwrap();
+            let mut writer = with_write_resources(Box::new(FailingFlushWriter), Some(&resources));
+            writer.write(&batch).await.unwrap();
+            assert!(writer.flush().await.is_err());
+            assert_eq!(writer.retained_input_size(), batch.get_array_memory_size());
+            assert_eq!(
+                resources.metrics().reserved_memory_bytes,
+                batch.get_array_memory_size()
+            );
+            if close {
+                assert!(writer.close().await.is_err());
+            } else {
+                drop(writer);
+            }
+            assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+        }
+    }
 
     #[test]
     fn write_format_validation_matches_compiled_factories() {

@@ -4646,15 +4646,19 @@ mod tests {
 
         writer.write(&first).await.unwrap();
         assert!(writer.in_progress_size() > 0);
+        assert_eq!(writer.retained_input_size(), first_bytes.div_ceil(5));
         assert_eq!(
             resources.metrics().reserved_memory_bytes,
             first_bytes.div_ceil(5)
         );
         writer.write(&second).await.unwrap();
+        assert_eq!(writer.retained_input_size(), second_bytes.div_ceil(4));
         assert_eq!(
             resources.metrics().reserved_memory_bytes,
             second_bytes.div_ceil(4)
         );
+        writer.flush().await.unwrap();
+        assert_eq!(writer.retained_input_size(), 0);
         writer.close().await.unwrap();
         assert_eq!(resources.metrics().reserved_memory_bytes, 0);
 
