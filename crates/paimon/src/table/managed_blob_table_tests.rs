@@ -35,6 +35,8 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as Arr
 use futures::TryStreamExt;
 use std::sync::Arc;
 
+mod compaction;
+
 fn scalar_batch_with_kinds(rows: &[(i32, Option<&[u8]>, i8)]) -> RecordBatch {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", ArrowDataType::Int32, false),
