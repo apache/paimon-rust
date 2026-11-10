@@ -115,6 +115,46 @@ fn set_snapshot_watermark(temp_dir: &TempDir, snapshot_id: i64, watermark: i64) 
 }
 
 #[tokio::test]
+async fn test_time_travel_on_quoted_table_name_with_spaces() {
+    use datafusion::arrow::array::Int32Array;
+
+    let temp_dir = TempDir::new().unwrap();
+    let mut options = Options::new();
+    options.set(
+        CatalogOptions::WAREHOUSE,
+        format!("file://{}", temp_dir.path().display()),
+    );
+    let sql_context = create_sql_context(Arc::new(FileSystemCatalog::new(options).unwrap())).await;
+
+    for sql in [
+        r#"CREATE TABLE paimon.default."with space" (id INT)"#,
+        r#"INSERT INTO paimon.default."with space" VALUES (8)"#,
+    ] {
+        sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    }
+
+    for separator in [" ", "\u{00a0}"] {
+        for clause in ["VERSION AS OF 1", "TIMESTAMP AS OF '2099-01-01 00:00:00'"] {
+            let sql = format!(r#"SELECT id FROM{separator}paimon.default."with space" {clause}"#);
+            let batches = sql_context
+                .sql(&sql)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(total_rows(&batches), 1, "{sql}");
+            let ids = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(ids.value(0), 8, "{sql}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_version_as_of_uses_snapshot_schema() {
     let (_tmp, sql_context) = setup_evolved_table().await;
 

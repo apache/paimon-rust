@@ -116,7 +116,7 @@ def test_branch_tags_are_isolated(branch_tables):
     plan = blue.new_read_builder({"scan.tag-name": "blue"}).new_scan().plan()
     assert plan.snapshot_id() == 1
     with pytest.raises(ValueError, match="main"):
-        blue.new_read_builder({"scan.tag-name": "main"})
+        blue.new_read_builder({"scan.tag-name": "main"}).new_scan()
 
 
 @pytest.mark.parametrize("suffix", [

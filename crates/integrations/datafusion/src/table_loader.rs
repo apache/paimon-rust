@@ -172,6 +172,32 @@ pub(crate) fn ensure_no_incremental_window(
     identifier: &Identifier,
     read: &Table,
 ) -> DFResult<()> {
+    ensure_no_session_incremental_window(statement, options)?;
+    ensure_table_has_no_incremental_window(statement, identifier, read)
+}
+
+/// The part of [`ensure_no_incremental_window`] that needs only the session's
+/// `options`: a window they set applies to every table the session reads.
+pub(crate) fn ensure_no_session_incremental_window(
+    statement: &str,
+    options: &HashMap<String, String>,
+) -> DFResult<()> {
+    let key = INCREMENTAL_WINDOW_OPTION;
+    if !options.contains_key(key) {
+        return Ok(());
+    }
+    Err(DataFusionError::Plan(format!(
+        "{statement} while scan option '{key}' is set; RESET 'paimon.{key}' first"
+    )))
+}
+
+/// The part of [`ensure_no_incremental_window`] that checks `read`, the table
+/// read for `identifier`, whose options hold the session's and its own.
+pub(crate) fn ensure_table_has_no_incremental_window(
+    statement: &str,
+    identifier: &Identifier,
+    read: &Table,
+) -> DFResult<()> {
     if matches!(
         CoreOptions::new(read.schema().options()).incremental_timestamp_window(),
         Ok(None)
@@ -179,11 +205,8 @@ pub(crate) fn ensure_no_incremental_window(
         return Ok(());
     }
     let key = INCREMENTAL_WINDOW_OPTION;
-    let reason = if options.contains_key(key) {
-        format!("while scan option '{key}' is set; RESET 'paimon.{key}' first")
-    } else {
-        let read = table_read_name(identifier, read);
-        format!("on {read}, which sets scan option '{key}'")
-    };
-    Err(DataFusionError::Plan(format!("{statement} {reason}")))
+    let read = table_read_name(identifier, read);
+    Err(DataFusionError::Plan(format!(
+        "{statement} on {read}, which sets scan option '{key}'"
+    )))
 }

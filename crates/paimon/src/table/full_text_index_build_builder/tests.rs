@@ -309,6 +309,71 @@ async fn test_execute_passes_prefixed_options_to_native_writer() {
 }
 
 #[tokio::test]
+async fn test_icu_split_search_before_and_after_index_build() {
+    let table = test_table("memory:/test_full_text_icu_split", table_options("10"))
+        .copy_with_options(HashMap::from([
+            ("global-index.full-text.index-columns".into(), "name".into()),
+            ("write-only".into(), "true".into()),
+            ("full-text.tokenizer".into(), "icu/split".into()),
+            ("full-text.stem".into(), "false".into()),
+            ("full-text.remove-stop-words".into(), "false".into()),
+            ("full-text-index.search-mode".into(), "full".into()),
+        ]));
+    setup_dirs(&table).await;
+    write_rows(
+        &table,
+        vec![1, 2, 3],
+        vec![
+            Some("Paimon支持中文搜索 hello_world alpha.beta getUserName"),
+            Some("Paimon支持英文搜索 hello_planet alpha.gamma"),
+            Some("中文 hello brave world alpha delta"),
+        ],
+    )
+    .await;
+    assert!(full_text_entries(&table).await.is_empty());
+
+    for indexed in [false, true] {
+        let table = if indexed {
+            assert_eq!(
+                table
+                    .new_global_index_build_builder()
+                    .with_index_type("full-text")
+                    .with_index_column("name")
+                    .execute()
+                    .await
+                    .unwrap(),
+                1
+            );
+            // Fast mode requires persisted index hits.
+            table.copy_with_options(HashMap::from([(
+                "full-text-index.search-mode".into(),
+                "fast".into(),
+            )]))
+        } else {
+            table.clone()
+        };
+        for (query, expected) in [
+            ("中文", vec![RowRange::new(0, 0), RowRange::new(2, 2)]),
+            ("world", vec![RowRange::new(0, 0), RowRange::new(2, 2)]),
+            ("beta", vec![RowRange::new(0, 0)]),
+            (
+                r#"{"match_phrase":{"query":"hello world"}}"#,
+                vec![RowRange::new(0, 0)],
+            ),
+            ("getUserName", vec![RowRange::new(0, 0)]),
+            ("user", vec![]),
+            ("missingtoken", vec![]),
+        ] {
+            assert_eq!(
+                search(&table, query).await,
+                expected,
+                "query={query}, indexed={indexed}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_execute_rejects_invalid_native_options_before_reading() {
     let table = test_table(
         "memory:/test_full_text_build_bad_options",

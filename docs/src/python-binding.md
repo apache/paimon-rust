@@ -185,6 +185,25 @@ their distinct `_ROW_ID`s to the table's rows.
 both batch and streaming splits to Java binary encoding, preserving the streaming
 flag.
 
+For continuous reads, `new_stream_scan()` returns a stateful scan that starts
+from `scan.mode`. See [Streaming Reading](streaming-reading.md) for startup
+modes, checkpoints, and row kinds:
+
+```python
+rb = table.new_read_builder({"scan.mode": "from-snapshot", "scan.snapshot-id": "5"})
+scan = rb.new_stream_scan()
+read = rb.with_include_row_kind(True).new_read()
+plan = scan.plan()
+if plan is not None:
+    batches = read.read(plan.splits())
+    # Process batches, then acknowledge the progress.
+    scan.notify_checkpoint_complete(scan.checkpoint())
+```
+
+`new_scan()` and `new_incremental_scan()` raise when a time-travel selector
+resolves to no snapshot, while `new_stream_scan()` resolves its start at the
+first plan, so snapshot 5 may also be the next commit or an expired one.
+
 For append and Data Evolution tables, select half-open row positions or one
 balanced shard on a scan:
 
@@ -464,6 +483,7 @@ rb = table.new_read_builder({"scan.tag-name": "release-1.0"})
 
 !!! warning
     Only one time-travel selector may be set. Providing multiple selectors will raise a `ValueError`.
+    A selector that resolves to no snapshot raises a `ValueError` from `new_scan()` and `new_incremental_scan()`.
 
 `scan.timestamp` selects the latest snapshot committed at or before the given
 local time. It accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS[.fraction]`, or
@@ -506,6 +526,42 @@ for tag in table.list_tags():
 for stat in table.partition_stats():
     print(stat.partition(), stat.record_count(), stat.total_size_bytes())
 ```
+
+## Table Maintenance
+
+### Compaction
+
+`table.new_compact_builder()` plans, executes and commits table compaction in
+one call, like the [`CALL sys.compact`](sql.md#compact) SQL procedure. Nothing
+is committed when planning yields no task. When a task fails, the files written
+by earlier tasks are deleted on a best-effort basis; a failed deletion is
+reported as a `RuntimeWarning` before the task's error is raised.
+
+```python
+metrics = table.new_compact_builder().execute()
+print(metrics["tasks"], metrics["files_removed"], metrics["files_added"])
+
+# Restrict compaction to partitions matching a predicate (same predicate
+# format as read filters), and set the commit user. It defaults to a generated
+# UUID; the snapshot records it as `<commit_user>-compact-<suffix>`.
+metrics = (
+    table.new_compact_builder()
+    .with_partition_filter({"method": "equal", "field": "dt", "literals": ["2026-11-01"]})
+    .with_commit_user("my-compactor")
+    .execute()
+)
+```
+
+The returned metrics are a dictionary with the task count and the write
+statistics of the compaction commit: `tasks`, `files_removed`, `files_added`,
+`rows_written`, `bytes_written`, `changelog_files_added`,
+`changelog_rows_written` and `changelog_bytes_written`.
+
+Compacting a primary-key table that uses the `lookup` changelog producer, the
+`first-row` merge engine or deletion vectors needs `local-cache.enabled=true` in
+the catalog options; without it `execute()` raises `ValueError` once there are
+tasks to run. See [Table Compaction](compaction.md) for the supported table
+modes.
 
 ## Python UDF
 

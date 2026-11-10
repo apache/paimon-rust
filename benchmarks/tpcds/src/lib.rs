@@ -200,7 +200,12 @@ mod tests {
             3
         );
         assert_eq!(
-            ctx.ctx().state().config_options().execution.batch_size,
+            ctx.ctx()
+                .state()
+                .config_options()
+                .execution
+                .batch_size
+                .get(),
             4096
         );
         assert!(
@@ -253,7 +258,7 @@ mod tests {
 
         assert_eq!(decoded.source, SourceKind::Paimon);
         assert!(decoded.disclosure.contains("non-TPC"));
-        assert_eq!(decoded.datafusion_version, "54.0.0");
+        assert_eq!(decoded.datafusion_version, datafusion::DATAFUSION_VERSION);
     }
 
     #[test]

@@ -610,7 +610,7 @@ mod tests {
         use crate::spec::{BlobType, DataType, VideoFrameDescriptor};
         use futures::TryStreamExt;
 
-        let frame = VideoFrameDescriptor::new("memory:/must-not-open-video".into(), 0, 8, 2, -1, 0)
+        let frame = VideoFrameDescriptor::new("memory:/must-not-open-video".into(), 0, 8, 2)
             .unwrap()
             .serialize();
         let fields = [DataField::new(

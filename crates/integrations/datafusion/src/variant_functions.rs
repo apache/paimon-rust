@@ -55,6 +55,10 @@ impl ParseJsonFunc {
 }
 
 impl ScalarUDFImpl for ParseJsonFunc {
+    fn is_strict(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         if self.try_parse {
             "try_parse_json"
@@ -181,6 +185,10 @@ impl VariantGetFunc {
 }
 
 impl ScalarUDFImpl for VariantGetFunc {
+    fn is_strict(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         if self.try_get {
             "try_variant_get"

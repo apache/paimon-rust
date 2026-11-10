@@ -1029,6 +1029,112 @@ async fn test_scoped_show_accepts_temp_only_database_and_shadowing() {
 }
 
 #[tokio::test]
+async fn test_update_and_delete_reject_shadowed_temporary_targets() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    ctx.sql("CREATE TABLE default.shadowed (id INT)")
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO default.shadowed VALUES (1), (2)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    for kind in ["TABLE", "VIEW"] {
+        ctx.sql(&format!(
+            "CREATE TEMPORARY {kind} default.shadowed AS SELECT CAST(999 AS INT) AS id"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            collect_ids(&ctx, "SELECT id FROM shadowed").await,
+            vec![999]
+        );
+
+        assert_sql_error_contains(
+            &ctx,
+            "UPDATE shadowed SET id = 10 WHERE id = 1",
+            "UPDATE on temporary tables or views is not supported",
+        )
+        .await;
+        assert_sql_error_contains(
+            &ctx,
+            "DELETE FROM paimon.default.shadowed WHERE id = 2",
+            "DELETE on temporary tables or views is not supported",
+        )
+        .await;
+
+        ctx.sql(&format!("DROP TEMPORARY {kind} default.shadowed"))
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_ids(&ctx, "SELECT id FROM shadowed ORDER BY id").await,
+            vec![1, 2]
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_truncate_rejects_shadowed_temporary_targets() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    ctx.sql("CREATE TABLE default.\"TruncateTarget\" (id INT, pt INT) PARTITIONED BY (pt)")
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO default.\"TruncateTarget\" VALUES (1, 1), (2, 2)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    for kind in ["TABLE", "VIEW"] {
+        ctx.sql(&format!(
+            "CREATE TEMPORARY {kind} default.\"TruncateTarget\" AS SELECT CAST(999 AS INT) AS id"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            collect_ids(&ctx, "SELECT id FROM \"TruncateTarget\"").await,
+            vec![999]
+        );
+        for sql in [
+            "TRUNCATE TABLE \"TruncateTarget\"",
+            "TRUNCATE TABLE IF EXISTS default.\"TruncateTarget\"",
+            "TRUNCATE TABLE paimon.default.\"TruncateTarget\" PARTITION (pt = 1)",
+        ] {
+            assert_sql_error_contains(
+                &ctx,
+                sql,
+                "TRUNCATE TABLE on temporary tables or views is not supported",
+            )
+            .await;
+        }
+        ctx.sql(&format!("DROP TEMPORARY {kind} default.\"TruncateTarget\""))
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_ids(&ctx, "SELECT id FROM \"TruncateTarget\"").await,
+            vec![1, 2]
+        );
+    }
+
+    ctx.sql("TRUNCATE TABLE \"TruncateTarget\" PARTITION (pt = 1)")
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_ids(&ctx, "SELECT id FROM \"TruncateTarget\"").await,
+        vec![2]
+    );
+    ctx.sql("TRUNCATE TABLE \"TruncateTarget\"").await.unwrap();
+    assert!(collect_ids(&ctx, "SELECT id FROM \"TruncateTarget\"")
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
 async fn test_scoped_show_accepts_information_schema() {
     let (_tmp, catalog) = create_test_env();
     let ctx = create_sql_context(catalog).await;
@@ -1573,6 +1679,41 @@ async fn test_drop_table() {
             .contains(&"to_drop".to_string()),
         "Table should not exist after DROP TABLE"
     );
+}
+
+#[tokio::test]
+async fn test_drop_table_resolves_each_catalog() {
+    let (_tmp1, catalog1) = create_test_env();
+    let (_tmp2, catalog2) = create_test_env();
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("cat1", catalog1.clone())
+        .await
+        .unwrap();
+    ctx.register_catalog("cat2", catalog2.clone())
+        .await
+        .unwrap();
+
+    for sql in [
+        "CREATE TABLE cat1.default.a (id INT)",
+        "CREATE TABLE cat1.default.b (id INT)",
+        "CREATE TABLE cat2.default.b (id INT)",
+    ] {
+        ctx.sql(sql).await.unwrap();
+    }
+
+    ctx.sql("DROP TABLE cat1.default.a, cat2.default.b")
+        .await
+        .unwrap();
+    assert_eq!(catalog1.list_tables("default").await.unwrap(), vec!["b"]);
+    assert!(catalog2.list_tables("default").await.unwrap().is_empty());
+
+    assert_sql_error_contains(
+        &ctx,
+        "DROP TABLE cat1.default.b, missing.default.b",
+        "Unknown catalog 'missing'",
+    )
+    .await;
+    assert_eq!(catalog1.list_tables("default").await.unwrap(), vec!["b"]);
 }
 
 // ======================= ALTER TABLE =======================
@@ -2401,6 +2542,46 @@ async fn test_create_temporary_view_fully_qualified() {
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2);
+}
+
+#[tokio::test]
+async fn test_create_temporary_view_preserves_quoted_names() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+
+    for qualifier in ["", "default.", "paimon.default."] {
+        for name in [
+            "\"MixedView\"",
+            "\"view.dot\"",
+            "\"view name\"",
+            "\"view\"\"quote\"",
+        ] {
+            let view = format!("{qualifier}{name}");
+            ctx.sql(&format!(
+                "CREATE TEMPORARY VIEW {view} AS SELECT CAST(1 AS INT) AS id"
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                collect_ids(&ctx, &format!("SELECT id FROM {view}")).await,
+                vec![1]
+            );
+
+            ctx.sql(&format!(
+                "CREATE TEMPORARY VIEW IF NOT EXISTS {view} AS SELECT CAST(2 AS INT) AS id"
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                collect_ids(&ctx, &format!("SELECT id FROM {view}")).await,
+                vec![1]
+            );
+
+            ctx.sql(&format!("DROP TEMPORARY VIEW {view}"))
+                .await
+                .unwrap();
+        }
+    }
 }
 
 #[tokio::test]

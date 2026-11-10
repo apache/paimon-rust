@@ -63,7 +63,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan, Volatility};
 use datafusion::prelude::{DataFrame, SessionContext};
-use datafusion::sql::planner::IdentNormalizer;
+use datafusion::sql::planner::{object_name_to_table_reference, IdentNormalizer};
 use datafusion::sql::sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, BinaryLength, CharacterLength, ColumnDef,
     ColumnOption, CommentDef, CommentObject, CreateFunction, CreateFunctionBody, CreateTable,
@@ -171,11 +171,11 @@ impl SQLContextBuilder {
         if let Some(runtime_env) = self.runtime_env {
             state_builder = state_builder.with_runtime_env(runtime_env);
         }
-        // EXTRACT bypasses the function registry, so intercept it before Spark's planner.
+        // EXTRACT and SUBSTRING bypass the registry; apply the same adapters to their syntax.
         state_builder
             .expr_planners()
             .get_or_insert_with(Vec::new)
-            .insert(0, Arc::new(crate::spark_functions::DatePartPlanner));
+            .insert(0, Arc::new(crate::spark_functions::FunctionPlanner));
         let state = state_builder.build();
         let mut ctx = SessionContext::new_with_state(state);
         crate::spark_functions::apply_compatibility_fixes(&ctx);
@@ -660,10 +660,7 @@ impl SQLContext {
                 )
                 .await
             }
-            Statement::Merge(merge) => {
-                self.handle_merge_into(merge, enable_ident_normalization)
-                    .await
-            }
+            Statement::Merge(merge) => self.handle_merge_into(merge, options).await,
             Statement::Update(update) => {
                 self.handle_update(update, enable_ident_normalization).await
             }
@@ -782,9 +779,7 @@ impl SQLContext {
                     // Only intercept DROP TABLE for Paimon catalogs; fall through for others
                     let table_ref: TableReference = names[0].to_string().as_str().into();
                     if self.is_paimon_catalog_ref(&table_ref) {
-                        let (catalog, _catalog_name, _) =
-                            self.resolve_catalog_and_table(&names[0])?;
-                        self.handle_drop_table(&catalog, names, *if_exists).await
+                        self.handle_drop_table(names, *if_exists).await
                     } else {
                         self.ctx.sql_with_options(sql, options).await
                     }
@@ -837,6 +832,15 @@ impl SQLContext {
                 .await
             }
             Statement::Query(_) | Statement::Explain { .. } => {
+                let mut statement = statements[0].clone();
+                if let Statement::Explain {
+                    statement: inner, ..
+                } = &mut statement
+                {
+                    if let Statement::Merge(merge) = inner.as_mut() {
+                        *merge = self.normalize_merge_into(merge).await?;
+                    }
+                }
                 let current_catalog = self.current_catalog_name();
                 let current_database = self
                     .ctx
@@ -847,7 +851,7 @@ impl SQLContext {
                     .clone();
                 let expanded = crate::sql_function::expand_statement(
                     &self.ctx.state(),
-                    statements[0].clone(),
+                    statement,
                     &self.catalogs,
                     &current_catalog,
                     &current_database,
@@ -1349,12 +1353,14 @@ impl SQLContext {
 
     async fn handle_drop_table(
         &self,
-        catalog: &Arc<dyn Catalog>,
         names: &[ObjectName],
         if_exists: bool,
     ) -> DFResult<DataFrame> {
-        for name in names {
-            let identifier = self.resolve_table_name(name)?;
+        let targets = names
+            .iter()
+            .map(|name| self.resolve_catalog_and_table(name))
+            .collect::<DFResult<Vec<_>>>()?;
+        for (catalog, _, identifier) in targets {
             catalog
                 .drop_table(&identifier, if_exists)
                 .await
@@ -1800,10 +1806,10 @@ impl SQLContext {
         Ok(())
     }
 
-    /// Reject UPDATE, DELETE and MERGE INTO while the query that finds their
-    /// target rows, a read of `table` in this session, would return the
-    /// changes of an incremental timestamp window: the write would change
-    /// rows by versions the table no longer holds.
+    /// Reject UPDATE and DELETE while the query that finds their target rows,
+    /// a read of `table` in this session, would return the changes of an
+    /// incremental timestamp window: the write would change rows by versions
+    /// the table no longer holds.
     async fn ensure_target_lookup_reads_rows(
         &self,
         identifier: &Identifier,
@@ -1826,11 +1832,12 @@ impl SQLContext {
         crate::table_loader::ensure_no_incremental_window(&statement, &options, identifier, &read)
     }
 
-    async fn handle_merge_into(
-        &self,
-        merge: &Merge,
-        enable_ident_normalization: bool,
-    ) -> DFResult<DataFrame> {
+    async fn handle_merge_into(&self, merge: &Merge, options: SQLOptions) -> DFResult<DataFrame> {
+        let merge = self.normalize_merge_into(merge).await?;
+        self.ctx.sql_with_options(&merge.to_string(), options).await
+    }
+
+    async fn normalize_merge_into(&self, merge: &Merge) -> DFResult<Merge> {
         self.ensure_no_time_travel_for_write("MERGE INTO")?;
         let table_name = match &merge.table {
             TableFactor::Table { name, .. } => name.clone(),
@@ -1841,16 +1848,57 @@ impl SQLContext {
             }
         };
         Self::ensure_main_branch_write_target(&table_name, "MERGE INTO")?;
-        let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
-
-        let table = catalog
-            .get_table(&identifier)
-            .await
-            .map_err(to_datafusion_error)?;
-        self.ensure_target_lookup_reads_rows(&identifier, &table, "MERGE INTO")
-            .await?;
-
-        crate::merge_into::execute_merge_into(self, merge, table, enable_ident_normalization).await
+        // The native planner reads the target rows through the target's
+        // provider, which refuses a window the table stores
+        // (`merge_into::plan_merge`); a window the session sets is refused
+        // here, as the session's time-travel options are.
+        crate::table_loader::ensure_no_session_incremental_window(
+            "Cannot execute MERGE INTO",
+            &self.dynamic_options.read().unwrap(),
+        )?;
+        // Use the configured native dialect for local expression scopes; the
+        // front parser treats lambda arrows as ordinary binary operators.
+        let state = self.ctx.state();
+        let parsed = state.sql_to_statement(
+            &merge.to_string(),
+            &state.config_options().sql_parser.dialect,
+        )?;
+        let datafusion::sql::parser::Statement::Statement(statement) = parsed else {
+            return Err(DataFusionError::Plan(
+                "Expected a native MERGE statement".into(),
+            ));
+        };
+        let Statement::Merge(mut merge) = *statement else {
+            return Err(DataFusionError::Plan(
+                "Expected a native MERGE statement".into(),
+            ));
+        };
+        crate::merge_into::qualify_not_matched_exprs(
+            &mut merge,
+            self.ctx.enable_ident_normalization(),
+        );
+        // `_ROW_ID` is a query-visible virtual column, but positional INSERTs
+        // still map to the persisted user columns. Make that list explicit
+        // before handing the statement to DataFusion's native planner.
+        if merge.clauses.iter().any(|clause| matches!(
+            &clause.action,
+            datafusion::sql::sqlparser::ast::MergeAction::Insert(insert) if insert.columns.is_empty()
+        )) {
+            let (catalog, _, identifier) = self.resolve_catalog_and_table(&table_name)?;
+            let table = catalog.get_table(&identifier).await.map_err(to_datafusion_error)?;
+            if table.schema().core_options().data_evolution_enabled() {
+                for clause in &mut merge.clauses {
+                    if let datafusion::sql::sqlparser::ast::MergeAction::Insert(insert) = &mut clause.action {
+                        if insert.columns.is_empty() {
+                            insert.columns = table.schema().fields().iter().map(|field| {
+                                ObjectName::from(vec![Ident::with_quote('"', field.name())])
+                            }).collect();
+                        }
+                    }
+                }
+            }
+        }
+        Ok(merge)
     }
 
     async fn handle_update(
@@ -1868,6 +1916,11 @@ impl SQLContext {
             }
         };
         Self::ensure_main_branch_write_target(&table_name, "UPDATE")?;
+        if self.temp_table_for(&table_name).await?.is_some() {
+            return Err(DataFusionError::NotImplemented(
+                "UPDATE on temporary tables or views is not supported".into(),
+            ));
+        }
         let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
 
         let table = catalog
@@ -1898,6 +1951,11 @@ impl SQLContext {
             }
         };
         Self::ensure_main_branch_write_target(&table_name, "DELETE")?;
+        if self.temp_table_for(&table_name).await?.is_some() {
+            return Err(DataFusionError::NotImplemented(
+                "DELETE on temporary tables or views is not supported".into(),
+            ));
+        }
         let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
 
         let table = catalog
@@ -2083,6 +2141,11 @@ impl SQLContext {
             DataFusionError::Plan("TRUNCATE TABLE requires a table name".to_string())
         })?;
         Self::ensure_main_branch_write_target(&target.name, "TRUNCATE TABLE")?;
+        if self.temp_table_for(&target.name).await?.is_some() {
+            return Err(DataFusionError::NotImplemented(
+                "TRUNCATE TABLE on temporary tables or views is not supported".into(),
+            ));
+        }
         let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&target.name)?;
         let table = match catalog.get_table(&identifier).await {
             Ok(t) => t,
@@ -2143,19 +2206,18 @@ impl SQLContext {
         let query_sql = create_view.query.to_string();
 
         if create_view.temporary {
-            let view_name = create_view.name.to_string();
-            let table_ref: TableReference = view_name.as_str().into();
-            let (catalog, database, name) = self.resolve_temp_table_name(table_ref)?;
+            let table_ref = object_name_to_table_reference(
+                create_view.name.clone(),
+                self.ctx.enable_ident_normalization(),
+            )?;
             let df = self.ctx.sql_with_options(&query_sql, sql_options).await?;
             let logical_plan = df.logical_plan().clone();
-            if create_view.if_not_exists
-                && self.temp_table_exist(format!("{catalog}.{database}.{name}"))?
-            {
+            if create_view.if_not_exists && self.temp_table_exist(table_ref.clone())? {
                 return ok_result(&self.ctx);
             }
             // Create a ViewTable and register it as a temp table
             let view_table = datafusion::datasource::ViewTable::new(logical_plan, Some(query_sql));
-            self.register_temp_table(format!("{catalog}.{database}.{name}"), Arc::new(view_table))?;
+            self.register_temp_table(table_ref, Arc::new(view_table))?;
             ok_result(&self.ctx)
         } else {
             validate_persistent_create_view(create_view)?;
@@ -3951,23 +4013,41 @@ enum TimeTravelClause {
     TimestampMillis(i64),
 }
 
-/// Check whether a SQL string contains a time-travel keyword (`VERSION AS OF` or
-/// `TIMESTAMP AS OF`) **outside** of single-quoted string literals, `--` line
-/// comments, and `/* */` block comments.
+/// Locate the table before a time-travel keyword without treating delimiters
+/// inside quoted identifiers as boundaries.
+fn time_travel_table_before(prefix: &str) -> (usize, &str) {
+    let prefix = prefix.trim_end();
+    let mut quote = None;
+    for (index, ch) in prefix.char_indices().rev() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+        } else if matches!(ch, '"' | '`') {
+            // Adjacent escaped quotes toggle the quote state twice.
+            quote = Some(ch);
+        } else if ch.is_whitespace() || matches!(ch, ',' | '(') {
+            let start = index + ch.len_utf8();
+            return (start, &prefix[start..]);
+        }
+    }
+    (0, prefix)
+}
+
+/// Check for a time-travel keyword outside quoted strings, identifiers, and comments.
 fn contains_time_travel_keyword(sql: &str) -> bool {
-    let lower = sql.to_lowercase();
-    let bytes = lower.as_bytes();
+    let bytes = sql.as_bytes();
     let len = bytes.len();
     let mut i = 0;
     while i < len {
         match bytes[i] {
-            b'\'' => {
-                // Skip string literal
+            quote @ (b'\'' | b'"' | b'`') => {
+                // Skip a quoted string or identifier, including doubled quotes.
                 i += 1;
                 while i < len {
-                    if bytes[i] == b'\'' {
+                    if bytes[i] == quote {
                         i += 1;
-                        if i < len && bytes[i] == b'\'' {
+                        if i < len && bytes[i] == quote {
                             i += 1; // escaped quote
                         } else {
                             break;
@@ -4011,24 +4091,22 @@ fn contains_time_travel_keyword(sql: &str) -> bool {
 }
 
 /// Extract **all** `VERSION AS OF <n>` or `VERSION AS OF '<tag>'` clauses from a
-/// SQL string, skipping string literals and comments.
+/// SQL string, skipping quoted strings, identifiers, and comments.
 fn extract_all_version_as_of(sql: &str) -> Vec<VersionAsOfInfo> {
-    let lower = sql.to_lowercase();
-    let bytes = lower.as_bytes();
+    let bytes = sql.as_bytes();
     let len = bytes.len();
-    let sql_bytes = sql.as_bytes();
     let mut i = 0;
     let mut results = Vec::new();
 
     while i < len {
         match bytes[i] {
-            b'\'' => {
-                // Skip string literal
+            quote @ (b'\'' | b'"' | b'`') => {
+                // Skip a quoted string or identifier, including doubled quotes.
                 i += 1;
                 while i < len {
-                    if sql_bytes[i] == b'\'' {
+                    if bytes[i] == quote {
                         i += 1;
-                        if i < len && sql_bytes[i] == b'\'' {
+                        if i < len && bytes[i] == quote {
                             i += 1; // escaped quote
                         } else {
                             break;
@@ -4091,17 +4169,11 @@ fn extract_all_version_as_of(sql: &str) -> Vec<VersionAsOfInfo> {
                         val_start + version.len()
                     };
 
-                    // Walk backwards from kw_start to find the table name boundary
-                    let table_end = sql[..kw_start].trim_end_matches(' ').len();
-                    let table_start = sql[..table_end]
-                        .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(')
-                        .map(|idx| idx + 1)
-                        .unwrap_or(0);
-                    let table_name = sql[table_start..table_end].to_string();
+                    let (table_start, table_name) = time_travel_table_before(&sql[..kw_start]);
 
                     if !table_name.is_empty() {
                         results.push(VersionAsOfInfo {
-                            table_name,
+                            table_name: table_name.to_string(),
                             version,
                             clause_range: (table_start, val_end),
                         });
@@ -4118,25 +4190,23 @@ fn extract_all_version_as_of(sql: &str) -> Vec<VersionAsOfInfo> {
     results
 }
 
-/// Extract **all** `TIMESTAMP AS OF '<ts>'` clauses from a SQL string, skipping
-/// string literals and comments.
+/// Extract all time-travel timestamp clauses outside quoted strings,
+/// identifiers, and comments.
 fn extract_all_timestamp_as_of(sql: &str) -> Vec<TimestampAsOfInfo> {
-    let lower = sql.to_lowercase();
-    let bytes = lower.as_bytes();
+    let bytes = sql.as_bytes();
     let len = bytes.len();
-    let sql_bytes = sql.as_bytes();
     let mut i = 0;
     let mut results = Vec::new();
 
     while i < len {
         match bytes[i] {
-            b'\'' => {
-                // Skip string literal
+            quote @ (b'\'' | b'"' | b'`') => {
+                // Skip a quoted string or identifier, including doubled quotes.
                 i += 1;
                 while i < len {
-                    if sql_bytes[i] == b'\'' {
+                    if bytes[i] == quote {
                         i += 1;
-                        if i < len && sql_bytes[i] == b'\'' {
+                        if i < len && bytes[i] == quote {
                             i += 1; // escaped quote
                         } else {
                             break;
@@ -4179,17 +4249,11 @@ fn extract_all_timestamp_as_of(sql: &str) -> Vec<TimestampAsOfInfo> {
                         let timestamp = remaining[1..close_quote + 1].to_string();
                         let val_end = val_start + close_quote + 2; // skip both quotes
 
-                        // Walk backwards to find the table name boundary
-                        let table_end = sql[..kw_start].trim_end_matches(' ').len();
-                        let table_start = sql[..table_end]
-                            .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(')
-                            .map(|idx| idx + 1)
-                            .unwrap_or(0);
-                        let table_name = sql[table_start..table_end].to_string();
+                        let (table_start, table_name) = time_travel_table_before(&sql[..kw_start]);
 
                         if !table_name.is_empty() {
                             results.push(TimestampAsOfInfo {
-                                table_name,
+                                table_name: table_name.to_string(),
                                 timestamp,
                                 clause_range: (table_start, val_end),
                             });
@@ -9091,6 +9155,28 @@ mod tests {
     }
 
     #[test]
+    fn test_time_travel_keeps_quoted_table_reference() {
+        let table = r#"paimon."my db"."with ""quote"", (space""#;
+        let version_sql = format!("SELECT 'İ' FROM {table} VERSION AS OF 1");
+        let versions = extract_all_version_as_of(&version_sql);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].table_name, table);
+        assert_eq!(
+            &version_sql[versions[0].clause_range.0..versions[0].clause_range.1],
+            format!("{table} VERSION AS OF 1")
+        );
+
+        let timestamp_sql = format!("SELECT 'İ' FROM {table} TIMESTAMP AS OF '2024-01-01'");
+        let timestamps = extract_all_timestamp_as_of(&timestamp_sql);
+        assert_eq!(timestamps.len(), 1);
+        assert_eq!(timestamps[0].table_name, table);
+        assert_eq!(
+            &timestamp_sql[timestamps[0].clause_range.0..timestamps[0].clause_range.1],
+            format!("{table} TIMESTAMP AS OF '2024-01-01'")
+        );
+    }
+
+    #[test]
     fn test_contains_time_travel_keyword() {
         assert!(contains_time_travel_keyword(
             "SELECT * FROM t VERSION AS OF 1"
@@ -9108,6 +9194,12 @@ mod tests {
         ));
         assert!(!contains_time_travel_keyword(
             "SELECT * FROM t /* timestamp as of now */ WHERE id > 0"
+        ));
+        assert!(!contains_time_travel_keyword(
+            r#"SELECT * FROM "version as of 1""#
+        ));
+        assert!(!contains_time_travel_keyword(
+            "SELECT * FROM `timestamp as of now`"
         ));
         // No keyword at all
         assert!(!contains_time_travel_keyword("SELECT * FROM t"));

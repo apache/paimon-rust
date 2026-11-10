@@ -707,6 +707,32 @@ Writing uses a **write-then-commit** flow:
 5. Pass the messages to `paimon_table_commit_commit`.
 6. Free the messages, writer, committer, and builder.
 
+### Exporting the Table's Write Schema
+
+Use `paimon_table_export_arrow_schema` to construct batches with the pinned
+table's field order, names, nullability and core Arrow types. The function does
+not query the catalog or refresh the table schema. Include your Arrow
+implementation's C Data Interface declarations for `struct ArrowSchema`:
+
+```c
+struct ArrowSchema schema = {0};
+paimon_error *error = paimon_table_export_arrow_schema(table, &schema);
+if (error != NULL) {
+    paimon_error_free(error);
+    return -1;
+}
+/* Import schema into the Arrow implementation and construct matching batches.
+   An importing consumer may move ownership and set schema.release to NULL. */
+if (schema.release != NULL) schema.release(&schema);
+```
+
+The table handle is borrowed; the exported schema remains valid after it is
+freed. Release the schema through its callback, rather than
+`paimon_arrow_batch_free` (which frees a library-owned batch allocation).
+The output must be initialized with a null release callback. Reusing a live
+schema returns an error without replacing it; release it before reuse.
+The core type mapping remains authoritative, including for unsupported types.
+
 ### Cross-process Commit Messages
 
 Workers can prepare files and export their ordinary commit messages for an
@@ -732,6 +758,47 @@ The version, message count and body lengths are transport metadata, not part
 of those bodies. Do not concatenate bodies or add a header inside a body.
 An empty message list exports an empty array. The buffers are independent of
 the source handle and remain valid after that handle is freed.
+
+For a size-limited transport, query the message count and export ranges. The
+limit applies to the sum of body lengths, excluding array overhead and the
+application's framing. Reserve space for that framing in the transport budget.
+This example reduces a range after `ResourceExhausted` (code `6`):
+
+```c
+size_t total = 0;
+paimon_error *count_error = paimon_commit_messages_count(messages, &total);
+if (count_error != NULL) {
+    /* Report the error before releasing it. */
+    paimon_error_free(count_error);
+    return -1;
+}
+for (size_t offset = 0; offset < total; ) {
+    size_t count = total - offset;
+    paimon_result_bytes_array chunk;
+    for (;;) {
+        chunk = paimon_commit_messages_serialize_range(
+            messages, offset, count, body_limit);
+        if (chunk.error == NULL) break;
+        int retry = chunk.error->code == 6 && count > 1;
+        paimon_error_free(chunk.error);
+        paimon_bytes_array_free(chunk.bytes); /* Empty on error. */
+        if (!retry) return -1; /* A single body may exceed the limit. */
+        count /= 2;
+    }
+    /* Send or copy chunk.bytes, preserving the bodies' order and boundaries. */
+    paimon_bytes_array_free(chunk.bytes);
+    offset += count;
+}
+```
+
+Errors do not consume messages or expose a partial array, so a smaller range
+can be retried against the same handle. `offset + count` must not overflow or
+exceed the message count. Empty ranges at or before the end succeed even with
+a zero-byte limit. The existing full-list export remains available.
+
+The byte limit is not a peak-memory or RSS bound: individual metadata rows
+still use temporary encoding buffers, and vector capacity and result ownership
+conversion can allocate additional memory.
 
 On the coordinator, create a standard committer for the intended table and
 operation. Enable overwrite on its builder before creating it if the workers
@@ -801,6 +868,13 @@ unflushed format-writer input batches. Sorting, encoding, transient routing
 batches, file indexes, caller-owned Arrow input, and allocation overhead are
 not fully charged. A reservation failure does not automatically flush or retry
 a writer; handle the error as a failed write operation.
+
+For append and postpone-bucket writes, formats that support flushing also flush
+when the current file's retained-input reservation reaches
+`write.parquet-buffer-size` (default 256 MiB). This accounts for inputs such as
+repeated strings whose Arrow buffers can be much larger than the encoded row
+group. The flush decision uses only that file's reservation. Each batch must
+still fit within the available budget before it can be flushed.
 
 The input Arrow schema must match the table schema exactly, including field
 count, order, names, and types. A non-nullable table field must not contain null

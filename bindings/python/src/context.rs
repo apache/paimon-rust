@@ -357,11 +357,11 @@ impl PaimonCatalog {
         py: Python<'py>,
         session: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
-        let name = cr"datafusion_catalog_provider".into();
+        let name = cr"datafusion_catalog_provider";
         let provider = Arc::clone(&self.provider) as Arc<dyn CatalogProvider + Send>;
         let codec = ffi_logical_codec_from_pycapsule(session)?;
         let provider = FFI_CatalogProvider::new_with_ffi_codec(provider, Some(runtime()), codec);
-        PyCapsule::new(py, provider, Some(name))
+        PyCapsule::new_with_value(py, provider, name)
     }
 
     /// List all databases in this catalog.
@@ -1038,6 +1038,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<PySQLOptions>()?;
     this.add_class::<PySQLContext>()?;
     this.add_class::<crate::write::PyBatchWriteBuilder>()?;
+    this.add_class::<crate::compact::PyCompactBuilder>()?;
     this.add_class::<crate::write::PyPostponeFixedBucketWriteBuilder>()?;
     this.add_class::<crate::write_routing::PyBucketRouter>()?;
     this.add_class::<crate::write_routing::PyDynamicBucketAssignerRouter>()?;

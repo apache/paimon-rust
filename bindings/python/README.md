@@ -79,8 +79,8 @@ Operators such as sorting and aggregation may still buffer data during execution
 
 `sql_stream_with_options(sql, options)` applies `SQLOptions` as `sql_with_options()`
 does: they restrict statements delegated to DataFusion, but not statements Paimon
-handles itself, such as `DELETE`, `UPDATE`, `MERGE INTO` or `DROP TABLE` on a
-Paimon table.
+handles itself, such as `DELETE`, `UPDATE` or `DROP TABLE` on a Paimon table.
+`MERGE INTO` uses DataFusion's native planner and honors the DML restriction.
 
 ### Native Vector Search
 
@@ -279,6 +279,12 @@ the ending snapshot, including when no selected files remain. The existing
 `new_scan()` honors these options; no new Python API is required.
 
 ### Custom Blob URI sources
+
+Batch and stream writers can be transferred between Python threads. Operations
+remain exclusive: calling another writer method while a write, prepare, or close
+is running raises `RuntimeError`. Call `close()` in a `finally` block to discard
+unprepared output and release source streams. Callback reference cycles are also
+visible to Python's garbage collector when collection runs on another thread.
 
 Before the first Arrow write, call
 `writer.with_blob_uri_reader_factory(factory)` to copy referenced Blob payloads

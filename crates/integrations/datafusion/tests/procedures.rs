@@ -59,6 +59,25 @@ async fn setup_table_with_snapshots() -> (tempfile::TempDir, paimon_datafusion::
     (tmp, sql_context)
 }
 
+const SNAPSHOT_TIMES: [u64; 3] = [1_700_000_000_000, 1_700_000_001_000, 1_700_000_002_000];
+
+async fn setup_table_with_snapshot_times() -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
+    let (tmp, sql_context) = setup_table_with_snapshots().await;
+    // Procedure arguments are epoch milliseconds. `$snapshots.commit_time` is
+    // a local TIMESTAMP, whose Arrow values include the system timezone offset.
+    // Explicit metadata times also keep boundary tests independent of the clock.
+    for (index, time_millis) in SNAPSHOT_TIMES.into_iter().enumerate() {
+        let path = tmp
+            .path()
+            .join(format!("test_db.db/t1/snapshot/snapshot-{}", index + 1));
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snapshot["timeMillis"] = serde_json::json!(time_millis);
+        std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    }
+    (tmp, sql_context)
+}
+
 async fn setup_table_with_watermarks(
     watermarks: [Option<i64>; 3],
 ) -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
@@ -434,6 +453,50 @@ async fn test_rename_branch_rejects_unopenable_source_and_target() {
     );
     // b1 is still openable through the table reader.
     table.copy_with_branch("b1").await.unwrap();
+}
+
+#[tokio::test]
+async fn test_fast_forward_validates_arguments_and_rejects_filesystem_tables() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(&sql_context, "CREATE TABLE paimon.test_db.t1 (id INT)").await;
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+
+    for (arguments, error) in [
+        (
+            "table => 'test_db.t1'",
+            "Missing required argument: 'branch'",
+        ),
+        ("branch => 'b1'", "Missing required argument: 'table'"),
+        (
+            "table => 'test_db.t1', branch => 'b1', tag => 'release'",
+            "Argument tag is unknown.",
+        ),
+        (
+            "table => 'test_db.t1', branch => 'b1', branch => 'b2'",
+            "Procedure argument branch is duplicated.",
+        ),
+    ] {
+        assert_sql_error(
+            &sql_context,
+            &format!("CALL sys.fast_forward({arguments})"),
+            error,
+        )
+        .await;
+    }
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.fast_forward(table => 'test_db.t1', branch => 'b1')",
+        "fast_forward is only supported for tables managed by a REST catalog",
+    )
+    .await;
+    assert!(bm.branch_exists("b1").await.unwrap());
 }
 
 #[tokio::test]
@@ -2693,73 +2756,83 @@ async fn test_rollback_to_tag() {
 
 #[tokio::test]
 async fn test_rollback_to_timestamp() {
-    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+    for (timestamp, expected_snapshot) in [
+        (SNAPSHOT_TIMES[0], 1),
+        (SNAPSHOT_TIMES[1] - 1, 1),
+        (SNAPSHOT_TIMES[1], 2),
+    ] {
+        let (_tmp, sql_context) = setup_table_with_snapshot_times().await;
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.rollback_to_timestamp(table => 'test_db.t1', timestamp => '{timestamp}')"
+            ),
+        )
+        .await;
 
-    // Get the timestamp of snapshot 1 from $snapshots system table
-    let batches = sql_context
-        .sql("SELECT snapshot_id, commit_time FROM paimon.test_db.`t1$snapshots` ORDER BY snapshot_id")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
-    // Use a timestamp between snapshot 1 and snapshot 2
-    let snap1_time = batches[0]
-        .column_by_name("commit_time")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<datafusion::arrow::array::TimestampMillisecondArray>()
-        .unwrap()
-        .value(0);
-
-    exec(
-        &sql_context,
-        &format!(
-            "CALL sys.rollback_to_timestamp(table => 'test_db.t1', timestamp => '{snap1_time}')"
-        ),
-    )
-    .await;
-
-    let count = row_count(&sql_context, "SELECT * FROM paimon.test_db.t1").await;
-    assert_eq!(count, 1);
+        let rows = collect_id_name(&sql_context, "SELECT id, name FROM paimon.test_db.t1").await;
+        let expected = [(1, "alice".to_string()), (2, "bob".to_string())];
+        assert_eq!(rows, expected[..expected_snapshot], "timestamp {timestamp}");
+        let snapshots = sql_context
+            .sql("SELECT snapshot_id FROM paimon.test_db.`t1$snapshots` ORDER BY snapshot_id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let ids = snapshots
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, (1..=expected_snapshot as i64).collect::<Vec<_>>());
+    }
 }
 
 #[tokio::test]
 async fn test_create_tag_from_timestamp() {
-    let (_tmp, sql_context) = setup_table_with_snapshots().await;
-
-    // Get the timestamp of snapshot 2
-    let batches = sql_context
-        .sql("SELECT snapshot_id, commit_time FROM paimon.test_db.`t1$snapshots` ORDER BY snapshot_id")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
-    let snap2_time = batches[0]
-        .column_by_name("commit_time")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<datafusion::arrow::array::TimestampMillisecondArray>()
-        .unwrap()
-        .value(1);
-
-    exec(
-        &sql_context,
-        &format!(
-            "CALL sys.create_tag_from_timestamp(table => 'test_db.t1', tag => 'ts_tag', timestamp => '{snap2_time}')"
-        ),
-    )
-    .await;
-
-    let count = row_count(
-        &sql_context,
-        "SELECT * FROM paimon.test_db.`t1$tags` WHERE tag_name = 'ts_tag'",
-    )
-    .await;
-    assert_eq!(count, 1);
+    let (tmp, sql_context) = setup_table_with_snapshot_times().await;
+    for (tag, timestamp, expected_snapshot) in [
+        ("before_first", SNAPSHOT_TIMES[0] - 1, 1),
+        ("between", SNAPSHOT_TIMES[1] - 1, 2),
+        ("exact", SNAPSHOT_TIMES[1], 2),
+    ] {
+        exec(
+            &sql_context,
+            &format!(
+                "CALL sys.create_tag_from_timestamp(table => 'test_db.t1', tag => '{tag}', timestamp => '{timestamp}')"
+            ),
+        )
+        .await;
+        assert_eq!(read_tag(tmp.path(), tag)["id"], expected_snapshot);
+        let batches = sql_context
+            .sql(&format!(
+                "SELECT snapshot_id FROM paimon.test_db.`t1$tags` WHERE tag_name = '{tag}'"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            expected_snapshot
+        );
+    }
 }
 
 #[tokio::test]

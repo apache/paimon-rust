@@ -71,6 +71,18 @@ impl BufferedBatch {
             Self::Materialized(batch) => batch.column(output_col_idx).as_ref(),
         }
     }
+
+    /// [`Self::column_for_output`] as the `ArrayRef` the batch holds.
+    pub(super) fn column_ref_for_output(
+        &self,
+        output_col_idx: usize,
+        source_output_col_indices: &[usize],
+    ) -> &arrow_array::ArrayRef {
+        match self {
+            Self::Source(batch) => batch.column(source_output_col_indices[output_col_idx]),
+            Self::Materialized(batch) => batch.column(output_col_idx),
+        }
+    }
 }
 
 /// A row reference as an index into the batch buffer.
@@ -775,7 +787,11 @@ impl PartialUpdateMergeFunction {
                     .and_then(|aggregators| aggregators.get_mut(output_col_idx))
                     .and_then(Option::as_mut)
                 {
-                    aggregator.agg(source_array, row.row_idx)?;
+                    aggregator.agg_array(
+                        batch_buffer[row.batch_idx]
+                            .column_ref_for_output(output_col_idx, source_output_col_indices),
+                        row.row_idx,
+                    )?;
                 } else if !source_array.is_null(row.row_idx) {
                     *selected = Some((row.batch_idx, row.row_idx));
                 }
@@ -1096,11 +1112,11 @@ impl AggregateMergeFunction {
             for (col_idx, slot) in aggregators.iter_mut().enumerate() {
                 if let Some(agg) = slot.as_mut() {
                     let source_array = batch_buffer[row.batch_idx]
-                        .column_for_output(col_idx, source_output_col_indices);
+                        .column_ref_for_output(col_idx, source_output_col_indices);
                     if kind.is_add() {
-                        agg.agg(source_array, row.row_idx)?;
+                        agg.agg_array(source_array, row.row_idx)?;
                     } else {
-                        agg.retract(source_array, row.row_idx)?;
+                        agg.retract(source_array.as_ref(), row.row_idx)?;
                     }
                 }
             }
@@ -1416,6 +1432,12 @@ impl SortMergeReaderBuilder {
 
     pub(crate) fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Replace the input streams, for a builder prepared before they exist.
+    pub(crate) fn with_streams(mut self, streams: Vec<ArrowRecordBatchStream>) -> Self {
+        self.streams = streams;
         self
     }
 

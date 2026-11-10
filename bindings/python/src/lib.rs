@@ -22,6 +22,7 @@ mod blob;
 mod blob_uri_reader;
 mod catalog_version;
 mod commit_callback;
+mod compact;
 mod context;
 mod error;
 mod evolution;

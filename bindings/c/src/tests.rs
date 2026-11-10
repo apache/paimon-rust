@@ -27,6 +27,7 @@
 //! runtime only for Rust-API setup (write_data_rust, setup_table_dirs).
 
 mod commit_messages;
+mod table_arrow_schema;
 
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
@@ -1920,7 +1921,22 @@ fn test_write_commit_read_roundtrip() {
         assert!(tw_result.error.is_null());
         let tw = tw_result.write;
 
-        let batch = make_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+        let mut exported = FFI_ArrowSchema::empty();
+        assert!(paimon_table_export_arrow_schema(
+            handle,
+            (&mut exported as *mut FFI_ArrowSchema).cast(),
+        )
+        .is_null());
+        let schema = ArrowSchema::try_from(&exported).unwrap();
+        exported.release.unwrap()(&mut exported);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
         let (array_box, schema_box) = export_batch_to_ffi(batch);
         let array_ptr = (&**array_box) as *const FFI_ArrowArray as *mut c_void;
         let schema_ptr = (&**schema_box) as *const FFI_ArrowSchema as *mut c_void;
@@ -1931,6 +1947,9 @@ fn test_write_commit_read_roundtrip() {
         let pc_result = paimon_table_write_prepare_commit(tw);
         assert!(pc_result.error.is_null());
         assert!(!pc_result.messages.is_null());
+
+        // Closing must preserve the commit messages already handed to the caller.
+        assert!(paimon_table_write_close(tw).is_null());
 
         let tc_result = paimon_write_builder_new_commit(wb);
         assert!(tc_result.error.is_null());
@@ -3324,6 +3343,13 @@ fn build_pk_vector_table(path: &str, vectors: &[[f32; PK_DIM]]) -> Table {
     );
 
     crate::runtime().block_on(async {
+        // Automatic compaction reloads the schema from storage after committing.
+        file_io
+            .new_output(&table.schema_manager().schema_path(table.schema().id()))
+            .unwrap()
+            .write(serde_json::to_vec(table.schema()).unwrap().into())
+            .await
+            .unwrap();
         // Write a real data file via the public write path to obtain a genuine
         // DataFileMeta (name, row count, stats, file size).
         let write_builder = table.new_write_builder();

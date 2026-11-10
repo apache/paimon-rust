@@ -410,14 +410,14 @@ fn build_column(
         DataType::Map(map_type) => build_map_column(records, name, map_type, num_rows)?,
         // Java encodes MULTISET<T> as a map from the element to an INT count,
         // sharing the MAP path (`AvroSchemaConverter#extractValueTypeToAvroMap`
-        // returns IntType). Unlike MAP, `paimon_type_to_arrow` lets the key here
-        // follow the element's nullability and pins the count non-nullable.
+        // returns IntType). MAP keys and MULTISET elements are non-nullable
+        // in Arrow; counts are non-nullable too.
         DataType::Multiset(multiset_type) => build_map_like_column(
             records,
             name,
             multiset_type.element_type(),
             &DataType::Int(IntType::new()),
-            multiset_type.element_type().is_nullable(),
+            false,
             false,
             num_rows,
         )?,
@@ -608,7 +608,7 @@ fn build_map_column(
 /// The key and value types are passed separately rather than taken from a
 /// `MapType` so `MULTISET<T>` can reuse this with an implicit `INT` count as the
 /// value. The two nullability flags must match what `paimon_type_to_arrow`
-/// declares for the same type -- MAP and MULTISET differ here -- or
+/// declares for the same type or
 /// `RecordBatch::try_new` rejects the column.
 fn build_map_like_column(
     records: &[Value],

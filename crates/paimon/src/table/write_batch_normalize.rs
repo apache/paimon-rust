@@ -1548,7 +1548,10 @@ mod tests {
                 let output = normalize_write_array(&input, &expected).unwrap();
                 assert_eq!(output.data_type(), &expected);
                 assert_eq!(output.len(), input.len());
-                assert_eq!(output.nulls(), input.nulls());
+                assert_eq!(output.null_count(), input.null_count());
+                for row in 0..input.len() {
+                    assert_eq!(output.is_null(row), input.is_null(row));
+                }
                 let data = output.to_data();
                 data.validate_full().unwrap();
             }
