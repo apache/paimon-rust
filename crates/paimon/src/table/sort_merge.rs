@@ -164,6 +164,15 @@ fn singleton_reducer_result(rows: &[MergeRow]) -> crate::Result<Option<MergeResu
     }))
 }
 
+/// Whether a merge function also reduces a key with a single version. Only the
+/// lookup changelog producer needs that; otherwise the lone version is returned
+/// as is (see [`singleton_reducer_result`]).
+pub(crate) fn reduces_singletons(table_options: &HashMap<String, String>) -> bool {
+    table_options
+        .get("changelog-producer")
+        .is_some_and(|value| value.eq_ignore_ascii_case("lookup"))
+}
+
 /// Merge function applied to rows sharing the same primary key.
 ///
 /// Deduplicate-style engines can keep returning a source row. Future
@@ -467,9 +476,7 @@ impl PartialUpdateMergeFunction {
         PartialUpdateConfig::new(table_options).validate_write_mode(true, table_name)?;
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
-            reduce_singletons: table_options
-                .get("changelog-producer")
-                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
+            reduce_singletons: reduces_singletons(table_options),
             remove_record_on_delete: PartialUpdateConfig::new(table_options)
                 .remove_record_on_delete(),
             sequence_group_partial_delete: HashSet::new(),
@@ -582,9 +589,7 @@ impl PartialUpdateMergeFunction {
 
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
-            reduce_singletons: table_options
-                .get("changelog-producer")
-                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
+            reduce_singletons: reduces_singletons(table_options),
             remove_record_on_delete: config.remove_record_on_delete(),
             sequence_group_partial_delete,
             sequence_group_enabled,
@@ -1058,9 +1063,7 @@ impl AggregateMergeFunction {
         Ok(Self {
             aggregators: Mutex::new(aggregators),
             remove_record_on_delete: config.remove_record_on_delete(),
-            reduce_singletons: table_options
-                .get("changelog-producer")
-                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
+            reduce_singletons: reduces_singletons(table_options),
         })
     }
 
