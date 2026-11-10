@@ -94,6 +94,32 @@ for batch in batches:
     print(batch)
 ```
 
+### Streaming SQL results
+
+`sql_stream()` executes one SQL query and returns a `RecordBatchReader`, yielding
+PyArrow batches without collecting the entire result in memory. Close the reader
+when stopping early to release the execution stream:
+
+```python
+from contextlib import closing
+
+with closing(ctx.sql_stream("SELECT id, name FROM paimon.my_db.t")) as reader:
+    for batch in reader:
+        print(batch.to_pydict())
+```
+
+`read_next_batch()` returns `None` when the reader is exhausted or closed.
+`reader.schema` is known before the first batch, so
+`pa.Table.from_batches(reader, schema=reader.schema)` also handles an empty
+result. Statements that write, such as `INSERT`, finish before `sql_stream()`
+returns. Errors during execution can surface while reading a batch and end the
+stream.
+
+`sql_stream_with_options(sql, options)` applies `SQLOptions` as
+`sql_with_options()` does: they restrict statements delegated to DataFusion, but
+not statements Paimon handles itself, such as `DELETE`, `UPDATE`, or `DROP TABLE`
+on a Paimon table.
+
 ### Runtime Resource Configuration
 
 `SQLContext` can use a bounded DataFusion memory pool and a dedicated temporary
@@ -471,6 +497,9 @@ rb = table.new_read_builder({"scan.version": "3"})
 
 # By tag name
 rb = table.new_read_builder({"scan.tag-name": "release-1.0"})
+
+# By watermark
+rb = table.new_read_builder({"scan.watermark": "1700000000000"})
 ```
 
 !!! warning
@@ -510,7 +539,7 @@ if snap:
 for snap in table.list_snapshots():
     print(snap.id(), snap.commit_kind())
 
-# Tags
+# Tags pinned on this table/branch
 for tag in table.list_tags():
     print(tag.name(), tag.snapshot_id())
 
@@ -518,6 +547,83 @@ for tag in table.list_tags():
 for stat in table.partition_stats():
     print(stat.partition(), stat.record_count(), stat.total_size_bytes())
 ```
+
+### Tag Management
+
+`table.list_tags()` only inspects tags. Create, fetch, page, delete, and rollback
+through the catalog:
+
+```python
+from pypaimon_rust.datafusion import Instant
+
+identifier = ("my_db", "users")
+
+# Pin the latest snapshot, or pass snapshot_id=... for an explicit snapshot.
+catalog.create_tag(identifier, "release-1.0")
+tag = catalog.get_tag(identifier, "release-1.0")
+print(tag.tag_name(), tag.snapshot().id())
+
+names, next_token = catalog.list_tags_paged(identifier, max_results=100)
+catalog.delete_tag(identifier, "release-1.0")
+
+# Roll the table back to a snapshot or tag instant.
+catalog.rollback_to(identifier, Instant.snapshot(1))
+catalog.rollback_to(identifier, Instant.tag("release-1.0"))
+```
+
+`create_tag(..., time_retained=...)` accepts an optional retention duration when
+the catalog implementation supports it. `ignore_if_exists=True` ignores a
+duplicate tag name.
+
+## Native Search
+
+Tables with vector or full-text indexes can search through the Rust core without
+materializing candidate rows in Python first:
+
+```python
+# Scalar vector search
+search = (
+    table.new_vector_search_builder()
+    .with_vector_column("embedding")
+    .with_query_vector([1.0, 0.0])
+    .with_limit(10)
+)
+plan = search.new_vector_search_scan().scan()
+result = search.new_vector_search_read().read_plan(plan)
+batches = result.new_read_builder().with_projection(["id"]).read()
+
+# Batch vector search returns one GlobalIndexResult per input query, in order
+batch = (
+    table.new_batch_vector_search_builder()
+    .with_vector_column("embedding")
+    .with_query_vectors([[1.0, 0.0], [0.0, 1.0]])
+    .with_limit(5)
+)
+results = batch.execute()
+
+# Full-text search
+text = (
+    table.new_full_text_search_builder()
+    .with_query("body", "needle")
+    .with_limit(10)
+)
+text_result = text.execute()
+
+# Hybrid vector + full-text search
+hybrid = (
+    table.new_hybrid_search_builder()
+    .add_vector_route("embedding", [1.0, 0.0], 10)
+    .add_full_text_route("body", "needle", 10)
+    .with_limit(5)
+)
+ranked = hybrid.execute()
+```
+
+`execute()` returns a `GlobalIndexResult` (or a list of them for batch vector
+search). Reusable scan/read plans pin one snapshot; scalar and partition filters
+are applied before ranking. Projected reads can include `__paimon_search_score`
+in relevance order. Hybrid routes can also be configured and executed separately
+through `route_builders()` / `rank(...)`.
 
 ## Table Maintenance
 
@@ -554,6 +660,47 @@ Compacting a primary-key table that uses the `lookup` changelog producer, the
 the catalog options; without it `execute()` raises `ValueError` once there are
 tasks to run. See [Table Compaction](compaction.md) for the supported table
 modes.
+
+### Global Index Build and Drop
+
+Build or drop global indexes with dedicated builders. Defaults use index type
+`btree`. `execute()` plans and commits in one call. `build()` and
+`build_shard()` return commit messages for the caller to publish.
+`plan()` exposes shards for distributed builds.
+
+```python
+# One-shot build and commit
+built = (
+    table.new_global_index_build_builder()
+    .with_index_column("embedding")
+    .with_index_type("ivf-flat")
+    .with_options({"dimension": "2", "nlist": "1", "metric": "l2"})
+    .execute()
+)
+
+# Advanced: build() returns commit messages for an explicit commit
+messages = (
+    table.new_global_index_build_builder()
+    .with_index_columns(["name"])
+    .with_index_type("btree")
+    .with_partition_filter({"method": "equal", "field": "dt", "literals": ["2026-11-01"]})
+    .build()
+)
+table.new_batch_write_builder().new_commit().commit(messages)
+
+# Drop indexes; dry_run=True reports work without committing
+dropped = (
+    table.new_global_index_drop_builder()
+    .with_index_column("name")
+    .with_index_type("btree")
+    .with_dry_run(False)
+    .execute()
+)
+```
+
+`GlobalIndexBuildBuilder.supports_index_type(...)` and
+`GlobalIndexDropBuilder.supports_index_type(...)` report which index types the
+builders accept.
 
 ## Python UDF
 

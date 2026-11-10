@@ -176,6 +176,69 @@ paimon_option options[] = {
 paimon_result_catalog_new result = paimon_catalog_create(options, 3);
 ```
 
+### Time Travel
+
+Create a read builder with scan options through
+`paimon_table_new_read_builder_with_options`. At most one time-travel selector
+may be set. A selector that does not resolve to a snapshot is an error; it never
+silently falls back to the latest snapshot.
+
+Supported selectors:
+
+- `scan.snapshot-id`
+- `scan.tag-name`
+- `scan.timestamp-millis`
+- `scan.timestamp`
+- `scan.watermark`
+- `scan.version`
+
+```c
+paimon_option travel[] = {
+    {.key = "scan.snapshot-id", .value = "1"},
+};
+paimon_result_read_builder builder_result =
+    paimon_table_new_read_builder_with_options(table, travel, 1);
+CHECK_RESULT(builder_result);
+read_builder = builder_result.read_builder;
+```
+
+`paimon_table_new_read_builder(table)` is equivalent to calling the options
+variant with an empty option list.
+
+### Tag Management
+
+Catalog tags pin table snapshots:
+
+```c
+/* Tag the latest snapshot. Pass a non-null i64* to pin an explicit snapshot. */
+paimon_error *error =
+    paimon_catalog_create_tag(catalog, identifier, "release-1.0", NULL, false);
+if (error != NULL) {
+    /* handle error */
+    paimon_error_free(error);
+}
+
+paimon_result_get_tag tag_result =
+    paimon_catalog_get_tag(catalog, identifier, "release-1.0");
+if (tag_result.error != NULL) {
+    /* handle error */
+    paimon_error_free(tag_result.error);
+} else {
+    /* tag_result.tag holds JSON bytes owned by the caller */
+    paimon_bytes_free(tag_result.tag);
+}
+
+error = paimon_catalog_delete_tag(catalog, identifier, "release-1.0");
+if (error != NULL) {
+    paimon_error_free(error);
+}
+```
+
+`ignore_if_exists` on create ignores a duplicate tag name. Delete does not
+ignore a missing tag. The C binding does not expose tag listing; read a known
+tag with `paimon_catalog_get_tag`, or use time travel with `scan.tag-name`.
+Creating tags with a retention duration is not exposed in the C API.
+
 ## Caller-managed File Cache
 
 Native engines can create a reusable `paimon_file_io` and connect Paimon reads
