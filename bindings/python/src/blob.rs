@@ -18,7 +18,7 @@
 use std::future::Future;
 
 use paimon::io::{FileIO, FileRead};
-use paimon::spec::BlobDescriptor;
+use paimon::spec::{BlobDescriptor, VideoFrameDescriptor};
 use paimon_datafusion::runtime::runtime;
 use paimon_datafusion::BlobReaderRegistry;
 use pyo3::exceptions::PyValueError;
@@ -52,7 +52,30 @@ impl PyBlobReaderRegistry {
     pub(crate) fn new(inner: BlobReaderRegistry) -> Self {
         Self { inner }
     }
+
+    fn open_descriptor_stream(
+        &self,
+        descriptor: &BlobDescriptor,
+    ) -> PyResult<Option<PyBlobInputStream>> {
+        let Some(file_io) = self.inner.resolve(descriptor.uri()) else {
+            return Ok(None);
+        };
+
+        Ok(Some(PyBlobInputStream::new(file_io, descriptor)?))
+    }
+
+    fn video_frame_descriptor(raw_value: &[u8]) -> PyResult<Option<VideoFrameDescriptor>> {
+        if !VideoFrameDescriptor::is_video_frame_descriptor(raw_value) {
+            return Ok(None);
+        }
+        VideoFrameDescriptor::deserialize(raw_value)
+            .map(Some)
+            .map_err(to_py_err)
+    }
 }
+
+type VideoFrameInput = (PyBlobInputStream, Option<(i64, i64)>);
+type VideoFrameLocation = ((String, i64, i64), i64);
 
 #[pymethods]
 impl PyBlobReaderRegistry {
@@ -62,11 +85,41 @@ impl PyBlobReaderRegistry {
         }
 
         let descriptor = BlobDescriptor::deserialize(raw_value).map_err(to_py_err)?;
-        let Some(file_io) = self.inner.resolve(descriptor.uri()) else {
+        self.open_descriptor_stream(&descriptor)
+    }
+
+    fn open_video_frame_descriptor_stream(
+        &self,
+        raw_value: &[u8],
+    ) -> PyResult<Option<VideoFrameInput>> {
+        let Some(frame) = Self::video_frame_descriptor(raw_value)? else {
             return Ok(None);
         };
 
-        Ok(Some(PyBlobInputStream::new(file_io, descriptor)?))
+        let stream = self
+            .open_descriptor_stream(frame.payload_descriptor())?
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "VideoFrameDescriptor requires a registered Paimon table FileIO",
+                )
+            })?;
+        let moov_range =
+            (frame.moov_length() > 0).then(|| (frame.moov_offset(), frame.moov_length()));
+        Ok(Some((stream, moov_range)))
+    }
+
+    fn describe_video_frame(&self, raw_value: &[u8]) -> PyResult<Option<VideoFrameLocation>> {
+        Ok(Self::video_frame_descriptor(raw_value)?.map(|frame| {
+            let payload = frame.payload_descriptor();
+            (
+                (
+                    payload.uri().to_string(),
+                    payload.offset(),
+                    payload.length(),
+                ),
+                frame.frame_index(),
+            )
+        }))
     }
 }
 
@@ -81,7 +134,7 @@ struct PyBlobInputStream {
 }
 
 impl PyBlobInputStream {
-    fn new(file_io: FileIO, descriptor: BlobDescriptor) -> PyResult<Self> {
+    fn new(file_io: FileIO, descriptor: &BlobDescriptor) -> PyResult<Self> {
         if descriptor.offset() < 0 {
             return Err(PyValueError::new_err(format!(
                 "BlobDescriptor has negative offset: {}",

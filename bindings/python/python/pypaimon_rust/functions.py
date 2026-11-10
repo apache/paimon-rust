@@ -20,7 +20,11 @@ import json
 import logging
 import math
 import struct
+from fractions import Fraction
+from itertools import chain, islice, pairwise
 from typing import Any, BinaryIO
+
+from ._video_index import VideoSeekMismatch, clip_seek, indexed_clip_frames, read_moov
 
 logger = logging.getLogger(__name__)
 _STILL_IMAGE_FORMATS = {
@@ -368,6 +372,110 @@ def _decode_video_frame(
     return None
 
 
+class _IncompleteVideoRange(ValueError):
+    pass
+
+
+def _video_source(container):
+    format_names = set((container.format.name or "").split(","))
+    if format_names & _STILL_IMAGE_FORMATS or not container.streams.video:
+        return None
+    return container.streams.video[0]
+
+
+def _video_range_frames(container, source, start_frame, end_frame, moov):
+    if moov is not None and "mp4" in (container.format.name or "").split(","):
+        seek = clip_seek(source, moov, start_frame, end_frame)
+        if seek is not None:
+            yield from indexed_clip_frames(container, source, seek)
+            return
+
+    count = 0
+    for count, frame in enumerate(islice(container.decode(source), start_frame, end_frame), 1):
+        yield frame
+    if count != end_frame - start_frame:
+        raise _IncompleteVideoRange(f"Video ends before frame {end_frame - 1}")
+
+
+def _encode_mp4(frames, width, height, rate, time_base, *, preserve_timing):
+    try:
+        import av
+    except ImportError as e:
+        raise ImportError("PyAV is required to encode video clips") from e
+
+    frame_step = max(1, round(1 / (rate * time_base)))
+    output = io.BytesIO()
+    with av.open(output, mode="w", format="mp4") as clip:
+        video = clip.add_stream("libx264", rate=rate, options={"preset": "veryfast"})
+        video.width = width
+        video.height = height
+        video.pix_fmt = "yuv444p" if width % 2 or height % 2 else "yuv420p"
+        video.codec_context.time_base = time_base
+        video.codec_context.max_b_frames = 0
+
+        origin = None
+        previous_pts = -frame_step
+        for frame, next_frame in pairwise(chain(frames, (None,))):
+            duration = 0
+            pts = previous_pts + frame_step
+            if preserve_timing and frame.time_base:
+                duration = frame.duration * frame.time_base
+                if frame.pts is not None:
+                    source_pts = round(frame.pts * frame.time_base / time_base)
+                    if origin is None:
+                        origin = source_pts - pts
+                    relative_pts = source_pts - origin
+                    if relative_pts > previous_pts:
+                        pts = relative_pts
+            if (frame.width, frame.height) != (width, height):
+                frame = frame.reformat(width=width, height=height, format=video.pix_fmt)
+            frame.pts = pts
+            frame.time_base = time_base
+            frame.pict_type = 0
+            previous_pts = pts
+            packets = video.encode(frame)
+            if next_frame is None:
+                packets.extend(video.encode())
+                # Earlier durations follow from the next packet's timestamp.
+                if packets and duration > 0:
+                    packets[-1].duration = round(duration / packets[-1].time_base)
+            for packet in packets:
+                clip.mux(packet)
+    return output.getvalue()
+
+
+def _encode_video_clip(
+    stream: BinaryIO, start_frame: int, end_frame: int, moov: bytes | None = None
+) -> bytes | None:
+    try:
+        import av
+    except ImportError as e:
+        raise ImportError("PyAV is required to encode video clips") from e
+
+    with av.open(stream, mode="r") as container:
+        source = _video_source(container)
+        if source is None:
+            return None
+        rate = source.average_rate or source.guessed_rate or Fraction(30)
+        frames = _video_range_frames(container, source, start_frame, end_frame, moov)
+        try:
+            return _encode_mp4(
+                frames, source.width, source.height, rate, source.time_base or 1 / rate,
+                preserve_timing=True,
+            )
+        except _IncompleteVideoRange:
+            return None
+
+
+def _encode_video_range(stream, start_frame, end_frame, moov):
+    try:
+        return _encode_video_clip(stream, start_frame, end_frame, moov)
+    except VideoSeekMismatch as e:
+        logger.debug("Retrying video clip with sequential decoding: %s", e)
+        stream.seek(0)
+        return _encode_video_clip(stream, start_frame, end_frame)
+
+
 def _make_video_snapshot(image_format: str = "PNG", blob_reader_registry=None):
     image_format = image_format.upper()
 
@@ -457,6 +565,48 @@ def _make_video_frame(image_format: str = "PNG", blob_reader_registry=None):
         return pa.array(frames, type=pa.binary())
 
     return video_frame
+
+
+def _make_video_clip(blob_reader_registry):
+    def video_clip(values, start_frames, end_frames):
+        try:
+            import pyarrow as pa
+        except ImportError as e:
+            raise ImportError("pyarrow is required to return video_clip results") from e
+
+        clips = []
+        for raw_value, start_frame, end_frame in zip(
+            values.to_pylist(), start_frames.to_pylist(), end_frames.to_pylist(), strict=True
+        ):
+            if (
+                raw_value is None
+                or start_frame is None
+                or end_frame is None
+                or not 0 <= start_frame < end_frame
+            ):
+                clips.append(None)
+                continue
+
+            try:
+                packed = blob_reader_registry.open_video_frame_descriptor_stream(raw_value)
+                if packed is None:
+                    stream = open_blob_descriptor_stream(raw_value, blob_reader_registry)
+                    moov_range = None
+                else:
+                    stream, moov_range = packed
+                with stream:
+                    moov = read_moov(stream, moov_range) if moov_range and start_frame else None
+                    clip = _encode_video_range(stream, start_frame, end_frame, moov)
+            except ImportError:
+                raise
+            except Exception as e:
+                logger.warning("Failed to encode video clip: %s", e)
+                clip = None
+            clips.append(clip)
+
+        return pa.array(clips, type=pa.binary())
+
+    return video_clip
 
 
 def _make_media_info(blob_reader_registry=None):

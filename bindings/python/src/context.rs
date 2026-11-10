@@ -30,6 +30,9 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::{LogicalPlan, Signature, TypeSignature, Volatility};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::keywords::Keyword;
+use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 use datafusion_ffi::catalog_provider::FFI_CatalogProvider;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use futures::StreamExt;
@@ -38,7 +41,7 @@ use paimon::{Catalog, CatalogFactory, Options};
 use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
 use pyo3::exceptions::{PyRuntimeWarning, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyCapsule;
+use pyo3::types::{PyBytes, PyCapsule};
 
 use crate::blob::PyBlobReaderRegistry;
 use crate::catalog_version::{PyGetTagResponse, PyInstant, PyTableSnapshot};
@@ -774,9 +777,10 @@ impl PySQLContext {
         );
         self.inner.ctx().register_udf(snapshot_udf);
 
+        let frame_blob_reader_registry = blob_reader_registry.clone_ref(py);
         let frame_func = functions
             .getattr("_make_video_frame")?
-            .call1(("PNG", blob_reader_registry))?
+            .call1(("PNG", frame_blob_reader_registry))?
             .unbind();
         let frame_signature = Signature::one_of(
             vec![
@@ -792,6 +796,31 @@ impl PySQLContext {
             frame_signature,
         );
         self.inner.ctx().register_udf(frame_udf);
+
+        let clip_func = functions
+            .getattr("_make_video_clip")?
+            .call1((blob_reader_registry,))?
+            .unbind();
+        let clip_signature = Signature::one_of(
+            [
+                ArrowDataType::Binary,
+                ArrowDataType::LargeBinary,
+                ArrowDataType::BinaryView,
+            ]
+            .into_iter()
+            .map(|source| {
+                TypeSignature::Exact(vec![source, ArrowDataType::Int64, ArrowDataType::Int64])
+            })
+            .collect(),
+            Volatility::Volatile,
+        );
+        let clip_udf = build_python_scalar_udf(
+            "video_clip".to_string(),
+            clip_func,
+            ArrowDataType::Binary,
+            clip_signature,
+        );
+        self.inner.ctx().register_udf(clip_udf);
 
         let vector_from_json_func = functions
             .getattr("_make_vector_from_json")?
@@ -970,6 +999,49 @@ impl PySQLContext {
     /// Stream SQL results. Close the reader when stopping early.
     fn sql_stream(&self, py: Python<'_>, sql: String) -> PyResult<PyRecordBatchReader> {
         self.execute_sql_stream(py, &sql, SQLOptions::new())
+    }
+
+    /// Encode one MP4 frame per row of an ordered read-only query.
+    #[pyo3(signature = (sql, *, column="frame", fps=None))]
+    fn read_video(
+        &self,
+        py: Python<'_>,
+        sql: &str,
+        column: &str,
+        fps: Option<f64>,
+    ) -> PyResult<Py<PyBytes>> {
+        if fps.is_some_and(|fps| !fps.is_finite() || fps <= 0.0) {
+            return Err(PyValueError::new_err("fps must be finite and positive"));
+        }
+        // Paimon handles some commands before DataFusion checks SQLOptions.
+        let tokens = Tokenizer::new(&GenericDialect {}, sql)
+            .tokenize()
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let first = tokens
+            .iter()
+            .find(|token| !matches!(token, Token::Whitespace(_) | Token::LParen));
+        if !matches!(first, Some(Token::Word(word)) if matches!(word.keyword,
+            Keyword::SELECT | Keyword::WITH | Keyword::VALUES | Keyword::TABLE))
+        {
+            return Err(PyValueError::new_err(
+                "read_video requires a read-only query",
+            ));
+        }
+        let assemble = py.import("pypaimon_rust._video_assembly")?;
+        let registry = Py::new(
+            py,
+            PyBlobReaderRegistry::new(self.inner.blob_reader_registry()),
+        )?;
+        let options = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+        let reader = self.execute_sql_stream(py, sql, options)?;
+        Ok(assemble
+            .getattr("read_video")?
+            .call1((reader, column, fps, registry))?
+            .cast_into::<PyBytes>()?
+            .unbind())
     }
 
     /// Stream SQL results using the supplied options.

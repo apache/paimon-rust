@@ -25,6 +25,7 @@ import sys
 import tarfile
 import tempfile
 import types
+from dataclasses import replace
 from pathlib import Path
 
 import pyarrow as pa
@@ -95,22 +96,41 @@ def serialize_blob_descriptor(uri: str, offset: int, length: int) -> bytes:
     )
 
 
+def serialize_video_frame_descriptor(uri, offset, length, frame_index, moov_range=(0, 0)):
+    uri_bytes = uri.encode("utf-8")
+    return (
+        struct.pack("<BQI", 1, 0x564944454F46524D, len(uri_bytes))
+        + uri_bytes
+        + struct.pack("<5q", offset, length, frame_index, *moov_range)
+    )
+
+
 def write_sample_video(
     path: Path,
     colors: tuple[tuple[int, int, int], ...] = ((240, 40, 80),),
+    frame_pts: tuple[int, ...] | None = None,
+    *,
+    codec: str = "mpeg4",
+    codec_tag: str | None = None,
+    codec_options: dict[str, str] | None = None,
+    muxer_options: dict[str, str] | None = None,
 ) -> None:
     av = pytest.importorskip("av")
     image_module = pytest.importorskip("PIL.Image")
 
-    with av.open(str(path), mode="w") as container:
-        stream = container.add_stream("mpeg4", rate=1)
+    with av.open(str(path), mode="w", options=muxer_options) as container:
+        stream = container.add_stream(codec, rate=1, options=codec_options)
+        if codec_tag is not None:
+            stream.codec_context.codec_tag = codec_tag
         stream.width = 32
         stream.height = 32
         stream.pix_fmt = "yuv420p"
 
-        for color in colors:
+        for index, color in enumerate(colors):
             image = image_module.new("RGB", (32, 32), color=color)
             frame = av.VideoFrame.from_image(image)
+            if frame_pts is not None:
+                frame.pts = frame_pts[index]
             for packet in stream.encode(frame):
                 container.mux(packet)
         for packet in stream.encode():
@@ -214,6 +234,7 @@ def test_video_snapshot_builtin_registered_on_context_init():
         SELECT
             video_snapshot(CAST(NULL AS BYTEA)) AS cover_png,
             video_frame(CAST(NULL AS BYTEA), 0) AS frame_png,
+            video_clip(CAST(NULL AS BYTEA), 0, 1) AS clip_mp4,
             media_info(CAST(NULL AS BYTEA)) AS media_info_json,
             media_thumbnail(CAST(NULL AS BYTEA)) AS thumbnail_png,
             vector_from_json(CAST(NULL AS STRING)) AS vector_value,
@@ -224,6 +245,7 @@ def test_video_snapshot_builtin_registered_on_context_init():
 
     assert table["cover_png"].to_pylist() == [None]
     assert table["frame_png"].to_pylist() == [None]
+    assert table["clip_mp4"].to_pylist() == [None]
     assert table["media_info_json"].to_pylist() == [None]
     assert table["thumbnail_png"].to_pylist() == [None]
     assert table["vector_value"].to_pylist() == [None]
@@ -469,6 +491,359 @@ def test_video_frame_accepts_frame_index():
         assert second_image.getpixel((16, 16)) != third_image.getpixel((16, 16))
 
         ctx.sql("DROP TEMPORARY TABLE paimon.default.videos")
+
+
+def test_video_clip_reads_source_and_selects_exact_frames(tmp_path):
+    av = pytest.importorskip("av")
+    video_path = tmp_path / "sample.mp4"
+    write_sample_video(
+        video_path,
+        colors=((240, 40, 80), (40, 220, 80), (40, 80, 240)),
+        frame_pts=(0, 1, 3),
+    )
+    video_bytes = video_path.read_bytes()
+
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE TABLE paimon.default.videos (video BINARY)")
+    packed_path = tmp_path / "default.db" / "videos" / "sample.video"
+    prefix = b"other payload"
+    packed_path.write_bytes(prefix + video_bytes + b"packed index")
+    frame_descriptor = serialize_video_frame_descriptor(
+        str(packed_path), len(prefix), len(video_bytes), 2
+    )
+    blob_descriptor = serialize_blob_descriptor(
+        str(packed_path), len(prefix), len(video_bytes)
+    )
+    ctx.register_batch(
+        "source_videos",
+        pa.record_batch(
+            [pa.array([video_bytes, blob_descriptor, frame_descriptor], type=pa.binary())],
+            names=["video"],
+        ),
+    )
+    ctx.sql("INSERT INTO paimon.default.videos SELECT video FROM paimon.default.source_videos")
+    batches = ctx.sql(
+        """
+        SELECT
+            video_clip(arrow_cast(video, 'LargeBinary'), CAST(1 AS INT), 3) AS clip,
+            video_clip(video, 1, 4) AS beyond_end,
+            video_clip(video, -1, 3) AS negative,
+            video_clip(video, 2, 2) AS empty,
+            video_clip(video, NULL, 3) AS null_bound
+        FROM paimon.default.videos
+        """
+    )
+    rows = pa.Table.from_batches(batches).to_pylist()
+
+    assert len(rows) == 3
+    for row in rows:
+        assert row["beyond_end"] is None
+        assert row["negative"] is None
+        assert row["empty"] is None
+        assert row["null_bound"] is None
+        assert row["clip"][4:8] == b"ftyp"
+        with av.open(io.BytesIO(row["clip"])) as clip:
+            assert clip.streams.video[0].codec_context.name == "h264"
+            frames = list(clip.decode(video=0))
+            assert [frame.time for frame in frames] == [0.0, 2.0]
+            assert float(frames[-1].duration * frames[-1].time_base) == 1.0
+            green, blue = [frame.to_image().getpixel((16, 16)) for frame in frames]
+            assert green == pytest.approx((40, 220, 80), abs=10)
+            assert blue == pytest.approx((40, 80, 240), abs=10)
+
+
+@pytest.mark.parametrize(
+    "mode", ["positive_ctts", "negative_ctts", "seek_mismatch", "fragmented"]
+)
+def test_video_clip_seeks_using_packed_moov(tmp_path, monkeypatch, mode):
+    av = pytest.importorskip("av")
+    from pypaimon_rust import functions
+
+    video_path = tmp_path / "sample.mp4"
+    muxer_options = {
+        "negative_ctts": {"movflags": "negative_cts_offsets"},
+        "fragmented": {"movflags": "empty_moov+frag_keyframe"},
+    }.get(mode)
+    write_sample_video(
+        video_path,
+        colors=tuple((15 * index, 20, 220 - 10 * index) for index in range(15)),
+        frame_pts=(0, 1, 2, 4, 5, 6, 7, 10, 11, 12, 15, 16, 17, 19, 21),
+        codec="libx264",
+        codec_options={"g": "4", "sc_threshold": "0", "bf": "2", "b_strategy": "0"},
+        muxer_options=muxer_options,
+    )
+    video_bytes = video_path.read_bytes()
+    moov_offset = video_bytes.index(b"moov") - 4
+    moov_size = struct.unpack_from(">I", video_bytes, moov_offset)[0]
+    start_frame, end_frame = 10, 14
+
+    with av.open(str(video_path)) as source:
+        frames = list(source.decode(video=0))
+        assert any(frame.pict_type == av.video.frame.PictureType.B for frame in frames)
+        assert not frames[start_frame].key_frame
+        keyframe_pts = next(frame.pts for frame in reversed(frames[:start_frame]) if frame.key_frame)
+        assert keyframe_pts > frames[0].pts
+
+    attempts = []
+    successful = []
+    indexed_clip_frames = functions.indexed_clip_frames
+
+    def record_seek(container, source, seek):
+        attempts.append(seek.keyframe_pts)
+        if mode == "seek_mismatch":
+            seek = replace(seek, keyframe_position=-1)
+        yield from indexed_clip_frames(container, source, seek)
+        successful.append(seek.keyframe_pts)
+
+    monkeypatch.setattr(functions, "indexed_clip_frames", record_seek)
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE TABLE paimon.default.videos (video BINARY)")
+    packed_path = tmp_path / "default.db" / "videos" / "sample.video"
+    prefix = b"other payload"
+    packed_path.write_bytes(prefix + video_bytes + b"packed index")
+    descriptor = serialize_video_frame_descriptor(
+        str(packed_path), len(prefix), len(video_bytes), 2, (moov_offset, moov_size)
+    )
+    ctx.register_batch(
+        "source_videos",
+        pa.record_batch([pa.array([descriptor, video_bytes], type=pa.binary())], names=["video"]),
+    )
+    ctx.sql("INSERT INTO paimon.default.videos SELECT video FROM paimon.default.source_videos")
+    batches = ctx.sql(
+        f"SELECT video_clip(video, {start_frame}, {end_frame}) AS clip FROM paimon.default.videos"
+    )
+    indexed, sequential = pa.Table.from_batches(batches)["clip"].to_pylist()
+    assert sequential is not None
+    assert indexed == sequential
+    assert attempts == ([] if mode == "fragmented" else [keyframe_pts])
+    assert successful == ([keyframe_pts] if mode in ("positive_ctts", "negative_ctts") else [])
+
+
+def test_read_video_assembles_ordered_images(tmp_path):
+    av = pytest.importorskip("av")
+    red, green, blue = (225, 35, 45), (45, 215, 45), (45, 35, 225)
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.register_batch(
+        "images",
+        pa.record_batch(
+            [[3, 1, 2], [sample_image_bytes(color=color) for color in (blue, red, green)]],
+            names=["id", "image"],
+        ),
+    )
+    sql = "-- Order the images for playback\nSELECT image FROM images ORDER BY id"
+    clip = ctx.read_video(sql, column="image", fps=2.5)
+    with av.open(io.BytesIO(clip)) as container:
+        frames = list(container.decode(video=0))
+        assert [frame.time for frame in frames] == pytest.approx([0.0, 0.4, 0.8])
+        for frame, color in zip(frames, (red, green, blue), strict=True):
+            assert frame.to_image().getpixel((16, 16)) == pytest.approx(color, abs=10)
+
+    with pytest.raises(ValueError, match="fps is required"):
+        ctx.read_video(sql, column="image")
+    with pytest.raises(ValueError, match="no rows"):
+        ctx.read_video("SELECT image FROM images WHERE FALSE", column="image", fps=30)
+    with pytest.raises(ValueError, match="row 1 contains NULL"):
+        ctx.read_video("SELECT CAST(NULL AS BYTEA) AS frame", fps=30)
+    with pytest.raises(ValueError, match="row 1 is not a decodable image"):
+        ctx.read_video("SELECT CAST('bad image' AS BYTEA) AS frame", fps=30)
+    with pytest.raises(ValueError, match="requires a read-only query"):
+        ctx.read_video("CREATE TABLE paimon.default.unexpected (id INT)", fps=30)
+
+
+@pytest.mark.parametrize("retry_seek", [False, True])
+def test_read_video_assembles_mixed_frames_across_batches(tmp_path, monkeypatch, retry_seek):
+    av = pytest.importorskip("av")
+    from pypaimon_rust import functions
+
+    colors = tuple((20 + 13 * index, 180 - 12 * index, 45 + 8 * index) for index in range(12))
+    pts = tuple(2 * index + (index >= 6) for index in range(12))
+    source = tmp_path / "sample.mp4"
+    write_sample_video(
+        source,
+        colors=colors,
+        frame_pts=pts,
+        codec="libx264",
+        codec_options={"g": "4", "sc_threshold": "0", "bf": "2", "b_strategy": "0"},
+    )
+    video = source.read_bytes()
+    moov_offset = video.index(b"moov") - 4
+    moov_size = struct.unpack_from(">I", video, moov_offset)[0]
+
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("SET datafusion.execution.batch_size = 2")
+    ctx.sql("SET datafusion.execution.target_partitions = 1")
+    ctx.sql("CREATE TABLE paimon.default.frames (position INT, frame BINARY)")
+    table_path = tmp_path / "default.db" / "frames"
+    packed = table_path / "frames.video"
+    prefix = b"packed payload prefix"
+    packed.write_bytes(prefix + video + b"packed index")
+
+    def descriptor(ordinal):
+        return serialize_video_frame_descriptor(
+            str(packed), len(prefix), len(video), ordinal, (moov_offset, moov_size)
+        )
+
+    red, blue = (225, 20, 20), (20, 20, 225)
+    blob = table_path / "image.blob"
+    image = sample_image_bytes(size=(48, 24), color=blue)
+    blob.write_bytes(prefix + image)
+    rows = [
+        sample_image_bytes(color=red),
+        descriptor(5),
+        descriptor(6),
+        descriptor(7),
+        serialize_blob_descriptor(str(blob), len(prefix), len(image)),
+        descriptor(9),
+    ]
+    ctx.register_batch(
+        "source_frames",
+        pa.record_batch(
+            [list(reversed(range(len(rows)))), list(reversed(rows))],
+            names=["position", "frame"],
+        ),
+    )
+    ctx.sql("INSERT INTO paimon.default.frames SELECT * FROM paimon.default.source_frames")
+    sql = "SELECT frame FROM paimon.default.frames ORDER BY position"
+    assert [batch.num_rows for batch in ctx.sql_stream(sql)] == [2, 2, 2]
+
+    seek_sizes = []
+    indexed_clip_frames = functions.indexed_clip_frames
+
+    def record_seek(container, source, seek):
+        seek_sizes.append(len(seek.expected_pts))
+        frames = indexed_clip_frames(container, source, seek)
+        if retry_seek and len(seek.expected_pts) == 3:
+            yield next(frames)
+            raise functions.VideoSeekMismatch("test seek failure after one frame")
+        yield from frames
+
+    monkeypatch.setattr(functions, "indexed_clip_frames", record_seek)
+    clip = ctx.read_video(sql, fps=8)
+    assert seek_sizes == [3, 1]
+    with av.open(io.BytesIO(clip)) as container:
+        frames = list(container.decode(video=0))
+        assert [frame.time for frame in frames] == pytest.approx([i / 8 for i in range(6)])
+        expected = (red, *colors[5:8], blue, colors[9])
+        for frame, color in zip(frames, expected, strict=True):
+            assert (frame.width, frame.height) == (32, 32)
+            assert frame.to_image().getpixel((16, 16)) == pytest.approx(color, abs=12)
+
+    clip = ctx.read_video(
+        "SELECT frame FROM paimon.default.frames WHERE position BETWEEN 1 AND 3 ORDER BY position"
+    )
+    with av.open(io.BytesIO(clip)) as container:
+        assert [frame.time for frame in container.decode(video=0)] == [0.0, 3.0, 5.0]
+    assert seek_sizes == [3, 1, 3]
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["closed", "signed_ctts", "open", "interlaced", "hevc_closed", "hevc_open", "hev1"],
+)
+def test_read_video_remuxes_only_safe_ranges(tmp_path, monkeypatch, mode):
+    av = pytest.importorskip("av")
+    from pypaimon_rust import _video_assembly
+
+    source_path = tmp_path / "sample.mp4"
+    colors = tuple((20 + 13 * index, 180 - 12 * index, 45 + 8 * index) for index in range(12))
+    codec, tag = "libx264", "avc1"
+    options = {"g": "4", "sc_threshold": "0", "bf": "2", "b_strategy": "0"}
+    if mode.startswith("hevc_") or mode == "hev1":
+        try:
+            av.Codec("libx265", "w")
+        except av.codec.codec.UnknownCodecError:
+            pytest.skip("PyAV was built without libx265")
+        codec, tag = "libx265", "hev1" if mode == "hev1" else "hvc1"
+        open_gop = int(mode == "hevc_open")
+        options = {
+            "x265-params": (
+                f"keyint=4:min-keyint=4:scenecut=0:open-gop={open_gop}:"
+                "bframes=2:b-adapt=0:log-level=error:frame-threads=1:pools=none"
+            )
+        }
+    elif mode == "open":
+        options["x264-params"] = "open-gop=1"
+    elif mode == "interlaced":
+        options["x264-params"] = "interlaced=1:tff=1"
+    write_sample_video(
+        source_path,
+        colors=colors,
+        frame_pts=(0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12),
+        codec=codec,
+        codec_tag=tag,
+        codec_options=options,
+        muxer_options={"movflags": "negative_cts_offsets"} if mode == "signed_ctts" else None,
+    )
+    video = source_path.read_bytes()
+    moov_offset = video.index(b"moov") - 4
+    moov_size = struct.unpack_from(">I", video, moov_offset)[0]
+    with av.open(str(source_path)) as source:
+        source_frames = list(source.decode(video=0))
+    assert len(source_frames) == len(colors)
+    assert source_frames[4].key_frame
+
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE TABLE paimon.default.frames (ordinal INT, frame BINARY)")
+    packed = tmp_path / "default.db" / "frames" / "frames.video"
+    prefix = b"packed payload prefix"
+    packed.write_bytes(prefix + video + b"packed index")
+    descriptors = [
+        serialize_video_frame_descriptor(
+            str(packed), len(prefix), len(video), ordinal, (moov_offset, moov_size)
+        )
+        for ordinal in range(len(colors))
+    ]
+    ctx.register_batch(
+        "source_frames",
+        pa.record_batch([list(range(len(colors))), descriptors], names=["ordinal", "frame"]),
+    )
+    ctx.sql("INSERT INTO paimon.default.frames SELECT * FROM paimon.default.source_frames")
+
+    encoded_ranges = []
+    encode_video_range = _video_assembly._encode_video_range
+
+    def record_encode(stream, start, end, moov):
+        encoded_ranges.append((start, end))
+        return encode_video_range(stream, start, end, moov)
+
+    monkeypatch.setattr(_video_assembly, "_encode_video_range", record_encode)
+    ranges = [(4, 5, False)]
+    if mode in ("closed", "signed_ctts", "hevc_closed"):
+        ranges = [(0, 4, True), (4, 8, True), (8, 12, True), (4, 7, False), (5, 8, False)]
+    elif mode == "hevc_open":
+        ranges = [(0, 4, True), (4, 5, False), (0, 12, False)]
+    elif mode == "hev1":
+        ranges = [(0, 4, True), (4, 8, False)]
+    for start, end, copied in ranges:
+        clip = ctx.read_video(
+            f"SELECT frame FROM paimon.default.frames "
+            f"WHERE ordinal >= {start} AND ordinal < {end} ORDER BY ordinal"
+        )
+        expected = source_frames[start:end]
+        with av.open(io.BytesIO(clip)) as container:
+            assert container.streams.video[0].codec_context.codec_tag == (tag if copied else "avc1")
+            actual = list(container.decode(video=0))
+        assert [frame.time for frame in actual] == pytest.approx(
+            [frame.time - expected[0].time for frame in expected]
+        )
+        if copied:
+            selected_pts = {frame.pts for frame in expected}
+            with av.open(str(source_path)) as source:
+                packets = [
+                    bytes(packet) for packet in source.demux(video=0) if packet.pts in selected_pts
+                ]
+            with av.open(io.BytesIO(clip)) as container:
+                assert [bytes(packet) for packet in container.demux(video=0) if packet.size] == packets
+            assert [frame.duration for frame in actual] == [frame.duration for frame in expected]
+        else:
+            for frame, color in zip(actual, colors[start:end], strict=True):
+                assert frame.to_image().getpixel((16, 16)) == pytest.approx(color, abs=12)
+    assert encoded_ranges == [(start, end) for start, end, copied in ranges if not copied]
 
 
 def test_media_info_returns_json_for_image_and_video():

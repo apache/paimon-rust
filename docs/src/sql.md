@@ -2412,10 +2412,21 @@ pip install "pypaimon-rust[video]"
 | `video_snapshot(blob)` | BINARY | PNG frame near timestamp 0ms |
 | `video_snapshot(blob, timestamp_ms)` | BINARY | PNG frame near the given timestamp |
 | `video_frame(blob, frame_index)` | BINARY | PNG frame by zero-based decoded frame index |
+| `video_clip(source, start_frame, end_frame)` | BINARY | MP4 clip from `start_frame` inclusive to `end_frame` exclusive |
 | `vector_from_json(json)` | `List<Float32>` | Converts a JSON float array string into an Arrow float vector |
 | `vector_to_json(vector)` | STRING | Converts an Arrow float vector back to a JSON array string |
 
 Invalid, NULL, unsupported, or undecodable media inputs return SQL `NULL`. Media functions read either inline bytes or BLOB descriptor bytes when the `SQLContext` has a registered Paimon catalog that can resolve the descriptor.
+
+`video_clip` also accepts a frame descriptor from a `video-frame-field` column
+and resolves its original video through the registered catalog. Both bounds are
+zero-based frame numbers in playback order in that original video. For example,
+`video_clip(content, 100, 200)` returns frames 100 through 199 as an H.264 MP4
+with a single video track. A range that extends beyond the source returns `NULL`.
+For AVC or HEVC in a packed MP4, `video_clip` uses the recorded `moov` range to
+seek to the nearest preceding keyframe and verifies the selected frames against
+the presentation timestamps in the index. Sources without a usable index are
+decoded from the beginning. Output uses the `libx264` encoder provided by PyAV.
 
 Example:
 
@@ -2444,6 +2455,39 @@ CROSS JOIN LATERAL vector_search(
     10
 ) AS r;
 ```
+
+### Assemble a Video from Query Results
+
+Python's `SQLContext.read_video()` streams a read-only query and returns one
+MP4 as `bytes`. Use `ORDER BY` with a unique tie-breaker if needed to
+define playback order. Each result row contributes one frame.
+
+```python
+mp4 = ctx.read_video(
+    """
+    SELECT frame
+    FROM paimon.default.episode_frames
+    WHERE episode_id = 42 AND frame_no >= 100 AND frame_no < 200
+    ORDER BY frame_no
+    """,
+    column="frame",
+    fps=30,
+)
+```
+
+The selected binary column can mix packed video frame descriptors, inline
+images, and image BLOB descriptors resolved through the registered catalog.
+Consecutive rows from the same video with consecutive frame numbers are decoded
+together, using the `moov` index when available. When `fps` is supplied, the
+output uses that fixed frame rate and resizes frames to the first frame's
+dimensions as needed. Omit `fps` for a single continuous video range to preserve
+its frame timing. For indexed progressive AVC or HEVC MP4, this mode copies the
+original compressed samples when the range begins at an IDR frame and covers a
+contiguous span in decode order. HEVC ranges with open-GOP pictures use the
+frame-accurate H.264 encoding path, as do other ranges that cannot be copied
+safely. A HEVC cut after the first frame requires complete out-of-band VPS, SPS,
+and PPS arrays in the source MP4.
+Empty results, NULL cells, and undecodable media raise an error.
 
 ## Vector Search
 

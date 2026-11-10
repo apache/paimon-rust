@@ -1159,6 +1159,11 @@ class SQLContext:
     def sql_stream(self, sql: str) -> RecordBatchReader:
         """Stream PyArrow batches; close the reader when stopping early."""
         ...
+    def read_video(
+        self, sql: str, *, column: str = "frame", fps: Optional[float] = None
+    ) -> bytes:
+        """Encode one MP4 frame per row in the query's result order."""
+        ...
     def sql_stream_with_options(
         self, sql: str, options: SQLOptions
     ) -> RecordBatchReader:
