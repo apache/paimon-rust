@@ -394,15 +394,16 @@ impl CollectAgg {
 
 /// Java equality of two one-element arrays.
 fn same_element(java_eq: bool, left: &ArrayRef, right: &ArrayRef) -> bool {
-    if java_eq {
+    // `java_equals` expects both sides to have the same type.
+    if java_eq && left.data_type() == right.data_type() {
         java_equals(left.as_ref(), 0, right.as_ref(), 0)
     } else {
         left.as_ref() == right.as_ref()
     }
 }
 
-/// Whether Arrow `==` can tell apart elements that Java's equaliser calls
-/// equal: FLOAT/DOUBLE values and maps, at any depth.
+/// Whether Arrow `==` can tell apart elements that Java calls equal:
+/// FLOAT/DOUBLE values and maps, at any depth.
 fn needs_java_eq(data_type: &ArrowDataType) -> bool {
     match data_type {
         ArrowDataType::Float32 | ArrowDataType::Float64 | ArrowDataType::Map(_, _) => true,
