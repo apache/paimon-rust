@@ -561,10 +561,13 @@ built, so its case sensitivity comes from which builder created it — see
 Filter push-down prunes data at two levels:
 
 1. **Scan planning** — skips partitions, buckets, and data files based on file-level statistics (min/max).
-2. **Read-side** — applies row-level filtering via Parquet native row filters for leaf predicates.
+2. **Read-side** — applies row-level filtering via Parquet native row filters for leaf predicates, then enforces the full predicate with an exact residual filter.
 
-!!! warning
-    Filter push-down is a **best-effort** optimization. The returned results may still contain rows that do not satisfy the filter condition. Callers should always apply residual filtering on the returned records to ensure correctness.
+Stats pruning and native push-down are conservative optimizations: inconclusive
+files and unsupported push-down shapes are kept for later filtering. Ordinary
+Paimon reads still return only matching rows because append, data-evolution, and
+primary-key merge paths apply an exact residual filter over the full predicate,
+including compound `And` / `Or` / `Not` trees.
 
 ### Building Predicates
 
