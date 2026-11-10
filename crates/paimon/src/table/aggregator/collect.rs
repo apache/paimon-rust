@@ -18,9 +18,11 @@
 //! Java `FieldCollectAgg`: concatenate ARRAY elements, optionally distinct
 //! and capped by `fields.<col>.count-limit`.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float32Type, Float64Type};
 use arrow_array::{new_empty_array, new_null_array, Array, ArrayRef, ListArray};
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_row::{RowConverter, Rows, SortField};
@@ -49,10 +51,18 @@ pub(crate) struct CollectAgg {
     /// The elements are a DELETE value kept as-is, so they may hold
     /// duplicates or exceed the limit until the next merge.
     raw_accumulator: bool,
-    elements: Vec<ArrayRef>,
-    /// Encoded keys of `elements` when `key_encoder` is set; `None` until
-    /// rebuilt after a retract.
-    element_keys: Option<HashSet<Box<[u8]>>>,
+    elements: VecDeque<ArrayRef>,
+    /// For distinct columns without the equaliser: `elements` is the
+    /// concatenation of merged operands in merge order, still to be
+    /// deduplicated and cut to the limit. Java's set merge gives the same
+    /// result whether that is done after each merge or once at the end.
+    unmerged: bool,
+    /// Length of `elements` the last time an unmerged concatenation was
+    /// merged; bounds how far it may grow before being merged again.
+    merged_len: usize,
+    /// Set by a DELETE value: with the equaliser, Java keeps duplicates that
+    /// an accumulator already holds, so `elements` may repeat an element.
+    may_repeat: bool,
 }
 
 /// One side of Java's merge, with the encoded keys of its elements when
@@ -62,6 +72,14 @@ struct Operand {
     keys: Option<Rows>,
     has_duplicate: bool,
 }
+
+struct Merged {
+    elements: Vec<ArrayRef>,
+    keys: Option<HashSet<Box<[u8]>>>,
+}
+
+/// Unmerged elements allowed beyond twice the merged length.
+const UNMERGED_SLACK: usize = 1024;
 
 impl CollectAgg {
     pub(crate) fn new(
@@ -102,8 +120,10 @@ impl CollectAgg {
             key_encoder,
             seen_input: false,
             raw_accumulator: false,
-            elements: Vec::new(),
-            element_keys: None,
+            elements: VecDeque::new(),
+            unmerged: false,
+            merged_len: 0,
+            may_repeat: false,
         })
     }
 
@@ -133,11 +153,14 @@ impl CollectAgg {
         Ok(Some(self.list(array)?.value(row_idx)))
     }
 
-    fn concat_elements(&self, elements: &[ArrayRef]) -> crate::Result<ArrayRef> {
-        if elements.is_empty() {
+    fn concat_elements<'a>(
+        &self,
+        elements: impl IntoIterator<Item = &'a ArrayRef>,
+    ) -> crate::Result<ArrayRef> {
+        let slices: Vec<&dyn Array> = elements.into_iter().map(|e| e.as_ref()).collect();
+        if slices.is_empty() {
             return Ok(new_empty_array(self.element.data_type()));
         }
-        let slices: Vec<&dyn Array> = elements.iter().map(|e| e.as_ref()).collect();
         concat(&slices).map_err(|e| Error::DataInvalid {
             message: format!(
                 "Failed to build collect result for '{}': {e}",
@@ -151,8 +174,23 @@ impl CollectAgg {
         let Some(encoder) = &self.key_encoder else {
             return Ok(None);
         };
+        // Java `Float.equals` / `Double.equals` treat every NaN as one value;
+        // only the keys are rewritten, the stored elements keep their bits.
+        let values: ArrayRef = match values.data_type() {
+            ArrowDataType::Float32 => Arc::new(
+                values
+                    .as_primitive::<Float32Type>()
+                    .unary::<_, Float32Type>(|v| if v.is_nan() { f32::NAN } else { v }),
+            ),
+            ArrowDataType::Float64 => Arc::new(
+                values
+                    .as_primitive::<Float64Type>()
+                    .unary::<_, Float64Type>(|v| if v.is_nan() { f64::NAN } else { v }),
+            ),
+            _ => Arc::clone(values),
+        };
         encoder
-            .convert_columns(std::slice::from_ref(values))
+            .convert_columns(&[values])
             .map(Some)
             .map_err(|e| Error::DataInvalid {
                 message: format!(
@@ -183,20 +221,6 @@ impl CollectAgg {
             keys: self.encode_keys(values)?,
             has_duplicate: true,
         })
-    }
-
-    /// The accumulator as Java's merge would have collected it so far, so
-    /// that the input can be appended without rebuilding the collection.
-    fn take_collected(&mut self) -> crate::Result<Merged> {
-        let elements = std::mem::take(&mut self.elements);
-        let keys = match (self.element_keys.take(), self.key_encoder.is_some()) {
-            (Some(keys), _) => Some(keys),
-            (None, true) => self
-                .encode_keys(&self.concat_elements(&elements)?)?
-                .map(|rows| rows.iter().map(|row| row.as_ref().into()).collect()),
-            (None, false) => None,
-        };
-        Ok(Merged { elements, keys })
     }
 
     /// Java's private `agg(first, firstHasDuplicate, second,
@@ -259,30 +283,145 @@ impl CollectAgg {
     }
 
     fn store(&mut self, merged: Merged) {
-        self.elements = merged.elements;
-        self.element_keys = merged.keys;
+        self.elements = merged.elements.into();
         self.seen_input = true;
         self.raw_accumulator = false;
+        self.unmerged = false;
+    }
+
+    /// Distinct without the equaliser: Java's set merge.
+    fn uses_set_merge(&self) -> bool {
+        self.distinct && !self.java_uses_equaliser
+    }
+
+    /// `elements` run through Java's merge as a single operand.
+    fn merged_elements(&self) -> crate::Result<Vec<ArrayRef>> {
+        let elements = self.elements.iter().cloned().collect();
+        let accumulator = self.operand(elements, false)?;
+        let empty = self.operand(Vec::new(), true)?;
+        Ok(self.merge(&accumulator, &empty).elements)
+    }
+
+    /// Merge an unmerged concatenation, so `elements` is what Java stores.
+    fn settle(&mut self) -> crate::Result<()> {
+        if self.unmerged {
+            let merged = self.merged_elements()?;
+            self.merged_len = merged.len();
+            self.elements = merged.into();
+            self.unmerged = false;
+        }
+        Ok(())
+    }
+
+    /// Add `values` before or after `elements` without merging. Without
+    /// distinct the limit is applied right away, which is Java's merge.
+    fn concat_input(&mut self, values: &ArrayRef, front: bool) -> crate::Result<()> {
+        let slices = (0..values.len()).map(|index| values.slice(index, 1));
+        if front {
+            for slice in slices.rev() {
+                self.elements.push_front(slice);
+            }
+        } else {
+            self.elements.extend(slices);
+        }
+        self.seen_input = true;
+        self.raw_accumulator = false;
+        if self.uses_set_merge() {
+            self.unmerged = true;
+            if self.elements.len() > 2 * self.merged_len + UNMERGED_SLACK {
+                self.settle()?;
+            }
+        } else {
+            let limit = self.limit();
+            if self.count_limit >= 0 {
+                self.elements.truncate(limit);
+            } else {
+                let excess = self.elements.len().saturating_sub(limit);
+                self.elements.drain(..excess);
+            }
+        }
+        Ok(())
+    }
+
+    /// Java `agg(input, true, acc, false)` with the equaliser and a
+    /// non-negative limit: the deduplicated input, then the accumulator
+    /// without the elements equal to one of them.
+    fn prepend_with_equaliser(&mut self, values: &ArrayRef) -> crate::Result<()> {
+        let mut first = Merged {
+            elements: Vec::new(),
+            keys: None,
+        };
+        self.collect(&mut first, &self.input_operand(values)?, false);
+        let input = first.elements;
+        if self.may_repeat {
+            self.elements
+                .retain(|element| !input.iter().any(|seen| seen.as_ref() == element.as_ref()));
+        } else {
+            // Each input element equals at most one accumulator element.
+            for seen in &input {
+                if let Some(position) = self
+                    .elements
+                    .iter()
+                    .position(|element| element.as_ref() == seen.as_ref())
+                {
+                    self.elements.remove(position);
+                }
+            }
+        }
+        for element in input.into_iter().rev() {
+            self.elements.push_front(element);
+        }
+        self.elements.truncate(self.limit());
+        self.seen_input = true;
+        self.raw_accumulator = false;
+        Ok(())
     }
 
     /// Java merges a stored DELETE value with a null input like any other
     /// accumulator; anything else is already in merged form.
     fn normalize_raw(&mut self) -> crate::Result<()> {
         if self.raw_accumulator {
-            let elements = std::mem::take(&mut self.elements);
-            let accumulator = self.operand(elements, false)?;
-            let empty = self.operand(Vec::new(), true)?;
-            let merged = self.merge(&accumulator, &empty);
-            self.store(merged);
+            if self.uses_set_merge() {
+                self.raw_accumulator = false;
+                self.unmerged = true;
+            } else {
+                let merged = Merged {
+                    elements: self.merged_elements()?,
+                    keys: None,
+                };
+                self.store(merged);
+            }
         }
         Ok(())
     }
 }
 
-struct Merged {
-    elements: Vec<ArrayRef>,
-    keys: Option<HashSet<Box<[u8]>>>,
+/// Arrow `==` on one-element arrays, except that two NaNs are equal like
+/// Java `Float.equals` / `Double.equals`.
+fn same_element(left: &ArrayRef, right: &ArrayRef) -> bool {
+    match (left.data_type(), right.data_type()) {
+        (ArrowDataType::Float32, ArrowDataType::Float32)
+            if left.is_valid(0) && right.is_valid(0) =>
+        {
+            let (l, r) = (
+                left.as_primitive::<Float32Type>().value(0),
+                right.as_primitive::<Float32Type>().value(0),
+            );
+            l.to_bits() == r.to_bits() || (l.is_nan() && r.is_nan())
+        }
+        (ArrowDataType::Float64, ArrowDataType::Float64)
+            if left.is_valid(0) && right.is_valid(0) =>
+        {
+            let (l, r) = (
+                left.as_primitive::<Float64Type>().value(0),
+                right.as_primitive::<Float64Type>().value(0),
+            );
+            l.to_bits() == r.to_bits() || (l.is_nan() && r.is_nan())
+        }
+        _ => left.as_ref() == right.as_ref(),
+    }
 }
+
 impl FieldAggregator for CollectAgg {
     fn name(&self) -> &'static str {
         "collect"
@@ -292,7 +431,9 @@ impl FieldAggregator for CollectAgg {
         self.seen_input = false;
         self.raw_accumulator = false;
         self.elements.clear();
-        self.element_keys = None;
+        self.unmerged = false;
+        self.merged_len = 0;
+        self.may_repeat = false;
     }
 
     /// Java `agg(acc, input)` is `agg(acc, false, input, true)`.
@@ -300,15 +441,21 @@ impl FieldAggregator for CollectAgg {
         let Some(values) = self.input_values(array, row_idx)? else {
             return self.normalize_raw();
         };
+        if !self.distinct || self.uses_set_merge() {
+            return self.concat_input(&values, false);
+        }
         let input = self.input_operand(&values)?;
         let merged = if self.raw_accumulator || self.count_limit < 0 {
-            let elements = std::mem::take(&mut self.elements);
+            let elements = Vec::from(std::mem::take(&mut self.elements));
             let accumulator = self.operand(elements, false)?;
             self.merge(&accumulator, &input)
         } else {
-            // Java would copy the accumulator unchanged before the input,
-            // so the input can be appended.
-            let mut merged = self.take_collected()?;
+            // The accumulator is already merged, so Java copies it unchanged
+            // and the input can be appended.
+            let mut merged = Merged {
+                elements: Vec::from(std::mem::take(&mut self.elements)),
+                keys: None,
+            };
             self.collect(&mut merged, &input, false);
             merged
         };
@@ -325,6 +472,7 @@ impl FieldAggregator for CollectAgg {
                 .collect();
             self.seen_input = true;
             self.raw_accumulator = true;
+            self.may_repeat = true;
         }
         Ok(())
     }
@@ -335,8 +483,14 @@ impl FieldAggregator for CollectAgg {
         let Some(values) = self.input_values(array, row_idx)? else {
             return self.normalize_raw();
         };
+        if !self.distinct || self.uses_set_merge() {
+            return self.concat_input(&values, true);
+        }
+        if self.count_limit >= 0 {
+            return self.prepend_with_equaliser(&values);
+        }
         let input = self.input_operand(&values)?;
-        let elements = std::mem::take(&mut self.elements);
+        let elements = Vec::from(std::mem::take(&mut self.elements));
         let accumulator = self.operand(elements, false)?;
         let merged = self.merge(&input, &accumulator);
         self.store(merged);
@@ -347,15 +501,15 @@ impl FieldAggregator for CollectAgg {
         if !self.seen_input || array.is_null(row_idx) {
             return Ok(());
         }
+        self.settle()?;
         let values = self.list(array)?.value(row_idx);
         let mut retracted: Vec<ArrayRef> = (0..values.len())
             .map(|index| values.slice(index, 1))
             .collect();
-        self.element_keys = None;
         self.elements.retain(|candidate| {
             if let Some(position) = retracted
                 .iter()
-                .position(|value| value.as_ref() == candidate.as_ref())
+                .position(|value| same_element(value, candidate))
             {
                 retracted.remove(position);
                 false
@@ -363,6 +517,7 @@ impl FieldAggregator for CollectAgg {
                 true
             }
         });
+        self.merged_len = self.elements.len();
         Ok(())
     }
 
@@ -373,14 +528,21 @@ impl FieldAggregator for CollectAgg {
                 1,
             ));
         }
-        let values = self.concat_elements(&self.elements)?;
-        let len = i32::try_from(self.elements.len()).map_err(|_| Error::DataInvalid {
+        let merged;
+        let elements: Vec<&ArrayRef> = if self.unmerged {
+            merged = self.merged_elements()?;
+            merged.iter().collect()
+        } else {
+            self.elements.iter().collect()
+        };
+        let len = i32::try_from(elements.len()).map_err(|_| Error::DataInvalid {
             message: format!(
                 "collect result for '{}' exceeds Arrow List offset",
                 self.field_name
             ),
             source: None,
         })?;
+        let values = self.concat_elements(elements)?;
         let result = ListArray::try_new(
             self.element.clone(),
             OffsetBuffer::new(ScalarBuffer::from(vec![0, len])),
@@ -727,10 +889,10 @@ mod tests {
         assert_eq!(values, vec![&b"c"[..], b"a", b"a", b"b"]);
     }
 
-    /// The hashed membership check gives the same answers as Arrow `==`,
-    /// including after a retract removes elements.
+    /// The hashed membership check gives the same answers as Java
+    /// `equals`, including after a retract removes elements.
     #[test]
-    fn distinct_keys_follow_arrow_equality() {
+    fn distinct_keys_follow_java_equality() {
         let mut agg = CollectAgg::new("items", &int_array(), true, i32::MAX).unwrap();
         agg.agg(&cell(&int_array(), &[Some(1), None, Some(1), Some(2)]), 0)
             .unwrap();
@@ -739,28 +901,51 @@ mod tests {
         assert_eq!(collected(&agg), vec![None]);
         agg.agg(&cell(&int_array(), &ints(&[1, 2])), 0).unwrap();
         assert_eq!(collected(&agg), vec![None, Some(1), Some(2)]);
+    }
 
+    fn doubles(values: &[f64]) -> ListArray {
+        ListArray::try_new(
+            Arc::new(arrow_schema::Field::new(
+                "item",
+                ArrowDataType::Float64,
+                true,
+            )),
+            OffsetBuffer::from_lengths([values.len()]),
+            Arc::new(Float64Array::from(values.to_vec())),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn collected_bits(agg: &CollectAgg) -> Vec<u64> {
+        let result = agg.result().unwrap();
+        let list = result.as_any().downcast_ref::<ListArray>().unwrap();
+        let values = list.value(0);
+        let values = values.as_any().downcast_ref::<Float64Array>().unwrap();
+        values.values().iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// Java `Double.equals` treats NaNs with different payloads as one value
+    /// and keeps 0.0 and -0.0 apart. Before the limit is applied, a second
+    /// NaN must not take the place of a finite value.
+    #[test]
+    fn distinct_doubles_merge_nan_payloads_like_java() {
+        let nan_1 = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_2 = f64::from_bits(0x7ff8_0000_0000_0002);
         let data_type = DataType::Array(ArrayType::new(DataType::Double(DoubleType::new())));
-        let doubles = |values: Vec<f64>| {
-            ListArray::try_new(
-                Arc::new(arrow_schema::Field::new(
-                    "item",
-                    ArrowDataType::Float64,
-                    true,
-                )),
-                OffsetBuffer::from_lengths([values.len()]),
-                Arc::new(Float64Array::from(values)),
-                None,
-            )
-            .unwrap()
-        };
-        for (values, expected) in [(vec![f64::NAN, f64::NAN], 1), (vec![0.0, -0.0], 2)] {
-            let mut agg = CollectAgg::new("items", &data_type, true, i32::MAX).unwrap();
-            agg.agg(&doubles(values.clone()), 0).unwrap();
-            let result = agg.result().unwrap();
-            let list = result.as_any().downcast_ref::<ListArray>().unwrap();
-            assert_eq!(list.value(0).len(), expected, "{values:?}");
-        }
+        let mut agg = CollectAgg::new("items", &data_type, true, 2).unwrap();
+        agg.agg(&doubles(&[nan_1, nan_2]), 0).unwrap();
+        agg.agg(&doubles(&[5.0]), 0).unwrap();
+        // The first NaN keeps its payload.
+        assert_eq!(
+            collected_bits(&agg),
+            vec![nan_1.to_bits(), 5.0f64.to_bits()]
+        );
+
+        let mut agg = CollectAgg::new("items", &data_type, true, i32::MAX).unwrap();
+        agg.agg(&doubles(&[0.0, -0.0, nan_2]), 0).unwrap();
+        agg.retract(&doubles(&[nan_1]), 0).unwrap();
+        assert_eq!(collected_bits(&agg), vec![0, (-0.0f64).to_bits()]);
     }
 
     /// Java picks the equaliser from the Paimon element type: VECTOR keeps

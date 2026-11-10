@@ -3467,11 +3467,21 @@ Sequence fields are always merged with `last_value`. Defining
 `fields.<sequence-field>.aggregate-function` is rejected, matching Java schema
 validation.
 
+`collect` supports `fields.<field>.distinct` and `fields.<field>.count-limit`.
+A positive limit `N` keeps the first `N` elements in merge order, a negative
+limit `-N` keeps the last `N`, and `0` produces an empty array. There is no limit
+by default. With `distinct=true`, the limit counts distinct elements: a positive
+limit keeps the first occurrence of each element and a negative limit keeps the
+last, both in their original order. For example, collecting `[1, 2, 1, 3]` with
+`distinct=true` gives `[1, 2]` for `count-limit=2` and `[1, 3]` for
+`count-limit=-2`. The limit is applied every time rows of a key are merged,
+including write-buffer flushes and compaction, so the shortened array is what
+gets written to data files.
+
 This is not full Java feature parity. Aggregation tables do not support retract
 rows (`DELETE` / `UPDATE_BEFORE`), deletion-vector writes or merge-on-read
 plans, cross-partition dynamic bucket writes, or advanced aggregation options
-such as `ignore-retract`, `distinct`, `nested-key`, `count-limit`, and sequence
-groups.
+such as `ignore-retract`, `nested-key`, and sequence groups.
 
 Primary-key compaction supports `changelog-producer=lookup`, including
 deletion-vector-enabled `deduplicate` tables, generating INSERT, UPDATE_BEFORE, UPDATE_AFTER and DELETE events when
