@@ -24,8 +24,7 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, Float64Type};
 use arrow_array::{
-    new_empty_array, new_null_array, Array, ArrayRef, FixedSizeListArray, ListArray, MapArray,
-    StructArray,
+    downcast_primitive_array, new_empty_array, new_null_array, Array, ArrayRef, ListArray,
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_row::{RowConverter, Rows, SortField};
@@ -46,9 +45,8 @@ pub(crate) struct CollectAgg {
     /// negative one keeps the last |N|.
     count_limit: i32,
     java_uses_equaliser: bool,
-    /// Whether elements hold FLOAT/DOUBLE values at any depth, so NaNs need
-    /// canonicalizing before elements are compared.
-    has_float: bool,
+    /// Elements are compared with `java_equals` instead of Arrow `==`.
+    java_eq: bool,
     /// Row encoder for distinct elements that Java collects into a
     /// `LinkedHashSet`. `None` for other columns, and for element types
     /// arrow-row cannot encode, which keep the linear comparison.
@@ -119,7 +117,7 @@ impl CollectAgg {
         };
         Ok(Self {
             field_name: field_name.to_string(),
-            has_float: contains_float(element.data_type()),
+            java_eq: needs_java_eq(element.data_type()),
             element,
             distinct,
             count_limit,
@@ -182,11 +180,7 @@ impl CollectAgg {
             return Ok(None);
         };
         // Only the keys are canonicalized; stored elements keep their bits.
-        let values = if self.has_float {
-            canonical_nan(values)
-        } else {
-            Arc::clone(values)
-        };
+        let values = canonical_nan(values);
         encoder
             .convert_columns(&[values])
             .map(Some)
@@ -269,7 +263,7 @@ impl CollectAgg {
                         };
                         merged.elements[..checked]
                             .iter()
-                            .any(|existing| same_element(self.has_float, existing, element))
+                            .any(|existing| same_element(self.java_eq, existing, element))
                     }
                 };
                 if duplicate {
@@ -351,12 +345,12 @@ impl CollectAgg {
         };
         self.collect(&mut first, &self.input_operand(values)?, false);
         let input = first.elements;
-        let has_float = self.has_float;
+        let java_eq = self.java_eq;
         if self.may_repeat {
             self.elements.retain(|element| {
                 !input
                     .iter()
-                    .any(|seen| same_element(has_float, seen, element))
+                    .any(|seen| same_element(java_eq, seen, element))
             });
         } else {
             // Each input element equals at most one accumulator element.
@@ -364,7 +358,7 @@ impl CollectAgg {
                 if let Some(position) = self
                     .elements
                     .iter()
-                    .position(|element| same_element(has_float, element, seen))
+                    .position(|element| same_element(java_eq, element, seen))
                 {
                     self.elements.remove(position);
                 }
@@ -398,124 +392,138 @@ impl CollectAgg {
     }
 }
 
-/// Java equality of two one-element arrays: Arrow `==`, or equal after
-/// `canonical_nan` when both hold a NaN.
-fn same_element(has_float: bool, left: &ArrayRef, right: &ArrayRef) -> bool {
-    left.as_ref() == right.as_ref()
-        || (has_float
-            && has_nan(left)
-            && has_nan(right)
-            && canonical_nan(left).as_ref() == canonical_nan(right).as_ref())
-}
-
-/// Whether `array` holds a FLOAT/DOUBLE NaN at any depth.
-fn has_nan(array: &ArrayRef) -> bool {
-    match array.data_type() {
-        ArrowDataType::Float32 => array
-            .as_primitive::<Float32Type>()
-            .values()
-            .iter()
-            .any(|v| v.is_nan()),
-        ArrowDataType::Float64 => array
-            .as_primitive::<Float64Type>()
-            .values()
-            .iter()
-            .any(|v| v.is_nan()),
-        ArrowDataType::Struct(_) => array.as_struct().columns().iter().any(has_nan),
-        ArrowDataType::List(_) => {
-            let array = array.as_list::<i32>();
-            has_nan(&own_values(array.offsets(), array.values()).1)
-        }
-        ArrowDataType::FixedSizeList(_, _) => has_nan(array.as_fixed_size_list().values()),
-        ArrowDataType::Map(_, _) => {
-            let array = array.as_map();
-            let entries: ArrayRef = Arc::new(array.entries().clone());
-            has_nan(&own_values(array.offsets(), &entries).1)
-        }
-        _ => false,
+/// Java equality of two one-element arrays.
+fn same_element(java_eq: bool, left: &ArrayRef, right: &ArrayRef) -> bool {
+    if java_eq {
+        java_equals(left.as_ref(), 0, right.as_ref(), 0)
+    } else {
+        left.as_ref() == right.as_ref()
     }
 }
 
-/// Whether `data_type` holds FLOAT/DOUBLE values at any depth.
-fn contains_float(data_type: &ArrowDataType) -> bool {
+/// Whether Arrow `==` can tell apart elements that Java's equaliser calls
+/// equal: FLOAT/DOUBLE values and maps, at any depth.
+fn needs_java_eq(data_type: &ArrowDataType) -> bool {
     match data_type {
-        ArrowDataType::Float32 | ArrowDataType::Float64 => true,
-        ArrowDataType::List(field)
-        | ArrowDataType::FixedSizeList(field, _)
-        | ArrowDataType::Map(field, _) => contains_float(field.data_type()),
-        ArrowDataType::Struct(fields) => fields.iter().any(|f| contains_float(f.data_type())),
+        ArrowDataType::Float32 | ArrowDataType::Float64 | ArrowDataType::Map(_, _) => true,
+        ArrowDataType::List(field) | ArrowDataType::FixedSizeList(field, _) => {
+            needs_java_eq(field.data_type())
+        }
+        ArrowDataType::Struct(fields) => fields.iter().any(|f| needs_java_eq(f.data_type())),
         _ => false,
     }
 }
 
-/// `array` with every FLOAT/DOUBLE NaN, at any depth, replaced by the
-/// canonical NaN. Java compares floating-point values with `Float.compare` /
-/// `Double.compare`: all NaNs are one value, and 0.0 and -0.0 are two.
-fn canonical_nan(array: &ArrayRef) -> ArrayRef {
-    match array.data_type() {
+/// Java's generated equaliser on row `i` of `left` and row `j` of `right`,
+/// which have the same type: two nulls are equal, FLOAT/DOUBLE compare like
+/// `Float.compare` / `Double.compare` (all NaNs are one value, 0.0 and -0.0
+/// are two), and map entries are matched by key, not by position.
+fn java_equals(left: &dyn Array, i: usize, right: &dyn Array, j: usize) -> bool {
+    match (left.is_null(i), right.is_null(j)) {
+        (true, true) => return true,
+        (false, false) => {}
+        _ => return false,
+    }
+    match left.data_type() {
+        ArrowDataType::Float32 => {
+            let l = left.as_primitive::<Float32Type>().value(i);
+            let r = right.as_primitive::<Float32Type>().value(j);
+            l.to_bits() == r.to_bits() || (l.is_nan() && r.is_nan())
+        }
+        ArrowDataType::Float64 => {
+            let l = left.as_primitive::<Float64Type>().value(i);
+            let r = right.as_primitive::<Float64Type>().value(j);
+            l.to_bits() == r.to_bits() || (l.is_nan() && r.is_nan())
+        }
+        ArrowDataType::Struct(_) => {
+            let (l, r) = (left.as_struct(), right.as_struct());
+            l.columns()
+                .iter()
+                .zip(r.columns())
+                .all(|(l, r)| java_equals(l.as_ref(), i, r.as_ref(), j))
+        }
+        ArrowDataType::List(_) => {
+            let (l, r) = (left.as_list::<i32>(), right.as_list::<i32>());
+            let (ls, le) = (
+                l.value_offsets()[i] as usize,
+                l.value_offsets()[i + 1] as usize,
+            );
+            let (rs, re) = (
+                r.value_offsets()[j] as usize,
+                r.value_offsets()[j + 1] as usize,
+            );
+            le - ls == re - rs
+                && (0..le - ls)
+                    .all(|k| java_equals(l.values().as_ref(), ls + k, r.values().as_ref(), rs + k))
+        }
+        ArrowDataType::FixedSizeList(_, size) => {
+            let (l, r) = (left.as_fixed_size_list(), right.as_fixed_size_list());
+            let (ls, rs) = (l.value_offset(i) as usize, r.value_offset(j) as usize);
+            (0..*size as usize)
+                .all(|k| java_equals(l.values().as_ref(), ls + k, r.values().as_ref(), rs + k))
+        }
+        ArrowDataType::Map(_, _) => {
+            let (l, r) = (left.as_map(), right.as_map());
+            let (ls, le) = (
+                l.value_offsets()[i] as usize,
+                l.value_offsets()[i + 1] as usize,
+            );
+            let (rs, re) = (
+                r.value_offsets()[j] as usize,
+                r.value_offsets()[j + 1] as usize,
+            );
+            if le - ls != re - rs {
+                return false;
+            }
+            // Like Java, each entry takes the first unmatched entry with the
+            // same key, and the values must then be equal.
+            let mut matched = vec![false; re - rs];
+            (ls..le).all(|lk| {
+                let found = (rs..re).find(|&rk| {
+                    !matched[rk - rs] && java_equals(l.keys().as_ref(), lk, r.keys().as_ref(), rk)
+                });
+                match found {
+                    Some(rk) if java_equals(l.values().as_ref(), lk, r.values().as_ref(), rk) => {
+                        matched[rk - rs] = true;
+                        true
+                    }
+                    _ => false,
+                }
+            })
+        }
+        ArrowDataType::Boolean => left.as_boolean().value(i) == right.as_boolean().value(j),
+        ArrowDataType::Utf8 => {
+            left.as_string::<i32>().value(i) == right.as_string::<i32>().value(j)
+        }
+        ArrowDataType::Binary => {
+            left.as_binary::<i32>().value(i) == right.as_binary::<i32>().value(j)
+        }
+        ArrowDataType::LargeBinary => {
+            left.as_binary::<i64>().value(i) == right.as_binary::<i64>().value(j)
+        }
+        _ => downcast_primitive_array!(
+            left, right => { left.value(i) == right.value(j) }
+            _ => left.slice(i, 1).as_ref() == right.slice(j, 1).as_ref(),
+        ),
+    }
+}
+
+/// `values` with every FLOAT/DOUBLE NaN replaced by the canonical NaN, for
+/// the set keys of top-level floating-point elements.
+fn canonical_nan(values: &ArrayRef) -> ArrayRef {
+    match values.data_type() {
         ArrowDataType::Float32 => Arc::new(
-            array
+            values
                 .as_primitive::<Float32Type>()
                 .unary::<_, Float32Type>(|v| if v.is_nan() { f32::NAN } else { v }),
         ),
         ArrowDataType::Float64 => Arc::new(
-            array
+            values
                 .as_primitive::<Float64Type>()
                 .unary::<_, Float64Type>(|v| if v.is_nan() { f64::NAN } else { v }),
         ),
-        ArrowDataType::Struct(_) => {
-            let array = array.as_struct();
-            Arc::new(StructArray::new(
-                array.fields().clone(),
-                array.columns().iter().map(canonical_nan).collect(),
-                array.nulls().cloned(),
-            ))
-        }
-        ArrowDataType::List(field) => {
-            let array = array.as_list::<i32>();
-            let (offsets, values) = own_values(array.offsets(), array.values());
-            Arc::new(ListArray::new(
-                field.clone(),
-                offsets,
-                canonical_nan(&values),
-                array.nulls().cloned(),
-            ))
-        }
-        ArrowDataType::FixedSizeList(field, size) => {
-            let array = array.as_fixed_size_list();
-            Arc::new(FixedSizeListArray::new(
-                field.clone(),
-                *size,
-                canonical_nan(array.values()),
-                array.nulls().cloned(),
-            ))
-        }
-        ArrowDataType::Map(field, sorted) => {
-            let array = array.as_map();
-            let entries: ArrayRef = Arc::new(array.entries().clone());
-            let (offsets, entries) = own_values(array.offsets(), &entries);
-            Arc::new(MapArray::new(
-                field.clone(),
-                offsets,
-                canonical_nan(&entries).as_struct().clone(),
-                array.nulls().cloned(),
-                *sorted,
-            ))
-        }
-        _ => Arc::clone(array),
+        _ => Arc::clone(values),
     }
-}
-
-/// Offsets rebased to 0 and the part of `values` they cover, so a sliced
-/// list does not canonicalize values outside the slice.
-fn own_values(offsets: &OffsetBuffer<i32>, values: &ArrayRef) -> (OffsetBuffer<i32>, ArrayRef) {
-    let start = offsets[0];
-    let end = offsets[offsets.len() - 1];
-    let rebased: Vec<i32> = offsets.iter().map(|offset| offset - start).collect();
-    (
-        OffsetBuffer::new(ScalarBuffer::from(rebased)),
-        values.slice(start as usize, (end - start) as usize),
-    )
 }
 
 impl FieldAggregator for CollectAgg {
@@ -602,11 +610,11 @@ impl FieldAggregator for CollectAgg {
         let mut retracted: Vec<ArrayRef> = (0..values.len())
             .map(|index| values.slice(index, 1))
             .collect();
-        let has_float = self.has_float;
+        let java_eq = self.java_eq;
         self.elements.retain(|candidate| {
             if let Some(position) = retracted
                 .iter()
-                .position(|value| same_element(has_float, value, candidate))
+                .position(|value| same_element(java_eq, value, candidate))
             {
                 retracted.remove(position);
                 false
@@ -663,11 +671,12 @@ mod tests {
 
     use super::*;
     use crate::spec::{
-        ArrayType, BlobType, DataField, DoubleType, IntType, RowType, VarBinaryType, VariantType,
-        VectorType,
+        ArrayType, BlobType, DataField, DoubleType, IntType, MapType, RowType, VarBinaryType,
+        VariantType, VectorType,
     };
     use arrow_array::{
-        BinaryArray, FixedSizeListArray, Float64Array, Int32Array, LargeBinaryArray, StructArray,
+        BinaryArray, FixedSizeListArray, Float64Array, Int32Array, LargeBinaryArray, MapArray,
+        StructArray,
     };
 
     fn input() -> ListArray {
@@ -1133,7 +1142,76 @@ mod tests {
         agg.agg(&cell, 0).unwrap();
         let result = agg.result().unwrap();
         let list = result.as_any().downcast_ref::<ListArray>().unwrap();
-        assert_eq!(list.value(0).len(), 2);
+        let kept = list.value(0);
+        let kept = kept.as_any().downcast_ref::<ListArray>().unwrap();
+        let bits: Vec<Vec<u64>> = (0..kept.len())
+            .map(|i| {
+                let values = kept.value(i);
+                let values = values.as_any().downcast_ref::<Float64Array>().unwrap();
+                values.values().iter().map(|v| v.to_bits()).collect()
+            })
+            .collect();
+        assert_eq!(
+            bits,
+            vec![
+                vec![nan_1.to_bits(), 1.0f64.to_bits()],
+                vec![0, 1.0f64.to_bits()]
+            ]
+        );
+    }
+
+    /// Java's equaliser matches map entries by key, so maps that differ only
+    /// in entry order are one value and do not use up the limit.
+    #[test]
+    fn distinct_maps_ignore_entry_order_like_java() {
+        let int = || DataType::Int(IntType::new());
+        let data_type = DataType::Array(ArrayType::new(DataType::Map(MapType::new(int(), int()))));
+        let ArrowDataType::List(element) = paimon_type_to_arrow(&data_type).unwrap() else {
+            unreachable!()
+        };
+        let ArrowDataType::Map(entries_field, _) = element.data_type() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(entry_fields) = entries_field.data_type() else {
+            unreachable!()
+        };
+        let one_map = |entries: &[(i32, i32)]| {
+            let column = |f: fn(&(i32, i32)) -> i32| {
+                Arc::new(Int32Array::from(entries.iter().map(f).collect::<Vec<_>>())) as ArrayRef
+            };
+            let entries_array = StructArray::try_new(
+                entry_fields.clone(),
+                vec![column(|e| e.0), column(|e| e.1)],
+                None,
+            )
+            .unwrap();
+            let map = MapArray::try_new(
+                entries_field.clone(),
+                OffsetBuffer::from_lengths([entries.len()]),
+                entries_array,
+                None,
+                false,
+            )
+            .unwrap();
+            ListArray::try_new(
+                element.clone(),
+                OffsetBuffer::from_lengths([1]),
+                Arc::new(map),
+                None,
+            )
+            .unwrap()
+        };
+        let mut agg = CollectAgg::new("items", &data_type, true, 2).unwrap();
+        agg.agg(&one_map(&[(1, 1), (2, 2)]), 0).unwrap();
+        agg.agg(&one_map(&[(2, 2), (1, 1)]), 0).unwrap();
+        agg.agg(&one_map(&[(1, 1), (2, 3)]), 0).unwrap();
+        let result = agg.result().unwrap();
+        let list = result.as_any().downcast_ref::<ListArray>().unwrap();
+        let maps = list.value(0);
+        let maps = maps.as_any().downcast_ref::<MapArray>().unwrap();
+        let values = maps.values().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(values.values().to_vec(), vec![1, 2, 1, 3]);
     }
 
     /// Java picks the equaliser from the Paimon element type: VECTOR keeps
