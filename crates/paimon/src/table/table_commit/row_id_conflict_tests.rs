@@ -188,7 +188,7 @@ async fn standalone_row_id_check_skips_compaction_history() {
 }
 
 #[tokio::test]
-async fn standalone_row_id_check_validates_snapshot_baselines_and_current_schema() {
+async fn standalone_row_id_check_validates_baselines_and_accepts_compatible_schema() {
     let commit = row_id_check_history("memory:/standalone_check_validation").await;
     let message = row_id_check_message("staged.parquet", "name");
     for (latest, baseline) in [(2, 0), (1, 2), (0, 1), (2, -1), (2, 2)] {
@@ -217,7 +217,11 @@ async fn standalone_row_id_check_validates_snapshot_baselines_and_current_schema
         .check_row_id_conflicts(&[message], 2, 1)
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("current table schema"));
+    assert!(error.to_string().contains("multiple MERGE INTO"));
+    commit
+        .check_row_id_conflicts(&[row_id_check_message("id-only.parquet", "id")], 2, 1)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

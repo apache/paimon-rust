@@ -5975,3 +5975,6 @@ mod read_path_completion;
 #[cfg(not(windows))]
 #[path = "rest_catalog/auto_compact_review.rs"]
 mod auto_compact_review;
+
+#[path = "rest_catalog/row_id_schema.rs"]
+mod row_id_schema;

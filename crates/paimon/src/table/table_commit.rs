@@ -55,6 +55,7 @@ mod auto_index_tests;
 mod auto_maintenance;
 mod global_index_source_check;
 mod index_commit;
+mod row_id_fields;
 
 use index_commit::IndexChanges;
 mod row_tracking;
@@ -302,9 +303,9 @@ impl TableCommit {
     /// Check logical row-ID/column conflicts before rebasing staged updates.
     ///
     /// Both snapshot IDs are resolved through this table's snapshot manager.
-    /// The captured interval must not cross a schema change, and this
-    /// committer's resolved schema must still be current. A newer schema may
-    /// exist before the next data snapshot is published.
+    /// Files retain their historical field identities across compatible schema
+    /// changes. Written fields must still exist in the current schema, even
+    /// when DDL has not published a new data snapshot.
     /// Like Java's `checkRowIdFromSnapshot(..., false)`, COMPACT snapshots are
     /// excluded: the caller may rewrite physical layouts only after this check
     /// has rejected concurrent logical writes. This method publishes nothing
@@ -340,21 +341,19 @@ impl TableCommit {
             .snapshot_manager
             .get_snapshot(latest_snapshot_id)
             .await?;
-        let baseline = if check_from_snapshot == latest_snapshot_id {
-            latest.clone()
-        } else {
+        if check_from_snapshot != latest_snapshot_id {
             self.snapshot_manager
                 .get_snapshot(check_from_snapshot)
-                .await?
-        };
-        if baseline.schema_id() != latest.schema_id()
-            || self.latest_schema_id().await? != self.table.schema().id()
-        {
-            return Err(crate::Error::DataInvalid {
-                message: "Row-ID conflict checks require an unchanged, current table schema".into(),
-                source: None,
-            });
+                .await?;
         }
+        let schema = self.latest_row_id_schema().await?;
+        let files = messages
+            .iter()
+            .flat_map(|message| &message.new_files)
+            .filter(|file| file.first_row_id.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        self.validate_row_id_update_fields(&schema, &files).await?;
         self.check_row_id_from_snapshot(
             Some(&latest),
             &self.messages_to_entries(messages),
@@ -1493,6 +1492,23 @@ impl TableCommit {
     ) -> Result<(Snapshot, Vec<PartitionStatistics>)> {
         let new_snapshot_id = latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1);
 
+        // Capture existing-row updates before assigning IDs to new appends.
+        // A mixed update/delete can be an OVERWRITE through deletion vectors.
+        let update_files = if self.data_evolution_enabled
+            && matches!(resolved.kind, CommitKind::APPEND | CommitKind::OVERWRITE)
+        {
+            resolved
+                .entries
+                .iter()
+                .filter(|entry| {
+                    *entry.kind() == FileKind::Add && entry.file().first_row_id.is_some()
+                })
+                .map(|entry| entry.file().clone())
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+
         if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
             if let Some(snapshot) = latest_snapshot {
                 if let Some(mut indexes) = super::compact::deletion_vectors::rewrite_indexes(
@@ -1654,7 +1670,16 @@ impl TableCommit {
                 .write_index_manifest(file_io, &manifest_dir, entries, created_files)
                 .await?;
         }
-        let schema_id = self.latest_schema_id().await?;
+        let schema_id = if update_files.is_empty() {
+            self.latest_schema_id().await?
+        } else {
+            // Every CAS retry resolves the schema again. Validate against the
+            // same schema recorded by this attempt, including catalog-only DDL.
+            let schema = self.latest_row_id_schema().await?;
+            self.validate_row_id_update_fields(&schema, &update_files)
+                .await?;
+            schema.id()
+        };
         let statistics_file = self
             .inherited_statistics(latest_snapshot.as_ref(), schema_id)
             .await?;
@@ -3374,15 +3399,11 @@ impl TableCommit {
     }
 
     async fn write_field_ids(&self, file: &DataFileMeta) -> Result<HashSet<i32>> {
-        let fields = if file.schema_id == self.table.schema().id() {
-            self.table.schema().fields().to_vec()
+        let schema = self.row_id_file_schema(file).await?;
+        let fields = if file.write_cols.is_none() {
+            schema.data_file_fields(None)
         } else {
-            self.table
-                .schema_manager()
-                .schema(file.schema_id)
-                .await?
-                .fields()
-                .to_vec()
+            schema.fields().to_vec()
         };
         let data_fields = fields
             .into_iter()
@@ -4095,6 +4116,7 @@ mod tests {
         include!("table_commit/callback_tests.rs");
         include!("table_commit/index_delete_tests.rs");
         include!("table_commit/row_id_conflict_tests.rs");
+        include!("table_commit/row_id_schema_tests.rs");
     }
 
     #[tokio::test]
