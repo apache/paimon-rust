@@ -24,7 +24,6 @@
 //!
 //! Reference: [PaimonTableValuedFunctions.scala](https://github.com/apache/paimon/blob/master/paimon-spark/paimon-spark-common/src/main/scala/org/apache/paimon/spark/PaimonTableValuedFunctions.scala)
 
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -119,7 +118,6 @@ impl TableFunctionImpl for FullTextSearchFunction {
                 // window's changes. Session options do not apply here.
                 ensure_no_incremental_window(
                     &format!("{FUNCTION_NAME} searches one snapshot and cannot run"),
-                    &HashMap::new(),
                     &identifier,
                     &table,
                 )?;

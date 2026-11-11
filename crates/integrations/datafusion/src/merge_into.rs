@@ -121,9 +121,9 @@ pub(crate) fn plan_merge(
             "Cannot execute MERGE INTO on a time-travel table".into(),
         ));
     }
-    // The target rows are found by a read of `table`, which an incremental
-    // window turns into the window's changes.
-    crate::table_loader::ensure_table_has_no_incremental_window(
+    // The target rows are found by a read of `table`, the session's options
+    // applied, which an incremental window turns into the window's changes.
+    crate::table_loader::ensure_no_incremental_window(
         "Cannot execute MERGE INTO",
         table.identifier(),
         &table,

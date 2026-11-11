@@ -1178,6 +1178,14 @@ impl Table {
         self.time_traveled
     }
 
+    /// Whether `key` was passed as a dynamic option to the
+    /// [`Table::copy_with_options`] or [`Table::copy_with_time_travel`] call
+    /// that made this copy or one it was copied from. An engine that applies
+    /// its session's options this way can tell them from stored ones.
+    pub fn is_dynamic_option(&self, key: &str) -> bool {
+        self.applied_dynamic_option_keys.contains(key)
+    }
+
     /// Whether a time-travel selector in this copy's options resolved to a
     /// snapshot. Lets external callers (e.g. the Python binding) distinguish
     /// "selector set but unresolved" (silent fallback to latest) from a real
@@ -1282,6 +1290,38 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{DataType, IntType, Schema, TableSchema};
+
+    #[test]
+    fn dynamic_options_are_told_from_stored_ones() {
+        let stored = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("incremental-between-timestamp", "0,1")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "t"),
+            "memory:/t".to_string(),
+            stored,
+            None,
+        );
+        assert!(!table.is_dynamic_option("incremental-between-timestamp"));
+        let copied = table.copy_with_options(HashMap::from([(
+            "scan.snapshot-id".to_string(),
+            "3".to_string(),
+        )]));
+        assert!(copied.is_dynamic_option("scan.snapshot-id"));
+        assert!(!copied.is_dynamic_option("incremental-between-timestamp"));
+        let overridden = copied.copy_with_options(HashMap::from([(
+            "incremental-between-timestamp".to_string(),
+            "1,2".to_string(),
+        )]));
+        assert!(overridden.is_dynamic_option("incremental-between-timestamp"));
+        assert!(overridden.is_dynamic_option("scan.snapshot-id"));
+    }
 
     /// The value every reader and writer of a bucket-local index file consults.
     ///

@@ -116,6 +116,37 @@ fn sorted_ids(batches: &[RecordBatch]) -> Vec<i32> {
 }
 
 #[tokio::test]
+async fn test_reports_output_rows_and_compute_time() {
+    use datafusion::physical_plan::metrics::MetricsSet;
+    use datafusion::physical_plan::{collect, ExecutionPlan};
+    let (_tmp, ctx) = setup_three_snapshots().await;
+    let frame = ctx
+        .sql("SELECT id FROM paimon_incremental_query('default.t', 1, 3)")
+        .await
+        .unwrap();
+    let task = Arc::new(frame.task_ctx());
+    let plan = frame.create_physical_plan().await.unwrap();
+    let batches = collect(Arc::clone(&plan), task).await.unwrap();
+    assert_eq!(total_rows(&batches), 2);
+    fn metrics(plan: &dyn ExecutionPlan) -> Option<MetricsSet> {
+        if plan.name() == "IncrementalQueryExec" {
+            return plan.metrics();
+        }
+        plan.children()
+            .into_iter()
+            .find_map(|child| metrics(child.as_ref()))
+    }
+    let metrics = metrics(plan.as_ref()).expect("IncrementalQueryExec metrics");
+    assert_eq!(metrics.output_rows(), Some(2));
+    // Each timed poll adds at least 1 ns and the stream is polled for its
+    // batch and its end, so more than 1 ns means the polls were timed.
+    assert!(
+        metrics.elapsed_compute().is_some_and(|nanos| nanos > 1),
+        "{metrics:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_auto_range_is_start_exclusive_end_inclusive() {
     let (_tmp, ctx) = setup_three_snapshots().await;
 
@@ -907,6 +938,22 @@ async fn test_writes_refuse_an_incremental_window() {
             "SET, {statement}: {err}"
         );
     }
+    // MERGE INTO planned on the bare SessionContext reaches the same refusal:
+    // the target's provider carries the session's window.
+    let err = match ctx.ctx().sql(statements[2]).await {
+        Err(e) => e.to_string(),
+        Ok(df) => df
+            .collect()
+            .await
+            .expect_err("expected MERGE INTO to fail")
+            .to_string(),
+    };
+    assert!(
+        err.contains(&format!(
+            "Cannot execute MERGE INTO while scan option '{key}' is set; RESET 'paimon.{key}' first"
+        )),
+        "bare context, MERGE INTO: {err}"
+    );
     run(&ctx, &format!("RESET 'paimon.{key}'")).await;
     assert_eq!(format(run(&ctx, table).await), expected);
 

@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -164,36 +163,10 @@ pub(crate) fn table_read_name(identifier: &Identifier, read: &Table) -> String {
 /// read returns the changes of an incremental timestamp window instead: the
 /// rows the window's commits wrote, older versions included, and, for rows
 /// read file by file, a row once per file with the columns it did not write
-/// NULL. `read` is the table read for `identifier`, with the session's
-/// `options` applied.
+/// NULL. `read` is the table read for `identifier`. A window set as a dynamic
+/// option is named for RESET: catalog tables receive the session's options
+/// that way.
 pub(crate) fn ensure_no_incremental_window(
-    statement: &str,
-    options: &HashMap<String, String>,
-    identifier: &Identifier,
-    read: &Table,
-) -> DFResult<()> {
-    ensure_no_session_incremental_window(statement, options)?;
-    ensure_table_has_no_incremental_window(statement, identifier, read)
-}
-
-/// The part of [`ensure_no_incremental_window`] that needs only the session's
-/// `options`: a window they set applies to every table the session reads.
-pub(crate) fn ensure_no_session_incremental_window(
-    statement: &str,
-    options: &HashMap<String, String>,
-) -> DFResult<()> {
-    let key = INCREMENTAL_WINDOW_OPTION;
-    if !options.contains_key(key) {
-        return Ok(());
-    }
-    Err(DataFusionError::Plan(format!(
-        "{statement} while scan option '{key}' is set; RESET 'paimon.{key}' first"
-    )))
-}
-
-/// The part of [`ensure_no_incremental_window`] that checks `read`, the table
-/// read for `identifier`, whose options hold the session's and its own.
-pub(crate) fn ensure_table_has_no_incremental_window(
     statement: &str,
     identifier: &Identifier,
     read: &Table,
@@ -205,8 +178,11 @@ pub(crate) fn ensure_table_has_no_incremental_window(
         return Ok(());
     }
     let key = INCREMENTAL_WINDOW_OPTION;
-    let read = table_read_name(identifier, read);
-    Err(DataFusionError::Plan(format!(
-        "{statement} on {read}, which sets scan option '{key}'"
-    )))
+    let reason = if read.is_dynamic_option(key) {
+        format!("while scan option '{key}' is set; RESET 'paimon.{key}' first")
+    } else {
+        let read = table_read_name(identifier, read);
+        format!("on {read}, which sets scan option '{key}'")
+    };
+    Err(DataFusionError::Plan(format!("{statement} {reason}")))
 }

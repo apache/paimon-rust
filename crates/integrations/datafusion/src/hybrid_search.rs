@@ -140,7 +140,6 @@ impl TableFunctionImpl for HybridSearchFunction {
                 // that window's changes. Session options do not apply here.
                 ensure_no_incremental_window(
                     &format!("{FUNCTION_NAME} searches one snapshot and cannot run"),
-                    &HashMap::new(),
                     &identifier,
                     &table,
                 )?;

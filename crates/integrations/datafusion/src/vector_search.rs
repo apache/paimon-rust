@@ -148,7 +148,7 @@ impl TableFunctionImpl for VectorSearchFunction {
                     table
                 } else {
                     table
-                        .copy_with_time_travel(dynamic_options.clone())
+                        .copy_with_time_travel(dynamic_options)
                         .await
                         .map_err(to_datafusion_error)?
                 };
@@ -158,7 +158,6 @@ impl TableFunctionImpl for VectorSearchFunction {
                 // NULL.
                 ensure_no_incremental_window(
                     &format!("{FUNCTION_NAME} searches one snapshot and cannot run"),
-                    &dynamic_options,
                     &identifier,
                     &table,
                 )?;

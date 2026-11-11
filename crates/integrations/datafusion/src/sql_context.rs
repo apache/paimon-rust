@@ -1820,16 +1820,16 @@ impl SQLContext {
         let options = self.dynamic_options.read().unwrap().clone();
         if options.is_empty() {
             return crate::table_loader::ensure_no_incremental_window(
-                &statement, &options, identifier, table,
+                &statement, identifier, table,
             );
         }
         // The lookup's provider applies the session's options to the table, a
         // session `branch` among them, so check the table it reads.
         let read = table
-            .copy_with_time_travel(options.clone())
+            .copy_with_time_travel(options)
             .await
             .map_err(to_datafusion_error)?;
-        crate::table_loader::ensure_no_incremental_window(&statement, &options, identifier, &read)
+        crate::table_loader::ensure_no_incremental_window(&statement, identifier, &read)
     }
 
     async fn handle_merge_into(&self, merge: &Merge, options: SQLOptions) -> DFResult<DataFrame> {
@@ -1848,14 +1848,6 @@ impl SQLContext {
             }
         };
         Self::ensure_main_branch_write_target(&table_name, "MERGE INTO")?;
-        // The native planner reads the target rows through the target's
-        // provider, which refuses a window the table stores
-        // (`merge_into::plan_merge`); a window the session sets is refused
-        // here, as the session's time-travel options are.
-        crate::table_loader::ensure_no_session_incremental_window(
-            "Cannot execute MERGE INTO",
-            &self.dynamic_options.read().unwrap(),
-        )?;
         // Use the configured native dialect for local expression scopes; the
         // front parser treats lambda arrows as ordinary binary operators.
         let state = self.ctx.state();

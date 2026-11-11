@@ -53,13 +53,14 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     PlanProperties, ReplaceChildrenOptions, StatisticsArgs,
 };
 use datafusion::prelude::SessionContext;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 use paimon::resource::ResourceContext;
 use paimon::spec::{CoreOptions, DataField};
 use paimon::table::{
@@ -367,6 +368,7 @@ struct IncrementalQueryExec {
     projection: ReadProjection,
     output_schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl IncrementalQueryExec {
@@ -394,6 +396,7 @@ impl IncrementalQueryExec {
             projection,
             output_schema,
             plan_properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -526,10 +529,21 @@ impl ExecutionPlan for IncrementalQueryExec {
             }))
         })
         .try_flatten();
+        // Output rows and compute time, as the ordinary scan reports them.
+        let mut stream = Box::pin(stream);
+        let metrics = BaselineMetrics::new(&self.metrics, partition);
+        let measured = futures::stream::poll_fn(move |cx| {
+            let _timer = metrics.elapsed_compute().timer();
+            metrics.record_poll(stream.as_mut().poll_next(cx))
+        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.output_schema.clone(),
-            stream,
+            measured,
         )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn statistics_from_inputs(
