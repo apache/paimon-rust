@@ -738,6 +738,92 @@ async fn test_merge_into_update_and_insert() {
 }
 
 #[tokio::test]
+async fn test_conditional_matched_update_and_insert() {
+    let (_tmp, sql_context) = setup_conditional_merge().await;
+
+    assert_eq!(
+        common::dml_count(
+            &sql_context,
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_conditional s ON t.id = s.id \
+             WHEN MATCHED AND s.version > t.value THEN UPDATE SET name = s.name \
+             WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, 40)",
+        )
+        .await,
+        2,
+    );
+    assert_eq!(
+        collect_rows_3col(
+            &sql_context,
+            "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
+        )
+        .await,
+        vec![
+            (1, "ALICE".to_string(), 10),
+            (2, "bob".to_string(), 20),
+            (3, "charlie".to_string(), 30),
+            (4, "dave".to_string(), 40),
+            (5, "eve".to_string(), 50),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn test_conditional_matched_delete_and_insert() {
+    let (_tmp, sql_context) = setup_conditional_merge().await;
+    common::exec(
+        &sql_context,
+        "ALTER TABLE paimon.test_db.target SET TBLPROPERTIES('deletion-vectors.enabled' = 'true')",
+    )
+    .await;
+
+    assert_eq!(
+        common::dml_count(
+            &sql_context,
+            "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_conditional s ON t.id = s.id \
+             WHEN MATCHED AND s.version > t.value THEN DELETE \
+             WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, 40)",
+        )
+        .await,
+        2,
+    );
+    assert_eq!(
+        collect_rows_3col(
+            &sql_context,
+            "SELECT id, name, value FROM paimon.test_db.target ORDER BY id",
+        )
+        .await,
+        vec![
+            (2, "bob".to_string(), 20),
+            (3, "charlie".to_string(), 30),
+            (4, "dave".to_string(), 40),
+            (5, "eve".to_string(), 50),
+        ],
+    );
+}
+
+async fn setup_conditional_merge() -> (TempDir, SQLContext) {
+    let (tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog).await;
+    setup_data_evolution_table(&sql_context).await;
+    common::exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.target VALUES \
+         (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30), (5, 'eve', 50)",
+    )
+    .await;
+    enable_data_evolution(&sql_context).await;
+    // The first three rows match ON and produce TRUE, FALSE, and NULL, respectively.
+    register_source(
+        &sql_context,
+        "CREATE TEMPORARY TABLE paimon.test_db.src_conditional AS SELECT * FROM \
+         (VALUES (1, 'ALICE', 11), (2, 'BOB', 19), (3, 'CHARLIE', NULL), (4, 'dave', 41)) \
+         AS s(id, name, version)",
+    )
+    .await;
+    (tmp, sql_context)
+}
+
+#[tokio::test]
 async fn test_merge_into_insert_only() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;
@@ -1103,7 +1189,7 @@ async fn test_rejects_multiple_when_matched() {
         "MERGE INTO paimon.test_db.target t USING paimon.test_db.src_multi s ON t.id = s.id \
          WHEN MATCHED AND t.id = 1 THEN UPDATE SET name = s.name \
          WHEN MATCHED THEN UPDATE SET name = 'default'",
-        "WHEN MATCHED AND <predicate> is not yet supported",
+        "Multiple WHEN MATCHED clauses are not yet supported",
     )
     .await;
 }
