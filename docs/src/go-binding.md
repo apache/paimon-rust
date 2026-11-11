@@ -332,8 +332,29 @@ snapshotID := int64(123)
 err := catalog.CreateTag(id, "dataset-43", &snapshotID, false)
 ```
 
-The final argument to `CreateTag` ignores an existing tag. Creating tags with
-a retention duration is not yet supported.
+The final argument to `CreateTag` ignores an existing tag.
+
+Create a tag with retention using duration strings such as `"1d"`, `"12h"`, or
+`"30min"`. Retention is persisted on the tag file; this API does not expire tags
+automatically. `GetTag` returns the retention as an ISO-8601 duration (for
+example `"1d"` becomes `"PT24H"`):
+
+```go
+snapshotID := int64(123)
+timeRetained := "1d"
+err := catalog.CreateTagWithRetention(id, "dataset-44", &snapshotID, &timeRetained, false)
+if err != nil {
+    log.Fatal(err)
+}
+tag, err := catalog.GetTag(id, "dataset-44")
+if err != nil {
+    log.Fatal(err)
+}
+log.Printf("retained for %s", *tag.TagTimeRetained)
+```
+
+Pass `nil` for `timeRetained` to create a tag without retention metadata, the
+same as `CreateTag`.
 
 ## Writing a Table
 

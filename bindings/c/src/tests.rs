@@ -1130,6 +1130,7 @@ fn test_catalog_tag_lifecycle() {
         let tag: paimon::api::GetTagResponse = serde_json::from_slice(tag_json).unwrap();
         assert_eq!(tag.tag_name, "release-1");
         assert_eq!(tag.snapshot.id(), 1);
+        assert!(tag.tag_time_retained.is_none());
 
         let explicit_name = CString::new("release-explicit").unwrap();
         let snapshot_id = 1;
@@ -1141,6 +1142,58 @@ fn test_catalog_tag_lifecycle() {
             false,
         );
         assert!(error.is_null());
+        let explicit_result =
+            paimon_catalog_get_tag(catalog, identifier.identifier, explicit_name.as_ptr());
+        assert!(explicit_result.error.is_null());
+        let explicit_json =
+            std::slice::from_raw_parts(explicit_result.tag.data, explicit_result.tag.len);
+        let explicit: paimon::api::GetTagResponse = serde_json::from_slice(explicit_json).unwrap();
+        assert!(explicit.tag_time_retained.is_none());
+        paimon_bytes_free(explicit_result.tag);
+
+        let retained_name = CString::new("release-retained").unwrap();
+        let time_retained = CString::new("1d").unwrap();
+        let error = paimon_catalog_create_tag_with_retention(
+            catalog,
+            identifier.identifier,
+            retained_name.as_ptr(),
+            &snapshot_id,
+            time_retained.as_ptr(),
+            false,
+        );
+        assert!(error.is_null());
+        let retained_result =
+            paimon_catalog_get_tag(catalog, identifier.identifier, retained_name.as_ptr());
+        assert!(retained_result.error.is_null());
+        let retained_json =
+            std::slice::from_raw_parts(retained_result.tag.data, retained_result.tag.len);
+        let retained: paimon::api::GetTagResponse = serde_json::from_slice(retained_json).unwrap();
+        assert_eq!(retained.tag_name, "release-retained");
+        assert_eq!(retained.snapshot.id(), 1);
+        assert_eq!(retained.tag_time_retained.as_deref(), Some("PT24H"));
+        assert!(retained.tag_create_time.is_some());
+        paimon_bytes_free(retained_result.tag);
+
+        let invalid_name = CString::new("release-invalid").unwrap();
+        let invalid_retained = CString::new("-1d").unwrap();
+        let invalid = paimon_catalog_create_tag_with_retention(
+            catalog,
+            identifier.identifier,
+            invalid_name.as_ptr(),
+            &snapshot_id,
+            invalid_retained.as_ptr(),
+            false,
+        );
+        assert_eq!((*invalid).code, PaimonErrorCode::InvalidInput as i32);
+        paimon_error_free(invalid);
+        let missing_invalid =
+            paimon_catalog_get_tag(catalog, identifier.identifier, invalid_name.as_ptr());
+        assert_eq!(
+            (*missing_invalid.error).code,
+            PaimonErrorCode::NotFound as i32
+        );
+        paimon_error_free(missing_invalid.error);
+
         let missing_snapshot_id = 2;
         let missing_snapshot_name = CString::new("missing-snapshot").unwrap();
         let missing = paimon_catalog_create_tag(
@@ -1175,6 +1228,9 @@ fn test_catalog_tag_lifecycle() {
 
         let error =
             paimon_catalog_delete_tag(catalog, identifier.identifier, explicit_name.as_ptr());
+        assert!(error.is_null());
+        let error =
+            paimon_catalog_delete_tag(catalog, identifier.identifier, retained_name.as_ptr());
         assert!(error.is_null());
 
         paimon_bytes_free(tag_result.tag);

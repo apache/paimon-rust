@@ -70,6 +70,18 @@ func (c *Catalog) CreateTag(
 	snapshotID *int64,
 	ignoreIfExists bool,
 ) error {
+	return c.CreateTagWithRetention(id, tagName, snapshotID, nil, ignoreIfExists)
+}
+
+// CreateTagWithRetention creates a tag with an optional retention duration such as "1d".
+// Pass nil timeRetained to create a tag without retention metadata.
+func (c *Catalog) CreateTagWithRetention(
+	id Identifier,
+	tagName string,
+	snapshotID *int64,
+	timeRetained *string,
+	ignoreIfExists bool,
+) error {
 	if c.inner == nil {
 		return ErrClosed
 	}
@@ -78,11 +90,12 @@ func (c *Catalog) CreateTag(
 		return err
 	}
 	defer ffiIdentifierFree.symbol(c.ctx)(cID)
-	return ffiCatalogCreateTag.symbol(c.ctx)(
+	return ffiCatalogCreateTagWithRetention.symbol(c.ctx)(
 		c.inner,
 		cID,
 		tagName,
 		snapshotID,
+		timeRetained,
 		ignoreIfExists,
 	)
 }
@@ -113,10 +126,11 @@ func (c *Catalog) DeleteTag(id Identifier, tagName string) error {
 	return ffiCatalogDeleteTag.symbol(c.ctx)(c.inner, cID, tagName)
 }
 
-var ffiCatalogCreateTag = newFFI(ffiOpts{
-	sym:   "paimon_catalog_create_tag",
+var ffiCatalogCreateTagWithRetention = newFFI(ffiOpts{
+	sym:   "paimon_catalog_create_tag_with_retention",
 	rType: &ffi.TypePointer,
 	aTypes: []*ffi.Type{
+		&ffi.TypePointer,
 		&ffi.TypePointer,
 		&ffi.TypePointer,
 		&ffi.TypePointer,
@@ -128,6 +142,7 @@ var ffiCatalogCreateTag = newFFI(ffiOpts{
 	*paimonIdentifier,
 	string,
 	*int64,
+	*string,
 	bool,
 ) error {
 	return func(
@@ -135,6 +150,7 @@ var ffiCatalogCreateTag = newFFI(ffiOpts{
 		id *paimonIdentifier,
 		tagName string,
 		snapshotID *int64,
+		timeRetained *string,
 		ignoreIfExists bool,
 	) error {
 		tagNamePtr, err := bytePtrFromString(tagName)
@@ -144,6 +160,15 @@ var ffiCatalogCreateTag = newFFI(ffiOpts{
 		var snapshotIDPtr unsafe.Pointer
 		if snapshotID != nil {
 			snapshotIDPtr = unsafe.Pointer(snapshotID)
+		}
+		var timeRetainedPtr unsafe.Pointer
+		var timeRetainedBytes *byte
+		if timeRetained != nil {
+			timeRetainedBytes, err = bytePtrFromString(*timeRetained)
+			if err != nil {
+				return err
+			}
+			timeRetainedPtr = unsafe.Pointer(timeRetainedBytes)
 		}
 		ignore := uint8(0)
 		if ignoreIfExists {
@@ -156,10 +181,13 @@ var ffiCatalogCreateTag = newFFI(ffiOpts{
 			unsafe.Pointer(&id),
 			unsafe.Pointer(&tagNamePtr),
 			unsafe.Pointer(&snapshotIDPtr),
+			unsafe.Pointer(&timeRetainedPtr),
 			unsafe.Pointer(&ignore),
 		)
 		runtime.KeepAlive(tagNamePtr)
 		runtime.KeepAlive(snapshotID)
+		runtime.KeepAlive(timeRetainedBytes)
+		runtime.KeepAlive(timeRetained)
 		return parseError(ctx, ffiError)
 	}
 })
