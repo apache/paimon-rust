@@ -1478,6 +1478,21 @@ impl SQLContext {
             .map(|temp| (catalog_name, database, table, temp)))
     }
 
+    /// Reject writes that would bypass a temporary object and mutate the
+    /// persistent table it shadows.
+    pub(crate) async fn reject_temporary_write_target(
+        &self,
+        name: &ObjectName,
+        operation: &str,
+    ) -> DFResult<()> {
+        if self.temp_table_for(name).await?.is_some() {
+            return Err(DataFusionError::NotImplemented(format!(
+                "{operation} on temporary tables or views is not supported"
+            )));
+        }
+        Ok(())
+    }
+
     fn show_create_result(
         &self,
         catalog_name: String,
@@ -1567,6 +1582,8 @@ impl SQLContext {
         } else {
             Self::ensure_main_branch_write_target(name, "ALTER TABLE")?;
         }
+        self.reject_temporary_write_target(name, "ALTER TABLE")
+            .await?;
         let identifier = self.resolve_table_name(name)?;
 
         if operations.len() > 1
@@ -1594,12 +1611,6 @@ impl SQLContext {
             if drop_partition_requests.len() != operations.len() {
                 return Err(DataFusionError::Plan(
                     "ALTER TABLE DROP PARTITION must be used alone".to_string(),
-                ));
-            }
-            if self.temp_table_for(name).await?.is_some() {
-                return Err(DataFusionError::NotImplemented(
-                    "ALTER TABLE DROP PARTITION on temporary tables or views is not supported"
-                        .into(),
                 ));
             }
             return self
@@ -1663,11 +1674,6 @@ impl SQLContext {
                     options,
                     column_position,
                 } => {
-                    if self.temp_table_for(name).await?.is_some() {
-                        return Err(DataFusionError::NotImplemented(
-                            "MODIFY COLUMN on temporary tables or views is not supported".into(),
-                        ));
-                    }
                     if column_position.is_some() {
                         return Err(DataFusionError::Plan(
                             "MODIFY COLUMN FIRST/AFTER is not supported".into(),
@@ -1952,6 +1958,8 @@ impl SQLContext {
             }
         };
         Self::ensure_main_branch_write_target(&table_name, "INSERT OVERWRITE")?;
+        self.reject_temporary_write_target(&table_name, "INSERT OVERWRITE")
+            .await?;
         let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
         let table = catalog
             .get_table(&identifier)

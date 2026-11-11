@@ -1135,7 +1135,7 @@ async fn test_truncate_rejects_shadowed_temporary_targets() {
 }
 
 #[tokio::test]
-async fn test_drop_partition_rejects_shadowed_temporary_targets() {
+async fn test_alter_and_partition_overwrite_reject_shadowed_temporary_targets() {
     let (_tmp, catalog) = create_test_env();
     let ctx = create_sql_context(catalog).await;
     ctx.sql(r#"CREATE TABLE default."PartitionTarget" (id INT, pt INT) PARTITIONED BY (pt)"#)
@@ -1158,15 +1158,32 @@ async fn test_drop_partition_rejects_shadowed_temporary_targets() {
             collect_ids(&ctx, r#"SELECT id FROM "PartitionTarget""#).await,
             vec![999]
         );
-        for sql in [
-            r#"ALTER TABLE "PartitionTarget" DROP PARTITION (pt = 1)"#,
-            r#"ALTER TABLE IF EXISTS default."PartitionTarget" DROP PARTITION (pt = 1)"#,
-            r#"ALTER TABLE paimon.default."PartitionTarget" DROP IF EXISTS PARTITION (pt = 1)"#,
+        for (sql, operation) in [
+            (
+                r#"INSERT OVERWRITE paimon.default."PartitionTarget" PARTITION (pt = 1) SELECT 8"#,
+                "INSERT OVERWRITE",
+            ),
+            (
+                r#"ALTER TABLE "PartitionTarget" DROP COLUMN id"#,
+                "ALTER TABLE",
+            ),
+            (
+                r#"ALTER TABLE "PartitionTarget" DROP PARTITION (pt = 1)"#,
+                "ALTER TABLE",
+            ),
+            (
+                r#"ALTER TABLE IF EXISTS default."PartitionTarget" DROP PARTITION (pt = 1)"#,
+                "ALTER TABLE",
+            ),
+            (
+                r#"ALTER TABLE paimon.default."PartitionTarget" DROP IF EXISTS PARTITION (pt = 1)"#,
+                "ALTER TABLE",
+            ),
         ] {
             assert_sql_error_contains(
                 &ctx,
                 sql,
-                "ALTER TABLE DROP PARTITION on temporary tables or views is not supported",
+                &format!("{operation} on temporary tables or views is not supported"),
             )
             .await;
         }
@@ -1181,6 +1198,13 @@ async fn test_drop_partition_rejects_shadowed_temporary_targets() {
         );
     }
 
+    ctx.sql(r#"INSERT OVERWRITE "PartitionTarget" PARTITION (pt = 1) SELECT 8"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_ids(&ctx, r#"SELECT id FROM "PartitionTarget" ORDER BY id"#).await,
+        vec![2, 8]
+    );
     ctx.sql(r#"ALTER TABLE "PartitionTarget" DROP PARTITION (pt = 1)"#)
         .await
         .unwrap();
