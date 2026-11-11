@@ -287,6 +287,13 @@ ctx.sql("INSERT INTO paimon.default.my_table VALUES (1, 'alice'), (2, 'bob')")
 !!! note "Write Builder Consistency"
     The writer and committer must come from the same `BatchWriteBuilder` — they share a `commit_user` for duplicate-commit detection. Passing messages from one builder's writer to another builder's committer will raise a `ValueError`.
 
+Data Evolution updates to existing row IDs retain their original field IDs across
+compatible schema changes, including renames and type widening. Each snapshot
+publication attempt, including internal retries, checks those IDs against the
+schema recorded in that snapshot. An update to a dropped field is rejected even
+if its name is reused or DDL has not published a new data snapshot. This check
+includes fields nested inside written ROW, ARRAY, MAP, and MULTISET columns.
+
 ## Column Projection
 
 Use `with_projection` to select specific columns. Only the requested columns are read, reducing I/O.
