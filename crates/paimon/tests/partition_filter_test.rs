@@ -380,3 +380,38 @@ async fn ordinary_partition_filter_survives_diff_workers_and_audit_images() {
             .all(|id| *id == 1));
     }
 }
+
+#[tokio::test]
+async fn ordinary_partition_filter_survives_incremental_delta_reads() {
+    // Delta reads take a separate path per table kind, plain and audit-log
+    // alike; the read's partition conjuncts must restrict every one of them.
+    for mode in ["append", "pk", "de"] {
+        let table = partitioned(mode).await;
+        let plan = table
+            .new_read_builder()
+            .new_incremental_scan(IncrementalScanMode::Delta, 0, 1)
+            .plan()
+            .await
+            .unwrap();
+        let mut builder = table.new_read_builder();
+        builder
+            .with_projection(&["id"])
+            .unwrap()
+            .with_filter(equal(&table, "p", "a"));
+        let read = builder.new_read().unwrap();
+        for audit in [false, true] {
+            let stream = if audit {
+                read.to_audit_log_arrow(&plan)
+            } else {
+                read.to_incremental_arrow(&plan)
+            };
+            let mut actual: Vec<i32> = Vec::new();
+            for batch in stream.unwrap().try_collect::<Vec<_>>().await.unwrap() {
+                let column = batch.column_by_name("id").unwrap().as_any();
+                actual.extend(column.downcast_ref::<Int32Array>().unwrap().values());
+            }
+            actual.sort_unstable();
+            assert_eq!(actual, [1, 3], "{mode} audit={audit}");
+        }
+    }
+}

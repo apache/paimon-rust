@@ -56,6 +56,7 @@ mod full_text_search;
 #[path = "../testdata/warehouse/mod.rs"]
 mod golden_warehouse;
 mod hybrid_search;
+mod incremental_query;
 mod json_functions;
 mod json_output;
 mod lateral_vector_search;

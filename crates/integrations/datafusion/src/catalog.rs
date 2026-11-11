@@ -440,6 +440,22 @@ impl PaimonCatalogProvider {
         self
     }
 
+    pub(crate) fn catalog(&self) -> &Arc<dyn Catalog> {
+        &self.catalog
+    }
+
+    /// The session's dynamic options as they stand now.
+    pub(crate) fn session_options(&self) -> HashMap<String, String> {
+        self.dynamic_options
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn blob_reader_registry(&self) -> &BlobReaderRegistry {
+        &self.blob_reader_registry
+    }
+
     /// Register an engine for a table type the Paimon reader cannot serve
     /// (e.g. [`PaimonTableType::IcebergTable`]); everything else takes the
     /// Paimon path unchanged. Kept inside the provider so the registered
