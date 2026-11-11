@@ -39,6 +39,7 @@ use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::data_file_path_factory::DataFilePathFactory;
 use crate::table::kv_data_file_writer::{KeyValueFileOptions, KeyValueRollingWriter};
 use crate::table::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
+use crate::table::managed_blob_writer::managed_blob_fields;
 use crate::table::sort_merge::{
     compare_sequence_order, BufferedBatch, LookupProvider, MergeFunction, MergeResult, MergeRow,
     CHANGELOG_BATCH_METADATA_KEY,
@@ -440,7 +441,7 @@ pub(super) async fn execute(
         file_source: 1,
         is_changelog: false,
         index_options: index.as_ref(),
-        managed_blob_enabled: false,
+        managed_blob_enabled: !managed_blob_fields(schema.fields(), &options).is_empty(),
         resources: resources.as_ref(),
     };
     let mut row_limit = options.target_file_row_num()?;
