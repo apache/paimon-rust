@@ -551,11 +551,13 @@ for stat in table.partition_stats():
 ### Tag Management
 
 `table.list_tags()` only inspects tags. Create, fetch, page, delete, and rollback
-through the catalog:
+go through the catalog. The Python binding exposes one API surface for every
+catalog, but support depends on the catalog implementation.
+
+Filesystem Catalog supports creating, fetching, and deleting tags. It does not
+implement `list_tags_paged` or `rollback_to`.
 
 ```python
-from pypaimon_rust.datafusion import Instant
-
 identifier = ("my_db", "users")
 
 # Pin the latest snapshot, or pass snapshot_id=... for an explicit snapshot.
@@ -563,17 +565,38 @@ catalog.create_tag(identifier, "release-1.0")
 tag = catalog.get_tag(identifier, "release-1.0")
 print(tag.tag_name(), tag.snapshot().id())
 
-names, next_token = catalog.list_tags_paged(identifier, max_results=100)
 catalog.delete_tag(identifier, "release-1.0")
-
-# Roll the table back to a snapshot or tag instant.
-catalog.rollback_to(identifier, Instant.snapshot(1))
-catalog.rollback_to(identifier, Instant.tag("release-1.0"))
 ```
 
-`create_tag(..., time_retained=...)` accepts an optional retention duration when
-the catalog implementation supports it. `ignore_if_exists=True` ignores a
+`create_tag(..., time_retained=...)` accepts an optional retention duration on
+both Filesystem Catalog and REST Catalog. `ignore_if_exists=True` ignores a
 duplicate tag name.
+
+REST Catalog also supports paged listing and rollback. These require
+`metastore: rest` and a running Paimon REST Server (see
+[REST Catalog](#rest-catalog) above). Finish every operation that needs the tag
+before deleting it:
+
+```python
+from pypaimon_rust.datafusion import Instant, PaimonCatalog
+
+catalog = PaimonCatalog({
+    "metastore": "rest",
+    "uri": "http://localhost:8080",
+    "warehouse": "my_warehouse",
+})
+identifier = ("my_db", "users")
+
+catalog.create_tag(identifier, "release-1.0", snapshot_id=1)
+names, next_token = catalog.list_tags_paged(identifier, max_results=100)
+
+# Pick one rollback target. Rolling back to an earlier snapshot deletes tags
+# that point at newer snapshots.
+catalog.rollback_to(identifier, Instant.tag("release-1.0"))
+# Or: catalog.rollback_to(identifier, Instant.snapshot(1))
+
+catalog.delete_tag(identifier, "release-1.0")
+```
 
 ## Native Search
 
