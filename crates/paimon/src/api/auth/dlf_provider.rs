@@ -280,6 +280,8 @@ pub struct DLFTokenLoaderFactory;
 
 impl DLFTokenLoaderFactory {
     /// Create a token loader based on options.
+    /// Explicit loaders and paths take precedence over inline credentials.
+    /// Only fall back to `DLF_TOKEN_PATH` when none of these are configured.
     pub fn create_token_loader(options: &Options) -> Result<Option<Arc<dyn DLFTokenLoader>>> {
         match options
             .get(CatalogOptions::DLF_TOKEN_LOADER)
@@ -308,7 +310,22 @@ impl DLFTokenLoaderFactory {
             None if options.get(CatalogOptions::DLF_TOKEN_PATH).is_some() => {
                 Self::create_local_file_loader(options).map(Some)
             }
-            None => Ok(None),
+            None if [
+                CatalogOptions::DLF_ACCESS_KEY_ID,
+                CatalogOptions::DLF_ACCESS_KEY_SECRET,
+                CatalogOptions::DLF_ACCESS_SECURITY_TOKEN,
+            ]
+            .iter()
+            .any(|key| options.contains(key)) =>
+            {
+                Ok(None)
+            }
+            None => match std::env::var("DLF_TOKEN_PATH") {
+                Ok(token_path) if !token_path.is_empty() => {
+                    Ok(Some(Arc::new(DLFLocalFileTokenLoader::new(token_path)?)))
+                }
+                _ => Ok(None),
+            },
         }
     }
 
@@ -518,7 +535,266 @@ impl TokenHTTPClient {
 
 #[cfg(test)]
 mod tests {
+    use super::super::AuthProviderFactory;
     use super::*;
+
+    const TOKEN_PATH_TEST_CHILD: &str = "PAIMON_DLF_TOKEN_PATH_TEST_CHILD";
+
+    // Set the environment before starting the process so parallel tests are unaffected.
+    fn run_token_path_environment_test(test_name: &str, token_path: Option<&std::ffi::OsStr>) {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                &format!("api::auth::dlf_provider::tests::{test_name}"),
+                "--nocapture",
+            ])
+            .env(TOKEN_PATH_TEST_CHILD, "1")
+            .env_remove("DLF_TOKEN_PATH");
+        if let Some(token_path) = token_path {
+            command.env("DLF_TOKEN_PATH", token_path);
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "child failed or did not run exactly one test:\n{}{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_path_environment_survives_rest_api_config_merge() {
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        use crate::api::rest_api::RESTApi;
+        use crate::api::ConfigResponse;
+
+        if std::env::var_os(TOKEN_PATH_TEST_CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            run_token_path_environment_test(
+                "test_token_path_environment_survives_rest_api_config_merge",
+                Some(dir.path().join("token.json").as_os_str()),
+            );
+            return;
+        }
+
+        let path = std::env::var("DLF_TOKEN_PATH").unwrap();
+        tokio::fs::write(
+            &path,
+            r#"{"AccessKeyId":"initial-ak","AccessKeySecret":"initial-sk","SecurityToken":"initial-sts"}"#,
+        )
+        .await
+        .unwrap();
+        let app = Router::new()
+            .route(
+                "/v1/config",
+                get(move |headers: HeaderMap| async move {
+                    assert!(headers["authorization"].to_str().unwrap().contains("initial-ak"));
+                    assert_eq!(headers["x-dlf-security-token"], "initial-sts");
+                    tokio::fs::write(
+                        &path,
+                        r#"{"AccessKeyId":"merged-ak","AccessKeySecret":"merged-sk","SecurityToken":"merged-sts"}"#,
+                    )
+                    .await
+                    .unwrap();
+                    Json(ConfigResponse::new(HashMap::new()))
+                }),
+            )
+            .route(
+                "/v1/databases",
+                get(|headers: HeaderMap| async move {
+                    assert!(headers["authorization"].to_str().unwrap().contains("merged-ak"));
+                    assert_eq!(headers["x-dlf-security-token"], "merged-sts");
+                    Json(serde_json::json!({"databases": ["default"]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut options = Options::new();
+        options.set(CatalogOptions::TOKEN_PROVIDER, "dlf");
+        options.set(CatalogOptions::URI, format!("http://{address}"));
+        options.set(CatalogOptions::DLF_REGION, "cn-hangzhou");
+        let api = RESTApi::new(options, true).await.unwrap();
+        assert!(api.options().get(CatalogOptions::DLF_TOKEN_PATH).is_none());
+        assert_eq!(api.list_databases().await.unwrap(), ["default"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_token_path_environment_discovers_file_and_refreshes() {
+        if std::env::var_os(TOKEN_PATH_TEST_CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            run_token_path_environment_test(
+                "test_token_path_environment_discovers_file_and_refreshes",
+                Some(dir.path().join("token.json").as_os_str()),
+            );
+            return;
+        }
+
+        let path = std::env::var("DLF_TOKEN_PATH").unwrap();
+        tokio::fs::write(
+            &path,
+            r#"{"AccessKeyId":"old-ak","AccessKeySecret":"old-sk","SecurityToken":"old-sts","Expiration":"2000-01-01T00:00:00Z"}"#,
+        )
+        .await
+        .unwrap();
+        let mut options = Options::new();
+        options.set(CatalogOptions::TOKEN_PROVIDER, "dlf");
+        options.set(
+            CatalogOptions::URI,
+            "https://cn-hangzhou-vpc.dlf.aliyuncs.com",
+        );
+        let loader = DLFTokenLoaderFactory::create_token_loader(&options)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loader.description(), path);
+        assert!(options.get(CatalogOptions::DLF_TOKEN_PATH).is_none());
+        let provider = AuthProviderFactory::create_auth_provider(&options).unwrap();
+        let auth = RESTAuthParameter::new("GET", "/test", None, HashMap::new());
+        let headers = provider
+            .merge_auth_header(HashMap::new(), &auth)
+            .await
+            .unwrap();
+        assert!(headers[AUTHORIZATION_HEADER_KEY].contains("old-ak"));
+        assert_eq!(headers["x-dlf-security-token"], "old-sts");
+
+        tokio::fs::write(
+            &path,
+            r#"{"AccessKeyId":"new-ak","AccessKeySecret":"new-sk","SecurityToken":"new-sts","Expiration":"2099-01-01T00:00:00Z"}"#,
+        )
+        .await
+        .unwrap();
+        let headers = provider
+            .merge_auth_header(HashMap::new(), &auth)
+            .await
+            .unwrap();
+        assert!(headers[AUTHORIZATION_HEADER_KEY].contains("new-ak"));
+        assert_eq!(headers["x-dlf-security-token"], "new-sts");
+        tokio::fs::remove_file(&path).await.unwrap();
+        let headers = provider
+            .merge_auth_header(HashMap::new(), &auth)
+            .await
+            .unwrap();
+        assert!(headers[AUTHORIZATION_HEADER_KEY].contains("new-ak"));
+    }
+
+    #[tokio::test]
+    async fn test_token_path_environment_respects_explicit_configuration() {
+        if std::env::var_os(TOKEN_PATH_TEST_CHILD).is_none() {
+            run_token_path_environment_test(
+                "test_token_path_environment_respects_explicit_configuration",
+                Some(std::ffi::OsStr::new("unused-token.json")),
+            );
+            return;
+        }
+
+        for key in [
+            CatalogOptions::DLF_ACCESS_KEY_ID,
+            CatalogOptions::DLF_ACCESS_KEY_SECRET,
+            CatalogOptions::DLF_ACCESS_SECURITY_TOKEN,
+        ] {
+            for value in ["explicit-value", ""] {
+                let mut options = Options::new();
+                options.set(key, value);
+                assert!(DLFTokenLoaderFactory::create_token_loader(&options)
+                    .unwrap()
+                    .is_none());
+            }
+        }
+
+        let mut options = Options::new();
+        options.set(CatalogOptions::TOKEN_PROVIDER, "dlf");
+        options.set(
+            CatalogOptions::URI,
+            "https://cn-hangzhou-vpc.dlf.aliyuncs.com",
+        );
+        options.set(CatalogOptions::DLF_ACCESS_KEY_ID, "inline-ak");
+        options.set(CatalogOptions::DLF_ACCESS_KEY_SECRET, "inline-sk");
+        options.set(CatalogOptions::DLF_ACCESS_SECURITY_TOKEN, "inline-sts");
+        let auth = RESTAuthParameter::new("GET", "/test", None, HashMap::new());
+        let provider = AuthProviderFactory::create_auth_provider(&options).unwrap();
+        let headers = provider
+            .merge_auth_header(HashMap::new(), &auth)
+            .await
+            .unwrap();
+        assert!(headers[AUTHORIZATION_HEADER_KEY].contains("inline-ak"));
+        assert_eq!(headers["x-dlf-security-token"], "inline-sts");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit.json");
+        tokio::fs::write(
+            &path,
+            r#"{"AccessKeyId":"file-ak","AccessKeySecret":"file-sk"}"#,
+        )
+        .await
+        .unwrap();
+        options.set(CatalogOptions::DLF_TOKEN_PATH, path.display().to_string());
+        for loader in [None, Some("local_file")] {
+            if let Some(loader) = loader {
+                options.set(CatalogOptions::DLF_TOKEN_LOADER, loader);
+            }
+            let provider = AuthProviderFactory::create_auth_provider(&options).unwrap();
+            let headers = provider
+                .merge_auth_header(HashMap::new(), &auth)
+                .await
+                .unwrap();
+            assert!(headers[AUTHORIZATION_HEADER_KEY].contains("file-ak"));
+        }
+
+        options.set(CatalogOptions::DLF_TOKEN_LOADER, "ecs");
+        options.set(
+            CatalogOptions::DLF_TOKEN_ECS_METADATA_URL,
+            "http://metadata/role",
+        );
+        assert_eq!(
+            DLFTokenLoaderFactory::create_token_loader(&options)
+                .unwrap()
+                .unwrap()
+                .description(),
+            "http://metadata/role"
+        );
+        options.set(CatalogOptions::DLF_TOKEN_LOADER, "unknown");
+        assert!(DLFTokenLoaderFactory::create_token_loader(&options)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Unknown DLF token loader"));
+        options.set(CatalogOptions::DLF_TOKEN_LOADER, "local_file");
+        options.remove(CatalogOptions::DLF_TOKEN_PATH);
+        assert!(DLFTokenLoaderFactory::create_token_loader(&options)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("dlf.token-path is required"));
+        options.set(CatalogOptions::DLF_TOKEN_PATH, "");
+        assert!(DLFTokenLoaderFactory::create_token_loader(&options)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_token_path_environment_missing_or_empty() {
+        if std::env::var_os(TOKEN_PATH_TEST_CHILD).is_some() {
+            assert!(DLFTokenLoaderFactory::create_token_loader(&Options::new())
+                .unwrap()
+                .is_none());
+            return;
+        }
+        for token_path in [None, Some(std::ffi::OsStr::new(""))] {
+            run_token_path_environment_test(
+                "test_token_path_environment_missing_or_empty",
+                token_path,
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_ecs_token_loader_sends_rest_user_agent() {
