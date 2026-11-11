@@ -26,9 +26,8 @@
 //!
 //! Reference: [org.apache.paimon.io.KeyValueDataFileWriterImpl](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/io/KeyValueDataFileWriterImpl.java)
 
-use super::kv_data_file_writer::KeyValueFileOptions;
+use super::kv_data_file_writer::{KeyValueFileOptions, KeyValueRollingWriter};
 use crate::arrow::arrow_fields_to_paimon;
-use crate::arrow::format::FormatWriterFactory;
 use crate::io::FileIO;
 use crate::resource::{MemoryReservation, ResourceContext};
 use crate::spec::{
@@ -56,7 +55,8 @@ pub(crate) struct KeyValueFileWriter {
     paths: super::data_file_path_factory::DataFilePathFactory,
     file_io: FileIO,
     config: KeyValueWriteConfig,
-    target_file_row_num: usize,
+    target_file_size: i64,
+    target_file_row_num: i64,
     ignore_delete: bool,
     /// Next sequence number to assign (bucket-local, always auto-incremented).
     next_sequence_number: i64,
@@ -108,12 +108,6 @@ pub(crate) struct KeyValueWriteConfig {
     pub file_index_options: Option<Arc<FileIndexOptions>>,
 }
 
-struct IndexedFileWrite<'a> {
-    format_writer_factory: &'a dyn FormatWriterFactory,
-    is_changelog: bool,
-    file_ordinal: usize,
-}
-
 impl KeyValueFileWriter {
     pub(crate) fn new(
         file_io: FileIO,
@@ -121,10 +115,8 @@ impl KeyValueFileWriter {
         next_sequence_number: i64,
     ) -> Result<Self> {
         let core_options = CoreOptions::new(&config.table_options);
-        let target_file_row_num = core_options
-            .target_file_row_num()?
-            .try_into()
-            .unwrap_or(usize::MAX);
+        let target_file_size = core_options.target_file_size();
+        let target_file_row_num = core_options.target_file_row_num()?;
         let ignore_delete =
             config.merge_engine == MergeEngine::PartialUpdate && core_options.ignore_delete();
         if config.merge_engine == MergeEngine::PartialUpdate {
@@ -157,6 +149,7 @@ impl KeyValueFileWriter {
             paths,
             file_io,
             config,
+            target_file_size,
             target_file_row_num,
             ignore_delete,
             next_sequence_number,
@@ -211,15 +204,6 @@ impl KeyValueFileWriter {
             managed_blob_enabled: self.managed_blob_writer.enabled(),
             resources: self.resources.as_ref(),
         }
-    }
-
-    fn new_format_writer_factory(
-        &self,
-        schema: arrow_schema::SchemaRef,
-        is_changelog: bool,
-    ) -> Result<Arc<dyn FormatWriterFactory>> {
-        self.file_options(is_changelog)
-            .new_format_writer_factory(schema)
     }
 
     pub(crate) fn with_resources(mut self, resources: Option<ResourceContext>) -> Self {
@@ -369,51 +353,18 @@ impl KeyValueFileWriter {
             }
         };
 
-        // The sorted output is already materialized in FLUSH_CHUNK_ROWS batches.
-        // Use the row target as an upper bound for each emitted batch and keep
-        // every file's key bounds, sequence bounds, and index local to its rows.
-        // Java creates independent data/changelog format factories for each
-        // buffer flush. Rolled files share history only within that flush.
-        let data_factory =
-            self.new_format_writer_factory(build_physical_schema(&data_batch.schema()), false)?;
-        for offset in (0..data_indices.len()).step_by(self.target_file_row_num) {
-            let len = self.target_file_row_num.min(data_indices.len() - offset);
-            let file_indices = data_indices.slice(offset, len);
-            let file = self
-                .write_indexed_file(
-                    &data_batch,
-                    data_seq.as_ref(),
-                    &file_indices,
-                    IndexedFileWrite {
-                        format_writer_factory: data_factory.as_ref(),
-                        is_changelog: false,
-                        file_ordinal: self.written_files.len(),
-                    },
-                )
-                .await?;
-            self.written_files.push(file);
-        }
+        // Each flush owns independent format factories; rolled files share
+        // format history only within that flush.
+        let files = self
+            .write_indexed_files(&data_batch, data_seq.as_ref(), &data_indices, false)
+            .await?;
+        self.written_files.extend(files);
 
         if self.config.input_changelog {
-            let changelog_factory =
-                self.new_format_writer_factory(build_physical_schema(&combined.schema()), true)?;
-            for offset in (0..sorted_indices.len()).step_by(self.target_file_row_num) {
-                let len = self.target_file_row_num.min(sorted_indices.len() - offset);
-                let file_indices = sorted_indices.slice(offset, len);
-                let file = self
-                    .write_indexed_file(
-                        &combined,
-                        seq_array.as_ref(),
-                        &file_indices,
-                        IndexedFileWrite {
-                            format_writer_factory: changelog_factory.as_ref(),
-                            is_changelog: true,
-                            file_ordinal: self.written_changelog_files.len(),
-                        },
-                    )
-                    .await?;
-                self.written_changelog_files.push(file);
-            }
+            let files = self
+                .write_indexed_files(&combined, seq_array.as_ref(), &sorted_indices, true)
+                .await?;
+            self.written_changelog_files.extend(files);
         }
         Ok(())
     }
@@ -457,29 +408,25 @@ impl KeyValueFileWriter {
     }
 
     /// Materialize sorted selections into thin KV chunks. Physical file metadata,
-    /// format encoding, indexes and cleanup are owned by KeyValueDataFileWriter.
-    async fn write_indexed_file(
+    /// rolling, format encoding, indexes and cleanup are owned by KeyValueRollingWriter.
+    async fn write_indexed_files(
         &self,
         batch: &RecordBatch,
         seq_array: &dyn Array,
         indices: &UInt32Array,
-        write: IndexedFileWrite<'_>,
-    ) -> Result<DataFileMeta> {
-        if indices.is_empty() {
-            return Err(crate::Error::DataInvalid {
-                message: "Cannot write an empty key-value data file".into(),
-                source: None,
-            });
-        }
+        is_changelog: bool,
+    ) -> Result<Vec<DataFileMeta>> {
         let physical_schema = build_physical_schema(&batch.schema());
-        let mut file = self
-            .file_options(write.is_changelog)
-            .open(
-                &physical_schema,
-                write.format_writer_factory,
-                write.file_ordinal,
-            )
-            .await?;
+        let mut writer = KeyValueRollingWriter::new(
+            self.file_options(is_changelog),
+            self.target_file_size,
+            self.target_file_row_num,
+        )
+        .with_first_file_ordinal(if is_changelog {
+            self.written_changelog_files.len()
+        } else {
+            self.written_files.len()
+        });
         let result = async {
             let vk_idx = batch
                 .schema()
@@ -487,8 +434,11 @@ impl KeyValueFileWriter {
                 .iter()
                 .position(|f| f.name() == crate::spec::VALUE_KIND_FIELD_NAME);
 
-            for chunk_start in (0..indices.len()).step_by(Self::FLUSH_CHUNK_ROWS) {
-                let chunk_len = Self::FLUSH_CHUNK_ROWS.min(indices.len() - chunk_start);
+            let mut chunk_start = 0;
+            while chunk_start < indices.len() {
+                let chunk_len = Self::FLUSH_CHUNK_ROWS
+                    .min(writer.remaining_rows())
+                    .min(indices.len() - chunk_start);
                 let chunk_indices = indices.slice(chunk_start, chunk_len);
 
                 let mut physical_columns: Vec<Arc<dyn Array>> = Vec::new();
@@ -540,16 +490,16 @@ impl KeyValueFileWriter {
                     message: format!("Failed to create physical batch: {e}"),
                     source: None,
                 })?;
-                file.write(&chunk_batch).await?;
+                writer.write(&chunk_batch).await?;
+                chunk_start += chunk_len;
             }
-            Ok(())
+            writer.prepare_commit().await
         }
         .await;
-        if let Err(error) = result {
-            file.abort().await;
-            return Err(error);
+        if result.is_err() {
+            writer.abort().await;
         }
-        file.close().await
+        result
     }
 
     /// Select output row indices from sorted inputs according to merge engine.
@@ -1067,6 +1017,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_indexed_output_creates_no_files() {
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let writer =
+            KeyValueFileWriter::new(io.clone(), test_write_config(MergeEngine::Deduplicate), 0)
+                .unwrap();
+        let batch = RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(vec![1])) as Arc<dyn Array>),
+            (
+                "seq",
+                Arc::new(Int64Array::from(vec![10])) as Arc<dyn Array>,
+            ),
+            (
+                "value",
+                Arc::new(Int32Array::from(vec![20])) as Arc<dyn Array>,
+            ),
+        ])
+        .unwrap();
+        for is_changelog in [false, true] {
+            let files = writer
+                .write_indexed_files(
+                    &batch,
+                    &Int64Array::from(vec![0]),
+                    &UInt32Array::from(Vec::<u32>::new()),
+                    is_changelog,
+                )
+                .await
+                .unwrap();
+            assert!(files.is_empty());
+        }
+        assert!(io
+            .list_status(writer.paths.bucket_path())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn remaining_rows_tracks_partial_writes_and_rolls() {
+        let writer = first_row_writer();
+        let mut rolling = KeyValueRollingWriter::new(writer.file_options(false), i64::MAX, 3);
+        let batch = RecordBatch::try_from_iter([
+            (
+                SEQUENCE_NUMBER_FIELD_NAME,
+                Arc::new(Int64Array::from(vec![0, 1, 2, 3])) as Arc<dyn Array>,
+            ),
+            (
+                VALUE_KIND_FIELD_NAME,
+                Arc::new(Int8Array::from(vec![0; 4])) as Arc<dyn Array>,
+            ),
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as Arc<dyn Array>,
+            ),
+            (
+                "seq",
+                Arc::new(Int64Array::from(vec![10; 4])) as Arc<dyn Array>,
+            ),
+            (
+                "value",
+                Arc::new(Int32Array::from(vec![20; 4])) as Arc<dyn Array>,
+            ),
+        ])
+        .unwrap();
+        assert_eq!(rolling.remaining_rows(), 3);
+        rolling.write(&batch.slice(0, 2)).await.unwrap();
+        assert_eq!(rolling.remaining_rows(), 1);
+        rolling.write(&batch.slice(2, 1)).await.unwrap();
+        assert_eq!(rolling.remaining_rows(), 3);
+        rolling.write(&batch.slice(3, 1)).await.unwrap();
+        assert_eq!(rolling.remaining_rows(), 2);
+        let files = rolling.prepare_commit().await.unwrap();
+        assert_eq!(rolling.remaining_rows(), 3);
+        assert_eq!(
+            files.iter().map(|file| file.row_count).collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+    }
+
+    #[tokio::test]
     async fn target_file_row_num_rolls_data_and_changelog_with_local_metadata() {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
@@ -1105,6 +1134,66 @@ mod tests {
                     .map(|file| (file.min_sequence_number, file.max_sequence_number))
                     .collect::<Vec<_>>(),
                 vec![(1, 3), (2, 4), (0, 0)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn target_file_size_rolls_flush_data_and_changelog() {
+        let rows = KeyValueFileWriter::FLUSH_CHUNK_ROWS * 2 + 1;
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values((0..rows as i32).rev())) as Arc<dyn Array>,
+            ),
+            (
+                "seq",
+                Arc::new(Int64Array::from_iter_values(0..rows as i64)) as Arc<dyn Array>,
+            ),
+            (
+                "value",
+                Arc::new(Int32Array::from_iter_values(0..rows as i32)) as Arc<dyn Array>,
+            ),
+        ])
+        .unwrap();
+        let mut config = test_write_config(MergeEngine::Deduplicate);
+        config.input_changelog = true;
+        config.write_buffer_size = i64::MAX;
+        config
+            .table_options
+            .insert("target-file-size".into(), "1b".into());
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let mut writer = KeyValueFileWriter::new(io.clone(), config, 0).unwrap();
+        for _ in 0..2 {
+            writer.write(&batch).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+        let prepared = writer.prepare_commit().await.unwrap();
+        for files in [&prepared.data_files, &prepared.changelog_files] {
+            assert_eq!(
+                files.iter().map(|file| file.row_count).collect::<Vec<_>>(),
+                vec![4096, 4096, 1, 4096, 4096, 1]
+            );
+            let mut ids = Vec::new();
+            for (ordinal, file) in files.iter().enumerate() {
+                assert!(file.file_name.ends_with(&format!("-{ordinal}.parquet")));
+                let stored = read_kv_file(&io, file).await;
+                assert_eq!(stored.num_rows() as i64, file.row_count);
+                ids.extend(
+                    stored
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied(),
+                );
+            }
+            assert_eq!(
+                ids,
+                (0..rows as i32).cycle().take(rows * 2).collect::<Vec<_>>()
             );
         }
     }
