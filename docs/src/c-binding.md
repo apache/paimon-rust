@@ -237,7 +237,23 @@ if (error != NULL) {
 `ignore_if_exists` on create ignores a duplicate tag name. Delete does not
 ignore a missing tag. The C binding does not expose tag listing; read a known
 tag with `paimon_catalog_get_tag`, or use time travel with `scan.tag-name`.
-Creating tags with a retention duration is not exposed in the C API.
+
+`paimon_catalog_create_tag` keeps the no-retention path by calling
+`paimon_catalog_create_tag_with_retention` with a null `time_retained`. Pass a
+duration such as `"1d"` or `"12h"` to persist retention on the tag file; this
+does not expire or delete tags automatically:
+
+```c
+/* Optional retention. NULL time_retained omits retention metadata. */
+error = paimon_catalog_create_tag_with_retention(
+    catalog, identifier, "release-retained", NULL, "1d", false);
+if (error != NULL) {
+    paimon_error_free(error);
+}
+```
+
+`paimon_catalog_get_tag` JSON may include `tagTimeRetained` as an ISO-8601
+duration (for example `"1d"` becomes `"PT24H"`).
 
 ## Caller-managed File Cache
 
