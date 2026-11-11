@@ -502,9 +502,9 @@ async fn authorized_pinned_snapshot_can_verify_a_retained_tag_after_expiry_or_id
         )
         .await;
         let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
-        g.table
-            .tag_manager()
-            .create("before", &snapshot)
+        g.ctx
+            .catalog
+            .create_tag(&g.identifier, "before", Some(snapshot.id()), false)
             .await
             .unwrap();
         let path = g.table.snapshot_manager().snapshot_path(1);
@@ -522,6 +522,16 @@ async fn authorized_pinned_snapshot_can_verify_a_retained_tag_after_expiry_or_id
         } else {
             g.table.file_io().delete_file(&path).await.unwrap();
         }
+        let retained = g
+            .ctx
+            .catalog
+            .get_tag(&g.identifier, "before")
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&retained.snapshot).unwrap(),
+            serde_json::to_value(&snapshot).unwrap()
+        );
         let view = g.table.copy_with_pinned_snapshot(Some(&snapshot));
         let rows = read_all(&view.new_read_builder()).await.unwrap();
         assert_eq!(ids(&rows), [1]);
@@ -546,10 +556,18 @@ async fn authorized_pinned_latest_can_use_rest_when_tag_metadata_is_unavailable(
             std::fs::copy(file.path(), destination.join(file.file_name())).unwrap();
         }
     }
-    // The mount exposes data/manifests but no snapshot directory. An unrelated
-    // malformed tag must not block validation through the REST snapshot source.
+    // The mount exposes data/manifests but no snapshot directory. Unavailable
+    // catalog tags must not block validation through the REST snapshot source.
     std::fs::create_dir_all(mounted.join("tag")).unwrap();
     std::fs::write(mounted.join("tag/tag-broken"), "not snapshot JSON").unwrap();
+    g.ctx
+        .server
+        .set_tag_read_error(Some(paimon::api::ErrorResponse::new(
+            None,
+            None,
+            Some("tag metadata unavailable".into()),
+            Some(501),
+        )));
     let mut options = g.ctx.catalog.options().clone();
     options.set("fuse.enabled", "true");
     options.set("fuse.root", root.path().to_str().unwrap());
@@ -560,7 +578,11 @@ async fn authorized_pinned_latest_can_use_rest_when_tag_metadata_is_unavailable(
         .get_table(&g.identifier)
         .await
         .unwrap();
-    assert!(table.tag_manager().list_all().await.is_err());
+    let error = table.tag_manager().list_all().await.unwrap_err();
+    assert!(
+        error.to_string().contains("tag metadata unavailable"),
+        "{error}"
+    );
     let view = table.copy_with_pinned_snapshot(Some(&snapshot));
     let rows = read_all(&view.new_read_builder()).await.unwrap();
     assert_eq!(ids(&rows), [1]);

@@ -51,9 +51,17 @@ type PartitionPageResponse = (Vec<Partition>, Option<String>);
 type PartitionSpecPageResponse = (Vec<HashMap<String, String>>, Option<String>);
 
 fn branch_name_from_uri(uri: &Uri) -> String {
-    // Branch paths use Java's form encoding. Decode the raw segment so spaces
-    // (`+`) remain distinct from literal plus signs (`%2B`), unlike Axum's Path.
-    let (_, suffix) = uri.path().rsplit_once("/branches/").unwrap();
+    resource_name_from_uri(uri, "/branches/")
+}
+
+fn tag_name_from_uri(uri: &Uri) -> String {
+    resource_name_from_uri(uri, "/tags/")
+}
+
+fn resource_name_from_uri(uri: &Uri, marker: &str) -> String {
+    // Branch and tag paths use Java's form encoding. Decode the raw segment so
+    // spaces (`+`) remain distinct from literal plus signs (`%2B`), unlike Axum's Path.
+    let (_, suffix) = uri.path().rsplit_once(marker).unwrap();
     RESTUtil::decode_string(suffix.split('/').next().unwrap())
 }
 
@@ -65,6 +73,12 @@ struct MockState {
     views: HashMap<String, GetViewResponse>,
     functions: HashMap<String, GetFunctionResponse>,
     tags: HashMap<String, GetTagResponse>,
+    catalog_snapshots: HashMap<String, Snapshot>,
+    create_tag_calls: Vec<(String, String, CreateTagRequest)>,
+    get_tag_calls: Vec<(String, String, String)>,
+    delete_tag_calls: Vec<(String, String, String)>,
+    tag_mutation_error: Option<ErrorResponse>,
+    tag_read_error: Option<ErrorResponse>,
     branches: HashMap<String, Vec<String>>,
     drop_branch_calls: Vec<(String, String, String)>,
     fast_forward_calls: Vec<(String, String, String)>,
@@ -792,11 +806,25 @@ impl RESTServer {
         (StatusCode::OK, Json(serde_json::json!(""))).into_response()
     }
 
-    /// Load the snapshot from the same filesystem fixtures used by table reads.
+    /// Load a registered catalog snapshot, or use the filesystem fixtures.
     pub async fn load_snapshot(
         Path((db, table)): Path<(String, String)>,
         Extension(state): Extension<Arc<RESTServer>>,
     ) -> impl IntoResponse {
+        let snapshot = state
+            .inner
+            .lock()
+            .unwrap()
+            .catalog_snapshots
+            .get(&format!("{db}.{table}"))
+            .cloned();
+        if let Some(snapshot) = snapshot {
+            return (
+                StatusCode::OK,
+                Json(json!({"snapshot": {"snapshot": snapshot}})),
+            )
+                .into_response();
+        }
         let identifier = Identifier::new(&db, &table);
         let parsed = identifier.parsed_object_name().unwrap();
         let key = format!("{db}.{}", parsed.table());
@@ -1121,24 +1149,44 @@ impl RESTServer {
         Extension(state): Extension<Arc<RESTServer>>,
         Json(request): Json<CreateTagRequest>,
     ) -> impl IntoResponse {
-        let mut state = state.inner.lock().unwrap();
-        if !state.tables.contains_key(&format!("{db}.{table}")) {
-            return resource_error(StatusCode::NOT_FOUND, "table", &table);
-        }
-
         let key = format!("{db}.{table}.{}", request.tag_name);
+        let (location, catalog_snapshot) = {
+            let mut state = state.inner.lock().unwrap();
+            state
+                .create_tag_calls
+                .push((db.clone(), table.clone(), request.clone()));
+            if let Some(error) = state.tag_mutation_error.clone() {
+                return Self::error_response(error);
+            }
+            let Some(response) = state.tables.get(&format!("{db}.{table}")) else {
+                return resource_error(StatusCode::NOT_FOUND, "table", &table);
+            };
+            let location = response.path.clone();
+            if state.tags.contains_key(&key) {
+                return resource_error(StatusCode::CONFLICT, "TAG", &request.tag_name);
+            }
+            let catalog_snapshot = state
+                .catalog_snapshots
+                .get(&format!("{db}.{table}"))
+                .cloned();
+            (location, catalog_snapshot)
+        };
+        let Some(snapshot) =
+            Self::tag_target(location, catalog_snapshot, request.snapshot_id).await
+        else {
+            let snapshot_id = request.snapshot_id.unwrap_or(1);
+            return resource_error(StatusCode::NOT_FOUND, "SNAPSHOT", &snapshot_id.to_string());
+        };
+
+        let mut state = state.inner.lock().unwrap();
         if state.tags.contains_key(&key) {
             return resource_error(StatusCode::CONFLICT, "TAG", &request.tag_name);
-        }
-        let snapshot_id = request.snapshot_id.unwrap_or(1);
-        if snapshot_id != 1 {
-            return resource_error(StatusCode::NOT_FOUND, "SNAPSHOT", &snapshot_id.to_string());
         }
         state.tags.insert(
             key,
             GetTagResponse {
                 tag_name: request.tag_name,
-                snapshot: tag_snapshot(snapshot_id),
+                snapshot,
                 tag_create_time: None,
                 tag_time_retained: request.time_retained,
             },
@@ -1146,11 +1194,85 @@ impl RESTServer {
         (StatusCode::OK, Json(json!(""))).into_response()
     }
 
-    pub async fn get_tag(
-        Path((db, table, tag)): Path<(String, String, String)>,
+    /// The snapshot a new tag points at: the catalog's current snapshot when no
+    /// id is requested or the id matches it, then table storage when the table
+    /// has snapshot files, otherwise a placeholder snapshot 1.
+    async fn tag_target(
+        location: Option<String>,
+        catalog_snapshot: Option<Snapshot>,
+        snapshot_id: Option<i64>,
+    ) -> Option<Snapshot> {
+        if let Some(snapshot) =
+            catalog_snapshot.filter(|snapshot| snapshot_id.is_none_or(|id| id == snapshot.id()))
+        {
+            return Some(snapshot);
+        }
+        let file_io = location
+            .as_deref()
+            .and_then(|location| paimon::io::FileIO::from_path(location).ok()?.build().ok());
+        if let (Some(location), Some(file_io)) = (location, file_io) {
+            let manager = paimon::table::SnapshotManager::new(file_io, location);
+            if !manager.list_all_ids().await.unwrap_or_default().is_empty() {
+                return match snapshot_id {
+                    None => manager.get_latest_snapshot().await.ok().flatten(),
+                    Some(id) => manager.get_snapshot(id).await.ok(),
+                };
+            }
+        }
+        (snapshot_id.unwrap_or(1) == 1).then(|| tag_snapshot(1))
+    }
+
+    /// List tag names in pages of `maxResults` (default 2, so clients must
+    /// follow tokens). The token is the last name of the previous page.
+    pub async fn list_tags(
+        Path((db, table)): Path<(String, String)>,
+        Query(params): Query<HashMap<String, String>>,
         Extension(state): Extension<Arc<RESTServer>>,
     ) -> impl IntoResponse {
         let state = state.inner.lock().unwrap();
+        if let Some(error) = state.tag_read_error.clone() {
+            return Self::error_response(error);
+        }
+        if !state.tables.contains_key(&format!("{db}.{table}")) {
+            return resource_error(StatusCode::NOT_FOUND, "TABLE", &table);
+        }
+        let prefix = format!("{db}.{table}.");
+        let mut names: Vec<String> = state
+            .tags
+            .keys()
+            .filter_map(|key| key.strip_prefix(&prefix))
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        let page_size = params
+            .get("maxResults")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2);
+        let mut remaining = names
+            .into_iter()
+            .filter(|name| params.get("pageToken").is_none_or(|token| name > token));
+        let page: Vec<String> = remaining.by_ref().take(page_size).collect();
+        let next_page_token = remaining.next().and_then(|_| page.last().cloned());
+        let response = paimon::api::ListTagsResponse {
+            tags: Some(page),
+            next_page_token,
+        };
+        (StatusCode::OK, Json(response)).into_response()
+    }
+
+    pub async fn get_tag(
+        Path((db, table, _)): Path<(String, String, String)>,
+        OriginalUri(uri): OriginalUri,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let tag = tag_name_from_uri(&uri);
+        let mut state = state.inner.lock().unwrap();
+        state
+            .get_tag_calls
+            .push((db.clone(), table.clone(), tag.clone()));
+        if let Some(error) = state.tag_read_error.clone() {
+            return Self::error_response(error);
+        }
         if !state.tables.contains_key(&format!("{db}.{table}")) {
             return resource_error(StatusCode::NOT_FOUND, "table", &table);
         }
@@ -1161,10 +1283,18 @@ impl RESTServer {
     }
 
     pub async fn delete_tag(
-        Path((db, table, tag)): Path<(String, String, String)>,
+        Path((db, table, _)): Path<(String, String, String)>,
+        OriginalUri(uri): OriginalUri,
         Extension(state): Extension<Arc<RESTServer>>,
     ) -> impl IntoResponse {
+        let tag = tag_name_from_uri(&uri);
         let mut state = state.inner.lock().unwrap();
+        state
+            .delete_tag_calls
+            .push((db.clone(), table.clone(), tag.clone()));
+        if let Some(error) = state.tag_mutation_error.clone() {
+            return Self::error_response(error);
+        }
         if !state.tables.contains_key(&format!("{db}.{table}")) {
             return resource_error(StatusCode::NOT_FOUND, "table", &table);
         }
@@ -2437,6 +2567,74 @@ impl RESTServer {
         );
     }
 
+    /// Serve a current snapshot from the catalog independently of table storage.
+    pub fn set_catalog_snapshot(&self, database: &str, table: &str, snapshot: Snapshot) {
+        self.inner
+            .lock()
+            .unwrap()
+            .catalog_snapshots
+            .insert(format!("{database}.{table}"), snapshot);
+    }
+
+    /// Set the REST metadata of a tag registered in the mock catalog.
+    pub fn set_tag_metadata(
+        &self,
+        database: &str,
+        table: &str,
+        tag: &str,
+        create_time: Option<i64>,
+        time_retained: Option<&str>,
+    ) {
+        let mut state = self.inner.lock().unwrap();
+        let response = state
+            .tags
+            .get_mut(&format!("{database}.{table}.{tag}"))
+            .unwrap();
+        response.tag_create_time = create_time;
+        response.tag_time_retained = time_retained.map(str::to_string);
+    }
+
+    /// Make tag reads and listings answer with `error` (status from its `code`).
+    pub fn set_tag_read_error(&self, error: Option<ErrorResponse>) {
+        self.inner.lock().unwrap().tag_read_error = error;
+    }
+
+    /// Tags of `database.table` known to the catalog, sorted by name.
+    pub fn tags(&self, database: &str, table: &str) -> Vec<GetTagResponse> {
+        let prefix = format!("{database}.{table}.");
+        let mut tags: Vec<_> = self
+            .inner
+            .lock()
+            .unwrap()
+            .tags
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, tag)| tag.clone())
+            .collect();
+        tags.sort_by(|a, b| a.tag_name.cmp(&b.tag_name));
+        tags
+    }
+
+    /// Tag-create attempts received by the server, including failed requests.
+    pub fn create_tag_calls(&self) -> Vec<(String, String, CreateTagRequest)> {
+        self.inner.lock().unwrap().create_tag_calls.clone()
+    }
+
+    /// Tag-get attempts received by the server, including failed requests.
+    pub fn get_tag_calls(&self) -> Vec<(String, String, String)> {
+        self.inner.lock().unwrap().get_tag_calls.clone()
+    }
+
+    /// Tag-delete attempts received by the server, including failed requests.
+    pub fn delete_tag_calls(&self) -> Vec<(String, String, String)> {
+        self.inner.lock().unwrap().delete_tag_calls.clone()
+    }
+
+    /// Make every tag create or delete answer with `error` (status from its `code`).
+    pub fn set_tag_mutation_error(&self, error: Option<ErrorResponse>) {
+        self.inner.lock().unwrap().tag_mutation_error = error;
+    }
+
     /// Register a branch of `database.table` in the catalog.
     pub fn add_branch(&self, database: &str, table: &str, branch: &str) {
         self.inner
@@ -2616,7 +2814,7 @@ pub async fn start_mock_server(
         )
         .route(
             &format!("{prefix}/databases/:db/tables/:table/tags"),
-            post(RESTServer::create_tag),
+            get(RESTServer::list_tags).post(RESTServer::create_tag),
         )
         .route(
             &format!("{prefix}/databases/:db/tables/:table/tags/:tag"),

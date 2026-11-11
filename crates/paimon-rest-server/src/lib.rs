@@ -185,6 +185,16 @@ fn build_router(prefix: &str, state: Arc<AppState>) -> Router {
             &format!("{base}/databases/:db/tables/:table/token"),
             get(table_token_stub),
         )
+        // Tags are not served yet. Answer 501 rather than an untyped 404, which
+        // a client would read as a missing table.
+        .route(
+            &format!("{base}/databases/:db/tables/:table/tags"),
+            get(tags_stub).post(tags_stub),
+        )
+        .route(
+            &format!("{base}/databases/:db/tables/:table/tags/:tag"),
+            get(tags_stub).delete(tags_stub),
+        )
         .layer(Extension(state))
 }
 
@@ -617,6 +627,16 @@ async fn table_token_stub() -> Response {
              set data-token.enabled=false (the default)."
                 .to_string(),
         ),
+        Some(StatusCode::NOT_IMPLEMENTED.as_u16() as i32),
+    );
+    (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
+}
+
+async fn tags_stub() -> Response {
+    let body = ErrorResponse::new(
+        None,
+        None,
+        Some("Tags are not supported by paimon-rest-server.".to_string()),
         Some(StatusCode::NOT_IMPLEMENTED.as_u16() as i32),
     );
     (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()

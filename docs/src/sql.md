@@ -1459,10 +1459,16 @@ CALL sys.create_tag(
 );
 ```
 
-When `time_retained` is specified, retention and tag creation time are persisted in
-the tag file. For example, `'1d'` appears as `PT24H` in the `time_retained` column
-of `$tags`. Omitting `time_retained` creates a tag without these metadata fields.
-This procedure does not automatically delete expired tags.
+For filesystem-managed tables, specifying `time_retained` persists retention and
+tag creation time in the tag file. For example, `'1d'` appears as `PT24H` in the
+`time_retained` column of `$tags`. Omitting `time_retained` creates a tag without
+these metadata fields. This procedure does not automatically delete expired tags.
+
+For tables managed by a REST catalog, the tag is created through the catalog:
+`snapshot_id` and `time_retained` are forwarded unchanged, and the server resolves
+the snapshot (the latest one when `snapshot_id` is omitted), validates retention,
+and stores the tag. The table's `tag/` directory is not read or written. An
+existing tag name fails with `Tag '...' already exists`, as for other tables.
 
 ### replace_tag
 
@@ -1513,6 +1519,10 @@ Create a named tag from an epoch timestamp in milliseconds (finds the earliest r
 CALL sys.create_tag_from_timestamp(table => 'paimon.my_db.my_table', tag => 'my_tag', timestamp => 1234567890000);
 ```
 
+This procedure is not supported for tables managed by a REST catalog. Their
+snapshots may exist only in the catalog, while timestamp selection currently
+relies on stored snapshot files.
+
 ### create_tag_from_watermark
 
 This procedure is not supported for tables managed by a REST catalog. Their
@@ -1554,6 +1564,23 @@ Delete a named tag:
 CALL sys.delete_tag(table => 'paimon.my_db.my_table', tag => 'my_tag');
 ```
 
+`tag` accepts a comma-separated list. Each name is trimmed, empty names are
+skipped, and missing tags are ignored. For tables managed by a REST catalog,
+each tag is deleted through the catalog, and the table's `tag/` directory is not
+read or written. Any other error stops the batch; earlier deletions are not
+rolled back.
+
+### rename_tag
+
+Rename a tag:
+
+```sql
+CALL sys.rename_tag(table => 'paimon.my_db.my_table', tag => 'old_tag', target_tag => 'new_tag');
+```
+
+The source tag must exist and the target tag must not. This procedure is not
+supported for tables managed by a REST catalog, which has no tag-rename endpoint.
+
 ### rollback_to
 
 Rollback a table to a specific snapshot or tag:
@@ -1573,6 +1600,10 @@ Rollback a table to an epoch timestamp in milliseconds (selects the latest retai
 ```sql
 CALL sys.rollback_to_timestamp(table => 'paimon.my_db.my_table', timestamp => 1234567890000);
 ```
+
+This procedure is not supported for tables managed by a REST catalog, for the
+same reason as `create_tag_from_timestamp`. Use `rollback_to` with an explicit
+`snapshot_id` or `tag` instead.
 
 Both timestamp procedures take epoch milliseconds. The `$snapshots.commit_time`
 column is a local `TIMESTAMP`; its raw Arrow value includes the local timezone
@@ -2898,7 +2929,16 @@ Use a quoted tag name with `VERSION AS OF`:
 SELECT * FROM paimon.default.my_table VERSION AS OF 'my_tag';
 ```
 
-Resolution order: first checks if a tag with that name exists, then tries to parse it as a snapshot ID.
+Resolution order: first resolves a tag with that name, then tries
+`watermark-<value>` or a numeric snapshot ID.
+
+For tables managed by a REST catalog, tags named by `VERSION AS OF` or
+`scan.tag-name` are resolved through the catalog; tag files in table storage are
+ignored. Legacy tags named `.` or `..` cannot be resolved through the REST API.
+If the tag endpoint returns HTTP 501, `scan.version` (including `VERSION AS OF`)
+can still resolve a numeric snapshot ID or `watermark-<value>` from stored
+snapshots. `scan.tag-name` always requires the tag endpoint, including for
+numeric tag names. Other catalog errors fail the query.
 
 ### By Timestamp
 
@@ -3170,6 +3210,17 @@ Columns:
 | `create_time` | TIMESTAMP | Tag creation time; `NULL` for tags written without one |
 | `time_retained` | STRING | Tag retention as an ISO-8601 duration (for example `PT72H`); `NULL` for tags written without one |
 
+For tables managed by a REST catalog, the tags are listed from the catalog
+rather than from tag files in table storage. Legacy tags named `.` or `..`, which
+cannot be addressed safely by the REST API, are omitted with a warning so they
+cannot prevent other tags from being queried. Their storage files are ignored,
+and direct time travel by these legacy names is rejected.
+
+`create_time` is a local `TIMESTAMP` without a timezone. REST catalog creation
+times are converted from epoch milliseconds to the client's local time, matching
+the local date-time fields in filesystem tag metadata. Its raw Arrow integer is
+not an epoch timestamp.
+
 ### $branches
 
 View all branches of a table:
@@ -3342,9 +3393,18 @@ Columns:
 | `index_file_size` | BIGINT | Total size of index files (bytes) |
 
 The output contains one row per scope:
-- `total` — sum across all branches and tags
+- `total` — unique referenced files across all branches and tags
 - `branch:main` — main branch snapshots + tag snapshots
 - `branch:<name>` — one row per other branch
+
+For tables managed by a REST catalog, branches and tags come from the catalog,
+including branches with no corresponding storage directory. Current snapshots
+and tag snapshots returned by the catalog are counted even when their snapshot
+files are absent, together with the snapshot history visible in table storage.
+REST metadata API failures, including HTTP 501, fail the query rather than return
+an incomplete count. Invalid or unaddressable branch names also fail the query.
+Legacy `.` or `..` tags fail this query because their catalog snapshots cannot
+be read safely; they are not replaced by storage files.
 
 To estimate possible orphan file size for recognized data files:
 

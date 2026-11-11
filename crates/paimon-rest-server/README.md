@@ -75,8 +75,15 @@ Served under the configured prefix (`/v1/...` by default):
 | POST | `/tables/rename` | rename table |
 | POST | `/databases/{db}/tables/{table}/commit` | commit a snapshot |
 | GET | `/databases/{db}/tables/{table}/partitions` | list partitions |
+| GET / POST | `/databases/{db}/tables/{table}/tags` | returns `501` (tags unsupported) |
+| GET / DELETE | `/databases/{db}/tables/{table}/tags/{tag}` | returns `501` (tags unsupported) |
 
 The data-token endpoint returns `501`; it is never called when
 `data-token.enabled=false` (the default).
+
+Tag operations return `501` without accessing tag files. Numeric and watermark
+`scan.version` selectors can still resolve snapshots from table storage when the
+tag endpoint is unsupported. Explicit `scan.tag-name` selectors and tag operations
+return the unsupported error.
 
 [`FileSystemCatalog`]: https://docs.rs/paimon
