@@ -747,5 +747,8 @@ deletion vectors and source-backed PK indexes, or deletion vectors and global
 indexes in Data Evolution mode.
 Embedded and sidecar file indexes are regenerated according to the captured
 table options. The automatic behavior also applies to language bindings using the
-table committer. The manual compaction API and background compaction scheduling
-are not yet exposed through language bindings.
+table committer. One-shot manual compaction is exposed to Python through
+[`table.new_compact_builder()`](python-binding.md#compaction) and to SQL through
+[`CALL sys.compact`](sql.md#compact). Go and C bindings do not expose a manual
+compaction builder yet. Background compaction scheduling is not exposed through
+language bindings.
