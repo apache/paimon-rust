@@ -3439,39 +3439,83 @@ clients may ignore it.
 Existing partial-update tables may also configure
 `fields.<field>.aggregate-function` or
 `fields.default-aggregate-function`. Rust supports the same aggregate-function
-set as the basic aggregation engine: `sum`, `product`, `min`, `max`,
-`last_value`, `first_value`, `last_non_null_value`,
-`first_non_null_value`, `bool_and`, `bool_or`, and `listagg`.
+set as the basic aggregation engine (see below).
 `last_non_null_value` may be used without a sequence group; other functions
 require the target field to be protected by a sequence group. When a
 lower-precedence group sequence arrives, order-sensitive functions use Java
 compatible reversed aggregation. Unknown functions and incompatible
 function/type combinations fail closed.
 
-Rust can read fully materialized compacted files from deletion-vector-enabled
-partial-update and aggregation tables. Every split must be raw-convertible,
-every file must have a known zero delete-row count, and
-`deletion-vectors.merge-on-read` must remain disabled. Writing these table
-combinations and reading plans that still require per-key merging are not
-supported.
+Rust can read deletion-vector-enabled partial-update and aggregation tables.
+Fully materialized compacted files can be read as raw-convertible splits when
+every file has a known zero delete-row count. Uncompacted overlapping files can
+also be read with `deletion-vectors.merge-on-read=true`. Primary-key
+deletion-vector compaction still requires `merge-engine=deduplicate`, so these
+engines do not produce DV compaction output in Rust.
 
 Rust currently supports `merge-engine=aggregation` in basic mode only. It works
-with fixed buckets and ordinary dynamic buckets (`'bucket' = '-1'`) when the
-primary key includes all partition columns. It supports per-field aggregate
-functions such as `sum`, `min`, `max`, value functions, boolean functions, and
-`listagg`, plus `fields.default-aggregate-function`. Each write-buffer flush
-aggregates duplicate primary keys before writing data files, so a file contains
-at most one row per key. Input changelog files retain the original rows.
+with fixed buckets and dynamic buckets (`'bucket' = '-1'`). Cross-partition
+updates (`'bucket' = '-1'` when the primary key does not contain every partition
+field) keep the existing partition/bucket location, matching Java
+`UseOldExistingProcessor`. Each write-buffer flush aggregates duplicate primary
+keys before writing data files, so a file contains at most one row per key.
+Input changelog files retain the original rows.
 
-Sequence fields are always merged with `last_value`. Defining
+Per-field aggregate functions are selected in this order: sequence fields always
+use `last_value`; primary-key columns pass through without an aggregator;
+otherwise `fields.<field>.aggregate-function`, then
+`fields.default-aggregate-function`, then `last_non_null_value`. Defining
 `fields.<sequence-field>.aggregate-function` is rejected, matching Java schema
-validation.
+validation. The undocumented Java SPI alias `first_not_null_value` is accepted
+and resolved to `first_non_null_value`.
 
-This is not full Java feature parity. Aggregation tables do not support retract
-rows (`DELETE` / `UPDATE_BEFORE`), deletion-vector writes or merge-on-read
-plans, cross-partition dynamic bucket writes, or advanced aggregation options
-such as `ignore-retract`, `distinct`, `nested-key`, `count-limit`, and sequence
-groups.
+Supported aggregate functions:
+
+| Function | Column type |
+|---|---|
+| `sum`, `product` | integer, `FLOAT`, `DOUBLE`, `DECIMAL` |
+| `min`, `max` | comparable scalars (not `MAP`, `MULTISET`, `ROW`, `ARRAY`, `VECTOR`, `VARIANT`, or `BLOB`) |
+| `last_value`, `first_value`, `last_non_null_value`, `first_non_null_value`, `primary-key` | any |
+| `bool_and`, `bool_or` | `BOOLEAN` |
+| `listagg` | unbounded `STRING` (`VARCHAR` with max length) |
+| `collect` | `ARRAY` |
+| `merge_map` | `MAP` |
+| `merge_map_with_keytime` | `MAP` whose value is a `ROW` with at least two fields |
+| `nested_update`, `nested_partial_update` | `ARRAY<ROW>` |
+| `rbm32`, `rbm64`, `hll_sketch`, `theta_sketch` | `VARBINARY` |
+
+Field-scoped options used by these functions:
+
+- `fields.<field>.ignore-retract=true` ignores retract cells for that field.
+  It conflicts with `aggregation.remove-record-on-delete=true`.
+- `fields.<field>.list-agg-delimiter` and `fields.<field>.distinct` for
+  `listagg`; `fields.<field>.distinct` also applies to `collect`.
+- `fields.<field>.sum.fail-on-overflow` / `fields.<field>.product.fail-on-overflow`
+  reject integer overflow instead of wrapping. Floating-point addition is
+  unaffected; Decimal overflow still yields NULL as in Java.
+- `fields.<field>.ts-field` selects the key-time field for
+  `merge_map_with_keytime` (defaults to the last ROW field).
+- `fields.<field>.nested-key`, `fields.<field>.nested-sequence-field`,
+  `fields.<field>.nested-key-null-strategy`, and `fields.<field>.count-limit`
+  for nested array aggregators. `nested_partial_update` requires
+  `nested-key`.
+
+`DELETE` / `UPDATE_BEFORE` rows are fed to each field aggregator's retract path
+(`AggregateMergeFunction`), except that
+`aggregation.remove-record-on-delete=true` turns a `DELETE` into a full-row
+tombstone via `replace_with_delete` instead of `retract`. Native retract is
+implemented for `sum`, `product`, `collect`, `merge_map`, `nested_update`,
+`last_value`, `last_non_null_value`, and `primary-key` (which applies `agg` on
+retract). Aggregators without native retract — including `min`, `max`,
+`bool_and` / `bool_or`, `listagg`, `first_value`, `first_non_null_value`,
+`nested_partial_update`, `merge_map_with_keytime`, and the bitmap/sketch
+functions — reject retract unless `fields.<field>.ignore-retract=true`.
+
+This is not full Java feature parity. Aggregation tables still reject
+`fields.*.sequence-group`. Primary-key deletion-vector compaction remains
+limited to `deduplicate`, so aggregation tables do not write deletion-vector
+compaction output; reading DV-enabled aggregation tables, including
+merge-on-read of uncompacted files, is supported.
 
 Primary-key compaction supports `changelog-producer=lookup`, including
 deletion-vector-enabled `deduplicate` tables, generating INSERT, UPDATE_BEFORE, UPDATE_AFTER and DELETE events when
