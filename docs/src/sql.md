@@ -935,6 +935,25 @@ INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol');
 INSERT INTO paimon.my_db.users SELECT * FROM source_table;
 ```
 
+An `INSERT INTO` an append-only table with `'bucket' = '-1'` (the default) can
+encode data files with several writers. The writer count is the table option
+`sink.parallelism`, capped at `datafusion.execution.target_partitions`; the sink
+deals input batches to the writers round-robin, and their files are committed
+together as one snapshot. Without the option, one writer is used. Primary-key
+tables, fixed-bucket tables and `INSERT OVERWRITE` always use one writer, but
+the option must still be a positive integer.
+
+Each writer rolls its own files in every partition it receives rows for, so on
+a partitioned table the file count grows to writers × partitions where one
+writer leaves one file per partition.
+`sink.parallelism` is the same option Flink reads for its sink, so a table that
+already sets it for Flink jobs also writes in parallel from DataFusion, with at
+most `target_partitions` writers whatever the Flink value is.
+
+```sql
+ALTER TABLE paimon.my_db.events SET TBLPROPERTIES ('sink.parallelism' = '4');
+```
+
 For `VARIANT` columns, convert JSON text with `parse_json` or `try_parse_json`:
 
 ```sql
