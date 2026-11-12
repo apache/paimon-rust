@@ -1615,9 +1615,8 @@ fn sort_merge_stream(
         tree.init(|a, b| compare_cursors(&cursors, a, b).then_with(|| a.cmp(&b)).is_gt());
 
         // Batch buffer: stores RecordBatches referenced by output indices.
-        // Each cursor's current batch gets an entry; when a cursor advances
-        // to a new batch, the old one stays in the buffer until the output
-        // batch is flushed.
+        // Retain batches referenced by cursors or pending output rows. Consumed
+        // batches can be reclaimed even before the output batch is full.
         let mut batch_buffer: Vec<BufferedBatch> = Vec::new();
         // Map from stream_idx -> current batch_buffer index.
         let mut stream_batch_idx: Vec<Option<usize>> = vec![None; num_streams];
@@ -1776,8 +1775,19 @@ fn sort_merge_stream(
                     Arc::new(output_schema.as_ref().clone().with_metadata(metadata)), changelog.columns().to_vec(),
                 ).map_err(|error| Error::DataInvalid { message: format!("Invalid changelog batch: {error}"), source: Some(Box::new(error)) })?;
             }
-            if output_indices.is_empty() {
-                compact_batch_buffer(&mut batch_buffer, &mut stream_batch_idx, &cursors);
+            // There can be at most one source batch per cursor and per pending
+            // output row. A factor of two amortizes compaction while bounding
+            // unrelated batches across a long sequence of omitted keys.
+            let referenced_batch_bound = num_streams.saturating_add(output_indices.len());
+            if output_indices.is_empty()
+                || batch_buffer.len() > referenced_batch_bound.saturating_mul(2)
+            {
+                compact_batch_buffer(
+                    &mut batch_buffer,
+                    &mut stream_batch_idx,
+                    &cursors,
+                    &mut output_indices,
+                );
             }
 
             // Yield a batch when we've accumulated enough rows.
@@ -1797,6 +1807,7 @@ fn sort_merge_stream(
                     &mut batch_buffer,
                     &mut stream_batch_idx,
                     &cursors,
+                    &mut output_indices,
                 );
                 yield batch;
             }
@@ -1844,13 +1855,14 @@ fn build_output_interleave(
 }
 
 /// Compact the batch buffer by removing batches no longer referenced by any
-/// cursor, and updating indices accordingly.
+/// cursor or pending output row, and updating indices accordingly.
 fn compact_batch_buffer(
     batch_buffer: &mut Vec<BufferedBatch>,
     stream_batch_idx: &mut [Option<usize>],
     cursors: &[Option<SortMergeCursor>],
+    output_indices: &mut [(usize, usize)],
 ) {
-    // Collect which buffer indices are still alive (referenced by a cursor).
+    // Collect buffer indices referenced by cursors or pending output rows.
     let mut alive: Vec<bool> = vec![false; batch_buffer.len()];
     for (i, cursor) in cursors.iter().enumerate() {
         if cursor.is_some() {
@@ -1858,6 +1870,9 @@ fn compact_batch_buffer(
                 alive[idx] = true;
             }
         }
+    }
+    for &(batch_idx, _) in output_indices.iter() {
+        alive[batch_idx] = true;
     }
 
     // Build old->new index mapping.
@@ -1871,6 +1886,10 @@ fn compact_batch_buffer(
     }
 
     *batch_buffer = new_buffer;
+
+    for (batch_idx, _) in output_indices {
+        *batch_idx = new_indices[*batch_idx].expect("pending output batch must remain alive");
+    }
 
     // Remap stream_batch_idx.
     for (i, cursor) in cursors.iter().enumerate() {
@@ -1896,6 +1915,93 @@ mod tests {
     use futures::TryStreamExt;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn pending_output_releases_unreferenced_source_batches() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::{Mutex, Weak};
+
+        let schema = make_schema();
+        let observed: Arc<Mutex<Vec<Weak<dyn Array>>>> = Arc::default();
+        let peak = Arc::new(AtomicUsize::new(0));
+        let stream = |keys: Vec<i32>, kind: i8, sequence: i64| {
+            let observed = observed.clone();
+            let peak = peak.clone();
+            let schema = schema.clone();
+            futures::stream::iter(keys)
+                .map(move |key| {
+                    let mut observed = observed.lock().unwrap();
+                    let live = observed
+                        .iter()
+                        .filter(|batch| batch.strong_count() > 0)
+                        .count();
+                    peak.fetch_max(live, AtomicOrdering::Relaxed);
+                    let value = format!("value-{key}");
+                    let batch = make_batch_with_kind(
+                        &schema,
+                        vec![key],
+                        vec![sequence],
+                        vec![kind],
+                        vec![Some(value.as_str())],
+                    );
+                    observed.push(Arc::downgrade(batch.column(3)));
+                    Ok(batch)
+                })
+                .boxed()
+        };
+        let inserts = stream((0..=65).collect(), RowKind::Insert.to_value(), 1);
+        let deletes = stream(
+            (1..65).filter(|key| *key != 31).collect(),
+            RowKind::Delete.to_value(),
+            2,
+        );
+        let batches = SortMergeReaderBuilder::new(
+            vec![inserts, deletes],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            make_output_schema(),
+            Box::new(DeduplicateMergeFunction),
+        )
+        .with_batch_size(256)
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let keys = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(keys.values().as_ref(), &[0, 31, 65]);
+        let values = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            vec![Some("value-0"), Some("value-31"), Some("value-65")]
+        );
+        // Two cursors and at most three pending source rows need only a small
+        // buffer. Unrelated consumed batches must not accumulate with deletes.
+        assert!(
+            peak.load(AtomicOrdering::Relaxed) <= 16,
+            "retained {} source batches",
+            peak.load(AtomicOrdering::Relaxed)
+        );
+        assert!(observed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|batch| batch.strong_count() == 0));
+    }
 
     #[test]
     fn level_column_survives_concatenation_and_serialization() {
