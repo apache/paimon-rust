@@ -1955,11 +1955,23 @@ impl OutputFile {
 
     /// Get an async streaming writer for format-level writes (e.g. parquet).
     pub(crate) async fn async_writer(&self) -> crate::Result<Box<dyn AsyncFileWrite>> {
+        self.async_writer_with_concurrency(1).await
+    }
+
+    /// Streaming writer with an explicit multipart concurrency.
+    ///
+    /// Callers that do not pass a concurrency keep the historical single
+    /// upload. Vector-index serialization uses eight so part uploads overlap
+    /// while each chunk stays 8 MiB.
+    pub(crate) async fn async_writer_with_concurrency(
+        &self,
+        concurrency: usize,
+    ) -> crate::Result<Box<dyn AsyncFileWrite>> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let writer: Box<dyn AsyncFileWrite> = Box::new(
             op.writer_with(&relative_path)
                 .chunk(8 * 1024 * 1024)
-                .concurrent(1)
+                .concurrent(concurrency)
                 .await?
                 .into_futures_async_write()
                 .compat_write(),
@@ -1976,6 +1988,9 @@ impl OutputFile {
         }))
     }
 }
+
+#[cfg(test)]
+pub(crate) mod multipart_test;
 
 #[cfg(test)]
 mod file_action_test {
@@ -4324,7 +4339,7 @@ mod input_output_test {
         let mut writer = file_io
             .new_output(&location)
             .unwrap()
-            .async_writer()
+            .async_writer_with_concurrency(8)
             .await
             .unwrap();
         writer.write_all(b"new metadata").await.unwrap();
