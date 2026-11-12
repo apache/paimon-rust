@@ -289,4 +289,6 @@ updates the identifier's current branch (main by default); it does not change
 the source branch. These catalog methods currently require a REST catalog.
 Other catalog implementations raise `NotImplementedError`.
 
-Time travel queries are not supported in the Python binding at this time.
+Time travel is supported through `Table.new_read_builder(options)` with one of
+`scan.snapshot-id`, `scan.tag-name`, `scan.timestamp-millis`, `scan.timestamp`,
+`scan.watermark`, or `scan.version`. At most one selector may be set.
