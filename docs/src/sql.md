@@ -918,10 +918,10 @@ The table type determines which row-level DML operations are supported:
 | `TRUNCATE TABLE` | Supported | Supported | Supported |
 | `ALTER TABLE ... DROP PARTITION` | Supported for partitioned tables | Supported for partitioned tables | Supported for partitioned tables |
 | `UPDATE` | Supported via Copy-on-Write | Not supported | Supported via row-id update |
-| `DELETE` | Supported via Copy-on-Write | Not supported | Supported when deletion vectors are enabled |
+| `DELETE` | Supported via Copy-on-Write | Supported for [eligible `deduplicate` tables](#delete) | Supported when deletion vectors are enabled |
 | `MERGE INTO` | Supported via Copy-on-Write | Not supported | Supported for matched `UPDATE`, matched `DELETE` with deletion vectors, and not-matched `INSERT` |
 
-A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. `DELETE` and matched `DELETE` in `MERGE INTO` additionally require `'deletion-vectors.enabled' = 'true'`. Primary-key row-level `UPDATE`, `DELETE`, and `MERGE INTO` are not supported even when data evolution is enabled.
+A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. `DELETE` and matched `DELETE` in `MERGE INTO` additionally require `'deletion-vectors.enabled' = 'true'`. Primary-key row-level `UPDATE` and `MERGE INTO` are not supported.
 
 ### INSERT INTO
 
@@ -1008,7 +1008,30 @@ DELETE FROM paimon.my_db.t WHERE name = 'b';
 
 For data-evolution row-tracking tables without primary keys, deletes are executed via deletion vectors and require `'deletion-vectors.enabled' = 'true'`.
 
-`DELETE` is not supported on primary-key tables.
+Primary-key tables using `merge-engine=deduplicate` with data evolution disabled
+support `DELETE` by writing tombstones for the logical rows matching the
+predicate. `DELETE` without `WHERE` deletes every row in the captured read
+snapshot. A delete with no matches returns zero without publishing a snapshot.
+
+Scans of the target table, including predicate self-references, use one captured
+snapshot. Tombstones keep the matched rows' `sequence.field` values, so concurrent
+upserts follow the normal primary-key merge rules, including
+`sequence.field.sort-order`. With the default ascending order, a higher-sequence
+upsert survives; without a sequence field, normal write ordering applies. This
+does not provide serializable predicate deletion.
+
+The affected-row count reports logical rows matching the predicate in the
+captured snapshot. It includes keys whose concurrent upserts survive under the
+merge rules above.
+
+Publication retries reuse prepared files without rescanning. Repeating the SQL
+statement scans a new snapshot and is a new operation. A commit error does not
+necessarily mean that the deletion was rolled back.
+
+Other primary-key merge engines, `ignore-delete=true` (including its fallback
+options), `rowkind.field`, query-authorized primary-key tables, aliases,
+multi-target/join deletes, `USING`, `RETURNING`, `ORDER BY`, `LIMIT`, `OUTPUT`, and
+target table modifiers are not supported by this path.
 
 ### MERGE INTO
 

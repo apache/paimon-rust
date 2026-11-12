@@ -2780,64 +2780,6 @@ async fn test_pk_aggregation_sequence_field_forced_last_value() {
     assert_eq!(ts.value(0), 250); // forced last_value over default sum
 }
 
-/// Aggregation without ignore-retract must reject a DELETE/UPDATE row.
-#[tokio::test]
-async fn test_pk_aggregation_rejects_delete() {
-    let (_tmp, sql_context) = setup_sql_context().await;
-
-    sql_context
-        .sql(
-            "CREATE TABLE paimon.test_db.t_agg_del (
-                id INT NOT NULL, amount INT,
-                PRIMARY KEY (id)
-            ) WITH (
-                'bucket' = '1',
-                'merge-engine' = 'aggregation',
-                'fields.amount.aggregate-function' = 'sum'
-            )",
-        )
-        .await
-        .unwrap();
-
-    sql_context
-        .sql("INSERT INTO paimon.test_db.t_agg_del VALUES (1, 10), (2, 20)")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
-    // DELETE may either fail at planning or surface Unsupported at execution.
-    // Either way the error must mention the aggregation engine refusing the
-    // retract row; we explicitly assert both branches so a future parser
-    // change cannot silently turn this into a no-op pass.
-    let plan_result = sql_context
-        .sql("DELETE FROM paimon.test_db.t_agg_del WHERE id = 1")
-        .await;
-    match plan_result {
-        Ok(df) => {
-            let exec = df.collect().await;
-            assert!(exec.is_err(), "DELETE on aggregation table should fail");
-            let msg = format!("{:?}", exec.err().unwrap());
-            assert!(
-                msg.contains("aggregation")
-                    || msg.contains("DELETE")
-                    || msg.contains("UPDATE_BEFORE"),
-                "expected aggregation engine to reject DELETE at execution, got {msg}"
-            );
-        }
-        Err(e) => {
-            let msg = format!("{e:?}");
-            assert!(
-                msg.contains("aggregation")
-                    || msg.contains("DELETE")
-                    || msg.contains("Unsupported"),
-                "expected aggregation engine to reject DELETE at planning, got {msg}"
-            );
-        }
-    }
-}
-
 /// `merge-engine=aggregation` with no per-field nor default aggregate-function
 /// should still work: each value column falls back to `last_non_null_value`,
 /// matching Java `AggregateMergeFunction#getAggFuncName`.

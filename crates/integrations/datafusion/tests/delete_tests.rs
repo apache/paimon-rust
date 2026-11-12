@@ -455,32 +455,6 @@ async fn test_delete_multiple_rows_from_single_commit() {
 // ======================= Unsupported cases =======================
 
 #[tokio::test]
-async fn test_delete_rejects_primary_key_table() {
-    let (tmp, catalog) = create_test_env();
-    let sql_context = create_sql_context(catalog).await;
-    sql_context
-        .sql("CREATE SCHEMA paimon.test_db")
-        .await
-        .unwrap();
-    sql_context
-        .sql(
-            "CREATE TABLE paimon.test_db.pk_t (\
-                id INT NOT NULL, name VARCHAR, PRIMARY KEY (id)\
-            ) WITH ('bucket' = '1')",
-        )
-        .await
-        .unwrap();
-
-    assert_sql_error(
-        &sql_context,
-        "DELETE FROM paimon.test_db.pk_t WHERE id = 1",
-        "DELETE on primary-key tables is not yet supported",
-    )
-    .await;
-    drop(tmp);
-}
-
-#[tokio::test]
 async fn test_delete_rejects_data_evolution_table_without_deletion_vectors() {
     let (tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog).await;
