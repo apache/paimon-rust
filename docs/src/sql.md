@@ -3550,6 +3550,10 @@ Field-scoped options used by these functions:
   It conflicts with `aggregation.remove-record-on-delete=true`.
 - `fields.<field>.list-agg-delimiter` and `fields.<field>.distinct` for
   `listagg`; `fields.<field>.distinct` also applies to `collect`.
+- `fields.<field>.count-limit` for `collect`: a positive `N` keeps the first
+  `N` elements in aggregation order; a negative `-N` keeps the last `N`. With
+  `distinct=true`, the limit counts distinct elements (first or last
+  occurrence). The default is unlimited.
 - `fields.<field>.sum.fail-on-overflow` / `fields.<field>.product.fail-on-overflow`
   reject integer overflow instead of wrapping. Floating-point addition is
   unaffected; Decimal overflow still yields NULL as in Java.
