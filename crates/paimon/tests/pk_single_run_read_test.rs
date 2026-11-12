@@ -165,3 +165,93 @@ async fn aggregation_reads_disjoint_files_without_merge_and_overlaps_still_merge
         .collect();
     assert_eq!(read(&table, &["id", "v"], None).await, expected);
 }
+
+async fn write_nullable(table: &Table, columns: &[(&str, Vec<Option<i32>>)]) {
+    write_batch(
+        table,
+        &RecordBatch::try_from_iter(columns.iter().map(|(name, values)| {
+            (
+                *name,
+                Arc::new(Int32Array::from(values.clone())) as ArrayRef,
+            )
+        }))
+        .unwrap(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn partial_update_reads_disjoint_files_without_merge_and_overlaps_still_merge() {
+    let table = pk_table_with(
+        "memory:/pk_single_run_read_partial_update",
+        &[("merge-engine", "partial-update")],
+    )
+    .await;
+    write(&table, 0..100, 1000).await;
+    write(&table, 100..200, 1000).await;
+    let expected: Vec<Vec<i32>> = (0..200).map(|id| vec![id, id + 1000]).collect();
+    assert_eq!(read(&table, &["id", "v"], None).await, expected);
+
+    // An overlapping file with a null `v` makes a two-run section, which still
+    // merges and keeps the earlier `v`; a non-null `v` replaces it.
+    write_nullable(
+        &table,
+        &[
+            ("id", (150..160).map(Some).collect()),
+            (
+                "v",
+                (150..160)
+                    .map(|id| (id >= 155).then_some(id + 2000))
+                    .collect(),
+            ),
+        ],
+    )
+    .await;
+    let expected: Vec<Vec<i32>> = (0..200)
+        .map(|id| vec![id, id + if (155..160).contains(&id) { 2000 } else { 1000 }])
+        .collect();
+    assert_eq!(read(&table, &["id", "v"], None).await, expected);
+}
+
+#[tokio::test]
+async fn partial_update_sequence_group_reads_single_runs_without_its_sequence_field() {
+    // `g` orders `v`, so a read of `id, v` also reads `g` and drops it again.
+    let path = "memory:/pk_single_run_read_sequence_group";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("v", DataType::Int(IntType::new()))
+        .column("g", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "partial-update")
+        .option("fields.g.sequence-group", "v")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let rows = |ids: std::ops::Range<i32>, v: i32, g: i32| {
+        [
+            ("id", ids.clone().map(Some).collect::<Vec<_>>()),
+            ("v", ids.clone().map(|id| Some(id + v)).collect()),
+            ("g", ids.map(|_| Some(g)).collect()),
+        ]
+    };
+    write_nullable(&table, &rows(0..100, 1000, 5)).await;
+    write_nullable(&table, &rows(100..200, 1000, 5)).await;
+    let expected: Vec<Vec<i32>> = (0..200).map(|id| vec![id, id + 1000]).collect();
+    assert_eq!(read(&table, &["id", "v"], None).await, expected);
+    assert_eq!(
+        read(&table, &["v", "g"], None).await,
+        (0..200).map(|id| vec![id + 1000, 5]).collect::<Vec<_>>()
+    );
+
+    // Overlapping files still merge: an older `g` leaves `v` alone, a newer one
+    // replaces it.
+    write_nullable(&table, &rows(150..155, 2000, 4)).await;
+    write_nullable(&table, &rows(155..160, 3000, 6)).await;
+    let expected: Vec<Vec<i32>> = (0..200)
+        .map(|id| vec![id, id + if (155..160).contains(&id) { 3000 } else { 1000 }])
+        .collect();
+    assert_eq!(read(&table, &["id", "v"], None).await, expected);
+}
