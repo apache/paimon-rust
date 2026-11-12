@@ -177,9 +177,7 @@ pub(crate) fn new_aggregator(
         "collect" => Ok(Box::new(CollectAgg::new(
             field_name,
             data_type,
-            table_options
-                .get(&format!("fields.{field_name}.distinct"))
-                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            table_options,
         )?)),
         "merge_map" => Ok(Box::new(MergeMapAgg::new(field_name, data_type)?)),
         "merge_map_with_keytime" => Ok(Box::new(MergeMapAgg::new_with_keytime(
