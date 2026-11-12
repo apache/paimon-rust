@@ -29,8 +29,9 @@ use paimon::table::{CopyOnWriteMergeWriter, Table};
 use crate::error::to_datafusion_error;
 use crate::merge_into::TempTableTracker;
 use crate::merge_into::{
-    build_partition_set_from_where, extract_tracking_columns, is_delete_conflict,
-    is_row_id_conflict, ok_result, register_cow_target_table, retry_on_conflict,
+    build_dml_selection_clause, build_partition_set_from_where, extract_tracking_columns,
+    is_delete_conflict, is_row_id_conflict, ok_result, register_cow_target_table,
+    retry_on_conflict,
 };
 use crate::sql_context::SQLContext;
 
@@ -94,11 +95,12 @@ async fn execute_data_evolution_delete_once(
     let wb = table.new_write_builder();
     let mut writer = wb.new_delete().map_err(to_datafusion_error)?;
 
-    let where_clause = match &delete.selection {
-        Some(expr) => format!(" WHERE {expr}"),
-        None => String::new(),
-    };
-    let query_sql = format!("SELECT \"_ROW_ID\" FROM {table_ref}{where_clause}");
+    let selection_clause = build_dml_selection_clause(
+        delete.selection.as_ref(),
+        &delete.order_by,
+        delete.limit.as_ref(),
+    );
+    let query_sql = format!("SELECT \"_ROW_ID\" FROM {table_ref}{selection_clause}");
     let batches = ctx.ctx().sql(&query_sql).await?.collect().await?;
 
     let total_count: u64 = batches.iter().map(|batch| batch.num_rows() as u64).sum();
@@ -182,14 +184,15 @@ async fn execute_cow_delete_inner(
     delete: &Delete,
     writer: &mut CopyOnWriteMergeWriter,
 ) -> DFResult<u64> {
-    let where_clause = match &delete.selection {
-        Some(expr) => format!(" WHERE {expr}"),
-        None => String::new(),
-    };
+    let selection_clause = build_dml_selection_clause(
+        delete.selection.as_ref(),
+        &delete.order_by,
+        delete.limit.as_ref(),
+    );
 
-    // Safety: where_clause comes from sqlparser AST to_string(), not raw user input.
+    // Selection clauses are rendered from the sqlparser AST.
     let query_sql = format!(
-        "SELECT \"__paimon_file_idx\", \"__paimon_row_offset\" FROM {cow_table_name}{where_clause}"
+        "SELECT \"__paimon_file_idx\", \"__paimon_row_offset\" FROM {cow_table_name}{selection_clause}"
     );
     let batches = ctx.sql(&query_sql).await?.collect().await?;
 

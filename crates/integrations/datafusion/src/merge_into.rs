@@ -49,6 +49,7 @@ use datafusion::physical_expr::{expressions::Column as PhysicalColumn, PhysicalE
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan};
 use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, OrderByExpr};
 use futures::TryStreamExt;
 
 use paimon::spec::{datums_to_binary_row, extract_datum_from_arrow, CoreOptions, DataField};
@@ -1161,6 +1162,31 @@ pub(crate) fn build_partition_set_from_batches(
     }
 
     Ok(Some(partition_set))
+}
+
+/// Preserve DML row selection in the internal SELECT so filtering, global sorting,
+/// and limiting finish before any selected rows are passed to the writer.
+pub(crate) fn build_dml_selection_clause(
+    selection: Option<&SqlExpr>,
+    order_by: &[OrderByExpr],
+    limit: Option<&SqlExpr>,
+) -> String {
+    let mut clause = String::new();
+    if let Some(selection) = selection {
+        clause.push_str(&format!(" WHERE {selection}"));
+    }
+    if !order_by.is_empty() {
+        let order_by = order_by
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        clause.push_str(&format!(" ORDER BY {order_by}"));
+    }
+    if let Some(limit) = limit {
+        clause.push_str(&format!(" LIMIT {limit}"));
+    }
+    clause
 }
 
 /// Query a table for distinct partition values matching an optional WHERE clause.
