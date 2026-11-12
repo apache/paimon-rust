@@ -132,12 +132,26 @@ impl VariantFloat32Projection {
         let layout = object_layout(value, 0)?;
         offsets.clear();
         offsets.reserve(layout.size + 1);
-        for index in 0..=layout.size {
-            offsets.push(read_unsigned(
-                value,
-                layout.offset_start + layout.offset_size * index,
-                layout.offset_size,
-            )?);
+        // object_layout has validated the complete offset table.
+        let bytes = &value[layout.offset_start..layout.data_start];
+        match layout.offset_size {
+            1 => offsets.extend(bytes.iter().map(|byte| *byte as usize)),
+            2 => offsets.extend(
+                bytes
+                    .chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize),
+            ),
+            3 => offsets.extend(
+                bytes
+                    .chunks_exact(3)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], 0]) as usize),
+            ),
+            4 => offsets.extend(
+                bytes
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize),
+            ),
+            _ => unreachable!("object_layout only accepts offset widths 1 through 4"),
         }
         let data_size = offsets[layout.size];
         if layout.data_start.checked_add(data_size) != Some(value.len()) {
@@ -291,6 +305,113 @@ fn numeric_to_float32(value: VariantRef<'_>, field: &str) -> Result<Option<f32>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projects_all_offset_widths_and_rejects_corruption() {
+        for json in [r#"{}"#, r#"{"a":1,"b":2}"#] {
+            let variant = GenericVariant::parse_json(json).unwrap();
+            let original = variant.value();
+            let layout = object_layout(original, 0).unwrap();
+            let expected_offsets: Vec<_> = (0..=layout.size)
+                .map(|i| {
+                    read_unsigned(
+                        original,
+                        layout.offset_start + i * layout.offset_size,
+                        layout.offset_size,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            for width in 1..=4 {
+                let mut value = original[..layout.offset_start].to_vec();
+                value[0] =
+                    (value[0] & !(3 << BASIC_TYPE_BITS)) | ((width as u8 - 1) << BASIC_TYPE_BITS);
+                for offset in &expected_offsets {
+                    value.extend_from_slice(&(*offset as u32).to_le_bytes()[..width]);
+                }
+                let data_start = value.len();
+                value.extend_from_slice(&original[layout.data_start..]);
+                validate_payload(&value, variant.metadata()).unwrap();
+                let fields = vec!["a".to_string(), "b".to_string(), "missing".to_string()];
+                let mut projection =
+                    VariantFloat32Projection::new(variant.metadata(), &fields).unwrap();
+                let mut offsets = Vec::new();
+                let mut output = vec![None; fields.len()];
+                let expected = if layout.size == 0 {
+                    vec![None; 3]
+                } else {
+                    vec![Some(1.0), Some(2.0), None]
+                };
+                for _ in 0..2 {
+                    projection
+                        .extract_float32(&value, variant.metadata(), &mut offsets, &mut output)
+                        .unwrap();
+                    assert_eq!(offsets, expected_offsets);
+                    assert_eq!(output, expected);
+                    projection
+                        .extract_float32_cast(
+                            &value,
+                            variant.metadata(),
+                            &[true; 3],
+                            &mut offsets,
+                            &mut output,
+                        )
+                        .unwrap();
+                    assert_eq!(output, expected);
+                }
+                for end in layout.offset_start..data_start {
+                    assert!(projection
+                        .extract_float32(
+                            &value[..end],
+                            variant.metadata(),
+                            &mut offsets,
+                            &mut output
+                        )
+                        .is_err());
+                }
+                let mut trailing = value.clone();
+                trailing.push(0);
+                assert!(projection
+                    .extract_float32(&trailing, variant.metadata(), &mut offsets, &mut output)
+                    .is_err());
+                let mut oversized = value.clone();
+                let sentinel = 0x8765_4321_u32 >> ((4 - width) * 8);
+                write_le_at(
+                    &mut oversized,
+                    layout.offset_start + layout.size * width,
+                    sentinel as usize,
+                    width,
+                );
+                assert!(projection
+                    .extract_float32(&oversized, variant.metadata(), &mut offsets, &mut output)
+                    .is_err());
+                assert_eq!(offsets[layout.size], sentinel as usize);
+                if layout.size > 0 {
+                    assert!(projection
+                        .extract_float32(
+                            &value[..value.len() - 1],
+                            variant.metadata(),
+                            &mut offsets,
+                            &mut output
+                        )
+                        .is_err());
+                    write_le_at(&mut value, layout.offset_start, expected_offsets[1], width);
+                    write_le_at(&mut value, layout.offset_start + width, 0, width);
+                    for _ in 0..2 {
+                        projection
+                            .extract_float32(&value, variant.metadata(), &mut offsets, &mut output)
+                            .unwrap();
+                        assert_eq!(output, vec![Some(2.0), Some(1.0), None]);
+                    }
+                    write_le_at(&mut value, layout.offset_start, 0, width);
+                    write_le_at(&mut value, layout.offset_start + width, 0, width);
+                    assert!(projection
+                        .extract_float32(&value, variant.metadata(), &mut offsets, &mut output)
+                        .is_err());
+                }
+            }
+        }
+    }
 
     #[test]
     fn handles_non_monotonic_object_offsets() {
