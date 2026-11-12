@@ -400,6 +400,10 @@ options.set(CatalogOptions::DLF_TOKEN_PATH, "/path/to/token.json");
 
 The JSON uses `AccessKeyId`, `AccessKeySecret`, optional `SecurityToken`, and
 optional `Expiration`. Expiring credentials are reloaded before expiration.
+For DLF authentication (`token.provider=dlf`), `DLF_TOKEN_PATH` provides a
+fallback path when no token loader, token path, or inline AK/STS credentials are
+configured. The same loader and refresh behavior apply. Unset or empty
+environment values are ignored.
 
 With `storage-jindo`, set `fs.oss.impl` to `jindo` to use an installed JindoSDK
 for OSS scan planning. Set `fs.jindo.library.path` unless the library is
