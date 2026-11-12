@@ -918,10 +918,10 @@ The table type determines which row-level DML operations are supported:
 | `TRUNCATE TABLE` | Supported | Supported | Supported |
 | `ALTER TABLE ... DROP PARTITION` | Supported for partitioned tables | Supported for partitioned tables | Supported for partitioned tables |
 | `UPDATE` | Supported via Copy-on-Write | Not supported | Supported via row-id update |
-| `DELETE` | Supported via Copy-on-Write | Not supported | Supported when deletion vectors are enabled |
+| `DELETE` | Supported via Copy-on-Write | Supported for [eligible `deduplicate` tables](#delete) | Supported when deletion vectors are enabled |
 | `MERGE INTO` | Supported via Copy-on-Write | Not supported | Supported for matched `UPDATE`, matched `DELETE` with deletion vectors, and not-matched `INSERT` |
 
-A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. `DELETE` and matched `DELETE` in `MERGE INTO` additionally require `'deletion-vectors.enabled' = 'true'`. Primary-key row-level `UPDATE`, `DELETE`, and `MERGE INTO` are not supported even when data evolution is enabled.
+A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. `DELETE` and matched `DELETE` in `MERGE INTO` additionally require `'deletion-vectors.enabled' = 'true'`. Primary-key row-level `UPDATE` and `MERGE INTO` are not supported.
 
 ### INSERT INTO
 
@@ -1008,7 +1008,46 @@ DELETE FROM paimon.my_db.t WHERE name = 'b';
 
 For data-evolution row-tracking tables without primary keys, deletes are executed via deletion vectors and require `'deletion-vectors.enabled' = 'true'`.
 
-`DELETE` is not supported on primary-key tables.
+Primary-key tables using `merge-engine=deduplicate` with data evolution disabled
+support `DELETE` by writing tombstones for the logical rows matching the
+predicate. `DELETE` without `WHERE` targets every row in the captured read
+snapshot. A delete with no matches returns zero without publishing a snapshot.
+
+The target and its live self-references, including those through views, use one
+captured snapshot and merge uncompacted primary-key versions before applying
+predicates. On deletion-vector tables this applies even when
+`deletion-vectors.merge-on-read` is disabled. Ordinary queries retain their
+configured read behavior. Explicitly historical and incremental views retain
+their selected snapshots or timestamp windows and configured read behavior.
+DELETE targets cannot use time-travel or incremental read options.
+
+The target and its live self-references must use the table's configured merge
+engine, sequence fields, sort order, bucket count, bucket keys and bucket
+function. Conflicting session options or options captured by a view are rejected
+before scanning, as are overrides that enable or disable deletion vectors or
+data evolution, or change row-kind handling or query authorization. Read tuning
+options, such as `read.batch-size`, remain supported.
+
+Tombstones preserve configured sequence values and sort order, so
+concurrent upserts follow the normal primary-key merge rules. With the default
+ascending order, a higher-sequence upsert survives; without a sequence field,
+normal write ordering applies. This does not provide serializable predicate
+deletion.
+
+The affected-row count reports logical rows matching the predicate in the
+captured snapshot. It includes keys whose concurrent upserts survive under the
+merge rules above.
+
+Publication retries reuse prepared files without rescanning. Repeating the SQL
+statement scans a new snapshot and is a new operation. A commit error does not
+necessarily mean that the deletion was rolled back. Prepared files are retained
+on publication errors; the error identifies the table and commit user for
+investigating an uncertain outcome.
+
+Other primary-key merge engines, `ignore-delete=true` (including its fallback
+options), `rowkind.field`, query-authorized primary-key tables, aliases,
+multi-target/join deletes, `USING`, `RETURNING`, `ORDER BY`, `LIMIT`, `OUTPUT`, and
+target table modifiers are not supported by this path.
 
 ### MERGE INTO
 
