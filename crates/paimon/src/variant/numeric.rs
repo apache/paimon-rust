@@ -138,17 +138,23 @@ impl VariantFloat32Projection {
             1 => offsets.extend(bytes.iter().map(|byte| *byte as usize)),
             2 => offsets.extend(
                 bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize),
             ),
             3 => offsets.extend(
                 bytes
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|b| u32::from_le_bytes([b[0], b[1], b[2], 0]) as usize),
             ),
             4 => offsets.extend(
                 bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize),
             ),
             _ => unreachable!("object_layout only accepts offset widths 1 through 4"),
