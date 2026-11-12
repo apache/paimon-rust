@@ -40,7 +40,7 @@ const BLOB_VIEW_FIELD_DIRECTIVE: &str = "__BLOB_VIEW_FIELD";
 /// The table schema for paimon table.
 ///
 /// Impl References: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/schema/TableSchema.java#L47>
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableSchema {
     /// version of schema for paimon
@@ -53,6 +53,57 @@ pub struct TableSchema {
     options: HashMap<String, String>,
     comment: Option<String>,
     time_millis: i64,
+}
+
+impl<'de> Deserialize<'de> for TableSchema {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Java SchemaSerializer interprets missing versions as Paimon 0.7,
+        // whose bucket and file-format defaults differ from current tables.
+        fn legacy_version() -> i32 {
+            1
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct StoredSchema {
+            #[serde(default = "legacy_version")]
+            version: i32,
+            id: i64,
+            fields: Vec<DataField>,
+            highest_field_id: i32,
+            partition_keys: Vec<String>,
+            primary_keys: Vec<String>,
+            options: HashMap<String, String>,
+            comment: Option<String>,
+            #[serde(default)]
+            time_millis: i64,
+        }
+
+        let stored = StoredSchema::deserialize(deserializer)?;
+        let mut options = stored.options;
+        if stored.version <= 1 {
+            options.entry("bucket".into()).or_insert_with(|| "1".into());
+        }
+        if stored.version <= 2 {
+            options
+                .entry("file.format".into())
+                .or_insert_with(|| "orc".into());
+        }
+        Ok(Self {
+            version: stored.version,
+            id: stored.id,
+            fields: stored.fields,
+            highest_field_id: stored.highest_field_id,
+            partition_keys: stored.partition_keys,
+            primary_keys: stored.primary_keys,
+            options,
+            comment: stored.comment,
+            time_millis: stored.time_millis,
+        })
+    }
 }
 
 impl TableSchema {
@@ -2705,6 +2756,73 @@ mod tests {
     };
 
     use super::*;
+
+    fn schema_json_with_version(version: Option<i32>) -> serde_json::Value {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let mut json = serde_json::to_value(TableSchema::new(0, &schema)).unwrap();
+        match version {
+            Some(version) => json["version"] = serde_json::json!(version),
+            None => {
+                json.as_object_mut().unwrap().remove("version");
+            }
+        }
+        json
+    }
+
+    #[test]
+    fn legacy_schema_defaults_follow_java_version_boundaries() {
+        for (version, bucket, format) in [
+            (None, 1, "orc"),
+            (Some(1), 1, "orc"),
+            (Some(2), -1, "orc"),
+            (Some(3), -1, "parquet"),
+            (Some(4), -1, "parquet"),
+        ] {
+            let schema: TableSchema =
+                serde_json::from_value(schema_json_with_version(version)).unwrap();
+            assert_eq!(schema.version(), version.unwrap_or(1));
+            assert_eq!(schema.core_options().bucket(), bucket);
+            assert_eq!(schema.core_options().file_format(), format);
+            let restored: TableSchema =
+                serde_json::from_str(&serde_json::to_string(&schema).unwrap()).unwrap();
+            assert_eq!(restored, schema);
+        }
+    }
+
+    #[test]
+    fn legacy_schema_defaults_preserve_explicit_options() {
+        for version in [None, Some(1), Some(2), Some(3)] {
+            let mut json = schema_json_with_version(version);
+            json["options"] = serde_json::json!({"bucket": "8", "file.format": "parquet"});
+            let schema: TableSchema = serde_json::from_value(json).unwrap();
+            assert_eq!(schema.core_options().bucket(), 8);
+            assert_eq!(schema.core_options().file_format(), "parquet");
+        }
+    }
+
+    #[test]
+    fn legacy_schema_accepts_missing_creation_time() {
+        let mut json = schema_json_with_version(None);
+        json.as_object_mut().unwrap().remove("timeMillis");
+        let schema: TableSchema = serde_json::from_value(json).unwrap();
+        assert_eq!(schema.time_millis(), 0);
+    }
+
+    #[test]
+    fn legacy_schema_rejects_malformed_explicit_version() {
+        for version in [
+            serde_json::Value::Null,
+            serde_json::json!("1"),
+            serde_json::json!(1.5),
+        ] {
+            let mut json = schema_json_with_version(None);
+            json["version"] = version;
+            assert!(serde_json::from_value::<TableSchema>(json).is_err());
+        }
+    }
 
     fn build_index_test_schema(
         columns: Vec<(&str, DataType)>,
