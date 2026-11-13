@@ -187,6 +187,21 @@ async fn all_id_values(table: &Table) -> Vec<(i32, i32)> {
     rows
 }
 
+async fn active_files(table: &Table) -> Vec<paimon::spec::DataFileMeta> {
+    table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .unwrap()
+        .splits()
+        .iter()
+        .flat_map(|split| split.data_files())
+        .cloned()
+        .collect()
+}
+
 #[tokio::test]
 async fn expire_filters_int_seconds_after_compact_but_not_before() {
     let table = table_with_schema(expire_schema(
@@ -400,6 +415,119 @@ async fn expire_plus_clustering_still_rejected() {
         Err(error) => error.to_string(),
     };
     assert!(err.contains("pk-clustering-override"));
+}
+
+/// Fully expired max-level files must be rewritten with empty output and retired.
+///
+/// Seed without expire so `ts=1` survives the first compact; then enable
+/// `record-level.expire-time=1 s` (deterministic: any wall clock after epoch
+/// second 2 treats `ts=1` as expired). Universal picks nothing for a lone
+/// max-level run; expire-only rewrite must drop every record, emit no data
+/// files, and remove the inputs from the committed Snapshot/Manifest.
+#[tokio::test]
+async fn expire_only_max_level_rewrite_retires_fully_expired_files() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("ts", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "deduplicate")
+        .option("num-sorted-run.compaction-trigger", "2")
+        .build()
+        .unwrap();
+    let table = table_with_schema(TableSchema::new(0, &schema)).await;
+
+    // ts=1 is far in the past once expire-time is enabled; keep it live for seeding.
+    write_batch(
+        &table,
+        &int_batch(vec![1, 2], vec![Some(1), Some(1)], vec![10, 20]),
+    )
+    .await;
+    let seed = table.new_compact_builder();
+    let seed_plan = seed.new_planner().unwrap().plan().await.unwrap();
+    assert!(!seed_plan.tasks().is_empty());
+    let seeded = execute(&table, &seed_plan).await;
+    seed.new_commit()
+        .unwrap()
+        .commit_compact(seeded.clone())
+        .await
+        .unwrap();
+    assert!(!seeded[0].files().is_empty());
+    let max_level = seeded[0].files()[0].level;
+    assert!(
+        max_level > 0,
+        "seed compact must materialize positive-level history, got level {max_level}"
+    );
+    assert!(seeded[0].files().iter().all(|file| file.level == max_level));
+    let expired_inputs = seeded[0].files().to_vec();
+    assert_eq!(id_values(&table).await, vec![(1, 10), (2, 20)]);
+
+    let table = table.copy_with_options(std::collections::HashMap::from([
+        ("record-level.expire-time".into(), "1 s".into()),
+        ("record-level.time-field".into(), "ts".into()),
+    ]));
+    let ts_field = table
+        .schema()
+        .fields()
+        .iter()
+        .find(|field| field.name() == "ts")
+        .unwrap();
+    for file in &expired_inputs {
+        let stats = file
+            .value_stats_for_field(table.schema().id(), table.schema().fields(), ts_field)
+            .expect("seeded max-level file must expose ts stats for expire selection");
+        assert_eq!(stats.min_value, Some(paimon::spec::Datum::Int(1)));
+        assert_eq!(stats.max_value, Some(paimon::spec::Datum::Int(1)));
+    }
+
+    let builder = table.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    assert_eq!(plan.tasks().len(), 1, "expected a single expire-only rewrite task");
+    let task = &plan.tasks()[0];
+    assert!(
+        task.files().iter().all(|file| file.level == max_level),
+        "expire-only rewrite must select only max-level inputs"
+    );
+    let selected: std::collections::HashSet<_> =
+        task.files().iter().map(|file| file.file_name.as_str()).collect();
+    for file in &expired_inputs {
+        assert!(
+            selected.contains(file.file_name.as_str()),
+            "planner must select seeded expired file {}",
+            file.file_name
+        );
+    }
+
+    let results = execute(&table, &plan).await;
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].files().is_empty(),
+        "all-expired rewrite must emit no data files"
+    );
+    builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap();
+
+    let active = active_files(&table).await;
+    for file in &expired_inputs {
+        assert!(
+            active
+                .iter()
+                .all(|alive| alive.file_name != file.file_name),
+            "expired input {} must be retired from the committed snapshot",
+            file.file_name
+        );
+    }
+    assert!(
+        active.is_empty(),
+        "no residual data files expected after retiring fully expired max-level inputs"
+    );
+    assert!(id_values(&table).await.is_empty());
+    assert!(all_id_values(&table).await.is_empty());
 }
 
 async fn lookup_compact(table: &Table) -> i64 {
