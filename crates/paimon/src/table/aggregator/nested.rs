@@ -743,6 +743,47 @@ mod tests {
         );
     }
 
+    /// Java `CoreOptions.fieldNestedUpdateAggCountLimit` defaults to
+    /// `Integer.MAX_VALUE`, accepts any `int` (including 0 / negative), and
+    /// rejects non-int strings / out-of-range values. NestedUpdate treats a
+    /// non-positive limit as "admit no rows" (`size < limit` / `count >=
+    /// remainSize`), so Rust's `max(0)` clamp matches Java results without
+    /// adopting CollectAgg's negative-limit semantics.
+    #[test]
+    fn nested_update_count_limit_config_matches_java_int_option() {
+        let (data_type, input) = input();
+
+        let mut unlimited =
+            NestedAgg::new("nested_update", "items", &data_type, &HashMap::new()).unwrap();
+        unlimited.agg(&input, 0).unwrap();
+        assert_eq!(result_rows(&unlimited).0, vec![Some(1), Some(2)]);
+
+        for limit in ["0", "-1", "-3"] {
+            let options = HashMap::from([("fields.items.count-limit".into(), limit.into())]);
+            let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options)
+                .unwrap_or_else(|err| panic!("count-limit={limit} should construct: {err:?}"));
+            agg.agg(&input, 0).unwrap();
+            assert_eq!(
+                result_rows(&agg).0,
+                Vec::<Option<i32>>::new(),
+                "count-limit={limit} must admit no nested rows"
+            );
+        }
+
+        for invalid in ["abc", "1.5", "", " 2 ", "2147483648", "-2147483649"] {
+            let options = HashMap::from([("fields.items.count-limit".into(), invalid.into())]);
+            let err = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::ConfigInvalid { ref message }
+                        if message.contains("count-limit") && message.contains(invalid)
+                ),
+                "count-limit={invalid:?} should be ConfigInvalid, got {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn nested_reverse_keeps_raw_older_accumulator_beyond_count_limit() {
         let (data_type, input) = input();
