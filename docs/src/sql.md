@@ -3559,6 +3559,20 @@ Field-scoped options used by these functions:
   `fields.<field>.nested-key-null-strategy`, and `fields.<field>.count-limit`
   for nested array aggregators. `nested_partial_update` requires
   `nested-key`.
+- `fields.<field>.count-limit` also applies to `collect`, see below.
+
+`collect` supports `fields.<field>.distinct` and `fields.<field>.count-limit`.
+A positive limit `N` keeps the first `N` elements in merge order, a negative
+limit `-N` keeps the last `N`, and `0` keeps none. There is no limit by
+default. With `distinct=true`, the limit counts distinct elements: a positive
+limit keeps the first occurrence of each element and a negative limit keeps the
+last, both in their original order. For example, merging rows `[1, 2]` and
+`[1, 3]` of one key with `distinct=true` gives `[1, 2]` for `count-limit=2` and
+`[1, 3]` for `count-limit=-2`. Both options apply when two or more rows of the
+same key are merged, including in write-buffer flushes and compaction, and the
+merged array is what gets written to data files. As in Java, a key with only
+one row keeps the array it was written with until another row of that key
+arrives or, with `changelog-producer=lookup`, until it is compacted.
 
 `DELETE` / `UPDATE_BEFORE` rows are fed to each field aggregator's retract path
 (`AggregateMergeFunction`), except that

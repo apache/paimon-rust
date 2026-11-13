@@ -103,12 +103,6 @@ pub(crate) trait FieldAggregator: Send + Sync + std::fmt::Debug {
     /// silently fall back to forward accumulation.
     fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()>;
 
-    /// Reverse through Java's default `agg(input, accumulator)` behavior.
-    /// Wrappers use this instead of a wrapped function's optional override.
-    fn agg_reversed_via_agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        self.agg_reversed(array, row_idx)
-    }
-
     /// Apply a DELETE / UPDATE_BEFORE cell. Java's default implementation
     /// rejects retracts unless the field uses `ignore-retract=true`.
     fn retract(&mut self, _array: &dyn Array, _row_idx: usize) -> crate::Result<()> {
@@ -180,6 +174,15 @@ pub(crate) fn new_aggregator(
             table_options
                 .get(&format!("fields.{field_name}.distinct"))
                 .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            table_options
+                .get(&format!("fields.{field_name}.count-limit"))
+                .map(|value| {
+                    value.parse::<i32>().map_err(|_| crate::Error::ConfigInvalid {
+                        message: format!("Invalid collect count-limit '{value}'"),
+                    })
+                })
+                .transpose()?
+                .unwrap_or(i32::MAX),
         )?)),
         "merge_map" => Ok(Box::new(MergeMapAgg::new(field_name, data_type)?)),
         "merge_map_with_keytime" => Ok(Box::new(MergeMapAgg::new_with_keytime(
@@ -243,10 +246,9 @@ impl FieldAggregator for IgnoreRetractAgg {
         self.0.replace_with_delete(array, row_idx)
     }
     fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        // Java FieldIgnoreRetractAgg inherits FieldAggregator#aggReversed,
-        // which invokes wrapper.agg(input, accumulator). Keep the wrapped
-        // function's state (notably first_value's initialized flag).
-        self.0.agg_reversed_via_agg(array, row_idx)
+        // Java FieldIgnoreRetractAgg delegates aggReversed to the wrapped
+        // function (apache/paimon#10540).
+        self.0.agg_reversed(array, row_idx)
     }
     fn retract(&mut self, _array: &dyn Array, _row_idx: usize) -> crate::Result<()> {
         Ok(())
