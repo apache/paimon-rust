@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 
 use super::data_file_index_writer::FileIndexOptions;
 use super::data_file_writer::DataFileWriter;
+use super::managed_blob_writer::managed_blob_fields;
 use super::partition_filter::{validate_partition_filter, PartitionFilter};
 use super::snapshot_manifest::read_snapshot_entries;
 use super::write_builder::{ensure_table_write_authorized, validate_commit_user};
@@ -41,7 +42,7 @@ use super::{DataSplit, Plan, Table, TableCommit, TableScan};
 use crate::resource::ResourceContext;
 use crate::spec::{
     bucket_path_under, BinaryRow, ChangelogProducer, DataFileMeta, FileKind, IndexManifest,
-    IndexManifestEntry, ManifestEntry, MergeEngine, PartitionComputer, Predicate, Snapshot,
+    IndexManifestEntry, ManifestEntry, MergeEngine, PartitionComputer, Predicate, Schema, Snapshot,
     TableSchema,
 };
 use crate::{Error, Result};
@@ -1174,6 +1175,15 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
         data_evolution::ensure_supported(table)?;
         return options.validate_data_file_path_directory();
     }
+    let managed_blob_enabled = !table.schema().primary_keys().is_empty()
+        && !managed_blob_fields(table.schema().fields(), &options).is_empty();
+    if managed_blob_enabled {
+        Schema::validate_primary_key_blob_configuration(
+            table.schema().fields(),
+            table.schema().primary_keys(),
+            properties,
+        )?;
+    }
     if table.schema().primary_keys().is_empty()
         && options.bucket() > 0
         && !properties
@@ -1205,12 +1215,13 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
         || options.data_evolution_enabled()
         || (options.deletion_vectors_enabled() && table.schema().primary_keys().is_empty())
         || options.query_auth_enabled()
-        || !options.blob_fields().is_empty()
-        || table
-            .schema()
-            .fields()
-            .iter()
-            .any(|field| field.data_type().is_blob_file_field())
+        || (!managed_blob_enabled
+            && (!options.blob_fields().is_empty()
+                || table
+                    .schema()
+                    .fields()
+                    .iter()
+                    .any(|field| field.data_type().is_blob_file_field())))
         || options.vector_file_format().is_some()
         || options.rowkind_field().is_some()
         || options.bucket() < -1

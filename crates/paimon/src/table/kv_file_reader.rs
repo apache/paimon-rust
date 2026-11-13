@@ -27,9 +27,10 @@
 
 use super::data_file_reader::{file_index_selection_to_local_ranges, DataFileReader};
 use super::sort_merge::{
-    schema_with_level, with_level, AggregateMergeFunction, DeduplicateMergeFunction,
-    FirstRowMergeFunction, LookupMergeFunction, MergeFunction, PartialUpdateMergeFunction,
-    QueryReducerMergeFunction, SortMergeReaderBuilder, CHANGELOG_BATCH_METADATA_KEY,
+    reduces_singletons, schema_with_level, with_level, AggregateMergeFunction,
+    DeduplicateMergeFunction, FirstRowMergeFunction, LookupMergeFunction, MergeFunction,
+    PartialUpdateMergeFunction, QueryReducerMergeFunction, SortMergeReaderBuilder,
+    CHANGELOG_BATCH_METADATA_KEY,
 };
 use crate::arrow::format::MosaicPrefetchOptions;
 use crate::arrow::shredding::variant::assemble_variant_extraction_array;
@@ -909,16 +910,21 @@ impl KeyValueFileReader {
                     let mut file_streams: Vec<ArrowRecordBatchStream> = Vec::new();
                     // One sorted run should not repeat a key, so under these
                     // engines every key is a lone version and needs no merge.
+                    // Aggregation returns a lone version as is too, unless the
+                    // lookup changelog producer makes it reduce singletons.
                     // Retract rows are still dropped per batch below: older Rust
                     // writers recorded `delete_row_count = 0` for files holding
                     // them.
                     let skip_merge = skip_single_runs
                         && lookup.is_none()
                         && input_stream_count == 1
-                        && matches!(
-                            config.merge_engine,
-                            MergeEngine::Deduplicate | MergeEngine::FirstRow
-                        );
+                        && match config.merge_engine {
+                            MergeEngine::Deduplicate | MergeEngine::FirstRow => true,
+                            MergeEngine::Aggregation => {
+                                !reduces_singletons(&config.table_options)
+                            }
+                            _ => false,
+                        };
                     let reject_retracts = config.merge_engine == MergeEngine::FirstRow
                         && !CoreOptions::new(&config.table_options).ignore_delete();
 
@@ -3075,6 +3081,7 @@ mod tests {
                 vec![("merge-engine", "first-row"), ("ignore-delete", "true")],
                 Some(vec![1, 2]),
             ),
+            (vec![("merge-engine", "aggregation")], Some(vec![1, 2])),
         ] {
             let table_path = "memory:/kv_legacy_retract";
             let table = pk_table(&file_io, table_path, &options);
@@ -3260,6 +3267,37 @@ mod tests {
         let batches = read_kv_split(&table, split).await;
         assert_eq!(int_column(&batches, "id"), vec![1, 2]);
         assert_eq!(int_column(&batches, "value"), vec![11, 20]);
+    }
+
+    #[tokio::test]
+    async fn single_run_read_merges_repeated_keys_under_aggregation() {
+        // A file from before #839 can repeat a key under aggregation.
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_repeated_keys_aggregation";
+        let table = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("merge-engine", "aggregation"),
+                ("fields.value.aggregate-function", "sum"),
+            ],
+        );
+        write_schema_file(&table, table.schema()).await;
+        let a =
+            write_kv_versions(&file_io, table_path, "a.parquet", &[(1, 0, 10), (1, 1, 11)]).await;
+        let b = write_kv_versions(&file_io, table_path, "b.parquet", &[(2, 2, 20)]).await;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![a, b])
+            .build()
+            .unwrap();
+        let batches = read_kv_split(&table, split).await;
+        assert_eq!(int_column(&batches, "id"), vec![1, 2]);
+        assert_eq!(int_column(&batches, "value"), vec![21, 20]);
     }
 
     #[tokio::test]

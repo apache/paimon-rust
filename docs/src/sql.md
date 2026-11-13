@@ -1459,10 +1459,16 @@ CALL sys.create_tag(
 );
 ```
 
-When `time_retained` is specified, retention and tag creation time are persisted in
-the tag file. For example, `'1d'` appears as `PT24H` in the `time_retained` column
-of `$tags`. Omitting `time_retained` creates a tag without these metadata fields.
-This procedure does not automatically delete expired tags.
+For filesystem-managed tables, specifying `time_retained` persists retention and
+tag creation time in the tag file. For example, `'1d'` appears as `PT24H` in the
+`time_retained` column of `$tags`. Omitting `time_retained` creates a tag without
+these metadata fields. This procedure does not automatically delete expired tags.
+
+For tables managed by a REST catalog, the tag is created through the catalog:
+`snapshot_id` and `time_retained` are forwarded unchanged, and the server resolves
+the snapshot (the latest one when `snapshot_id` is omitted), validates retention,
+and stores the tag. The table's `tag/` directory is not read or written. An
+existing tag name fails with `Tag '...' already exists`, as for other tables.
 
 ### replace_tag
 
@@ -1513,6 +1519,10 @@ Create a named tag from an epoch timestamp in milliseconds (finds the earliest r
 CALL sys.create_tag_from_timestamp(table => 'paimon.my_db.my_table', tag => 'my_tag', timestamp => 1234567890000);
 ```
 
+This procedure is not supported for tables managed by a REST catalog. Their
+snapshots may exist only in the catalog, while timestamp selection currently
+relies on stored snapshot files.
+
 ### create_tag_from_watermark
 
 This procedure is not supported for tables managed by a REST catalog. Their
@@ -1554,6 +1564,23 @@ Delete a named tag:
 CALL sys.delete_tag(table => 'paimon.my_db.my_table', tag => 'my_tag');
 ```
 
+`tag` accepts a comma-separated list. Each name is trimmed, empty names are
+skipped, and missing tags are ignored. For tables managed by a REST catalog,
+each tag is deleted through the catalog, and the table's `tag/` directory is not
+read or written. Any other error stops the batch; earlier deletions are not
+rolled back.
+
+### rename_tag
+
+Rename a tag:
+
+```sql
+CALL sys.rename_tag(table => 'paimon.my_db.my_table', tag => 'old_tag', target_tag => 'new_tag');
+```
+
+The source tag must exist and the target tag must not. This procedure is not
+supported for tables managed by a REST catalog, which has no tag-rename endpoint.
+
 ### rollback_to
 
 Rollback a table to a specific snapshot or tag:
@@ -1573,6 +1600,10 @@ Rollback a table to an epoch timestamp in milliseconds (selects the latest retai
 ```sql
 CALL sys.rollback_to_timestamp(table => 'paimon.my_db.my_table', timestamp => 1234567890000);
 ```
+
+This procedure is not supported for tables managed by a REST catalog, for the
+same reason as `create_tag_from_timestamp`. Use `rollback_to` with an explicit
+`snapshot_id` or `tag` instead.
 
 Both timestamp procedures take epoch milliseconds. The `$snapshots.commit_time`
 column is a local `TIMESTAMP`; its raw Arrow value includes the local timezone
@@ -2898,7 +2929,16 @@ Use a quoted tag name with `VERSION AS OF`:
 SELECT * FROM paimon.default.my_table VERSION AS OF 'my_tag';
 ```
 
-Resolution order: first checks if a tag with that name exists, then tries to parse it as a snapshot ID.
+Resolution order: first resolves a tag with that name, then tries
+`watermark-<value>` or a numeric snapshot ID.
+
+For tables managed by a REST catalog, tags named by `VERSION AS OF` or
+`scan.tag-name` are resolved through the catalog; tag files in table storage are
+ignored. Legacy tags named `.` or `..` cannot be resolved through the REST API.
+If the tag endpoint returns HTTP 501, `scan.version` (including `VERSION AS OF`)
+can still resolve a numeric snapshot ID or `watermark-<value>` from stored
+snapshots. `scan.tag-name` always requires the tag endpoint, including for
+numeric tag names. Other catalog errors fail the query.
 
 ### By Timestamp
 
@@ -3170,6 +3210,17 @@ Columns:
 | `create_time` | TIMESTAMP | Tag creation time; `NULL` for tags written without one |
 | `time_retained` | STRING | Tag retention as an ISO-8601 duration (for example `PT72H`); `NULL` for tags written without one |
 
+For tables managed by a REST catalog, the tags are listed from the catalog
+rather than from tag files in table storage. Legacy tags named `.` or `..`, which
+cannot be addressed safely by the REST API, are omitted with a warning so they
+cannot prevent other tags from being queried. Their storage files are ignored,
+and direct time travel by these legacy names is rejected.
+
+`create_time` is a local `TIMESTAMP` without a timezone. REST catalog creation
+times are converted from epoch milliseconds to the client's local time, matching
+the local date-time fields in filesystem tag metadata. Its raw Arrow integer is
+not an epoch timestamp.
+
 ### $branches
 
 View all branches of a table:
@@ -3342,9 +3393,18 @@ Columns:
 | `index_file_size` | BIGINT | Total size of index files (bytes) |
 
 The output contains one row per scope:
-- `total` — sum across all branches and tags
+- `total` — unique referenced files across all branches and tags
 - `branch:main` — main branch snapshots + tag snapshots
 - `branch:<name>` — one row per other branch
+
+For tables managed by a REST catalog, branches and tags come from the catalog,
+including branches with no corresponding storage directory. Current snapshots
+and tag snapshots returned by the catalog are counted even when their snapshot
+files are absent, together with the snapshot history visible in table storage.
+REST metadata API failures, including HTTP 501, fail the query rather than return
+an incomplete count. Invalid or unaddressable branch names also fail the query.
+Legacy `.` or `..` tags fail this query because their catalog snapshots cannot
+be read safely; they are not replaced by storage files.
 
 To estimate possible orphan file size for recognized data files:
 
@@ -3439,33 +3499,67 @@ clients may ignore it.
 Existing partial-update tables may also configure
 `fields.<field>.aggregate-function` or
 `fields.default-aggregate-function`. Rust supports the same aggregate-function
-set as the basic aggregation engine: `sum`, `product`, `min`, `max`,
-`last_value`, `first_value`, `last_non_null_value`,
-`first_non_null_value`, `bool_and`, `bool_or`, and `listagg`.
+set as the basic aggregation engine (see below).
 `last_non_null_value` may be used without a sequence group; other functions
 require the target field to be protected by a sequence group. When a
 lower-precedence group sequence arrives, order-sensitive functions use Java
 compatible reversed aggregation. Unknown functions and incompatible
 function/type combinations fail closed.
 
-Rust can read fully materialized compacted files from deletion-vector-enabled
-partial-update and aggregation tables. Every split must be raw-convertible,
-every file must have a known zero delete-row count, and
-`deletion-vectors.merge-on-read` must remain disabled. Writing these table
-combinations and reading plans that still require per-key merging are not
-supported.
+Rust can read deletion-vector-enabled partial-update and aggregation tables.
+Fully materialized compacted files can be read as raw-convertible splits when
+every file has a known zero delete-row count. Uncompacted overlapping files can
+also be read with `deletion-vectors.merge-on-read=true`. Primary-key
+deletion-vector compaction still requires `merge-engine=deduplicate`, so these
+engines do not produce DV compaction output in Rust.
 
 Rust currently supports `merge-engine=aggregation` in basic mode only. It works
-with fixed buckets and ordinary dynamic buckets (`'bucket' = '-1'`) when the
-primary key includes all partition columns. It supports per-field aggregate
-functions such as `sum`, `min`, `max`, value functions, boolean functions, and
-`listagg`, plus `fields.default-aggregate-function`. Each write-buffer flush
-aggregates duplicate primary keys before writing data files, so a file contains
-at most one row per key. Input changelog files retain the original rows.
+with fixed buckets and dynamic buckets (`'bucket' = '-1'`). Cross-partition
+updates (`'bucket' = '-1'` when the primary key does not contain every partition
+field) keep the existing partition/bucket location, matching Java
+`UseOldExistingProcessor`. Each write-buffer flush aggregates duplicate primary
+keys before writing data files, so a file contains at most one row per key.
+Input changelog files retain the original rows.
 
-Sequence fields are always merged with `last_value`. Defining
+Per-field aggregate functions are selected in this order: sequence fields always
+use `last_value`; primary-key columns pass through without an aggregator;
+otherwise `fields.<field>.aggregate-function`, then
+`fields.default-aggregate-function`, then `last_non_null_value`. Defining
 `fields.<sequence-field>.aggregate-function` is rejected, matching Java schema
-validation.
+validation. The undocumented Java SPI alias `first_not_null_value` is accepted
+and resolved to `first_non_null_value`.
+
+Supported aggregate functions:
+
+| Function | Column type |
+|---|---|
+| `sum`, `product` | integer, `FLOAT`, `DOUBLE`, `DECIMAL` |
+| `min`, `max` | comparable scalars (not `MAP`, `MULTISET`, `ROW`, `ARRAY`, `VECTOR`, `VARIANT`, or `BLOB`) |
+| `last_value`, `first_value`, `last_non_null_value`, `first_non_null_value`, `primary-key` | any |
+| `bool_and`, `bool_or` | `BOOLEAN` |
+| `listagg` | unbounded `STRING` (`VARCHAR` with max length) |
+| `collect` | `ARRAY` |
+| `merge_map` | `MAP` |
+| `merge_map_with_keytime` | `MAP` whose value is a `ROW` with at least two fields |
+| `nested_update`, `nested_partial_update` | `ARRAY<ROW>` |
+| `rbm32`, `rbm64`, `hll_sketch`, `theta_sketch` | `VARBINARY` |
+
+Field-scoped options used by these functions:
+
+- `fields.<field>.ignore-retract=true` ignores retract cells for that field.
+  It conflicts with `aggregation.remove-record-on-delete=true`.
+- `fields.<field>.list-agg-delimiter` and `fields.<field>.distinct` for
+  `listagg`; `fields.<field>.distinct` also applies to `collect`.
+- `fields.<field>.sum.fail-on-overflow` / `fields.<field>.product.fail-on-overflow`
+  reject integer overflow instead of wrapping. Floating-point addition is
+  unaffected; Decimal overflow still yields NULL as in Java.
+- `fields.<field>.ts-field` selects the key-time field for
+  `merge_map_with_keytime` (defaults to the last ROW field).
+- `fields.<field>.nested-key`, `fields.<field>.nested-sequence-field`,
+  `fields.<field>.nested-key-null-strategy`, and `fields.<field>.count-limit`
+  for nested array aggregators. `nested_partial_update` requires
+  `nested-key`.
+- `fields.<field>.count-limit` also applies to `collect`, see below.
 
 `collect` supports `fields.<field>.distinct` and `fields.<field>.count-limit`.
 A positive limit `N` keeps the first `N` elements in merge order, a negative
@@ -3480,10 +3574,22 @@ merged array is what gets written to data files. As in Java, a key with only
 one row keeps the array it was written with until another row of that key
 arrives or, with `changelog-producer=lookup`, until it is compacted.
 
-This is not full Java feature parity. Aggregation tables do not support retract
-rows (`DELETE` / `UPDATE_BEFORE`), deletion-vector writes or merge-on-read
-plans, cross-partition dynamic bucket writes, or advanced aggregation options
-such as `ignore-retract`, `nested-key`, and sequence groups.
+`DELETE` / `UPDATE_BEFORE` rows are fed to each field aggregator's retract path
+(`AggregateMergeFunction`), except that
+`aggregation.remove-record-on-delete=true` turns a `DELETE` into a full-row
+tombstone via `replace_with_delete` instead of `retract`. Native retract is
+implemented for `sum`, `product`, `collect`, `merge_map`, `nested_update`,
+`last_value`, `last_non_null_value`, and `primary-key` (which applies `agg` on
+retract). Aggregators without native retract — including `min`, `max`,
+`bool_and` / `bool_or`, `listagg`, `first_value`, `first_non_null_value`,
+`nested_partial_update`, `merge_map_with_keytime`, and the bitmap/sketch
+functions — reject retract unless `fields.<field>.ignore-retract=true`.
+
+This is not full Java feature parity. Aggregation tables still reject
+`fields.*.sequence-group`. Primary-key deletion-vector compaction remains
+limited to `deduplicate`, so aggregation tables do not write deletion-vector
+compaction output; reading DV-enabled aggregation tables, including
+merge-on-read of uncompacted files, is supported.
 
 Primary-key compaction supports `changelog-producer=lookup`, including
 deletion-vector-enabled `deduplicate` tables, generating INSERT, UPDATE_BEFORE, UPDATE_AFTER and DELETE events when

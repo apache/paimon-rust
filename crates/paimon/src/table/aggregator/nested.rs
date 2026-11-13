@@ -29,7 +29,7 @@ use arrow_select::concat::concat;
 
 use super::{unsupported_type_error, FieldAggregator};
 use crate::arrow::paimon_type_to_arrow;
-use crate::spec::DataType;
+use crate::spec::{extract_datum_from_array, BinaryRow, DataField, DataType};
 use crate::Error;
 
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +58,15 @@ pub(crate) struct NestedAgg {
     seen_input: bool,
     raw_accumulator: bool,
     rows: Vec<ArrayRef>,
+    row_type_fields: Vec<DataField>,
+    /// Whether no key column type rules out BinaryRow serialization.
+    key_types_serializable: bool,
+    /// Whether lookups go through `key_index`, keyed like Java's map by the
+    /// BinaryRow of the key columns. Cleared when a key value fails to
+    /// serialize, until the next `reset()`; lookups then scan `rows`.
+    key_serializable: bool,
+    /// Position in `rows` of each serialized key, built on first use.
+    key_index: Option<HashMap<Vec<u8>, usize>>,
 }
 
 impl NestedAgg {
@@ -90,6 +99,9 @@ impl NestedAgg {
         let strategy_option = format!("fields.{field_name}.nested-key-null-strategy");
         let key_indices =
             parse_nested_fields(options.get(&key_option), row_type.fields(), &key_option)?;
+        let key_serializable = key_indices
+            .iter()
+            .all(|&index| binary_row_serializable(row_type.fields()[index].data_type()));
         let sequence_indices = parse_nested_fields(
             options.get(&sequence_option),
             row_type.fields(),
@@ -146,6 +158,10 @@ impl NestedAgg {
             seen_input: false,
             raw_accumulator: false,
             rows: Vec::new(),
+            row_type_fields: row_type.fields().to_vec(),
+            key_types_serializable: key_serializable,
+            key_serializable,
+            key_index: None,
         })
     }
 
@@ -185,6 +201,71 @@ impl NestedAgg {
         self.key_indices
             .iter()
             .all(|&index| left.column(index).as_ref() == right.column(index).as_ref())
+    }
+
+    /// The key columns of a one-row struct serialized as a BinaryRow.
+    fn key_bytes(&self, row: &StructArray) -> crate::Result<Vec<u8>> {
+        let datums = self
+            .key_indices
+            .iter()
+            .map(|&index| {
+                let data_type = self.row_type_fields[index].data_type();
+                Ok((
+                    extract_datum_from_array(row.column(index), 0, index, data_type)?,
+                    data_type,
+                ))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let datums: Vec<_> = datums
+            .iter()
+            .map(|(datum, data_type)| (datum.as_ref(), *data_type))
+            .collect();
+        Ok(BinaryRow::from_datums(&datums).to_serialized_bytes())
+    }
+
+    /// The index key of `row`, or `None` when keys are compared by scanning.
+    fn index_key(&mut self, row: &StructArray) -> Option<Vec<u8>> {
+        if !self.key_serializable {
+            return None;
+        }
+        let key = self.key_bytes(row).ok();
+        if key.is_none() {
+            // The index only caches positions; a key it cannot serialize
+            // is still compared by the scan, as are later keys until the
+            // next `reset()`.
+            self.key_serializable = false;
+            self.key_index = None;
+        }
+        key
+    }
+
+    fn key_position(&mut self, row: &StructArray, key: Option<&[u8]>) -> Option<usize> {
+        if let Some(key) = key {
+            if self.key_index.is_none() {
+                let index = self
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .map(|(position, existing)| {
+                        Ok((self.key_bytes(self.row(existing.as_ref())?)?, position))
+                    })
+                    .collect::<crate::Result<HashMap<_, _>>>();
+                self.key_serializable = index.is_ok();
+                self.key_index = index.ok();
+            }
+            if let Some(index) = &self.key_index {
+                return index.get(key).copied();
+            }
+        }
+        self.rows.iter().position(|existing| {
+            self.same_key(self.row(existing.as_ref()).expect("stored Struct row"), row)
+        })
+    }
+
+    fn remember_position(&mut self, key: Option<Vec<u8>>, position: usize) {
+        if let (Some(index), Some(key)) = (&mut self.key_index, key) {
+            index.insert(key, position);
+        }
     }
 
     fn compare_sequence(&self, left: &StructArray, right: &StructArray) -> crate::Result<Ordering> {
@@ -254,10 +335,8 @@ impl NestedAgg {
         if !self.key_is_valid(row)? {
             return Ok(());
         }
-        let position = self.rows.iter().position(|existing| {
-            self.same_key(self.row(existing.as_ref()).expect("stored Struct row"), row)
-        });
-        match position {
+        let key = self.index_key(row);
+        match self.key_position(row, key.as_deref()) {
             Some(index) => {
                 let existing = self.row(self.rows[index].as_ref())?;
                 let replacement = match self.mode {
@@ -276,7 +355,8 @@ impl NestedAgg {
                 || matches!(self.mode, NestedMode::PartialUpdate)
                 || self.rows.len() < row_limit =>
             {
-                self.rows.push(incoming)
+                self.rows.push(incoming);
+                self.remember_position(key, self.rows.len() - 1);
             }
             None => {}
         }
@@ -333,6 +413,7 @@ impl NestedAgg {
         self.rows = (0..values.len())
             .map(|index| values.slice(index, 1))
             .collect();
+        self.key_index = None;
         self.seen_input = true;
         self.raw_accumulator = true;
         Ok(())
@@ -343,6 +424,7 @@ impl NestedAgg {
             return Ok(());
         }
         self.raw_accumulator = false;
+        self.key_index = None;
         let raw_rows = std::mem::take(&mut self.rows);
         for row in raw_rows {
             if row.is_null(0) {
@@ -355,16 +437,12 @@ impl NestedAgg {
                 if !self.key_is_valid(nested_row)? {
                     continue;
                 }
-                let position = self.rows.iter().position(|existing| {
-                    self.same_key(
-                        self.row(existing.as_ref()).expect("stored Struct row"),
-                        nested_row,
-                    )
-                });
-                if let Some(index) = position {
+                let key = self.index_key(nested_row);
+                if let Some(index) = self.key_position(nested_row, key.as_deref()) {
                     self.rows[index] = row;
                 } else {
                     self.rows.push(row);
+                    self.remember_position(key, self.rows.len() - 1);
                 }
             } else {
                 self.add_row(row, false, self.count_limit)?;
@@ -384,9 +462,22 @@ impl NestedAgg {
     }
 }
 
+/// False for key column types `extract_datum_from_array` always rejects.
+fn binary_row_serializable(data_type: &DataType) -> bool {
+    !matches!(
+        data_type,
+        DataType::Array(_)
+            | DataType::Map(_)
+            | DataType::Multiset(_)
+            | DataType::Row(_)
+            | DataType::Vector(_)
+            | DataType::Blob(_)
+    )
+}
+
 fn parse_nested_fields(
     option: Option<&String>,
-    fields: &[crate::spec::DataField],
+    fields: &[DataField],
     option_name: &str,
 ) -> crate::Result<Vec<usize>> {
     option
@@ -421,6 +512,8 @@ impl FieldAggregator for NestedAgg {
         self.seen_input = false;
         self.raw_accumulator = false;
         self.rows.clear();
+        self.key_serializable = self.key_types_serializable;
+        self.key_index = None;
     }
 
     fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
@@ -507,6 +600,7 @@ impl FieldAggregator for NestedAgg {
                 continue;
             }
             let key_indices = self.key_indices.clone();
+            self.key_index = None;
             self.rows.retain(|candidate| {
                 let candidate = candidate
                     .as_any()
@@ -568,8 +662,8 @@ impl FieldAggregator for NestedAgg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{ArrayType, DataField, IntType, RowType};
-    use arrow_array::Int32Array;
+    use crate::spec::{ArrayType, DataField, IntType, RowType, VariantType};
+    use arrow_array::{BinaryArray, Int32Array};
     use arrow_schema::Field;
 
     fn input() -> (DataType, ListArray) {
@@ -751,5 +845,147 @@ mod tests {
             result_rows(&agg),
             (vec![Some(3)], vec![Some(30)], vec![Some(3)],)
         );
+    }
+
+    /// A one-row ARRAY<ROW<id, value, seq>> cell with the given rows.
+    fn rows_cell(rows: &[(i32, i32, i32)]) -> (DataType, ListArray) {
+        let (data_type, input) = input();
+        let ArrowDataType::List(element) = input.data_type().clone() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(fields) = element.data_type() else {
+            unreachable!()
+        };
+        let column = |f: fn(&(i32, i32, i32)) -> i32| {
+            Arc::new(Int32Array::from(rows.iter().map(f).collect::<Vec<_>>())) as ArrayRef
+        };
+        let rows_array = StructArray::try_new(
+            fields.clone(),
+            vec![column(|r| r.0), column(|r| r.1), column(|r| r.2)],
+            None,
+        )
+        .unwrap();
+        let list = ListArray::try_new(
+            element,
+            OffsetBuffer::from_lengths([rows.len()]),
+            Arc::new(rows_array),
+            None,
+        )
+        .unwrap();
+        (data_type, list)
+    }
+
+    fn sorted_rows(agg: &NestedAgg) -> Vec<(i32, i32, i32)> {
+        let (ids, values, seqs) = result_rows(agg);
+        let mut rows: Vec<_> = (0..ids.len())
+            .map(|i| (ids[i].unwrap(), values[i].unwrap(), seqs[i].unwrap()))
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// Three versions of each of 2000 keys arrive out of sequence order;
+    /// each key keeps its highest-sequence version.
+    #[test]
+    fn many_keys_keep_their_highest_sequence_version() {
+        let options = HashMap::from([
+            ("fields.items.nested-key".into(), "id".into()),
+            ("fields.items.nested-sequence-field".into(), "seq".into()),
+        ]);
+        let (data_type, _) = input();
+        let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap();
+        for seq in [2, 3, 1] {
+            let rows: Vec<_> = (0..2000).map(|id| (id, id * 10 + seq, seq)).collect();
+            agg.agg(&rows_cell(&rows).1, 0).unwrap();
+        }
+        let expected: Vec<_> = (0..2000).map(|id| (id, id * 10 + 3, 3)).collect();
+        assert_eq!(sorted_rows(&agg), expected);
+    }
+
+    /// Retract removes rows and shifts positions; later lookups must not use
+    /// the old ones. A DELETE value with a repeated key is deduplicated when
+    /// the next row merges it.
+    #[test]
+    fn keys_are_found_after_retract_and_delete() {
+        let options = HashMap::from([("fields.items.nested-key".into(), "id".into())]);
+        let (data_type, _) = input();
+        let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap();
+        agg.agg(&rows_cell(&[(1, 10, 0), (2, 20, 0), (3, 30, 0)]).1, 0)
+            .unwrap();
+        agg.retract(&rows_cell(&[(1, 10, 0)]).1, 0).unwrap();
+        agg.agg(&rows_cell(&[(3, 31, 0), (1, 11, 0)]).1, 0).unwrap();
+        assert_eq!(sorted_rows(&agg), vec![(1, 11, 0), (2, 20, 0), (3, 31, 0)]);
+
+        agg.replace_with_delete(&rows_cell(&[(4, 40, 0), (4, 41, 0), (5, 50, 0)]).1, 0)
+            .unwrap();
+        agg.agg(&rows_cell(&[(5, 51, 0)]).1, 0).unwrap();
+        assert_eq!(sorted_rows(&agg), vec![(4, 41, 0), (5, 51, 0)]);
+    }
+
+    /// The merge function resets the aggregator between primary keys; the
+    /// next key must not see positions from the previous one.
+    #[test]
+    fn reset_drops_positions_of_the_previous_primary_key() {
+        let options = HashMap::from([("fields.items.nested-key".into(), "id".into())]);
+        let (data_type, _) = input();
+        let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap();
+        agg.agg(&rows_cell(&[(1, 10, 0), (2, 20, 0)]).1, 0).unwrap();
+        agg.reset();
+        agg.agg(&rows_cell(&[(2, 21, 0)]).1, 0).unwrap();
+        agg.agg(&rows_cell(&[(2, 22, 0)]).1, 0).unwrap();
+        assert_eq!(sorted_rows(&agg), vec![(2, 22, 0)]);
+    }
+
+    /// Keys the BinaryRow serializer rejects are compared by scanning, and
+    /// `reset()` turns the index back on.
+    #[test]
+    fn unserializable_variant_keys_fall_back_to_scanning() {
+        let data_type = DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+            DataField::new(1, "id".into(), DataType::Variant(VariantType::new())),
+            DataField::new(2, "value".into(), DataType::Int(IntType::new())),
+        ]))));
+        let ArrowDataType::List(element) = paimon_type_to_arrow(&data_type).unwrap() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(fields) = element.data_type() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(variant_fields) = fields[0].data_type() else {
+            unreachable!()
+        };
+        let bytes = || Arc::new(BinaryArray::from(vec![&b"\xff"[..], b"\xff"])) as ArrayRef;
+        let ids =
+            StructArray::try_new(variant_fields.clone(), vec![bytes(), bytes()], None).unwrap();
+        let rows = StructArray::try_new(
+            fields.clone(),
+            vec![Arc::new(ids), Arc::new(Int32Array::from(vec![1, 2]))],
+            None,
+        )
+        .unwrap();
+        let list = ListArray::try_new(
+            element,
+            OffsetBuffer::from_lengths([2]),
+            Arc::new(rows),
+            None,
+        )
+        .unwrap();
+        let options = HashMap::from([("fields.items.nested-key".into(), "id".into())]);
+        let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap();
+        let first = list.value(0).slice(0, 1);
+        assert!(agg.key_bytes(agg.row(first.as_ref()).unwrap()).is_err());
+        agg.agg(&list, 0).unwrap();
+        assert!(!agg.key_serializable);
+        let result = agg.result().unwrap();
+        let result = result.as_any().downcast_ref::<ListArray>().unwrap();
+        let rows = result.value(0);
+        let rows = rows.as_any().downcast_ref::<StructArray>().unwrap();
+        let values = rows
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.values().to_vec(), vec![2]);
+        agg.reset();
+        assert!(agg.key_serializable);
     }
 }

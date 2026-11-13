@@ -112,25 +112,21 @@ func (rb *ReadBuilder) WithLimit(limit int) error {
 	return ffiReadBuilderWithLimit.symbol(rb.ctx)(rb.inner, uintptr(limit))
 }
 
-// WithFilter sets a filter predicate for scan planning and read-side pruning.
+// WithFilter sets a filter predicate for scan planning and read-side filtering.
 //
 // The predicate is used in two phases:
 //   - Scan planning: prunes partitions, buckets, and data files based on
 //     file-level statistics (min/max). This is conservative — files whose
 //     statistics are inconclusive are kept.
-//   - Read-side: applies row-level filtering via Parquet native row filters
-//     for supported leaf predicates (Eq, NotEq, Lt, Le, Gt, Ge, IsNull,
-//     IsNotNull, In, NotIn).
+//   - Read-side: may use Parquet native row filters for supported leaf
+//     predicates, then enforces the full predicate with an exact residual
+//     filter on append, data-evolution, and primary-key merge reads.
 //
-// Row-level filtering is exact for most common types (Bool, Int, Long, Float,
-// Double, String, Date, Decimal, Binary). However, the following cases are NOT
-// filtered at the row level and may return non-matching rows:
-//   - Compound predicates (And/Or/Not) — not yet implemented for row-level filtering.
-//   - Time, Timestamp, and LocalZonedTimestamp columns (not yet implemented).
-//   - Schema-evolution: the predicate column does not exist in older data files.
-//   - Data-evolution mode (data-evolution.enabled = true).
-//
-// In these cases callers should apply residual filtering on the returned records.
+// Native push-down is a best-effort optimization and may skip compound
+// predicates or leaf shapes it cannot evaluate. Exactness still comes from the
+// residual pass, which retains And/Or/Not trees and filters every yielded
+// batch. Callers do not need to re-apply the predicate for ordinary Paimon
+// reads.
 //
 // The predicate is consumed (ownership transferred to the read builder);
 // the caller must NOT close it after this call.

@@ -71,6 +71,18 @@ impl BufferedBatch {
             Self::Materialized(batch) => batch.column(output_col_idx).as_ref(),
         }
     }
+
+    /// [`Self::column_for_output`] as the `ArrayRef` the batch holds.
+    pub(super) fn column_ref_for_output(
+        &self,
+        output_col_idx: usize,
+        source_output_col_indices: &[usize],
+    ) -> &arrow_array::ArrayRef {
+        match self {
+            Self::Source(batch) => batch.column(source_output_col_indices[output_col_idx]),
+            Self::Materialized(batch) => batch.column(output_col_idx),
+        }
+    }
 }
 
 /// A row reference as an index into the batch buffer.
@@ -150,6 +162,15 @@ fn singleton_reducer_result(rows: &[MergeRow]) -> crate::Result<Option<MergeResu
     } else {
         MergeResult::Omit
     }))
+}
+
+/// Whether a merge function also reduces a key with a single version. Only the
+/// lookup changelog producer needs that; otherwise the lone version is returned
+/// as is (see [`singleton_reducer_result`]).
+pub(crate) fn reduces_singletons(table_options: &HashMap<String, String>) -> bool {
+    table_options
+        .get("changelog-producer")
+        .is_some_and(|value| value.eq_ignore_ascii_case("lookup"))
 }
 
 /// Merge function applied to rows sharing the same primary key.
@@ -455,9 +476,7 @@ impl PartialUpdateMergeFunction {
         PartialUpdateConfig::new(table_options).validate_write_mode(true, table_name)?;
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
-            reduce_singletons: table_options
-                .get("changelog-producer")
-                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
+            reduce_singletons: reduces_singletons(table_options),
             remove_record_on_delete: PartialUpdateConfig::new(table_options)
                 .remove_record_on_delete(),
             sequence_group_partial_delete: HashSet::new(),
@@ -570,9 +589,7 @@ impl PartialUpdateMergeFunction {
 
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
-            reduce_singletons: table_options
-                .get("changelog-producer")
-                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
+            reduce_singletons: reduces_singletons(table_options),
             remove_record_on_delete: config.remove_record_on_delete(),
             sequence_group_partial_delete,
             sequence_group_enabled,
@@ -775,7 +792,11 @@ impl PartialUpdateMergeFunction {
                     .and_then(|aggregators| aggregators.get_mut(output_col_idx))
                     .and_then(Option::as_mut)
                 {
-                    aggregator.agg(source_array, row.row_idx)?;
+                    aggregator.agg_array(
+                        batch_buffer[row.batch_idx]
+                            .column_ref_for_output(output_col_idx, source_output_col_indices),
+                        row.row_idx,
+                    )?;
                 } else if !source_array.is_null(row.row_idx) {
                     *selected = Some((row.batch_idx, row.row_idx));
                 }
@@ -1042,9 +1063,7 @@ impl AggregateMergeFunction {
         Ok(Self {
             aggregators: Mutex::new(aggregators),
             remove_record_on_delete: config.remove_record_on_delete(),
-            reduce_singletons: table_options
-                .get("changelog-producer")
-                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
+            reduce_singletons: reduces_singletons(table_options),
         })
     }
 
@@ -1096,11 +1115,11 @@ impl AggregateMergeFunction {
             for (col_idx, slot) in aggregators.iter_mut().enumerate() {
                 if let Some(agg) = slot.as_mut() {
                     let source_array = batch_buffer[row.batch_idx]
-                        .column_for_output(col_idx, source_output_col_indices);
+                        .column_ref_for_output(col_idx, source_output_col_indices);
                     if kind.is_add() {
-                        agg.agg(source_array, row.row_idx)?;
+                        agg.agg_array(source_array, row.row_idx)?;
                     } else {
-                        agg.retract(source_array, row.row_idx)?;
+                        agg.retract(source_array.as_ref(), row.row_idx)?;
                     }
                 }
             }

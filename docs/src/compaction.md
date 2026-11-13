@@ -698,12 +698,46 @@ deletions into reassigned row IDs are not provided. Setting
 `data-evolution.compaction.split-large-files=true` or
 `data-evolution.compaction.rewrite-row-ids=true` is rejected.
 
+## Primary-key managed BLOB compaction
+
+Primary-key tables with managed `BLOB`, `ARRAY<BLOB>`, or `MAP<K, BLOB>` fields
+support compaction with `deduplicate`, `partial-update`, or `first-row`.
+Managed BLOB validation still requires `changelog-producer=none`. Existing merge
+engine, fixed/dynamic bucket, deletion-vector, and local-cache requirements also
+apply. Postpone buckets remain unsupported.
+
+Compaction merges the stored descriptors using the existing primary-key path.
+It does not resolve payloads, externalize values again, or create new
+`.managed.blob` packs. Inline descriptor and view fields in the same table are
+preserved and excluded from managed reference tracking.
+
+Each output data file gets its own `.blobref`, rebuilt from the managed
+descriptors in the non-retract rows actually written to that file. References
+are deduplicated at pack granularity, including scalar values, array elements,
+and map values. Null values and empty collections add no references; an empty
+reference set still produces a valid sidecar. Input sidecars are not merged or
+read to construct the output reference sets.
+
+The sidecar is owned by its data file through `DataFileMeta.extra_files` and
+published with it in the same `COMPACT` snapshot. Unsubmitted output files and
+their sidecars can be aborted together. Shared packs are not extra files and
+are not deleted by compaction, including packs whose values were overwritten.
+Historical snapshots continue to use their original files and descriptors.
+Pack garbage collection and reclaiming unused bytes within packs are outside
+this compaction path.
+
+Automatic compaction uses the same execution path and rebuilds the same
+per-file sidecars. It follows the existing triggers and `write-only` setting;
+supporting managed BLOBs does not force compaction after every write.
+
 ## Current scope
 
 The `full-compaction` changelog producer is unsupported. Primary-key deletion-vector
 compaction supports `deduplicate` with `none`, `input` or `lookup`.
-Outside Data Evolution mode, row tracking and dedicated
-blob/vector storage are unsupported. Query authorization, rowkind fields and
+Outside Data Evolution mode, row tracking, append-table dedicated BLOB storage,
+and dedicated vector storage are unsupported. Primary-key managed BLOB storage
+is supported as described above; tables containing only inline BLOB descriptors
+or views remain unsupported. Query authorization, rowkind fields and
 postpone buckets are unsupported in all modes.
 Ordered bucketed append, append incremental clustering, primary-key clustering
 override (`pk-clustering-override`) and record-level expiration
@@ -713,5 +747,8 @@ deletion vectors and source-backed PK indexes, or deletion vectors and global
 indexes in Data Evolution mode.
 Embedded and sidecar file indexes are regenerated according to the captured
 table options. The automatic behavior also applies to language bindings using the
-table committer. The manual compaction API and background compaction scheduling
-are not yet exposed through language bindings.
+table committer. One-shot manual compaction is exposed to Python through
+[`table.new_compact_builder()`](python-binding.md#compaction) and to SQL through
+[`CALL sys.compact`](sql.md#compact). Go and C bindings do not expose a manual
+compaction builder yet. Background compaction scheduling is not exposed through
+language bindings.

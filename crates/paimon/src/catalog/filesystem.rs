@@ -645,7 +645,10 @@ impl Catalog for FileSystemCatalog {
     ) -> Result<()> {
         let table = self.get_table(identifier).await?;
         let manager = table.tag_manager();
-        let Some(snapshot) = manager.get(tag_name).await? else {
+        // Match Java TagManager.deleteTag: delete the tag meta file only.
+        // Referenced data files are left for orphan cleanup, and an expired
+        // snapshot must not block deleting the tag.
+        if manager.get(tag_name).await?.is_none() {
             return if ignore_if_not_exists {
                 Ok(())
             } else {
@@ -653,15 +656,8 @@ impl Catalog for FileSystemCatalog {
                     tag_name: tag_name.to_string(),
                 })
             };
-        };
-        match table.snapshot_manager().get_snapshot(snapshot.id()).await {
-            Ok(_) => manager.delete(tag_name).await,
-            Err(Error::SnapshotNotExist { .. }) => Err(Error::Unsupported {
-                message: "deleting a tag after its snapshot expired is not supported by FileSystemCatalog"
-                    .to_string(),
-            }),
-            Err(error) => Err(error),
         }
+        manager.delete(tag_name).await
     }
 }
 
@@ -1464,47 +1460,6 @@ mod tests {
         let tag = catalog.get_tag(&identifier, "from-tag").await.unwrap();
         assert_eq!(tag.snapshot.id(), 1);
         assert_eq!(tag.tag_time_retained.as_deref(), Some("PT24H"));
-    }
-
-    #[tokio::test]
-    async fn test_delete_expired_tag_is_unsupported() {
-        let (_temp_dir, catalog) = create_test_catalog();
-        catalog
-            .create_database("db1", false, HashMap::new())
-            .await
-            .unwrap();
-        let identifier = Identifier::new("db1", "t");
-        catalog
-            .create_table(&identifier, testing_schema(), false)
-            .await
-            .unwrap();
-        give_the_table_a_snapshot(&catalog, &identifier).await;
-        catalog
-            .create_tag(&identifier, "release-1", Some(1), false)
-            .await
-            .unwrap();
-
-        catalog
-            .get_table(&identifier)
-            .await
-            .unwrap()
-            .snapshot_manager()
-            .delete_snapshot(1)
-            .await
-            .unwrap();
-        assert!(matches!(
-            catalog.delete_tag(&identifier, "release-1", false).await,
-            Err(Error::Unsupported { .. })
-        ));
-        assert_eq!(
-            catalog
-                .get_tag(&identifier, "release-1")
-                .await
-                .unwrap()
-                .snapshot
-                .id(),
-            1
-        );
     }
 
     #[test]
@@ -2735,5 +2690,91 @@ mod tests {
             ts.options().get("sequence.field").map(String::as_str),
             Some("ver")
         );
+    }
+}
+
+/// Tag-cleanup coverage that must also run on Windows. Uses the in-memory
+/// warehouse so it is not blocked by the local-fs directory listing skip above.
+#[cfg(test)]
+mod delete_expired_tag_tests {
+    use super::*;
+    use crate::spec::{CommitKind, Snapshot};
+    use crate::table::SnapshotManager;
+    use std::collections::HashMap;
+
+    fn create_memory_catalog() -> FileSystemCatalog {
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, "memory:/warehouse-tag-cleanup");
+        FileSystemCatalog::new(options).unwrap()
+    }
+
+    fn testing_schema() -> Schema {
+        Schema::builder()
+            .column(
+                "id",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .build()
+            .unwrap()
+    }
+
+    async fn give_the_table_a_snapshot(catalog: &FileSystemCatalog, identifier: &Identifier) {
+        let table_path = catalog.table_path(identifier);
+        let snapshot = Snapshot::builder()
+            .version(3)
+            .id(1)
+            .schema_id(0)
+            .base_manifest_list("base-list".to_string())
+            .delta_manifest_list("delta-list".to_string())
+            .commit_user("test-user".to_string())
+            .commit_identifier(0)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(1000)
+            .build();
+        assert!(
+            SnapshotManager::new(catalog.file_io.clone(), table_path)
+                .commit_snapshot(&snapshot)
+                .await
+                .unwrap(),
+            "the fixture snapshot must be the table's first"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_expired_tag_removes_tag_file() {
+        let catalog = create_memory_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let identifier = Identifier::new("db1", "t");
+        catalog
+            .create_table(&identifier, testing_schema(), false)
+            .await
+            .unwrap();
+        give_the_table_a_snapshot(&catalog, &identifier).await;
+        catalog
+            .create_tag(&identifier, "release-1", Some(1), false)
+            .await
+            .unwrap();
+
+        catalog
+            .get_table(&identifier)
+            .await
+            .unwrap()
+            .snapshot_manager()
+            .delete_snapshot(1)
+            .await
+            .unwrap();
+        // Java TagManager.deleteTag only removes the tag meta file; orphan data
+        // cleanup is separate. Expired snapshots must not block tag deletion.
+        catalog
+            .delete_tag(&identifier, "release-1", false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.get_tag(&identifier, "release-1").await,
+            Err(Error::TagNotExist { .. })
+        ));
     }
 }

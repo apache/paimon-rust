@@ -557,8 +557,9 @@ pub trait Catalog: Send + Sync {
 
     /// Delete a tag.
     ///
-    /// `FileSystemCatalog` returns [`crate::Error::Unsupported`] when the tagged snapshot has
-    /// expired because Rust does not yet implement Java's tag file cleanup.
+    /// Deletes the tag meta file even when the tagged snapshot has already
+    /// expired (Java `TagManager.deleteTag`). Referenced data files are left
+    /// for orphan cleanup.
     async fn delete_tag(
         &self,
         _identifier: &Identifier,

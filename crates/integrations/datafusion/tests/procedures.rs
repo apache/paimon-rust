@@ -2708,7 +2708,7 @@ async fn test_delete_multiple_tags() {
 
     exec(
         &sql_context,
-        "CALL sys.delete_tag(table => 'test_db.t1', tag => 'v1,v2')",
+        "CALL sys.delete_tag(table => 'test_db.t1', tag => ' v1, missing,,v2 ')",
     )
     .await;
 

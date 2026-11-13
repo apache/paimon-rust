@@ -332,8 +332,29 @@ snapshotID := int64(123)
 err := catalog.CreateTag(id, "dataset-43", &snapshotID, false)
 ```
 
-The final argument to `CreateTag` ignores an existing tag. Creating tags with
-a retention duration is not yet supported.
+The final argument to `CreateTag` ignores an existing tag.
+
+Create a tag with retention using duration strings such as `"1d"`, `"12h"`, or
+`"30min"`. Retention is persisted on the tag file; this API does not expire tags
+automatically. `GetTag` returns the retention as an ISO-8601 duration (for
+example `"1d"` becomes `"PT24H"`):
+
+```go
+snapshotID := int64(123)
+timeRetained := "1d"
+err := catalog.CreateTagWithRetention(id, "dataset-44", &snapshotID, &timeRetained, false)
+if err != nil {
+    log.Fatal(err)
+}
+tag, err := catalog.GetTag(id, "dataset-44")
+if err != nil {
+    log.Fatal(err)
+}
+log.Printf("retained for %s", *tag.TagTimeRetained)
+```
+
+Pass `nil` for `timeRetained` to create a tag without retention metadata, the
+same as `CreateTag`.
 
 ## Writing a Table
 
@@ -561,10 +582,13 @@ built, so its case sensitivity comes from which builder created it — see
 Filter push-down prunes data at two levels:
 
 1. **Scan planning** — skips partitions, buckets, and data files based on file-level statistics (min/max).
-2. **Read-side** — applies row-level filtering via Parquet native row filters for leaf predicates.
+2. **Read-side** — applies row-level filtering via Parquet native row filters for leaf predicates, then enforces the full predicate with an exact residual filter.
 
-!!! warning
-    Filter push-down is a **best-effort** optimization. The returned results may still contain rows that do not satisfy the filter condition. Callers should always apply residual filtering on the returned records to ensure correctness.
+Stats pruning and native push-down are conservative optimizations: inconclusive
+files and unsupported push-down shapes are kept for later filtering. Ordinary
+Paimon reads still return only matching rows because append, data-evolution, and
+primary-key merge paths apply an exact residual filter over the full predicate,
+including compound `And` / `Or` / `Not` trees.
 
 ### Building Predicates
 

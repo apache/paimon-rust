@@ -28,14 +28,19 @@ use paimon::spec::{DataType, Datum, IntType, PredicateBuilder, Schema, TableSche
 use paimon::table::Table;
 
 async fn pk_table() -> Table {
-    let schema = Schema::builder()
+    pk_table_with("memory:/pk_single_run_read", &[]).await
+}
+
+async fn pk_table_with(path: &str, options: &[(&str, &str)]) -> Table {
+    let mut schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("v", DataType::Int(IntType::new()))
         .primary_key(["id"])
-        .option("bucket", "1")
-        .build()
-        .unwrap();
-    let path = "memory:/pk_single_run_read";
+        .option("bucket", "1");
+    for (key, value) in options {
+        schema = schema.option(*key, *value);
+    }
+    let schema = schema.build().unwrap();
     let (io, table) = memory_table(path, TableSchema::new(0, &schema));
     setup_dirs(&io, path).await;
     persist_table_schema(&io, path, table.schema()).await;
@@ -124,6 +129,39 @@ async fn disjoint_files_read_without_merge_and_overlaps_still_merge() {
     write(&table, 150..160, 2000).await;
     let expected: Vec<Vec<i32>> = (0..300)
         .map(|id| vec![id, id + if (150..160).contains(&id) { 2000 } else { 1000 }])
+        .collect();
+    assert_eq!(read(&table, &["id", "v"], None).await, expected);
+}
+
+#[tokio::test]
+async fn aggregation_reads_disjoint_files_without_merge_and_overlaps_still_merge() {
+    let table = pk_table_with(
+        "memory:/pk_single_run_read_aggregation",
+        &[
+            ("merge-engine", "aggregation"),
+            ("fields.v.aggregate-function", "sum"),
+        ],
+    )
+    .await;
+    write(&table, 0..100, 1000).await;
+    write(&table, 100..200, 1000).await;
+    let expected: Vec<Vec<i32>> = (0..200).map(|id| vec![id, id + 1000]).collect();
+    assert_eq!(read(&table, &["id", "v"], None).await, expected);
+
+    // An overlapping file makes a two-run section, which still sums.
+    write(&table, 150..160, 2000).await;
+    let expected: Vec<Vec<i32>> = (0..200)
+        .map(|id| {
+            let v = id + 1000;
+            vec![
+                id,
+                if (150..160).contains(&id) {
+                    v + id + 2000
+                } else {
+                    v
+                },
+            ]
+        })
         .collect();
     assert_eq!(read(&table, &["id", "v"], None).await, expected);
 }

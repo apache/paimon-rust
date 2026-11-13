@@ -81,6 +81,13 @@ pub(crate) trait FieldAggregator: Send + Sync + std::fmt::Debug {
     /// Accumulate one input cell.
     fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()>;
 
+    /// [`Self::agg`] for a caller that holds the column as an [`ArrayRef`], so
+    /// an aggregator that keeps an input cell can keep a reference to it
+    /// instead of copying it for every row.
+    fn agg_array(&mut self, array: &ArrayRef, row_idx: usize) -> crate::Result<()> {
+        self.agg(array.as_ref(), row_idx)
+    }
+
     /// Replace the accumulator cell with a DELETE row's payload. Java resets
     /// the row here, while preserving field aggregator state until the next PK.
     fn replace_with_delete(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
