@@ -227,10 +227,49 @@ pub(in crate::table::compact) fn select_with_force_level_zero(
     Ok(Some((selected, output_level)))
 }
 
+/// When UniversalCompaction picks nothing, rewrite max-level files whose value
+/// stats prove every record is already past `record-level.expire-time`.
+///
+/// Unknown / incomplete stats never force a rewrite.
+pub(in crate::table::compact) fn select_expired_max_level(
+    files: &[DataFileMeta],
+    schema: &TableSchema,
+) -> Result<Option<(Vec<DataFileMeta>, i32)>> {
+    let Some(expire) = crate::table::record_level_expire::RecordLevelExpire::create(schema)? else {
+        return Ok(None);
+    };
+    let properties = schema.options();
+    let strategy = UniversalCompaction::from_options(properties, "")?;
+    let configured_levels = integer_option(
+        properties,
+        "num-levels",
+        strategy.trigger.saturating_add(1),
+        2,
+    )?;
+    let levels = configured_levels.max(
+        files
+            .iter()
+            .map(|file| file.level.saturating_add(1))
+            .max()
+            .unwrap_or(2),
+    );
+    let max_level = levels - 1;
+    let expired = files
+        .iter()
+        .filter(|file| file.level == max_level && expire.is_expire_file(file, schema))
+        .cloned()
+        .collect::<Vec<_>>();
+    if expired.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((expired, max_level)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spec::stats::BinaryTableStats;
+    use crate::spec::{BinaryRowBuilder, IntType, Schema};
     use crate::Error;
     use std::collections::HashMap;
     fn file(name: &str, level: i32, size: i64) -> DataFileMeta {
@@ -257,6 +296,81 @@ mod tests {
             write_cols: None,
             column_max_sequence_numbers: None,
         }
+    }
+
+    fn expire_schema() -> TableSchema {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("ts", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("record-level.expire-time", "1 s")
+            .option("record-level.time-field", "ts")
+            .option("num-levels", "3")
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
+    fn expired_max_level_file(name: &str) -> DataFileMeta {
+        let mut min = BinaryRowBuilder::new(2);
+        min.write_int(0, 1);
+        min.write_int(1, 1);
+        let mut max = BinaryRowBuilder::new(2);
+        max.write_int(0, 1);
+        max.write_int(1, 1);
+        DataFileMeta {
+            file_name: name.into(),
+            file_size: 10,
+            row_count: 1,
+            min_key: vec![],
+            max_key: vec![],
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::new(
+                min.build().to_serialized_bytes(),
+                max.build().to_serialized_bytes(),
+                vec![Some(0), Some(0)],
+            ),
+            min_sequence_number: 0,
+            max_sequence_number: 1,
+            schema_id: 0,
+            level: 2,
+            extra_files: vec![],
+            creation_time: None,
+            delete_row_count: Some(0),
+            embedded_index: None,
+            file_source: Some(0),
+            value_stats_cols: Some(vec!["id".into(), "ts".into()]),
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+            column_max_sequence_numbers: None,
+        }
+    }
+
+    #[test]
+    fn expired_max_level_files_are_rewritten_when_universal_picks_nothing() {
+        let schema = expire_schema();
+        let file = expired_max_level_file("expired.parquet");
+        assert!(select(vec![file.clone()], schema.options())
+            .unwrap()
+            .is_none());
+        let (selected, output_level) = select_expired_max_level(&[file.clone()], &schema)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].file_name, "expired.parquet");
+        assert_eq!(output_level, 2);
+    }
+
+    #[test]
+    fn unknown_stats_do_not_trigger_expire_rewrite() {
+        let schema = expire_schema();
+        let mut file = expired_max_level_file("unknown.parquet");
+        file.value_stats = BinaryTableStats::empty();
+        assert!(select_expired_max_level(&[file], &schema)
+            .unwrap()
+            .is_none());
     }
     #[test]
     fn java_force_l0_stops_before_a_large_higher_level_and_outputs_below_it() {

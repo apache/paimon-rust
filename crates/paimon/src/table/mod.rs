@@ -46,6 +46,7 @@ mod commit_callback;
 mod commit_message;
 mod compact;
 mod consumer_manager;
+pub(crate) mod record_level_expire;
 pub(crate) mod cow_writer;
 mod data_evolution_fields;
 mod data_evolution_nested;

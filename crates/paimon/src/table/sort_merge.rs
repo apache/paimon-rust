@@ -1397,6 +1397,10 @@ pub(crate) struct SortMergeReaderBuilder {
     merge_function: Box<dyn MergeFunction>,
     batch_size: usize,
     lookup: Option<Arc<dyn LookupProvider>>,
+    /// When set, drop expired compact-input rows before lookup/merge (Java
+    /// RecordLevelExpire reader wrap). Lookup history is filtered separately
+    /// by [`crate::table::record_level_expire::ExpiringLookup`].
+    input_expire: Option<(crate::table::record_level_expire::RecordLevelExpire, i64)>,
 }
 
 impl SortMergeReaderBuilder {
@@ -1425,11 +1429,20 @@ impl SortMergeReaderBuilder {
             merge_function,
             batch_size: 1024,
             lookup: None,
+            input_expire: None,
         }
     }
 
     pub(crate) fn with_lookup(mut self, lookup: Option<Arc<dyn LookupProvider>>) -> Self {
         self.lookup = lookup;
+        self
+    }
+
+    pub(crate) fn with_input_expire(
+        mut self,
+        expire: Option<(crate::table::record_level_expire::RecordLevelExpire, i64)>,
+    ) -> Self {
+        self.input_expire = expire;
         self
     }
 
@@ -1497,6 +1510,7 @@ impl SortMergeReaderBuilder {
             self.merge_function,
             self.batch_size,
             self.lookup.map(|lookup| (lookup, self.input_schema)),
+            self.input_expire,
         )
     }
 }
@@ -1571,6 +1585,7 @@ fn sort_merge_stream(
     merge_function: Box<dyn MergeFunction>,
     batch_size: usize,
     lookup: Option<(Arc<dyn LookupProvider>, SchemaRef)>,
+    input_expire: Option<(crate::table::record_level_expire::RecordLevelExpire, i64)>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let num_streams = streams.len();
     if num_streams == 0 {
@@ -1707,6 +1722,32 @@ fn sort_merge_stream(
                 tree.update(|a, b| compare_cursors(&cursors, a, b).then_with(|| a.cmp(&b)).is_gt());
             }
 
+            // Filter expired compact-input rows before lookup inject / merge
+            // (Java RecordLevelExpire wraps the compact reader so Lookup never
+            // sees expired L0). Historical LevelLookup rows are filtered by
+            // ExpiringLookup when a surviving L0 key still needs before-state.
+            if let Some((expire, now_secs)) = &input_expire {
+                let mut kept = Vec::with_capacity(same_key_rows.len());
+                for row in same_key_rows.drain(..) {
+                    if expire.keeps_merge_row(
+                        &batch_buffer,
+                        &row,
+                        &source_output_col_indices,
+                        &output_schema,
+                        *now_secs,
+                    )? {
+                        kept.push(row);
+                    }
+                }
+                same_key_rows = kept;
+            }
+
+            // Java reader wrap means a fully-expired key never enters merge, so
+            // Lookup is not consulted and history is left untouched.
+            if same_key_rows.is_empty() {
+                continue;
+            }
+
             if let Some((lookup, schema)) = &lookup {
                 let mut has_base = false;
                 for row in &same_key_rows {
@@ -1736,6 +1777,7 @@ fn sort_merge_stream(
                     }
                 }
             }
+
             let (merged, changelog) = merge_function.merge_with_changelog(
                 &same_key_rows, &batch_buffer, &source_output_col_indices, &output_schema,
             )?;
