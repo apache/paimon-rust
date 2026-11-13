@@ -368,20 +368,12 @@ async fn native_merge_retains_session_variable_providers() {
             "INSERT INTO paimon.test_db.target (id, value) VALUES (1, 10)",
         )
         .await;
-        // Data-evolution tables only support unconditional matched clauses.
-        let matched_predicate = if options.is_empty() {
-            " AND @delta = 7"
-        } else {
-            ""
-        };
         assert_eq!(
             common::dml_count(
                 &ctx,
-                &format!(
-                    "MERGE INTO paimon.test_db.target t USING (VALUES (1)) AS s(id) \
+                "MERGE INTO paimon.test_db.target t USING (VALUES (1)) AS s(id) \
              ON t.id = s.id AND @@flag = 7 \
-             WHEN MATCHED{matched_predicate} THEN UPDATE SET value = @delta"
-                )
+             WHEN MATCHED AND @delta = 7 THEN UPDATE SET value = @delta"
             )
             .await,
             1
@@ -401,21 +393,19 @@ async fn native_merge_retains_session_variable_providers() {
             common::collect_id_value(&ctx, "SELECT id, value FROM paimon.test_db.target").await,
             vec![(1, 7), (2, 7)]
         );
-        if options.is_empty() {
-            assert_eq!(
-                common::dml_count(
-                    &ctx,
-                    "MERGE INTO paimon.test_db.target t USING (VALUES (1)) AS s(id) \
+        assert_eq!(
+            common::dml_count(
+                &ctx,
+                "MERGE INTO paimon.test_db.target t USING (VALUES (1)) AS s(id) \
              ON t.id = s.id WHEN MATCHED AND @delta <> 7 THEN UPDATE SET value = 0"
-                )
-                .await,
-                0
-            );
-            assert_eq!(
-                common::collect_id_value(&ctx, "SELECT id, value FROM paimon.test_db.target").await,
-                vec![(1, 7), (2, 7)]
-            );
-        }
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            common::collect_id_value(&ctx, "SELECT id, value FROM paimon.test_db.target").await,
+            vec![(1, 7), (2, 7)]
+        );
     }
 }
 

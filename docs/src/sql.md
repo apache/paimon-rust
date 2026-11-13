@@ -1056,14 +1056,16 @@ are published in one commit. Multiple source rows selecting conflicting actions
 for the same target row fail without publishing any actions. A sole unconditional
 matched DELETE collapses duplicate matches and counts each deleted target once.
 
-Append-only tables support multiple conditional matched clauses with the first
-true clause taking effect; NULL predicates fall through. Data-evolution tables
-retain the restriction of one unconditional matched clause. Both support
-conditional not-matched inserts. `NOT MATCHED BY SOURCE` and subqueries inside
-`ON` or action expressions are not supported by the Paimon executor. Native
-planner restrictions also apply, including `UPDATE SET *`, `INSERT *`, `OUTPUT`,
-and action-level `WHERE` predicates. After declaring a table alias, use that
-alias in column references.
+Append-only tables support multiple matched clauses and execute the first
+applicable action. Data-evolution tables support a single matched `UPDATE` or
+`DELETE` with an optional predicate. A clause predicate must evaluate to `TRUE`
+for its action to apply. If no matched action applies, the target row is
+preserved. Both table types support conditional `WHEN NOT MATCHED` inserts,
+which apply only to source rows without an `ON` match. The Paimon executor
+does not support `NOT MATCHED BY SOURCE` or subqueries inside `ON` or action
+expressions. Native planner restrictions also apply, including `UPDATE SET *`,
+`INSERT *`, `OUTPUT`, and action-level `WHERE` predicates. After declaring a
+table alias, use that alias in column references.
 
 `SQLContext` expands positional MERGE inserts to persisted column names for
 data-evolution tables, excluding the virtual `_ROW_ID`. When using a raw

@@ -198,11 +198,6 @@ pub(crate) fn plan_merge(
                         "Multiple WHEN MATCHED clauses are not yet supported".into(),
                     ));
                 }
-                if de && clause.predicate.is_some() {
-                    return Err(DataFusionError::NotImplemented(
-                        "WHEN MATCHED AND <predicate> is not yet supported".into(),
-                    ));
-                }
                 matched_count += 1;
             }
             _ => {}
