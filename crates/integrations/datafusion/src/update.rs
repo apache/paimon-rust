@@ -35,8 +35,8 @@ use paimon::table::{CopyOnWriteMergeWriter, Table};
 
 use crate::error::to_datafusion_error;
 use crate::merge_into::{
-    build_partition_set_from_where, extract_tracking_columns, is_delete_conflict,
-    is_row_id_conflict, ok_result, project_update_columns, quote_identifier,
+    build_dml_selection_clause, build_partition_set_from_where, extract_tracking_columns,
+    is_delete_conflict, is_row_id_conflict, ok_result, project_update_columns, quote_identifier,
     register_cow_target_table, retry_on_conflict, validate_update_columns, TempTableTracker,
 };
 use crate::sql_context::{normalize_schema_identifier, SQLContext};
@@ -103,7 +103,7 @@ async fn execute_update_once(
         .new_data_evolution_writer(columns.clone())
         .map_err(to_datafusion_error)?;
 
-    // 3. Query the target table directly with WHERE filter.
+    // 3. Select the target rows with filtering, ordering, and limit.
     let table_ref = update.table.to_string();
 
     let select_parts: Vec<String> =
@@ -114,12 +114,13 @@ async fn execute_update_once(
             .collect();
 
     let select_clause = select_parts.join(", ");
-    let where_clause = match &update.selection {
-        Some(expr) => format!(" WHERE {expr}"),
-        None => String::new(),
-    };
+    let selection_clause = build_dml_selection_clause(
+        update.selection.as_ref(),
+        &update.order_by,
+        update.limit.as_ref(),
+    );
 
-    let query_sql = format!("SELECT {select_clause} FROM {table_ref}{where_clause}");
+    let query_sql = format!("SELECT {select_clause} FROM {table_ref}{selection_clause}");
     let batches = ctx.ctx().sql(&query_sql).await?.collect().await?;
 
     // 4. Project update columns (rename __upd_X → X)
@@ -235,13 +236,14 @@ async fn execute_cow_update_inner(
             .collect();
 
     let select_clause = select_parts.join(", ");
-    let where_clause = match &update.selection {
-        Some(expr) => format!(" WHERE {expr}"),
-        None => String::new(),
-    };
+    let selection_clause = build_dml_selection_clause(
+        update.selection.as_ref(),
+        &update.order_by,
+        update.limit.as_ref(),
+    );
 
-    // Safety: where_clause comes from sqlparser AST to_string(), not raw user input.
-    let query_sql = format!("SELECT {select_clause} FROM {cow_table_name}{where_clause}");
+    // Selection clauses are rendered from the sqlparser AST.
+    let query_sql = format!("SELECT {select_clause} FROM {cow_table_name}{selection_clause}");
     let join_result = ctx.sql(&query_sql).await?.collect().await?;
 
     let mut update_value_batches: Vec<RecordBatch> = Vec::new();
