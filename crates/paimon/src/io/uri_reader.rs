@@ -42,7 +42,7 @@ impl UriInput {
         if http {
             Ok(Self::Http(HttpReader { uri: uri.into() }))
         } else {
-            Ok(Self::File(file_io.new_input(uri)?))
+            Ok(Self::File(file_io.for_row_data().new_input(uri)?))
         }
     }
 
