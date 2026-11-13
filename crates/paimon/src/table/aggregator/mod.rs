@@ -38,6 +38,8 @@ mod bitmap;
 mod bitmap64;
 mod bool_agg;
 mod collect;
+#[cfg(test)]
+mod java_rust_compat;
 mod listagg;
 mod merge_map;
 mod nested;
