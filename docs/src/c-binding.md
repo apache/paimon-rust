@@ -325,6 +325,41 @@ range is clamped to the number of available splits.
     reversed: `paimon_table_write_write_arrow_batch` consumes the exported
     Arrow structures, so the caller must not release them again.
 
+## Current-state Audit Reads
+
+Use `paimon_read_builder_plan_audit` to plan a current-state audit scan from an
+ordinary read builder. It preserves retracts and complete merge groups using
+the core audit planner. The builder's table view, user-column projection,
+case-sensitivity setting and filters are applied. Planning does not use the
+builder's limit to prune input; apply the final limit in the caller.
+
+Create a read with `paimon_read_builder_new_read`, then execute its assigned
+splits with `paimon_table_read_to_audit_log_arrow(read, plan, offset, length)`.
+The offset and length select complete logical splits, as in ordinary reads.
+The plan may also come from `paimon_plan_from_split_bytes`. Externally planned
+splits must preserve audit merge groups, including first-row merge and
+deletion-vector overlap boundaries; an ordinary scan plan that already pruned
+retract-only groups is not sufficient.
+
+Output prepends `rowkind` and, when configured by
+`table-read.sequence-number.enabled`, `_SEQUENCE_NUMBER` to the selected user
+fields. An empty user-column projection reads only these system columns.
+`paimon_table_export_audit_arrow_schema` exports the full audit schema to an
+initialized, empty `ArrowSchema`; the batch reader exports the actual projected
+schema with each batch. Release the standalone schema through its Arrow release
+callback, and release each batch with `paimon_arrow_batch_free`.
+
+The reader owns the inputs needed by its stream and may outlive the read,
+builder, table and plan handles. Use the existing record-batch reader functions
+to consume and free it. Attached resource contexts are retained by the stream.
+Apply system-column predicates in the caller; builder predicates address the
+base table's fields.
+
+These APIs read the merged current state, retaining winning delete rows. They
+do not return every historical event and do not execute incremental Delta,
+Changelog or Diff plans. Incremental planning and transport require separate
+interfaces.
+
 ## Projection and Predicates
 
 Projection uses a null-terminated array of column names:
