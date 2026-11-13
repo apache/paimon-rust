@@ -704,6 +704,35 @@ fn test_file_io_external_cache_short_hit_fails_open_to_storage() {
 }
 
 #[test]
+fn test_table_from_schema_json_accepts_legacy_defaults() {
+    let path = CString::new("memory:/test_legacy_schema").unwrap();
+    let database = CString::new("default").unwrap();
+    let table_name = CString::new("test").unwrap();
+    let mut json = serde_json::to_value(simple_table_schema()).unwrap();
+    json.as_object_mut().unwrap().remove("version");
+    let schema_json = CString::new(serde_json::to_string(&json).unwrap()).unwrap();
+
+    unsafe {
+        let result = paimon_table_from_schema_json(
+            path.as_ptr(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+        );
+        assert!(result.error.is_null());
+        assert!(!result.table.is_null());
+        let schema = table_ref(result.table).schema();
+        assert_eq!(schema.version(), 1);
+        assert_eq!(schema.core_options().bucket(), 1);
+        assert_eq!(schema.core_options().file_format(), "orc");
+        paimon_table_free(result.table);
+    }
+}
+
+#[test]
 fn test_table_from_schema_json_preserves_resolved_schema_and_branch() {
     let path = CString::new("memory:/test_resolved_branch").unwrap();
     let database = CString::new("default").unwrap();

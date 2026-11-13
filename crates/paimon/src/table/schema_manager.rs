@@ -212,6 +212,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_schema_defaults_apply_to_historical_files() {
+        let file_io = memory_file_io();
+        let table_path = "memory:/legacy_schema_history";
+        let manager = SchemaManager::new(file_io.clone(), table_path.into());
+        file_io
+            .mkdirs(&format!("{table_path}/schema"))
+            .await
+            .unwrap();
+        let schema = Schema::builder().build().unwrap();
+        let mut legacy = serde_json::to_value(TableSchema::new(0, &schema)).unwrap();
+        legacy.as_object_mut().unwrap().remove("version");
+        file_io
+            .new_output(&manager.schema_path(0))
+            .unwrap()
+            .write(serde_json::to_vec(&legacy).unwrap().into())
+            .await
+            .unwrap();
+        write_schema_file(&file_io, &format!("{table_path}/schema"), 1).await;
+
+        let latest = manager.latest().await.unwrap().unwrap();
+        assert_eq!(latest.id(), 1);
+        assert_eq!(latest.version(), TableSchema::CURRENT_VERSION);
+        assert_eq!(latest.core_options().file_format(), "parquet");
+        let historical = manager.schema(0).await.unwrap();
+        assert_eq!(historical.version(), 1);
+        assert_eq!(historical.core_options().bucket(), 1);
+        assert_eq!(historical.core_options().file_format(), "orc");
+        assert!(Arc::ptr_eq(&historical, &manager.schema(0).await.unwrap()));
+    }
+
+    #[tokio::test]
     async fn list_all_ids_returns_empty_for_missing_directory() {
         let file_io = memory_file_io();
         let sm = SchemaManager::new(file_io, "memory:/list_missing".to_string());
