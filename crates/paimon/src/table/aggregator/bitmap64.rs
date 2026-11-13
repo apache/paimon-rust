@@ -540,6 +540,49 @@ fn encode(values: &Ranges) -> crate::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Test-only helpers for Java ↔ Rust compatibility fixtures.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    pub fn encode_values(values: impl IntoIterator<Item = u64>) -> crate::Result<Vec<u8>> {
+        let mut grouped: BTreeMap<[u8; 6], Vec<(u16, u16)>> = BTreeMap::new();
+        for value in values {
+            let bytes = value.to_be_bytes();
+            let low = value as u16;
+            grouped
+                .entry(bytes[..6].try_into().unwrap())
+                .or_default()
+                .push((low, low));
+        }
+        let ranges = grouped
+            .into_iter()
+            .map(|(key, mut ranges)| {
+                normalize_ranges(&mut ranges);
+                (key, Container::Ranges(ranges))
+            })
+            .collect();
+        encode(&ranges)
+    }
+
+    pub fn decode_to_values(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
+        let ranges = decode(bytes)?;
+        Ok(ranges
+            .iter()
+            .flat_map(|(high, container)| {
+                let high = high
+                    .iter()
+                    .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
+                let lows = container.ranges().into_owned();
+                lows.into_iter().flat_map(move |(start, end)| {
+                    (start..=end).map(move |low| (high << 16) | u64::from(low))
+                })
+            })
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
