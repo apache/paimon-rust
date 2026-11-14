@@ -50,7 +50,7 @@ pub(crate) use bitmap64::Roaring64Agg;
 pub(crate) use bool_agg::{BoolAndAgg, BoolOrAgg};
 pub(crate) use collect::CollectAgg;
 pub(crate) use listagg::ListaggAgg;
-pub(crate) use merge_map::MergeMapAgg;
+pub(crate) use merge_map::{validate_merge_map_with_keytime, MergeMapAgg};
 pub(crate) use nested::NestedAgg;
 pub(crate) use numeric::{MaxAgg, MinAgg, ProductAgg, SumAgg};
 pub(crate) use sketch::{HllSketchAgg, ThetaSketchAgg};

@@ -466,6 +466,7 @@ impl<'a> PartialUpdateConfig<'a> {
                         .find(|field| field.name() == field_name)
                         .expect("field existence checked above")
                         .data_type(),
+                    self.options,
                 )?;
             }
             per_field.insert(field_name, value.as_str());
@@ -495,7 +496,7 @@ impl<'a> PartialUpdateConfig<'a> {
             let Some(function) = per_field.get(field_name).copied().or(default) else {
                 continue;
             };
-            validate_aggregator_for_type(function, field_name, field.data_type())?;
+            validate_aggregator_for_type(function, field_name, field.data_type(), self.options)?;
             // Compared raw on purpose: Java `PartialUpdateMergeFunction` tests
             // `aggFuncName.equals(FieldLastNonNullValueAggFactory.NAME)`, and that
             // factory has no legacy alias — only `first_non_null_value` does — so
