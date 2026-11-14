@@ -664,9 +664,10 @@ async fn lookup_expire_update_when_live_history_and_live_input() {
     write_batch(&table, &int_batch(vec![1], vec![Some(live_ts())], vec![11])).await;
     let after = lookup_compact(&table).await;
     assert_eq!(id_value(&table, 1).await, Some(11));
+    // events() sorts lexicographically, so "+U" precedes "-U".
     assert_eq!(
         super::lookup_changelog_tests::events(&table, before, after).await,
-        vec![("-U".into(), 1, 10), ("+U".into(), 1, 11)]
+        vec![("+U".into(), 1, 11), ("-U".into(), 1, 10)]
     );
 }
 

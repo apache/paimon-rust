@@ -83,32 +83,8 @@ pub(super) async fn events(table: &Table, start: i64, end: i64) -> Vec<(String, 
             )
         }));
     }
-    sort_changelog_events(&mut events);
+    events.sort();
     events
-}
-
-/// Stable order for assertions: key, then retract-before-add (`-U` before `+U`).
-///
-/// Lexicographic sort would put `"+U"` before `"-U"` and invert Lookup update
-/// pairs even when the writer emitted retract-then-add correctly.
-fn changelog_kind_rank(kind: &str) -> u8 {
-    match kind {
-        "-U" => 0,
-        "-D" => 1,
-        "+I" => 2,
-        "+U" => 3,
-        _ => 4,
-    }
-}
-
-fn sort_changelog_events(events: &mut [(String, i32, i32)]) {
-    events.sort_by(|left, right| {
-        left.1
-            .cmp(&right.1)
-            .then_with(|| changelog_kind_rank(&left.0).cmp(&changelog_kind_rank(&right.0)))
-            .then_with(|| left.2.cmp(&right.2))
-            .then_with(|| left.0.cmp(&right.0))
-    });
 }
 
 fn expected(events: &[(&str, i32, i32)]) -> Vec<(String, i32, i32)> {
@@ -116,7 +92,7 @@ fn expected(events: &[(&str, i32, i32)]) -> Vec<(String, i32, i32)> {
         .iter()
         .map(|(kind, key, value)| (kind.to_string(), *key, *value))
         .collect::<Vec<_>>();
-    sort_changelog_events(&mut events);
+    events.sort();
     events
 }
 
