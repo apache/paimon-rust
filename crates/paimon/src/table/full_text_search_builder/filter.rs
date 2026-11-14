@@ -203,17 +203,25 @@ pub(super) async fn matching_indexed_rows(
             None => None,
         };
         match answer {
-            Some((answer, exact)) => {
-                let candidates = row_ids(&answer)? & &decided;
-                if exact {
+            Some((answer, exact, candidate_ranges)) => {
+                let answer = row_ids(&answer)? & &decided;
+                // With an exact answer, only rows in `candidate_ranges` still need
+                // the data; the rest are proven matches.
+                let (proven, candidates) = if exact {
+                    let candidates = row_ids(&candidate_ranges)? & &answer;
+                    (&answer - &candidates, candidates)
+                } else {
+                    (RoaringTreemap::new(), answer)
+                };
+                if !proven.is_empty() {
                     matched |= if core.data_evolution_enabled() {
-                        candidates
+                        proven
                     } else {
                         // An exact index match does not establish snapshot visibility.
-                        matching_rows(evaluation, &Predicate::AlwaysTrue, ranges(&candidates)?)
-                            .await?
+                        matching_rows(evaluation, &Predicate::AlwaysTrue, ranges(&proven)?).await?
                     };
-                } else if core.global_index_filter_refine_from_data() {
+                }
+                if !candidates.is_empty() && core.global_index_filter_refine_from_data() {
                     matched |= matching_rows(evaluation, filter, ranges(&candidates)?).await?;
                 }
             }

@@ -19,8 +19,8 @@
 
 use super::all_match::all_matching_entries;
 use super::entry::{
-    bitmap_meta_may_match, bitmap_meta_may_match_between, multivalue_meta_may_match,
-    sorted_entry_meta, GlobalIndexEntry, GlobalIndexFileKind,
+    bitmap_meta_may_match, bitmap_meta_may_match_between, is_floating_point,
+    multivalue_meta_may_match, sorted_entry_meta, GlobalIndexEntry, GlobalIndexFileKind,
 };
 use super::predicates::{
     entries_support_predicate, is_multivalue_predicate, is_sorted_global_index_supported_op,
@@ -39,9 +39,11 @@ use crate::btree::{make_key_comparator, serialize_datum};
 #[cfg(test)]
 use crate::spec::GlobalIndexSearchMode;
 use crate::spec::{DataType, Datum, Predicate, PredicateOperator};
+use crate::table::bitmap_global_index_format::is_bitmap_floating_residual_sensitive_op;
 use crate::table::bitmap_global_index_format::{
     make_bitmap_key_comparator, serialize_bitmap_datum,
 };
+use crate::table::source::exclude_row_ranges;
 use crate::table::RowRange;
 use crate::{Error, Result};
 use futures::{StreamExt, TryStreamExt};
@@ -62,6 +64,22 @@ pub(super) struct GlobalIndexScanResult {
     /// False when an AND conjunct was declined or only some constraints were
     /// selected for a field. Contributing field IDs alone cannot prove exactness.
     pub(super) fully_evaluated: bool,
+    /// Rows in `row_ranges` that are only candidates: a bitmap answers floating
+    /// ranges and negations with every non-null row. Callers check this against
+    /// the rows they actually use.
+    pub(super) candidate_ranges: Vec<RowRange>,
+}
+
+/// Row ranges, indexed coverage, whether every predicate was evaluated, and
+/// the candidate-only part of the row ranges.
+type LeafResult = (Vec<RowRange>, Vec<RowRange>, bool, Vec<RowRange>);
+
+/// Candidate ranges restricted to rows that are still in `row_ranges`.
+fn candidates_within(candidates: Vec<RowRange>, row_ranges: &[RowRange]) -> Vec<RowRange> {
+    if candidates.is_empty() {
+        return candidates;
+    }
+    intersect_sorted_ranges(&crate::table::merge_row_ranges(candidates), row_ranges)
 }
 
 pub(super) async fn try_fold_bounded<T, Fut, Acc, Fold>(
@@ -153,14 +171,22 @@ impl GlobalIndexScanner {
                     self.evaluate_leaf(&selected_entries, &predicates)
                         .await
                         .map(|result| {
-                            result.map(|(row_ranges, indexed_coverage, fully_evaluated)| {
-                                GlobalIndexScanResult {
+                            result.map(
+                                |(
                                     row_ranges,
-                                    evaluated_field_ids: HashSet::from([field_id]),
                                     indexed_coverage,
                                     fully_evaluated,
-                                }
-                            })
+                                    candidate_ranges,
+                                )| {
+                                    GlobalIndexScanResult {
+                                        row_ranges,
+                                        evaluated_field_ids: HashSet::from([field_id]),
+                                        indexed_coverage,
+                                        fully_evaluated,
+                                        candidate_ranges,
+                                    }
+                                },
+                            )
                         })
                 }
                 Predicate::And(_) => {
@@ -169,6 +195,7 @@ impl GlobalIndexScanner {
                     let mut indexed_coverage: Option<Vec<RowRange>> = None;
                     let mut evaluated_field_ids = HashSet::new();
                     let mut fully_evaluated = true;
+                    let mut candidate_ranges = Vec::new();
                     loop {
                         let remaining_predicate = Predicate::And(children.clone());
                         let Some(composite) = self.evaluate_composite(&remaining_predicate).await?
@@ -177,6 +204,7 @@ impl GlobalIndexScanner {
                         };
                         let result = composite.result;
                         fully_evaluated &= result.fully_evaluated;
+                        candidate_ranges.extend(result.candidate_ranges);
                         row_ranges = Some(match row_ranges {
                             None => result.row_ranges,
                             Some(existing) => {
@@ -274,6 +302,7 @@ impl GlobalIndexScanner {
                         mut indexed_coverage,
                         mut evaluated_field_ids,
                         mut fully_evaluated,
+                        mut candidate_ranges,
                     ) = try_fold_bounded(
                         leaf_futures,
                         leaf_group_count.max(1),
@@ -282,12 +311,22 @@ impl GlobalIndexScanner {
                             indexed_coverage,
                             evaluated_field_ids,
                             fully_evaluated,
+                            candidate_ranges,
                         ),
-                        |(row_ranges, indexed_coverage, evaluated_field_ids, fully_evaluated),
+                        |(
+                            row_ranges,
+                            indexed_coverage,
+                            evaluated_field_ids,
+                            fully_evaluated,
+                            candidate_ranges,
+                        ),
                          (field_id, result, group_fully_evaluated)| {
                             *fully_evaluated &= group_fully_evaluated && result.is_some();
-                            if let Some((ranges, coverage, leaf_fully_evaluated)) = result {
+                            if let Some((ranges, coverage, leaf_fully_evaluated, candidates)) =
+                                result
+                            {
                                 *fully_evaluated &= leaf_fully_evaluated;
+                                candidate_ranges.extend(candidates);
                                 *row_ranges = Some(match row_ranges.take() {
                                     None => ranges,
                                     Some(existing) => intersect_sorted_ranges(&existing, &ranges),
@@ -310,6 +349,7 @@ impl GlobalIndexScanner {
                     while let Some(result) = stream.try_next().await? {
                         if let Some(child_result) = result {
                             fully_evaluated &= child_result.fully_evaluated;
+                            candidate_ranges.extend(child_result.candidate_ranges);
                             row_ranges = Some(match row_ranges {
                                 None => child_result.row_ranges,
                                 Some(existing) => {
@@ -330,6 +370,7 @@ impl GlobalIndexScanner {
                     }
 
                     Ok(row_ranges.map(|row_ranges| GlobalIndexScanResult {
+                        candidate_ranges: candidates_within(candidate_ranges, &row_ranges),
                         row_ranges,
                         evaluated_field_ids,
                         indexed_coverage: indexed_coverage.unwrap_or_default(),
@@ -338,6 +379,10 @@ impl GlobalIndexScanner {
                 }
                 Predicate::Or(children) => {
                     let mut all_ranges: Vec<RowRange> = Vec::new();
+                    let mut candidate_ranges = Vec::new();
+                    // Rows some arm proves match. Another arm's candidates must not
+                    // turn them back into candidates.
+                    let mut exact_ranges = Vec::new();
                     let mut fully_evaluated = true;
                     let mut evaluated_field_ids = HashSet::new();
                     let mut indexed_coverage: Option<Vec<RowRange>> = None;
@@ -349,7 +394,19 @@ impl GlobalIndexScanner {
                         match result {
                             Some(child_result) => {
                                 fully_evaluated &= child_result.fully_evaluated;
+                                if child_result.fully_evaluated {
+                                    if child_result.candidate_ranges.is_empty() {
+                                        exact_ranges
+                                            .extend(child_result.row_ranges.iter().cloned());
+                                    } else {
+                                        exact_ranges.extend(exclude_row_ranges(
+                                            &child_result.row_ranges,
+                                            &child_result.candidate_ranges,
+                                        ));
+                                    }
+                                }
                                 all_ranges.extend(child_result.row_ranges);
+                                candidate_ranges.extend(child_result.candidate_ranges);
                                 evaluated_field_ids.extend(child_result.evaluated_field_ids);
                                 indexed_coverage = Some(match indexed_coverage {
                                     None => child_result.indexed_coverage,
@@ -368,6 +425,10 @@ impl GlobalIndexScanner {
                         crate::table::merge_row_ranges(all_ranges)
                     };
                     Ok(Some(GlobalIndexScanResult {
+                        candidate_ranges: exclude_row_ranges(
+                            &candidates_within(candidate_ranges, &row_ranges),
+                            &exact_ranges,
+                        ),
                         row_ranges,
                         evaluated_field_ids,
                         indexed_coverage: indexed_coverage.unwrap_or_default(),
@@ -386,7 +447,7 @@ impl GlobalIndexScanner {
         &self,
         entries: &[&GlobalIndexEntry],
         predicates: &[(PredicateOperator, &[Datum], &DataType)],
-    ) -> Result<Option<(Vec<RowRange>, Vec<RowRange>, bool)>> {
+    ) -> Result<Option<LeafResult>> {
         let Some(normalized_predicates) = predicates
             .iter()
             .map(|(op, literals, data_type)| {
@@ -439,7 +500,7 @@ impl GlobalIndexScanner {
             )
         };
         if between.as_ref().is_some_and(|range| range.is_empty()) {
-            return Ok(Some((Vec::new(), coverage(), true)));
+            return Ok(Some((Vec::new(), coverage(), true, Vec::new())));
         }
 
         let effective_predicates = if between.is_some() {
@@ -591,6 +652,17 @@ impl GlobalIndexScanner {
             )
         });
 
+        // A bitmap answers floating ranges and negations with every non-null
+        // row (see `bitmap_meta_may_match`), so its results are candidates
+        // only. Sorted indexes answer them exactly. Only rows a bitmap shard
+        // actually returns are candidates.
+        let bitmap_superset_ops = predicates.iter().any(|(op, _, data_type)| {
+            is_floating_point(data_type) && is_bitmap_floating_residual_sensitive_op(*op)
+        });
+        let mut bitmap_ranges = Vec::new();
+        // Rows a BTree proves. A bitmap may cover the same rows, and its
+        // candidates must not undo these.
+        let mut exact_ranges = Vec::new();
         let mut query_plans = Vec::with_capacity(entries.len());
         let mut all_matching_ranges = Vec::new();
         let mut fully_evaluated = true;
@@ -600,7 +672,13 @@ impl GlobalIndexScanner {
                     .iter()
                     .all(|matches| matches[entry_idx])
             {
-                all_matching_ranges.push(RowRange::new(entry.row_range_start, entry.row_range_end));
+                let range = RowRange::new(entry.row_range_start, entry.row_range_end);
+                match entry.index_type {
+                    GlobalIndexFileKind::Bitmap => bitmap_ranges.push(range.clone()),
+                    GlobalIndexFileKind::BTree => exact_ranges.push(range.clone()),
+                    GlobalIndexFileKind::Multivalue | GlobalIndexFileKind::FM => {}
+                }
+                all_matching_ranges.push(range);
                 continue;
             }
             // Also check if between range may match
@@ -670,7 +748,13 @@ impl GlobalIndexScanner {
                 // Only a proven identity remains (other conjuncts may have
                 // declined their budget). Preserve its indexed domain and
                 // leave the residual filter to the ordinary table reader.
-                all_matching_ranges.push(RowRange::new(entry.row_range_start, entry.row_range_end));
+                let range = RowRange::new(entry.row_range_start, entry.row_range_end);
+                match entry.index_type {
+                    GlobalIndexFileKind::Bitmap => bitmap_ranges.push(range.clone()),
+                    GlobalIndexFileKind::BTree => exact_ranges.push(range.clone()),
+                    GlobalIndexFileKind::Multivalue | GlobalIndexFileKind::FM => {}
+                }
+                all_matching_ranges.push(range);
                 continue;
             }
             query_plans.push(EntryQueryPlan {
@@ -723,18 +807,26 @@ impl GlobalIndexScanner {
                         })
                         .collect::<Vec<_>>()
                 });
-                Ok((ranges, result.declined))
+                let is_bitmap = matches!(entry.index_type, GlobalIndexFileKind::Bitmap);
+                let is_btree = matches!(entry.index_type, GlobalIndexFileKind::BTree);
+                Ok((ranges, result.declined, is_bitmap, is_btree))
             });
-        let (all_ranges, declined) = try_fold_bounded(
+        let (all_ranges, declined, bitmap_ranges, exact_ranges) = try_fold_bounded(
             futures,
             self.global_index_thread_num,
-            (all_matching_ranges, false),
-            |(all_ranges, declined), (ranges, file_declined)| {
+            (all_matching_ranges, false, bitmap_ranges, exact_ranges),
+            |(all_ranges, declined, bitmap_ranges, exact_ranges),
+             (ranges, file_declined, is_bitmap, is_btree)| {
                 if file_declined {
                     *declined = true;
                     return;
                 }
                 if let Some(ranges) = ranges {
+                    if is_bitmap {
+                        bitmap_ranges.extend(ranges.iter().cloned());
+                    } else if is_btree {
+                        exact_ranges.extend(ranges.iter().cloned());
+                    }
                     all_ranges.extend(ranges);
                 }
             },
@@ -749,6 +841,13 @@ impl GlobalIndexScanner {
             crate::table::merge_row_ranges(all_ranges),
             coverage(),
             fully_evaluated,
+            if !bitmap_superset_ops || bitmap_ranges.is_empty() {
+                Vec::new()
+            } else if fully_evaluated {
+                exclude_row_ranges(&bitmap_ranges, &exact_ranges)
+            } else {
+                crate::table::merge_row_ranges(bitmap_ranges)
+            },
         )))
     }
 
