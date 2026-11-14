@@ -1100,11 +1100,12 @@ mod tests {
     #[test]
     fn merge_map_with_keytime_validation_accepts_supported_types() {
         use crate::spec::{
-            BigIntType, DateType, DecimalType, DoubleType, FloatType, LocalZonedTimestampType,
-            SmallIntType, TimeType, TimestampType, TinyIntType,
+            BigIntType, CharType, DateType, DecimalType, DoubleType, FloatType,
+            LocalZonedTimestampType, SmallIntType, TimeType, TimestampType, TinyIntType,
         };
 
         let cases = [
+            DataType::Char(CharType::new(8).unwrap()),
             DataType::VarChar(VarCharType::string_type()),
             DataType::TinyInt(TinyIntType::new()),
             DataType::SmallInt(SmallIntType::new()),

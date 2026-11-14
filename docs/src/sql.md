@@ -3574,8 +3574,8 @@ by ticks under a unified time semantics (timezone metadata does not affect
 ordering). A NULL key-time ignores the incoming update and leaves any
 existing key unchanged. A NULL ROW value removes that key. Rust Native
 supports the key-time types listed above, including `FLOAT`/`DOUBLE`. The
-Python Native fallback gate is not yet synced to those types, so typed
-key-times still take the Python aggregator path. Java still rejects
+Python Native eligibility gate allows the same Rust-supported set (and
+falls back only for types Rust cannot compare). Java still rejects
 `FLOAT`/`DOUBLE` key-times.
 
 `DELETE` / `UPDATE_BEFORE` rows are fed to each field aggregator's retract path

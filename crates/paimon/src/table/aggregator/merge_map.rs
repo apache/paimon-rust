@@ -247,11 +247,10 @@ impl MergeMapAgg {
                     self.apply_keytime_entry(key, value)?;
                 }
             } else {
-                // Java's default aggReversed calls agg(older, accumulator).
-                // Start with the older map, then apply the current values as
-                // the incoming map so timestamp ties keep the older entry when
-                // overwrite-on-equal-ts is false; when true, the accumulator
-                // (applied second) wins equal ties, matching merge order.
+                // Java's default aggReversed(acc, input) equals agg(input, acc):
+                // start with this input map, then apply the current accumulator
+                // so equal timestamps keep the input when overwrite-on-equal-ts
+                // is false; when true, the accumulator (applied second) wins.
                 let current = std::mem::replace(&mut self.entries, incoming);
                 self.normalized = false;
                 self.normalize();
@@ -625,7 +624,7 @@ fn downcast<'a, T: Array + 'static>(
 mod tests {
     use super::*;
     use crate::spec::{
-        BigIntType, DataField, DateType, DecimalType, DoubleType, FloatType, IntType,
+        BigIntType, CharType, DataField, DateType, DecimalType, DoubleType, FloatType, IntType,
         LocalZonedTimestampType, MapType, RowType, SmallIntType, TimeType, TimestampType,
         TinyIntType, VarCharType,
     };
@@ -944,6 +943,7 @@ mod tests {
 
     #[test]
     fn keytime_integer_types_keep_newer() {
+        // Mirrors Java FieldAggregatorTest#testFieldMergeMapWithKeyTimeAggIntegerTypes.
         let cases: Vec<(DataType, ArrayRef, ArrayRef)> = vec![
             (
                 DataType::TinyInt(TinyIntType::new()),
@@ -952,18 +952,23 @@ mod tests {
             ),
             (
                 DataType::SmallInt(SmallIntType::new()),
-                Arc::new(Int16Array::from(vec![9i16])),
-                Arc::new(Int16Array::from(vec![10i16])),
+                Arc::new(Int16Array::from(vec![-2i16])),
+                Arc::new(Int16Array::from(vec![-1i16])),
             ),
             (
                 DataType::Int(IntType::new()),
-                Arc::new(Int32Array::from(vec![9])),
-                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int32Array::from(vec![i32::MIN])),
+                Arc::new(Int32Array::from(vec![-1])),
             ),
             (
                 DataType::BigInt(BigIntType::new()),
                 Arc::new(Int64Array::from(vec![9i64])),
                 Arc::new(Int64Array::from(vec![10i64])),
+            ),
+            (
+                DataType::BigInt(BigIntType::new()),
+                Arc::new(Int64Array::from(vec![i64::MIN])),
+                Arc::new(Int64Array::from(vec![i64::MIN + 1])),
             ),
         ];
         for (ts_type, older, newer) in cases {
@@ -973,6 +978,35 @@ mod tests {
                 "integer keytime should keep newer"
             );
         }
+    }
+
+    #[test]
+    fn keytime_char_utf16_matches_varchar() {
+        let ts = DataType::Char(CharType::new(8).unwrap());
+        let low = "\u{10000}";
+        let high = "\u{E000}";
+        assert_eq!(
+            merge_two(
+                ts.clone(),
+                1,
+                Arc::new(StringArray::from(vec![high])),
+                2,
+                Arc::new(StringArray::from(vec![low])),
+                HashMap::new(),
+            ),
+            1
+        );
+        assert_eq!(
+            merge_two(
+                ts,
+                1,
+                Arc::new(StringArray::from(vec![low])),
+                2,
+                Arc::new(StringArray::from(vec![high])),
+                HashMap::new(),
+            ),
+            2
+        );
     }
 
     #[test]
@@ -1065,19 +1099,54 @@ mod tests {
             2
         );
         let decimal = DataType::Decimal(DecimalType::new(10, 2).unwrap());
-        let older = Decimal128Array::from(vec![900i128])
+        let older = Decimal128Array::from(vec![1000i128])
             .with_precision_and_scale(10, 2)
             .unwrap();
-        let newer = Decimal128Array::from(vec![1000i128])
+        let newer = Decimal128Array::from(vec![1001i128])
             .with_precision_and_scale(10, 2)
             .unwrap();
         assert_eq!(
             merge_two(
-                decimal,
+                decimal.clone(),
                 1,
                 Arc::new(older),
                 2,
+                Arc::new(newer.clone()),
+                HashMap::new(),
+            ),
+            2
+        );
+        // Equal scale keeps first; negative unscaled stays older.
+        assert_eq!(
+            merge_two(
+                decimal,
+                1,
                 Arc::new(newer),
+                2,
+                Arc::new(
+                    Decimal128Array::from(vec![-150i128])
+                        .with_precision_and_scale(10, 2)
+                        .unwrap()
+                ),
+                HashMap::new(),
+            ),
+            1
+        );
+        // Non-compact DECIMAL(20,4) still compares by unscaled ordinal.
+        let wide = DataType::Decimal(DecimalType::new(20, 4).unwrap());
+        let wide_older = Decimal128Array::from(vec![123_456_789_012_345_000i128])
+            .with_precision_and_scale(20, 4)
+            .unwrap();
+        let wide_newer = Decimal128Array::from(vec![123_456_789_012_345_001i128])
+            .with_precision_and_scale(20, 4)
+            .unwrap();
+        assert_eq!(
+            merge_two(
+                wide,
+                1,
+                Arc::new(wide_older),
+                2,
+                Arc::new(wide_newer),
                 HashMap::new(),
             ),
             2
