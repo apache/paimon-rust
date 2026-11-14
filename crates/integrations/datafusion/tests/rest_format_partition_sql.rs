@@ -227,6 +227,51 @@ async fn test_partition_commands_update_rest_metadata_and_directories() {
 }
 
 #[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_partition_maintenance_rejects_shadowed_temporary_targets() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (server, context) =
+        setup_rest_table(&temp_dir, format_table_schema(&[("dt", varchar())])).await;
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (dt = 'a')"),
+    )
+    .await;
+    write_ids_file(&temp_dir.path().join("dt=a/part-0.parquet"), &[1, 2]);
+    std::fs::create_dir_all(temp_dir.path().join("dt=discovered")).unwrap();
+    let before = partition_statistics(&server);
+    common::exec(
+        &context,
+        &format!("CREATE TEMPORARY VIEW {TABLE_NAME} AS SELECT 99 AS id"),
+    )
+    .await;
+
+    for (sql, operation) in [
+        (
+            format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (dt = 'b')"),
+            "ALTER TABLE",
+        ),
+        (
+            format!("MSCK REPAIR TABLE {TABLE_NAME} ADD PARTITIONS"),
+            "MSCK REPAIR TABLE",
+        ),
+        (
+            format!("ANALYZE TABLE {TABLE_NAME} COMPUTE STATISTICS"),
+            "ANALYZE TABLE",
+        ),
+    ] {
+        common::assert_sql_error(
+            &context,
+            &sql,
+            &format!("{operation} on temporary tables or views is not supported"),
+        )
+        .await;
+    }
+    assert_eq!(partition_statistics(&server), before);
+    assert!(!temp_dir.path().join("dt=b").exists());
+}
+
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_partition_literals() {
     let temp_dir = tempfile::tempdir().unwrap();
