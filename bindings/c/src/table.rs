@@ -478,6 +478,7 @@ unsafe fn new_read_builder_state(
         table: resolved,
         resources: None,
         projected_columns: None,
+        read_type: None,
         filter: None,
         case_sensitive: true,
         limit: None,
@@ -633,6 +634,7 @@ pub unsafe extern "C" fn paimon_read_builder_with_projection(
 
     if columns.is_null() {
         state.projected_columns = None;
+        state.read_type = None;
         return std::ptr::null_mut();
     }
 
@@ -663,6 +665,53 @@ pub unsafe extern "C" fn paimon_read_builder_with_projection(
     }
 
     state.projected_columns = Some(col_names);
+    state.read_type = None;
+    std::ptr::null_mut()
+}
+
+/// Set a structured read type, including nested ROW/ARRAY/MAP projections.
+///
+/// `read_type_json` uses Paimon's JSON array of DataFields, preserving field IDs
+/// and the requested recursive types. The input is copied and can be freed
+/// after this call. Core read-type semantics and validation apply when building
+/// and executing the read; this does not modify the table's stored schema.
+///
+/// The last successful call to this function or `with_projection` selects the
+/// projection. An empty JSON array selects zero columns; null clears both
+/// selectors. Invalid JSON leaves the builder unchanged. Name-based case
+/// sensitivity does not rewrite the explicitly supplied field identities.
+///
+/// # Safety
+/// `rb` must be a valid read builder or null (returns error).
+/// `read_type_json` must be null or a valid null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_read_builder_with_read_type_json(
+    rb: *mut paimon_read_builder,
+    read_type_json: *const c_char,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(rb, "rb") {
+        return error;
+    }
+    let read_type = if read_type_json.is_null() {
+        None
+    } else {
+        let json = match validate_cstr(read_type_json, "read_type_json") {
+            Ok(json) => json,
+            Err(error) => return error,
+        };
+        match serde_json::from_str::<Vec<DataField>>(&json) {
+            Ok(fields) => Some(fields),
+            Err(error) => {
+                return paimon_error::new(
+                    PaimonErrorCode::InvalidInput,
+                    format!("Invalid read type JSON: {error}"),
+                );
+            }
+        }
+    };
+    let state = &mut *((*rb).inner as *mut ReadBuilderState);
+    state.read_type = read_type;
+    state.projected_columns = None;
     std::ptr::null_mut()
 }
 
@@ -762,6 +811,7 @@ pub unsafe extern "C" fn paimon_read_builder_new_scan(
     let state = &*((*rb).inner as *const ReadBuilderState);
     let scan_state = TableScanState {
         table: state.table.clone(),
+        read_type: state.read_type.clone(),
         filter: state.filter.clone(),
         limit: state.limit,
     };
@@ -789,6 +839,9 @@ pub unsafe extern "C" fn paimon_read_builder_new_read(
     let state = &*((*rb).inner as *const ReadBuilderState);
     let mut rb_rust = state.table.new_read_builder();
     rb_rust.with_case_sensitive(state.case_sensitive);
+    if let Some(read_type) = &state.read_type {
+        rb_rust.with_read_type(read_type.clone());
+    }
 
     // Apply projection if set
     if let Some(ref columns) = state.projected_columns {
@@ -863,6 +916,9 @@ pub unsafe extern "C" fn paimon_table_scan_plan(
     }
     let scan_state = &*((*scan).inner as *const TableScanState);
     let mut rb = scan_state.table.new_read_builder();
+    if let Some(read_type) = &scan_state.read_type {
+        rb.with_read_type(read_type.clone());
+    }
     if let Some(ref filter) = scan_state.filter {
         rb.with_filter(filter.clone());
     }

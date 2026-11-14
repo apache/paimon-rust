@@ -27,6 +27,7 @@
 //! runtime only for Rust-API setup (write_data_rust, setup_table_dirs).
 
 mod commit_messages;
+mod read_type;
 mod table_arrow_schema;
 
 use std::collections::HashMap;

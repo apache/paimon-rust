@@ -78,6 +78,28 @@ LD_LIBRARY_PATH=target/release ./example /path/to/warehouse
 DYLD_LIBRARY_PATH=target/release ./example /path/to/warehouse
 ```
 
+## Structured Projections
+
+`paimon_read_builder_with_read_type_json` accepts a JSON array of Paimon
+DataFields for nested projections. Each field retains its schema ID and selected
+recursive type, for example:
+
+```json
+[{"id":1,"name":"payload","type":{"type":"ROW","fields":[{"id":2,"name":"selected","type":"INT"}]}}]
+```
+
+Use the IDs from the resolved table schema. This selects `payload.selected`
+without requesting the other fields of `payload`; ARRAY elements and MAP values
+can likewise carry projected ROW types. It uses the core `with_read_type`
+contract, including schema-evolution and format-specific validation. It changes
+the read type, not the table's stored schema.
+
+The JSON is copied during the call. The last successful call to this API or
+`paimon_read_builder_with_projection` selects the projection; JSON decoding errors
+leave the previous selection intact. `[]` selects zero columns while retaining
+row counts, and a null pointer clears the projection. Case sensitivity applies
+to name projections; an explicit read type keeps its supplied field identities.
+
 ## Opening and Scanning a Table
 
 The following program opens `default.my_table` from a filesystem catalog and
