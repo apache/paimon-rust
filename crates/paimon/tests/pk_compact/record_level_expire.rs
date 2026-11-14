@@ -103,7 +103,7 @@ fn timestamp_batch(
     unit: TimeUnit,
     tz: Option<&str>,
 ) -> RecordBatch {
-    let tz = tz.map(|zone| Arc::<str>::from(zone));
+    let tz = tz.map(Arc::<str>::from);
     let array: ArrayRef = match unit {
         TimeUnit::Millisecond => Arc::new(
             TimestampMillisecondArray::from(millis).with_timezone_opt(tz.clone()),
