@@ -73,11 +73,26 @@ impl PrimaryKeyCompactPlanner {
                 validate_file(file, true)?;
             }
             if planner::enabled(&context.schema)? {
+                let bucket_files = files.clone();
                 if let Some((files, output_level)) = planner::select_with_force_level_zero(
                     files,
                     context.schema.options(),
                     force_level_zero,
                 )? {
+                    tasks.push(CompactTask {
+                        context: context.clone(),
+                        task_id: tasks.len(),
+                        partition,
+                        bucket,
+                        total_buckets,
+                        files,
+                        output_level: Some(output_level),
+                    });
+                } else if let Some((files, output_level)) =
+                    planner::select_expired_max_level(&bucket_files, &context.schema)?
+                {
+                    // Max-level files that UniversalCompaction would skip still
+                    // need a rewrite when value stats prove every record expired.
                     tasks.push(CompactTask {
                         context: context.clone(),
                         task_id: tasks.len(),
@@ -138,10 +153,10 @@ impl MergeFunction for CompactDeduplicate {
         _columns: &[usize],
         _schema: &SchemaRef,
     ) -> Result<MergeResult> {
-        let row = rows
-            .iter()
-            .max_by(|a, b| compare_sequence_order(a, b))
-            .expect("merge called with empty key group");
+        let Some(row) = rows.iter().max_by(|a, b| compare_sequence_order(a, b)) else {
+            // Expire may remove every version before the engine runs.
+            return Ok(MergeResult::Omit);
+        };
         RowKind::from_value(row.value_kind)?;
         Ok(MergeResult::SourceRow {
             batch_idx: row.batch_idx,
@@ -381,13 +396,36 @@ pub(super) async fn execute(
     let lookup_changelog = options.try_changelog_producer()? == ChangelogProducer::Lookup;
     let output_level = task.output_level();
     let drop_delete = options.deletion_vectors_enabled() && output_level > 0;
-    let reader = new_reader(table, resources.clone())?.with_lookup(lookup);
+    // Java wraps both compact and LevelLookup readers with RecordLevelExpire so
+    // LookupChangelogMergeFunction never observes expiration-only deletes.
+    let expire = crate::table::record_level_expire::RecordLevelExpire::create(schema)?;
+    let now_secs = crate::table::record_level_expire::current_epoch_secs();
+    let lookup = match (lookup, &expire) {
+        (Some(provider), Some(expire)) => {
+            Some(crate::table::record_level_expire::ExpiringLookup::wrap(
+                provider,
+                expire.clone(),
+                now_secs,
+            ))
+        }
+        (provider, _) => provider,
+    };
+    let reader = new_reader(table, resources.clone())?
+        .with_lookup(lookup)
+        .with_input_expire(expire.clone().map(|expire| (expire, now_secs)));
     let mut batches =
         reader.read_with_merge_function(std::slice::from_ref(split), move |config, fields| {
+            let engine = new_merge_function(config, fields, output_level)?;
             if lookup_changelog {
-                lookup::new_merge_function(config, fields, output_level)
+                // Input/history expire filtering happens before Lookup.add.
+                lookup::wrap(engine, config, fields)
             } else {
-                new_merge_function(config, fields, output_level)
+                Ok(match expire.clone() {
+                    Some(expire) => crate::table::record_level_expire::wrap_expire_with_now(
+                        engine, expire, now_secs,
+                    ),
+                    None => engine,
+                })
             }
         })?;
     let keys = schema.trimmed_primary_keys();

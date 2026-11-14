@@ -66,6 +66,8 @@ pub(crate) struct KeyValueFileReader {
     pushdown_predicates: Vec<Predicate>,
     include_file_levels: bool,
     lookup: Option<Arc<dyn super::sort_merge::LookupProvider>>,
+    /// Compact-input expire filter shared with sort-merge (Java reader wrap).
+    input_expire: Option<(crate::table::record_level_expire::RecordLevelExpire, i64)>,
     #[cfg(test)]
     input_batch_sizes: Option<std::sync::Arc<std::sync::Mutex<Vec<usize>>>>,
 }
@@ -444,6 +446,7 @@ impl KeyValueFileReader {
             config,
             include_file_levels,
             lookup: None,
+            input_expire: None,
             pushdown_predicates,
             #[cfg(test)]
             input_batch_sizes: None,
@@ -456,6 +459,14 @@ impl KeyValueFileReader {
     ) -> Self {
         self.include_file_levels |= lookup.is_some();
         self.lookup = lookup;
+        self
+    }
+
+    pub(super) fn with_input_expire(
+        mut self,
+        input_expire: Option<(crate::table::record_level_expire::RecordLevelExpire, i64)>,
+    ) -> Self {
+        self.input_expire = input_expire;
         self
     }
 
@@ -848,6 +859,7 @@ impl KeyValueFileReader {
         let file_io = self.file_io;
         let include_file_levels = self.include_file_levels;
         let lookup = self.lookup;
+        let input_expire = self.input_expire;
         let config = self.config;
         let table_schema_id = config.table_schema_id;
         let pushdown_predicates = self.pushdown_predicates;
@@ -1065,6 +1077,7 @@ impl KeyValueFileReader {
                             merge_output_schema.clone(),
                             merge_function(&config, &merge_output_fields)?,
                         )
+                        .with_input_expire(input_expire.clone())
                         .with_user_sequence_descending(
                             !CoreOptions::new(&config.table_options)
                                 .sequence_field_sort_order_is_ascending(),
@@ -1119,6 +1132,7 @@ impl KeyValueFileReader {
                             merge_function(&config, &merge_output_fields)?,
                         )
                         .with_lookup(lookup.clone())
+                        .with_input_expire(input_expire.clone())
                         .with_user_sequence_descending(
                             !CoreOptions::new(&config.table_options)
                                 .sequence_field_sort_order_is_ascending(),

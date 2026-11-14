@@ -768,12 +768,12 @@ impl CompactTask {
             .map(|entry| (entry.file().file_name.as_str(), entry))
             .collect::<HashMap<_, _>>();
         if self.is_primary_key() && primary_key::planner::enabled(&self.context.schema)? {
-            let selected = primary_key::planner::select(
+            let selected = primary_key::planner::select_or_expire(
                 bucket_files
                     .values()
                     .map(|entry| entry.file().clone())
                     .collect(),
-                self.context.schema.options(),
+                &self.context.schema,
             )?
             .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?;
             if selected.0 != self.files || Some(selected.1) != self.output_level {
@@ -884,7 +884,7 @@ pub(super) fn validate_primary_key_changes(
             .cloned()
             .collect::<Vec<_>>();
         let (selected, output_level) = if incremental {
-            primary_key::planner::select(files, schema.options())?
+            primary_key::planner::select_or_expire(files, schema)?
                 .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?
         } else {
             let level = files
@@ -1045,11 +1045,17 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
         let dv = task.is_primary_key() && options.deletion_vectors_enabled();
         // First-row can leave every accepted key in retained history, even
         // with ignore-delete=false, and therefore produce no data files.
+        // Record-level expire may also drop every version during rewrite.
         let can_omit_keys = dv
             || (task.is_primary_key()
                 && (options.merge_engine()? == MergeEngine::FirstRow
                     || (options.ignore_delete()
-                        && options.merge_engine()? == MergeEngine::PartialUpdate)));
+                        && options.merge_engine()? == MergeEngine::PartialUpdate)
+                    || task
+                        .context
+                        .schema
+                        .options()
+                        .contains_key("record-level.expire-time")));
         if dv
             && result.files.iter().any(|file| {
                 file.delete_row_count != Some(0) || file.row_count > i64::from(u32::MAX) + 1
@@ -1196,18 +1202,24 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
             message: "Compaction of ordered bucketed append tables is not supported; bucket-append-ordered=false is required".into(),
         });
     }
-    if properties
+    if properties.contains_key("record-level.expire-time") {
+        if table.schema().primary_keys().is_empty() {
+            return Err(Error::Unsupported {
+                message: "record-level.expire-time is only supported for primary-key compaction"
+                    .into(),
+            });
+        }
+        // Validate time-field / duration and reject expire + clustering.
+        let _ = crate::table::record_level_expire::RecordLevelExpire::create(table.schema())?;
+    } else if properties
         .get("pk-clustering-override")
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-        || properties.contains_key("record-level.expire-time")
         || (table.schema().primary_keys().is_empty() && options.clustering_incremental_enabled())
     {
-        // Clustered KV files are not necessarily primary-key ordered; record
-        // expiration must filter versions before merging, as Java does.
+        // Clustered KV files are not necessarily primary-key ordered.
         return Err(Error::Unsupported {
-            message:
-                "Compaction does not support pk-clustering-override, append incremental clustering or record-level.expire-time"
-                    .into(),
+            message: "Compaction does not support pk-clustering-override or append incremental clustering"
+                .into(),
         });
     }
     if table.is_format_table()
