@@ -768,12 +768,12 @@ impl CompactTask {
             .map(|entry| (entry.file().file_name.as_str(), entry))
             .collect::<HashMap<_, _>>();
         if self.is_primary_key() && primary_key::planner::enabled(&self.context.schema)? {
-            let selected = primary_key::planner::select(
+            let selected = primary_key::planner::select_or_expire(
                 bucket_files
                     .values()
                     .map(|entry| entry.file().clone())
                     .collect(),
-                self.context.schema.options(),
+                &self.context.schema,
             )?
             .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?;
             if selected.0 != self.files || Some(selected.1) != self.output_level {
@@ -884,7 +884,7 @@ pub(super) fn validate_primary_key_changes(
             .cloned()
             .collect::<Vec<_>>();
         let (selected, output_level) = if incremental {
-            primary_key::planner::select(files, schema.options())?
+            primary_key::planner::select_or_expire(files, schema)?
                 .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?
         } else {
             let level = files

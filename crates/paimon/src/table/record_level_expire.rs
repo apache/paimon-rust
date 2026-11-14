@@ -66,14 +66,16 @@ impl RecordLevelExpire {
         let expire_millis = parse_duration_millis(raw).ok_or_else(|| Error::ConfigInvalid {
             message: format!("Invalid record-level.expire-time '{raw}'"),
         })?;
-        let expire_secs = i64::try_from(expire_millis / 1000).map_err(|_| Error::ConfigInvalid {
-            message: format!("record-level.expire-time '{raw}' is out of range"),
-        })?;
-        let time_field_name = options.get(RECORD_LEVEL_TIME_FIELD).ok_or_else(|| {
-            Error::ConfigInvalid {
-                message: "You should set time field for record-level expire.".into(),
-            }
-        })?;
+        let expire_secs =
+            i64::try_from(expire_millis / 1000).map_err(|_| Error::ConfigInvalid {
+                message: format!("record-level.expire-time '{raw}' is out of range"),
+            })?;
+        let time_field_name =
+            options
+                .get(RECORD_LEVEL_TIME_FIELD)
+                .ok_or_else(|| Error::ConfigInvalid {
+                    message: "You should set time field for record-level expire.".into(),
+                })?;
         let time_field = schema
             .fields()
             .iter()
@@ -223,10 +225,7 @@ impl LookupProvider for ExpiringLookup {
         };
         if batch.num_rows() != 1 {
             return Err(Error::DataInvalid {
-                message: format!(
-                    "Lookup must return one KV row, got {}",
-                    batch.num_rows()
-                ),
+                message: format!("Lookup must return one KV row, got {}", batch.num_rows()),
                 source: None,
             });
         }
@@ -255,11 +254,13 @@ fn validate_time_field_type(data_type: &DataType) -> Result<()> {
 fn datum_to_seconds(data_type: &DataType, datum: &Datum) -> Result<Option<i64>> {
     match (data_type, datum) {
         (DataType::Int(_), Datum::Int(value)) => Ok(Some(i64::from(*value))),
-        (DataType::BigInt(_), Datum::Long(value)) => Ok(Some(if *value >= BIGINT_MILLIS_THRESHOLD {
-            value / 1000
-        } else {
-            *value
-        })),
+        (DataType::BigInt(_), Datum::Long(value)) => {
+            Ok(Some(if *value >= BIGINT_MILLIS_THRESHOLD {
+                value / 1000
+            } else {
+                *value
+            }))
+        }
         (DataType::Timestamp(_), Datum::Timestamp { millis, .. })
         | (DataType::LocalZonedTimestamp(_), Datum::LocalZonedTimestamp { millis, .. })
         | (DataType::LocalZonedTimestamp(_), Datum::Timestamp { millis, .. })
@@ -371,8 +372,10 @@ mod tests {
 
     #[test]
     fn create_requires_time_field_and_rejects_clustering() {
-        let missing =
-            schema_with(&[("record-level.expire-time", "1 s")], DataType::Int(IntType::new()));
+        let missing = schema_with(
+            &[("record-level.expire-time", "1 s")],
+            DataType::Int(IntType::new()),
+        );
         let err = RecordLevelExpire::create(&missing).unwrap_err();
         assert!(err.to_string().contains("time field"));
 

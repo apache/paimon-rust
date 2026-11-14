@@ -401,13 +401,13 @@ pub(super) async fn execute(
     let expire = crate::table::record_level_expire::RecordLevelExpire::create(schema)?;
     let now_secs = crate::table::record_level_expire::current_epoch_secs();
     let lookup = match (lookup, &expire) {
-        (Some(provider), Some(expire)) => Some(
-            crate::table::record_level_expire::ExpiringLookup::wrap(
+        (Some(provider), Some(expire)) => {
+            Some(crate::table::record_level_expire::ExpiringLookup::wrap(
                 provider,
                 expire.clone(),
                 now_secs,
-            ),
-        ),
+            ))
+        }
         (provider, _) => provider,
     };
     let reader = new_reader(table, resources.clone())?

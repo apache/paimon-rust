@@ -19,7 +19,9 @@ use super::*;
 use arrow_array::{
     ArrayRef, Int32Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
 };
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
+use arrow_schema::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
+};
 use paimon::spec::{BigIntType, LocalZonedTimestampType, TimestampType, VALUE_KIND_FIELD_NAME};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,11 +45,7 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
-fn expire_schema(
-    time_type: DataType,
-    options: &[(&str, &str)],
-    merge_engine: &str,
-) -> TableSchema {
+fn expire_schema(time_type: DataType, options: &[(&str, &str)], merge_engine: &str) -> TableSchema {
     let mut builder = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("ts", time_type)
@@ -105,9 +103,9 @@ fn timestamp_batch(
 ) -> RecordBatch {
     let tz = tz.map(Arc::<str>::from);
     let array: ArrayRef = match unit {
-        TimeUnit::Millisecond => Arc::new(
-            TimestampMillisecondArray::from(millis).with_timezone_opt(tz.clone()),
-        ),
+        TimeUnit::Millisecond => {
+            Arc::new(TimestampMillisecondArray::from(millis).with_timezone_opt(tz.clone()))
+        }
         TimeUnit::Microsecond => {
             let micros = millis.into_iter().map(|m| m * 1000).collect::<Vec<_>>();
             Arc::new(TimestampMicrosecondArray::from(micros).with_timezone_opt(tz.clone()))
@@ -531,9 +529,7 @@ async fn expire_only_max_level_rewrite_retires_fully_expired_files() {
     let active = active_files(&table).await;
     for file in &expired_inputs {
         assert!(
-            active
-                .iter()
-                .all(|alive| alive.file_name != file.file_name),
+            active.iter().all(|alive| alive.file_name != file.file_name),
             "expired input {} must be retired from the committed snapshot",
             file.file_name
         );
@@ -665,11 +661,7 @@ async fn lookup_expire_update_when_live_history_and_live_input() {
         .await
         .unwrap()
         .unwrap();
-    write_batch(
-        &table,
-        &int_batch(vec![1], vec![Some(live_ts())], vec![11]),
-    )
-    .await;
+    write_batch(&table, &int_batch(vec![1], vec![Some(live_ts())], vec![11])).await;
     let after = lookup_compact(&table).await;
     assert_eq!(id_value(&table, 1).await, Some(11));
     assert_eq!(

@@ -227,6 +227,20 @@ pub(in crate::table::compact) fn select_with_force_level_zero(
     Ok(Some((selected, output_level)))
 }
 
+/// Incremental run selection used by execute/commit validation.
+///
+/// Matches planning: prefer UniversalCompaction, then fall back to an
+/// expire-only max-level rewrite when value stats prove every record expired.
+pub(in crate::table::compact) fn select_or_expire(
+    files: Vec<DataFileMeta>,
+    schema: &TableSchema,
+) -> Result<Option<(Vec<DataFileMeta>, i32)>> {
+    if let Some(selected) = select(files.clone(), schema.options())? {
+        return Ok(Some(selected));
+    }
+    select_expired_max_level(&files, schema)
+}
+
 /// When UniversalCompaction picks nothing, rewrite max-level files whose value
 /// stats prove every record is already past `record-level.expire-time`.
 ///
@@ -359,6 +373,10 @@ mod tests {
             select_expired_max_level(std::slice::from_ref(&file), &schema)
                 .unwrap()
                 .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].file_name, "expired.parquet");
+        assert_eq!(output_level, 2);
+        let (selected, output_level) = select_or_expire(vec![file], &schema).unwrap().unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].file_name, "expired.parquet");
         assert_eq!(output_level, 2);
