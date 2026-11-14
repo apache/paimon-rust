@@ -20,9 +20,7 @@ use arrow_array::{
     ArrayRef, Int32Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
 };
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
-use paimon::spec::{
-    BigIntType, LocalZonedTimestampType, TimestampType, VALUE_KIND_FIELD_NAME,
-};
+use paimon::spec::{BigIntType, LocalZonedTimestampType, TimestampType, VALUE_KIND_FIELD_NAME};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -151,6 +149,14 @@ async fn id_values(table: &Table) -> Vec<(i32, i32)> {
     rows
 }
 
+async fn id_value(table: &Table, id: i32) -> Option<i32> {
+    id_values(table)
+        .await
+        .into_iter()
+        .find(|(key, _)| *key == id)
+        .map(|(_, value)| value)
+}
+
 async fn all_id_values(table: &Table) -> Vec<(i32, i32)> {
     let builder = table.new_read_builder();
     let plan = builder
@@ -211,7 +217,11 @@ async fn expire_filters_int_seconds_after_compact_but_not_before() {
     ))
     .await;
     let live = i32::try_from(now_secs() + 3600).unwrap();
-    write_batch(&table, &int_batch(vec![1, 2], vec![Some(1), Some(live)], vec![10, 20])).await;
+    write_batch(
+        &table,
+        &int_batch(vec![1, 2], vec![Some(1), Some(live)], vec![10, 20]),
+    )
+    .await;
     assert_eq!(id_values(&table).await, vec![(1, 10), (2, 20)]);
     assert_eq!(all_id_values(&table).await, vec![(1, 10), (2, 20)]);
     compact(&table).await;
@@ -280,8 +290,7 @@ async fn expire_timestamp_and_timestamp_ltz() {
             None,
         ),
     ] {
-        let table =
-            table_with_schema(expire_schema(time_type, &[], "deduplicate")).await;
+        let table = table_with_schema(expire_schema(time_type, &[], "deduplicate")).await;
         let live_millis = (now_secs() + 3600) * 1000;
         write_batch(
             &table,
@@ -483,14 +492,21 @@ async fn expire_only_max_level_rewrite_retires_fully_expired_files() {
 
     let builder = table.new_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
-    assert_eq!(plan.tasks().len(), 1, "expected a single expire-only rewrite task");
+    assert_eq!(
+        plan.tasks().len(),
+        1,
+        "expected a single expire-only rewrite task"
+    );
     let task = &plan.tasks()[0];
     assert!(
         task.files().iter().all(|file| file.level == max_level),
         "expire-only rewrite must select only max-level inputs"
     );
-    let selected: std::collections::HashSet<_> =
-        task.files().iter().map(|file| file.file_name.as_str()).collect();
+    let selected: std::collections::HashSet<_> = task
+        .files()
+        .iter()
+        .map(|file| file.file_name.as_str())
+        .collect();
     for file in &expired_inputs {
         assert!(
             selected.contains(file.file_name.as_str()),
@@ -548,7 +564,10 @@ async fn lookup_compact(table: &Table) -> i64 {
         .unwrap()
 }
 
-/// Seed a max-level history row, then enable expire for the next compact.
+/// Seed a large max-level history, then enable expire for the next compact.
+///
+/// Padding keeps the max-level run large enough that force-L0 stops before it,
+/// matching Java Lookup incremental compaction (history stays on LevelLookup).
 async fn seed_lookup_history_then_enable_expire(ts: i32, value: i32) -> Table {
     let schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
@@ -561,9 +580,17 @@ async fn seed_lookup_history_then_enable_expire(ts: i32, value: i32) -> Table {
         .build()
         .unwrap();
     let table = table_with_schema(TableSchema::new(0, &schema)).await;
-    write_batch(&table, &int_batch(vec![1], vec![Some(ts)], vec![value])).await;
+    let mut ids = vec![1];
+    let mut timestamps = vec![Some(ts)];
+    let mut values = vec![value];
+    for id in 2..=1000 {
+        ids.push(id);
+        timestamps.push(Some(ts));
+        values.push(id);
+    }
+    write_batch(&table, &int_batch(ids, timestamps, values)).await;
     lookup_compact(&table).await;
-    assert_eq!(id_values(&table).await, vec![(1, value)]);
+    assert_eq!(id_value(&table, 1).await, Some(value));
     table.copy_with_options(std::collections::HashMap::from([
         ("record-level.expire-time".into(), "1 s".into()),
         ("record-level.time-field".into(), "ts".into()),
@@ -584,9 +611,10 @@ async fn lookup_expire_no_changelog_when_history_and_input_all_expired() {
         .unwrap()
         .unwrap();
     // Fully expired L0 never enters Lookup; Java emits no expiration-only -D.
+    // Large max-level history is left to LevelLookup and remains readable.
     write_batch(&table, &int_batch(vec![1], vec![Some(0)], vec![99])).await;
     let after = lookup_compact(&table).await;
-    assert_eq!(id_values(&table).await, vec![(1, 10)]);
+    assert_eq!(id_value(&table, 1).await, Some(10));
     assert!(super::lookup_changelog_tests::events(&table, before, after)
         .await
         .is_empty());
@@ -604,7 +632,7 @@ async fn lookup_expire_insert_when_expired_history_and_live_input() {
     let live = live_ts();
     write_batch(&table, &int_batch(vec![1], vec![Some(live)], vec![11])).await;
     let after = lookup_compact(&table).await;
-    assert_eq!(id_values(&table).await, vec![(1, 11)]);
+    assert_eq!(id_value(&table, 1).await, Some(11));
     assert_eq!(
         super::lookup_changelog_tests::events(&table, before, after).await,
         vec![("+I".into(), 1, 11)]
@@ -622,7 +650,7 @@ async fn lookup_expire_no_changelog_when_live_history_and_input_all_expired() {
         .unwrap();
     write_batch(&table, &int_batch(vec![1], vec![Some(0)], vec![99])).await;
     let after = lookup_compact(&table).await;
-    assert_eq!(id_values(&table).await, vec![(1, 10)]);
+    assert_eq!(id_value(&table, 1).await, Some(10));
     assert!(super::lookup_changelog_tests::events(&table, before, after)
         .await
         .is_empty());
@@ -637,9 +665,13 @@ async fn lookup_expire_update_when_live_history_and_live_input() {
         .await
         .unwrap()
         .unwrap();
-    write_batch(&table, &int_batch(vec![1], vec![Some(live_ts())], vec![11])).await;
+    write_batch(
+        &table,
+        &int_batch(vec![1], vec![Some(live_ts())], vec![11]),
+    )
+    .await;
     let after = lookup_compact(&table).await;
-    assert_eq!(id_values(&table).await, vec![(1, 11)]);
+    assert_eq!(id_value(&table, 1).await, Some(11));
     assert_eq!(
         super::lookup_changelog_tests::events(&table, before, after).await,
         vec![("-U".into(), 1, 10), ("+U".into(), 1, 11)]

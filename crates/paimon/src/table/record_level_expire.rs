@@ -290,14 +290,6 @@ pub(crate) struct ExpireBeforeMerge {
 }
 
 impl ExpireBeforeMerge {
-    pub(crate) fn wrap(inner: Box<dyn MergeFunction>, expire: RecordLevelExpire) -> Self {
-        Self {
-            now_secs: current_epoch_secs(),
-            expire,
-            inner,
-        }
-    }
-
     fn live_rows(
         &self,
         rows: &[MergeRow],
@@ -343,18 +335,7 @@ impl MergeFunction for ExpireBeforeMerge {
     }
 }
 
-/// Wrap a compaction merge function when record-level expire is configured.
-pub(crate) fn maybe_wrap_expire(
-    inner: Box<dyn MergeFunction>,
-    schema: &TableSchema,
-) -> Result<Box<dyn MergeFunction>> {
-    Ok(match RecordLevelExpire::create(schema)? {
-        Some(expire) => Box::new(ExpireBeforeMerge::wrap(inner, expire)),
-        None => inner,
-    })
-}
-
-/// Like [`maybe_wrap_expire`], but reuses a frozen `now` for one compaction task.
+/// Wrap a non-Lookup compaction merge function with a frozen task-level `now`.
 pub(crate) fn wrap_expire_with_now(
     inner: Box<dyn MergeFunction>,
     expire: RecordLevelExpire,

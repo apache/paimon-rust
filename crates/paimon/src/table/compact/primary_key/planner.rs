@@ -355,9 +355,10 @@ mod tests {
         assert!(select(vec![file.clone()], schema.options())
             .unwrap()
             .is_none());
-        let (selected, output_level) = select_expired_max_level(&[file.clone()], &schema)
-            .unwrap()
-            .unwrap();
+        let (selected, output_level) =
+            select_expired_max_level(std::slice::from_ref(&file), &schema)
+                .unwrap()
+                .unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].file_name, "expired.parquet");
         assert_eq!(output_level, 2);
