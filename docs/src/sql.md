@@ -3558,9 +3558,14 @@ Field-scoped options used by these functions:
 - `fields.<field>.ts-field` selects the key-time field for
   `merge_map_with_keytime` (defaults to the last ROW field).
 - `fields.<field>.nested-key`, `fields.<field>.nested-sequence-field`,
+  `fields.<field>.nested-sequence-overwrite-on-equal` (default `true`;
+  requires `nested-sequence-field`),
   `fields.<field>.nested-key-null-strategy`, and `fields.<field>.count-limit`
   for nested array aggregators. `nested_partial_update` requires
-  `nested-key`.
+  `nested-key`. When `nested-sequence-field` is set, a nested ROW overwrites
+  an equal-key accumulator if its sequence is greater, or equal when
+  `nested-sequence-overwrite-on-equal` is `true` (default). Set it to `false`
+  to overwrite only when the new sequence is strictly greater.
 - `fields.<field>.count-limit` also applies to `collect`, see below.
 
 `collect` supports `fields.<field>.distinct` and `fields.<field>.count-limit`.

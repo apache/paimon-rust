@@ -34,6 +34,7 @@ const DISTINCT_SUFFIX: &str = ".distinct";
 const SEQUENCE_GROUP_SUFFIX: &str = ".sequence-group";
 const NESTED_KEY_SUFFIX: &str = ".nested-key";
 const NESTED_SEQUENCE_FIELD_SUFFIX: &str = ".nested-sequence-field";
+const NESTED_SEQUENCE_OVERWRITE_ON_EQUAL_SUFFIX: &str = ".nested-sequence-overwrite-on-equal";
 const NESTED_KEY_NULL_STRATEGY_SUFFIX: &str = ".nested-key-null-strategy";
 const COUNT_LIMIT_SUFFIX: &str = ".count-limit";
 const MAP_STORAGE_LAYOUT_SUFFIX: &str = ".map.storage-layout";
@@ -247,6 +248,7 @@ enum FieldScopedOptionKind {
     Distinct,
     NestedKey,
     NestedSequenceField,
+    NestedSequenceOverwriteOnEqual,
     NestedKeyNullStrategy,
     CountLimit,
     IgnoreRetract,
@@ -271,6 +273,10 @@ fn parse_field_scoped_option_key(key: &str) -> Option<(&str, FieldScopedOptionKi
         (
             NESTED_SEQUENCE_FIELD_SUFFIX,
             FieldScopedOptionKind::NestedSequenceField,
+        ),
+        (
+            NESTED_SEQUENCE_OVERWRITE_ON_EQUAL_SUFFIX,
+            FieldScopedOptionKind::NestedSequenceOverwriteOnEqual,
         ),
         (
             NESTED_KEY_NULL_STRATEGY_SUFFIX,
