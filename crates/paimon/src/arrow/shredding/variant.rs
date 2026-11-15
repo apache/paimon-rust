@@ -2044,8 +2044,8 @@ mod tests {
     use super::*;
     use crate::arrow::variant_arrow_type;
     use crate::spec::{
-        variant_extraction_row, BlobType, DoubleType, FloatType, IntType, TinyIntType, VarCharType,
-        VariantType,
+        variant_extraction_row, BigIntType, BlobType, DoubleType, FloatType, IntType, TinyIntType,
+        VarCharType, VariantType,
     };
 
     #[test]
@@ -2085,6 +2085,48 @@ mod tests {
             assert_eq!(first.to_json().unwrap(), original.to_json().unwrap());
             std::hint::black_box(assembled);
         }
+    }
+
+    #[test]
+    fn sparse_shredded_batch_does_not_copy_wide_dictionaries() {
+        let configured = DataType::Row(RowType::new(vec![DataField::new(
+            7,
+            "age".to_string(),
+            DataType::BigInt(BigIntType::new()),
+        )]));
+        let physical = variant_shredding_type(&configured).unwrap();
+        let small = GenericVariant::parse_json(r#"{"age":27}"#).unwrap();
+        let sources = (0..9)
+            .map(|suffix| {
+                let extra = (0..512)
+                    .map(|key| format!(r#", "zz_{suffix}_{key:04}":0"#))
+                    .collect::<String>();
+                let wide = GenericVariant::parse_json(&format!(r#"{{"age":27{extra}}}"#)).unwrap();
+                assert!(wide.metadata().len() > 4096);
+                GenericVariant::from_parts(small.value().to_vec(), wide.metadata().to_vec())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let source_metadata_bytes = (0..512)
+            .map(|row| sources[row % sources.len()].metadata().len())
+            .sum::<usize>();
+        let input = variant_array(
+            (0..512)
+                .map(|row| Some(sources[row % sources.len()].clone()))
+                .collect(),
+        )
+        .unwrap();
+        let shredded = shred_variant_array(input.as_ref(), &physical).unwrap();
+        let assembled = assemble_shredded_variant_array(shredded.as_ref()).unwrap();
+        let mut result_metadata_bytes = 0;
+        for row in 0..512 {
+            let value = variant_from_array(assembled.as_ref(), row)
+                .unwrap()
+                .unwrap();
+            assert_eq!(value.to_json().unwrap(), small.to_json().unwrap());
+            result_metadata_bytes += value.metadata().len();
+        }
+        assert!(result_metadata_bytes < source_metadata_bytes / 8);
     }
 
     #[test]

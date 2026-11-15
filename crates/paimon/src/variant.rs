@@ -43,6 +43,10 @@ const MAX_CACHED_VARIANT_METADATA_TOTAL_BYTES: usize = 1024 * 1024;
 const MAX_CACHED_VARIANT_METADATA_ENTRIES: usize = 4;
 const MAX_REBUILD_METADATA_ENTRIES: usize = 8;
 const MAX_REBUILD_METADATA_BYTES: usize = 8 * 1024 * 1024;
+// A shared dictionary is useful for wide values, but copying a much larger
+// dictionary into every sparse result costs more than remapping its few keys.
+const MIN_SPARSE_REBUILD_METADATA_BYTES: usize = 4 * 1024;
+const SPARSE_REBUILD_METADATA_RATIO: usize = 8;
 
 thread_local! {
     /// Exact-byte cache: metadata dictionaries are often repeated across rows and
@@ -2877,9 +2881,50 @@ pub(crate) fn rebuild_shredded_with_cache(
         return GenericVariant::from_parts(value.to_vec(), metadata.to_vec());
     }
 
-    let mut builder = VariantBuilder::with_source_metadata(cache.get_or_parse(metadata)?);
+    // Choose before parsing/caching the source dictionary: a batch can contain
+    // more distinct wide dictionaries than the cache holds, while each row
+    // materializes only a handful of fields. The legacy builder emits a
+    // compact dictionary and remaps residual key IDs in this case.
+    let payload_bytes = row
+        .fields
+        .iter()
+        .enumerate()
+        .fold(0usize, |size, (idx, value)| {
+            if idx == metadata_idx {
+                size
+            } else {
+                size.saturating_add(value.as_ref().map_or(0, shredded_value_bytes))
+            }
+        });
+    let compact = metadata.len() > MIN_SPARSE_REBUILD_METADATA_BYTES
+        && metadata.len() > payload_bytes.saturating_mul(SPARSE_REBUILD_METADATA_RATIO);
+    let mut builder = if compact {
+        VariantBuilder::new()
+    } else {
+        VariantBuilder::with_source_metadata(cache.get_or_parse(metadata)?)
+    };
     rebuild_shredded_into(row, metadata, schema, &mut builder)?;
     builder.result()
+}
+
+fn shredded_value_bytes(value: &ShreddedValue) -> usize {
+    match value {
+        ShreddedValue::Boolean(_) | ShreddedValue::Int8(_) => 1,
+        ShreddedValue::Int16(_) => 2,
+        ShreddedValue::Int32(_) | ShreddedValue::Float32(_) | ShreddedValue::Date32(_) => 4,
+        ShreddedValue::Int64(_) | ShreddedValue::Float64(_) | ShreddedValue::Timestamp(_) => 8,
+        ShreddedValue::Decimal128(_) => 16,
+        ShreddedValue::String(value) => value.len(),
+        ShreddedValue::Binary(value) => value.len(),
+        ShreddedValue::Row(row) => row.fields.iter().flatten().fold(0usize, |size, value| {
+            size.saturating_add(shredded_value_bytes(value))
+        }),
+        ShreddedValue::List(rows) => rows.iter().fold(0usize, |size, row| {
+            size.saturating_add(row.fields.iter().flatten().fold(0usize, |row_size, value| {
+                row_size.saturating_add(shredded_value_bytes(value))
+            }))
+        }),
+    }
 }
 
 /// Resolve a path directly against a clipped shredded schema. Unrequested
@@ -4317,6 +4362,54 @@ mod tests {
             assert_eq!(rebuilt.metadata(), original.metadata());
             assert_eq!(rebuilt.to_json().unwrap(), original.to_json().unwrap());
         }
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn rebuild_shredded_compacts_sparse_rows_with_wide_rotating_dictionaries() {
+        let schema = simple_object_shredding_schema();
+        let small = GenericVariant::parse_json(r#"{"age":27,"extra":{"nested":1}}"#).unwrap();
+        let mut row = cast_shredded(&small, &schema).unwrap();
+        let dictionaries = (0..9)
+            .map(|suffix| {
+                let extra = (0..512)
+                    .map(|key| format!(r#", "zz_{suffix}_{key:04}":0"#))
+                    .collect::<String>();
+                let source = GenericVariant::parse_json(&format!(
+                    r#"{{"age":27,"extra":{{"nested":1}}{extra}}}"#
+                ))
+                .unwrap();
+                assert!(source.metadata().len() > MIN_SPARSE_REBUILD_METADATA_BYTES);
+                source.metadata().to_vec()
+            })
+            .collect::<Vec<_>>();
+        let mut cache = RebuildMetadataCache::default();
+        let mut total_metadata_bytes = 0;
+
+        for i in 0..512 {
+            row.set(0, ShreddedValue::Binary(dictionaries[i % 9].clone()))
+                .unwrap();
+            let rebuilt = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap();
+            assert_eq!(rebuilt.to_json().unwrap(), small.to_json().unwrap());
+            total_metadata_bytes += rebuilt.metadata().len();
+        }
+        assert!(total_metadata_bytes < 512 * 128);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn rebuild_shredded_keeps_source_dictionary_for_dense_rows() {
+        let schema = simple_object_shredding_schema();
+        let extra = (0..512)
+            .map(|key| format!(r#", "zz_{key:04}":{key}"#))
+            .collect::<String>();
+        let original = GenericVariant::parse_json(&format!(r#"{{"age":27{extra}}}"#)).unwrap();
+        let row = cast_shredded(&original, &schema).unwrap();
+        let mut cache = RebuildMetadataCache::default();
+
+        let rebuilt = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap();
+        assert_eq!(rebuilt.to_json().unwrap(), original.to_json().unwrap());
+        assert_eq!(rebuilt.metadata(), original.metadata());
         assert_eq!(cache.entries.len(), 1);
     }
 
