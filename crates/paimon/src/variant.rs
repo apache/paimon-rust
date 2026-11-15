@@ -2979,12 +2979,15 @@ pub(crate) fn rebuild_shredded_with_cache(
         false
     };
     let mut builder = if compact {
+        if metadata.len() > SIZE_LIMIT {
+            return data_invalid("Variant value or metadata exceeds constructor size limit");
+        }
+        validate_metadata(metadata)?;
         VariantBuilder::new()
     } else {
         VariantBuilder::with_source_metadata(cache.get_or_parse(metadata)?)
     };
-    let mut validation =
-        VariantMetadataValidation::new(metadata, builder.source_metadata.is_some());
+    let mut validation = VariantMetadataValidation::new(metadata, true);
     rebuild_shredded_into(row, &mut validation, schema, &mut builder, 0)?;
     builder.result_from_validated_inputs()
 }
@@ -4669,6 +4672,44 @@ mod tests {
         assert!(
             matches!(err, Error::DataInvalid { message, .. } if message.contains("size limit"))
         );
+    }
+
+    #[test]
+    fn rebuild_shredded_rejects_invalid_unused_metadata_key_on_compact_path() {
+        let schema = simple_object_shredding_schema();
+        let original = GenericVariant::parse_json(r#"{"age":27}"#).unwrap();
+        let mut row = cast_shredded(&original, &schema).unwrap();
+        assert!(row.field(schema.variant_idx.unwrap()).is_none());
+
+        let unused_keys = (0..512)
+            .map(|key| format!(r#", "zz_{key:04}_abcdefghijklmnop":0"#))
+            .collect::<String>();
+        let wide = GenericVariant::parse_json(&format!(r#"{{"age":27{unused_keys}}}"#)).unwrap();
+        let mut metadata = wide.metadata().to_vec();
+        assert!(metadata.len() > MIN_SPARSE_REBUILD_METADATA_BYTES);
+
+        row.set(
+            schema.top_level_metadata_idx.unwrap(),
+            ShreddedValue::Binary(metadata.clone()),
+        )
+        .unwrap();
+        let mut cache = RebuildMetadataCache::default();
+        let rebuilt = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap();
+        assert_eq!(rebuilt.to_json().unwrap(), original.to_json().unwrap());
+        assert!(
+            cache.entries.is_empty(),
+            "the valid row must use compact output"
+        );
+
+        *metadata.last_mut().unwrap() = 0xff;
+        row.set(
+            schema.top_level_metadata_idx.unwrap(),
+            ShreddedValue::Binary(metadata),
+        )
+        .unwrap();
+        let err = rebuild_shredded_with_cache(&row, &schema, &mut RebuildMetadataCache::default())
+            .unwrap_err();
+        assert!(matches!(err, Error::DataInvalid { message, .. } if message.contains("UTF-8")));
     }
 
     #[test]
