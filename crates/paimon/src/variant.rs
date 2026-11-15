@@ -1640,6 +1640,11 @@ impl VariantBuilder {
         push_signed_le(&mut self.value, value as i128, 8);
     }
 
+    fn append_uuid(&mut self, value: uuid::Uuid) {
+        self.value.push(primitive_header(UUID));
+        self.value.extend_from_slice(value.as_bytes());
+    }
+
     fn append_decimal(&mut self, decimal: VariantDecimal) {
         if decimal.scale as u8 <= MAX_DECIMAL4_PRECISION
             && decimal.precision <= MAX_DECIMAL4_PRECISION
@@ -1663,6 +1668,84 @@ impl VariantBuilder {
 
     fn write_pos(&self) -> usize {
         self.value.len()
+    }
+
+    // The path-extraction builder has no source dictionary. Re-encode keys
+    // there; only full-value rebuilding may copy source IDs and value bytes.
+    fn append_variant_ref(&mut self, variant: VariantRef<'_>) -> Result<()> {
+        match variant.kind()? {
+            VariantKind::Object => {
+                let start = self.write_pos();
+                let mut fields = Vec::new();
+                for field in variant.object_fields()? {
+                    let id = self.add_key(&field.key);
+                    fields.push(FieldEntry {
+                        key: field.key,
+                        id,
+                        offset: self.write_pos() - start,
+                    });
+                    self.append_variant_ref(field.value)?;
+                }
+                self.finish_object(start, fields)
+            }
+            VariantKind::Array => {
+                let start = self.write_pos();
+                let mut offsets = Vec::new();
+                for element in variant.array_elements()? {
+                    offsets.push(self.write_pos() - start);
+                    self.append_variant_ref(element)?;
+                }
+                self.finish_array(start, offsets)
+            }
+            VariantKind::Null => {
+                self.append_null();
+                Ok(())
+            }
+            VariantKind::Boolean => {
+                self.append_bool(variant.get_boolean()?);
+                Ok(())
+            }
+            VariantKind::Long => {
+                self.append_long(variant.get_long()?);
+                Ok(())
+            }
+            VariantKind::String => {
+                self.append_string(&variant.get_string()?);
+                Ok(())
+            }
+            VariantKind::Double => {
+                self.append_double(variant.get_double()?);
+                Ok(())
+            }
+            VariantKind::Decimal => {
+                self.append_decimal(variant.get_decimal()?);
+                Ok(())
+            }
+            VariantKind::Date => {
+                self.append_date(variant.get_long()? as i32);
+                Ok(())
+            }
+            VariantKind::Timestamp => {
+                self.append_timestamp(variant.get_long()?);
+                Ok(())
+            }
+            VariantKind::TimestampNtz => {
+                self.append_timestamp_ntz(variant.get_long()?);
+                Ok(())
+            }
+            VariantKind::Float => {
+                self.append_float(variant.get_float()?);
+                Ok(())
+            }
+            VariantKind::Binary => {
+                self.append_binary(variant.get_binary()?);
+                Ok(())
+            }
+            VariantKind::Uuid => {
+                self.append_uuid(get_uuid(variant.value, variant.pos)?);
+                Ok(())
+            }
+        }
     }
 
     fn finish_object(&mut self, start: usize, mut fields: Vec<FieldEntry>) -> Result<()> {
@@ -3260,7 +3343,11 @@ fn rebuild_shredded_into(
                         return data_invalid("Malformed shredded Variant object field");
                     };
                     if shredded_row_has_value(field_row, &field.schema) {
-                        let id = builder.source_key_id(&field.field_name);
+                        let id = if builder.source_metadata.is_some() {
+                            builder.source_key_id(&field.field_name)
+                        } else {
+                            builder.add_key(&field.field_name)
+                        };
                         fields.push(FieldEntry {
                             key: field.field_name.clone(),
                             id,
@@ -3283,13 +3370,21 @@ fn rebuild_shredded_into(
                                 "Malformed shredded Variant duplicate object field",
                             );
                         }
-                        let id = field.id;
+                        let id = if builder.source_metadata.is_some() {
+                            field.id
+                        } else {
+                            builder.add_key(&field.key)
+                        };
                         fields.push(FieldEntry {
                             key: field.key,
                             id,
                             offset: builder.write_pos() - start,
                         });
-                        builder.value.extend_from_slice(field.value.value_slice()?);
+                        if builder.source_metadata.is_some() {
+                            builder.value.extend_from_slice(field.value.value_slice()?);
+                        } else {
+                            builder.append_variant_ref(field.value)?;
+                        }
                     }
                 }
                 builder.finish_object(start, fields)?;
@@ -3302,7 +3397,11 @@ fn rebuild_shredded_into(
         let mut validation =
             VariantMetadataValidation::new(metadata, builder.source_metadata.is_some());
         let variant = VariantRef::new_with_cached_metadata(value, 0, &mut validation)?;
-        builder.value.extend_from_slice(variant.value_slice()?);
+        if builder.source_metadata.is_some() {
+            builder.value.extend_from_slice(variant.value_slice()?);
+        } else {
+            builder.append_variant_ref(variant)?;
+        }
         Ok(())
     } else {
         data_invalid("Malformed shredded Variant: missing value")
@@ -4175,6 +4274,31 @@ mod tests {
 
         let rebuilt = rebuild_shredded(&row, &schema).unwrap();
         assert_eq!(rebuilt.to_json().unwrap(), variant.to_json().unwrap());
+    }
+
+    #[test]
+    fn extracting_mixed_typed_and_residual_object_preserves_metadata_ids() {
+        let schema = simple_object_shredding_schema();
+        let original = GenericVariant::parse_json(r#"{"age":27,"extra":{"nested":1}}"#).unwrap();
+        let row = cast_shredded(&original, &schema).unwrap();
+        let expected = original.to_json().unwrap();
+        let string_type = DataType::VarChar(VarCharType::string_type());
+
+        for fail_on_error in [false, true] {
+            let mut metadata = VariantMetadataValidation::new(original.metadata(), false);
+            assert_eq!(
+                extract_shredded_path_cast(
+                    &row,
+                    &schema,
+                    &mut metadata,
+                    "$",
+                    &string_type,
+                    fail_on_error,
+                )
+                .unwrap(),
+                Some(ShreddedValue::String(expected.clone()))
+            );
+        }
     }
 
     #[test]
