@@ -28,10 +28,10 @@ use crate::spec::{
 };
 use crate::variant::{
     build_variant_schema, cast_shredded, cast_variant_to_shredded_value,
-    infer_variant_shredding_schema, rebuild_shredded, top_level_path_key, variant_shredding_type,
-    GenericVariant, ShreddedRow, ShreddedValue, VariantShreddingInferConfig,
-    VariantShreddingInferenceSession, VARIANT_METADATA_FIELD_NAME, VARIANT_TYPED_VALUE_FIELD_NAME,
-    VARIANT_VALUE_FIELD_NAME,
+    infer_variant_shredding_schema, rebuild_shredded, rebuild_shredded_with_cache,
+    top_level_path_key, variant_shredding_type, GenericVariant, RebuildMetadataCache, ShreddedRow,
+    ShreddedValue, VariantShreddingInferConfig, VariantShreddingInferenceSession,
+    VARIANT_METADATA_FIELD_NAME, VARIANT_TYPED_VALUE_FIELD_NAME, VARIANT_VALUE_FIELD_NAME,
 };
 use crate::{Error, Result};
 use arrow_array::{
@@ -795,6 +795,7 @@ pub(crate) fn assemble_shredded_variant_array(array: &dyn Array) -> Result<Array
         })?;
 
     let mut variants = Vec::with_capacity(input.len());
+    let mut metadata_cache = RebuildMetadataCache::default();
     for row in 0..input.len() {
         if input.is_null(row) {
             variants.push(None);
@@ -804,7 +805,11 @@ pub(crate) fn assemble_shredded_variant_array(array: &dyn Array) -> Result<Array
                     message: "Shredded Variant row is null".to_string(),
                     source: None,
                 })?;
-            variants.push(Some(rebuild_shredded(&shredded, &schema)?));
+            variants.push(Some(rebuild_shredded_with_cache(
+                &shredded,
+                &schema,
+                &mut metadata_cache,
+            )?));
         }
     }
     variant_array(variants)
@@ -2039,8 +2044,202 @@ mod tests {
     use super::*;
     use crate::arrow::variant_arrow_type;
     use crate::spec::{
-        variant_extraction_row, BlobType, FloatType, IntType, VarCharType, VariantType,
+        variant_extraction_row, BigIntType, BlobType, DoubleType, FloatType, IntType, TinyIntType,
+        VarCharType, VariantType,
     };
+
+    #[test]
+    #[ignore = "manual synthetic full-Variant rebuild benchmark"]
+    fn benchmark_wide_shredded_variant_rebuild() {
+        let fields = (0..200)
+            .map(|index| {
+                let ty = if index % 2 == 0 {
+                    DataType::TinyInt(TinyIntType::new())
+                } else {
+                    DataType::Double(DoubleType::new())
+                };
+                DataField::new(index, format!("field_{index:04}"), ty)
+            })
+            .collect();
+        let physical = variant_shredding_type(&DataType::Row(RowType::new(fields))).unwrap();
+        let json = (0..5362)
+            .map(|index| {
+                let value = if index < 200 && index % 2 == 1 && index >= 54 {
+                    "1.5e0"
+                } else {
+                    "0"
+                };
+                format!("\"field_{index:04}\":{value}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let original = GenericVariant::parse_json(&format!("{{{json}}}")).unwrap();
+        let input = variant_array(vec![Some(original.clone()); 512]).unwrap();
+        let shredded = shred_variant_array(input.as_ref(), &physical).unwrap();
+
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let assembled = assemble_shredded_variant_array(shredded.as_ref()).unwrap();
+            eprintln!("512 rows x 5362 fields: {:?}", start.elapsed());
+            let first = variant_from_array(assembled.as_ref(), 0).unwrap().unwrap();
+            assert_eq!(first.to_json().unwrap(), original.to_json().unwrap());
+            std::hint::black_box(assembled);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual in-memory Parquet decode and full-Variant assembly benchmark"]
+    fn benchmark_wide_variant_parquet_read() {
+        use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter};
+        use sha2::{Digest, Sha256};
+
+        fn encode(array: ArrayRef) -> bytes::Bytes {
+            let schema = Arc::new(arrow_schema::Schema::new(vec![ArrowField::new(
+                "v",
+                array.data_type().clone(),
+                true,
+            )]));
+            let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+            let mut encoded = Vec::new();
+            let mut writer = ArrowWriter::try_new(&mut encoded, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            bytes::Bytes::from(encoded)
+        }
+
+        fn decode(encoded: &bytes::Bytes) -> ArrayRef {
+            ParquetRecordBatchReaderBuilder::try_new(encoded.clone())
+                .unwrap()
+                .with_batch_size(512)
+                .build()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .column(0)
+                .clone()
+        }
+
+        let fields = (0..200)
+            .map(|index| {
+                let ty = if index % 2 == 0 {
+                    DataType::TinyInt(TinyIntType::new())
+                } else {
+                    DataType::Double(DoubleType::new())
+                };
+                DataField::new(index, format!("field_{index:04}"), ty)
+            })
+            .collect();
+        let physical = variant_shredding_type(&DataType::Row(RowType::new(fields))).unwrap();
+        let json = (0..5362)
+            .map(|index| {
+                let value = if index < 200 && index % 2 == 1 && index >= 54 {
+                    "1.5e0"
+                } else {
+                    "0"
+                };
+                format!("\"field_{index:04}\":{value}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let original = GenericVariant::parse_json(&format!("{{{json}}}")).unwrap();
+        let plain = variant_array(vec![Some(original.clone()); 512]).unwrap();
+        let shredded = shred_variant_array(plain.as_ref(), &physical).unwrap();
+        let plain_file = encode(plain);
+        let shredded_file = encode(shredded);
+
+        let assembled = assemble_shredded_variant_array(decode(&shredded_file).as_ref()).unwrap();
+        let expected = original.to_json().unwrap();
+        let mut digest = Sha256::new();
+        for row in 0..512 {
+            let actual = variant_from_array(assembled.as_ref(), row)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual.to_json().unwrap(), expected);
+            digest.update((actual.value().len() as u64).to_le_bytes());
+            digest.update(actual.value());
+            digest.update((actual.metadata().len() as u64).to_le_bytes());
+            digest.update(actual.metadata());
+        }
+        eprintln!(
+            "plain_file={} bytes, shredded_file={} bytes, output_sha256={}",
+            plain_file.len(),
+            shredded_file.len(),
+            hex::encode(digest.finalize())
+        );
+
+        for round in 0..7 {
+            let plain_start = std::time::Instant::now();
+            std::hint::black_box(decode(&plain_file));
+            let plain_elapsed = plain_start.elapsed();
+
+            let shredded_start = std::time::Instant::now();
+            let physical = decode(&shredded_file);
+            std::hint::black_box(assemble_shredded_variant_array(physical.as_ref()).unwrap());
+            let shredded_elapsed = shredded_start.elapsed();
+            eprintln!("round {round}: plain={plain_elapsed:?}, shredded={shredded_elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn sparse_shredded_batch_does_not_copy_wide_dictionaries() {
+        let configured = DataType::Row(RowType::new(vec![DataField::new(
+            7,
+            "age".to_string(),
+            DataType::BigInt(BigIntType::new()),
+        )]));
+        let physical = variant_shredding_type(&configured).unwrap();
+        for small_json in [
+            r#"{"age":27}"#.to_string(),
+            format!(r#"{{"age":27,"text":"{}"}}"#, "x".repeat(16 * 1024)),
+            format!(
+                r#"{{"age":27,"items":[{}]}}"#,
+                vec![r#"{"x":1,"y":2,"z":3}"#; 256].join(",")
+            ),
+        ] {
+            let small = GenericVariant::parse_json(&small_json).unwrap();
+            let prefix = small_json.strip_suffix('}').unwrap();
+            let extra_keys = if small_json.len() > 1024 { 5_362 } else { 512 };
+            let sources = (0..9)
+                .map(|suffix| {
+                    let extra = (0..extra_keys)
+                        .map(|key| format!(r#", "zz_{suffix}_{key:04}":0"#))
+                        .collect::<String>();
+                    let wide = GenericVariant::parse_json(&format!("{prefix}{extra}}}")).unwrap();
+                    assert!(wide.metadata().len() > 4096);
+                    GenericVariant::from_parts(small.value().to_vec(), wide.metadata().to_vec())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                sources
+                    .iter()
+                    .map(|source| source.metadata().len())
+                    .sum::<usize>()
+                    < 1024 * 1024
+            );
+            let source_metadata_bytes = (0..512)
+                .map(|row| sources[row % sources.len()].metadata().len())
+                .sum::<usize>();
+            let input = variant_array(
+                (0..512)
+                    .map(|row| Some(sources[row % sources.len()].clone()))
+                    .collect(),
+            )
+            .unwrap();
+            let shredded = shred_variant_array(input.as_ref(), &physical).unwrap();
+            let assembled = assemble_shredded_variant_array(shredded.as_ref()).unwrap();
+            let mut result_metadata_bytes = 0;
+            for row in 0..512 {
+                let value = variant_from_array(assembled.as_ref(), row)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(value.to_json().unwrap(), small.to_json().unwrap());
+                result_metadata_bytes += value.metadata().len();
+            }
+            assert!(result_metadata_bytes < source_metadata_bytes / 8);
+        }
+    }
 
     #[test]
     fn factory_owns_activation_and_configured_schema_precedence() {
@@ -3203,5 +3402,50 @@ mod tests {
             let actual = variant_from_array(restored.as_ref(), row).unwrap().unwrap();
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn parquet_shredded_decimal_rejects_value_exceeding_typed_precision() {
+        use crate::spec::DecimalType;
+
+        let DataType::Row(physical) =
+            variant_shredding_type(&DataType::Decimal(DecimalType::new(9, 0).unwrap())).unwrap()
+        else {
+            panic!("expected shredded Variant ROW");
+        };
+        let schema = build_variant_schema(&physical).unwrap();
+        let original = GenericVariant::parse_json("1").unwrap();
+        let mut row = cast_shredded(&original, &schema).unwrap();
+        assert!(row.field(schema.variant_idx.unwrap()).is_none());
+
+        row.set(
+            schema.typed_idx.unwrap(),
+            ShreddedValue::Decimal128(999_999_999),
+        )
+        .unwrap();
+        let valid = parquet_roundtrip(
+            shredded_rows_to_struct_array(vec![Some(row.clone())], &physical).unwrap(),
+        );
+        let restored = assemble_shredded_variant_array(valid.as_ref()).unwrap();
+        assert_eq!(
+            variant_from_array(restored.as_ref(), 0)
+                .unwrap()
+                .unwrap()
+                .to_json()
+                .unwrap(),
+            "999999999"
+        );
+
+        row.set(
+            schema.typed_idx.unwrap(),
+            ShreddedValue::Decimal128(1_000_000_000),
+        )
+        .unwrap();
+        let invalid =
+            parquet_roundtrip(shredded_rows_to_struct_array(vec![Some(row)], &physical).unwrap());
+        let err = assemble_shredded_variant_array(invalid.as_ref()).unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { message, .. } if message.contains("decimal typed_value precision"))
+        );
     }
 }
