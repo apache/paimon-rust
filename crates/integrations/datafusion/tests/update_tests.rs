@@ -581,8 +581,8 @@ async fn test_update_with_order_by_and_limit() {
         // ORDER BY uses the original values of the updated column.
         let cnt = dml_count(
             &sql_context,
-            "UPDATE paimon.test_db.t SET id = id + 10 \
-             WHERE id <> 4 ORDER BY pt DESC, id ASC LIMIT 2",
+            "UPDATE paimon.test_db.t SET id = paimon.test_db.t.id + 10 \
+             WHERE t.id <> 4 ORDER BY t.pt DESC, t.id ASC LIMIT 2",
         )
         .await;
         assert_eq!(cnt, 2);
@@ -607,6 +607,66 @@ async fn test_update_with_order_by_and_limit() {
             rows.iter().filter(|(_, name, _)| name == "limited").count(),
             1
         );
+    }
+}
+
+#[tokio::test]
+async fn test_update_selects_rows_before_set() {
+    for options in [
+        "",
+        "WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true',
+            'deletion-vectors.enabled' = 'true'
+        )",
+    ] {
+        for (assignment, ordering, expected) in [
+            (
+                "id + 100",
+                "__upd_id",
+                vec![(1, "a".into(), 20), (102, "b".into(), 10)],
+            ),
+            (
+                "12 / (2 - id)",
+                "id",
+                vec![(2, "b".into(), 10), (12, "a".into(), 20)],
+            ),
+        ] {
+            let (_tmp, catalog) = create_test_env();
+            let sql_context = create_sql_context(catalog).await;
+            sql_context
+                .sql("CREATE SCHEMA paimon.test_db")
+                .await
+                .unwrap();
+            sql_context
+                .sql(&format!(
+                    "CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, __upd_id INT) {options}"
+                ))
+                .await
+                .unwrap();
+            exec(
+                &sql_context,
+                "INSERT INTO paimon.test_db.t (id, name, __upd_id) VALUES (1, 'a', 20), (2, 'b', 10)",
+            )
+            .await;
+
+            let cnt = dml_count(
+                &sql_context,
+                &format!(
+                    "UPDATE paimon.test_db.t SET id = {assignment} ORDER BY {ordering} LIMIT 1"
+                ),
+            )
+            .await;
+            assert_eq!(cnt, 1);
+            assert_eq!(
+                query_int_str_int(
+                    &sql_context,
+                    "SELECT id, name, __upd_id FROM paimon.test_db.t ORDER BY id"
+                )
+                .await,
+                expected
+            );
+        }
     }
 }
 

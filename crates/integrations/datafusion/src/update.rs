@@ -35,9 +35,10 @@ use paimon::table::{CopyOnWriteMergeWriter, Table};
 
 use crate::error::to_datafusion_error;
 use crate::merge_into::{
-    build_dml_selection_clause, build_partition_set_from_where, extract_tracking_columns,
-    is_delete_conflict, is_row_id_conflict, ok_result, project_update_columns, quote_identifier,
-    register_cow_target_table, retry_on_conflict, validate_update_columns, TempTableTracker,
+    build_dml_selection_clause, build_partition_set_from_where, dml_table_alias,
+    extract_tracking_columns, is_delete_conflict, is_row_id_conflict, ok_result,
+    project_update_columns, quote_identifier, register_cow_target_table, retry_on_conflict,
+    validate_update_columns, TempTableTracker,
 };
 use crate::sql_context::{normalize_schema_identifier, SQLContext};
 
@@ -113,14 +114,17 @@ async fn execute_update_once(
             }))
             .collect();
 
-    let select_clause = select_parts.join(", ");
     let selection_clause = build_dml_selection_clause(
         update.selection.as_ref(),
         &update.order_by,
         update.limit.as_ref(),
     );
 
-    let query_sql = format!("SELECT {select_clause} FROM {table_ref}{selection_clause}");
+    let alias = dml_table_alias(ctx.ctx(), &table_ref);
+    let select_clause = select_parts.join(", ");
+    let query_sql = format!(
+        "SELECT {select_clause} FROM (SELECT * FROM {table_ref}{selection_clause}) AS {alias}"
+    );
     let batches = ctx.ctx().sql(&query_sql).await?.collect().await?;
 
     // 4. Project update columns (rename __upd_X → X)
@@ -235,15 +239,18 @@ async fn execute_cow_update_inner(
             }))
             .collect();
 
-    let select_clause = select_parts.join(", ");
+    let table_ref = update.table.to_string();
     let selection_clause = build_dml_selection_clause(
         update.selection.as_ref(),
         &update.order_by,
         update.limit.as_ref(),
     );
-
-    // Selection clauses are rendered from the sqlparser AST.
-    let query_sql = format!("SELECT {select_clause} FROM {cow_table_name}{selection_clause}");
+    let alias = dml_table_alias(ctx, &table_ref);
+    let select_clause = select_parts.join(", ");
+    let query_sql = format!(
+        "SELECT {select_clause} FROM \
+         (SELECT * FROM {cow_table_name} AS {alias}{selection_clause}) AS {alias}"
+    );
     let join_result = ctx.sql(&query_sql).await?.collect().await?;
 
     let mut update_value_batches: Vec<RecordBatch> = Vec::new();

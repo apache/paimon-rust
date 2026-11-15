@@ -502,7 +502,7 @@ async fn test_delete_with_order_by_and_limit() {
         let cnt = dml_count(
             &sql_context,
             "DELETE FROM paimon.test_db.t \
-             WHERE id <> 4 ORDER BY pt DESC, id ASC LIMIT 2",
+             WHERE t.id <> 4 ORDER BY paimon.test_db.t.pt DESC, t.id ASC LIMIT 2",
         )
         .await;
         assert_eq!(cnt, 2);

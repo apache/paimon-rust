@@ -36,7 +36,7 @@ use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, Sch
 use datafusion::arrow::record_batch::RecordBatchOptions;
 use datafusion::catalog::Session;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, DFSchema, DFSchemaRef};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, TableReference};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -1162,6 +1162,17 @@ pub(crate) fn build_partition_set_from_batches(
     }
 
     Ok(Some(partition_set))
+}
+
+/// Use the original target name as the alias of an internal DML relation.
+pub(crate) fn dml_table_alias(ctx: &SessionContext, table_ref: &str) -> String {
+    let normalize = ctx
+        .state()
+        .config_options()
+        .sql_parser
+        .enable_ident_normalization;
+    let target = TableReference::parse_str_normalized(table_ref, !normalize);
+    quote_identifier(target.table())
 }
 
 /// Preserve DML row selection in the internal SELECT so filtering, global sorting,

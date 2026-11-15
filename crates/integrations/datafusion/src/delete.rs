@@ -29,9 +29,9 @@ use paimon::table::{CopyOnWriteMergeWriter, Table};
 use crate::error::to_datafusion_error;
 use crate::merge_into::TempTableTracker;
 use crate::merge_into::{
-    build_dml_selection_clause, build_partition_set_from_where, extract_tracking_columns,
-    is_delete_conflict, is_row_id_conflict, ok_result, register_cow_target_table,
-    retry_on_conflict,
+    build_dml_selection_clause, build_partition_set_from_where, dml_table_alias,
+    extract_tracking_columns, is_delete_conflict, is_row_id_conflict, ok_result,
+    register_cow_target_table, retry_on_conflict,
 };
 use crate::sql_context::SQLContext;
 
@@ -162,8 +162,14 @@ async fn execute_cow_delete_once(
     }
 
     let cow_target_qualified = cow_table_name;
-    let result =
-        execute_cow_delete_inner(ctx.ctx(), &cow_target_qualified, delete, &mut writer).await;
+    let result = execute_cow_delete_inner(
+        ctx.ctx(),
+        &cow_target_qualified,
+        table_ref,
+        delete,
+        &mut writer,
+    )
+    .await;
     let total_count = result?;
 
     let messages = writer.prepare_commit().await.map_err(to_datafusion_error)?;
@@ -181,6 +187,7 @@ async fn execute_cow_delete_once(
 async fn execute_cow_delete_inner(
     ctx: &SessionContext,
     cow_table_name: &str,
+    table_ref: &str,
     delete: &Delete,
     writer: &mut CopyOnWriteMergeWriter,
 ) -> DFResult<u64> {
@@ -189,10 +196,10 @@ async fn execute_cow_delete_inner(
         &delete.order_by,
         delete.limit.as_ref(),
     );
-
-    // Selection clauses are rendered from the sqlparser AST.
+    let alias = dml_table_alias(ctx, table_ref);
     let query_sql = format!(
-        "SELECT \"__paimon_file_idx\", \"__paimon_row_offset\" FROM {cow_table_name}{selection_clause}"
+        "SELECT \"__paimon_file_idx\", \"__paimon_row_offset\" \
+         FROM {cow_table_name} AS {alias}{selection_clause}"
     );
     let batches = ctx.sql(&query_sql).await?.collect().await?;
 
