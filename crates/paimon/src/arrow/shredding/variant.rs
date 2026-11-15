@@ -3403,4 +3403,49 @@ mod tests {
             assert_eq!(actual, expected);
         }
     }
+
+    #[test]
+    fn parquet_shredded_decimal_rejects_value_exceeding_typed_precision() {
+        use crate::spec::DecimalType;
+
+        let DataType::Row(physical) =
+            variant_shredding_type(&DataType::Decimal(DecimalType::new(9, 0).unwrap())).unwrap()
+        else {
+            panic!("expected shredded Variant ROW");
+        };
+        let schema = build_variant_schema(&physical).unwrap();
+        let original = GenericVariant::parse_json("1").unwrap();
+        let mut row = cast_shredded(&original, &schema).unwrap();
+        assert!(row.field(schema.variant_idx.unwrap()).is_none());
+
+        row.set(
+            schema.typed_idx.unwrap(),
+            ShreddedValue::Decimal128(999_999_999),
+        )
+        .unwrap();
+        let valid = parquet_roundtrip(
+            shredded_rows_to_struct_array(vec![Some(row.clone())], &physical).unwrap(),
+        );
+        let restored = assemble_shredded_variant_array(valid.as_ref()).unwrap();
+        assert_eq!(
+            variant_from_array(restored.as_ref(), 0)
+                .unwrap()
+                .unwrap()
+                .to_json()
+                .unwrap(),
+            "999999999"
+        );
+
+        row.set(
+            schema.typed_idx.unwrap(),
+            ShreddedValue::Decimal128(1_000_000_000),
+        )
+        .unwrap();
+        let invalid =
+            parquet_roundtrip(shredded_rows_to_struct_array(vec![Some(row)], &physical).unwrap());
+        let err = assemble_shredded_variant_array(invalid.as_ref()).unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { message, .. } if message.contains("decimal typed_value precision"))
+        );
+    }
 }

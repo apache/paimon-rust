@@ -3743,11 +3743,16 @@ fn append_scalar_shredded_value(
         (
             VariantScalarSchema::Decimal { precision, scale },
             ShreddedValue::Decimal128(unscaled),
-        ) => builder.append_decimal(VariantDecimal {
-            unscaled: *unscaled,
-            precision: *precision,
-            scale: *scale,
-        }),
+        ) => {
+            if decimal_precision(*unscaled) > *precision {
+                return data_invalid("Malformed shredded Variant decimal typed_value precision");
+            }
+            builder.append_decimal(VariantDecimal {
+                unscaled: *unscaled,
+                precision: *precision,
+                scale: *scale,
+            });
+        }
         (VariantScalarSchema::String, ShreddedValue::String(v)) => builder.append_string(v),
         (VariantScalarSchema::Binary, ShreddedValue::Binary(v)) => builder.append_binary(v),
         (VariantScalarSchema::Date32, ShreddedValue::Date32(v)) => builder.append_date(*v),
