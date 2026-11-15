@@ -2098,6 +2098,10 @@ mod tests {
         for small_json in [
             r#"{"age":27}"#.to_string(),
             format!(r#"{{"age":27,"text":"{}"}}"#, "x".repeat(16 * 1024)),
+            format!(
+                r#"{{"age":27,"items":[{}]}}"#,
+                vec![r#"{"x":1,"y":2,"z":3}"#; 256].join(",")
+            ),
         ] {
             let small = GenericVariant::parse_json(&small_json).unwrap();
             let prefix = small_json.strip_suffix('}').unwrap();

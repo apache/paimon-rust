@@ -47,6 +47,7 @@ const MAX_REBUILD_METADATA_BYTES: usize = 8 * 1024 * 1024;
 // sparse result costs more than remapping the keys actually present.
 const MIN_SPARSE_REBUILD_METADATA_BYTES: usize = 4 * 1024;
 const SPARSE_REBUILD_KEY_RATIO: usize = 8;
+const MAX_SPARSE_REBUILD_SCAN_NODES: usize = 4096;
 
 thread_local! {
     /// Exact-byte cache: metadata dictionaries are often repeated across rows and
@@ -2881,18 +2882,24 @@ pub(crate) fn rebuild_shredded_with_cache(
         return GenericVariant::from_parts(value.to_vec(), metadata.to_vec());
     }
 
-    // Count keys, not payload bytes: a single long string must not make a
-    // two-field object look dense. Stop once enough keys are found to reuse
-    // the dictionary; malformed input takes the normal validating path.
+    // Count distinct keys, not payload bytes or array element occurrences.
+    // Bound work on unvalidated values before the normal rebuild validates them.
     let compact = if metadata.len() > MIN_SPARSE_REBUILD_METADATA_BYTES {
         metadata_offset_size(metadata)
             .and_then(|size| read_unsigned(metadata, 1, size))
             .ok()
             .is_some_and(|keys| {
                 let limit = keys / SPARSE_REBUILD_KEY_RATIO;
-                limit > 0
-                    && rebuilt_key_occurrences(row, schema, limit, 0)
-                        .is_some_and(|used| used < limit)
+                if limit == 0 {
+                    return false;
+                }
+                let mut scan = RebuiltKeyScan {
+                    metadata,
+                    distinct: HashSet::new(),
+                    remaining_nodes: MAX_SPARSE_REBUILD_SCAN_NODES,
+                    limit,
+                };
+                matches!(scan.visit_row(row, schema, 0), Some(false))
             })
     } else {
         false
@@ -2906,110 +2913,149 @@ pub(crate) fn rebuild_shredded_with_cache(
     builder.result()
 }
 
-/// An upper bound on distinct keys, capped at `limit`. Repeated keys in arrays
-/// may overcount, which only makes us conservatively retain the source metadata.
-fn rebuilt_key_occurrences(
-    row: &ShreddedRow,
-    schema: &VariantSchema,
+/// A bounded, best-effort preflight. `Some(true)` proves that enough distinct
+/// keys exist to reuse the dictionary; `Some(false)` selects compact output.
+/// Malformed structure returns `None` and lets the validating path report it.
+struct RebuiltKeyScan<'a> {
+    metadata: &'a [u8],
+    distinct: HashSet<&'a str>,
+    remaining_nodes: usize,
     limit: usize,
-    depth: usize,
-) -> Option<usize> {
-    if depth > MAX_NESTING_DEPTH || limit == 0 {
-        return None;
-    }
-    let mut count = 0;
-    if let Some(typed) = schema.typed_idx.and_then(|idx| row.field(idx)) {
-        match typed {
-            ShreddedValue::Row(object) if schema.object_schema.is_some() => {
-                for (idx, field) in schema.object_schema.as_ref()?.iter().enumerate() {
-                    let ShreddedValue::Row(child) = object.field(idx)? else {
-                        return None;
-                    };
-                    if shredded_row_has_value(child, &field.schema) {
-                        count += 1;
-                        if count >= limit {
-                            return Some(limit);
-                        }
-                        count += rebuilt_key_occurrences(
-                            child,
-                            &field.schema,
-                            limit - count,
-                            depth + 1,
-                        )?;
-                    }
-                }
-            }
-            ShreddedValue::List(elements) if schema.array_schema.is_some() => {
-                for element in elements {
-                    count += rebuilt_key_occurrences(
-                        element,
-                        schema.array_schema.as_ref()?,
-                        limit - count,
-                        depth + 1,
-                    )?;
-                    if count >= limit {
-                        return Some(limit);
-                    }
-                }
-            }
-            _ if schema.object_schema.is_some() || schema.array_schema.is_some() => return None,
-            _ => {}
-        }
-    }
-    if let Some(value) = schema.variant_idx.and_then(|idx| row.field(idx)) {
-        let ShreddedValue::Binary(value) = value else {
-            return None;
-        };
-        count += binary_key_occurrences(value, 0, limit - count, depth)?;
-    }
-    Some(count)
 }
 
-fn binary_key_occurrences(value: &[u8], pos: usize, limit: usize, depth: usize) -> Option<usize> {
-    if depth > MAX_NESTING_DEPTH || limit == 0 {
-        return None;
+impl<'a> RebuiltKeyScan<'a> {
+    fn add_key(&mut self, key: &'a str) -> bool {
+        self.distinct.insert(key);
+        self.distinct.len() >= self.limit
     }
-    match value_kind(value, pos).ok()? {
-        VariantKind::Object => {
-            let layout = object_layout(value, pos).ok()?;
-            if layout.size >= limit {
-                return Some(limit);
+
+    fn visit_row(
+        &mut self,
+        row: &ShreddedRow,
+        schema: &'a VariantSchema,
+        depth: usize,
+    ) -> Option<bool> {
+        if depth > MAX_NESTING_DEPTH {
+            return None;
+        }
+        if self.remaining_nodes == 0 {
+            return Some(false);
+        }
+        self.remaining_nodes -= 1;
+        if let Some(typed) = schema.typed_idx.and_then(|idx| row.field(idx)) {
+            match typed {
+                ShreddedValue::Row(object) if schema.object_schema.is_some() => {
+                    for (idx, field) in schema.object_schema.as_ref()?.iter().enumerate() {
+                        let ShreddedValue::Row(child) = object.field(idx)? else {
+                            return None;
+                        };
+                        if shredded_row_has_value(child, &field.schema) {
+                            if self.add_key(&field.field_name)
+                                || self.visit_row(child, &field.schema, depth + 1)?
+                            {
+                                return Some(true);
+                            }
+                            if self.remaining_nodes == 0 {
+                                return Some(false);
+                            }
+                        }
+                    }
+                }
+                ShreddedValue::List(elements) if schema.array_schema.is_some() => {
+                    for element in elements {
+                        if self.visit_row(element, schema.array_schema.as_ref()?, depth + 1)? {
+                            return Some(true);
+                        }
+                        if self.remaining_nodes == 0 {
+                            return Some(false);
+                        }
+                    }
+                }
+                _ if schema.object_schema.is_some() || schema.array_schema.is_some() => {
+                    return None;
+                }
+                _ => {}
             }
-            let mut count = layout.size;
-            for idx in 0..layout.size {
-                let offset = read_unsigned(
-                    value,
-                    layout.offset_start + idx * layout.offset_size,
-                    layout.offset_size,
-                )
-                .ok()?;
-                let child = layout.data_start.checked_add(offset)?;
-                count += binary_key_occurrences(value, child, limit - count, depth + 1)?;
-                if count >= limit {
-                    return Some(limit);
+        }
+        if let Some(value) = schema.variant_idx.and_then(|idx| row.field(idx)) {
+            let ShreddedValue::Binary(value) = value else {
+                return None;
+            };
+            if self.visit_binary(value, 0, depth, &mut HashSet::new())? {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
+    fn visit_binary(
+        &mut self,
+        value: &[u8],
+        pos: usize,
+        depth: usize,
+        visited: &mut HashSet<usize>,
+    ) -> Option<bool> {
+        if depth > MAX_NESTING_DEPTH || !visited.insert(pos) {
+            return None;
+        }
+        if self.remaining_nodes == 0 {
+            return Some(false);
+        }
+        self.remaining_nodes -= 1;
+        match value_kind(value, pos).ok()? {
+            VariantKind::Object => {
+                let layout = object_layout(value, pos).ok()?;
+                // A valid object has unique keys. Dense objects need no
+                // per-key preflight; the rebuild still validates malformed ones.
+                if layout.size >= self.limit {
+                    return Some(true);
+                }
+                for idx in 0..layout.size {
+                    let id = read_unsigned(
+                        value,
+                        layout.id_start + idx * layout.id_size,
+                        layout.id_size,
+                    )
+                    .ok()?;
+                    if self.add_key(get_metadata_key_ref(self.metadata, id).ok()?) {
+                        return Some(true);
+                    }
+                    let offset = read_unsigned(
+                        value,
+                        layout.offset_start + idx * layout.offset_size,
+                        layout.offset_size,
+                    )
+                    .ok()?;
+                    let child = layout.data_start.checked_add(offset)?;
+                    if self.visit_binary(value, child, depth + 1, visited)? {
+                        return Some(true);
+                    }
+                    if self.remaining_nodes == 0 {
+                        return Some(false);
+                    }
                 }
             }
-            Some(count)
-        }
-        VariantKind::Array => {
-            let layout = array_layout(value, pos).ok()?;
-            let mut count = 0;
-            for idx in 0..layout.size {
-                let offset = read_unsigned(
-                    value,
-                    layout.offset_start + idx * layout.offset_size,
-                    layout.offset_size,
-                )
-                .ok()?;
-                let child = layout.data_start.checked_add(offset)?;
-                count += binary_key_occurrences(value, child, limit - count, depth + 1)?;
-                if count >= limit {
-                    return Some(limit);
+            VariantKind::Array => {
+                let layout = array_layout(value, pos).ok()?;
+                for idx in 0..layout.size {
+                    let offset = read_unsigned(
+                        value,
+                        layout.offset_start + idx * layout.offset_size,
+                        layout.offset_size,
+                    )
+                    .ok()?;
+                    let child = layout.data_start.checked_add(offset)?;
+                    if self.visit_binary(value, child, depth + 1, visited)? {
+                        return Some(true);
+                    }
+                    if self.remaining_nodes == 0 {
+                        return Some(false);
+                    }
                 }
             }
-            Some(count)
+            _ => {}
         }
-        _ => Some(0),
+        Some(false)
     }
 }
 
@@ -4492,6 +4538,56 @@ mod tests {
         }
         assert!(total_metadata_bytes < 512 * 128);
         assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn malformed_residual_array_does_not_amplify_preflight_work() {
+        // Every array points four elements at the same child. A recursive
+        // preflight without repeated-offset detection visits 4^12 nodes.
+        let mut bad_array = vec![PRIMITIVE | (NULL << BASIC_TYPE_BITS)];
+        for _ in 0..12 {
+            let mut parent = vec![array_header(false, 1), 4, 0, 0, 0, 0, bad_array.len() as u8];
+            parent.extend_from_slice(&bad_array);
+            bad_array = parent;
+        }
+        assert_eq!(bad_array.len(), 85);
+        let metadata = GenericVariant::parse_json("{}").unwrap();
+        let mut scan = RebuiltKeyScan {
+            metadata: metadata.metadata(),
+            distinct: HashSet::new(),
+            remaining_nodes: MAX_SPARSE_REBUILD_SCAN_NODES,
+            limit: 100,
+        };
+        assert_eq!(
+            scan.visit_binary(&bad_array, 0, 0, &mut HashSet::new()),
+            None
+        );
+        assert!(scan.remaining_nodes > MAX_SPARSE_REBUILD_SCAN_NODES - 32);
+
+        let schema = simple_object_shredding_schema();
+        let extra = (0..512)
+            .map(|key| format!(r#", "zz_{key:04}":0"#))
+            .collect::<String>();
+        let source =
+            GenericVariant::parse_json(&format!(r#"{{"age":27,"extra":null{extra}}}"#)).unwrap();
+        let mut row = cast_shredded(&source, &schema).unwrap();
+        let extra_id = (0..514)
+            .find(|id| get_metadata_key_ref(source.metadata(), *id).unwrap() == "extra")
+            .unwrap();
+        let mut bad_root = vec![
+            object_header(false, 1, 1),
+            1,
+            extra_id as u8,
+            0,
+            bad_array.len() as u8,
+        ];
+        bad_root.extend_from_slice(&bad_array);
+        row.set(schema.variant_idx.unwrap(), ShreddedValue::Binary(bad_root))
+            .unwrap();
+        assert!(
+            rebuild_shredded_with_cache(&row, &schema, &mut RebuildMetadataCache::default())
+                .is_err()
+        );
     }
 
     #[test]
