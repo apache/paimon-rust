@@ -1407,6 +1407,9 @@ struct RebuildMetadata {
 
 impl RebuildMetadata {
     fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > SIZE_LIMIT {
+            return data_invalid("Variant value or metadata exceeds constructor size limit");
+        }
         validate_metadata(bytes)?;
         let offset_size = metadata_offset_size(bytes)?;
         let dict_size = read_unsigned(bytes, 1, offset_size)?;
@@ -4506,6 +4509,36 @@ mod tests {
             assert_eq!(rebuilt.to_json().unwrap(), original.to_json().unwrap());
         }
         assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn rebuild_shredded_rejects_oversized_metadata_without_residual() {
+        let schema = simple_object_shredding_schema();
+        let original = GenericVariant::parse_json(r#"{"age":27}"#).unwrap();
+        let mut row = cast_shredded(&original, &schema).unwrap();
+        assert!(row.field(schema.variant_idx.unwrap()).is_none());
+
+        // A valid two-key dictionary: "age" plus one unused, very long key.
+        // Its size is 128 MiB + 17 bytes, while the reconstructed value is small.
+        let mut metadata = vec![b'x'; SIZE_LIMIT + 17];
+        metadata[0] = VERSION | (3 << 6);
+        write_le_at(&mut metadata, 1, 2, 4);
+        write_le_at(&mut metadata, 5, 0, 4);
+        write_le_at(&mut metadata, 9, 3, 4);
+        write_le_at(&mut metadata, 13, SIZE_LIMIT, 4);
+        metadata[17..20].copy_from_slice(b"age");
+        validate_metadata(&metadata).unwrap();
+
+        row.set(
+            schema.top_level_metadata_idx.unwrap(),
+            ShreddedValue::Binary(metadata),
+        )
+        .unwrap();
+        let err = rebuild_shredded_with_cache(&row, &schema, &mut RebuildMetadataCache::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { message, .. } if message.contains("size limit"))
+        );
     }
 
     #[test]
