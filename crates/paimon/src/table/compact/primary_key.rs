@@ -86,6 +86,7 @@ impl PrimaryKeyCompactPlanner {
                         total_buckets,
                         files,
                         output_level: Some(output_level),
+                        blob_field_id: None,
                     });
                 }
                 continue;
@@ -118,6 +119,7 @@ impl PrimaryKeyCompactPlanner {
                     total_buckets,
                     files,
                     output_level: None,
+                    blob_field_id: None,
                 });
             }
         }

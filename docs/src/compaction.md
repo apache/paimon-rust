@@ -19,10 +19,10 @@ under the License.
 
 # Table Compaction
 
-Rust supports small-file compaction for ordinary append tables, normal-file
-compaction for Data Evolution tables, and sorted-run compaction for primary-key
-tables with fixed or dynamic buckets. `CompactBuilder` creates
-a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
+Rust supports small-file compaction for ordinary append tables, normal-file and
+opt-in dedicated BLOB compaction for Data Evolution tables, and sorted-run
+compaction for primary-key tables with fixed or dynamic buckets. `CompactBuilder`
+creates a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
 execution do not publish snapshots; `commit_compact` atomically publishes the
 selected results in a `COMPACT` snapshot. DataFusion SQL runs this flow through
 [`CALL sys.compact`](sql.md#compact), and Python through
@@ -688,15 +688,71 @@ Changing storage options does not migrate values in existing files. If selected
 normal files still provide a field that the current schema stores in dedicated
 files, compaction is rejected before writing or publishing output. Migrate those
 historical inline values first; otherwise omitting the field would lose data.
-With deletion vectors enabled, one output file is limited to 4,294,967,296
+With deletion vectors enabled, one normal output file is limited to 4,294,967,296
 physical row slots so every local position remains deletable by the current
 Rust writer. Wider rewrites are rejected before execution; 64-bit deletion-vector
 writing is not yet supported.
 
-Dedicated Blob/Vector compaction, splitting large normal files, and materializing
+Dedicated Vector compaction, splitting large normal files, and materializing
 deletions into reassigned row IDs are not provided. Setting
 `data-evolution.compaction.split-large-files=true` or
 `data-evolution.compaction.rewrite-row-ids=true` is rejected.
+
+### Dedicated BLOB files
+
+Enable payload compaction explicitly on the Rust builder:
+
+```rust
+let builder = table.new_compact_builder().with_blob_compaction(true);
+let plan = builder.new_planner()?.plan().await?;
+let executor = builder.new_executor()?;
+let mut results = Vec::new();
+for task in plan.tasks() {
+    results.push(executor.execute(task).await?);
+}
+builder.new_commit()?.commit_compact(results).await?;
+```
+
+The default planner and automatic compaction continue to select normal files.
+The BLOB option applies to Data Evolution append tables with row tracking,
+`bucket=-1`, and no primary key. It supports dedicated `BLOB`, `ARRAY<BLOB>`,
+and `MAP<K, BLOB>` files, following Java's `DataEvolutionBlobCompactTask`.
+Video-frame fields and historical `.video` sources are rejected even if the
+current schema no longer configures video storage. BLOB field-type conversion
+and migration from inline storage are unsupported.
+The BLOB switch is currently exposed through the Rust builder; SQL and language
+bindings continue to use normal-file compaction.
+
+Planning resolves historical schemas by field ID, preserving renamed field
+identity and separating dropped/recreated fields with reused names. Each task
+contains at least two files of one field. Overlapping versions stay together;
+adjacent groups are packed by `blob.target-file-size`, while gaps and standalone
+files at or above that size end a bin. A task streams effective values, resolving
+sparse-update placeholders through older versions, into one new `.blob` file.
+The target guides input selection; write-time size and row limits do not roll
+the output. NULL, empty payloads, collection nulls, row IDs, sequence bounds,
+and column sequence metadata are preserved. Deleted physical slots remain;
+BLOB-only tasks retain the existing normal anchors and deletion vectors.
+For example, a five-row baseline with two sparse updates goes from three BLOB
+files to one while keeping the normal anchor and all five physical row slots.
+
+When a BLOB output spans several normal groups, commit it with its planned
+normal merge, or commit that normal merge first. Other task subsets can be
+committed independently. The committer checks the final row-range layout on
+each attempt and rejects omitted or concurrently added overlapping versions
+of the same BLOB field. Historical field IDs, types and supported task options
+are checked again at publication, including for serialized worker results.
+BLOB-only tasks can coexist with updates to other fields or disjoint row-ID
+ranges, disjoint appends and logical deletions. Retained snapshots keep their
+original files.
+Failed execution cleans its partial outputs; use `abort_compact`
+for earlier results that were never submitted. After a failed or uncertain commit,
+retain the submitted outputs and retry with the same `commit_user` and results.
+In a mixed plan, `rows_written` sums the physical slots of normal and BLOB
+outputs, so it can count the same logical row in more than one task.
+
+This operation copies dedicated BLOB payloads. Primary-key managed BLOB
+compaction below merges descriptors and rebuilds reference sidecars instead.
 
 ## Primary-key managed BLOB compaction
 

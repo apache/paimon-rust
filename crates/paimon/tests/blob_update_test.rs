@@ -16,6 +16,8 @@
 // under the License.
 
 mod common;
+#[path = "blob_update/compaction.rs"]
+mod compaction;
 
 use arrow_array::builder::{LargeBinaryBuilder, ListBuilder, MapBuilder, StringBuilder};
 use arrow_array::{
@@ -142,44 +144,6 @@ async fn short_deltas_keep_prefix_placeholders_and_stop_before_unchanged_tail() 
     assert_eq!(
         payloads.iter().collect::<Vec<_>>(),
         vec![Some(b"first".as_slice()), Some(b"second".as_slice())]
-    );
-}
-
-#[tokio::test]
-async fn sparse_positions_continue_across_rolled_delta_files() {
-    let table = table(&[("blob.target-file-size", "20 B")]).await;
-    seed(&table).await;
-    let messages = apply(
-        &table,
-        matched(vec![0, 4], vec![Some(b"first"), Some(b"last")]),
-    )
-    .await;
-    let mut ranges = messages
-        .iter()
-        .flat_map(|message| &message.new_files)
-        .map(|file| file.row_id_range().unwrap())
-        .collect::<Vec<_>>();
-    ranges.sort_unstable();
-    assert_eq!(ranges, vec![(0, 0), (1, 4)]);
-    table
-        .new_write_builder()
-        .new_commit()
-        .commit(messages)
-        .await
-        .unwrap();
-    assert_eq!(
-        rows(&table)
-            .await
-            .iter()
-            .map(|row| row.1.clone())
-            .collect::<Vec<_>>(),
-        vec![
-            Some(b"first".to_vec()),
-            None,
-            Some(vec![]),
-            Some(b"old-3".to_vec()),
-            Some(b"last".to_vec()),
-        ]
     );
 }
 
@@ -325,136 +289,6 @@ fn collection_values(map: bool, values: &[Option<Vec<Option<&[u8]>>>]) -> ArrayR
     }
 }
 
-#[tokio::test]
-async fn collection_updates_preserve_parent_null_empty_and_child_null_values() {
-    for map in [false, true] {
-        for rolling in [false, true] {
-            let blob = DataType::Blob(BlobType::new());
-            let kind = if map {
-                DataType::Map(MapType::new(
-                    DataType::VarChar(VarCharType::new(100).unwrap()),
-                    blob,
-                ))
-            } else {
-                DataType::Array(ArrayType::new(blob))
-            };
-            let table = typed_table(
-                kind,
-                &[(
-                    "blob.target-file-size",
-                    if rolling { "20 B" } else { "1 MB" },
-                )],
-            )
-            .await;
-            let original = collection_values(
-                map,
-                &[
-                    Some(vec![Some(b"zero"), None, Some(b"")]),
-                    None,
-                    Some(vec![]),
-                    Some(vec![Some(b"three")]),
-                    Some(vec![Some(b"four")]),
-                ],
-            );
-            let builder = table.new_write_builder();
-            let mut writer = builder.new_write().unwrap();
-            writer
-                .write_arrow_batch(
-                    &RecordBatch::try_from_iter([
-                        (
-                            "id",
-                            Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])) as ArrayRef,
-                        ),
-                        ("payload", original.clone()),
-                        (
-                            "value",
-                            Arc::new(Int32Array::from(vec![10, 11, 12, 13, 14])) as ArrayRef,
-                        ),
-                    ])
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-            builder
-                .new_commit()
-                .commit(writer.prepare_commit().await.unwrap())
-                .await
-                .unwrap();
-            // Sliced input exercises non-zero list/map offsets as well as
-            // unordered row IDs spanning separate input batches.
-            let values = collection_values(
-                map,
-                &[
-                    Some(vec![Some(b"unused")]),
-                    Some(vec![Some(b"new"), None, Some(b"")]),
-                    None,
-                ],
-            );
-            let batch = RecordBatch::try_from_iter([
-                (
-                    "_ROW_ID",
-                    Arc::new(Int64Array::from(vec![-1, 4, 1])) as ArrayRef,
-                ),
-                ("payload", values),
-            ])
-            .unwrap()
-            .slice(1, 2);
-            let messages = apply(&table, batch).await;
-            assert!(messages
-                .iter()
-                .flat_map(|message| &message.new_files)
-                .all(|file| file.file_name.ends_with(".blob")));
-            builder.new_commit().commit(messages).await.unwrap();
-            let batch = read_batch(&table).await;
-            let expected = collection_values(
-                map,
-                &[
-                    Some(vec![Some(b"zero"), None, Some(b"")]),
-                    None,
-                    Some(vec![]),
-                    Some(vec![Some(b"three")]),
-                    Some(vec![Some(b"new"), None, Some(b"")]),
-                ],
-            );
-            let expected = arrow_cast::cast(&expected, batch.column(1).data_type()).unwrap();
-            assert_eq!(batch.column(1).to_data(), expected.to_data());
-            let descriptors = table.copy_with_options(
-                [("blob-as-descriptor".into(), "true".into())]
-                    .into_iter()
-                    .collect(),
-            );
-            let batch = read_batch(&descriptors).await;
-            let payload = batch.column(1);
-            assert!(payload.is_null(1));
-            let (children, empty) = if map {
-                let map = payload.as_any().downcast_ref::<MapArray>().unwrap();
-                (map.value(4).column(1).clone(), map.value_length(2))
-            } else {
-                let list = payload.as_any().downcast_ref::<ListArray>().unwrap();
-                (list.value(4), list.value_length(2))
-            };
-            assert_eq!(empty, 0);
-            let values = children
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .unwrap();
-            assert!(values.is_null(1));
-            assert_eq!(
-                BlobDescriptor::deserialize(values.value(0))
-                    .unwrap()
-                    .length(),
-                3
-            );
-            assert_eq!(
-                BlobDescriptor::deserialize(values.value(2))
-                    .unwrap()
-                    .length(),
-                0
-            );
-        }
-    }
-}
-
 async fn seed(table: &Table) {
     seed_chunks(table, 5).await;
 }
@@ -575,17 +409,20 @@ async fn rows(table: &Table) -> Vec<(i32, Option<Vec<u8>>, i32)> {
     let mut rows = Vec::new();
     for batch in batches {
         let ids = batch
-            .column(0)
+            .column_by_name("id")
+            .unwrap()
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
         let blobs = batch
-            .column(1)
+            .column_by_name("payload")
+            .unwrap()
             .as_any()
             .downcast_ref::<LargeBinaryArray>()
             .unwrap();
         let values = batch
-            .column(2)
+            .column_by_name("value")
+            .unwrap()
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();

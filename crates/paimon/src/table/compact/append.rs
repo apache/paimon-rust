@@ -61,6 +61,7 @@ impl AppendCompactPlanner {
                     total_buckets,
                     files,
                     output_level: None,
+                    blob_field_id: None,
                 });
             }
         }
