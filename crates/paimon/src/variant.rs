@@ -40,13 +40,13 @@ const TYPE_INFO_MASK: u8 = 0x3f;
 const MAX_SHORT_STR_SIZE: usize = 0x3f;
 const MAX_CACHED_VARIANT_METADATA_BYTES: usize = 512 * 1024;
 const MAX_CACHED_VARIANT_METADATA_TOTAL_BYTES: usize = 1024 * 1024;
-const MAX_CACHED_VARIANT_METADATA_ENTRIES: usize = 4;
+const MAX_CACHED_VARIANT_METADATA_ENTRIES: usize = 16;
 const MAX_REBUILD_METADATA_ENTRIES: usize = 8;
 const MAX_REBUILD_METADATA_BYTES: usize = 8 * 1024 * 1024;
-// A shared dictionary is useful for wide values, but copying a much larger
-// dictionary into every sparse result costs more than remapping its few keys.
+// A shared dictionary is useful for wide objects, but copying it into every
+// sparse result costs more than remapping the keys actually present.
 const MIN_SPARSE_REBUILD_METADATA_BYTES: usize = 4 * 1024;
-const SPARSE_REBUILD_METADATA_RATIO: usize = 8;
+const SPARSE_REBUILD_KEY_RATIO: usize = 8;
 
 thread_local! {
     /// Exact-byte cache: metadata dictionaries are often repeated across rows and
@@ -2881,23 +2881,22 @@ pub(crate) fn rebuild_shredded_with_cache(
         return GenericVariant::from_parts(value.to_vec(), metadata.to_vec());
     }
 
-    // Choose before parsing/caching the source dictionary: a batch can contain
-    // more distinct wide dictionaries than the cache holds, while each row
-    // materializes only a handful of fields. The legacy builder emits a
-    // compact dictionary and remaps residual key IDs in this case.
-    let payload_bytes = row
-        .fields
-        .iter()
-        .enumerate()
-        .fold(0usize, |size, (idx, value)| {
-            if idx == metadata_idx {
-                size
-            } else {
-                size.saturating_add(value.as_ref().map_or(0, shredded_value_bytes))
-            }
-        });
-    let compact = metadata.len() > MIN_SPARSE_REBUILD_METADATA_BYTES
-        && metadata.len() > payload_bytes.saturating_mul(SPARSE_REBUILD_METADATA_RATIO);
+    // Count keys, not payload bytes: a single long string must not make a
+    // two-field object look dense. Stop once enough keys are found to reuse
+    // the dictionary; malformed input takes the normal validating path.
+    let compact = if metadata.len() > MIN_SPARSE_REBUILD_METADATA_BYTES {
+        metadata_offset_size(metadata)
+            .and_then(|size| read_unsigned(metadata, 1, size))
+            .ok()
+            .is_some_and(|keys| {
+                let limit = keys / SPARSE_REBUILD_KEY_RATIO;
+                limit > 0
+                    && rebuilt_key_occurrences(row, schema, limit, 0)
+                        .is_some_and(|used| used < limit)
+            })
+    } else {
+        false
+    };
     let mut builder = if compact {
         VariantBuilder::new()
     } else {
@@ -2907,23 +2906,110 @@ pub(crate) fn rebuild_shredded_with_cache(
     builder.result()
 }
 
-fn shredded_value_bytes(value: &ShreddedValue) -> usize {
-    match value {
-        ShreddedValue::Boolean(_) | ShreddedValue::Int8(_) => 1,
-        ShreddedValue::Int16(_) => 2,
-        ShreddedValue::Int32(_) | ShreddedValue::Float32(_) | ShreddedValue::Date32(_) => 4,
-        ShreddedValue::Int64(_) | ShreddedValue::Float64(_) | ShreddedValue::Timestamp(_) => 8,
-        ShreddedValue::Decimal128(_) => 16,
-        ShreddedValue::String(value) => value.len(),
-        ShreddedValue::Binary(value) => value.len(),
-        ShreddedValue::Row(row) => row.fields.iter().flatten().fold(0usize, |size, value| {
-            size.saturating_add(shredded_value_bytes(value))
-        }),
-        ShreddedValue::List(rows) => rows.iter().fold(0usize, |size, row| {
-            size.saturating_add(row.fields.iter().flatten().fold(0usize, |row_size, value| {
-                row_size.saturating_add(shredded_value_bytes(value))
-            }))
-        }),
+/// An upper bound on distinct keys, capped at `limit`. Repeated keys in arrays
+/// may overcount, which only makes us conservatively retain the source metadata.
+fn rebuilt_key_occurrences(
+    row: &ShreddedRow,
+    schema: &VariantSchema,
+    limit: usize,
+    depth: usize,
+) -> Option<usize> {
+    if depth > MAX_NESTING_DEPTH || limit == 0 {
+        return None;
+    }
+    let mut count = 0;
+    if let Some(typed) = schema.typed_idx.and_then(|idx| row.field(idx)) {
+        match typed {
+            ShreddedValue::Row(object) if schema.object_schema.is_some() => {
+                for (idx, field) in schema.object_schema.as_ref()?.iter().enumerate() {
+                    let ShreddedValue::Row(child) = object.field(idx)? else {
+                        return None;
+                    };
+                    if shredded_row_has_value(child, &field.schema) {
+                        count += 1;
+                        if count >= limit {
+                            return Some(limit);
+                        }
+                        count += rebuilt_key_occurrences(
+                            child,
+                            &field.schema,
+                            limit - count,
+                            depth + 1,
+                        )?;
+                    }
+                }
+            }
+            ShreddedValue::List(elements) if schema.array_schema.is_some() => {
+                for element in elements {
+                    count += rebuilt_key_occurrences(
+                        element,
+                        schema.array_schema.as_ref()?,
+                        limit - count,
+                        depth + 1,
+                    )?;
+                    if count >= limit {
+                        return Some(limit);
+                    }
+                }
+            }
+            _ if schema.object_schema.is_some() || schema.array_schema.is_some() => return None,
+            _ => {}
+        }
+    }
+    if let Some(value) = schema.variant_idx.and_then(|idx| row.field(idx)) {
+        let ShreddedValue::Binary(value) = value else {
+            return None;
+        };
+        count += binary_key_occurrences(value, 0, limit - count, depth)?;
+    }
+    Some(count)
+}
+
+fn binary_key_occurrences(value: &[u8], pos: usize, limit: usize, depth: usize) -> Option<usize> {
+    if depth > MAX_NESTING_DEPTH || limit == 0 {
+        return None;
+    }
+    match value_kind(value, pos).ok()? {
+        VariantKind::Object => {
+            let layout = object_layout(value, pos).ok()?;
+            if layout.size >= limit {
+                return Some(limit);
+            }
+            let mut count = layout.size;
+            for idx in 0..layout.size {
+                let offset = read_unsigned(
+                    value,
+                    layout.offset_start + idx * layout.offset_size,
+                    layout.offset_size,
+                )
+                .ok()?;
+                let child = layout.data_start.checked_add(offset)?;
+                count += binary_key_occurrences(value, child, limit - count, depth + 1)?;
+                if count >= limit {
+                    return Some(limit);
+                }
+            }
+            Some(count)
+        }
+        VariantKind::Array => {
+            let layout = array_layout(value, pos).ok()?;
+            let mut count = 0;
+            for idx in 0..layout.size {
+                let offset = read_unsigned(
+                    value,
+                    layout.offset_start + idx * layout.offset_size,
+                    layout.offset_size,
+                )
+                .ok()?;
+                let child = layout.data_start.checked_add(offset)?;
+                count += binary_key_occurrences(value, child, limit - count, depth + 1)?;
+                if count >= limit {
+                    return Some(limit);
+                }
+            }
+            Some(count)
+        }
+        _ => Some(0),
     }
 }
 
@@ -3803,7 +3889,7 @@ mod tests {
     #[test]
     fn metadata_cache_respects_entry_and_byte_limits() {
         VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
-        for i in 0..5 {
+        for i in 0..=MAX_CACHED_VARIANT_METADATA_ENTRIES {
             let variant = GenericVariant::parse_json(&format!(r#"{{"field_{i}":0}}"#)).unwrap();
             validate_metadata(variant.metadata()).unwrap();
         }
@@ -3846,6 +3932,17 @@ mod tests {
         }
         VALIDATED_METADATA.with(|cached| {
             assert!(!cached.borrow().iter().any(|entry| entry == &large));
+        });
+        VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
+        let rotating = (0..9).map(|suffix| wide(suffix, 1_000)).collect::<Vec<_>>();
+        assert!(
+            rotating.iter().map(Vec::len).sum::<usize>() < MAX_CACHED_VARIANT_METADATA_TOTAL_BYTES
+        );
+        for metadata in &rotating {
+            validate_metadata(metadata).unwrap();
+        }
+        VALIDATED_METADATA.with(|cached| {
+            assert_eq!(cached.borrow().len(), rotating.len());
         });
         let before = VALIDATED_METADATA.with(|cached| cached.borrow().len());
         validate_metadata(&oversize).unwrap();
@@ -4404,6 +4501,24 @@ mod tests {
             .map(|key| format!(r#", "zz_{key:04}":{key}"#))
             .collect::<String>();
         let original = GenericVariant::parse_json(&format!(r#"{{"age":27{extra}}}"#)).unwrap();
+        let row = cast_shredded(&original, &schema).unwrap();
+        let mut cache = RebuildMetadataCache::default();
+
+        let rebuilt = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap();
+        assert_eq!(rebuilt.to_json().unwrap(), original.to_json().unwrap());
+        assert_eq!(rebuilt.metadata(), original.metadata());
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn rebuild_shredded_keeps_source_dictionary_for_dense_nested_rows() {
+        let schema = simple_object_shredding_schema();
+        let fields = (0..512)
+            .map(|key| format!(r#""zz_{key:04}":{key}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let original =
+            GenericVariant::parse_json(&format!(r#"{{"nested":{{{fields}}}}}"#)).unwrap();
         let row = cast_shredded(&original, &schema).unwrap();
         let mut cache = RebuildMetadataCache::default();
 
