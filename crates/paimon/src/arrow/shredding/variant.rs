@@ -2088,6 +2088,100 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual in-memory Parquet decode and full-Variant assembly benchmark"]
+    fn benchmark_wide_variant_parquet_read() {
+        use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter};
+        use sha2::{Digest, Sha256};
+
+        fn encode(array: ArrayRef) -> bytes::Bytes {
+            let schema = Arc::new(arrow_schema::Schema::new(vec![ArrowField::new(
+                "v",
+                array.data_type().clone(),
+                true,
+            )]));
+            let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+            let mut encoded = Vec::new();
+            let mut writer = ArrowWriter::try_new(&mut encoded, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            bytes::Bytes::from(encoded)
+        }
+
+        fn decode(encoded: &bytes::Bytes) -> ArrayRef {
+            ParquetRecordBatchReaderBuilder::try_new(encoded.clone())
+                .unwrap()
+                .with_batch_size(512)
+                .build()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .column(0)
+                .clone()
+        }
+
+        let fields = (0..200)
+            .map(|index| {
+                let ty = if index % 2 == 0 {
+                    DataType::TinyInt(TinyIntType::new())
+                } else {
+                    DataType::Double(DoubleType::new())
+                };
+                DataField::new(index, format!("field_{index:04}"), ty)
+            })
+            .collect();
+        let physical = variant_shredding_type(&DataType::Row(RowType::new(fields))).unwrap();
+        let json = (0..5362)
+            .map(|index| {
+                let value = if index < 200 && index % 2 == 1 && index >= 54 {
+                    "1.5e0"
+                } else {
+                    "0"
+                };
+                format!("\"field_{index:04}\":{value}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let original = GenericVariant::parse_json(&format!("{{{json}}}")).unwrap();
+        let plain = variant_array(vec![Some(original.clone()); 512]).unwrap();
+        let shredded = shred_variant_array(plain.as_ref(), &physical).unwrap();
+        let plain_file = encode(plain);
+        let shredded_file = encode(shredded);
+
+        let assembled = assemble_shredded_variant_array(decode(&shredded_file).as_ref()).unwrap();
+        let expected = original.to_json().unwrap();
+        let mut digest = Sha256::new();
+        for row in 0..512 {
+            let actual = variant_from_array(assembled.as_ref(), row)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual.to_json().unwrap(), expected);
+            digest.update((actual.value().len() as u64).to_le_bytes());
+            digest.update(actual.value());
+            digest.update((actual.metadata().len() as u64).to_le_bytes());
+            digest.update(actual.metadata());
+        }
+        eprintln!(
+            "plain_file={} bytes, shredded_file={} bytes, output_sha256={}",
+            plain_file.len(),
+            shredded_file.len(),
+            hex::encode(digest.finalize())
+        );
+
+        for round in 0..7 {
+            let plain_start = std::time::Instant::now();
+            std::hint::black_box(decode(&plain_file));
+            let plain_elapsed = plain_start.elapsed();
+
+            let shredded_start = std::time::Instant::now();
+            let physical = decode(&shredded_file);
+            std::hint::black_box(assemble_shredded_variant_array(physical.as_ref()).unwrap());
+            let shredded_elapsed = shredded_start.elapsed();
+            eprintln!("round {round}: plain={plain_elapsed:?}, shredded={shredded_elapsed:?}");
+        }
+    }
+
+    #[test]
     fn sparse_shredded_batch_does_not_copy_wide_dictionaries() {
         let configured = DataType::Row(RowType::new(vec![DataField::new(
             7,

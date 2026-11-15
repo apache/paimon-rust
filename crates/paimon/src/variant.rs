@@ -176,6 +176,15 @@ impl<'a> VariantRef<'a> {
         pos: usize,
         metadata: &mut VariantMetadataValidation<'a>,
     ) -> Result<Self> {
+        Self::new_with_cached_metadata_at_depth(value, pos, metadata, 0)
+    }
+
+    fn new_with_cached_metadata_at_depth(
+        value: &'a [u8],
+        pos: usize,
+        metadata: &mut VariantMetadataValidation<'a>,
+        depth: usize,
+    ) -> Result<Self> {
         if metadata.bytes.is_empty() || (metadata.bytes[0] & VERSION_MASK) != VERSION {
             return data_invalid("Malformed Variant metadata version");
         }
@@ -186,7 +195,7 @@ impl<'a> VariantRef<'a> {
             validate_metadata(metadata.bytes)?;
             metadata.validated = true;
         }
-        let root_size = validate_value(value, metadata.bytes, 0, 0)?;
+        let root_size = validate_value(value, metadata.bytes, 0, depth)?;
         if root_size != value.len() {
             return data_invalid("Malformed Variant root size");
         }
@@ -439,6 +448,7 @@ pub(crate) struct VariantSchema {
     pub(crate) scalar_schema: Option<VariantScalarSchema>,
     pub(crate) object_schema: Option<Vec<VariantObjectField>>,
     pub(crate) object_schema_map: HashMap<String, usize>,
+    object_schema_order: Vec<usize>,
     pub(crate) array_schema: Option<Box<VariantSchema>>,
 }
 
@@ -627,13 +637,12 @@ fn validate_object(value: &[u8], metadata: &[u8], pos: usize, depth: usize) -> R
     }
 
     let mut ranges = Vec::with_capacity(layout.size);
-    let mut previous_key: Option<String> = None;
+    let mut previous_key: Option<&str> = None;
     for i in 0..layout.size {
         let id = read_unsigned(value, layout.id_start + layout.id_size * i, layout.id_size)?;
-        let key = get_metadata_key(metadata, id)?;
+        let key = get_metadata_key_ref(metadata, id)?;
         if previous_key
-            .as_deref()
-            .is_some_and(|previous| java_string_cmp(previous, &key) != std::cmp::Ordering::Less)
+            .is_some_and(|previous| java_string_cmp(previous, key) != std::cmp::Ordering::Less)
         {
             return data_invalid("Malformed Variant object key order");
         }
@@ -1393,8 +1402,8 @@ pub(crate) fn top_level_path_key(path: &str) -> Result<Option<String>> {
 }
 
 #[derive(Clone)]
-struct FieldEntry {
-    key: String,
+struct FieldEntry<K = String> {
+    key: K,
     id: usize,
     offset: usize,
 }
@@ -1508,17 +1517,38 @@ impl VariantBuilder {
         id
     }
 
-    fn result(mut self) -> Result<GenericVariant> {
+    fn result(self) -> Result<GenericVariant> {
+        self.result_inner(true)
+    }
+
+    // Only the shredded rebuild uses this: every residual is validated at its
+    // final nesting depth, and typed values plus object/array headers are
+    // emitted by this builder. Keep the general builder's full validation.
+    fn result_from_validated_inputs(self) -> Result<GenericVariant> {
+        self.result_inner(false)
+    }
+
+    fn result_inner(mut self, validate_output: bool) -> Result<GenericVariant> {
+        if !validate_output && (self.value.is_empty() || self.value.len() > SIZE_LIMIT) {
+            return data_invalid("Variant value exceeds constructor size limit");
+        }
         if let Some(metadata) = &self.source_metadata {
             if self.dictionary_keys.is_empty() {
-                if self.value.len() > SIZE_LIMIT {
+                if !validate_output && metadata.bytes.len() > SIZE_LIMIT {
                     return data_invalid(
                         "Variant value or metadata exceeds constructor size limit",
                     );
                 }
-                let root_size = validate_value(&self.value, &metadata.bytes, 0, 0)?;
-                if root_size != self.value.len() {
-                    return data_invalid("Malformed Variant root size");
+                if validate_output {
+                    if self.value.len() > SIZE_LIMIT {
+                        return data_invalid(
+                            "Variant value or metadata exceeds constructor size limit",
+                        );
+                    }
+                    let root_size = validate_value(&self.value, &metadata.bytes, 0, 0)?;
+                    if root_size != self.value.len() {
+                        return data_invalid("Malformed Variant root size");
+                    }
                 }
                 return Ok(GenericVariant {
                     value: self.value,
@@ -1563,7 +1593,17 @@ impl VariantBuilder {
             current_offset,
             offset_size,
         );
-        GenericVariant::from_parts(self.value, metadata)
+        if validate_output {
+            GenericVariant::from_parts(self.value, metadata)
+        } else {
+            if metadata.len() > SIZE_LIMIT {
+                return data_invalid("Variant value or metadata exceeds constructor size limit");
+            }
+            Ok(GenericVariant {
+                value: self.value,
+                metadata,
+            })
+        }
     }
 
     fn add_key(&mut self, key: &str) -> usize {
@@ -1756,11 +1796,27 @@ impl VariantBuilder {
         }
     }
 
-    fn finish_object(&mut self, start: usize, mut fields: Vec<FieldEntry>) -> Result<()> {
-        fields.sort_by(|a, b| java_string_cmp(&a.key, &b.key));
+    fn finish_object<K: AsRef<str>>(
+        &mut self,
+        start: usize,
+        mut fields: Vec<FieldEntry<K>>,
+    ) -> Result<()> {
+        fields.sort_by(|a, b| java_string_cmp(a.key.as_ref(), b.key.as_ref()));
+        self.finish_sorted_object(start, fields)
+    }
+
+    fn finish_sorted_object<K: AsRef<str>>(
+        &mut self,
+        start: usize,
+        fields: Vec<FieldEntry<K>>,
+    ) -> Result<()> {
         for pair in fields.windows(2) {
-            if pair[0].key == pair[1].key {
-                return data_invalid("VARIANT_DUPLICATE_KEY");
+            match java_string_cmp(pair[0].key.as_ref(), pair[1].key.as_ref()) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => return data_invalid("VARIANT_DUPLICATE_KEY"),
+                std::cmp::Ordering::Greater => {
+                    return data_invalid("Malformed Variant object key order")
+                }
             }
         }
 
@@ -1772,7 +1828,11 @@ impl VariantBuilder {
         let id_size = integer_size(max_id)?;
         let offset_size = integer_size(data_size)?;
         let header_size = 1 + size_bytes + size * id_size + (size + 1) * offset_size;
-        self.value.splice(start..start, vec![0; header_size]);
+        // The exact width is known only after writing the body. Shift it in
+        // place rather than allocating an intermediate zero-filled header.
+        let old_len = self.value.len();
+        self.value.resize(old_len + header_size, 0);
+        self.value.copy_within(start..old_len, start + header_size);
         self.value[start] = object_header(large_size, id_size, offset_size);
         write_le_at(&mut self.value, start + 1, size, size_bytes);
         let id_start = start + 1 + size_bytes;
@@ -2726,6 +2786,16 @@ fn build_variant_schema_with_level(row_type: &RowType, top_level: bool) -> Resul
                 .collect()
         })
         .unwrap_or_default();
+    let object_schema_order = object_schema
+        .as_ref()
+        .map(|fields| {
+            let mut order = (0..fields.len()).collect::<Vec<_>>();
+            order.sort_by(|left, right| {
+                java_string_cmp(&fields[*left].field_name, &fields[*right].field_name)
+            });
+            order
+        })
+        .unwrap_or_default();
 
     Ok(VariantSchema {
         typed_idx,
@@ -2735,6 +2805,7 @@ fn build_variant_schema_with_level(row_type: &RowType, top_level: bool) -> Resul
         scalar_schema,
         object_schema,
         object_schema_map,
+        object_schema_order,
         array_schema,
     })
 }
@@ -2912,8 +2983,10 @@ pub(crate) fn rebuild_shredded_with_cache(
     } else {
         VariantBuilder::with_source_metadata(cache.get_or_parse(metadata)?)
     };
-    rebuild_shredded_into(row, metadata, schema, &mut builder)?;
-    builder.result()
+    let mut validation =
+        VariantMetadataValidation::new(metadata, builder.source_metadata.is_some());
+    rebuild_shredded_into(row, &mut validation, schema, &mut builder, 0)?;
+    builder.result_from_validated_inputs()
 }
 
 /// A bounded, best-effort preflight. `Some(true)` proves that enough distinct
@@ -3193,7 +3266,8 @@ fn extract_shredded_segments(
             return Ok(None);
         }
         let mut builder = VariantBuilder::new();
-        rebuild_shredded_into(row, metadata, schema, &mut builder)?;
+        let mut validation = VariantMetadataValidation::new(metadata, false);
+        rebuild_shredded_into(row, &mut validation, schema, &mut builder, 0)?;
         return builder.result().map(Some);
     };
     if let Some(typed) = schema.typed_idx.and_then(|index| row.field(index)) {
@@ -3491,12 +3565,16 @@ fn parse_decimal_string(input: &str) -> Option<VariantDecimal> {
     })
 }
 
-fn rebuild_shredded_into(
-    row: &ShreddedRow,
-    metadata: &[u8],
+fn rebuild_shredded_into<'a>(
+    row: &'a ShreddedRow,
+    validation: &mut VariantMetadataValidation<'a>,
     schema: &VariantSchema,
     builder: &mut VariantBuilder,
+    depth: usize,
 ) -> Result<()> {
+    if depth > MAX_NESTING_DEPTH {
+        return data_invalid("Malformed Variant nesting depth");
+    }
     if let Some(typed_idx) = schema.typed_idx {
         if let Some(typed_value) = row.field(typed_idx) {
             if let Some(scalar) = &schema.scalar_schema {
@@ -3509,7 +3587,7 @@ fn rebuild_shredded_into(
                 let mut offsets = Vec::with_capacity(elements.len());
                 for element in elements {
                     offsets.push(builder.write_pos() - start);
-                    rebuild_shredded_into(element, metadata, element_schema, builder)?;
+                    rebuild_shredded_into(element, validation, element_schema, builder, depth + 1)?;
                 }
                 builder.finish_array(start, offsets)?;
             } else if let Some(object_schema) = &schema.object_schema {
@@ -3517,7 +3595,7 @@ fn rebuild_shredded_into(
                     return data_invalid("Malformed shredded Variant object typed_value");
                 };
                 let start = builder.write_pos();
-                let mut fields = Vec::new();
+                let mut typed_fields = vec![None; object_schema.len()];
                 for (idx, field) in object_schema.iter().enumerate() {
                     let Some(ShreddedValue::Row(field_row)) = object_row.field(idx) else {
                         return data_invalid("Malformed shredded Variant object field");
@@ -3528,24 +3606,29 @@ fn rebuild_shredded_into(
                         } else {
                             builder.add_key(&field.field_name)
                         };
-                        fields.push(FieldEntry {
-                            key: field.field_name.clone(),
+                        typed_fields[idx] = Some(FieldEntry {
+                            key: field.field_name.as_str(),
                             id,
                             offset: builder.write_pos() - start,
                         });
-                        rebuild_shredded_into(field_row, metadata, &field.schema, builder)?;
+                        rebuild_shredded_into(
+                            field_row,
+                            validation,
+                            &field.schema,
+                            builder,
+                            depth + 1,
+                        )?;
                     }
                 }
+                let mut residual_fields = Vec::new();
                 if let Some(value) = optional_binary_field(row, schema.variant_idx)? {
-                    let mut validation =
-                        VariantMetadataValidation::new(metadata, builder.source_metadata.is_some());
                     let variant_ref =
-                        VariantRef::new_with_cached_metadata(value, 0, &mut validation)?;
+                        VariantRef::new_with_cached_metadata_at_depth(value, 0, validation, depth)?;
                     if variant_ref.kind()? != VariantKind::Object {
                         return data_invalid("Malformed shredded Variant object value");
                     }
-                    for field in variant_ref.object_fields()? {
-                        if schema.object_field_index(&field.key).is_some() {
+                    for field in variant_ref.object_fields_borrowed()? {
+                        if schema.object_field_index(field.key).is_some() {
                             return data_invalid(
                                 "Malformed shredded Variant duplicate object field",
                             );
@@ -3553,9 +3636,9 @@ fn rebuild_shredded_into(
                         let id = if builder.source_metadata.is_some() {
                             field.id
                         } else {
-                            builder.add_key(&field.key)
+                            builder.add_key(field.key)
                         };
-                        fields.push(FieldEntry {
+                        residual_fields.push(FieldEntry {
                             key: field.key,
                             id,
                             offset: builder.write_pos() - start,
@@ -3567,16 +3650,44 @@ fn rebuild_shredded_into(
                         }
                     }
                 }
-                builder.finish_object(start, fields)?;
+                // The validated residual object is already key-sorted. Keep
+                // the body in its original order, and merge only header entries.
+                let capacity = typed_fields.len() + residual_fields.len();
+                let mut typed = schema
+                    .object_schema_order
+                    .iter()
+                    .filter_map(|&idx| typed_fields[idx].take())
+                    .peekable();
+                let mut residual = residual_fields.into_iter().peekable();
+                let mut fields = Vec::with_capacity(capacity);
+                loop {
+                    match (typed.peek(), residual.peek()) {
+                        (Some(left), Some(right)) => {
+                            if java_string_cmp(left.key, right.key).is_lt() {
+                                fields.push(typed.next().unwrap());
+                            } else {
+                                fields.push(residual.next().unwrap());
+                            }
+                        }
+                        (Some(_), None) => {
+                            fields.extend(typed);
+                            break;
+                        }
+                        (None, Some(_)) => {
+                            fields.extend(residual);
+                            break;
+                        }
+                        (None, None) => break,
+                    }
+                }
+                builder.finish_sorted_object(start, fields)?;
             }
             return Ok(());
         }
     }
 
     if let Some(value) = optional_binary_field(row, schema.variant_idx)? {
-        let mut validation =
-            VariantMetadataValidation::new(metadata, builder.source_metadata.is_some());
-        let variant = VariantRef::new_with_cached_metadata(value, 0, &mut validation)?;
+        let variant = VariantRef::new_with_cached_metadata_at_depth(value, 0, validation, depth)?;
         if builder.source_metadata.is_some() {
             builder.value.extend_from_slice(variant.value_slice()?);
         } else {
@@ -3775,8 +3886,14 @@ struct ObjectFieldRef<'a> {
     value: VariantRef<'a>,
 }
 
+struct BorrowedObjectFieldRef<'a> {
+    key: &'a str,
+    id: usize,
+    value: VariantRef<'a>,
+}
+
 impl<'a> VariantRef<'a> {
-    fn object_fields(&self) -> Result<Vec<ObjectFieldRef<'a>>> {
+    fn object_fields_borrowed(&self) -> Result<Vec<BorrowedObjectFieldRef<'a>>> {
         let layout = object_layout(self.value, self.pos)?;
         let mut fields = Vec::with_capacity(layout.size);
         for i in 0..layout.size {
@@ -3785,19 +3902,31 @@ impl<'a> VariantRef<'a> {
                 layout.id_start + layout.id_size * i,
                 layout.id_size,
             )?;
-            let key = get_metadata_key(self.metadata, id)?;
+            let key = get_metadata_key_ref(self.metadata, id)?;
             let offset = read_unsigned(
                 self.value,
                 layout.offset_start + layout.offset_size * i,
                 layout.offset_size,
             )?;
-            fields.push(ObjectFieldRef {
+            fields.push(BorrowedObjectFieldRef {
                 key,
                 id,
                 value: VariantRef::new_at(self.value, self.metadata, layout.data_start + offset)?,
             });
         }
         Ok(fields)
+    }
+
+    fn object_fields(&self) -> Result<Vec<ObjectFieldRef<'a>>> {
+        Ok(self
+            .object_fields_borrowed()?
+            .into_iter()
+            .map(|field| ObjectFieldRef {
+                key: field.key.to_owned(),
+                id: field.id,
+                value: field.value,
+            })
+            .collect())
     }
 
     fn array_elements(&self) -> Result<Vec<VariantRef<'a>>> {
@@ -4495,6 +4624,7 @@ mod tests {
     #[test]
     fn rebuild_shredded_reuses_original_metadata_ids() {
         let schema = simple_object_shredding_schema();
+        assert_eq!(schema.object_schema_order, vec![2, 0, 1]);
         // The source dictionary order differs from the shredding schema order.
         let original = GenericVariant::parse_json(
             r#"{"city":"Beijing","nested":{"x":1},"age":27,"active":true}"#,
@@ -4683,6 +4813,37 @@ mod tests {
         age.set(0, ShreddedValue::Binary(vec![0xff])).unwrap();
 
         assert!(rebuild_shredded(&row, &schema).is_err());
+    }
+
+    #[test]
+    fn rebuild_shredded_rejects_misordered_residual_keys() {
+        let schema = simple_object_shredding_schema();
+        let original = GenericVariant::parse_json(r#"{"age":27,"left":1,"right":2}"#).unwrap();
+        let mut row = cast_shredded(&original, &schema).unwrap();
+        let idx = schema.variant_idx.unwrap();
+        let Some(ShreddedValue::Binary(value)) = row.field(idx) else {
+            panic!("expected residual object");
+        };
+        let mut malformed = value.clone();
+        let layout = object_layout(&malformed, 0).unwrap();
+        assert_eq!(layout.size, 2);
+        assert_eq!(layout.id_size, 1);
+        malformed.swap(layout.id_start, layout.id_start + 1);
+        row.set(idx, ShreddedValue::Binary(malformed)).unwrap();
+        assert!(rebuild_shredded(&row, &schema).is_err());
+    }
+
+    #[test]
+    fn residual_validation_checks_final_nesting_depth() {
+        let nested = GenericVariant::parse_json("[null]").unwrap();
+        let mut metadata = VariantMetadataValidation::new(nested.metadata(), false);
+        assert!(VariantRef::new_with_cached_metadata_at_depth(
+            nested.value(),
+            0,
+            &mut metadata,
+            MAX_NESTING_DEPTH,
+        )
+        .is_err());
     }
 
     #[test]
