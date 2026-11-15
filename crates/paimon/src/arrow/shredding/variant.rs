@@ -28,10 +28,10 @@ use crate::spec::{
 };
 use crate::variant::{
     build_variant_schema, cast_shredded, cast_variant_to_shredded_value,
-    infer_variant_shredding_schema, rebuild_shredded, top_level_path_key, variant_shredding_type,
-    GenericVariant, ShreddedRow, ShreddedValue, VariantShreddingInferConfig,
-    VariantShreddingInferenceSession, VARIANT_METADATA_FIELD_NAME, VARIANT_TYPED_VALUE_FIELD_NAME,
-    VARIANT_VALUE_FIELD_NAME,
+    infer_variant_shredding_schema, rebuild_shredded, rebuild_shredded_with_cache,
+    top_level_path_key, variant_shredding_type, GenericVariant, RebuildMetadataCache, ShreddedRow,
+    ShreddedValue, VariantShreddingInferConfig, VariantShreddingInferenceSession,
+    VARIANT_METADATA_FIELD_NAME, VARIANT_TYPED_VALUE_FIELD_NAME, VARIANT_VALUE_FIELD_NAME,
 };
 use crate::{Error, Result};
 use arrow_array::{
@@ -795,6 +795,7 @@ pub(crate) fn assemble_shredded_variant_array(array: &dyn Array) -> Result<Array
         })?;
 
     let mut variants = Vec::with_capacity(input.len());
+    let mut metadata_cache = RebuildMetadataCache::default();
     for row in 0..input.len() {
         if input.is_null(row) {
             variants.push(None);
@@ -804,7 +805,11 @@ pub(crate) fn assemble_shredded_variant_array(array: &dyn Array) -> Result<Array
                     message: "Shredded Variant row is null".to_string(),
                     source: None,
                 })?;
-            variants.push(Some(rebuild_shredded(&shredded, &schema)?));
+            variants.push(Some(rebuild_shredded_with_cache(
+                &shredded,
+                &schema,
+                &mut metadata_cache,
+            )?));
         }
     }
     variant_array(variants)
@@ -2039,8 +2044,108 @@ mod tests {
     use super::*;
     use crate::arrow::variant_arrow_type;
     use crate::spec::{
-        variant_extraction_row, BlobType, FloatType, IntType, VarCharType, VariantType,
+        variant_extraction_row, BigIntType, BlobType, DoubleType, FloatType, IntType, TinyIntType,
+        VarCharType, VariantType,
     };
+
+    #[test]
+    #[ignore = "manual synthetic full-Variant rebuild benchmark"]
+    fn benchmark_wide_shredded_variant_rebuild() {
+        let fields = (0..200)
+            .map(|index| {
+                let ty = if index % 2 == 0 {
+                    DataType::TinyInt(TinyIntType::new())
+                } else {
+                    DataType::Double(DoubleType::new())
+                };
+                DataField::new(index, format!("field_{index:04}"), ty)
+            })
+            .collect();
+        let physical = variant_shredding_type(&DataType::Row(RowType::new(fields))).unwrap();
+        let json = (0..5362)
+            .map(|index| {
+                let value = if index < 200 && index % 2 == 1 && index >= 54 {
+                    "1.5e0"
+                } else {
+                    "0"
+                };
+                format!("\"field_{index:04}\":{value}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let original = GenericVariant::parse_json(&format!("{{{json}}}")).unwrap();
+        let input = variant_array(vec![Some(original.clone()); 512]).unwrap();
+        let shredded = shred_variant_array(input.as_ref(), &physical).unwrap();
+
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let assembled = assemble_shredded_variant_array(shredded.as_ref()).unwrap();
+            eprintln!("512 rows x 5362 fields: {:?}", start.elapsed());
+            let first = variant_from_array(assembled.as_ref(), 0).unwrap().unwrap();
+            assert_eq!(first.to_json().unwrap(), original.to_json().unwrap());
+            std::hint::black_box(assembled);
+        }
+    }
+
+    #[test]
+    fn sparse_shredded_batch_does_not_copy_wide_dictionaries() {
+        let configured = DataType::Row(RowType::new(vec![DataField::new(
+            7,
+            "age".to_string(),
+            DataType::BigInt(BigIntType::new()),
+        )]));
+        let physical = variant_shredding_type(&configured).unwrap();
+        for small_json in [
+            r#"{"age":27}"#.to_string(),
+            format!(r#"{{"age":27,"text":"{}"}}"#, "x".repeat(16 * 1024)),
+            format!(
+                r#"{{"age":27,"items":[{}]}}"#,
+                vec![r#"{"x":1,"y":2,"z":3}"#; 256].join(",")
+            ),
+        ] {
+            let small = GenericVariant::parse_json(&small_json).unwrap();
+            let prefix = small_json.strip_suffix('}').unwrap();
+            let extra_keys = if small_json.len() > 1024 { 5_362 } else { 512 };
+            let sources = (0..9)
+                .map(|suffix| {
+                    let extra = (0..extra_keys)
+                        .map(|key| format!(r#", "zz_{suffix}_{key:04}":0"#))
+                        .collect::<String>();
+                    let wide = GenericVariant::parse_json(&format!("{prefix}{extra}}}")).unwrap();
+                    assert!(wide.metadata().len() > 4096);
+                    GenericVariant::from_parts(small.value().to_vec(), wide.metadata().to_vec())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                sources
+                    .iter()
+                    .map(|source| source.metadata().len())
+                    .sum::<usize>()
+                    < 1024 * 1024
+            );
+            let source_metadata_bytes = (0..512)
+                .map(|row| sources[row % sources.len()].metadata().len())
+                .sum::<usize>();
+            let input = variant_array(
+                (0..512)
+                    .map(|row| Some(sources[row % sources.len()].clone()))
+                    .collect(),
+            )
+            .unwrap();
+            let shredded = shred_variant_array(input.as_ref(), &physical).unwrap();
+            let assembled = assemble_shredded_variant_array(shredded.as_ref()).unwrap();
+            let mut result_metadata_bytes = 0;
+            for row in 0..512 {
+                let value = variant_from_array(assembled.as_ref(), row)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(value.to_json().unwrap(), small.to_json().unwrap());
+                result_metadata_bytes += value.metadata().len();
+            }
+            assert!(result_metadata_bytes < source_metadata_bytes / 8);
+        }
+    }
 
     #[test]
     fn factory_owns_activation_and_configured_schema_precedence() {
