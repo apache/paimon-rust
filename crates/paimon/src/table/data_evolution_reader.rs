@@ -268,11 +268,10 @@ impl DataEvolutionReader {
     }
 
     /// Managed BLOB payloads are fetched by the format reader, before the
-    /// residual predicate. A LIMIT with a predicate on ordinary columns must
-    /// therefore select matching row IDs before opening those payloads.
+    /// residual predicate. Select rows using ordinary-column predicates before
+    /// opening payloads, including when the query has no output limit.
     fn needs_managed_blob_preselection(&self, splits: &[DataSplit]) -> bool {
-        if self.limit.is_none()
-            || self.predicates.is_empty()
+        if self.predicates.is_empty()
             || self.blob_as_descriptor
             || !self.blob_view_read_fields().is_empty()
             || !self
@@ -311,12 +310,10 @@ impl DataEvolutionReader {
         &self,
         splits: &[DataSplit],
     ) -> crate::Result<Vec<DataSplit>> {
-        let Some(mut remaining) = self.limit else {
-            return Ok(splits.to_vec());
-        };
+        let mut remaining = self.limit;
         let mut selected = Vec::new();
         for split in splits {
-            if remaining == 0 {
+            if remaining == Some(0) {
                 break;
             }
             // This read projects only synthesized row IDs. Predicate columns
@@ -337,7 +334,7 @@ impl DataEvolutionReader {
             )?
             .with_partition_fields(self.partition_fields.clone())
             .with_batch_size(self.batch_size)
-            .with_limit(Some(remaining))
+            .with_limit(remaining)
             .with_parquet_read_budget(self.parquet_read_budget.clone())
             .with_table_options(Arc::clone(&self.table_options))
             .with_mosaic_prefetch(self.mosaic_prefetch)
@@ -375,7 +372,7 @@ impl DataEvolutionReader {
                         .with_selected_row_ranges(crate::table::merge_row_ranges(ranges)),
                 );
             }
-            remaining = remaining.saturating_sub(selected_count);
+            remaining = remaining.map(|limit| limit.saturating_sub(selected_count));
         }
         Ok(selected)
     }
@@ -5776,6 +5773,131 @@ mod tests {
             collect_binary_values(std::slice::from_ref(&first_batch), "payload"),
             vec![Some(b"first-0".to_vec()), Some(b"first-1".to_vec())]
         );
+    }
+
+    #[tokio::test]
+    async fn test_blob_filter_without_limit_reads_only_matching_latest_rows() {
+        for split_blob_files in [false, true] {
+            let tempdir = tempdir().unwrap();
+            let table_path = local_file_path(tempdir.path());
+            let bucket_dir = tempdir.path().join("bucket-0");
+            fs::create_dir_all(&bucket_dir).unwrap();
+            let mut files = Vec::new();
+            // The update changes which physical rows match. Filtering the old
+            // column would select the corrupt fourth payload and miss row one.
+            for (name, ids, sequence) in [
+                ("old.parquet", vec![1, 2, 3, 4], 1),
+                ("new.parquet", vec![4, 2, 3, 1], 2),
+            ] {
+                let path = bucket_dir.join(name);
+                write_int_parquet_file(&path, vec![("id", ids)], None);
+                files.push(data_file_meta_with_path(
+                    name,
+                    100,
+                    4,
+                    sequence,
+                    path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ));
+            }
+            let blob_groups: Vec<(i64, Vec<Option<&[u8]>>)> = if split_blob_files {
+                vec![
+                    (100, vec![Some(b"first"), Some(b"second")]),
+                    (102, vec![Some(b"third"), Some(b"fourth")]),
+                ]
+            } else {
+                vec![(
+                    100,
+                    vec![
+                        Some(b"first"),
+                        Some(b"second"),
+                        Some(b"third"),
+                        Some(b"fourth"),
+                    ],
+                )]
+            };
+            for (index, (first_row_id, values)) in blob_groups.into_iter().enumerate() {
+                let name = format!("payload-{index}.blob");
+                let path = bucket_dir.join(&name);
+                write_blob_file(&path, &values);
+                if values.iter().any(|value| *value == Some(&b"fourth"[..])) {
+                    // Leave the descriptor index readable, but invalidate the
+                    // excluded payload's entry header so decoding it fails.
+                    let mut bytes = fs::read(&path).unwrap();
+                    let offset = bytes
+                        .windows(b"fourth".len())
+                        .position(|window| window == b"fourth")
+                        .unwrap()
+                        - 4;
+                    bytes[offset] ^= 1;
+                    fs::write(&path, bytes).unwrap();
+                }
+                files.push(data_file_meta_with_path(
+                    &name,
+                    first_row_id,
+                    values.len() as i64,
+                    1,
+                    path.metadata().unwrap().len() as i64,
+                    Some(vec!["payload"]),
+                ));
+            }
+            let schema = TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("payload", DataType::Blob(BlobType::new()))
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true")
+                    .option("read.batch-size", "2")
+                    .build()
+                    .unwrap(),
+            );
+            let table = Table::new(
+                FileIOBuilder::new("file").build().unwrap(),
+                Identifier::new("default", "blob_filtered_latest_t"),
+                table_path,
+                schema,
+                None,
+            );
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(local_file_path(&bucket_dir))
+                .with_total_buckets(1)
+                .with_data_files(files)
+                .build()
+                .unwrap();
+            for threshold in [1, 4] {
+                let mut builder = table.new_read_builder();
+                builder.with_filter(
+                    PredicateBuilder::new(table.schema().fields())
+                        .greater_than("id", Datum::Int(threshold))
+                        .unwrap(),
+                );
+                let batches = builder
+                    .new_read()
+                    .unwrap()
+                    .to_arrow(std::slice::from_ref(&split))
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                if threshold == 1 {
+                    assert_eq!(collect_int_values(&batches, "id"), vec![4, 2, 3]);
+                    assert_eq!(
+                        collect_binary_values(&batches, "payload"),
+                        vec![
+                            Some(b"first".to_vec()),
+                            Some(b"second".to_vec()),
+                            Some(b"third".to_vec())
+                        ]
+                    );
+                } else {
+                    assert!(collect_int_values(&batches, "id").is_empty());
+                }
+            }
+        }
     }
 
     #[tokio::test]
