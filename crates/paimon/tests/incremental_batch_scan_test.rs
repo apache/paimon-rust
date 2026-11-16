@@ -1811,3 +1811,75 @@ async fn delta_keeps_physical_retractions_and_changelog_row_kinds() {
     }
     assert!(read_current_pairs(&table).await.is_empty());
 }
+
+/// A primary-key table keeps managed BLOB descriptors in its data files, and an
+/// incremental read must return the payloads, as an ordinary read and the
+/// audit-log read do.
+#[tokio::test]
+async fn incremental_read_resolves_primary_key_blob_payloads() {
+    use arrow_array::{ArrayRef, LargeBinaryArray};
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use paimon::spec::{BlobType, DataType, IntType, Schema, TableSchema};
+    use std::sync::Arc;
+
+    let batch = |ids: Vec<i32>, pictures: Vec<&[u8]>| {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowDataType::Int32, false),
+                Field::new("picture", ArrowDataType::LargeBinary, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(LargeBinaryArray::from(pictures)),
+            ],
+        )
+        .unwrap()
+    };
+    let rows = |batches: Vec<RecordBatch>| {
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let ids = batch.column_by_name("id").unwrap();
+            let ids = ids.as_any().downcast_ref::<Int32Array>().unwrap();
+            let pictures = batch.column_by_name("picture").unwrap();
+            let pictures = pictures
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                rows.push((ids.value(row), pictures.value(row).to_vec()));
+            }
+        }
+        rows.sort();
+        rows
+    };
+    let expected = vec![
+        (1, b"aaa".to_vec()),
+        (2, b"bb".to_vec()),
+        (2, b"c".to_vec()),
+    ];
+    let path = "memory:/incremental_batch/primary_key_blobs";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .column("picture", DataType::Blob(BlobType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    write_batch(&table, &batch(vec![1, 2], vec![b"aaa", b"bb"])).await;
+    write_batch(&table, &batch(vec![2], vec![b"c"])).await;
+
+    let builder = table.new_read_builder();
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 0, 2)
+        .plan()
+        .await
+        .unwrap();
+    let read = builder.new_read().unwrap();
+    let incremental = read.to_incremental_arrow(&plan).unwrap();
+    assert_eq!(rows(incremental.try_collect().await.unwrap()), expected);
+    let audit = read.to_audit_log_arrow(&plan).unwrap();
+    assert_eq!(rows(audit.try_collect().await.unwrap()), expected);
+}
