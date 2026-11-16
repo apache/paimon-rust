@@ -1651,13 +1651,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sink_parallelism_minus_one_keeps_single_writer() {
+        // -1 is Flink's PARALLELISM_DEFAULT, and Java FlinkSinkBuilder treats
+        // null or -1 as an unset sink parallelism. A table configured that
+        // way for Flink stays writable and keeps the single writer, as
+        // without the option.
+        let minus_one: &[(&str, &str)] = &[("sink.parallelism", "-1")];
+        let fixed_bucket: &[(&str, &str)] = &[
+            ("bucket", "1"),
+            ("bucket-key", "id"),
+            ("sink.parallelism", "-1"),
+        ];
+        let cases = [
+            EightBatchInsert {
+                options: minus_one,
+                ..EightBatchInsert::new("test_df_minus_one_append")
+            },
+            EightBatchInsert {
+                options: fixed_bucket,
+                ..EightBatchInsert::new("test_df_minus_one_fixed_bucket")
+            },
+            EightBatchInsert {
+                options: minus_one,
+                primary_keys: &["id"],
+                ..EightBatchInsert::new("test_df_minus_one_primary_key")
+            },
+            EightBatchInsert {
+                options: minus_one,
+                overwrite: true,
+                ..EightBatchInsert::new("test_df_minus_one_overwrite")
+            },
+        ];
+        for case in cases {
+            let outcome = case.run().await.unwrap();
+            assert_eq!(outcome.count, 16, "{}", case.name);
+            assert_eq!(outcome.rows, expected_rows(), "{}", case.name);
+            assert_eq!(outcome.latest_snapshot_id, Some(1), "{}", case.name);
+            assert_eq!(outcome.file_rows, vec![16], "{}", case.name);
+        }
+    }
+
+    #[tokio::test]
     async fn test_insert_into_rejects_invalid_sink_parallelism() {
-        // Java Integer.parseInt rejects " 4", and a writer count must be
-        // positive. The option is checked before deciding whether it applies,
-        // so a primary-key table fails too.
+        // Java Integer.parseInt rejects " 4", and Flink accepts only a
+        // positive parallelism or -1 (OperatorValidationUtils). The option is
+        // checked before deciding whether it applies, so a primary-key table
+        // fails too.
         let cases: [(&str, &str, &[&str]); 4] = [
             ("test_df_invalid_parallelism_zero", "0", &[]),
-            ("test_df_invalid_parallelism_negative", "-1", &[]),
+            ("test_df_invalid_parallelism_negative", "-2", &[]),
             ("test_df_invalid_parallelism_space", " 4", &[]),
             ("test_df_invalid_parallelism_primary_key", "0", &["id"]),
         ];
@@ -1674,7 +1716,7 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("'sink.parallelism' must be a positive integer"),
+                    .contains("'sink.parallelism' must be a positive integer or -1"),
                 "{name}: {error}"
             );
         }

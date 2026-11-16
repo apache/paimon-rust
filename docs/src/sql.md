@@ -939,9 +939,10 @@ An `INSERT INTO` an append-only table with `'bucket' = '-1'` (the default) can
 encode data files with several writers. The writer count is the table option
 `sink.parallelism`, capped at `datafusion.execution.target_partitions`; the sink
 deals input batches to the writers round-robin, and their files are committed
-together as one snapshot. Without the option, one writer is used. Primary-key
-tables, fixed-bucket tables and `INSERT OVERWRITE` always use one writer, but
-the option must still be a positive integer.
+together as one snapshot. Without the option, or with `-1` (Flink's default
+parallelism), one writer is used. Primary-key tables, fixed-bucket tables and
+`INSERT OVERWRITE` always use one writer, but the option must still be a
+positive integer or `-1`.
 
 Each writer rolls its own files in every partition it receives rows for, so on
 a partitioned table the file count grows to writers × partitions where one

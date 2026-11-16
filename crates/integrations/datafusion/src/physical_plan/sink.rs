@@ -33,7 +33,9 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::DisplayAs;
 use futures::channel::mpsc;
-use futures::{SinkExt, StreamExt};
+use futures::future::try_join;
+use futures::stream::FuturesUnordered;
+use futures::{SinkExt, StreamExt, TryStreamExt};
 use paimon::spec::{CoreOptions, ROW_ID_FIELD_NAME};
 use paimon::table::{CommitMessage, Table, WriteBuilder};
 
@@ -138,9 +140,12 @@ impl PaimonDataSink {
             // Same accepted forms as Java Integer.parseInt.
             Some(value) => match value.parse::<i32>() {
                 Ok(count) if count > 0 => count as usize,
+                // Flink's PARALLELISM_DEFAULT: Java FlinkSinkBuilder treats -1
+                // like an unset option, so it keeps one writer here as well.
+                Ok(-1) => return Ok(1),
                 _ => {
                     return Err(DataFusionError::Configuration(format!(
-                        "'{SINK_PARALLELISM}' must be a positive integer, got '{value}'"
+                        "'{SINK_PARALLELISM}' must be a positive integer or -1, got '{value}'"
                     )))
                 }
             },
@@ -157,7 +162,9 @@ impl PaimonDataSink {
     }
 
     /// Deal input batches round-robin to `writers` spawned `TableWrite`s and
-    /// gather their commit messages.
+    /// gather their commit messages. The input and every writer are polled
+    /// together, so the first failure ends the statement and dropping the
+    /// rest cancels the input and the other writers.
     async fn write_parallel(
         &self,
         wb: &WriteBuilder<'_>,
@@ -179,28 +186,47 @@ impl PaimonDataSink {
             }));
         }
 
-        let mut row_count = 0u64;
-        let mut next = 0;
-        while let Some(batch) = data.next().await {
-            let batch = to_paimon_batch(batch?, self.strip_internal_row_id)?;
-            row_count += batch.num_rows() as u64;
-            if senders[next].send(batch).await.is_err() {
-                // The writer stopped on an error, which its join reports below.
-                break;
+        let strip_internal_row_id = self.strip_internal_row_id;
+        let dispatch = async move {
+            let mut row_count = 0u64;
+            let mut next = 0;
+            while let Some(batch) = data.next().await {
+                let batch = to_paimon_batch(batch?, strip_internal_row_id)?;
+                row_count += batch.num_rows() as u64;
+                if senders[next].send(batch).await.is_err() {
+                    // The writer stopped on an error, which its task reports.
+                    break;
+                }
+                next = (next + 1) % writers;
             }
-            next = (next + 1) % writers;
-        }
-        drop(senders);
-
-        let mut messages = Vec::new();
-        for task in tasks {
-            let result = task
-                .join_unwind()
-                .await
-                .map_err(|error| DataFusionError::ExecutionJoin(Box::new(error)))?;
-            messages.extend(result.map_err(to_datafusion_error)?);
-        }
-        Ok((row_count, messages))
+            // Dropping the senders ends the writers' input.
+            Ok::<_, DataFusionError>(row_count)
+        };
+        // FuturesUnordered yields each writer as it finishes, so a failed
+        // writer is seen while earlier writers still run.
+        let mut finished = tasks
+            .into_iter()
+            .enumerate()
+            .map(|(index, task)| async move {
+                let messages = task
+                    .join_unwind()
+                    .await
+                    .map_err(|error| DataFusionError::ExecutionJoin(Box::new(error)))?
+                    .map_err(to_datafusion_error)?;
+                Ok::<_, DataFusionError>((index, messages))
+            })
+            .collect::<FuturesUnordered<_>>();
+        let joins = async move {
+            let mut per_writer = Vec::with_capacity(writers);
+            while let Some(done) = finished.try_next().await? {
+                per_writer.push(done);
+            }
+            // Keep the messages in writer order.
+            per_writer.sort_by_key(|(index, _)| *index);
+            Ok(per_writer.into_iter().flat_map(|(_, messages)| messages))
+        };
+        let (row_count, messages) = try_join(dispatch, joins).await?;
+        Ok((row_count, messages.collect()))
     }
 }
 
@@ -297,5 +323,136 @@ mod tests {
             converted.schema().field(1).data_type(),
             &ArrowDataType::Utf8
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_parallel_writer_failure_ends_insert_while_input_pending() {
+        use std::time::Duration;
+
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use datafusion::prelude::SessionConfig;
+        use paimon::catalog::Identifier;
+        use paimon::io::FileIOBuilder;
+        use paimon::spec::{DataType, IntType, Schema as PaimonSchema, TableSchema};
+
+        // When a writer fails while the input waits for its next batch, the
+        // INSERT must return the writer's error instead of waiting for input
+        // that may never come.
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the bucket directory belongs: opening the
+        // first data file fails with a real filesystem error.
+        std::fs::write(dir.path().join("bucket-0"), b"").unwrap();
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option(SINK_PARALLELISM, "2")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            Identifier::new("default", "t"),
+            format!("file:{}", dir.path().display()),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        // One batch for the first writer, then the input stays pending like a
+        // slow source.
+        let input = futures::stream::iter([Ok(batch)]).chain(futures::stream::pending());
+        let data = Box::pin(RecordBatchStreamAdapter::new(arrow_schema.clone(), input));
+        let context = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_target_partitions(2)),
+        );
+        let sink = PaimonDataSink::new(table, arrow_schema, false);
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), sink.write_all(data, &context)).await;
+
+        let error = result
+            .expect("INSERT still waits for input after a writer failed")
+            .unwrap_err();
+        assert!(error.to_string().contains("bucket-0"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_later_writer_failure_ends_insert_while_earlier_writer_waits() {
+        use std::time::Duration;
+
+        use datafusion::arrow::array::StringArray;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use datafusion::prelude::SessionConfig;
+        use paimon::catalog::Identifier;
+        use paimon::io::FileIOBuilder;
+        use paimon::spec::{DataType, IntType, Schema as PaimonSchema, TableSchema, VarCharType};
+
+        // The second writer fails while the first writer is still alive and
+        // waiting for more input. The INSERT must return the second writer's
+        // error; waiting on the writers in creation order would block on the
+        // first writer and never see it.
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the bucket directory of partition p=bad
+        // belongs: only writes to that partition fail, with a real filesystem
+        // error.
+        std::fs::create_dir_all(dir.path().join("p=bad")).unwrap();
+        std::fs::write(dir.path().join("p=bad").join("bucket-0"), b"").unwrap();
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("p", DataType::VarChar(VarCharType::string_type()))
+            .partition_keys(["p"])
+            .option(SINK_PARALLELISM, "2")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            Identifier::new("default", "t"),
+            format!("file:{}", dir.path().display()),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, true),
+            Field::new("p", ArrowDataType::Utf8, true),
+        ]));
+        let batch = |id: i32, p: &str| {
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![id])),
+                    Arc::new(StringArray::from(vec![p])),
+                ],
+            )
+            .unwrap()
+        };
+        // Batches are dealt round-robin: the p=ok batch goes to the first
+        // writer, which buffers it and waits; the p=bad batch goes to the
+        // second writer, which fails. Then the input stays pending like a
+        // slow source.
+        let input = futures::stream::iter([Ok(batch(1, "ok")), Ok(batch(2, "bad"))])
+            .chain(futures::stream::pending());
+        let data = Box::pin(RecordBatchStreamAdapter::new(arrow_schema.clone(), input));
+        let context = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_target_partitions(2)),
+        );
+        let sink = PaimonDataSink::new(table, arrow_schema, false);
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), sink.write_all(data, &context)).await;
+
+        let error = result
+            .expect("INSERT still waits after the second writer failed")
+            .unwrap_err();
+        // The error comes from opening a data file under p=bad/bucket-0, so
+        // it names the failed partition.
+        assert!(error.to_string().contains("p=bad"), "{error}");
     }
 }
