@@ -37,7 +37,10 @@ use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
 
-fn to_paimon_batch(batch: RecordBatch, strip_internal_row_id: bool) -> DFResult<RecordBatch> {
+pub(crate) fn to_paimon_batch(
+    batch: RecordBatch,
+    strip_internal_row_id: bool,
+) -> DFResult<RecordBatch> {
     let input_schema = batch.schema();
     let row_id_index = strip_internal_row_id.then(|| {
         input_schema

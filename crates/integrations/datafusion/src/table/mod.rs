@@ -17,6 +17,7 @@
 
 //! Paimon table provider for DataFusion.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -199,6 +200,16 @@ impl PaimonTableProvider {
     pub(crate) fn with_pinned_snapshot(mut self, snapshot: &Snapshot) -> Self {
         self.table = self.table.copy_with_pinned_snapshot(Some(snapshot));
         self
+    }
+
+    pub(crate) fn with_primary_key_delete_snapshot(mut self, snapshot: &Snapshot) -> Self {
+        // Merge L0 versions before evaluating DELETE predicates, even when
+        // ordinary deletion-vector reads are compacted-only.
+        self.table = self.table.copy_with_options(HashMap::from([(
+            "deletion-vectors.merge-on-read".to_string(),
+            "true".to_string(),
+        )]));
+        self.with_pinned_snapshot(snapshot)
     }
 }
 
