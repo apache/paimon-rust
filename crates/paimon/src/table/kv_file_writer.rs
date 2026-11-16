@@ -524,27 +524,6 @@ impl KeyValueFileWriter {
         }
     }
 
-    /// Java's reducer wrapper keeps a one-row key group byte-for-byte. In
-    /// particular, a lone retract must reach an older file with its original
-    /// kind and payload instead of being aggregated against an empty state.
-    fn singleton_merge_row(
-        batch: &RecordBatch,
-        row_idx: usize,
-        output_indices: &[usize],
-        output_schema: &Arc<ArrowSchema>,
-    ) -> Result<RecordBatch> {
-        let columns = output_indices
-            .iter()
-            .map(|&index| batch.column(index).slice(row_idx, 1))
-            .collect();
-        RecordBatch::try_new(output_schema.clone(), columns).map_err(|error| {
-            crate::Error::DataInvalid {
-                message: format!("Failed to keep singleton merge row: {error}"),
-                source: Some(Box::new(error)),
-            }
-        })
-    }
-
     fn merge_aggregation_rows(
         &self,
         batch: &RecordBatch,
@@ -605,7 +584,7 @@ impl KeyValueFileWriter {
             .collect();
         let key_rows = self.convert_key_rows(batch)?;
         let buffers = [BufferedBatch::Source(batch.clone())];
-        let mut merged = Vec::new();
+        let mut merged = MergedRows::default();
         let mut merged_kinds = Vec::new();
         let mut last_indices = Vec::new();
         let mut start = 0;
@@ -617,12 +596,7 @@ impl KeyValueFileWriter {
                 end += 1;
             }
             if end - start == 1 {
-                merged.push(Self::singleton_merge_row(
-                    batch,
-                    rows[start].row_idx,
-                    &output_indices,
-                    &output_schema,
-                )?);
+                merged.keep(rows[start].row_idx);
                 merged_kinds.push(rows[start].value_kind);
             } else {
                 let group = rows[start..end].iter().collect::<Vec<_>>();
@@ -644,8 +618,9 @@ impl KeyValueFileWriter {
             message: format!("Failed to build merged aggregation batch: {e}"),
             source: Some(Box::new(e)),
         };
-        let merged =
-            arrow_select::concat::concat_batches(&output_schema, &merged).map_err(arrow_error)?;
+        let merged = merged
+            .finish(batch, &output_indices, &output_schema)
+            .map_err(arrow_error)?;
         let merged = if let Some(idx) = value_kind_idx {
             let mut columns = merged.columns().to_vec();
             columns.insert(idx, Arc::new(Int8Array::from(merged_kinds)));
@@ -719,7 +694,7 @@ impl KeyValueFileWriter {
             .collect();
         let key_rows = self.convert_key_rows(batch)?;
         let buffers = [BufferedBatch::Source(batch.clone())];
-        let mut merged = Vec::new();
+        let mut merged = MergedRows::default();
         let mut merged_kinds = Vec::new();
         let mut last_indices = Vec::new();
         let mut start = 0;
@@ -731,12 +706,7 @@ impl KeyValueFileWriter {
                 end += 1;
             }
             if end - start == 1 {
-                merged.push(Self::singleton_merge_row(
-                    batch,
-                    rows[start].row_idx,
-                    &output_indices,
-                    &output_schema,
-                )?);
+                merged.keep(rows[start].row_idx);
                 merged_kinds.push(rows[start].value_kind);
                 last_indices.push(sorted_indices.value(start));
                 start = end;
@@ -767,11 +737,9 @@ impl KeyValueFileWriter {
             message: format!("Failed to build merged partial-update batch: {e}"),
             source: Some(Box::new(e)),
         };
-        let merged = if merged.is_empty() {
-            RecordBatch::new_empty(output_schema.clone())
-        } else {
-            arrow_select::concat::concat_batches(&output_schema, &merged).map_err(arrow_error)?
-        };
+        let merged = merged
+            .finish(batch, &output_indices, &output_schema)
+            .map_err(arrow_error)?;
         let merged = if let Some(idx) = value_kind_idx {
             let mut columns = merged.columns().to_vec();
             columns.insert(idx, Arc::new(Int8Array::from(merged_kinds)));
@@ -948,6 +916,64 @@ pub(crate) fn build_physical_schema(user_schema: &ArrowSchema) -> Arc<ArrowSchem
         }
     }
     Arc::new(ArrowSchema::new(physical_fields))
+}
+
+/// Rows of a flushed key-value buffer after merging: a lone version of a key is
+/// picked from the sorted buffer as is, the way Java's reducer wrapper keeps a
+/// one-row key group byte-for-byte (a lone retract keeps its kind and payload
+/// instead of being aggregated against an empty state). A merged key adds its
+/// one-row result. The output is assembled once, in pick order.
+#[derive(Default)]
+struct MergedRows {
+    /// `(0, row)` picks buffer row `row`; `(i, 0)` picks `materialized[i - 1]`.
+    picks: Vec<(usize, usize)>,
+    materialized: Vec<RecordBatch>,
+}
+
+impl MergedRows {
+    fn keep(&mut self, row: usize) {
+        self.picks.push((0, row));
+    }
+
+    fn push(&mut self, row: RecordBatch) {
+        self.materialized.push(row);
+        self.picks.push((self.materialized.len(), 0));
+    }
+
+    fn finish(
+        self,
+        batch: &RecordBatch,
+        output_indices: &[usize],
+        output_schema: &Arc<ArrowSchema>,
+    ) -> std::result::Result<RecordBatch, arrow_schema::ArrowError> {
+        if self.picks.is_empty() {
+            return Ok(RecordBatch::new_empty(output_schema.clone()));
+        }
+        let columns = if self.materialized.is_empty() {
+            let rows = UInt32Array::from_iter_values(self.picks.iter().map(|&(_, row)| row as u32));
+            output_indices
+                .iter()
+                .map(|&index| arrow_select::take::take(batch.column(index).as_ref(), &rows, None))
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            output_indices
+                .iter()
+                .enumerate()
+                .map(|(column, &index)| {
+                    let mut sources: Vec<&dyn Array> =
+                        Vec::with_capacity(self.materialized.len() + 1);
+                    sources.push(batch.column(index).as_ref());
+                    sources.extend(
+                        self.materialized
+                            .iter()
+                            .map(|row| row.column(column).as_ref()),
+                    );
+                    arrow_select::interleave::interleave(&sources, &self.picks)
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        RecordBatch::try_new(output_schema.clone(), columns)
+    }
 }
 
 #[cfg(test)]
@@ -1852,6 +1878,101 @@ mod tests {
                 .unwrap();
             assert_eq!(kinds.values().as_ref(), &[3, 0]);
             assert_eq!(values.values().as_ref(), &[200, 50]);
+        }
+    }
+
+    #[test]
+    fn test_flush_merge_engines_keep_lone_rows_around_merged_keys() {
+        // Unsorted input with a merged key between lone keys, and a string column,
+        // so the output picks rows from the buffer and from the merged results.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("seq", ArrowDataType::Int64, false),
+            ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![3, 1, 2, 1])),
+                Arc::new(Int64Array::from(vec![40, 10, 30, 20])),
+                Arc::new(Int8Array::from(vec![0, 0, 0, 0])),
+                Arc::new(Int32Array::from(vec![
+                    Some(30),
+                    Some(10),
+                    Some(20),
+                    Some(11),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("c"),
+                    Some("a"),
+                    Some("b"),
+                    Some("a2"),
+                ])),
+            ],
+        )
+        .unwrap();
+        let sorted = UInt32Array::from(vec![1, 3, 2, 0]);
+        let sequence = Int64Array::from(vec![0, 1, 2, 3]);
+        for engine in [MergeEngine::PartialUpdate, MergeEngine::Aggregation] {
+            let writer = KeyValueFileWriter::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                test_write_config(engine),
+                0,
+            )
+            .unwrap();
+            let (merged, merged_seq) = match engine {
+                MergeEngine::PartialUpdate => {
+                    writer.merge_partial_update_rows(&batch, &sequence, &sorted)
+                }
+                MergeEngine::Aggregation => {
+                    writer.merge_aggregation_rows(&batch, &sequence, &sorted)
+                }
+                _ => unreachable!(),
+            }
+            .unwrap();
+            let column = |index: usize| merged.column(index).clone();
+            assert_eq!(
+                column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .as_ref(),
+                &[1, 2, 3],
+                "{engine:?}"
+            );
+            assert_eq!(
+                column(3)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .as_ref(),
+                &[11, 20, 30],
+                "{engine:?}"
+            );
+            assert_eq!(
+                column(4)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![Some("a2"), Some("b"), Some("c")],
+                "{engine:?}"
+            );
+            assert_eq!(
+                merged_seq
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .as_ref(),
+                &[3, 2, 0],
+                "{engine:?}"
+            );
         }
     }
 
