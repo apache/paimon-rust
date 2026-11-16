@@ -1135,6 +1135,86 @@ async fn test_truncate_rejects_shadowed_temporary_targets() {
 }
 
 #[tokio::test]
+async fn test_alter_and_partition_overwrite_reject_shadowed_temporary_targets() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    ctx.sql(r#"CREATE TABLE default."PartitionTarget" (id INT, pt INT) PARTITIONED BY (pt)"#)
+        .await
+        .unwrap();
+    ctx.sql(r#"INSERT INTO default."PartitionTarget" VALUES (1, 1), (2, 2)"#)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    for kind in ["TABLE", "VIEW"] {
+        ctx.sql(&format!(
+            r#"CREATE TEMPORARY {kind} default."PartitionTarget" AS SELECT CAST(999 AS INT) AS id"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            collect_ids(&ctx, r#"SELECT id FROM "PartitionTarget""#).await,
+            vec![999]
+        );
+        for (sql, operation) in [
+            (
+                r#"INSERT OVERWRITE paimon.default."PartitionTarget" PARTITION (pt = 1) SELECT 8"#,
+                "INSERT OVERWRITE",
+            ),
+            (
+                r#"ALTER TABLE "PartitionTarget" DROP COLUMN id"#,
+                "ALTER TABLE",
+            ),
+            (
+                r#"ALTER TABLE "PartitionTarget" DROP PARTITION (pt = 1)"#,
+                "ALTER TABLE",
+            ),
+            (
+                r#"ALTER TABLE IF EXISTS default."PartitionTarget" DROP PARTITION (pt = 1)"#,
+                "ALTER TABLE",
+            ),
+            (
+                r#"ALTER TABLE paimon.default."PartitionTarget" DROP IF EXISTS PARTITION (pt = 1)"#,
+                "ALTER TABLE",
+            ),
+        ] {
+            assert_sql_error_contains(
+                &ctx,
+                sql,
+                &format!("{operation} on temporary tables or views is not supported"),
+            )
+            .await;
+        }
+        ctx.sql(&format!(
+            r#"DROP TEMPORARY {kind} default."PartitionTarget""#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            collect_ids(&ctx, r#"SELECT id FROM "PartitionTarget" ORDER BY id"#).await,
+            vec![1, 2]
+        );
+    }
+
+    ctx.sql(r#"INSERT OVERWRITE "PartitionTarget" PARTITION (pt = 1) SELECT 8"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_ids(&ctx, r#"SELECT id FROM "PartitionTarget" ORDER BY id"#).await,
+        vec![2, 8]
+    );
+    ctx.sql(r#"ALTER TABLE "PartitionTarget" DROP PARTITION (pt = 1)"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_ids(&ctx, r#"SELECT id FROM "PartitionTarget""#).await,
+        vec![2]
+    );
+}
+
+#[tokio::test]
 async fn test_scoped_show_accepts_information_schema() {
     let (_tmp, catalog) = create_test_env();
     let ctx = create_sql_context(catalog).await;
