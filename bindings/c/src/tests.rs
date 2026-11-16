@@ -26,6 +26,7 @@
 //! must NOT wrap C FFI calls inside another `block_on`. Use the global
 //! runtime only for Rust-API setup (write_data_rust, setup_table_dirs).
 
+mod audit_read;
 mod commit_messages;
 mod table_arrow_schema;
 
