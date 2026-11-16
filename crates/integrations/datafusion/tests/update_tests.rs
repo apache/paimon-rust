@@ -531,6 +531,145 @@ async fn test_update_empty_table() {
     drop(tmp);
 }
 
+// ======================= ORDER BY and LIMIT =======================
+
+#[tokio::test]
+async fn test_update_with_order_by_and_limit() {
+    for options in [
+        "",
+        "WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true',
+            'deletion-vectors.enabled' = 'true'
+        )",
+    ] {
+        let (_tmp, catalog) = create_test_env();
+        let sql_context = create_sql_context(catalog).await;
+        sql_context
+            .sql("CREATE SCHEMA paimon.test_db")
+            .await
+            .unwrap();
+        sql_context
+            .sql(&format!(
+                "CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, pt INT) \
+                 PARTITIONED BY (pt) {options}"
+            ))
+            .await
+            .unwrap();
+
+        // Separate commits and partitions exercise global row selection.
+        exec(
+            &sql_context,
+            "INSERT INTO paimon.test_db.t (id, name, pt) VALUES (1, 'a', 1), (4, 'd', 2)",
+        )
+        .await;
+        exec(
+            &sql_context,
+            "INSERT INTO paimon.test_db.t (id, name, pt) VALUES (2, 'b', 1), (3, 'c', 2)",
+        )
+        .await;
+
+        let before = query_pt(&sql_context).await;
+        let cnt = dml_count(
+            &sql_context,
+            "UPDATE paimon.test_db.t SET name = 'x' WHERE id > 1 LIMIT 0",
+        )
+        .await;
+        assert_eq!(cnt, 0);
+        assert_eq!(query_pt(&sql_context).await, before);
+
+        // ORDER BY uses the original values of the updated column.
+        let cnt = dml_count(
+            &sql_context,
+            "UPDATE paimon.test_db.t SET id = paimon.test_db.t.id + 10 \
+             WHERE t.id <> 4 ORDER BY t.pt DESC, t.id ASC LIMIT 2",
+        )
+        .await;
+        assert_eq!(cnt, 2);
+        assert_eq!(
+            query_pt(&sql_context).await,
+            vec![
+                (2, "b".into(), 1),
+                (4, "d".into(), 2),
+                (11, "a".into(), 1),
+                (13, "c".into(), 2),
+            ]
+        );
+
+        let cnt = dml_count(
+            &sql_context,
+            "UPDATE paimon.test_db.t SET name = 'limited' LIMIT 1",
+        )
+        .await;
+        assert_eq!(cnt, 1);
+        let rows = query_pt(&sql_context).await;
+        assert_eq!(
+            rows.iter().filter(|(_, name, _)| name == "limited").count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_update_selects_rows_before_set() {
+    for options in [
+        "",
+        "WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true',
+            'deletion-vectors.enabled' = 'true'
+        )",
+    ] {
+        for (assignment, ordering, expected) in [
+            (
+                "id + 100",
+                "__upd_id",
+                vec![(1, "a".into(), 20), (102, "b".into(), 10)],
+            ),
+            (
+                "12 / (2 - id)",
+                "id",
+                vec![(2, "b".into(), 10), (12, "a".into(), 20)],
+            ),
+        ] {
+            let (_tmp, catalog) = create_test_env();
+            let sql_context = create_sql_context(catalog).await;
+            sql_context
+                .sql("CREATE SCHEMA paimon.test_db")
+                .await
+                .unwrap();
+            sql_context
+                .sql(&format!(
+                    "CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, __upd_id INT) {options}"
+                ))
+                .await
+                .unwrap();
+            exec(
+                &sql_context,
+                "INSERT INTO paimon.test_db.t (id, name, __upd_id) VALUES (1, 'a', 20), (2, 'b', 10)",
+            )
+            .await;
+
+            let cnt = dml_count(
+                &sql_context,
+                &format!(
+                    "UPDATE paimon.test_db.t SET id = {assignment} ORDER BY {ordering} LIMIT 1"
+                ),
+            )
+            .await;
+            assert_eq!(cnt, 1);
+            assert_eq!(
+                query_int_str_int(
+                    &sql_context,
+                    "SELECT id, name, __upd_id FROM paimon.test_db.t ORDER BY id"
+                )
+                .await,
+                expected
+            );
+        }
+    }
+}
+
 // ======================= Unsupported cases =======================
 
 #[tokio::test]
