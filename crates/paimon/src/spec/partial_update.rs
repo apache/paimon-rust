@@ -38,7 +38,6 @@ const LIST_AGG_DELIMITER_SUFFIX: &str = ".list-agg-delimiter";
 const IGNORE_RETRACT_SUFFIX: &str = ".ignore-retract";
 const DISTINCT_SUFFIX: &str = ".distinct";
 const NESTED_KEY_SUFFIX: &str = ".nested-key";
-const NESTED_SEQUENCE_FIELD_SUFFIX: &str = ".nested-sequence-field";
 const NESTED_SEQUENCE_OVERWRITE_ON_EQUAL_SUFFIX: &str = ".nested-sequence-overwrite-on-equal";
 const COUNT_LIMIT_SUFFIX: &str = ".count-limit";
 
@@ -559,8 +558,6 @@ impl<'a> PartialUpdateConfig<'a> {
                     && !is_fields_option_with_suffix(key, DISTINCT_SUFFIX)
                     && !is_fields_option_with_suffix(key, IGNORE_RETRACT_SUFFIX)
                     && !is_fields_option_with_suffix(key, NESTED_KEY_SUFFIX)
-                    && !is_fields_option_with_suffix(key, NESTED_SEQUENCE_FIELD_SUFFIX)
-                    && !is_fields_option_with_suffix(key, NESTED_SEQUENCE_OVERWRITE_ON_EQUAL_SUFFIX)
                     && !is_fields_option_with_suffix(key, COUNT_LIMIT_SUFFIX)
                     && key.as_str() != FIELDS_DEFAULT_AGG_FUNCTION_OPTION
             })

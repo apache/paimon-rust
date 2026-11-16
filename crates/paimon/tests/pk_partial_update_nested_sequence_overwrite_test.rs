@@ -153,21 +153,16 @@ async fn read_amount(table: &Table) -> i32 {
 }
 
 #[tokio::test]
-async fn overwrite_on_equal_false_rejected_before_either_commit_grouping() {
-    // Create-time validation is the shared gate for both single-commit and
-    // multi-commit write groupings; neither path can bypass it.
-    for single_commit in [true, false] {
-        let err = schema(Some("false")).unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains("nested-sequence-overwrite-on-equal=false"),
-            "single_commit={single_commit}, got {message}"
-        );
-        assert!(
-            message.contains("sequence-group"),
-            "single_commit={single_commit}, got {message}"
-        );
-    }
+async fn overwrite_on_equal_false_rejected_at_schema_create() {
+    // Create-time validation rejects the unsafe combination before any write
+    // path can observe grouping-dependent equal-sequence retention.
+    let err = schema(Some("false")).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("nested-sequence-overwrite-on-equal=false"),
+        "got {message}"
+    );
+    assert!(message.contains("sequence-group"), "got {message}");
 }
 
 #[tokio::test]
