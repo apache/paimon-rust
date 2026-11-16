@@ -244,6 +244,25 @@ balances complete Data Evolution file groups by row ID. The returned
 replacement columns in that reader's visible row order, including when deletion
 vectors remove physical rows. Input batch boundaries may differ from read batches.
 
+To reuse a coordinator's captured plan, configure `with_plan` before creating
+the updater. Core balances only those supplied groups and keeps their snapshot;
+it reauthorizes the worker without scanning data manifests. If the coordinator
+has already assigned complete file groups to this worker, use `(0, 1)`.
+Transport the snapshot ID together with the picklable splits, then reconstruct
+`Plan` in the worker:
+
+```python
+from pypaimon_rust.datafusion import Plan
+
+worker_plan = Plan(captured_snapshot_id, assigned_complete_splits)
+update = table.new_batch_write_builder().new_update().with_update_type(["result"])
+shard = update.with_plan(worker_plan).new_shard_updator(0, 1)
+```
+
+Keep every group's normal and partial-column files and deletion metadata.
+Selected row ranges, scores and incremental/streaming splits are not mutation
+plans. An empty worker plan stays empty even after new data is appended.
+
 Finish the reader and supply exactly the same number of rows before calling
 `prepare_commit()`. Core buffers one file group, reuses the normal partial-column
 writer and returns messages with the captured snapshot's conflict check. Repeated

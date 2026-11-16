@@ -1203,7 +1203,7 @@ impl RowIdFileIndex {
 /// Validate transported planner metadata and mint a worker-local mutation grant.
 /// The caller supplies complete planner groups; manifests are deliberately not
 /// re-read to rediscover metadata already captured by the coordinator.
-async fn authorize_row_id_plan(
+pub(super) async fn authorize_row_id_plan(
     table: &Table,
     plan: &Plan,
 ) -> Result<(Table, Option<Snapshot>, Plan)> {
