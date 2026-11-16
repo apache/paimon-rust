@@ -239,6 +239,38 @@ for batch in batches:
     print(batch)
 ```
 
+## Extracting VARIANT Values
+
+`pypaimon_rust.data.variant_get` extracts one path from a PyArrow VARIANT array
+with the same exact types as PyPaimon's Python implementation:
+
+```python
+import pyarrow as pa
+from pypaimon_rust.data import variant_get
+
+ages = variant_get(batch.column("payload"), "$.age", pa.int64())
+names = variant_get(batch.column("payload"), "$.name", pa.string())
+items = variant_get(batch.column("payload"), "$.items", pa.list_(pa.int64()))
+```
+
+Supported targets are booleans, signed integers, float32/64, string/large_string,
+binary/large_binary, date32, microsecond timestamps (with or without a timezone),
+Decimal128 with nonnegative scale, and nested struct, list, large_list,
+fixed_size_list and string-keyed map types. The result preserves the requested
+Arrow type. Missing paths, VARIANT nulls and SQL nulls produce nulls.
+This includes missing or null nested children with nonnullable field annotations,
+matching Python extraction. VARIANT input `value` and `metadata` children may use
+binary or large_binary storage; dictionary-encoded metadata with Int32 indices
+is also accepted.
+
+Extraction performs no implicit casts: float widths, timestamp timezone presence
+and decimal scales must match the stored type. Type mismatches raise `TypeError`;
+integer overflow, insufficient decimal precision and malformed input raise
+`ValueError`. Paths support object keys, quoted keys and array indices.
+
+`variant_get_numeric_fields(column, fields)` retains its numeric-to-float32
+conversion and ordered fixed-size-list output for literal top-level field names.
+
 ## Writing to a Table
 
 Paimon Python uses a **write-then-commit** pattern: write PyArrow RecordBatches to a writer, prepare commit messages, then commit.
