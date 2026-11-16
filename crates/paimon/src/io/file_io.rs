@@ -942,8 +942,9 @@ impl FileIO {
     }
 
     /// Publish a complete immutable file only if the target does not exist.
-    /// Returns `false` only for a definite publication conflict. Other failures
-    /// may have an unknown outcome and must never trigger an unconditional write.
+    /// Returns `false` when a conditional write is rejected. The target may
+    /// have been published by an earlier attempt of the same request.
+    /// Errors can also leave the publication outcome unknown.
     pub(crate) async fn write_atomic_if_not_exists(
         &self,
         path: &str,
@@ -1773,6 +1774,11 @@ pub struct InputFile {
 }
 
 impl InputFile {
+    pub(crate) fn without_cache(mut self) -> Self {
+        self.cache = None;
+        self
+    }
+
     pub fn location(&self) -> &str {
         &self.path
     }
