@@ -2262,6 +2262,84 @@ mod tests {
     }
 
     #[test]
+    fn shredded_variant_nested_field_ids_survive_arrow_roundtrip() {
+        // Java files carry IDs on nested physical fields too. Simulate their
+        // schema independently of Rust's runtime Arrow schema convention.
+        fn file_type(data_type: &DataType) -> ArrowDataType {
+            match data_type {
+                DataType::Row(row) => ArrowDataType::Struct(
+                    row.fields()
+                        .iter()
+                        .map(|field| {
+                            crate::arrow::arrow_field_with_paimon_id(
+                                field.name(),
+                                file_type(field.data_type()),
+                                field.data_type().is_nullable(),
+                                field.id(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                DataType::Array(array) => ArrowDataType::List(Arc::new(ArrowField::new(
+                    "element",
+                    file_type(array.element_type()),
+                    array.element_type().is_nullable(),
+                ))),
+                _ => paimon_type_to_arrow(data_type).unwrap(),
+            }
+        }
+        let configured = DataType::Row(RowType::new(vec![
+            DataField::new(
+                17,
+                "object".into(),
+                DataType::Row(RowType::new(vec![DataField::new(
+                    29,
+                    "score".into(),
+                    DataType::BigInt(BigIntType::new()),
+                )])),
+            ),
+            DataField::new(
+                41,
+                "items".into(),
+                DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                    DataField::new(
+                        53,
+                        "label".into(),
+                        DataType::VarChar(VarCharType::string_type()),
+                    ),
+                ])))),
+            ),
+        ]));
+        let physical = variant_shredding_type(&configured).unwrap();
+        let DataType::Row(root) = &physical else {
+            unreachable!()
+        };
+        let DataType::Row(object) = root.fields()[2].data_type() else {
+            unreachable!()
+        };
+        let DataType::Row(wrapper) = object.fields()[0].data_type() else {
+            unreachable!()
+        };
+        assert_eq!(wrapper.fields()[0].id(), 0);
+        assert_eq!(wrapper.fields()[1].id(), 1);
+        let arrow = file_type(&physical);
+        assert_eq!(
+            arrow_to_paimon_type(&arrow, physical.is_nullable()).unwrap(),
+            physical
+        );
+        let ArrowDataType::Struct(fields) = arrow else {
+            unreachable!()
+        };
+        assert_eq!(fields[2].metadata()["PARQUET:field_id"], "2");
+        let ArrowDataType::Struct(typed) = fields[2].data_type() else {
+            unreachable!()
+        };
+        assert_eq!(typed[0].metadata()["PARQUET:field_id"], "17");
+        assert_eq!(typed[1].metadata()["PARQUET:field_id"], "41");
+    }
+
+    #[test]
     fn configured_schema_transforms_and_reassembles_variant_batch() {
         let logical_fields = vec![
             DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
