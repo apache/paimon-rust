@@ -59,6 +59,8 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
+mod variant_schema;
+
 pub(crate) struct ParquetFormatReader {
     read_budget: Option<Arc<ReadBudget>>,
     page_index_enabled: bool,
@@ -343,17 +345,24 @@ impl PhysicalFormatWriterFactory for ParquetWriterFactory {
         schema: arrow_schema::SchemaRef,
         write_fields: Option<&[DataField]>,
     ) -> crate::Result<Box<dyn FormatFileWriter>> {
-        Ok(Box::new(
-            ParquetFormatWriter::new(
-                output,
-                schema,
-                compression,
-                self.zstd_level,
-                self.stats_fields.as_deref().or(write_fields),
-                &self.format_options,
-            )
-            .await?,
-        ))
+        let input_schema = schema;
+        let schema = match (write_fields, self.write_fields.as_deref()) {
+            (Some(physical), Some(logical)) => {
+                variant_schema::with_variant_field_ids(&input_schema, physical, logical)
+            }
+            _ => input_schema.clone(),
+        };
+        let mut writer = ParquetFormatWriter::new(
+            output,
+            schema,
+            compression,
+            self.zstd_level,
+            self.stats_fields.as_deref().or(write_fields),
+            &self.format_options,
+        )
+        .await?;
+        writer.input_schema = input_schema;
+        Ok(Box::new(writer))
     }
 }
 
@@ -5246,10 +5255,13 @@ mod tests {
         ];
         let options = HashMap::from([(
             "parquet.variant.shreddingSchema".to_string(),
-            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"age","type":"BIGINT"},{"name":"city","type":"STRING"}]}}]}"#.to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"age","type":"BIGINT"},{"name":"city","type":"STRING"},{"name":"address","type":{"type":"ROW","fields":[{"name":"zip","type":"BIGINT"}]}},{"name":"items","type":{"type":"ARRAY","element":{"type":"ARRAY","element":"BIGINT"}}}]}}]}"#.to_string(),
         )]);
         let variants = [
-            GenericVariant::parse_json(r#"{"age":27,"city":"Beijing"}"#).unwrap(),
+            GenericVariant::parse_json(
+                r#"{"age":27,"city":"Beijing","address":{"zip":100},"items":[[1,2],[],[3]]}"#,
+            )
+            .unwrap(),
             GenericVariant::parse_json(r#"{"age":27}"#).unwrap(),
             GenericVariant::parse_json(r#"{"city":"Beijing","other":"xxx"}"#).unwrap(),
             GenericVariant::parse_json(r#"{"age":"27"}"#).unwrap(),
@@ -5303,6 +5315,28 @@ mod tests {
         let file_size = writer.close().await.unwrap().file_size;
 
         let raw_bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
+        let footer = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            raw_bytes.clone(),
+        )
+        .unwrap();
+        fn assert_parquet_ids(field: &parquet::schema::types::Type) {
+            // The repeated LIST container is not a Paimon field; its element is.
+            if field.name() != "list" {
+                assert!(
+                    field.get_basic_info().has_id(),
+                    "missing Parquet field ID: {}",
+                    field.name()
+                );
+            }
+            if field.is_group() {
+                for child in field.get_fields() {
+                    assert_parquet_ids(child);
+                }
+            }
+        }
+        for field in footer.parquet_schema().root_schema().get_fields() {
+            assert_parquet_ids(field);
+        }
         let raw_batches =
             parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(raw_bytes, 1024)
                 .unwrap()
@@ -5316,6 +5350,51 @@ mod tests {
         assert!(raw_variant_fields
             .iter()
             .any(|field| field.name() == "typed_value"));
+        fn assert_arrow_ids(field: &arrow_schema::Field) {
+            assert!(
+                field.metadata().contains_key("PARQUET:field_id"),
+                "missing Arrow field ID: {}",
+                field.name()
+            );
+            match field.data_type() {
+                arrow_schema::DataType::Struct(fields) => {
+                    for child in fields {
+                        assert_arrow_ids(child);
+                    }
+                }
+                arrow_schema::DataType::List(element) => assert_arrow_ids(element),
+                _ => {}
+            }
+        }
+        for field in raw_variant_fields {
+            assert_arrow_ids(field);
+        }
+        let arrow_schema::DataType::Struct(object) = raw_variant_fields[2].data_type() else {
+            unreachable!()
+        };
+        let arrow_schema::DataType::Struct(age) = object
+            .iter()
+            .find(|field| field.name() == "age")
+            .unwrap()
+            .data_type()
+        else {
+            unreachable!()
+        };
+        assert_eq!(age[0].metadata()["PARQUET:field_id"], "0");
+        assert_eq!(age[1].metadata()["PARQUET:field_id"], "1");
+        let arrow_schema::DataType::Struct(items) = object
+            .iter()
+            .find(|field| field.name() == "items")
+            .unwrap()
+            .data_type()
+        else {
+            unreachable!()
+        };
+        let arrow_schema::DataType::List(element) = items[1].data_type() else {
+            unreachable!()
+        };
+        // Java SpecialFields, using the wrapper's typed_value field ID (=1).
+        assert_eq!(element.metadata()["PARQUET:field_id"], "536871936");
 
         let input = file_io.new_input(&path).unwrap();
         let file_reader = input.reader().await.unwrap();

@@ -2523,6 +2523,9 @@ fn variant_shredding_row_type(
     is_object_field: bool,
 ) -> Result<RowType> {
     let mut fields = Vec::new();
+    // Java creates a fresh RowType builder for each wrapper. Only the root
+    // contains metadata, shifting its value/typed_value IDs from 0/1 to 1/2.
+    let value_id = i32::from(is_top_level);
     if is_top_level {
         fields.push(DataField::new(
             0,
@@ -2539,12 +2542,12 @@ fn variant_shredding_row_type(
                 false,
             )?);
             fields.push(DataField::new(
-                1,
+                value_id,
                 VARIANT_VALUE_FIELD_NAME.to_string(),
                 variant_binary_type(true)?,
             ));
             fields.push(DataField::new(
-                2,
+                value_id + 1,
                 VARIANT_TYPED_VALUE_FIELD_NAME.to_string(),
                 DataType::Array(ArrayType::with_nullable(data_type.is_nullable(), element)),
             ));
@@ -2562,31 +2565,31 @@ fn variant_shredding_row_type(
                 })
                 .collect::<Result<Vec<_>>>()?;
             fields.push(DataField::new(
-                1,
+                value_id,
                 VARIANT_VALUE_FIELD_NAME.to_string(),
                 variant_binary_type(true)?,
             ));
             fields.push(DataField::new(
-                2,
+                value_id + 1,
                 VARIANT_TYPED_VALUE_FIELD_NAME.to_string(),
                 DataType::Row(RowType::new(object_fields)),
             ));
         }
         DataType::Variant(_) => {
             fields.push(DataField::new(
-                1,
+                value_id,
                 VARIANT_VALUE_FIELD_NAME.to_string(),
                 variant_binary_type(is_object_field)?,
             ));
         }
         dt if scalar_schema_for_type(dt)?.is_some() => {
             fields.push(DataField::new(
-                1,
+                value_id,
                 VARIANT_VALUE_FIELD_NAME.to_string(),
                 variant_binary_type(true)?,
             ));
             fields.push(DataField::new(
-                2,
+                value_id + 1,
                 VARIANT_TYPED_VALUE_FIELD_NAME.to_string(),
                 shredding_typed_value_type(data_type)?,
             ));

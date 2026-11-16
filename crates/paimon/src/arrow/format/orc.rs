@@ -16,6 +16,7 @@
 // under the License.
 
 use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
+use crate::arrow::shredding::{map::MapShreddingReadPlan, ShreddingReadPlan};
 use crate::io::{FileRead, FileWrite, OutputFile};
 use crate::spec::{
     is_row_tracking_column, DataField, DataType, Datum, Predicate, PredicateOperator,
@@ -25,6 +26,7 @@ use crate::Error;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use async_trait::async_trait;
+use base64::Engine;
 use bytes::Bytes;
 use futures::{future::BoxFuture, StreamExt};
 use orc_rust::predicate::PredicateValue;
@@ -41,6 +43,61 @@ use tokio::sync::{mpsc, oneshot};
 const ORC_IN_PREDICATE_MAX_LITERALS: usize = 20;
 
 pub(crate) struct OrcFormatReader;
+
+/// Java/PyPaimon store field metadata in a base64 Arrow IPC schema in the ORC
+/// user metadata. Keep ORC's physical types and use the IPC schema only for
+/// field annotations, as the two formats have different nullability rules.
+/// Like Java, ignore unusable optional schemas. Relevant shredding annotations
+/// are validated separately by the MAP read plan.
+fn with_arrow_field_metadata(
+    physical: &SchemaRef,
+    metadata: &HashMap<String, Vec<u8>>,
+) -> SchemaRef {
+    let Some(encoded) = metadata.get("ARROW:schema") else {
+        return physical.clone();
+    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .unwrap_or_else(|_| encoded.clone());
+    let bytes = if decoded.starts_with(&[255; 4]) && decoded.len() >= 8 {
+        &decoded[8..]
+    } else {
+        decoded.as_slice()
+    };
+    let Some(ipc_fields) = arrow_ipc::root_as_message(bytes)
+        .ok()
+        .and_then(|message| message.header_as_schema())
+        .and_then(|schema| schema.fields())
+    else {
+        return physical.clone();
+    };
+    // Decoding Arrow types is unnecessary and can panic on a schema which is
+    // structurally valid but has an unsupported or incomplete field type.
+    let annotations = ipc_fields
+        .iter()
+        .filter_map(|field| {
+            let name = field.name()?;
+            let metadata = field
+                .custom_metadata()?
+                .iter()
+                .filter_map(|entry| Some((entry.key()?.to_string(), entry.value()?.to_string())))
+                .collect::<HashMap<_, _>>();
+            Some((name, metadata))
+        })
+        .collect::<HashMap<_, _>>();
+    let fields = physical
+        .fields()
+        .iter()
+        .map(|field| match annotations.get(field.name().as_str()) {
+            Some(metadata) => Arc::new(field.as_ref().clone().with_metadata(metadata.clone())),
+            None => field.clone(),
+        })
+        .collect::<Vec<_>>();
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        physical.metadata().clone(),
+    ))
+}
 
 fn orc_error<E>(error: E, context: &str) -> Error
 where
@@ -378,6 +435,11 @@ impl FormatFileReader for OrcFormatReader {
         // to the requested output by name afterwards, so the extra columns are
         // harmless.
         let scan_fields = crate::arrow::residual::widen_scan_fields(read_fields, predicates);
+        let file_schema = with_arrow_field_metadata(
+            &builder.schema(),
+            builder.file_metadata().user_custom_metadata(),
+        );
+        let map_read_plan = MapShreddingReadPlan::create(&scan_fields, &file_schema)?;
         let projected_names: Vec<String> =
             scan_fields.iter().map(|f| f.name().to_string()).collect();
         let orc_predicate = build_orc_predicate(predicates);
@@ -430,6 +492,10 @@ impl FormatFileReader for OrcFormatReader {
         Ok(stream
             .map(move |r| {
                 let batch = r.map_err(|error| orc_error(error, "ORC read error"))?;
+                let batch = match &map_read_plan {
+                    Some(plan) => plan.assemble_batch(&batch)?,
+                    None => batch,
+                };
                 match &residual {
                     Some((fp, scan_fields)) => {
                         crate::arrow::residual::filter_record_batch_by_predicates(
@@ -1140,6 +1206,221 @@ mod tests {
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
         let error = stream.next().await.unwrap().unwrap_err();
         assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+    }
+
+    #[tokio::test]
+    async fn reads_shared_shredding_maps_before_filtering_and_selection() {
+        use crate::io::FileIOBuilder;
+        use crate::spec::{MapType, VarCharType};
+        use arrow_array::MapArray;
+        use std::collections::BTreeMap;
+
+        let bytes =
+            Bytes::from_static(include_bytes!("../../../testdata/map_shredding/shared.orc"));
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/shared.orc";
+        io.new_output(path)
+            .unwrap()
+            .write(bytes.clone())
+            .await
+            .unwrap();
+        let id = field(0, "id", DataType::Int(IntType::new()));
+        let tags = field(
+            1,
+            "tags",
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type())
+                    .copy_with_nullable(false)
+                    .unwrap(),
+                DataType::Int(IntType::new()),
+            )),
+        );
+        let selected = tags
+            .clone()
+            .with_description(Some("__PAIMON_MAP_SELECTED_KEYS:b;missing".into()));
+        let predicates = file_predicates(
+            vec![leaf(0, PredicateOperator::GtEq, vec![Datum::Int(2)])],
+            vec![id.clone(), tags.clone()],
+        );
+        let map = |items: Vec<(&str, Option<i32>)>| {
+            Some(
+                items
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        };
+        for (fields, filter, ranges, expected) in [
+            (
+                vec![tags.clone()],
+                None,
+                None,
+                vec![
+                    map(vec![("a", Some(10)), ("b", Some(20))]),
+                    None,
+                    map(vec![]),
+                    map(vec![("a", Some(30)), ("b", None)]),
+                ],
+            ),
+            (
+                vec![tags],
+                Some(&predicates),
+                None,
+                vec![map(vec![]), map(vec![("a", Some(30)), ("b", None)])],
+            ),
+            (
+                vec![selected],
+                None,
+                Some(vec![RowRange::new(1, 3)]),
+                vec![None, map(vec![]), map(vec![("b", None)])],
+            ),
+            (vec![id], None, None, vec![]),
+        ] {
+            let input = io.new_input(path).unwrap();
+            let mut stream = OrcFormatReader
+                .read_batch_stream(
+                    Box::new(input.reader().await.unwrap()),
+                    bytes.len() as u64,
+                    &fields,
+                    filter,
+                    Some(2),
+                    ranges,
+                )
+                .await
+                .unwrap();
+            let mut actual = Vec::new();
+            let mut count = 0;
+            while let Some(batch) = stream.next().await {
+                let batch = batch.unwrap();
+                count += batch.num_rows();
+                let Some(column) = batch.column_by_name("tags") else {
+                    continue;
+                };
+                let maps = column.as_any().downcast_ref::<MapArray>().unwrap();
+                for row in 0..maps.len() {
+                    if maps.is_null(row) {
+                        actual.push(None);
+                    } else {
+                        let entries = maps.value(row);
+                        let keys = entries
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap();
+                        let values = entries
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap();
+                        actual.push(Some(
+                            keys.iter()
+                                .zip(values.iter())
+                                .map(|(key, value)| (key.unwrap().to_string(), value))
+                                .collect(),
+                        ));
+                    }
+                }
+            }
+            assert_eq!(
+                count,
+                if expected.is_empty() {
+                    4
+                } else {
+                    expected.len()
+                }
+            );
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn optional_orc_schema_without_fields_does_not_panic() {
+        use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+        let mut bytes = IpcDataGenerator::default()
+            .schema_to_bytes_with_dictionary_tracker(
+                &Schema::empty(),
+                &mut DictionaryTracker::new(false),
+                &IpcWriteOptions::default(),
+            )
+            .ipc_message;
+        let schema_table = arrow_ipc::root_as_message(&bytes)
+            .unwrap()
+            .header_as_schema()
+            .unwrap()
+            ._tab
+            .loc();
+        let distance =
+            i32::from_le_bytes(bytes[schema_table..schema_table + 4].try_into().unwrap());
+        let vtable = (schema_table as isize - distance as isize) as usize;
+        let fields_slot = vtable + arrow_ipc::Schema::VT_FIELDS as usize;
+        bytes[fields_slot..fields_slot + 2].fill(0);
+        assert!(arrow_ipc::root_as_message(&bytes)
+            .unwrap()
+            .header_as_schema()
+            .unwrap()
+            .fields()
+            .is_none());
+        let physical = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            true,
+        )]));
+        let parsed =
+            with_arrow_field_metadata(&physical, &HashMap::from([("ARROW:schema".into(), bytes)]));
+        assert_eq!(parsed, physical);
+    }
+
+    #[test]
+    fn orc_field_annotations_do_not_require_valid_unused_arrow_types() {
+        use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+        let annotation = HashMap::from([("custom".into(), "preserved".into())]);
+        let schema = Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, true).with_metadata(annotation.clone()),
+            Field::new("unused", ArrowDataType::Int32, true),
+        ]);
+        let mut bytes = IpcDataGenerator::default()
+            .schema_to_bytes_with_dictionary_tracker(
+                &schema,
+                &mut DictionaryTracker::new(false),
+                &IpcWriteOptions::default(),
+            )
+            .ipc_message;
+        let int_table = arrow_ipc::root_as_message(&bytes)
+            .unwrap()
+            .header_as_schema()
+            .unwrap()
+            .fields()
+            .unwrap()
+            .get(1)
+            .type_as_int()
+            .unwrap()
+            ._tab
+            .loc();
+        let distance = i32::from_le_bytes(bytes[int_table..int_table + 4].try_into().unwrap());
+        let vtable = (int_table as isize - distance as isize) as usize;
+        let width_slot = vtable + arrow_ipc::Int::VT_BITWIDTH as usize;
+        let width =
+            u16::from_le_bytes(bytes[width_slot..width_slot + 2].try_into().unwrap()) as usize;
+        bytes[int_table + width..int_table + width + 4].fill(0);
+        assert!(arrow_ipc::root_as_message(&bytes).is_ok());
+        let physical = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            true,
+        )]));
+        let parsed =
+            with_arrow_field_metadata(&physical, &HashMap::from([("ARROW:schema".into(), bytes)]));
+        assert_eq!(parsed.field(0).metadata(), &annotation);
+    }
+
+    #[test]
+    fn malformed_optional_orc_arrow_metadata_is_ignored() {
+        let schema = Arc::new(Schema::empty());
+        let parsed = with_arrow_field_metadata(
+            &schema,
+            &HashMap::from([("ARROW:schema".into(), b"invalid IPC schema".to_vec())]),
+        );
+        assert_eq!(parsed, schema);
     }
 
     #[tokio::test]

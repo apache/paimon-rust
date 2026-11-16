@@ -92,6 +92,107 @@ async fn read_batch(table: &Table) -> RecordBatch {
 }
 
 #[tokio::test]
+async fn partial_column_commit_without_baseline_accepts_short_blob_delta() {
+    let table = table(&[]).await;
+    seed(&table).await;
+    let mut messages = apply(&table, matched(vec![1], vec![Some(b"updated")])).await;
+    for message in &mut messages {
+        message.check_from_snapshot = None;
+    }
+    assert!(
+        messages
+            .iter()
+            .flat_map(|message| &message.new_files)
+            .all(|file| file.row_count == 2
+                && file.write_cols.as_deref() == Some(&["payload".into()]))
+    );
+    table
+        .new_write_builder()
+        .new_commit()
+        .commit(messages)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&table).await,
+        vec![
+            (0, Some(b"old-0".to_vec()), 10),
+            (1, Some(b"updated".to_vec()), 11),
+            (2, Some(vec![]), 12),
+            (3, Some(b"old-3".to_vec()), 13),
+            (4, Some(b"old-4".to_vec()), 14),
+        ]
+    );
+
+    let before = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    for row_count in [0, -1] {
+        let mut invalid = apply(&table, matched(vec![1], vec![Some(b"invalid")])).await;
+        for message in &mut invalid {
+            message.check_from_snapshot = None;
+            for file in &mut message.new_files {
+                file.row_count = row_count;
+            }
+        }
+        assert!(
+            table
+                .new_write_builder()
+                .new_commit()
+                .commit(invalid)
+                .await
+                .is_err(),
+            "nonpositive dedicated file row count {row_count} must not commit"
+        );
+    }
+    let batch = RecordBatch::try_from_iter([
+        ("_ROW_ID", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+        ("value", Arc::new(Int32Array::from(vec![99])) as ArrayRef),
+    ])
+    .unwrap();
+    let mut short_normal = apply(&table, batch).await;
+    for message in &mut short_normal {
+        message.check_from_snapshot = None;
+        for file in &mut message.new_files {
+            // The short BLOB delta above cannot validate a normal column file.
+            file.row_count = 2;
+        }
+    }
+    assert!(table
+        .new_write_builder()
+        .new_commit()
+        .commit(short_normal)
+        .await
+        .is_err());
+    let mut invalid = apply(&table, matched(vec![2], vec![Some(b"bad")])).await;
+    for message in &mut invalid {
+        message.check_from_snapshot = None;
+        for file in &mut message.new_files {
+            // A dedicated delta may be shorter than its anchor, but must fit in it.
+            file.first_row_id = Some(4);
+        }
+    }
+    assert!(table
+        .new_write_builder()
+        .new_commit()
+        .commit(invalid)
+        .await
+        .is_err());
+    assert_eq!(
+        table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        before.id()
+    );
+}
+
+#[tokio::test]
 async fn short_deltas_keep_prefix_placeholders_and_stop_before_unchanged_tail() {
     let table = table(&[]).await;
     seed(&table).await;
