@@ -1360,7 +1360,12 @@ impl FileIOBuilder {
     }
 
     pub fn build(mut self) -> crate::Result<FileIO> {
-        let cache = self.cache.clone();
+        let cache = match &self.cache {
+            Some(cache) => Some(Arc::clone(cache)),
+            None => super::cache::create_local_cache(&crate::common::Options::from_map(
+                self.props.clone(),
+            ))?,
+        };
         let cache_namespace = storage_cache_namespace(&self.props);
         let file_format_metadata_cache = self
             .file_format_metadata_cache
@@ -2908,6 +2913,97 @@ mod input_output_test {
             .with_local_cache(cache)
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_builder_local_cache_options_and_injected_cache() {
+        for mode in ["default", "disabled", "configured", "injected"] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("manifest-test");
+            let path = source.to_string_lossy().into_owned();
+            std::fs::write(&source, b"metadata").unwrap();
+            let mut builder = FileIOBuilder::new("file");
+            if mode == "configured" {
+                builder = builder
+                    .with_prop(CatalogOptions::LOCAL_CACHE_ENABLED, "true")
+                    .with_prop(CatalogOptions::LOCAL_CACHE_WHITELIST, "meta")
+                    .with_prop(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB");
+            } else if mode == "disabled" {
+                builder = builder.with_prop(CatalogOptions::LOCAL_CACHE_ENABLED, "false");
+            } else if mode == "injected" {
+                let mut options = Options::new();
+                options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+                options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB");
+                let cache = crate::io::cache::create_local_cache(&options)
+                    .unwrap()
+                    .unwrap();
+                builder = builder
+                    .with_local_cache(cache)
+                    .with_prop(CatalogOptions::LOCAL_CACHE_ENABLED, "false");
+            }
+            let io = builder.build().unwrap();
+            assert_eq!(
+                io.new_input(&path).unwrap().read().await.unwrap(),
+                Bytes::from_static(b"metadata")
+            );
+            std::fs::remove_file(&source).unwrap();
+            // A clone must share the populated cache, including an injected cache
+            // whose settings take precedence over the builder's properties.
+            let second = io.clone().new_input(&path).unwrap().read().await;
+            if matches!(mode, "configured" | "injected") {
+                assert_eq!(second.unwrap(), Bytes::from_static(b"metadata"), "{mode}");
+                io.new_output(&path)
+                    .unwrap()
+                    .write(Bytes::from_static(b"new metadata"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    io.new_input(&path).unwrap().read().await.unwrap(),
+                    Bytes::from_static(b"new metadata"),
+                    "{mode}"
+                );
+            } else {
+                assert!(second.is_err(), "{mode} must not enable caching");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_builder_local_cache_does_not_cache_mutable_hints_or_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let io = FileIOBuilder::new("file")
+            .with_prop(CatalogOptions::LOCAL_CACHE_ENABLED, "true")
+            .with_prop(CatalogOptions::LOCAL_CACHE_WHITELIST, "meta")
+            .with_prop(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "1 MiB")
+            .build()
+            .unwrap();
+        for name in ["LATEST", "image.blob"] {
+            let source = directory.path().join(name);
+            let path = source.to_string_lossy().into_owned();
+            std::fs::write(&source, b"first").unwrap();
+            assert_eq!(
+                io.new_input(&path).unwrap().read().await.unwrap(),
+                Bytes::from_static(b"first")
+            );
+            std::fs::write(&source, b"updated").unwrap();
+            assert_eq!(
+                io.new_input(&path).unwrap().read().await.unwrap(),
+                Bytes::from_static(b"updated"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_builder_local_cache_rejects_invalid_enabled_options() {
+        let error = FileIOBuilder::new("memory")
+            .with_prop(CatalogOptions::LOCAL_CACHE_ENABLED, "true")
+            .with_prop(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "invalid")
+            .build()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(CatalogOptions::LOCAL_CACHE_MAX_SIZE));
     }
 
     #[test]
