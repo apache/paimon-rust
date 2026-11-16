@@ -15,12 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java `FieldCollectAgg`: concatenate ARRAY elements, optionally distinct.
+//! Java `FieldCollectAgg`: concatenate ARRAY elements, optionally distinct
+//! and capped by `fields.<col>.count-limit`.
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use arrow_array::{new_empty_array, new_null_array, Array, ArrayRef, ListArray};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float32Type, Float64Type};
+use arrow_array::{
+    downcast_primitive_array, new_empty_array, new_null_array, Array, ArrayRef, ListArray,
+};
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_row::{RowConverter, Rows, SortField};
 use arrow_schema::{DataType as ArrowDataType, FieldRef};
 use arrow_select::concat::concat;
 
@@ -34,116 +41,489 @@ pub(crate) struct CollectAgg {
     field_name: String,
     element: FieldRef,
     distinct: bool,
+    /// A positive limit keeps the first N elements in merge order, a
+    /// negative one keeps the last |N|.
+    count_limit: i32,
     java_uses_equaliser: bool,
+    /// Elements are compared with `java_equals` instead of Arrow `==`.
+    java_eq: bool,
+    /// Row encoder for distinct elements that Java collects into a
+    /// `LinkedHashSet`. `None` for other columns, and for element types
+    /// arrow-row cannot encode, which keep the linear comparison.
+    key_encoder: Option<RowConverter>,
     seen_input: bool,
+    /// The elements are a DELETE value kept as-is, so they may hold
+    /// duplicates or exceed the limit until the next merge.
     raw_accumulator: bool,
-    elements: Vec<ArrayRef>,
+    elements: VecDeque<ArrayRef>,
+    /// For distinct columns without the equaliser: `elements` is the
+    /// concatenation of merged operands in merge order, still to be
+    /// deduplicated and cut to the limit. Java's set merge gives the same
+    /// result whether that is done after each merge or once at the end.
+    unmerged: bool,
+    /// Length of `elements` the last time an unmerged concatenation was
+    /// merged; bounds how far it may grow before being merged again.
+    merged_len: usize,
+    /// Set by a DELETE value: with the equaliser, Java keeps duplicates that
+    /// an accumulator already holds, so `elements` may repeat an element.
+    may_repeat: bool,
 }
+
+/// One side of Java's merge, with the encoded keys of its elements when
+/// the column deduplicates through a set.
+struct Operand {
+    elements: Vec<ArrayRef>,
+    keys: Option<Rows>,
+    has_duplicate: bool,
+}
+
+struct Merged {
+    elements: Vec<ArrayRef>,
+    keys: Option<HashSet<Box<[u8]>>>,
+}
+
+/// Unmerged elements allowed beyond twice the merged length.
+const UNMERGED_SLACK: usize = 1024;
 
 impl CollectAgg {
     pub(crate) fn new(
         field_name: &str,
         data_type: &DataType,
         distinct: bool,
+        count_limit: i32,
     ) -> crate::Result<Self> {
-        if !matches!(data_type, DataType::Array(_)) {
+        let DataType::Array(array_type) = data_type else {
             return Err(unsupported_type_error("collect", field_name, data_type));
-        }
+        };
         let ArrowDataType::List(element) = paimon_type_to_arrow(data_type)? else {
             unreachable!("ARRAY must map to Arrow List")
         };
+        // Java `FieldCollectAgg#needsEqualiser`: constructed types and
+        // BINARY/VARBINARY (Rust has no GEOMETRY/GEOGRAPHY).
+        let java_uses_equaliser = matches!(
+            array_type.element_type(),
+            DataType::Array(_)
+                | DataType::Vector(_)
+                | DataType::Multiset(_)
+                | DataType::Map(_)
+                | DataType::Row(_)
+                | DataType::Binary(_)
+                | DataType::VarBinary(_)
+        );
+        let key_encoder = if distinct && !java_uses_equaliser {
+            RowConverter::new(vec![SortField::new(element.data_type().clone())]).ok()
+        } else {
+            None
+        };
         Ok(Self {
             field_name: field_name.to_string(),
-            java_uses_equaliser: matches!(
-                element.data_type(),
-                ArrowDataType::Struct(_)
-                    | ArrowDataType::List(_)
-                    | ArrowDataType::LargeList(_)
-                    | ArrowDataType::Map(_, _)
-                    | ArrowDataType::Binary
-                    | ArrowDataType::LargeBinary
-                    | ArrowDataType::FixedSizeBinary(_)
-            ),
+            java_eq: needs_java_eq(element.data_type()),
             element,
             distinct,
+            count_limit,
+            java_uses_equaliser,
+            key_encoder,
             seen_input: false,
             raw_accumulator: false,
-            elements: Vec::new(),
+            elements: VecDeque::new(),
+            unmerged: false,
+            merged_len: 0,
+            may_repeat: false,
         })
     }
 
-    fn preserve_raw(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+    fn limit(&self) -> usize {
+        self.count_limit.unsigned_abs() as usize
+    }
+
+    fn list<'a>(&self, array: &'a dyn Array) -> crate::Result<&'a ListArray> {
+        array
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| Error::DataInvalid {
+                message: format!(
+                    "collect column '{}' requires Arrow List, got {:?}",
+                    self.field_name,
+                    array.data_type()
+                ),
+                source: None,
+            })
+    }
+
+    /// The input row's elements as one array, or `None` for a null cell.
+    fn input_values(&self, array: &dyn Array, row_idx: usize) -> crate::Result<Option<ArrayRef>> {
         if array.is_null(row_idx) {
-            return Ok(());
+            return Ok(None);
         }
-        let list =
-            array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| Error::DataInvalid {
-                    message: format!(
-                        "collect column '{}' requires Arrow List, got {:?}",
-                        self.field_name,
-                        array.data_type()
-                    ),
-                    source: None,
-                })?;
-        let values = list.value(row_idx);
-        self.elements = (0..values.len())
-            .map(|index| values.slice(index, 1))
-            .collect();
+        Ok(Some(self.list(array)?.value(row_idx)))
+    }
+
+    fn concat_elements<'a>(
+        &self,
+        elements: impl IntoIterator<Item = &'a ArrayRef>,
+    ) -> crate::Result<ArrayRef> {
+        let slices: Vec<&dyn Array> = elements.into_iter().map(|e| e.as_ref()).collect();
+        if slices.is_empty() {
+            return Ok(new_empty_array(self.element.data_type()));
+        }
+        concat(&slices).map_err(|e| Error::DataInvalid {
+            message: format!(
+                "Failed to build collect result for '{}': {e}",
+                self.field_name
+            ),
+            source: Some(Box::new(e)),
+        })
+    }
+
+    fn encode_keys(&self, values: &ArrayRef) -> crate::Result<Option<Rows>> {
+        let Some(encoder) = &self.key_encoder else {
+            return Ok(None);
+        };
+        // Only the keys are canonicalized; stored elements keep their bits.
+        let values = canonical_nan(values);
+        encoder
+            .convert_columns(&[values])
+            .map(Some)
+            .map_err(|e| Error::DataInvalid {
+                message: format!(
+                    "Failed to encode collect elements for '{}': {e}",
+                    self.field_name
+                ),
+                source: Some(Box::new(e)),
+            })
+    }
+    fn operand(&self, elements: Vec<ArrayRef>, has_duplicate: bool) -> crate::Result<Operand> {
+        let keys = if self.key_encoder.is_some() {
+            self.encode_keys(&self.concat_elements(&elements)?)?
+        } else {
+            None
+        };
+        Ok(Operand {
+            elements,
+            keys,
+            has_duplicate,
+        })
+    }
+
+    fn input_operand(&self, values: &ArrayRef) -> crate::Result<Operand> {
+        Ok(Operand {
+            elements: (0..values.len())
+                .map(|index| values.slice(index, 1))
+                .collect(),
+            keys: self.encode_keys(values)?,
+            has_duplicate: true,
+        })
+    }
+
+    /// Java's private `agg(first, firstHasDuplicate, second,
+    /// secondHasDuplicate)`: a positive limit collects `first` then
+    /// `second`; a negative one collects both backwards, `second` first,
+    /// and reverses the result.
+    fn merge(&self, first: &Operand, second: &Operand) -> Merged {
+        let mut merged = Merged {
+            elements: Vec::new(),
+            keys: self.key_encoder.as_ref().map(|_| HashSet::new()),
+        };
+        if self.count_limit >= 0 {
+            self.collect(&mut merged, first, false);
+            self.collect(&mut merged, second, false);
+        } else {
+            self.collect(&mut merged, second, true);
+            self.collect(&mut merged, first, true);
+            merged.elements.reverse();
+        }
+        merged
+    }
+
+    /// Java `collect`: add the operand's elements until the collection
+    /// holds |count-limit| of them, skipping duplicates when distinct.
+    fn collect(&self, merged: &mut Merged, operand: &Operand, backwards: bool) {
+        // Java `checkDuplicateUntil`: with the equaliser, an operand known
+        // to be duplicate-free is checked only against what was collected
+        // before it.
+        let check_until = if operand.has_duplicate {
+            usize::MAX
+        } else {
+            merged.elements.len()
+        };
+        let len = operand.elements.len();
+        for index in (0..len).map(|i| if backwards { len - 1 - i } else { i }) {
+            if merged.elements.len() >= self.limit() {
+                break;
+            }
+            let element = &operand.elements[index];
+            if self.distinct {
+                let duplicate = match (&mut merged.keys, &operand.keys) {
+                    (Some(seen), Some(rows)) => !seen.insert(rows.row(index).as_ref().into()),
+                    _ => {
+                        let checked = if self.java_uses_equaliser {
+                            check_until.min(merged.elements.len())
+                        } else {
+                            merged.elements.len()
+                        };
+                        merged.elements[..checked]
+                            .iter()
+                            .any(|existing| same_element(self.java_eq, existing, element))
+                    }
+                };
+                if duplicate {
+                    continue;
+                }
+            }
+            merged.elements.push(element.clone());
+        }
+    }
+
+    fn store(&mut self, merged: Merged) {
+        self.elements = merged.elements.into();
         self.seen_input = true;
-        self.raw_accumulator = true;
+        self.raw_accumulator = false;
+        self.unmerged = false;
+    }
+
+    /// Distinct without the equaliser: Java's set merge.
+    fn uses_set_merge(&self) -> bool {
+        self.distinct && !self.java_uses_equaliser
+    }
+
+    /// `elements` run through Java's merge as a single operand.
+    fn merged_elements(&self) -> crate::Result<Vec<ArrayRef>> {
+        let elements = self.elements.iter().cloned().collect();
+        let accumulator = self.operand(elements, false)?;
+        let empty = self.operand(Vec::new(), true)?;
+        Ok(self.merge(&accumulator, &empty).elements)
+    }
+
+    /// Merge an unmerged concatenation, so `elements` is what Java stores.
+    fn settle(&mut self) -> crate::Result<()> {
+        if self.unmerged {
+            let merged = self.merged_elements()?;
+            self.merged_len = merged.len();
+            self.elements = merged.into();
+            self.unmerged = false;
+        }
         Ok(())
     }
 
-    fn normalize_raw_for_agg(&mut self) {
-        if !self.raw_accumulator || !self.distinct || self.java_uses_equaliser {
-            return;
+    /// Add `values` before or after `elements` without merging. Without
+    /// distinct the limit is applied right away, which is Java's merge.
+    fn concat_input(&mut self, values: &ArrayRef, front: bool) -> crate::Result<()> {
+        let slices = (0..values.len()).map(|index| values.slice(index, 1));
+        if front {
+            for slice in slices.rev() {
+                self.elements.push_front(slice);
+            }
+        } else {
+            self.elements.extend(slices);
         }
-        let mut distinct: Vec<ArrayRef> = Vec::new();
-        for element in std::mem::take(&mut self.elements) {
-            if !distinct
-                .iter()
-                .any(|existing| existing.as_ref() == element.as_ref())
-            {
-                distinct.push(element);
+        self.seen_input = true;
+        self.raw_accumulator = false;
+        if self.uses_set_merge() {
+            self.unmerged = true;
+            if self.elements.len() > 2 * self.merged_len + UNMERGED_SLACK {
+                self.settle()?;
+            }
+        } else {
+            let limit = self.limit();
+            if self.count_limit >= 0 {
+                self.elements.truncate(limit);
+            } else {
+                let excess = self.elements.len().saturating_sub(limit);
+                self.elements.drain(..excess);
             }
         }
-        self.elements = distinct;
-        self.raw_accumulator = false;
+        Ok(())
     }
 
-    fn collect(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        if array.is_null(row_idx) {
-            return Ok(());
-        }
-        let list =
-            array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| Error::DataInvalid {
-                    message: format!(
-                        "collect column '{}' requires Arrow List, got {:?}",
-                        self.field_name,
-                        array.data_type()
-                    ),
-                    source: None,
-                })?;
-        self.seen_input = true;
-        let values = list.value(row_idx);
-        for index in 0..values.len() {
-            let element = values.slice(index, 1);
-            if !self.distinct
-                || !self
+    /// Java `agg(input, true, acc, false)` with the equaliser and a
+    /// non-negative limit: the deduplicated input, then the accumulator
+    /// without the elements equal to one of them.
+    fn prepend_with_equaliser(&mut self, values: &ArrayRef) -> crate::Result<()> {
+        let mut first = Merged {
+            elements: Vec::new(),
+            keys: None,
+        };
+        self.collect(&mut first, &self.input_operand(values)?, false);
+        let input = first.elements;
+        let java_eq = self.java_eq;
+        if self.may_repeat {
+            self.elements.retain(|element| {
+                !input
+                    .iter()
+                    .any(|seen| same_element(java_eq, seen, element))
+            });
+        } else {
+            // Each input element equals at most one accumulator element.
+            for seen in &input {
+                if let Some(position) = self
                     .elements
                     .iter()
-                    .any(|existing| existing.as_ref() == element.as_ref())
-            {
-                self.elements.push(element);
+                    .position(|element| same_element(java_eq, element, seen))
+                {
+                    self.elements.remove(position);
+                }
+            }
+        }
+        for element in input.into_iter().rev() {
+            self.elements.push_front(element);
+        }
+        self.elements.truncate(self.limit());
+        self.seen_input = true;
+        self.raw_accumulator = false;
+        Ok(())
+    }
+
+    /// Java merges a stored DELETE value with a null input like any other
+    /// accumulator; anything else is already in merged form.
+    fn normalize_raw(&mut self) -> crate::Result<()> {
+        if self.raw_accumulator {
+            if self.uses_set_merge() {
+                self.raw_accumulator = false;
+                self.unmerged = true;
+            } else {
+                let merged = Merged {
+                    elements: self.merged_elements()?,
+                    keys: None,
+                };
+                self.store(merged);
             }
         }
         Ok(())
+    }
+}
+
+/// Java equality of two one-element arrays.
+fn same_element(java_eq: bool, left: &ArrayRef, right: &ArrayRef) -> bool {
+    // `java_equals` expects both sides to have the same type.
+    if java_eq && left.data_type() == right.data_type() {
+        java_equals(left.as_ref(), 0, right.as_ref(), 0)
+    } else {
+        left.as_ref() == right.as_ref()
+    }
+}
+
+/// Whether Arrow `==` can tell apart elements that Java calls equal:
+/// FLOAT/DOUBLE values and maps, at any depth.
+fn needs_java_eq(data_type: &ArrowDataType) -> bool {
+    match data_type {
+        ArrowDataType::Float32 | ArrowDataType::Float64 | ArrowDataType::Map(_, _) => true,
+        ArrowDataType::List(field) | ArrowDataType::FixedSizeList(field, _) => {
+            needs_java_eq(field.data_type())
+        }
+        ArrowDataType::Struct(fields) => fields.iter().any(|f| needs_java_eq(f.data_type())),
+        _ => false,
+    }
+}
+
+/// Java's generated equaliser on row `i` of `left` and row `j` of `right`,
+/// which have the same type: two nulls are equal, FLOAT/DOUBLE compare like
+/// `Float.compare` / `Double.compare` (all NaNs are one value, 0.0 and -0.0
+/// are two), and map entries are matched by key, not by position.
+fn java_equals(left: &dyn Array, i: usize, right: &dyn Array, j: usize) -> bool {
+    match (left.is_null(i), right.is_null(j)) {
+        (true, true) => return true,
+        (false, false) => {}
+        _ => return false,
+    }
+    match left.data_type() {
+        ArrowDataType::Float32 => {
+            let l = left.as_primitive::<Float32Type>().value(i);
+            let r = right.as_primitive::<Float32Type>().value(j);
+            l.to_bits() == r.to_bits() || (l.is_nan() && r.is_nan())
+        }
+        ArrowDataType::Float64 => {
+            let l = left.as_primitive::<Float64Type>().value(i);
+            let r = right.as_primitive::<Float64Type>().value(j);
+            l.to_bits() == r.to_bits() || (l.is_nan() && r.is_nan())
+        }
+        ArrowDataType::Struct(_) => {
+            let (l, r) = (left.as_struct(), right.as_struct());
+            l.columns()
+                .iter()
+                .zip(r.columns())
+                .all(|(l, r)| java_equals(l.as_ref(), i, r.as_ref(), j))
+        }
+        ArrowDataType::List(_) => {
+            let (l, r) = (left.as_list::<i32>(), right.as_list::<i32>());
+            let (ls, le) = (
+                l.value_offsets()[i] as usize,
+                l.value_offsets()[i + 1] as usize,
+            );
+            let (rs, re) = (
+                r.value_offsets()[j] as usize,
+                r.value_offsets()[j + 1] as usize,
+            );
+            le - ls == re - rs
+                && (0..le - ls)
+                    .all(|k| java_equals(l.values().as_ref(), ls + k, r.values().as_ref(), rs + k))
+        }
+        ArrowDataType::FixedSizeList(_, size) => {
+            let (l, r) = (left.as_fixed_size_list(), right.as_fixed_size_list());
+            let (ls, rs) = (l.value_offset(i) as usize, r.value_offset(j) as usize);
+            (0..*size as usize)
+                .all(|k| java_equals(l.values().as_ref(), ls + k, r.values().as_ref(), rs + k))
+        }
+        ArrowDataType::Map(_, _) => {
+            let (l, r) = (left.as_map(), right.as_map());
+            let (ls, le) = (
+                l.value_offsets()[i] as usize,
+                l.value_offsets()[i + 1] as usize,
+            );
+            let (rs, re) = (
+                r.value_offsets()[j] as usize,
+                r.value_offsets()[j + 1] as usize,
+            );
+            if le - ls != re - rs {
+                return false;
+            }
+            // Like Java, each entry takes the first unmatched entry with the
+            // same key, and the values must then be equal.
+            let mut matched = vec![false; re - rs];
+            (ls..le).all(|lk| {
+                let found = (rs..re).find(|&rk| {
+                    !matched[rk - rs] && java_equals(l.keys().as_ref(), lk, r.keys().as_ref(), rk)
+                });
+                match found {
+                    Some(rk) if java_equals(l.values().as_ref(), lk, r.values().as_ref(), rk) => {
+                        matched[rk - rs] = true;
+                        true
+                    }
+                    _ => false,
+                }
+            })
+        }
+        ArrowDataType::Boolean => left.as_boolean().value(i) == right.as_boolean().value(j),
+        ArrowDataType::Utf8 => {
+            left.as_string::<i32>().value(i) == right.as_string::<i32>().value(j)
+        }
+        ArrowDataType::Binary => {
+            left.as_binary::<i32>().value(i) == right.as_binary::<i32>().value(j)
+        }
+        ArrowDataType::LargeBinary => {
+            left.as_binary::<i64>().value(i) == right.as_binary::<i64>().value(j)
+        }
+        _ => downcast_primitive_array!(
+            left, right => { left.value(i) == right.value(j) }
+            _ => left.slice(i, 1).as_ref() == right.slice(j, 1).as_ref(),
+        ),
+    }
+}
+
+/// `values` with every FLOAT/DOUBLE NaN replaced by the canonical NaN, for
+/// the set keys of top-level floating-point elements.
+fn canonical_nan(values: &ArrayRef) -> ArrayRef {
+    match values.data_type() {
+        ArrowDataType::Float32 => Arc::new(
+            values
+                .as_primitive::<Float32Type>()
+                .unary::<_, Float32Type>(|v| if v.is_nan() { f32::NAN } else { v }),
+        ),
+        ArrowDataType::Float64 => Arc::new(
+            values
+                .as_primitive::<Float64Type>()
+                .unary::<_, Float64Type>(|v| if v.is_nan() { f64::NAN } else { v }),
+        ),
+        _ => Arc::clone(values),
     }
 }
 
@@ -156,52 +536,69 @@ impl FieldAggregator for CollectAgg {
         self.seen_input = false;
         self.raw_accumulator = false;
         self.elements.clear();
+        self.unmerged = false;
+        self.merged_len = 0;
+        self.may_repeat = false;
     }
 
+    /// Java `agg(acc, input)` is `agg(acc, false, input, true)`.
     fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        self.normalize_raw_for_agg();
-        self.collect(array, row_idx)
+        let Some(values) = self.input_values(array, row_idx)? else {
+            return self.normalize_raw();
+        };
+        if !self.distinct || self.uses_set_merge() {
+            return self.concat_input(&values, false);
+        }
+        let input = self.input_operand(&values)?;
+        let merged = if self.raw_accumulator || self.count_limit < 0 {
+            let elements = Vec::from(std::mem::take(&mut self.elements));
+            let accumulator = self.operand(elements, false)?;
+            self.merge(&accumulator, &input)
+        } else {
+            // The accumulator is already merged, so Java copies it unchanged
+            // and the input can be appended.
+            let mut merged = Merged {
+                elements: Vec::from(std::mem::take(&mut self.elements)),
+                keys: None,
+            };
+            self.collect(&mut merged, &input, false);
+            merged
+        };
+        self.store(merged);
+        Ok(())
     }
 
     fn replace_with_delete(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        // Java keeps the DELETE value as it is until the next merge.
         self.reset();
-        self.preserve_raw(array, row_idx)
+        if let Some(values) = self.input_values(array, row_idx)? {
+            self.elements = (0..values.len())
+                .map(|index| values.slice(index, 1))
+                .collect();
+            self.seen_input = true;
+            self.raw_accumulator = true;
+            self.may_repeat = true;
+        }
+        Ok(())
     }
 
+    /// Java `aggReversed(acc, input)` is `agg(input, true, acc, false)`:
+    /// the older input comes first.
     fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        // Java FieldCollectAgg overrides aggReversed to preserve accumulator
-        // order (and the distinct state) instead of prepending the input.
-        self.normalize_raw_for_agg();
-        self.collect(array, row_idx)
-    }
-
-    fn agg_reversed_via_agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        // FieldIgnoreRetractAgg inherits the default reverse method, so it
-        // calls collect.agg(older, current), not collect.aggReversed. Preserve
-        // the current elements while prepending the older operand.
-        let current = std::mem::take(&mut self.elements);
-        let current_seen = self.seen_input;
-        self.seen_input = false;
-        self.raw_accumulator = false;
-        if self.distinct && self.java_uses_equaliser {
-            // Java copies the older accumulator unchanged for complex/binary
-            // elements, then deduplicates only the newer input against it.
-            self.preserve_raw(array, row_idx)?;
-        } else {
-            self.collect(array, row_idx)?;
+        let Some(values) = self.input_values(array, row_idx)? else {
+            return self.normalize_raw();
+        };
+        if !self.distinct || self.uses_set_merge() {
+            return self.concat_input(&values, true);
         }
-        for element in current {
-            if !self.distinct
-                || !self
-                    .elements
-                    .iter()
-                    .any(|existing| existing.as_ref() == element.as_ref())
-            {
-                self.elements.push(element);
-            }
+        if self.count_limit >= 0 {
+            return self.prepend_with_equaliser(&values);
         }
-        self.seen_input |= current_seen;
-        self.raw_accumulator = false;
+        let input = self.input_operand(&values)?;
+        let elements = Vec::from(std::mem::take(&mut self.elements));
+        let accumulator = self.operand(elements, false)?;
+        let merged = self.merge(&input, &accumulator);
+        self.store(merged);
         Ok(())
     }
 
@@ -209,22 +606,16 @@ impl FieldAggregator for CollectAgg {
         if !self.seen_input || array.is_null(row_idx) {
             return Ok(());
         }
-        let list =
-            array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| Error::DataInvalid {
-                    message: format!("collect column '{}' requires Arrow List", self.field_name),
-                    source: None,
-                })?;
-        let values = list.value(row_idx);
+        self.settle()?;
+        let values = self.list(array)?.value(row_idx);
         let mut retracted: Vec<ArrayRef> = (0..values.len())
             .map(|index| values.slice(index, 1))
             .collect();
+        let java_eq = self.java_eq;
         self.elements.retain(|candidate| {
             if let Some(position) = retracted
                 .iter()
-                .position(|value| value.as_ref() == candidate.as_ref())
+                .position(|value| same_element(java_eq, value, candidate))
             {
                 retracted.remove(position);
                 false
@@ -232,6 +623,7 @@ impl FieldAggregator for CollectAgg {
                 true
             }
         });
+        self.merged_len = self.elements.len();
         Ok(())
     }
 
@@ -242,25 +634,21 @@ impl FieldAggregator for CollectAgg {
                 1,
             ));
         }
-        let values = if self.elements.is_empty() {
-            new_empty_array(self.element.data_type())
+        let merged;
+        let elements: Vec<&ArrayRef> = if self.unmerged {
+            merged = self.merged_elements()?;
+            merged.iter().collect()
         } else {
-            let slices: Vec<&dyn Array> = self.elements.iter().map(|e| e.as_ref()).collect();
-            concat(&slices).map_err(|e| Error::DataInvalid {
-                message: format!(
-                    "Failed to build collect result for '{}': {e}",
-                    self.field_name
-                ),
-                source: Some(Box::new(e)),
-            })?
+            self.elements.iter().collect()
         };
-        let len = i32::try_from(self.elements.len()).map_err(|_| Error::DataInvalid {
+        let len = i32::try_from(elements.len()).map_err(|_| Error::DataInvalid {
             message: format!(
                 "collect result for '{}' exceeds Arrow List offset",
                 self.field_name
             ),
             source: None,
         })?;
+        let values = self.concat_elements(elements)?;
         let result = ListArray::try_new(
             self.element.clone(),
             OffsetBuffer::new(ScalarBuffer::from(vec![0, len])),
@@ -283,8 +671,14 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::spec::{ArrayType, IntType, VarBinaryType};
-    use arrow_array::{BinaryArray, Int32Array};
+    use crate::spec::{
+        ArrayType, BlobType, DataField, DoubleType, IntType, MapType, RowType, VarBinaryType,
+        VariantType, VectorType,
+    };
+    use arrow_array::{
+        BinaryArray, FixedSizeListArray, Float64Array, Int32Array, LargeBinaryArray, MapArray,
+        StructArray,
+    };
 
     fn input() -> ListArray {
         let field = Arc::new(arrow_schema::Field::new("item", ArrowDataType::Int32, true));
@@ -302,7 +696,7 @@ mod tests {
         let data_type = DataType::Array(ArrayType::new(DataType::Int(IntType::new())));
         let input = input();
         for (distinct, expected) in [(false, vec![1, 2, 2, 3]), (true, vec![1, 2, 3])] {
-            let mut agg = CollectAgg::new("items", &data_type, distinct).unwrap();
+            let mut agg = CollectAgg::new("items", &data_type, distinct, i32::MAX).unwrap();
             agg.agg(&input, 0).unwrap();
             agg.agg(&input, 1).unwrap();
             let result = agg.result().unwrap();
@@ -344,7 +738,7 @@ mod tests {
                 .values()
                 .to_vec()
         };
-        let mut agg = CollectAgg::new("items", &data_type, true).unwrap();
+        let mut agg = CollectAgg::new("items", &data_type, true, i32::MAX).unwrap();
         agg.replace_with_delete(&raw, 0).unwrap();
         assert_eq!(values(&agg), vec![1, 1, 2]);
         agg.agg(null.as_ref(), 0).unwrap();
@@ -366,7 +760,7 @@ mod tests {
     fn collect_retract_removes_only_matching_occurrences() {
         let data_type = DataType::Array(ArrayType::new(DataType::Int(IntType::new())));
         let input = input();
-        let mut agg = CollectAgg::new("items", &data_type, false).unwrap();
+        let mut agg = CollectAgg::new("items", &data_type, false, i32::MAX).unwrap();
         agg.agg(&input, 0).unwrap();
         agg.agg(&input, 1).unwrap();
         agg.retract(&input, 1).unwrap();
@@ -378,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn ignore_retract_reversed_uses_default_order_instead_of_collect_override() {
+    fn ignore_retract_reversed_puts_older_input_first() {
         let data_type = DataType::Array(ArrayType::new(DataType::Int(IntType::new())));
         let input = input();
         for (distinct, expected) in [(false, vec![1, 2, 2, 3]), (true, vec![1, 2, 3])] {
@@ -398,8 +792,11 @@ mod tests {
         }
     }
 
+    /// Java's ignore-retract wrapper delegates `aggReversed` to collect, so
+    /// the older input is deduplicated like any input that may hold
+    /// duplicates.
     #[test]
-    fn ignore_retract_reversed_preserves_duplicate_binary_older_accumulator() {
+    fn ignore_retract_reversed_deduplicates_older_binary_input() {
         let data_type = DataType::Array(ArrayType::new(DataType::VarBinary(
             VarBinaryType::new(100).unwrap(),
         )));
@@ -434,7 +831,433 @@ mod tests {
             (0..elements.len())
                 .map(|i| elements.value(i))
                 .collect::<Vec<_>>(),
-            vec![&b"a"[..], &b"a"[..], &b"b"[..]]
+            vec![&b"a"[..], &b"b"[..]]
         );
+    }
+
+    fn int_array() -> DataType {
+        DataType::Array(ArrayType::new(DataType::Int(IntType::new())))
+    }
+
+    fn row_array() -> DataType {
+        let field = DataField::new(0, "f0".into(), DataType::Int(IntType::new()));
+        DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![field]))))
+    }
+
+    /// A one-row ARRAY<INT> or ARRAY<ROW<INT>> cell.
+    fn cell(data_type: &DataType, values: &[Option<i32>]) -> ListArray {
+        let ArrowDataType::List(element) = paimon_type_to_arrow(data_type).unwrap() else {
+            unreachable!()
+        };
+        let ints: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
+        let values: ArrayRef = match element.data_type() {
+            ArrowDataType::Struct(fields) => {
+                Arc::new(StructArray::try_new(fields.clone(), vec![ints], None).unwrap())
+            }
+            _ => ints,
+        };
+        ListArray::try_new(
+            element,
+            OffsetBuffer::from_lengths([values.len()]),
+            values,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn ints(values: &[i32]) -> Vec<Option<i32>> {
+        values.iter().copied().map(Some).collect()
+    }
+
+    fn collected(agg: &dyn FieldAggregator) -> Vec<Option<i32>> {
+        let result = agg.result().unwrap();
+        let list = result.as_any().downcast_ref::<ListArray>().unwrap();
+        let values = list.value(0);
+        let values = match values.as_any().downcast_ref::<StructArray>() {
+            Some(rows) => rows.column(0).clone(),
+            None => values,
+        };
+        values
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .collect()
+    }
+
+    /// Java `FieldAggregatorTest#testFieldCollectAggWithCountLimit`.
+    #[test]
+    fn count_limit_matches_java_for_scalar_and_row_elements() {
+        let cases: [(bool, i32, &[i32]); 6] = [
+            (false, 3, &[2, 1, 2]),
+            (true, 3, &[2, 1, 3]),
+            (false, -3, &[3, 3, 1]),
+            (true, -3, &[2, 3, 1]),
+            (false, 0, &[]),
+            (true, 0, &[]),
+        ];
+        for data_type in [int_array(), row_array()] {
+            let input = cell(&data_type, &ints(&[2, 1, 2, 3, 3, 1]));
+            let older = cell(&data_type, &ints(&[2, 1, 2]));
+            let newer = cell(&data_type, &ints(&[3, 3, 1]));
+            for (distinct, limit, expected) in cases {
+                let context = format!("{data_type:?} distinct={distinct} limit={limit}");
+                let new = || CollectAgg::new("items", &data_type, distinct, limit).unwrap();
+
+                let mut single = new();
+                single.agg(&input, 0).unwrap();
+                assert_eq!(collected(&single), ints(expected), "{context}");
+
+                let mut forward = new();
+                forward.agg(&older, 0).unwrap();
+                forward.agg(&newer, 0).unwrap();
+                assert_eq!(collected(&forward), ints(expected), "{context}");
+
+                let mut reversed = new();
+                reversed.agg_reversed(&newer, 0).unwrap();
+                reversed.agg_reversed(&older, 0).unwrap();
+                assert_eq!(collected(&reversed), ints(expected), "{context}");
+            }
+        }
+    }
+
+    /// Java `aggReversed(acc, input)` is `agg(input, true, acc, false)`.
+    #[test]
+    fn agg_reversed_puts_older_input_first() {
+        for (distinct, expected) in [(false, [1, 2, 2, 3].as_slice()), (true, &[1, 2, 3])] {
+            let mut agg = CollectAgg::new("items", &int_array(), distinct, i32::MAX).unwrap();
+            agg.agg(&cell(&int_array(), &ints(&[2, 3])), 0).unwrap();
+            agg.agg_reversed(&cell(&int_array(), &ints(&[1, 2])), 0)
+                .unwrap();
+            assert_eq!(collected(&agg), ints(expected), "distinct={distinct}");
+        }
+    }
+
+    #[test]
+    fn count_limit_option_is_read_and_validated() {
+        let options = |limit: &str| {
+            HashMap::from([("fields.items.count-limit".to_string(), limit.to_string())])
+        };
+        let mut agg =
+            super::super::new_aggregator("collect", "items", &int_array(), &options("2")).unwrap();
+        agg.agg(&cell(&int_array(), &ints(&[1, 2, 3])), 0).unwrap();
+        assert_eq!(collected(agg.as_ref()), ints(&[1, 2]));
+        for invalid in ["abc", "3000000000"] {
+            let error =
+                super::super::new_aggregator("collect", "items", &int_array(), &options(invalid))
+                    .unwrap_err();
+            assert!(matches!(error, Error::ConfigInvalid { .. }), "{invalid}");
+        }
+    }
+
+    /// A DELETE value is kept whole; the next merge applies the limit.
+    #[test]
+    fn delete_value_is_capped_by_the_next_merge() {
+        let raw = cell(&int_array(), &ints(&[1, 2, 3, 4, 5]));
+        let null = new_null_array(raw.data_type(), 1);
+        for (limit, expected) in [(2, [1, 2]), (-2, [4, 5])] {
+            let mut agg = CollectAgg::new("items", &int_array(), false, limit).unwrap();
+            agg.replace_with_delete(&raw, 0).unwrap();
+            assert_eq!(collected(&agg), ints(&[1, 2, 3, 4, 5]));
+            agg.agg(null.as_ref(), 0).unwrap();
+            assert_eq!(collected(&agg), ints(&expected), "limit={limit}");
+        }
+    }
+
+    /// With the equaliser, Java checks the older accumulator only against
+    /// the elements collected before it, so its own duplicates survive.
+    #[test]
+    fn agg_reversed_keeps_duplicates_of_a_binary_delete_value() {
+        let data_type = DataType::Array(ArrayType::new(DataType::VarBinary(
+            VarBinaryType::new(100).unwrap(),
+        )));
+        let binary_cell = |values: &[&[u8]]| {
+            ListArray::try_new(
+                Arc::new(arrow_schema::Field::new(
+                    "item",
+                    ArrowDataType::Binary,
+                    true,
+                )),
+                OffsetBuffer::from_lengths([values.len()]),
+                Arc::new(BinaryArray::from(values.to_vec())),
+                None,
+            )
+            .unwrap()
+        };
+        let mut agg = CollectAgg::new("items", &data_type, true, i32::MAX).unwrap();
+        agg.replace_with_delete(&binary_cell(&[b"a", b"a", b"b"]), 0)
+            .unwrap();
+        agg.agg_reversed(&binary_cell(&[b"c"]), 0).unwrap();
+        let result = agg.result().unwrap();
+        let list = result.as_any().downcast_ref::<ListArray>().unwrap();
+        let values = list.value(0);
+        let values = values.as_any().downcast_ref::<BinaryArray>().unwrap();
+        let values: Vec<&[u8]> = values.iter().flatten().collect();
+        assert_eq!(values, vec![&b"c"[..], b"a", b"a", b"b"]);
+    }
+
+    /// The hashed membership check gives the same answers as Java
+    /// `equals`, including after a retract removes elements.
+    #[test]
+    fn distinct_keys_follow_java_equality() {
+        let mut agg = CollectAgg::new("items", &int_array(), true, i32::MAX).unwrap();
+        agg.agg(&cell(&int_array(), &[Some(1), None, Some(1), Some(2)]), 0)
+            .unwrap();
+        assert_eq!(collected(&agg), vec![Some(1), None, Some(2)]);
+        agg.retract(&cell(&int_array(), &ints(&[1, 2])), 0).unwrap();
+        assert_eq!(collected(&agg), vec![None]);
+        agg.agg(&cell(&int_array(), &ints(&[1, 2])), 0).unwrap();
+        assert_eq!(collected(&agg), vec![None, Some(1), Some(2)]);
+    }
+
+    fn doubles(values: &[f64]) -> ListArray {
+        ListArray::try_new(
+            Arc::new(arrow_schema::Field::new(
+                "item",
+                ArrowDataType::Float64,
+                true,
+            )),
+            OffsetBuffer::from_lengths([values.len()]),
+            Arc::new(Float64Array::from(values.to_vec())),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn collected_bits(agg: &CollectAgg) -> Vec<u64> {
+        let result = agg.result().unwrap();
+        let list = result.as_any().downcast_ref::<ListArray>().unwrap();
+        let values = list.value(0);
+        let values = values.as_any().downcast_ref::<Float64Array>().unwrap();
+        values.values().iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// Java `Double.equals` treats NaNs with different payloads as one value
+    /// and keeps 0.0 and -0.0 apart. Before the limit is applied, a second
+    /// NaN must not take the place of a finite value.
+    #[test]
+    fn distinct_doubles_merge_nan_payloads_like_java() {
+        let nan_1 = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_2 = f64::from_bits(0x7ff8_0000_0000_0002);
+        let data_type = DataType::Array(ArrayType::new(DataType::Double(DoubleType::new())));
+        let mut agg = CollectAgg::new("items", &data_type, true, 2).unwrap();
+        agg.agg(&doubles(&[nan_1, nan_2]), 0).unwrap();
+        agg.agg(&doubles(&[5.0]), 0).unwrap();
+        // The first NaN keeps its payload.
+        assert_eq!(
+            collected_bits(&agg),
+            vec![nan_1.to_bits(), 5.0f64.to_bits()]
+        );
+
+        let mut agg = CollectAgg::new("items", &data_type, true, i32::MAX).unwrap();
+        agg.agg(&doubles(&[0.0, -0.0, nan_2]), 0).unwrap();
+        agg.retract(&doubles(&[nan_1]), 0).unwrap();
+        assert_eq!(collected_bits(&agg), vec![0, (-0.0f64).to_bits()]);
+    }
+
+    /// One-row ARRAY<ROW<DOUBLE>> cell.
+    fn double_rows(data_type: &DataType, values: &[f64]) -> ListArray {
+        let ArrowDataType::List(element) = paimon_type_to_arrow(data_type).unwrap() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(fields) = element.data_type() else {
+            unreachable!()
+        };
+        let doubles: ArrayRef = Arc::new(Float64Array::from(values.to_vec()));
+        let rows = StructArray::try_new(fields.clone(), vec![doubles], None).unwrap();
+        ListArray::try_new(
+            element,
+            OffsetBuffer::from_lengths([values.len()]),
+            Arc::new(rows),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn collected_row_bits(agg: &CollectAgg) -> Vec<u64> {
+        let result = agg.result().unwrap();
+        let list = result.as_any().downcast_ref::<ListArray>().unwrap();
+        let rows = list.value(0);
+        let rows = rows.as_any().downcast_ref::<StructArray>().unwrap();
+        let values = rows
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        values.values().iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// Java's equaliser compares DOUBLE fields with `Double.compare`, so NaN
+    /// payloads inside a ROW element are one value as well.
+    #[test]
+    fn distinct_rows_merge_nan_payloads_like_java() {
+        let nan_1 = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_2 = f64::from_bits(0x7ff8_0000_0000_0002);
+        let field = DataField::new(0, "f0".into(), DataType::Double(DoubleType::new()));
+        let data_type = DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![field]))));
+        let mut agg = CollectAgg::new("items", &data_type, true, 2).unwrap();
+        agg.agg(&double_rows(&data_type, &[nan_1, nan_2]), 0)
+            .unwrap();
+        agg.agg(&double_rows(&data_type, &[5.0]), 0).unwrap();
+        assert_eq!(
+            collected_row_bits(&agg),
+            vec![nan_1.to_bits(), 5.0f64.to_bits()]
+        );
+
+        let mut agg = CollectAgg::new("items", &data_type, true, i32::MAX).unwrap();
+        agg.agg(&double_rows(&data_type, &[0.0, -0.0, nan_2]), 0)
+            .unwrap();
+        agg.retract(&double_rows(&data_type, &[nan_1]), 0).unwrap();
+        assert_eq!(collected_row_bits(&agg), vec![0, (-0.0f64).to_bits()]);
+    }
+
+    /// The same holds for ARRAY<DOUBLE> elements, whose values are sliced
+    /// out of one shared buffer.
+    #[test]
+    fn distinct_arrays_merge_nan_payloads_like_java() {
+        let nan_1 = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_2 = f64::from_bits(0x7ff8_0000_0000_0002);
+        let inner = DataType::Array(ArrayType::new(DataType::Double(DoubleType::new())));
+        let data_type = DataType::Array(ArrayType::new(inner));
+        let ArrowDataType::List(element) = paimon_type_to_arrow(&data_type).unwrap() else {
+            unreachable!()
+        };
+        let ArrowDataType::List(item) = element.data_type() else {
+            unreachable!()
+        };
+        let lists = ListArray::try_new(
+            item.clone(),
+            OffsetBuffer::from_lengths([2, 2, 2]),
+            Arc::new(Float64Array::from(vec![nan_1, 1.0, nan_2, 1.0, 0.0, 1.0])),
+            None,
+        )
+        .unwrap();
+        let cell = ListArray::try_new(
+            element,
+            OffsetBuffer::from_lengths([3]),
+            Arc::new(lists),
+            None,
+        )
+        .unwrap();
+        let mut agg = CollectAgg::new("items", &data_type, true, i32::MAX).unwrap();
+        agg.agg(&cell, 0).unwrap();
+        let result = agg.result().unwrap();
+        let list = result.as_any().downcast_ref::<ListArray>().unwrap();
+        let kept = list.value(0);
+        let kept = kept.as_any().downcast_ref::<ListArray>().unwrap();
+        let bits: Vec<Vec<u64>> = (0..kept.len())
+            .map(|i| {
+                let values = kept.value(i);
+                let values = values.as_any().downcast_ref::<Float64Array>().unwrap();
+                values.values().iter().map(|v| v.to_bits()).collect()
+            })
+            .collect();
+        assert_eq!(
+            bits,
+            vec![
+                vec![nan_1.to_bits(), 1.0f64.to_bits()],
+                vec![0, 1.0f64.to_bits()]
+            ]
+        );
+    }
+
+    /// Java's equaliser matches map entries by key, so maps that differ only
+    /// in entry order are one value and do not use up the limit.
+    #[test]
+    fn distinct_maps_ignore_entry_order_like_java() {
+        let int = || DataType::Int(IntType::new());
+        let data_type = DataType::Array(ArrayType::new(DataType::Map(MapType::new(int(), int()))));
+        let ArrowDataType::List(element) = paimon_type_to_arrow(&data_type).unwrap() else {
+            unreachable!()
+        };
+        let ArrowDataType::Map(entries_field, _) = element.data_type() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(entry_fields) = entries_field.data_type() else {
+            unreachable!()
+        };
+        let one_map = |entries: &[(i32, i32)]| {
+            let column = |f: fn(&(i32, i32)) -> i32| {
+                Arc::new(Int32Array::from(entries.iter().map(f).collect::<Vec<_>>())) as ArrayRef
+            };
+            let entries_array = StructArray::try_new(
+                entry_fields.clone(),
+                vec![column(|e| e.0), column(|e| e.1)],
+                None,
+            )
+            .unwrap();
+            let map = MapArray::try_new(
+                entries_field.clone(),
+                OffsetBuffer::from_lengths([entries.len()]),
+                entries_array,
+                None,
+                false,
+            )
+            .unwrap();
+            ListArray::try_new(
+                element.clone(),
+                OffsetBuffer::from_lengths([1]),
+                Arc::new(map),
+                None,
+            )
+            .unwrap()
+        };
+        let mut agg = CollectAgg::new("items", &data_type, true, 2).unwrap();
+        agg.agg(&one_map(&[(1, 1), (2, 2)]), 0).unwrap();
+        agg.agg(&one_map(&[(2, 2), (1, 1)]), 0).unwrap();
+        agg.agg(&one_map(&[(1, 1), (2, 3)]), 0).unwrap();
+        let result = agg.result().unwrap();
+        let list = result.as_any().downcast_ref::<ListArray>().unwrap();
+        let maps = list.value(0);
+        let maps = maps.as_any().downcast_ref::<MapArray>().unwrap();
+        let values = maps.values().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(values.values().to_vec(), vec![1, 2, 1, 3]);
+    }
+
+    /// Java picks the equaliser from the Paimon element type: VECTOR keeps
+    /// a DELETE value's duplicates through a null merge, VARIANT and BLOB
+    /// go through a hash set and drop them.
+    #[test]
+    fn delete_value_duplicates_follow_the_java_element_family() {
+        let vector = DataType::Vector(VectorType::new(2, DataType::Int(IntType::new())).unwrap());
+        for (element, expected_len) in [
+            (vector, 2),
+            (DataType::Variant(VariantType::new()), 1),
+            (DataType::Blob(BlobType::new()), 1),
+        ] {
+            let data_type = DataType::Array(ArrayType::new(element.clone()));
+            let ArrowDataType::List(field) = paimon_type_to_arrow(&data_type).unwrap() else {
+                unreachable!()
+            };
+            let one: ArrayRef = match field.data_type() {
+                ArrowDataType::FixedSizeList(item, size) => Arc::new(
+                    FixedSizeListArray::try_new(
+                        item.clone(),
+                        *size,
+                        Arc::new(Int32Array::from(vec![1, 2])),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                ArrowDataType::Struct(fields) => {
+                    let bytes = || Arc::new(BinaryArray::from(vec![&b"\x01"[..]])) as ArrayRef;
+                    Arc::new(
+                        StructArray::try_new(fields.clone(), vec![bytes(), bytes()], None).unwrap(),
+                    )
+                }
+                _ => Arc::new(LargeBinaryArray::from(vec![&b"x"[..]])),
+            };
+            let twice = concat(&[one.as_ref(), one.as_ref()]).unwrap();
+            let raw =
+                ListArray::try_new(field, OffsetBuffer::from_lengths([2]), twice, None).unwrap();
+            let mut agg = CollectAgg::new("items", &data_type, true, i32::MAX).unwrap();
+            agg.replace_with_delete(&raw, 0).unwrap();
+            agg.agg(new_null_array(raw.data_type(), 1).as_ref(), 0)
+                .unwrap();
+            let result = agg.result().unwrap();
+            let list = result.as_any().downcast_ref::<ListArray>().unwrap();
+            assert_eq!(list.value(0).len(), expected_len, "{element:?}");
+        }
     }
 }
