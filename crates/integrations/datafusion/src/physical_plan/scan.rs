@@ -64,7 +64,10 @@ use paimon::DataSplit;
 use crate::error::to_datafusion_error;
 use crate::filter_pushdown::{is_float_zero, scalar_to_datum};
 
-fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
+pub(crate) fn to_datafusion_batch(
+    batch: RecordBatch,
+    schema: &ArrowSchemaRef,
+) -> DFResult<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
         return Err(datafusion::error::DataFusionError::Execution(format!(
             "Paimon reader returned {} columns for DataFusion schema with {} fields",

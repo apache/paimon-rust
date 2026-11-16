@@ -541,7 +541,7 @@ impl<'a> PaimonReadBuilder<'a> {
     /// Configure a row limit for scan planning and reads.
     ///
     /// This allows paimon-core scan planning to generate fewer splits when the
-    /// current scan state keeps split-level `merged_row_count()` conservative.
+    /// current scan state keeps split-level row counts conservative.
     ///
     /// A [`TableRead`] created by this builder also enforces the final limit
     /// across splits after filtering and row selection. Data-evolution reads

@@ -366,30 +366,43 @@ async fn evolution_chunks(
                 message: "data evolution chunk group has no row range".to_string(),
                 source: None,
             })?;
-        let anchor = data_evolution_anchor_file(&files)?;
-        let anchor_deletion = deletion_by_name.get(&anchor.file_name).cloned().flatten();
-        let (first_row_id, physical_count) = if anchor_deletion.is_some() {
-            let (anchor_from, anchor_to) = anchor.row_id_range().unwrap();
-            if anchor_from > from || anchor_to < to {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "data evolution anchor range [{anchor_from}, {anchor_to}] does not contain group [{from}, {to}]"
-                    ),
-                    source: None,
-                });
+        // Deletion vectors belong to a group's normal anchor file. A group
+        // without them is sliced over its row range and needs no normal file,
+        // as change events of BLOB or VECTOR rewrites alone have none.
+        let anchor = if files
+            .iter()
+            .any(|file| matches!(deletion_by_name.get(&file.file_name), Some(Some(_))))
+        {
+            Some(data_evolution_anchor_file(&files)?)
+        } else {
+            None
+        };
+        let anchor_deletion =
+            anchor.and_then(|anchor| deletion_by_name.get(&anchor.file_name).cloned().flatten());
+        let (first_row_id, physical_count) = match (anchor, &anchor_deletion) {
+            (Some(anchor), Some(_)) => {
+                let (anchor_from, anchor_to) = anchor.row_id_range().unwrap();
+                if anchor_from > from || anchor_to < to {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "data evolution anchor range [{anchor_from}, {anchor_to}] does not contain group [{from}, {to}]"
+                        ),
+                        source: None,
+                    });
+                }
+                (anchor_from, anchor.row_count)
             }
-            (anchor_from, anchor.row_count)
-        } else {
-            (from, to - from + 1)
+            _ => (from, to - from + 1),
         };
-        let anchor_input = InputFile {
-            file: anchor.clone(),
-            deletion_file: anchor_deletion.clone(),
-        };
-        let slicer = if anchor_deletion.is_some() {
-            live_row_slicer(table, &anchor_input).await?
-        } else {
-            LiveRowSlicer::new(physical_count, Vec::new())?
+        let slicer = match (anchor, anchor_deletion) {
+            (Some(anchor), Some(deletion_file)) => {
+                let anchor_input = InputFile {
+                    file: anchor.clone(),
+                    deletion_file: Some(deletion_file),
+                };
+                live_row_slicer(table, &anchor_input).await?
+            }
+            _ => LiveRowSlicer::new(physical_count, Vec::new())?,
         };
         let mut slicer = match slicer {
             Some(slicer) => slicer,

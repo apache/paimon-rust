@@ -776,10 +776,21 @@ impl<'a> PaimonTableRead<'a> {
                 }
             }
         }
-        // Delta / Changelog rows are read as-is from planned files (no full-table
-        // merge against historical base versions).
+        // Delta / Changelog rows are read as-is from planned files, without a merge
+        // against historical base versions. Files are still decoded as an ordinary
+        // read decodes them: primary-key BLOB descriptors resolve to payloads, and
+        // data-evolution files in a split that hold column slices of the same rows
+        // merge by row id.
         let data_splits = self.matching_splits(&data_splits)?;
-        self.new_data_file_reader()?.read(&data_splits)
+        let core_options = self.table.schema().core_options();
+        if !self.table.schema().primary_keys().is_empty() {
+            return self
+                .resolving_primary_key_blobs(&core_options, |read| read.read_raw(&data_splits));
+        }
+        if core_options.data_evolution_enabled() {
+            return self.read_with_evolution(&data_splits, &core_options);
+        }
+        self.read_raw(&data_splits)
     }
 
     fn to_incremental_diff_arrow(
@@ -828,6 +839,14 @@ impl<'a> PaimonTableRead<'a> {
     ) -> crate::Result<ArrowRecordBatchStream> {
         match plan.mode() {
             IncrementalScanMode::Diff => self.audit_diff_stream(plan),
+            // A data-evolution table has no primary key, so its rows are inserts,
+            // read as `to_incremental_arrow` reads them.
+            IncrementalScanMode::Delta
+                if self.table.schema().core_options().data_evolution_enabled() =>
+            {
+                let schema = audit_schema_for_read_type(&self.read_type, false)?;
+                prepend_insert_row_kind_stream(self.to_incremental_arrow(plan)?, schema)
+            }
             IncrementalScanMode::Delta => {
                 self.audit_raw_stream(plan, !self.table.schema().primary_keys().is_empty())
             }
@@ -1901,6 +1920,18 @@ impl<'a> PaimonTableRead<'a> {
         data_splits: &[DataSplit],
         core_options: &CoreOptions<'_>,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        self.resolving_primary_key_blobs(core_options, |read| {
+            read.read_pk(data_splits, core_options)
+        })
+    }
+
+    /// Runs `read` over the stored BLOB descriptors and resolves primary-key
+    /// managed BLOB payloads in its output.
+    fn resolving_primary_key_blobs(
+        &self,
+        core_options: &CoreOptions<'_>,
+        read: impl FnOnce(&Self) -> crate::Result<ArrowRecordBatchStream>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         use super::managed_blob_reader::{resolve_primary_key_blob_stream, ManagedBlobReadPlan};
 
         if let Some(plan) = ManagedBlobReadPlan::new(
@@ -1912,7 +1943,7 @@ impl<'a> PaimonTableRead<'a> {
             let mut inner = self.clone();
             inner.read_type = plan.scan_fields().to_vec();
             inner.data_predicates.clear();
-            let stream = inner.read_pk(data_splits, core_options)?;
+            let stream = read(&inner)?;
             return Ok(plan.finish(
                 stream,
                 core_options,
@@ -1922,7 +1953,7 @@ impl<'a> PaimonTableRead<'a> {
             ));
         }
 
-        let stream = self.read_pk(data_splits, core_options)?;
+        let stream = read(self)?;
         Ok(resolve_primary_key_blob_stream(
             stream,
             self.read_type(),

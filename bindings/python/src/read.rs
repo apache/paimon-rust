@@ -776,7 +776,8 @@ impl PyTableScan {
         Ok(slf)
     }
 
-    /// Deterministically shuffle fixed-live-row chunks. `seed` is a decimal
+    /// Deterministically shuffle fixed-live-row chunks; on Data Evolution
+    /// tables chunks count row ids. `seed` is a decimal
     /// Python integer string so arbitrarily large seeds retain Python's
     /// `random.Random` semantics.
     fn with_chunk_shuffle(

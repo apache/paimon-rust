@@ -33,7 +33,7 @@ use datafusion::catalog::Session;
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::common::project_schema;
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
@@ -46,7 +46,7 @@ use crate::table::{PaimonScanBuilder, PaimonTableProvider};
 use crate::table_function_args::{
     extract_int_literal, extract_string_literal, parse_table_identifier,
 };
-use crate::table_loader::load_data_table_for_read;
+use crate::table_loader::{ensure_no_incremental_window, load_data_table_for_read};
 
 const FUNCTION_NAME: &str = "full_text_search";
 
@@ -111,7 +111,18 @@ impl TableFunctionImpl for FullTextSearchFunction {
 
         let catalog = Arc::clone(&self.catalog);
         let table = block_on_with_runtime(
-            async move { load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await },
+            async move {
+                let table = load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await?;
+                // The index is searched at one snapshot, while a window stored
+                // on the table would make the read of its hits return that
+                // window's changes. Session options do not apply here.
+                ensure_no_incremental_window(
+                    &format!("{FUNCTION_NAME} searches one snapshot and cannot run"),
+                    &identifier,
+                    &table,
+                )?;
+                Ok::<_, DataFusionError>(table)
+            },
             "full_text_search: catalog access thread panicked",
         )?;
 

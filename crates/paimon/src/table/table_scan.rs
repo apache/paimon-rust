@@ -731,8 +731,8 @@ fn merge_manifest_entries(mut entries: Vec<ManifestEntry>) -> Vec<ManifestEntry>
     entries
 }
 
-/// Whether scan-owned pruning still preserves `merged_row_count()` as a safe
-/// row-count hint.
+/// Whether scan-owned pruning still preserves `row_count_lower_bound()` as a
+/// safe row-count hint.
 ///
 /// Data predicates and row ranges can reduce rows within a split after planning,
 /// so split-level row counts stop being a conservative bound for final rows.
@@ -775,10 +775,10 @@ impl LimitPushdownAccumulator {
             return true;
         }
 
-        if let Some(merged_count) = split.merged_row_count() {
+        if let Some(count) = split.row_count_lower_bound() {
             self.fallback_splits.push(split.clone());
             self.limited_splits.push(split);
-            self.scanned_row_count += merged_count;
+            self.scanned_row_count += count;
             // Compare without a lossy signed cast: `limit` is `usize`, so
             // `limit as i64` turns any value above `i64::MAX` (e.g. a C caller
             // passing `SIZE_MAX`) negative, which would early-stop after the
@@ -2347,7 +2347,7 @@ impl<'a> PaimonTableScan<'a> {
     /// Apply a limit-pushdown hint to the generated splits.
     ///
     /// Mirrors Java `DataTableBatchScan#applyPushDownLimit`: splits whose
-    /// `merged_row_count()` is unknown (for example merge-needed PK splits or
+    /// `row_count_lower_bound()` is unknown (for example merge-needed PK splits or
     /// unknown deletion cardinality) are skipped — they contribute an unknown
     /// number of rows, so they cannot help satisfy the limit. Pruning is
     /// committed only once the accumulated known row count reaches the limit;
@@ -3151,21 +3151,39 @@ impl<'a> PaimonTableScan<'a> {
                 scan_stats.data_evolution_groups_pruned_by_row_ranges +=
                     groups_pruned_by_row_ranges;
 
-                // Filter groups by merged stats before splitting.
+                // Filter groups by merged stats before splitting. Change events
+                // may decode a group file by file, returning each file's own
+                // rows rather than the merged rows these stats describe, so
+                // such a group also stays when one of its files may match.
                 let row_id_groups: Vec<Vec<DataFileMeta>> = if self.data_predicates.is_empty() {
                     row_id_groups
                 } else {
                     let before = row_id_groups.len();
                     let mut groups = Vec::with_capacity(before);
                     for group in row_id_groups {
-                        if data_evolution_group_matches_predicates_for_table(
+                        let mut keep = data_evolution_group_matches_predicates_for_table(
                             &self.table,
                             &group,
                             &self.data_predicates,
                             &mut stats_schema_cache,
                         )
-                        .await
-                        {
+                        .await;
+                        if !keep && self.is_streaming() && group.len() > 1 {
+                            for file in &group {
+                                if data_evolution_group_matches_predicates_for_table(
+                                    &self.table,
+                                    std::slice::from_ref(file),
+                                    &self.data_predicates,
+                                    &mut stats_schema_cache,
+                                )
+                                .await
+                                {
+                                    keep = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if keep {
                             groups.push(group);
                         }
                     }
@@ -3174,7 +3192,10 @@ impl<'a> PaimonTableScan<'a> {
                 };
 
                 let row_id_groups = if let Some(read_field_ids) = data_evolution_read_field_ids {
-                    if read_field_ids.is_empty() {
+                    // Change events keep each group whole, as Java's
+                    // `incremental-between` scan does: a group read file by
+                    // file must return the same rows whatever the projection.
+                    if read_field_ids.is_empty() || self.is_streaming() {
                         row_id_groups
                     } else {
                         let mut pruned = Vec::with_capacity(row_id_groups.len());

@@ -134,9 +134,13 @@ fn rewrite_aggregate(aggregate: &Aggregate) -> DFResult<Option<LogicalPlan>> {
     let table = paimon.table();
     let table_schema = table.schema();
     // Manifest row counts of a primary-key table are physical: several versions
-    // of a key count separately until they are merged at read time.
-    if CoreOptions::new(table_schema.options()).is_format_table()
+    // of a key count separately until they are merged at read time. Manifests
+    // count a snapshot's rows, while an incremental window reads the rows its
+    // commits wrote.
+    let options = CoreOptions::new(table_schema.options());
+    if options.is_format_table()
         || !table_schema.primary_keys().is_empty()
+        || !matches!(options.incremental_timestamp_window(), Ok(None))
     {
         return Ok(None);
     }
