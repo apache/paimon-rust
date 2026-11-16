@@ -105,6 +105,35 @@ fn reader_file_groups(files: &[DataFileMeta]) -> Vec<Vec<DataFileMeta>> {
     }
 }
 
+/// Read one validated BLOB compaction range without a normal-file anchor or
+/// deletion filtering. Descriptors let the writer stream the payload copies.
+pub(super) fn read_blob_compaction(
+    split: &DataSplit,
+    field: DataField,
+    file_io: FileIO,
+    first: i64,
+    last: i64,
+    batch_size: usize,
+) -> crate::Result<ArrowRecordBatchStream> {
+    let mut bunch = BlobBunch::new(first, last - first + 1);
+    for file in split.data_files() {
+        bunch.add(file.clone())?;
+    }
+    bunch.finalize()?;
+    bunch.validate_logical_range()?;
+    blob_fallback::read(
+        split,
+        bunch,
+        vec![field],
+        None,
+        Some(batch_size),
+        file_io,
+        true,
+        DEFAULT_BLOB_READ_PARALLELISM,
+        None,
+    )
+}
+
 /// Reads data files in data evolution mode, merging columns from files
 /// that share the same logical row range.
 pub(crate) struct DataEvolutionReader {
@@ -2934,7 +2963,8 @@ impl BlobBunch {
 
         blob_file_row_range(&file)?;
         if let Some(first_file) = self.files.first() {
-            if file.write_cols != first_file.write_cols {
+            // Sources are grouped by field ID; names can differ across schemas.
+            if file.schema_id == first_file.schema_id && file.write_cols != first_file.write_cols {
                 return Err(Error::DataInvalid {
                     message: "All files in a blob bunch should have the same write columns."
                         .to_string(),

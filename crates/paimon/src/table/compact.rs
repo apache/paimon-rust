@@ -49,13 +49,15 @@ use crate::{Error, Result};
 
 /// Creates planners, executors and a committer with one shared configuration.
 /// Output size and append task selection use the captured table options.
-/// Supports ordinary append, data-evolution normal files, and fixed or dynamic
-/// bucket PK tables. Data evolution preserves row IDs and logical deletions.
+/// Supports ordinary append, data-evolution normal and opt-in BLOB files,
+/// and fixed or dynamic bucket PK tables. Data evolution preserves row IDs
+/// and logical deletions.
 pub struct CompactBuilder<'a> {
     table: &'a Table,
     partition_filter: Option<Predicate>,
     resources: Option<ResourceContext>,
     commit_user: String,
+    compact_blob: bool,
 }
 
 impl<'a> CompactBuilder<'a> {
@@ -65,6 +67,7 @@ impl<'a> CompactBuilder<'a> {
             partition_filter: None,
             resources: None,
             commit_user: uuid::Uuid::new_v4().to_string(),
+            compact_blob: false,
         }
     }
 
@@ -83,6 +86,14 @@ impl<'a> CompactBuilder<'a> {
         self
     }
 
+    /// Include dedicated Data Evolution BLOB files in planning.
+    /// Disabled by default because execution copies payloads. Cross-group BLOB
+    /// results require the normal merge in the same or an earlier commit.
+    pub fn with_blob_compaction(mut self, enabled: bool) -> Self {
+        self.compact_blob = enabled;
+        self
+    }
+
     pub fn with_commit_user(mut self, commit_user: impl Into<String>) -> Result<Self> {
         let commit_user = commit_user.into();
         validate_commit_user(&commit_user)?;
@@ -93,15 +104,21 @@ impl<'a> CompactBuilder<'a> {
     pub fn new_planner(&self) -> Result<CompactPlanner> {
         ensure_supported(self.table)?;
         let options = self.table.schema().core_options();
+        if self.compact_blob && !options.data_evolution_enabled() {
+            return Err(Error::Unsupported {
+                message: "Dedicated BLOB compaction requires a Data Evolution table".into(),
+            });
+        }
         if options.target_file_size() <= 0 {
             return Err(Error::ConfigInvalid {
                 message: "Compaction requires a positive target-file-size".into(),
             });
         }
         let kind = if options.data_evolution_enabled() {
-            CompactPlannerKind::DataEvolution(data_evolution::DataEvolutionCompactPlanner::new(
-                &options,
-            )?)
+            CompactPlannerKind::DataEvolution(
+                data_evolution::DataEvolutionCompactPlanner::new(&options)?
+                    .with_blob_compaction(self.compact_blob),
+            )
         } else if self.table.schema().primary_keys().is_empty() {
             CompactPlannerKind::Append(append::AppendCompactPlanner::new(&options)?)
         } else {
@@ -219,6 +236,7 @@ struct CompactContext {
 }
 
 /// An immutable, serializable set of independently executable compaction tasks.
+/// A BLOB result spanning normal groups must be published with or after their merge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactPlan {
     snapshot_id: Option<i64>,
@@ -246,6 +264,9 @@ pub struct CompactTask {
     files: Vec<DataFileMeta>,
     #[serde(default)]
     output_level: Option<i32>,
+    /// Stable field ID for dedicated BLOB tasks; historical names can differ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blob_field_id: Option<i32>,
 }
 
 impl CompactTask {
@@ -531,7 +552,7 @@ impl CompactExecutor {
             .get(&key)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        task.validate_inputs(active)?;
+        task.validate_inputs(&self.table, active).await?;
         // validate_target proved the complete schema and branch are identical.
         // Preserve already resolved catalog schemas in the shared manager;
         // rebuilding it here would require REST-only schemas to exist on disk.
@@ -754,9 +775,16 @@ impl CompactTask {
         }
     }
 
-    fn validate_inputs(&self, active: &[ManifestEntry]) -> Result<()> {
+    async fn validate_inputs(&self, table: &Table, active: &[ManifestEntry]) -> Result<()> {
         if self.is_data_evolution() {
-            data_evolution::validate_inputs(&self.partition, self.bucket, &self.files, active)?;
+            data_evolution::validate_inputs(
+                table,
+                &self.partition,
+                self.bucket,
+                &self.files,
+                active,
+            )
+            .await?;
         }
         let bucket_files = active
             .iter()
@@ -810,6 +838,9 @@ impl CompactTask {
             ));
         }
         ensure_snapshot_supported(table, &self.context.snapshot)?;
+        if self.blob_field_id.is_some() && !self.is_data_evolution() {
+            return Err(invalid("BLOB compaction requires Data Evolution"));
+        }
         let incremental =
             self.is_primary_key() && primary_key::planner::enabled(&self.context.schema)?;
         // Legacy results may be recovered as already committed before their
@@ -844,7 +875,7 @@ impl CompactTask {
             }
         }
         if self.is_data_evolution() {
-            data_evolution::row_range(&self.files)?;
+            data_evolution::validate_task(self)?;
         }
         Ok(())
     }

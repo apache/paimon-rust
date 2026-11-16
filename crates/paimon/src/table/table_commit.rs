@@ -2135,9 +2135,11 @@ impl TableCommit {
                         .collect::<HashSet<_>>();
                     if self.data_evolution_enabled {
                         super::compact::data_evolution::validate_replacement_inputs(
+                            &self.table,
                             entries,
                             &captured_files,
-                        )?;
+                        )
+                        .await?;
                         super::compact::data_evolution::validate_storage_layout(
                             &self.table,
                             &deletes
@@ -2210,9 +2212,11 @@ impl TableCommit {
                 }
                 if self.data_evolution_enabled {
                     super::compact::data_evolution::validate_replacement_inputs(
+                        &self.table,
                         entries,
                         base_data_files.as_deref().unwrap_or_default(),
-                    )?;
+                    )
+                    .await?;
                 }
                 self.check_compact_lsm_conflicts(
                     base_data_files.as_deref().unwrap_or_default(),
