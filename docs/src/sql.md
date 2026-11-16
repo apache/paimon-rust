@@ -3559,13 +3559,26 @@ Field-scoped options used by these functions:
   `merge_map_with_keytime` (defaults to the last ROW field).
 - `fields.<field>.nested-key`, `fields.<field>.nested-sequence-field`,
   `fields.<field>.nested-sequence-overwrite-on-equal` (default `true`;
-  requires `nested-sequence-field`),
+  requires `nested-sequence-field`; applies only to `nested_update`),
   `fields.<field>.nested-key-null-strategy`, and `fields.<field>.count-limit`
   for nested array aggregators. `nested_partial_update` requires
-  `nested-key`. When `nested-sequence-field` is set, a nested ROW overwrites
-  an equal-key accumulator if its sequence is greater, or equal when
-  `nested-sequence-overwrite-on-equal` is `true` (default). Set it to `false`
-  to overwrite only when the new sequence is strictly greater.
+  `nested-key`. When `nested-sequence-field` is set for `nested_update`, a
+  nested ROW overwrites an equal-key accumulator if its sequence is greater,
+  or equal when `nested-sequence-overwrite-on-equal` is `true` (default).
+  Set it to `false` to overwrite only when the new sequence is strictly
+  greater. That strict equal-sequence policy is currently enforced by Rust
+  writer/compaction paths that implement the option; a Java runtime that has
+  not implemented it may still overwrite the nested ROW when sequences are
+  equal. Tables that rely on `false` to keep equal sequences from overwriting
+  should not mix writers or compaction from a Java runtime that does not yet
+  support the option. Do not use `nested-sequence-overwrite-on-equal=false` on a
+  `merge-engine=partial-update` `nested_update` field that also participates
+  in a `sequence-group`: that combination can make equal-sequence retention
+  depend on flush/commit grouping and is rejected by schema validation.
+  `nested_partial_update` does not use this equal-sequence gate; its non-NULL
+  nested fields keep the existing partial-update merge behavior, and that
+  option must not be treated as stale-event protection for
+  `nested_partial_update`.
 - `fields.<field>.count-limit` also applies to `collect`, see below.
 
 `collect` supports `fields.<field>.distinct` and `fields.<field>.count-limit`.

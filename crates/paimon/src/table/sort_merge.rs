@@ -4102,6 +4102,133 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_partial_update_rejects_nested_update_overwrite_on_equal_false() {
+        use crate::spec::{ArrayType, RowType};
+        let fields = vec![
+            DataField::new(0, "pk".into(), crate::spec::DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "version".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                2,
+                "items".into(),
+                crate::spec::DataType::Array(ArrayType::new(crate::spec::DataType::Row(
+                    RowType::new(vec![
+                        DataField::new(
+                            3,
+                            "item_id".into(),
+                            crate::spec::DataType::Int(IntType::new()),
+                        ),
+                        DataField::new(
+                            4,
+                            "amount".into(),
+                            crate::spec::DataType::Int(IntType::new()),
+                        ),
+                    ]),
+                ))),
+            ),
+        ];
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.version.sequence-group".to_string(),
+                "items".to_string(),
+            ),
+            (
+                "fields.items.aggregate-function".to_string(),
+                "nested_update".to_string(),
+            ),
+            ("fields.items.nested-key".to_string(), "item_id".to_string()),
+            (
+                "fields.items.nested-sequence-field".to_string(),
+                "item_id".to_string(),
+            ),
+            (
+                "fields.items.nested-sequence-overwrite-on-equal".to_string(),
+                "false".to_string(),
+            ),
+        ]);
+
+        let err = PartialUpdateMergeFunction::new_with_schema(
+            &options,
+            "default.t",
+            &fields,
+            &fields,
+            &["pk".to_string()],
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, Error::ConfigInvalid { ref message }
+                if message.contains("nested-sequence-overwrite-on-equal=false")
+                    && message.contains("sequence-group")),
+            "expected unsafe nested_update overwrite rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_partial_update_accepts_nested_update_overwrite_on_equal_true() {
+        use crate::spec::{ArrayType, RowType};
+        let fields = vec![
+            DataField::new(0, "pk".into(), crate::spec::DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "version".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                2,
+                "items".into(),
+                crate::spec::DataType::Array(ArrayType::new(crate::spec::DataType::Row(
+                    RowType::new(vec![
+                        DataField::new(
+                            3,
+                            "item_id".into(),
+                            crate::spec::DataType::Int(IntType::new()),
+                        ),
+                        DataField::new(
+                            4,
+                            "amount".into(),
+                            crate::spec::DataType::Int(IntType::new()),
+                        ),
+                    ]),
+                ))),
+            ),
+        ];
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.version.sequence-group".to_string(),
+                "items".to_string(),
+            ),
+            (
+                "fields.items.aggregate-function".to_string(),
+                "nested_update".to_string(),
+            ),
+            ("fields.items.nested-key".to_string(), "item_id".to_string()),
+            (
+                "fields.items.nested-sequence-field".to_string(),
+                "item_id".to_string(),
+            ),
+            (
+                "fields.items.nested-sequence-overwrite-on-equal".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+
+        PartialUpdateMergeFunction::new_with_schema(
+            &options,
+            "default.t",
+            &fields,
+            &fields,
+            &["pk".to_string()],
+        )
+        .unwrap();
+    }
+
     // ---------- AggregateMergeFunction ----------
 
     use crate::spec::{DataType as PaimonDataType, IntType, VarCharType};
