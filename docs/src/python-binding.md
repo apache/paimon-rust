@@ -624,10 +624,10 @@ batch = (
 )
 results = batch.execute()
 
-# Full-text search
+# Full-text search — query is a serialized match DSL, not plain text
 text = (
     table.new_full_text_search_builder()
-    .with_query("body", "needle")
+    .with_query("body", '{"match":{"query":"needle"}}')
     .with_limit(10)
 )
 text_result = text.execute()
@@ -636,11 +636,15 @@ text_result = text.execute()
 hybrid = (
     table.new_hybrid_search_builder()
     .add_vector_route("embedding", [1.0, 0.0], 10)
-    .add_full_text_route("body", "needle", 10)
+    .add_full_text_route("body", '{"match":{"query":"needle"}}', 10)
     .with_limit(5)
 )
 ranked = hybrid.execute()
 ```
+
+`with_query` and `add_full_text_route` take a JSON DSL string (for example
+`{"match":{"query":"..."}}`), not a bare search term. Plain text raises a JSON
+parse error.
 
 `execute()` returns a `GlobalIndexResult` (or a list of them for batch vector
 search). Reusable scan/read plans pin one snapshot; scalar and partition filters
