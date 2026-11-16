@@ -208,6 +208,7 @@ impl GlobalIndexScanner {
                     // Tuple bounds can leave suffix constraints for data reads.
                     // Search pre-filters exclude these definitions entirely.
                     fully_evaluated: false,
+                    candidate_ranges: Vec::new(),
                 },
             }));
         }

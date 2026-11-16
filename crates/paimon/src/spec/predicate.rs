@@ -292,6 +292,46 @@ pub enum PredicateOperator {
     NotBetween,
 }
 
+impl PredicateOperator {
+    /// The operator selecting the complement of the non-NULL rows, matching
+    /// Java `LeafFunction.negate`. `None` when there is no such operator.
+    fn negate(self) -> Option<Self> {
+        Some(match self {
+            Self::IsNull => Self::IsNotNull,
+            Self::IsNotNull => Self::IsNull,
+            Self::Eq => Self::NotEq,
+            Self::NotEq => Self::Eq,
+            Self::Lt => Self::GtEq,
+            Self::GtEq => Self::Lt,
+            Self::LtEq => Self::Gt,
+            Self::Gt => Self::LtEq,
+            Self::In => Self::NotIn,
+            Self::NotIn => Self::In,
+            Self::Between => Self::NotBetween,
+            Self::NotBetween => Self::Between,
+            Self::StartsWith
+            | Self::EndsWith
+            | Self::Contains
+            | Self::ArrayContains
+            | Self::ArraysOverlap
+            | Self::ArrayContainsAll
+            | Self::Like => return None,
+        })
+    }
+}
+
+/// The operator [`Predicate::negate`] flips `op` to on a field of `data_type`.
+fn negated_op(op: PredicateOperator, data_type: &DataType) -> Option<PredicateOperator> {
+    // `NaN < 1.0` and `NaN >= 1.0` are both false, so a flipped comparison
+    // would drop NaN. `Not` keeps it, as Java's NaN-last ordering does.
+    if matches!(data_type, DataType::Float(_) | DataType::Double(_))
+        && !matches!(op, PredicateOperator::IsNull | PredicateOperator::IsNotNull)
+    {
+        return None;
+    }
+    op.negate()
+}
+
 impl fmt::Display for PredicateOperator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -470,34 +510,26 @@ impl Predicate {
 
     /// Negate a predicate with simplification.
     ///
+    /// Like Java `Predicate.negate`, leaf operators are flipped (`=` / `!=`,
+    /// `<` / `>=`, `IS NULL` / `IS NOT NULL`, `IN` / `NOT IN`, ...) and AND/OR
+    /// are pushed down with De Morgan, so a NULL input still evaluates to false.
+    /// A plain `!p` would select NULL rows for `NOT(p = 'a')`.
+    ///
     /// - `NOT(NOT(p))` → `p` (double negation elimination)
     /// - `NOT(AlwaysTrue)` → `AlwaysFalse`
     /// - `NOT(AlwaysFalse)` → `AlwaysTrue`
+    /// - Leaves without a negated operator stay wrapped in `Not`, and so do
+    ///   FLOAT/DOUBLE comparisons, which NaN makes non-complementary.
     pub fn negate(predicate: Predicate) -> Predicate {
         match predicate {
             Predicate::Not(inner) => *inner,
             Predicate::AlwaysTrue => Predicate::AlwaysFalse,
             Predicate::AlwaysFalse => Predicate::AlwaysTrue,
-            Predicate::NestedLeaf {
-                root,
-                index,
-                path,
-                op,
-                literals,
-            } if literals.is_empty()
-                && matches!(op, PredicateOperator::In | PredicateOperator::NotIn) =>
-            {
-                Predicate::NestedLeaf {
-                    root,
-                    index,
-                    path,
-                    op: if op == PredicateOperator::In {
-                        PredicateOperator::NotIn
-                    } else {
-                        PredicateOperator::In
-                    },
-                    literals,
-                }
+            Predicate::And(children) => {
+                Predicate::or(children.into_iter().map(Predicate::negate).collect())
+            }
+            Predicate::Or(children) => {
+                Predicate::and(children.into_iter().map(Predicate::negate).collect())
             }
             Predicate::Leaf {
                 column,
@@ -505,23 +537,86 @@ impl Predicate {
                 data_type,
                 op,
                 literals,
-            } if literals.is_empty()
-                && matches!(op, PredicateOperator::In | PredicateOperator::NotIn) =>
-            {
-                // Java negates the leaf function, retaining its NULL exclusion.
-                Predicate::Leaf {
+            } => match negated_op(op, &data_type) {
+                Some(op) => Predicate::Leaf {
                     column,
                     index,
                     data_type,
-                    op: if op == PredicateOperator::In {
-                        PredicateOperator::NotIn
-                    } else {
-                        PredicateOperator::In
-                    },
+                    op,
                     literals,
-                }
+                },
+                None => Predicate::Not(Box::new(Predicate::Leaf {
+                    column,
+                    index,
+                    data_type,
+                    op,
+                    literals,
+                })),
+            },
+            Predicate::NestedLeaf {
+                root,
+                index,
+                path,
+                op,
+                literals,
+            } => match negated_op(op, path[path.len() - 1].data_type()) {
+                Some(op) => Predicate::NestedLeaf {
+                    root,
+                    index,
+                    path,
+                    op,
+                    literals,
+                },
+                None => Predicate::Not(Box::new(Predicate::NestedLeaf {
+                    root,
+                    index,
+                    path,
+                    op,
+                    literals,
+                })),
+            },
+        }
+    }
+
+    /// `IS NOT NULL` on the field of a leaf kept under `Not` by [`negate`].
+    /// Like Java `NotStartsWith`, `NotLike`, ..., that `Not` is false for NULL
+    /// input, so it is evaluated as `guard AND NOT leaf`. `None` for other
+    /// predicates and for `IS [NOT] NULL` leaves.
+    ///
+    /// [`negate`]: Predicate::negate
+    pub(crate) fn not_null_guard(&self) -> Option<Predicate> {
+        match self {
+            Predicate::Leaf {
+                column,
+                index,
+                data_type,
+                op,
+                ..
+            } if !matches!(op, PredicateOperator::IsNull | PredicateOperator::IsNotNull) => {
+                Some(Predicate::Leaf {
+                    column: column.clone(),
+                    index: *index,
+                    data_type: data_type.clone(),
+                    op: PredicateOperator::IsNotNull,
+                    literals: Vec::new(),
+                })
             }
-            other => Predicate::Not(Box::new(other)),
+            Predicate::NestedLeaf {
+                root,
+                index,
+                path,
+                op,
+                ..
+            } if !matches!(op, PredicateOperator::IsNull | PredicateOperator::IsNotNull) => {
+                Some(Predicate::NestedLeaf {
+                    root: root.clone(),
+                    index: *index,
+                    path: path.clone(),
+                    op: PredicateOperator::IsNotNull,
+                    literals: Vec::new(),
+                })
+            }
+            _ => None,
         }
     }
 
@@ -2453,7 +2548,7 @@ pub(crate) fn eval_row(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
             }
             Ok(false)
         }
-        Predicate::Not(inner) => Ok(!eval_row(inner, row)?),
+        Predicate::Not(inner) => eval_row_negated(inner, row),
         Predicate::Leaf {
             index,
             data_type,
@@ -2464,6 +2559,35 @@ pub(crate) fn eval_row(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
             let datum = extract_datum(row, *index, data_type)?;
             Ok(eval_leaf(*op, datum.as_ref(), literals))
         }
+    }
+}
+
+/// Evaluates `NOT predicate`. The `NOT` is pushed down to the leaves with
+/// De Morgan first: a leaf yields false for NULL, so negating a compound
+/// result would turn UNKNOWN into true.
+fn eval_row_negated(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
+    match predicate {
+        Predicate::And(children) => {
+            for child in children {
+                if eval_row_negated(child, row)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Predicate::Or(children) => {
+            for child in children {
+                if !eval_row_negated(child, row)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Predicate::Not(inner) => eval_row(inner, row),
+        _ => match predicate.not_null_guard() {
+            Some(guard) => Ok(eval_row(&guard, row)? && !eval_row(predicate, row)?),
+            None => Ok(!eval_row(predicate, row)?),
+        },
     }
 }
 
@@ -3193,13 +3317,39 @@ mod tests {
     #[test]
     fn test_not() {
         let pb = PredicateBuilder::new(&test_fields());
-        let p = pb.equal("id", Datum::Int(1)).unwrap();
-        let negated = Predicate::negate(p.clone());
+        let eq = pb.equal("id", Datum::Int(1)).unwrap();
+        let gt = pb.greater_than("hr", Datum::Int(2)).unwrap();
 
-        match &negated {
-            Predicate::Not(inner) => assert_eq!(inner.as_ref(), &p),
-            other => panic!("expected Not, got {other:?}"),
-        }
+        // Like Java, leaves flip their operator instead of becoming `Not`.
+        assert_eq!(
+            Predicate::negate(eq.clone()),
+            pb.not_equal("id", Datum::Int(1)).unwrap()
+        );
+        assert_eq!(
+            Predicate::negate(Predicate::and(vec![eq.clone(), gt.clone()])),
+            Predicate::or(vec![
+                pb.not_equal("id", Datum::Int(1)).unwrap(),
+                pb.less_or_equal("hr", Datum::Int(2)).unwrap(),
+            ])
+        );
+        assert_eq!(
+            Predicate::negate(Predicate::or(vec![eq.clone(), gt.clone()])),
+            Predicate::and(vec![
+                pb.not_equal("id", Datum::Int(1)).unwrap(),
+                pb.less_or_equal("hr", Datum::Int(2)).unwrap(),
+            ])
+        );
+        assert_eq!(
+            Predicate::negate(pb.is_null("id").unwrap()),
+            pb.is_not_null("id").unwrap()
+        );
+
+        // No negated operator: stays `Not`.
+        let starts = pb.starts_with("name", Datum::String("a".into())).unwrap();
+        assert_eq!(
+            Predicate::negate(starts.clone()),
+            Predicate::Not(Box::new(starts))
+        );
     }
 
     // ======================== field_idx_to_partition_idx ========================
@@ -3278,7 +3428,7 @@ mod tests {
     fn test_display_not() {
         let pb = PredicateBuilder::new(&test_fields());
         let p = pb.equal("id", Datum::Int(1)).unwrap();
-        let negated = Predicate::negate(p);
+        let negated = Predicate::Not(Box::new(p));
         assert_eq!(format!("{negated}"), "NOT (id = 1)");
     }
 
@@ -3695,6 +3845,27 @@ mod tests {
         // NULL compared to any value → false (SQL null semantics)
         assert!(!eval_row(
             &make_leaf("x", 0, PredicateOperator::Eq, vec![Datum::Int(42)]),
+            &row
+        )
+        .unwrap());
+        // ... and so is its negation.
+        assert!(!eval_row(
+            &Predicate::negate(make_leaf(
+                "x",
+                0,
+                PredicateOperator::Eq,
+                vec![Datum::Int(42)]
+            )),
+            &row
+        )
+        .unwrap());
+        assert!(!eval_row(
+            &Predicate::Not(Box::new(make_leaf(
+                "x",
+                0,
+                PredicateOperator::Gt,
+                vec![Datum::Int(42)]
+            ))),
             &row
         )
         .unwrap());
