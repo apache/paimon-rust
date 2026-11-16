@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
-use crate::io::uri_reader::sanitize_blob_uri;
+use crate::io::uri_reader::{sanitize_blob_uri, UriInput};
 use crate::io::{FileIO, FileRead};
 use crate::spec::BlobDescriptor;
 use crate::Result;
@@ -94,68 +94,62 @@ impl BlobReader {
 
     /// Read a descriptor batch in input order.
     pub async fn read_blobs(&self, descriptors: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
-        let mut by_uri = HashMap::<String, Vec<(usize, BlobDescriptor)>>::new();
+        let mut by_uri = HashMap::<String, Vec<BlobReadRequestSpec>>::new();
         for (index, bytes) in descriptors.iter().enumerate() {
             let descriptor = BlobDescriptor::deserialize(bytes)
                 .map_err(|error| blob_error_with_context(error, &[index], None))?;
-            descriptor.range_spec().map_err(|error| {
+            let range = descriptor.range_spec().map_err(|error| {
                 blob_error_with_context(error, &[index], Some(descriptor.uri()))
             })?;
             by_uri
                 .entry(descriptor.uri().to_string())
                 .or_default()
-                .push((index, descriptor));
+                .push(BlobReadRequestSpec {
+                    row: index,
+                    offset: range.offset(),
+                    length: range.length(),
+                });
         }
 
         let limiter = self.limiter.clone();
         let blob_parallelism = limiter.parallelism();
-        let groups: Vec<Vec<(usize, Vec<u8>)>> = stream::iter(by_uri)
-            .map(|(uri, entries)| {
+        let mut groups = stream::iter(by_uri)
+            .map(|(uri, requests)| {
                 let limiter = limiter.clone();
                 async move {
-                    let indices = entries.iter().map(|(index, _)| *index).collect::<Vec<_>>();
-                    let file_io = match &self.file_io {
-                        Some(file_io) => file_io.clone(),
-                        None => FileIO::from_path(&uri)
-                            .and_then(|builder| {
-                                builder.with_props(self.storage_options.iter()).build()
-                            })
-                            .map_err(|error| {
-                                blob_error_with_context(error, &indices, Some(&uri))
-                            })?,
+                    let indices = requests
+                        .iter()
+                        .map(|request| request.row)
+                        .collect::<Vec<_>>();
+                    let result = async {
+                        let file_io = match &self.file_io {
+                            Some(file_io) => file_io.clone(),
+                            None => FileIO::from_path(&uri)?
+                                .with_props(self.storage_options.iter())
+                                .build()?,
+                        };
+                        let (group, _) =
+                            BlobReadGroup::plan(&file_io, &uri, requests, &limiter).await?;
+                        match group {
+                            Some(group) => group.read(limiter).await,
+                            None => Ok(Vec::new()),
+                        }
                     };
-                    let mut builder = LargeBinaryBuilder::with_capacity(entries.len(), 0);
-                    for (_, descriptor) in &entries {
-                        builder.append_value(
-                            BlobDescriptor::new(
-                                descriptor.uri().to_string(),
-                                descriptor.offset(),
-                                descriptor.length(),
-                            )
-                            .serialize(),
-                        );
-                    }
-                    let resolved = resolve_blob_column(&builder.finish(), &file_io, limiter)
+                    result
                         .await
-                        .map_err(|error| blob_error_with_context(error, &indices, Some(&uri)))?;
-                    Ok::<_, crate::Error>(
-                        entries
-                            .into_iter()
-                            .enumerate()
-                            .map(|(position, (index, _))| {
-                                (index, resolved.value(position).to_vec())
-                            })
-                            .collect(),
-                    )
+                        .map_err(|error| blob_error_with_context(error, &indices, Some(&uri)))
                 }
             })
-            .buffer_unordered(blob_parallelism)
-            .try_collect()
-            .await?;
+            .buffer_unordered(blob_parallelism);
 
-        let mut values = groups.into_iter().flatten().collect::<Vec<_>>();
-        values.sort_unstable_by_key(|(index, _)| *index);
-        Ok(values.into_iter().map(|(_, value)| value).collect())
+        // Empty ranges produce no read and keep their empty output slot.
+        let mut values = vec![Vec::new(); descriptors.len()];
+        while let Some(reads) = groups.try_next().await? {
+            for read in reads {
+                values[read.row] = read.data.to_vec();
+            }
+        }
+        Ok(values)
     }
 }
 
@@ -394,17 +388,6 @@ impl BlobReadLimiter {
     }
 }
 
-/// For each row in a blob column, if the value is a serialized `BlobDescriptor`,
-/// resolve it by reading the actual data from the referenced URI+offset+length.
-/// Raw data values are passed through unchanged.
-pub(crate) async fn resolve_blob_column(
-    col: &LargeBinaryArray,
-    file_io: &FileIO,
-    limiter: BlobReadLimiter,
-) -> Result<LargeBinaryArray> {
-    resolve_column(col, file_io, limiter, false).await
-}
-
 /// Resolve a schema-declared descriptor column, including version 1 descriptors
 /// which have no magic number and cannot be detected in arbitrary payload bytes.
 pub(crate) async fn resolve_descriptor_column(
@@ -412,132 +395,46 @@ pub(crate) async fn resolve_descriptor_column(
     file_io: &FileIO,
     limiter: BlobReadLimiter,
 ) -> Result<LargeBinaryArray> {
-    resolve_column(col, file_io, limiter, true).await
-}
-
-async fn resolve_column(
-    col: &LargeBinaryArray,
-    file_io: &FileIO,
-    limiter: BlobReadLimiter,
-    descriptor_only: bool,
-) -> Result<LargeBinaryArray> {
-    let mut needs_resolve = false;
-    for i in 0..col.len() {
-        if !col.is_null(i) && (descriptor_only || BlobDescriptor::is_blob_descriptor(col.value(i)))
-        {
-            needs_resolve = true;
-            break;
-        }
-    }
-
-    if !needs_resolve {
+    if col.null_count() == col.len() {
         return Ok(col.clone());
     }
 
-    let mut cells = Vec::with_capacity(col.len());
+    let mut cells = vec![None; col.len()];
     let mut requests_by_uri: HashMap<String, Vec<BlobReadRequestSpec>> = HashMap::new();
-    let mut value_capacity = 0usize;
-
-    for row in 0..col.len() {
-        if col.is_null(row) {
-            cells.push(ResolvedBlobCell::Null);
-            continue;
-        }
-
-        let value = col.value(row);
-        if descriptor_only || BlobDescriptor::is_blob_descriptor(value) {
-            let desc = BlobDescriptor::deserialize(value)?;
-            let range = desc.range_spec()?;
-            requests_by_uri
-                .entry(desc.uri().to_string())
-                .or_default()
-                .push(BlobReadRequestSpec {
-                    row,
-                    offset: range.offset(),
-                    length: range.length(),
-                });
-            cells.push(ResolvedBlobCell::Null);
-        } else {
-            value_capacity = value_capacity.saturating_add(value.len());
-            cells.push(ResolvedBlobCell::Value(Bytes::copy_from_slice(value)));
-        }
+    for (row, value) in col.iter().enumerate() {
+        let Some(value) = value else { continue };
+        let desc = BlobDescriptor::deserialize(value)?;
+        let range = desc.range_spec()?;
+        requests_by_uri
+            .entry(desc.uri().to_string())
+            .or_default()
+            .push(BlobReadRequestSpec {
+                row,
+                offset: range.offset(),
+                length: range.length(),
+            });
     }
 
     let mut read_groups = Vec::with_capacity(requests_by_uri.len());
     for (uri, requests) in requests_by_uri {
-        let input = crate::io::uri_reader::UriInput::new(file_io, &uri)?;
-        let file_size = if requests.iter().any(|request| request.length.is_none()) {
-            let _metadata_permit = limiter.acquire_request(&uri, "metadata").await?;
-            input
-                .size()
-                .await
-                .map_err(|e| crate::Error::UnexpectedError {
-                    message: format!(
-                        "Failed to read metadata for BlobDescriptor URI '{}': {e}",
-                        sanitize_blob_uri(&uri)
-                    ),
-                    source: Some(Box::new(e)),
-                })?
-        } else {
-            0
-        };
-        let mut bounded_requests = Vec::with_capacity(requests.len());
-        for request in requests {
-            let length = request
-                .length
-                .unwrap_or_else(|| file_size.saturating_sub(request.offset));
-            request
-                .offset
-                .checked_add(length)
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: format!(
-                        "BlobDescriptor range overflows u64: offset={}, length={length}",
-                        request.offset
-                    ),
-                    source: None,
-                })?;
-            value_capacity = value_capacity.saturating_add(length as usize);
-            if length == 0 {
-                cells[request.row] = ResolvedBlobCell::Value(Bytes::new());
-                continue;
-            }
-            bounded_requests.push(BlobReadRequest {
-                row: request.row,
-                offset: request.offset,
-                length,
-            });
+        let (group, empty_rows) = BlobReadGroup::plan(file_io, &uri, requests, &limiter).await?;
+        for row in empty_rows {
+            cells[row] = Some(Bytes::new());
         }
-
-        if bounded_requests.is_empty() {
-            continue;
-        }
-
-        let reader = input.reader().await?;
-        read_groups.push(BlobReadGroup {
-            uri,
-            reader,
-            reads: merge_blob_read_requests(bounded_requests),
-        });
+        read_groups.extend(group);
     }
 
+    let mut value_capacity = 0usize;
     for resolved in read_blob_groups(read_groups, limiter).await? {
-        cells[resolved.row] = ResolvedBlobCell::Value(resolved.data);
+        value_capacity = value_capacity.saturating_add(resolved.data.len());
+        cells[resolved.row] = Some(resolved.data);
     }
 
     let mut builder = LargeBinaryBuilder::with_capacity(col.len(), value_capacity);
     for cell in cells {
-        match cell {
-            ResolvedBlobCell::Null => builder.append_null(),
-            ResolvedBlobCell::Value(value) => builder.append_value(value.as_ref()),
-        }
+        builder.append_option(cell);
     }
     Ok(builder.finish())
-}
-
-#[derive(Debug)]
-enum ResolvedBlobCell {
-    Null,
-    Value(Bytes),
 }
 
 #[derive(Debug)]
@@ -573,22 +470,83 @@ struct BlobReadGroup {
     reads: Vec<MergedBlobRead>,
 }
 
+impl BlobReadGroup {
+    async fn plan(
+        file_io: &FileIO,
+        uri: &str,
+        requests: Vec<BlobReadRequestSpec>,
+        limiter: &BlobReadLimiter,
+    ) -> Result<(Option<Self>, Vec<usize>)> {
+        let input = UriInput::new(file_io, uri)?;
+        let file_size = if requests.iter().any(|request| request.length.is_none()) {
+            let _metadata_permit = limiter.acquire_request(uri, "metadata").await?;
+            input
+                .size()
+                .await
+                .map_err(|e| crate::Error::UnexpectedError {
+                    message: format!(
+                        "Failed to read metadata for BlobDescriptor URI '{}': {e}",
+                        sanitize_blob_uri(uri)
+                    ),
+                    source: Some(Box::new(e)),
+                })?
+        } else {
+            0
+        };
+        let mut bounded_requests = Vec::with_capacity(requests.len());
+        let mut empty_rows = Vec::new();
+        for request in requests {
+            let length = request
+                .length
+                .unwrap_or_else(|| file_size.saturating_sub(request.offset));
+            request
+                .offset
+                .checked_add(length)
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "BlobDescriptor range overflows u64: offset={}, length={length}",
+                        request.offset
+                    ),
+                    source: None,
+                })?;
+            if length == 0 {
+                empty_rows.push(request.row);
+                continue;
+            }
+            bounded_requests.push(BlobReadRequest {
+                row: request.row,
+                offset: request.offset,
+                length,
+            });
+        }
+
+        if bounded_requests.is_empty() {
+            return Ok((None, empty_rows));
+        }
+
+        let group = Self {
+            uri: uri.to_string(),
+            reader: input.reader().await?,
+            reads: merge_blob_read_requests(bounded_requests),
+        };
+        Ok((Some(group), empty_rows))
+    }
+
+    async fn read(self, limiter: BlobReadLimiter) -> Result<Vec<ResolvedBlobRead>> {
+        read_merged_blob_ranges(&self.uri, self.reader, self.reads, limiter).await
+    }
+}
+
 async fn read_blob_groups(
     groups: Vec<BlobReadGroup>,
     limiter: BlobReadLimiter,
 ) -> Result<Vec<ResolvedBlobRead>> {
     let blob_parallelism = limiter.parallelism();
-    let grouped_results: Vec<Vec<ResolvedBlobRead>> =
-        stream::iter(groups)
-            .map(|group| {
-                let limiter = limiter.clone();
-                async move {
-                    read_merged_blob_ranges(&group.uri, group.reader, group.reads, limiter).await
-                }
-            })
-            .buffer_unordered(blob_parallelism)
-            .try_collect()
-            .await?;
+    let grouped_results: Vec<Vec<ResolvedBlobRead>> = stream::iter(groups)
+        .map(|group| group.read(limiter.clone()))
+        .buffer_unordered(blob_parallelism)
+        .try_collect()
+        .await?;
     Ok(grouped_results.into_iter().flatten().collect())
 }
 
@@ -730,7 +688,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn legacy_descriptor_parsing_requires_schema_context() {
+    async fn descriptor_column_resolves_legacy_values_and_preserves_empty_and_null() {
         let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
         let uri = "memory:/payload";
         io.new_output(uri)
@@ -738,19 +696,18 @@ mod tests {
             .write(Bytes::from_static(b"hello"))
             .await
             .unwrap();
-        let v2 = BlobDescriptor::new(uri.into(), 1, 3).serialize();
-        let mut v1 = vec![1];
-        v1.extend_from_slice(&v2[9..]);
-        let column = LargeBinaryArray::from(vec![Some(v1.as_slice()), None]);
-        let raw = resolve_blob_column(&column, &io, BlobReadLimiter::new())
-            .await
-            .unwrap();
-        assert_eq!(raw, column);
+        let v1 = java_v1_descriptor(uri, 1, 3);
+        let empty = java_v2_descriptor(uri, 0, 0);
+        let column =
+            LargeBinaryArray::from(vec![Some(v1.as_slice()), None, Some(empty.as_slice())]);
+        assert!(!BlobDescriptor::is_blob_descriptor(&v1));
         let resolved = resolve_descriptor_column(&column, &io, BlobReadLimiter::new())
             .await
             .unwrap();
         assert_eq!(resolved.value(0), b"ell");
         assert!(resolved.is_null(1));
+        assert!(!resolved.is_null(2));
+        assert!(resolved.value(2).is_empty());
     }
 
     #[derive(Clone)]
@@ -986,34 +943,46 @@ mod tests {
 
     #[tokio::test]
     async fn test_merged_descriptors_issue_one_underlying_read() {
-        let reader = TrackingFileRead::new(Bytes::from_static(b"abcdefghijkl"));
-        let reads = merge_blob_read_requests(vec![
-            BlobReadRequest {
+        let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let uri = "memory:/blob.bin";
+        let bytes = Bytes::from_static(b"abcdefgh");
+        io.new_output(uri)
+            .unwrap()
+            .write(bytes.clone())
+            .await
+            .unwrap();
+        let reader = TrackingFileRead::new(bytes);
+        let limiter = BlobReadLimiter::new();
+        let requests = vec![
+            BlobReadRequestSpec {
                 row: 0,
                 offset: 0,
-                length: 4,
+                length: Some(4),
             },
-            BlobReadRequest {
+            BlobReadRequestSpec {
                 row: 1,
                 offset: 4,
-                length: 4,
+                length: Some(4),
             },
-            BlobReadRequest {
+            BlobReadRequestSpec {
                 row: 2,
                 offset: 2,
-                length: 6,
+                length: None,
             },
-        ]);
+            BlobReadRequestSpec {
+                row: 3,
+                offset: 7,
+                length: Some(0),
+            },
+        ];
+        let (group, empty_rows) = BlobReadGroup::plan(&io, uri, requests, &limiter)
+            .await
+            .unwrap();
+        let mut group = group.unwrap();
+        group.reader = Arc::new(reader.clone());
+        let results = group.read(limiter).await.unwrap();
 
-        let results = read_merged_blob_ranges(
-            "memory:/blob.bin",
-            Arc::new(reader.clone()),
-            reads,
-            BlobReadLimiter::new(),
-        )
-        .await
-        .unwrap();
-
+        assert_eq!(empty_rows, vec![3]);
         assert_eq!(results.len(), 3);
         assert_eq!(reader.ranges(), vec![0..8]);
     }
@@ -1167,12 +1136,16 @@ mod tests {
         std::fs::write(second.path(), b"UVWXYZ").unwrap();
         let first_uri = file_uri(first.path());
         let second_uri = file_uri(second.path());
+        let dir = tempfile::tempdir().unwrap();
+        let missing_uri = file_uri(&dir.path().join("missing.bin"));
         let descriptors = vec![
             java_v2_descriptor(&second_uri, 1, 3),
             java_v2_descriptor(&first_uri, 3, -1),
             java_v2_descriptor(&first_uri, 5, 0),
             java_v2_descriptor(&first_uri, 2, 4),
+            java_v2_descriptor(&missing_uri, 0, 0),
             java_v2_descriptor(&first_uri, 2, 4),
+            java_v1_descriptor(&second_uri, 10, -1),
         ];
 
         let values = BlobReader::default()
@@ -1187,7 +1160,9 @@ mod tests {
                 b"defghij".to_vec(),
                 Vec::new(),
                 b"cdef".to_vec(),
+                Vec::new(),
                 b"cdef".to_vec(),
+                Vec::new(),
             ]
         );
     }
@@ -1228,6 +1203,27 @@ mod tests {
         assert!(message.contains("ftp://example.com/a"));
         assert!(!message.contains("access-key"));
         assert!(!message.contains("sensitive"));
+    }
+
+    #[tokio::test]
+    async fn test_standalone_blob_reader_reports_group_input_indices() {
+        let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let missing_uri = "memory:/missing.bin";
+        let descriptors = vec![
+            java_v2_descriptor(missing_uri, 0, 0),
+            java_v2_descriptor("memory:/other.bin", 0, 0),
+            java_v2_descriptor(missing_uri, 0, -1),
+        ];
+
+        let error = BlobReader::from_file_io(io)
+            .read_blobs(&descriptors)
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("input indices [0, 2]"));
+        assert!(message.contains(missing_uri));
+        assert!(message.contains("Failed to read metadata"));
     }
 
     #[tokio::test]
