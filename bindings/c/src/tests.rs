@@ -28,6 +28,7 @@
 
 mod audit_read;
 mod commit_messages;
+mod read_type;
 mod table_arrow_schema;
 
 use std::collections::HashMap;
