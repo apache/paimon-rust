@@ -38,3 +38,17 @@ def variant_get_numeric_fields(
 ) -> pyarrow.FixedSizeListArray:
     """Extract literal top-level numeric fields as float32 in the requested order."""
     ...
+
+def variant_get(
+    column: pyarrow.Array, path: str, data_type: pyarrow.DataType
+) -> pyarrow.Array:
+    """Extract one VARIANT path without implicit casts.
+
+    Supports bool, signed integers, float32/64, string/large_string,
+    binary/large_binary, date32, timestamp('us'), decimal128 with nonnegative
+    scale, and nested struct/list/large_list/fixed_size_list/string-keyed map.
+    VARIANT value/metadata children accept binary or large_binary storage.
+    Missing paths, VARIANT nulls and SQL nulls return nulls. Type mismatches
+    raise TypeError; malformed input and numeric overflow raise ValueError.
+    """
+    ...

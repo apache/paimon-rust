@@ -231,7 +231,10 @@ impl<'a> VariantRef<'a> {
         self.get_path_segments(&parse_path(path)?)
     }
 
-    fn get_path_segments(&self, segments: &[PathSegment]) -> Result<Option<VariantRef<'a>>> {
+    pub(crate) fn get_path_segments(
+        &self,
+        segments: &[PathSegment],
+    ) -> Result<Option<VariantRef<'a>>> {
         let mut current = *self;
         for segment in segments {
             match (segment, current.kind()?) {
@@ -287,7 +290,7 @@ impl<'a> VariantRef<'a> {
         Ok(out)
     }
 
-    fn get_field_by_key(&self, key: &str) -> Result<Option<VariantRef<'a>>> {
+    pub(crate) fn get_field_by_key(&self, key: &str) -> Result<Option<VariantRef<'a>>> {
         let layout = object_layout(self.value, self.pos)?;
         if layout.size < BINARY_SEARCH_THRESHOLD {
             for i in 0..layout.size {
@@ -3772,14 +3775,14 @@ fn decimal_to_integral(variant: VariantRef<'_>, min: i128, max: i128) -> Result<
 }
 
 #[derive(Clone)]
-struct ObjectFieldRef<'a> {
-    key: String,
+pub(crate) struct ObjectFieldRef<'a> {
+    pub(crate) key: String,
     id: usize,
-    value: VariantRef<'a>,
+    pub(crate) value: VariantRef<'a>,
 }
 
 impl<'a> VariantRef<'a> {
-    fn object_fields(&self) -> Result<Vec<ObjectFieldRef<'a>>> {
+    pub(crate) fn object_fields(&self) -> Result<Vec<ObjectFieldRef<'a>>> {
         let layout = object_layout(self.value, self.pos)?;
         let mut fields = Vec::with_capacity(layout.size);
         for i in 0..layout.size {
@@ -3803,7 +3806,7 @@ impl<'a> VariantRef<'a> {
         Ok(fields)
     }
 
-    fn array_elements(&self) -> Result<Vec<VariantRef<'a>>> {
+    pub(crate) fn array_elements(&self) -> Result<Vec<VariantRef<'a>>> {
         let layout = array_layout(self.value, self.pos)?;
         let mut elements = Vec::with_capacity(layout.size);
         for i in 0..layout.size {

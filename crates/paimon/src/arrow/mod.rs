@@ -46,7 +46,7 @@ mod variant;
 
 pub use read_budget::ReadBudget;
 pub use row_filter::{RowFilter, RowFilterContext, RowFilterFactory};
-pub use variant::variant_get_numeric_fields;
+pub use variant::{variant_get, variant_get_numeric_fields};
 
 use crate::spec::{
     ArrayType, BigIntType, BinaryType, BooleanType, DataField, DataType as PaimonDataType,
