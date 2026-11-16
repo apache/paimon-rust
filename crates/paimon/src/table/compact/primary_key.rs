@@ -87,6 +87,7 @@ impl PrimaryKeyCompactPlanner {
                         files,
                         output_level: Some(output_level),
                         blob_field_id: None,
+                        vector_field_ids: None,
                     });
                 }
                 continue;
@@ -120,6 +121,7 @@ impl PrimaryKeyCompactPlanner {
                     files,
                     output_level: None,
                     blob_field_id: None,
+                    vector_field_ids: None,
                 });
             }
         }

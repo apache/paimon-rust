@@ -150,7 +150,10 @@ async fn compact_rejects_historical_inline_fields_after_enabling_dedicated_forma
             expected,
             "the reader must still see inline values before compaction"
         );
-        let builder = evolved.new_compact_builder().with_blob_compaction(blob);
+        let builder = evolved
+            .new_compact_builder()
+            .with_blob_compaction(blob)
+            .with_vector_compaction(!blob);
         let error = builder.new_planner().unwrap().plan().await.unwrap_err();
         assert!(matches!(error, paimon::Error::Unsupported { .. }));
         assert!(error
@@ -179,60 +182,68 @@ async fn compact_rejects_historical_inline_fields_after_enabling_dedicated_forma
             expected,
             "rejected compaction must preserve every historical inline value"
         );
-        if blob {
-            let evolved = evolved
-                .copy_with_options([("compaction.min.file-num".into(), "100".into())].into());
-            for value in [b"new".as_slice(), b"latest".as_slice()] {
-                let builder = evolved.new_write_builder();
-                let messages = builder
-                    .new_update()
-                    .unwrap()
-                    .update_by_arrow_with_row_id(vec![RecordBatch::try_from_iter([
-                        ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
-                        (
-                            "payload",
-                            Arc::new(LargeBinaryArray::from(vec![Some(value)])) as ArrayRef,
-                        ),
-                    ])
-                    .unwrap()])
-                    .await
-                    .unwrap();
-                builder.new_commit().commit(messages).await.unwrap();
-            }
-            let expected = rows(&evolved).await;
-            let builder = evolved.new_compact_builder().with_blob_compaction(true);
-            let plan = builder.new_planner().unwrap().plan().await.unwrap();
-            assert_eq!(plan.tasks().len(), 1);
-            assert_eq!(plan.tasks()[0].files().len(), 2);
-            assert!(plan.tasks()[0]
-                .files()
-                .iter()
-                .all(|file| file.file_name.ends_with(".blob")));
-            let error = builder
-                .new_executor()
+        let evolved = evolved.copy_with_options([("target-file-size".into(), "1 b".into())].into());
+        for value in [3, 4] {
+            let builder = evolved.new_write_builder();
+            let payload: ArrayRef = if blob {
+                Arc::new(LargeBinaryArray::from_iter([Some(vec![value as u8])]))
+            } else {
+                Arc::new(
+                    FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                        [Some(vec![Some(value as f32), Some(10.0)])],
+                        2,
+                    ),
+                )
+            };
+            let messages = builder
+                .new_update()
                 .unwrap()
-                .execute(&plan.tasks()[0])
+                .update_by_arrow_with_row_id(vec![RecordBatch::try_from_iter([
+                    ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+                    ("payload", payload),
+                ])
+                .unwrap()])
                 .await
-                .unwrap_err();
-            assert!(
-                matches!(error, paimon::Error::Unsupported { .. }),
-                "{error}"
-            );
-            assert!(
-                error
-                    .to_string()
-                    .contains("historical inline field 'payload'"),
-                "{error}"
-            );
-            assert_eq!(rows(&evolved).await, expected);
-            assert_eq!(
-                evolved
-                    .snapshot_manager()
-                    .get_latest_snapshot_id()
-                    .await
-                    .unwrap(),
-                Some(4)
-            );
+                .unwrap();
+            builder.new_commit().commit(messages).await.unwrap();
         }
+        let expected = rows(&evolved).await;
+        let builder = evolved
+            .new_compact_builder()
+            .with_blob_compaction(blob)
+            .with_vector_compaction(!blob);
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+        assert_eq!(plan.tasks()[0].files().len(), 2);
+        assert!(plan.tasks()[0].files().iter().all(|file| if blob {
+            file.file_name.ends_with(".blob")
+        } else {
+            file.file_name.contains(".vector.")
+        }));
+        let error = builder
+            .new_executor()
+            .unwrap()
+            .execute(&plan.tasks()[0])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, paimon::Error::Unsupported { .. }),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("historical inline field 'payload'"),
+            "{error}"
+        );
+        assert_eq!(rows(&evolved).await, expected);
+        assert_eq!(
+            evolved
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap(),
+            Some(4)
+        );
     }
 }
