@@ -25,6 +25,48 @@ from pypaimon_rust.datafusion import (
 
 
 @pytest.mark.parametrize('stream', [False, True])
+def test_shard_updates_reuse_transported_worker_plans(tmp_path, stream):
+    import pickle
+
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.planned_shards')
+    context.sql("""CREATE TABLE paimon.planned_shards.t (id INT, value INT) WITH (
+        'bucket' = '-1', 'row-tracking.enabled' = 'true',
+        'data-evolution.enabled' = 'true')""")
+    for values in ['(1, 10), (2, 20)', '(3, 30)']:
+        context.sql('INSERT INTO paimon.planned_shards.t (id, value) VALUES ' + values)
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('planned_shards.t')
+    plan = table.new_read_builder().new_scan().plan_all()
+    groups = datafusion.RowIdPlan(plan).groups()
+    assert len(groups) == 2
+    context.sql('INSERT INTO paimon.planned_shards.t (id, value) VALUES (4, 40)')
+    builder = (table.new_stream_write_builder().with_commit_user('planned-shards')
+               if stream else table.new_batch_write_builder())
+    messages, seen = [], []
+    # Include an empty worker after the table has advanced beyond the plan.
+    for splits in [[group[2]] for group in groups] + [[]]:
+        snapshot_id, worker_splits = pickle.loads(pickle.dumps((plan.snapshot_id(), splits)))
+        worker_plan = datafusion.Plan(snapshot_id, worker_splits)
+        update = builder.new_update().with_update_type(['value']).with_plan(worker_plan)
+        shard = update.new_shard_updator(0, 1)
+        for batch in shard.arrow_reader():
+            seen.extend(batch.column('id').to_pylist())
+            values = [value + 100 for value in batch.column('value').to_pylist()]
+            shard.update_by_arrow_batch(pa.record_batch(
+                [pa.array(values, type=pa.int32())], names=['value']))
+        messages.extend(shard.prepare_commit())
+        shard.close()
+    assert sorted(seen) == [1, 2, 3]
+    assert messages
+    committer = builder.new_commit()
+    committer.commit(7, messages) if stream else committer.commit(messages)
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, value FROM paimon.planned_shards.t ORDER BY id'))
+    assert actual.to_pydict() == {'id': [1, 2, 3, 4], 'value': [110, 120, 130, 40]}
+
+
+@pytest.mark.parametrize('stream', [False, True])
 def test_arrow_row_id_deletes_preserve_captured_bucket_vectors(tmp_path, stream):
     context = SQLContext()
     context.register_catalog('paimon', {'warehouse': str(tmp_path)})
