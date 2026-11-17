@@ -27,8 +27,9 @@ use crate::spec::MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION;
 use crate::spec::{DataField, DataType as PaimonDataType, Datum, Predicate};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
-use arrow_array::RecordBatch;
-use arrow_array::RecordBatchOptions;
+use arrow_array::{make_array, Array, ArrayRef, OffsetSizeTrait, RecordBatch, RecordBatchOptions};
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -870,20 +871,17 @@ fn take_row_slices(
     let Some(slices) = slices else {
         return ensure_schema(batch, target_schema);
     };
-
     if slices.is_empty() {
-        return empty_batch(target_schema.clone(), 0);
+        return ensure_schema(batch.slice(0, 0), target_schema);
     }
-
-    if slices.len() == 1 {
-        let (offset, len) = slices[0];
-        return ensure_schema(batch.slice(offset, len), target_schema);
+    if let [(offset, len)] = slices {
+        return ensure_schema(batch.slice(*offset, *len), target_schema);
     }
 
     let sliced_batches = slices
         .iter()
-        .map(|(offset, len)| batch.slice(*offset, *len))
-        .collect::<Vec<_>>();
+        .map(|(offset, len)| ensure_schema(batch.slice(*offset, *len), target_schema))
+        .collect::<crate::Result<Vec<_>>>()?;
     arrow_select::concat::concat_batches(target_schema, &sliced_batches).map_err(|e| {
         Error::UnexpectedError {
             message: format!("Failed to apply Mosaic row selection: {e}"),
@@ -897,16 +895,133 @@ fn ensure_schema(batch: RecordBatch, target_schema: &SchemaRef) -> crate::Result
         return Ok(batch);
     }
 
+    if batch.num_columns() != target_schema.fields().len() {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Mosaic returned {} columns for {} projected fields",
+                batch.num_columns(),
+                target_schema.fields().len()
+            ),
+            source: None,
+        });
+    }
     if batch.num_columns() == 0 {
         return empty_batch(target_schema.clone(), batch.num_rows());
     }
 
-    RecordBatch::try_new(target_schema.clone(), batch.columns().to_vec()).map_err(|e| {
-        Error::UnexpectedError {
-            message: format!("Failed to align Mosaic RecordBatch schema: {e}"),
-            source: Some(Box::new(e)),
-        }
+    let columns = target_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let column = batch
+                .column_by_name(field.name())
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!("Missing projected Mosaic field '{}'", field.name()),
+                    source: None,
+                })?;
+            align_array_type(column, field.data_type())
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to align Mosaic RecordBatch schema: {e}"),
+        source: Some(Box::new(e)),
     })
+}
+
+/// Rebuild an Arrow array with the logical schema's nested field metadata while
+/// retaining the physical buffers. Arrow includes List/Map/Struct child field
+/// names in data-type equality, but Mosaic writers use different internal names
+/// (for example `$data$`) than Paimon's logical Arrow schema (`element`).
+fn align_array_type(array: &ArrayRef, target_type: &ArrowDataType) -> crate::Result<ArrayRef> {
+    if array.data_type() == target_type {
+        return Ok(array.clone());
+    }
+
+    let data = align_array_data(array.to_data(), target_type, false)?;
+    Ok(make_array(data))
+}
+
+fn align_array_data(
+    data: ArrayData,
+    target: &ArrowDataType,
+    map_entries: bool,
+) -> crate::Result<ArrayData> {
+    use ArrowDataType::{FixedSizeList, LargeList, List, Map, Struct};
+    let source = data.data_type();
+    if source == target {
+        return Ok(data);
+    }
+    let builder = match (source, target) {
+        (List(_), List(field)) => align_list_data::<i32>(data, field.data_type(), false)?,
+        (LargeList(_), LargeList(field)) => align_list_data::<i64>(data, field.data_type(), false)?,
+        (FixedSizeList(_, a), FixedSizeList(field, b)) if a == b => {
+            let child = align_array_data(data.child_data()[0].clone(), field.data_type(), false)?;
+            data.into_builder().child_data(vec![child])
+        }
+        // Arrow MAP fixes key and value by position, regardless of their field names.
+        (Map(_, a), Map(entries, b)) if a == b => {
+            align_list_data::<i32>(data, entries.data_type(), true)?
+        }
+        (Struct(input), Struct(output))
+            if input.len() == output.len()
+                && (map_entries
+                    || input
+                        .iter()
+                        .zip(output.iter())
+                        .all(|(a, b)| a.name() == b.name())) =>
+        {
+            let children = data
+                .child_data()
+                .iter()
+                .zip(output)
+                .map(|(child, field)| align_array_data(child.clone(), field.data_type(), false))
+                .collect::<crate::Result<Vec<_>>>()?;
+            data.into_builder().child_data(children)
+        }
+        _ => {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Cannot align incompatible Mosaic Arrow type {source:?} to {target:?}"
+                ),
+                source: None,
+            })
+        }
+    };
+    builder
+        .data_type(target.clone())
+        .build()
+        .map_err(|e| Error::DataInvalid {
+            message: format!("Cannot align Mosaic Arrow array to {target:?}: {e}"),
+            source: Some(Box::new(e)),
+        })
+}
+
+/// A sliced List or Map still owns the full child array. Align only the span
+/// referenced by these offsets so nulls outside the selection cannot fail validation.
+fn align_list_data<O: OffsetSizeTrait>(
+    data: ArrayData,
+    child_type: &ArrowDataType,
+    map_entries: bool,
+) -> crate::Result<ArrayDataBuilder> {
+    let offsets = ScalarBuffer::<O>::new(data.buffers()[0].clone(), data.offset(), data.len() + 1);
+    let first = offsets[0];
+    let start = first.as_usize();
+    let end = offsets[data.len()].as_usize();
+    let values = &data.child_data()[0];
+    if start == 0 && end == values.len() {
+        let child = align_array_data(values.clone(), child_type, map_entries)?;
+        return Ok(data.into_builder().child_data(vec![child]));
+    }
+
+    let visible = make_array(values.clone()).slice(start, end - start);
+    let child = align_array_data(visible.to_data(), child_type, map_entries)?;
+    let offsets = OffsetBuffer::new(offsets).subtract(first);
+    Ok(data
+        .into_builder()
+        .offset(0)
+        .buffers(vec![offsets.into_inner().into_inner()])
+        .child_data(vec![child]))
 }
 
 fn empty_batch(schema: SchemaRef, row_count: usize) -> crate::Result<RecordBatch> {
@@ -2550,6 +2665,151 @@ mod tests {
         assert_eq!(label_keys.value(2), "c");
         assert!(label_values.is_null(1));
         assert_eq!(label_values.value(2), 30);
+    }
+
+    #[test]
+    fn mosaic_only_renames_positional_map_children() {
+        let pair = |a, b| {
+            ArrowDataType::Struct(
+                vec![
+                    Arc::new(Field::new(a, ArrowDataType::Int32, false)),
+                    Arc::new(Field::new(b, ArrowDataType::Int32, true)),
+                ]
+                .into(),
+            )
+        };
+        let input = pair("keys", "values");
+        let target = pair("key", "value");
+        assert!(align_array_type(&arrow_array::new_empty_array(&input), &target).is_err());
+        let map = |ty| ArrowDataType::Map(Arc::new(Field::new("entries", ty, false)), false);
+        assert!(align_array_type(&arrow_array::new_empty_array(&map(input)), &map(target)).is_ok());
+    }
+
+    #[test]
+    fn schema_validation_only_sees_selected_rows() {
+        let schema = |nullable| {
+            Arc::new(Schema::new(vec![Field::new(
+                "v",
+                ArrowDataType::Int32,
+                nullable,
+            )]))
+        };
+        let batch = RecordBatch::try_new(
+            schema(true),
+            vec![Arc::new(Int32Array::from(vec![
+                None,
+                Some(42),
+                None,
+                Some(7),
+            ]))],
+        )
+        .unwrap();
+        for (ranges, expected) in [
+            (vec![], vec![]),
+            (vec![(1, 1)], vec![42]),
+            (vec![(3, 1), (1, 1)], vec![7, 42]),
+        ] {
+            let selected = take_row_slices(batch.clone(), Some(&ranges), &schema(false)).unwrap();
+            assert_eq!(selected.schema(), schema(false));
+            assert_eq!(
+                selected
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .as_ref(),
+                expected.as_slice()
+            );
+        }
+        assert!(take_row_slices(batch, None, &schema(false)).is_err());
+    }
+
+    #[tokio::test]
+    async fn required_list_elements_are_validated_only_in_selected_mosaic_rows() {
+        let lists = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(
+            [None, Some(42), Some(7), None, Some(9)].map(|value| Some(vec![value])),
+        );
+        let input = Arc::new(Schema::new(vec![Field::new(
+            "nums",
+            lists.data_type().clone(),
+            true,
+        )]));
+        let data = write_mosaic(&RecordBatch::try_new(input, vec![Arc::new(lists)]).unwrap());
+        let required = [field(
+            0,
+            "nums",
+            DataType::Array(ArrayType::new(DataType::Int(IntType::with_nullable(false)))),
+        )];
+
+        for (ranges, expected) in [
+            (vec![RowRange::new(1, 2)], [42, 7]),
+            (vec![RowRange::new(2, 2), RowRange::new(4, 4)], [7, 9]),
+        ] {
+            let batches = read_batches(data.clone(), &required, Some(ranges))
+                .await
+                .unwrap();
+            let lists = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            assert_eq!(lists.value_offsets(), &[0, 1, 2]);
+            let values = lists
+                .values()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(values.values().as_ref(), &expected);
+        }
+        let err = read_batches(data, &required, Some(vec![RowRange::new(0, 1)]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-nullable child"), "{err}");
+    }
+
+    #[test]
+    fn test_align_mosaic_list_child_field_name() {
+        let physical_field = Arc::new(Field::new("$data$", ArrowDataType::Int32, true));
+        let physical_array = ListArray::try_new(
+            physical_field.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 3])),
+            Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])),
+            Some(NullBuffer::new(BooleanBuffer::from(vec![true, false]))),
+        )
+        .unwrap();
+        let physical_schema = Arc::new(Schema::new(vec![Field::new(
+            "nums",
+            ArrowDataType::List(physical_field),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(physical_schema, vec![Arc::new(physical_array)]).unwrap();
+
+        let target_field = Arc::new(Field::new("element", ArrowDataType::Int32, true));
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "nums",
+            ArrowDataType::List(target_field),
+            true,
+        )]));
+        assert!(ensure_schema(batch.clone(), &Arc::new(Schema::empty())).is_err());
+        let selected =
+            take_row_slices(batch.clone(), Some(&[(1, 1), (0, 1)]), &target_schema).unwrap();
+        assert_eq!(selected.num_rows(), 2);
+        assert!(selected.column(0).is_null(0));
+        let aligned = ensure_schema(batch, &target_schema).unwrap();
+
+        assert_eq!(aligned.schema(), target_schema);
+        let nums = aligned
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(nums.value_offsets(), &[0, 3, 3]);
+        assert!(nums.is_null(1));
+        let values = nums.values().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values.value(0), 10);
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), 30);
     }
 
     /// Null values in nullable columns must round-trip as nulls.

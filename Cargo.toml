@@ -38,6 +38,7 @@ rust-version = "1.95.0"
 [workspace.dependencies]
 arrow = "59.2"
 arrow-array = { version = "59.2", features = ["ffi"] }
+arrow-data = "59.2"
 arrow-arith = "59.2"
 arrow-buffer = "59.2"
 arrow-schema = "59.2"
