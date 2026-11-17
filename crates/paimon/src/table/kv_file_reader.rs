@@ -4154,11 +4154,10 @@ mod tests {
             vec![10]
         );
 
+        // Java PR 11178: a lone UPDATE_BEFORE removes the row.
         write_commit(&table, &make(Some(99), 1)).await;
-        assert_eq!(
-            int_column(&read_rows(&table, None, None).await, "value"),
-            vec![10]
-        );
+        let rows = read_rows(&table, None, None).await;
+        assert!(rows.iter().all(|batch| batch.num_rows() == 0), "{rows:?}");
 
         write_commit(&table, &make(Some(20), 2)).await;
         assert_eq!(
