@@ -174,25 +174,30 @@ Supported formats and options:
 
 | Format | Behavior and options |
 | --- | --- |
-| `csv` | Infer columns or use a DDL `schema`; `header`, `sep`/`delimiter`, `quote`, `escape`, `nullValue`, `multiLine`. Without `schema`, headers default to enabled; with `schema`, headers default to disabled. The default escape is backslash. Quoted line breaks require `multiLine => true`. |
+| `csv` | Infer columns or use a DDL `schema`; `header`, `sep`/`delimiter`, `quote`, `escape`, `nullValue`, `multiLine`, `mode => 'FAILFAST'`. Without `schema`, headers default to enabled; with `schema`, headers default to disabled. Headerless inference names columns `_c0`, `_c1`, etc. The default escape is backslash; `quote => ''` disables quoting. Quoted line breaks require `multiLine => true`. |
 | `parquet` | Native Parquet schema, column pruning and predicate pushdown; optional `schema`. |
-| `json` | One object per line by default, including `.jsonl`/`.ndjson` files. `multiLine => true` reads one object or an array of objects per file. Optional `schema`. |
+| `json` | One object per line by default, including `.jsonl`/`.ndjson` files. `multiLine => true` reads one object or an array of objects per file. Optional `schema` and `mode => 'FAILFAST'`. |
 | `text` | One UTF-8 line per `value STRING` row; default separators are LF, CRLF and CR. `lineSep` sets a separator; `wholeText => true` reads each file as one row, including empty files. |
 | `binaryFile` | One row per file: `path STRING`, `modificationTime TIMESTAMP`, `length BIGINT`, `content BINARY`. Selecting only metadata avoids reading file contents. |
 
 Options are named, case-insensitive and must evaluate to constants. Duplicate,
 unknown and format-inappropriate options are rejected. `format` can be omitted
 for recognized extensions; mixed formats require an explicit format. Directories
-are scanned recursively. Path globs support `*`, `?` and character classes.
+are scanned recursively. Path globs support `*`, `?` and character classes,
+including Hadoop-style negation `[^a]`. Unsupported brace expansion is rejected.
 Each wildcard matches one path component; a matched directory includes its descendants.
 `pathGlobFilter` (alias `fileNamePattern`) filters leaf names. Hidden path
 components beginning with `.` or `_` are skipped. No matching files is an error.
 
-Every source row exposes `_metadata` with `file_path`, `file_name`, `file_size`
-and `file_modification_time`, unless the data already contains a column named
-`_metadata`, which takes precedence. Unlike Databricks, the generated struct is
-currently included in `SELECT *`; select data columns explicitly when a stable
-output schema is needed.
+Every source row exposes `_metadata` with `file_path`, `file_name`, `file_size`,
+`file_modification_time`, `file_block_start` and `file_block_length`, unless the
+data already contains a column named `_metadata`, which takes precedence.
+`SQLContext.sql` excludes generated metadata from `SELECT *` and `alias.*`;
+select `_metadata` explicitly to include it. Metadata explicitly exported by
+a subquery, CTE or view remains an ordinary visible column. Each file is exposed
+as one logical block with offset zero and length equal to the file size.
+Wildcard selection through an alias on a parenthesized join containing
+`read_files` is unsupported; alias the individual sources instead.
 With DataFusion's default identifier normalization, quote the camel-case binary
 column as `"modificationTime"` when selecting it explicitly.
 CSV and Parquet inference uses DataFusion's inference limits. NDJSON inference
@@ -204,8 +209,13 @@ This is a supported subset of [Databricks `read_files`](https://docs.databricks.
 It does not add the `read_csv`, `read_parquet`, `read_json`, `read_text`, `read_blob`
 or `read_ndjson` aliases. Hive partition inference, compressed text inputs, schema
 hints/rescued-data modes, streaming ingestion, Avro, ORC, XML and service-specific
-connections are not implemented. Malformed input fails rather than being rescued
-or silently dropped. Whole-file text, binary content and multi-line JSON
+connections are not implemented. CSV/JSON currently use strict parsing, including
+when `mode` is omitted; this differs from Databricks' default `PERMISSIVE` mode.
+Use `mode => 'FAILFAST', schemaEvolutionMode => 'none'` for an explicit strict-reading
+contract with rescued data disabled. Only `none` is supported for schema evolution.
+Other parsing modes are rejected; malformed input fails rather than being rescued or silently
+dropped. JSON single-quoted strings and non-finite numbers are also unsupported.
+Whole-file text, binary content and multi-line JSON
 materialize a file in memory; ordinary text and CSV are streamed in batches.
 
 ### REST Catalog Views and SQL Functions

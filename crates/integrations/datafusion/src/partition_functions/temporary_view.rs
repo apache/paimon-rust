@@ -116,7 +116,13 @@ impl MetadataView {
                     &self.database,
                 )
                 .await?;
-                let plan = state.create_logical_plan(&query).await?;
+                let plan = crate::read_files::sql(
+                    &datafusion::prelude::SessionContext::new_with_state(state),
+                    &query,
+                    datafusion::execution::context::SQLOptions::new(),
+                )
+                .await?
+                .into_unoptimized_plan();
                 if plan.schema().as_arrow() != self.schema.as_ref() {
                     return Err(plan_datafusion_err!(
                         "metadata-dependent temporary view schema changed since creation"

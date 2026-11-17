@@ -20,6 +20,31 @@ use datafusion::error::Result;
 
 use super::error;
 
+/// Hadoop uses `^`, rather than Rust glob's `!`, to negate a character class.
+pub(super) fn pattern(value: &str) -> Result<Pattern> {
+    if value.contains(['{', '}']) {
+        return Err(error("brace expansion in glob patterns is not supported"));
+    }
+    let mut translated = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        translated.push(ch);
+        if ch == '[' {
+            match chars.peek() {
+                Some('^') => {
+                    chars.next();
+                    translated.push('!');
+                }
+                Some('!') => {
+                    return Err(error("use [^...] to negate a glob character class"));
+                }
+                _ => {}
+            }
+        }
+    }
+    Pattern::new(&translated).map_err(error)
+}
+
 /// Match file or directory names at their specified depth. A matched directory
 /// includes its descendants, just as a literal directory passed to read_files.
 #[derive(Clone, Debug)]
@@ -34,7 +59,7 @@ impl PathGlob {
         let components = pattern
             .trim_end_matches('/')
             .split('/')
-            .map(|part| Pattern::new(part).map_err(error))
+            .map(self::pattern)
             .collect::<Result<_>>()?;
         Ok(Self {
             components,

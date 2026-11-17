@@ -759,7 +759,7 @@ impl SQLContext {
                     if self.is_paimon_catalog_ref(&table_ref) {
                         self.handle_create_view(create_view, options).await
                     } else {
-                        self.ctx.sql_with_options(sql, options).await
+                        crate::read_files::sql(&self.ctx, sql, options).await
                     }
                 }
             }
@@ -929,11 +929,9 @@ impl SQLContext {
                     &current_database,
                 )
                 .await?;
-                self.ctx
-                    .sql_with_options(&expanded.to_string(), options)
-                    .await
+                crate::read_files::sql(&self.ctx, &expanded.to_string(), options).await
             }
-            _ => self.ctx.sql_with_options(sql, options).await,
+            _ => crate::read_files::sql(&self.ctx, sql, options).await,
         }
     }
 
@@ -1025,7 +1023,7 @@ impl SQLContext {
             &current_database,
         )
         .await?;
-        self.ctx.sql_with_options(&expanded, sql_options).await
+        crate::read_files::sql(&self.ctx, &expanded, sql_options).await
     }
 
     async fn time_travel_provider(
@@ -1327,7 +1325,7 @@ impl SQLContext {
         if let Some(query) = &ct.query {
             // CREATE TEMPORARY TABLE ... AS SELECT ...
             let query_sql = query.to_string();
-            let df = self.ctx.sql_with_options(&query_sql, sql_options).await?;
+            let df = crate::read_files::sql(&self.ctx, &query_sql, sql_options).await?;
             let schema = df.schema().inner().clone();
             let batches = df.collect().await?;
 
@@ -1892,7 +1890,7 @@ impl SQLContext {
 
     async fn handle_merge_into(&self, merge: &Merge, options: SQLOptions) -> DFResult<DataFrame> {
         let merge = self.normalize_merge_into(merge).await?;
-        self.ctx.sql_with_options(&merge.to_string(), options).await
+        crate::read_files::sql(&self.ctx, &merge.to_string(), options).await
     }
 
     async fn normalize_merge_into(&self, merge: &Merge) -> DFResult<Merge> {
@@ -2054,10 +2052,7 @@ impl SQLContext {
         let source = insert.source.as_ref().ok_or_else(|| {
             DataFusionError::Plan("INSERT OVERWRITE requires a source query".into())
         })?;
-        let df = self
-            .ctx
-            .sql_with_options(&source.to_string(), sql_options)
-            .await?;
+        let df = crate::read_files::sql(&self.ctx, &source.to_string(), sql_options).await?;
 
         let all_fields = table.schema().fields();
         let non_static_fields: Vec<&PaimonDataField> = all_fields
@@ -2270,9 +2265,7 @@ impl SQLContext {
                     &state.config_options().catalog.default_schema,
                 )
                 .await?;
-                self.ctx
-                    .sql_with_options(&expanded_query, sql_options)
-                    .await
+                crate::read_files::sql(&self.ctx, &expanded_query, sql_options).await
             })
             .await?;
             let logical_plan = df.logical_plan().clone();

@@ -34,7 +34,7 @@ use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{lit, Expr};
+use datafusion::logical_expr::Expr;
 use datafusion::object_store::{ObjectStore, ObjectStoreExt};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -46,7 +46,7 @@ use datafusion::prelude::SessionContext;
 use futures::{stream, StreamExt, TryStreamExt};
 use serde_json::Value;
 
-use super::{error, metadata, File, Format, Options};
+use super::{error, metadata_expr, File, Format, Options};
 
 fn json_records(bytes: &[u8]) -> Result<Vec<Value>> {
     match serde_json::from_slice::<Value>(bytes)
@@ -140,6 +140,13 @@ pub(super) async fn infer_csv_schema(
         if records_to_read == 0 {
             break;
         }
+    }
+    if options.header == Some(false) {
+        fields = fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| Arc::new(field.as_ref().clone().with_name(format!("_c{index}"))))
+            .collect();
     }
     Ok(Arc::new(Schema::new(fields)))
 }
@@ -311,7 +318,7 @@ pub(super) async fn provider(
         let frame = if source_metadata {
             frame
         } else {
-            frame.with_column("_metadata", lit(metadata(&file)?))?
+            frame.with_column("_metadata", metadata_expr(&file)?)?
         };
         plans.push(frame.into_unoptimized_plan());
     }
@@ -934,6 +941,7 @@ impl CsvInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::logical_expr::lit;
 
     #[test]
     fn csv_eof_checks_quote_and_escape_state_across_chunks() {

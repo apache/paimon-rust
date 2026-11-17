@@ -220,7 +220,9 @@ async fn planned_stores_are_captured_and_adls_containers_remain_separate() {
     ctx.ctx()
         .runtime_env()
         .register_object_store(&url, original);
-    let planned = ctx.sql("SELECT value FROM read_files('abfss://allowed@account.dfs.core.windows.net/imports/data.txt', format => 'text')").await.unwrap();
+    let sql = "SELECT * FROM read_files('abfss://allowed@account.dfs.core.windows.net/imports/data.txt', format => 'text')";
+    let planned = ctx.sql(sql).await.unwrap();
+    assert_eq!(planned.schema().fields().len(), 1);
     let replacement = Arc::new(InMemory::new());
     replacement
         .put(&Path::from("imports/data.txt"), "replacement".into())
@@ -236,6 +238,14 @@ async fn planned_stores_are_captured_and_adls_containers_remain_separate() {
             .try_as_str()
             .flatten(),
         Some("original")
+    );
+    let replacement = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(
+        ScalarValue::try_from_array(replacement[0].column(0), 0)
+            .unwrap()
+            .try_as_str()
+            .flatten(),
+        Some("replacement")
     );
     assert!(ctx.sql("SELECT * FROM read_files('abfss://other@account.dfs.core.windows.net/imports/data.txt', format => 'text')").await.is_err());
 }

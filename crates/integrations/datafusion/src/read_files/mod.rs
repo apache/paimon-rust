@@ -17,6 +17,7 @@
 
 mod glob;
 mod options;
+mod projection;
 mod raw;
 mod scoped;
 pub(crate) mod store;
@@ -41,14 +42,35 @@ use datafusion::logical_expr::planner::{
 use datafusion::logical_expr::{lit, LogicalPlan, LogicalPlanBuilder, Union};
 use datafusion::object_store::{path::Path, ObjectMeta, ObjectStore, ObjectStoreExt};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast::{FunctionArg, FunctionArgExpr, TableFactor};
+use datafusion::sql::sqlparser::ast::{
+    FunctionArg, FunctionArgExpr, ObjectName, TableAliasColumnDef, TableFactor,
+};
 use futures::TryStreamExt;
 use url::Url;
 
 use options::{Format, Options};
+pub(crate) use projection::sql;
+
+const GENERATED_METADATA: &str = "paimon.read_files.generated_metadata";
+
+fn metadata_expr(file: &File) -> Result<datafusion::logical_expr::Expr> {
+    Ok(lit(metadata(file)?).alias_with_metadata(
+        "_metadata",
+        Some(datafusion::common::metadata::FieldMetadata::from(
+            std::collections::HashMap::from([(GENERATED_METADATA.to_string(), "true".to_string())]),
+        )),
+    ))
+}
 
 fn error(message: impl std::fmt::Display) -> DataFusionError {
     DataFusionError::Plan(format!("read_files: {message}"))
+}
+
+fn is_read_files(name: &ObjectName) -> bool {
+    name.0.len() == 1
+        && name.0[0]
+            .as_ident()
+            .is_some_and(|i| i.value.eq_ignore_ascii_case("read_files"))
 }
 
 fn parse_url(path: &str) -> Result<Url> {
@@ -198,11 +220,7 @@ impl RelationPlanner for ReadFilesPlanner {
             } => (name, args, alias),
             _ => return Ok(RelationPlanning::Original(Box::new(relation))),
         };
-        if name.0.len() != 1
-            || !name.0[0]
-                .as_ident()
-                .is_some_and(|i| i.value.eq_ignore_ascii_case("read_files"))
-        {
+        if !is_read_files(name) {
             return Ok(RelationPlanning::Original(Box::new(relation)));
         }
         let mut exprs = Vec::new();
@@ -230,9 +248,27 @@ impl RelationPlanner for ReadFilesPlanner {
             .context_provider()
             .get_table_function_source("read_files", exprs)?;
         let plan = LogicalPlanBuilder::scan("read_files()", source, None)?.build()?;
+        let mut alias = alias.clone();
+        if let Some(alias) = &mut alias {
+            if !alias.columns.is_empty()
+                && plan
+                    .schema()
+                    .fields()
+                    .iter()
+                    .any(|field| field.metadata().contains_key(GENERATED_METADATA))
+            {
+                if alias.columns.len() + 1 != plan.schema().fields().len() {
+                    return Err(error(
+                        "table alias columns must match the number of data columns",
+                    ));
+                }
+                alias
+                    .columns
+                    .push(TableAliasColumnDef::from_name("_metadata"));
+            }
+        }
         Ok(RelationPlanning::Planned(Box::new(PlannedRelation::new(
-            plan,
-            alias.clone(),
+            plan, alias,
         ))))
     }
 }
@@ -390,6 +426,20 @@ async fn build(
                 .await?
         }
     };
+    // A real field can carry metadata from an earlier export. Provenance tags
+    // belong to this source binding and must never hide persisted user columns.
+    let schema = Arc::new(datafusion::arrow::datatypes::Schema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let mut metadata = field.metadata().clone();
+                metadata.remove(GENERATED_METADATA);
+                field.as_ref().clone().with_metadata(metadata)
+            })
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    ));
     let listing_options = ListingOptions::new(file_format).with_file_extension("");
     let has_source_metadata = schema
         .fields()
@@ -409,7 +459,7 @@ async fn build(
         let frame = if has_source_metadata {
             frame
         } else {
-            frame.with_column("_metadata", lit(metadata(&file)?))?
+            frame.with_column("_metadata", metadata_expr(&file)?)?
         };
         plans.push(frame.into_unoptimized_plan());
     }
@@ -435,6 +485,8 @@ fn metadata(file: &File) -> Result<ScalarValue> {
             DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
             false,
         ),
+        Field::new("file_block_start", DataType::Int64, false),
+        Field::new("file_block_length", DataType::Int64, false),
     ];
     let values = [
         ScalarValue::Utf8(Some(file.url.to_string())),
@@ -443,6 +495,8 @@ fn metadata(file: &File) -> Result<ScalarValue> {
         )),
         ScalarValue::Int64(Some(i64::try_from(file.meta.size).map_err(error)?)),
         ScalarValue::TimestampMicrosecond(Some(file.meta.last_modified.timestamp_micros()), None),
+        ScalarValue::Int64(Some(0)),
+        ScalarValue::Int64(Some(i64::try_from(file.meta.size).map_err(error)?)),
     ];
     let arrays = values
         .iter()

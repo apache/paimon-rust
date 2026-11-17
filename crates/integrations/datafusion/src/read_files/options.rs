@@ -150,6 +150,8 @@ impl Options {
             "linesep",
             "nullvalue",
             "pathglobfilter",
+            "mode",
+            "schemaevolutionmode",
         ];
         for name in values.keys() {
             if !known.contains(&name.as_str()) {
@@ -163,20 +165,34 @@ impl Options {
         let text = |key: &str| values.get(key).map(|expr| string(expr, key)).transpose();
         let flag = |key: &str| values.get(key).map(|expr| boolean(expr, key)).transpose();
         let byte = |key: &str| values.get(key).map(|expr| character(expr, key)).transpose();
+        if text("mode")?.is_some_and(|mode| !mode.eq_ignore_ascii_case("FAILFAST")) {
+            return Err(error("only mode => 'FAILFAST' is supported; PERMISSIVE and DROPMALFORMED are not implemented"));
+        }
+        if text("schemaevolutionmode")?.is_some_and(|mode| !mode.eq_ignore_ascii_case("none")) {
+            return Err(error("only schemaEvolutionMode => 'none' is supported"));
+        }
         Ok(Self {
             path,
             format: text("format")?.map(|v| Format::parse(&v)).transpose()?,
             schema: text("schema")?,
             header: flag("header")?,
             delimiter: byte("sep")?,
-            quote: byte("quote")?,
+            quote: text("quote")?
+                .map(|value| {
+                    if value.is_empty() {
+                        Ok(0)
+                    } else {
+                        character(values["quote"], "quote")
+                    }
+                })
+                .transpose()?,
             escape: Some(byte("escape")?.unwrap_or(b'\\')),
             multi_line: flag("multiline")?.unwrap_or(false),
             whole_text: flag("wholetext")?.unwrap_or(false),
             line_sep: text("linesep")?,
             null_value: text("nullvalue")?,
             file_pattern: text("pathglobfilter")?
-                .map(|v| Pattern::new(&v).map_err(error))
+                .map(|v| super::glob::pattern(&v))
                 .transpose()?,
             specified: values.keys().cloned().collect(),
         })
@@ -186,7 +202,7 @@ impl Options {
         for name in &self.specified {
             let valid = match name.as_str() {
                 "header" | "sep" | "quote" | "escape" | "nullvalue" => format == Format::Csv,
-                "multiline" => matches!(format, Format::Csv | Format::Json),
+                "multiline" | "mode" => matches!(format, Format::Csv | Format::Json),
                 "wholetext" | "linesep" => format == Format::Text,
                 "schema" => !matches!(format, Format::Text | Format::Binary),
                 _ => true,
