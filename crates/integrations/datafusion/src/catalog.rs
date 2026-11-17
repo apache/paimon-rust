@@ -1103,7 +1103,11 @@ impl PaimonSchemaProvider {
                         identifier.database(),
                     )
                     .await?;
-                    let plan = state.create_logical_plan(&query).await?;
+                    let plan = crate::read_files::sql(
+                        &datafusion::prelude::SessionContext::new_with_state(state),
+                        &query,
+                        datafusion::execution::context::SQLOptions::new(),
+                    ).await?.into_unoptimized_plan();
                     let plan = enforce_view_schema(plan, &view)?;
                     Ok(Some(Arc::new(datafusion::datasource::ViewTable::new(
                         plan,
