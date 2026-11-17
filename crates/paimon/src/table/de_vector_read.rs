@@ -77,6 +77,7 @@ use multi_vector::{ListScorer, ListScoring};
 
 /// Owns the queries and executes the snapshot-scoped plan from `DeVectorScan`.
 pub(super) struct DeVectorRead {
+    row_range: Option<RowRange>,
     vector_searches: Vec<VectorSearch>,
     max_sim: bool,
 }
@@ -110,11 +111,24 @@ impl DeVectorRead {
         Ok(Self {
             vector_searches,
             max_sim: false,
+            row_range: None,
         })
     }
 
     pub(super) fn with_max_sim(mut self) -> Self {
         self.max_sim = true;
+        self
+    }
+
+    pub(super) fn with_row_range(mut self, range: Option<RowRange>) -> Self {
+        self.row_range = range;
+        self
+    }
+
+    pub(super) fn with_expected_distance_metric(mut self, metric: Option<&str>) -> Self {
+        for search in &mut self.vector_searches {
+            search.expected_distance_metric = metric.map(str::to_string);
+        }
         self
     }
 
@@ -281,6 +295,7 @@ impl DeVectorRead {
                     schema_fields: pinned_table.schema().fields(),
                     next_row_id,
                     filter: filter.as_ref(),
+                    row_range: self.row_range.as_ref(),
                 },
                 &index_entries,
                 &vector_searches,
@@ -751,6 +766,7 @@ pub(super) struct VectorSearchEvaluation<'a> {
     pub(super) schema_fields: &'a [DataField],
     pub(super) next_row_id: Option<i64>,
     pub(super) filter: Option<&'a Predicate>,
+    pub(super) row_range: Option<&'a RowRange>,
 }
 
 #[derive(Default)]
@@ -974,6 +990,7 @@ async fn evaluate_batch_vector_search_with_executor(
     scalar_prefilter_ranges: &[RowRange],
     max_sim: bool,
 ) -> crate::Result<Vec<ScoredRowIds>> {
+    let row_range = evaluation.row_range;
     let timing_enabled = vector_search_timing_enabled();
     let total_start = timing_enabled.then(Instant::now);
     if vector_searches.is_empty() {
@@ -1033,10 +1050,12 @@ async fn evaluate_batch_vector_search_with_executor(
         .filter(|e| {
             e.kind == FileKind::Add
                 && is_vindex_index_type(&e.index_file.index_type)
-                && e.index_file
-                    .global_index_meta
-                    .as_ref()
-                    .is_some_and(|m| m.index_field_id == field_id)
+                && e.index_file.global_index_meta.as_ref().is_some_and(|m| {
+                    m.index_field_id == field_id
+                        && row_range.is_none_or(|r| {
+                            r.overlaps_inclusive(m.row_range_start, m.row_range_end)
+                        })
+                })
         })
         .collect();
 
@@ -1356,6 +1375,28 @@ async fn evaluate_batch_vector_search_with_executor(
                             .map(&restrict_to_live)
                             .or_else(|| live_rows.clone()),
                     };
+                    // Work in local index coordinates. A range covering the whole shard
+                    // needs no bitmap, even when its upper bound is i64::MAX.
+                    let local = if let Some(range) = row_range
+                        .filter(|r| r.from() > meta.row_range_start || r.to() < meta.row_range_end)
+                    {
+                        let from =
+                            (range.from().max(meta.row_range_start) - meta.row_range_start) as u64;
+                        let to = (range.to().min(meta.row_range_end) - meta.row_range_start) as u64;
+                        let scoped = if let Some(local) = local {
+                            let mut bitmap = (*local).clone();
+                            bitmap.remove_range(..from);
+                            bitmap.remove_range(to + 1..);
+                            bitmap
+                        } else {
+                            let mut bitmap = RoaringTreemap::new();
+                            bitmap.insert_range(from..=to);
+                            bitmap
+                        };
+                        Some(Arc::new(scoped))
+                    } else {
+                        local
+                    };
                     if let Some(local) = local {
                         search.set_shared_include_row_ids(local);
                     }
@@ -1424,10 +1465,7 @@ async fn evaluate_batch_vector_search_with_executor(
                 {
                     let result: VectorTaskScores = serde_json::from_value(value)
                         .map_err(|error| crate::table::search_task::invalid(error.to_string()))?;
-                    if let Some(metric) = result.metric {
-                        metric_check.check(file, metric)?;
-                    }
-                    let rows = result.restore()?;
+                    let rows = result.restore_index_scores(file, &metric_check, vector_searches)?;
                     if rows.len() != vector_searches.len() {
                         return Err(crate::table::search_task::invalid(
                             "Vector index task returned wrong query count",
@@ -1565,6 +1603,12 @@ async fn evaluate_batch_vector_search_with_executor(
             }
             ranges
         };
+        if let Some(range) = row_range {
+            raw_ranges = raw_ranges
+                .iter()
+                .filter_map(|r| r.intersect_inclusive(range.from(), range.to()))
+                .collect();
+        }
         raw_ranges = merge_row_ranges(raw_ranges);
         if !scalar_prefilter_ranges.is_empty() && !bitmap_ranges.is_empty() {
             let covered = intersect_sorted_ranges(scalar_prefilter_ranges, &bitmap_ranges);
@@ -2222,6 +2266,14 @@ enum RawVectorMetric {
 }
 
 impl RawVectorMetric {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::L2 => "l2",
+            Self::Cosine => "cosine",
+            Self::InnerProduct => "inner_product",
+        }
+    }
+
     fn parse(value: &str) -> crate::Result<Self> {
         Self::parse_normalized(&normalize_metric(value)).ok_or_else(|| crate::Error::DataInvalid {
             message: format!("Unknown vector search metric: {value}"),
@@ -2294,6 +2346,7 @@ async fn resolve_raw_vector_metric(
         schema_fields: &[],
         next_row_id: None,
         filter: None,
+        row_range: None,
     };
     resolve_raw_vector_metric_resolved(
         evaluation,
@@ -2552,6 +2605,9 @@ async fn read_raw_vector_scores(
     let result_count = list_scoring.map_or(vector_searches.len(), |mode| {
         mode.result_count(vector_searches.len())
     });
+    for search in vector_searches {
+        search.ensure_distance_metric(metric.as_str())?;
+    }
     let timing_enabled = vector_search_timing_enabled();
     let total_start = timing_enabled.then(Instant::now);
     if vector_searches.is_empty() {
@@ -3646,6 +3702,8 @@ struct TaskVectorSearch {
     limit: usize,
     field: String,
     options: HashMap<String, String>,
+    #[serde(default)]
+    expected_distance_metric: Option<String>,
     include: Option<usize>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -3682,6 +3740,7 @@ impl TaskVectorQueries {
                     limit: search.limit,
                     field: search.field_name.clone(),
                     options: search.options.clone(),
+                    expected_distance_metric: search.expected_distance_metric.clone(),
                     include,
                 })
             })
@@ -3712,6 +3771,7 @@ impl TaskVectorQueries {
                     query.field.clone(),
                 )?
                 .with_options(query.options.clone());
+                search.expected_distance_metric = query.expected_distance_metric.clone();
                 if let Some(index) = query.include {
                     let shared = filters.get(index).ok_or_else(|| {
                         crate::table::search_task::invalid(
@@ -3781,6 +3841,29 @@ impl VectorTaskScores {
                 .collect(),
         }
     }
+    fn restore_index_scores(
+        self,
+        file: &str,
+        metrics: &VectorMetricCheck,
+        searches: &[VectorSearch],
+    ) -> crate::Result<Vec<ScoredRowIds>> {
+        if let Some(metric) = self.metric {
+            for search in searches {
+                search.ensure_distance_metric(metric.as_str())?;
+            }
+            metrics.check(file, metric)?;
+        } else if searches
+            .iter()
+            .any(|search| search.expected_distance_metric.is_some())
+            && self.results.iter().any(|result| !result.row_ids.is_empty())
+        {
+            return Err(crate::table::search_task::invalid(
+                "Cannot validate scored index results without a persisted metric",
+            ));
+        }
+        self.restore()
+    }
+
     fn restore(self) -> crate::Result<Vec<ScoredRowIds>> {
         self.results
             .into_iter()
@@ -3840,6 +3923,7 @@ pub(super) async fn execute_search_task(
                 schema_fields: table.schema().fields(),
                 next_row_id: None,
                 filter: None,
+                row_range: None,
             };
             let core = CoreOptions::new(table.schema().options());
             let (parallelism, range_concurrency) =

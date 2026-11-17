@@ -90,6 +90,7 @@ impl Table {
             schema_fields: table.schema().fields(),
             next_row_id: Some(next_row_id),
             filter: Some(&filter),
+            row_range: None,
         };
         let mut leaves = Vec::new();
         crate::arrow::residual::collect_predicate_leaf_refs(&filter, &mut leaves);

@@ -61,6 +61,7 @@ fn eval_context<'a>(
         schema_fields: fields,
         next_row_id,
         filter: None,
+        row_range: None,
     }
 }
 
@@ -246,6 +247,7 @@ fn scheduled_vector_transport_restores_one_shared_raw_filter_per_bitmap() {
         .collect::<Vec<_>>();
     for search in &mut searches {
         search.set_shared_include_row_ids(Arc::clone(&shared));
+        search.expected_distance_metric = Some("l2".into());
         search.options = HashMap::from([
             (
                 "global-index.diskann.index-columns".into(),
@@ -264,6 +266,7 @@ fn scheduled_vector_transport_restores_one_shared_raw_filter_per_bitmap() {
     assert!(restored.iter().all(
         |search| search.options["global-index.diskann.index-columns"] == "embedding"
             && search.options["opaque.parameter"] == "unchanged"
+            && search.expected_distance_metric.as_deref() == Some("l2")
     ));
     let restored_shared = shared_batch_include_row_ids(&restored).unwrap();
     assert_eq!(restored_shared.as_ref(), shared.as_ref());
@@ -884,6 +887,51 @@ fn test_configured_raw_vector_metric_precedence_and_conflict_default() {
     assert_eq!(
         configured_raw_vector_metric_override(&options, "embedding").unwrap(),
         None
+    );
+}
+
+#[test]
+fn coordinator_validates_persisted_metric_even_if_worker_ignored_expectation() {
+    let search = VectorSearch::new(vec![1.0], 1, "embedding".into())
+        .unwrap()
+        .with_expected_distance_metric("Inner-Product".into());
+    let metrics = VectorMetricCheck {
+        state: Default::default(),
+        requested: None,
+    };
+    for (metric, accepted) in [
+        (Some(RawVectorMetric::L2), false),
+        (None, false),
+        (Some(RawVectorMetric::InnerProduct), true),
+    ] {
+        let reply = VectorTaskScores::capture(vec![ScoredRowIds::new(vec![1], vec![0.5])], metric);
+        assert_eq!(
+            reply
+                .restore_index_scores("index", &metrics, std::slice::from_ref(&search))
+                .is_ok(),
+            accepted
+        );
+    }
+}
+
+#[tokio::test]
+async fn raw_search_rejects_mismatched_expected_metric() {
+    let table = de_vector_table().await;
+    let search = VectorSearch::new(vec![1.0, 0.0], 3, "embedding".into())
+        .unwrap()
+        .with_expected_distance_metric("cosine".into());
+    let result = read_raw_batch_vector_search_with_executor(
+        &table,
+        &[search],
+        &[RowRange::new(0, 3)],
+        RawVectorMetric::L2,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(crate::Error::DataInvalid { message, .. })
+        if message.contains("metric mismatch"))
     );
 }
 
@@ -2089,6 +2137,7 @@ async fn filtered_rerank_rejects_metric_from_a_skipped_shard() {
         schema_fields: table.schema().fields(),
         next_row_id: snapshot.next_row_id(),
         filter: None,
+        row_range: None,
     };
     let error = evaluate_vector_search(evaluation, &entries, &query)
         .await

@@ -95,23 +95,29 @@ enum VectorReadKind {
 impl BatchVectorRead {
     pub(super) fn new(
         table: &Table,
-        column: &str,
         queries: &[&[f32]],
         limit: usize,
         options: &HashMap<String, String>,
         filter: Option<&Predicate>,
+        expected_distance_metric: Option<&str>,
         context: PlanContext,
     ) -> crate::Result<Self> {
+        let column = context.column.as_str();
         let core = CoreOptions::new(table.schema().options());
         let reader = if targets_primary_key_column(table, column) {
             let pk_col = core.single_vector_index_column()?;
             PkVectorSearchParams::validate_inputs(table, filter, &pk_col, queries, limit)?;
-            VectorReadKind::PrimaryKey(Box::new(PkVectorRead::new(
-                table, options, filter, &pk_col, queries, limit,
-            )))
+            VectorReadKind::PrimaryKey(Box::new(
+                PkVectorRead::new(table, options, filter, &pk_col, queries, limit)
+                    .with_expected_distance_metric(expected_distance_metric),
+            ))
         } else {
             validate_list_queries(table, column, queries, false)?;
-            VectorReadKind::DataEvolution(DeVectorRead::new(column, queries, limit, options)?)
+            VectorReadKind::DataEvolution(
+                DeVectorRead::new(column, queries, limit, options)?
+                    .with_row_range(context.row_range.clone())
+                    .with_expected_distance_metric(expected_distance_metric),
+            )
         };
         Ok(Self {
             context,
@@ -126,10 +132,14 @@ impl BatchVectorRead {
         queries: &[&[f32]],
         limit: usize,
         options: &HashMap<String, String>,
+        expected_distance_metric: Option<&str>,
         context: PlanContext,
     ) -> crate::Result<Self> {
         validate_list_queries(table, column, queries, true)?;
-        let reader = DeVectorRead::new(column, queries, limit, options)?.with_max_sim();
+        let reader = DeVectorRead::new(column, queries, limit, options)?
+            .with_row_range(context.row_range.clone())
+            .with_max_sim()
+            .with_expected_distance_metric(expected_distance_metric);
         Ok(Self {
             context,
             table: table.clone(),

@@ -510,6 +510,12 @@ fn prepare_search_with_shared_filter(
         merged_options.extend(vector_search.options.clone());
         &merged_options
     };
+    let metric_name = match metadata.metric {
+        MetricType::L2 => "l2",
+        MetricType::Cosine => "cosine",
+        MetricType::InnerProduct => "inner_product",
+    };
+    vector_search.ensure_distance_metric(metric_name)?;
     if vector_search.vector.len() != metadata.dimension {
         return Err(crate::Error::DataInvalid {
             message: format!(
