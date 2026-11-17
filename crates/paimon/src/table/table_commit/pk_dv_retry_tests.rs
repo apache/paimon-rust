@@ -90,6 +90,25 @@ mod pk_dv_retry {
         .unwrap()
     }
 
+    async fn count_rows(table: &Table, id: i32) -> usize {
+        let mut read = table.new_read_builder();
+        read.with_filter(
+            crate::spec::PredicateBuilder::new(table.schema().fields())
+                .equal("id", Datum::Int(id))
+                .unwrap(),
+        );
+        let plan = read.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = read
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
     async fn replace_vectors(table: &Table, masks: &[(&str, &[u32])]) {
         let mut message = CommitMessage::new(EMPTY_SERIALIZED_ROW.to_vec(), 0, vec![]);
         message.deleted_index_files = vectors(table).await.1;
@@ -292,6 +311,133 @@ mod pk_dv_retry {
         check_compact_publications(&[FirstPublication::Replay { legacy: false }]).await;
     }
 
+    #[tokio::test]
+    async fn rest_compact_conflict_cleans_unpublished_dv_without_snapshot_file() {
+        use crate::api::rest_api::RESTApi;
+        use axum::{
+            body::Bytes,
+            http::{Method, Uri},
+            Json, Router,
+        };
+        use std::sync::Mutex;
+
+        let (table, anchor, _) = fixture().await;
+        write(&table, vec![42], 0).await;
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        let result = builder
+            .new_executor()
+            .unwrap()
+            .execute(&plan.tasks()[0])
+            .await
+            .unwrap();
+        let current = Arc::new(Mutex::new(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap(),
+        ));
+        let submitted = Arc::new(Mutex::new(Vec::<Snapshot>::new()));
+        let app = Router::new().fallback({
+            let current = current.clone();
+            let submitted = submitted.clone();
+            let table = table.clone();
+            move |method: Method, uri: Uri, body: Bytes| {
+                let current = current.clone();
+                let submitted = submitted.clone();
+                let table = table.clone();
+                async move {
+                    let response = if method == Method::POST && uri.path().ends_with("/commit") {
+                        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let next: Snapshot = serde_json::from_value(request["snapshot"].clone()).unwrap();
+                        assert_eq!(next.id(), current.lock().unwrap().id() + 1);
+                        let first = {
+                            let mut submitted = submitted.lock().unwrap();
+                            submitted.push(next.clone());
+                            submitted.len() == 1
+                        };
+                        if first {
+                            write(&table, vec![4000], 0).await;
+                            let manager = table.snapshot_manager();
+                            let winner = manager.get_latest_snapshot().await.unwrap().unwrap();
+                            assert_eq!(winner.id(), next.id());
+                            // The catalog keeps the snapshot; clients only need its manifests.
+                            manager.delete_snapshot(winner.id()).await.unwrap();
+                            *current.lock().unwrap() = winner;
+                        } else {
+                            *current.lock().unwrap() = next;
+                        }
+                        serde_json::json!({"success": !first})
+                    } else if uri.path().ends_with("/snapshot") {
+                        serde_json::json!({"snapshot": {"snapshot": *current.lock().unwrap(), "recordCount": 0}})
+                    } else {
+                        serde_json::json!({"schemaId": table.schema().id()})
+                    };
+                    Json(response)
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut options = crate::Options::new();
+        options.set("uri", format!("http://{}", listener.local_addr().unwrap()));
+        options.set("prefix", "test");
+        options.set("token.provider", "bear");
+        options.set("token", "test-token");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let env = crate::table::RESTEnv::new(
+            table.identifier().clone(),
+            "uuid".into(),
+            Arc::new(RESTApi::new(options.clone(), false).await.unwrap()),
+            options.clone(),
+            false,
+            None,
+            crate::io::FileIOCacheContext::from_props(options.to_map()).unwrap(),
+        );
+        let rest = Table::new(
+            table.file_io().clone(),
+            table.identifier().clone(),
+            table.location().into(),
+            table.schema().clone(),
+            Some(env),
+        );
+        let mut commit = TableCommit::new(rest.clone(), "rest-compactor".into());
+        commit.commit_min_retry_wait_ms = 0;
+        commit.commit_max_retry_wait_ms = 0;
+        let metrics = commit.commit_compact(vec![result.clone()]).await.unwrap();
+        let attempts = submitted.lock().unwrap().clone();
+        assert_eq!(attempts.len(), 2);
+        let first_paths = dv_paths(&rest, &attempts[0]).await;
+        let published_paths = dv_paths(&rest, &attempts[1]).await;
+        assert_eq!(first_paths.len(), 1);
+        assert!(!published_paths.contains(&first_paths[0]));
+        assert!(!rest.file_io().exists(&first_paths[0]).await.unwrap());
+        for path in &published_paths {
+            assert!(rest.file_io().exists(path).await.unwrap());
+        }
+        for snapshot in &attempts {
+            assert!(!rest
+                .file_io()
+                .exists(&rest.snapshot_manager().snapshot_path(snapshot.id()))
+                .await
+                .unwrap());
+        }
+        assert_eq!(
+            vectors(&rest).await.0[&anchor],
+            [42, 500].into_iter().collect()
+        );
+        let readable = rest.copy_with_options(HashMap::from([(
+            "deletion-vectors.merge-on-read".into(),
+            "true".into(),
+        )]));
+        assert_eq!(count_rows(&readable, 4000).await, 1);
+        assert_eq!(count_rows(&readable, 42).await, 1);
+        assert_eq!(commit.commit_compact(vec![result]).await.unwrap(), metrics);
+        assert_eq!(submitted.lock().unwrap().len(), 2);
+        server.abort();
+    }
+
     #[cfg(feature = "storage-fs")]
     struct ReplayAfterRollback {
         table: Table,
@@ -380,23 +526,8 @@ mod pk_dv_retry {
         assert!(!fresh.file_io().has_local_cache());
         for (reader, name) in [(&fresh, "fresh"), (&cached, "committing")] {
             for (id, expected_rows) in [(4000, 0), (2001, 1)] {
-                let mut read = reader.new_read_builder();
-                read.with_filter(
-                    crate::spec::PredicateBuilder::new(reader.schema().fields())
-                        .equal("id", Datum::Int(id))
-                        .unwrap(),
-                );
-                let plan = read.new_scan().plan().await.unwrap();
-                let batches: Vec<RecordBatch> = read
-                    .new_read()
-                    .unwrap()
-                    .to_arrow(plan.splits())
-                    .unwrap()
-                    .try_collect()
-                    .await
-                    .unwrap();
                 assert_eq!(
-                    batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    count_rows(reader, id).await,
                     expected_rows,
                     "{name} reader, id={id}",
                 );

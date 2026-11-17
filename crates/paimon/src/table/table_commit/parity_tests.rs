@@ -1183,6 +1183,7 @@ async fn rest_commit_uses_catalog_snapshot_schema_and_retry_identity() {
     let mut commit = TableCommit::new(table, "rest-writer".into());
     commit.commit_min_retry_wait_ms = 0;
     commit.commit_max_retry_wait_ms = 0;
+    commit.commit_max_retries = 0;
     let messages = vec![append_message("new")];
     commit
         .commit_if_latest_snapshot_with_identifier(messages.clone(), 7, 42)
