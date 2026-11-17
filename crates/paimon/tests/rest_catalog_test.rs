@@ -2532,6 +2532,76 @@ async fn test_catalog_create_function() {
 }
 
 #[tokio::test]
+async fn test_catalog_drop_function() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "answer");
+    let function = Function::new(
+        identifier.clone(),
+        None,
+        None,
+        true,
+        HashMap::new(),
+        None,
+        HashMap::new(),
+    );
+    ctx.catalog.create_function(&function, false).await.unwrap();
+
+    ctx.catalog.drop_function(&identifier, false).await.unwrap();
+
+    assert!(ctx
+        .catalog
+        .list_functions("default")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        ctx.catalog.get_function(&identifier).await.unwrap_err(),
+        paimon::Error::FunctionNotExist { full_name } if full_name == "default.answer"
+    ));
+    assert!(matches!(
+        ctx.catalog.drop_function(&identifier, false).await.unwrap_err(),
+        paimon::Error::FunctionNotExist { full_name } if full_name == "default.answer"
+    ));
+    ctx.catalog.drop_function(&identifier, true).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_catalog_drop_function_if_exists_preserves_other_errors() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "answer");
+    for status in [
+        StatusCode::FORBIDDEN,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::NOT_IMPLEMENTED,
+    ] {
+        ctx.server.set_drop_function_error_status(Some(status));
+        let error = ctx
+            .catalog
+            .drop_function(&identifier, true)
+            .await
+            .unwrap_err();
+        match status {
+            StatusCode::FORBIDDEN => assert!(matches!(
+                error,
+                paimon::Error::RestApi {
+                    source: paimon::api::RestError::Forbidden { .. }
+                }
+            )),
+            StatusCode::INTERNAL_SERVER_ERROR => assert!(matches!(
+                error,
+                paimon::Error::RestApi {
+                    source: paimon::api::RestError::ServiceFailure { .. }
+                }
+            )),
+            StatusCode::NOT_IMPLEMENTED => {
+                assert!(matches!(error, paimon::Error::Unsupported { .. }))
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_catalog_create_function_already_exists() {
     let ctx = setup_catalog(vec!["default"]).await;
     let function = Function::new(

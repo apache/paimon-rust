@@ -41,6 +41,7 @@
 //! - `CREATE VIEW [IF NOT EXISTS] view [(col, ...)] AS query`
 //! - `DROP VIEW [IF EXISTS] view`
 //! - `CREATE FUNCTION name(args) RETURNS type [LANGUAGE SQL] RETURN expression`
+//! - `DROP FUNCTION [IF EXISTS] name`
 //! - `TRUNCATE TABLE db.t`
 //! - `TRUNCATE TABLE db.t PARTITION (col = val, ...)`
 
@@ -740,6 +741,49 @@ impl SQLContext {
                 } else {
                     self.ctx.sql_with_options(sql, options).await
                 }
+            }
+            Statement::DropFunction(drop_function)
+                if drop_function
+                    .func_desc
+                    .iter()
+                    .any(|function| self.is_paimon_function_name(&function.name)) =>
+            {
+                // sqlparser consumes TEMPORARY without retaining it in the function AST.
+                let temporary = {
+                    let mut parser = Parser::new(&GenericDialect {})
+                        .try_with_sql(&rewritten_sql)
+                        .map_err(|error| {
+                            DataFusionError::Plan(format!("SQL parse error: {error}"))
+                        })?;
+                    while parser.consume_token(&Token::SemiColon) {}
+                    parser.parse_keywords(&[Keyword::DROP, Keyword::TEMPORARY, Keyword::FUNCTION])
+                };
+                if temporary {
+                    return Err(DataFusionError::NotImplemented(
+                        "DROP TEMPORARY FUNCTION is not supported for Paimon catalogs".to_string(),
+                    ));
+                }
+                let [function] = drop_function.func_desc.as_slice() else {
+                    return Err(DataFusionError::Plan(
+                        "Persistent DROP FUNCTION does not support multiple functions".to_string(),
+                    ));
+                };
+                if let Some(behavior) = &drop_function.drop_behavior {
+                    return Err(DataFusionError::Plan(format!(
+                        "DROP FUNCTION {behavior} is not supported"
+                    )));
+                }
+                if function.args.is_some() {
+                    return Err(DataFusionError::Plan(
+                        "DROP FUNCTION argument signatures are not supported".to_string(),
+                    ));
+                }
+                let (catalog, _, identifier) = self.resolve_catalog_and_function(&function.name)?;
+                catalog
+                    .drop_function(&identifier, drop_function.if_exists)
+                    .await
+                    .map_err(to_datafusion_error)?;
+                ok_result(&self.ctx)
             }
             Statement::Drop {
                 object_type: ObjectType::Database,
@@ -4388,6 +4432,14 @@ mod tests {
     use paimon::table::Table;
 
     #[test]
+    fn test_sql_context_sql_future_is_send() {
+        fn assert_send(_: impl Send) {}
+        let ctx = SQLContext::new();
+        assert_send(ctx.sql("DROP FUNCTION db.fn"));
+        assert_send(ctx.sql_with_options("DROP FUNCTION db.fn", SQLOptions::new()));
+    }
+
+    #[test]
     fn test_sql_context_builder_uses_custom_runtime_env() {
         let runtime_env = RuntimeEnvBuilder::new()
             .with_memory_pool(Arc::new(FairSpillPool::new(1024)))
@@ -4582,6 +4634,20 @@ mod tests {
             }
             functions.insert(function.identifier().clone(), function.clone());
             Ok(())
+        }
+
+        async fn drop_function(
+            &self,
+            identifier: &Identifier,
+            ignore_if_not_exists: bool,
+        ) -> paimon::Result<()> {
+            if self.functions.lock().unwrap().remove(identifier).is_some() || ignore_if_not_exists {
+                Ok(())
+            } else {
+                Err(paimon::Error::FunctionNotExist {
+                    full_name: identifier.full_name(),
+                })
+            }
         }
 
         async fn get_function(
@@ -5098,6 +5164,165 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_resolves_supported_name_forms() {
+        let catalog = Arc::new(MockCatalog::new());
+        let other_catalog = Arc::new(MockCatalog::new());
+        let mut ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.register_catalog("other", other_catalog.clone())
+            .await
+            .unwrap();
+        ctx.set_current_database("session_db").await.unwrap();
+        for (sql, target, database, name) in [
+            ("DROP FUNCTION BARE", &catalog, "session_db", "bare"),
+            (
+                "DROP FUNCTION IF EXISTS DB.QUALIFIED",
+                &catalog,
+                "db",
+                "qualified",
+            ),
+            ("DROP FUNCTION OTHER.DB.FULL", &other_catalog, "db", "full"),
+            (
+                "DROP FUNCTION \"other\".\"Db\".\"Fn\"",
+                &other_catalog,
+                "Db",
+                "Fn",
+            ),
+            ("DROP FUNCTION \"Db\".\"Fn\"", &catalog, "Db", "Fn"),
+            (
+                "DROP FUNCTION \"TEMPORARY\"",
+                &catalog,
+                "session_db",
+                "TEMPORARY",
+            ),
+            (
+                "; /* empty */ ; DROP FUNCTION db.\"quoted.fn\";",
+                &catalog,
+                "db",
+                "quoted.fn",
+            ),
+        ] {
+            add_unary_sql_function_in_database(target, database, name, "x + 1", true);
+            ctx.sql(sql).await.unwrap();
+            assert!(target.function_lookups.lock().unwrap().is_empty());
+            assert!(matches!(
+                target.get_function(&Identifier::new(database, name)).await,
+                Err(paimon::Error::FunctionNotExist { .. })
+            ));
+            target.function_lookups.lock().unwrap().clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_honors_if_exists() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog).await;
+
+        let error = ctx.sql("DROP FUNCTION db.missing").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Function db.missing does not exist"),
+            "{error}"
+        );
+        ctx.sql("DROP FUNCTION IF EXISTS db.missing").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_rejects_unsupported_forms_before_deleting() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "kept", "x + 1", true);
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        for (sql, expected) in [
+            ("DROP FUNCTION kept CASCADE", "CASCADE"),
+            ("DROP FUNCTION kept RESTRICT", "RESTRICT"),
+            ("DROP FUNCTION kept()", "signatures"),
+            ("DROP FUNCTION kept(BIGINT)", "signatures"),
+            ("DROP FUNCTION kept; SELECT 1", "exactly one SQL statement"),
+            (
+                "DROP FUNCTION datafusion.public.other, paimon.default.kept",
+                "multiple functions",
+            ),
+        ] {
+            let error = ctx.sql(sql).await.unwrap_err();
+            assert!(error.to_string().contains(expected), "{sql}: {error}");
+            assert!(catalog
+                .functions
+                .lock()
+                .unwrap()
+                .contains_key(&Identifier::new("default", "kept")));
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_preserves_local_function_with_same_name() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "abs", "x + 1", true);
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.sql("DROP FUNCTION abs").await.unwrap();
+        assert!(catalog.functions.lock().unwrap().is_empty());
+        ctx.sql("DROP FUNCTION IF EXISTS abs").await.unwrap();
+        assert!(ctx.ctx.state().scalar_functions().contains_key("abs"));
+        ctx.sql("SELECT abs(-1)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_rejects_temporary_before_deleting() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "abs", "x + 1", true);
+        add_unary_sql_function_in_database(&catalog, "db", "kept", "x + 1", true);
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        for sql in [
+            "DROP TEMPORARY FUNCTION abs",
+            "-- leading comment\nDROP /* modifier */ TEMPORARY FUNCTION IF EXISTS db.kept",
+            "; /* empty statements */ ; dRoP TeMpOrArY FuNcTiOn IF EXISTS db.kept;",
+        ] {
+            let error = ctx
+                .sql(sql)
+                .await
+                .expect_err("temporary function drop must be rejected");
+            assert!(
+                error.to_string().contains("DROP TEMPORARY FUNCTION"),
+                "{error}"
+            );
+            assert_eq!(catalog.functions.lock().unwrap().len(), 2);
+            assert!(ctx.ctx.state().scalar_functions().contains_key("abs"));
+        }
+    }
+
+    #[tokio::test]
+    async fn function_drop_delegates_without_paimon_catalog() {
+        for sql in ["DROP FUNCTION abs", "DROP TEMPORARY FUNCTION abs"] {
+            let ctx = SQLContext::new();
+            assert!(ctx.ctx.state().scalar_functions().contains_key("abs"));
+            ctx.sql(sql).await.unwrap();
+            assert!(!ctx.ctx.state().scalar_functions().contains_key("abs"));
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_preserves_unsupported_catalog_error() {
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog_with_default_db("paimon", Arc::new(ProbeTrackingCatalog::new()), None)
+            .await
+            .unwrap();
+        let error = ctx
+            .sql("DROP FUNCTION IF EXISTS db.missing")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Catalog does not support functions"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

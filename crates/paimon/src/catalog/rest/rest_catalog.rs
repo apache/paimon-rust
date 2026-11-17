@@ -642,6 +642,21 @@ impl Catalog for RESTCatalog {
         })
     }
 
+    async fn drop_function(
+        &self,
+        identifier: &Identifier,
+        ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        let result = self
+            .api
+            .drop_function(identifier)
+            .await
+            .map_err(|error| map_rest_error_for_function(error, identifier));
+        ignore_error_if(result, |error| {
+            ignore_if_not_exists && matches!(error, Error::FunctionNotExist { .. })
+        })
+    }
+
     async fn get_function(&self, identifier: &Identifier) -> Result<crate::catalog::Function> {
         let response = self
             .api

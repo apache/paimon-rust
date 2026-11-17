@@ -94,6 +94,7 @@ struct MockState {
     list_partitions_by_filter_error_status: Option<StatusCode>,
     view_function_endpoints_unsupported: bool,
     drop_view_error_status: Option<StatusCode>,
+    drop_function_error_status: Option<StatusCode>,
     list_page_size: Option<usize>,
     no_permission_databases: HashSet<String>,
     no_permission_tables: HashSet<String>,
@@ -644,6 +645,39 @@ impl RESTServer {
         let key = format!("{db}.{function}");
         if let Some(response) = s.functions.get(&key) {
             (StatusCode::OK, Json(response.clone())).into_response()
+        } else {
+            let err = ErrorResponse::new(
+                Some("function".to_string()),
+                Some(function),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            (StatusCode::NOT_FOUND, Json(err)).into_response()
+        }
+    }
+
+    /// Handle DELETE /databases/:db/functions/:function - drop a persistent function.
+    pub async fn drop_function(
+        Path((db, function)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut s = state.inner.lock().unwrap();
+        let status = if s.view_function_endpoints_unsupported {
+            Some(StatusCode::NOT_IMPLEMENTED)
+        } else {
+            s.drop_function_error_status
+        };
+        if let Some(status) = status {
+            let err = ErrorResponse::new(
+                Some("function".to_string()),
+                Some(function),
+                status.canonical_reason().map(ToString::to_string),
+                Some(status.as_u16() as i32),
+            );
+            return (status, Json(err)).into_response();
+        }
+        if s.functions.remove(&format!("{db}.{function}")).is_some() {
+            StatusCode::NO_CONTENT.into_response()
         } else {
             let err = ErrorResponse::new(
                 Some("function".to_string()),
@@ -2193,6 +2227,11 @@ impl RESTServer {
         self.inner.lock().unwrap().drop_view_error_status = status;
     }
 
+    /// Make the drop-function endpoint return the given status.
+    pub fn set_drop_function_error_status(&self, status: Option<StatusCode>) {
+        self.inner.lock().unwrap().drop_function_error_status = status;
+    }
+
     /// Make the create-partitions endpoint return the given status.
     pub fn set_create_partitions_error_status(&self, status: Option<StatusCode>) {
         self.inner.lock().unwrap().create_partitions_error_status = status;
@@ -2862,7 +2901,7 @@ pub async fn start_mock_server(
         )
         .route(
             &format!("{prefix}/databases/:db/functions/:function"),
-            get(RESTServer::get_function),
+            get(RESTServer::get_function).delete(RESTServer::drop_function),
         )
         .route(
             &format!("{prefix}/databases/:db/tables/:table/auth"),
