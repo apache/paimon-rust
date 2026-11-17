@@ -200,10 +200,10 @@ pub(super) fn validate_global_vector_index_types(
         let file = &entry.index_file;
         if entry.kind != FileKind::Add
             || !is_vindex_index_type(&file.index_type)
-            || !file
+            || file
                 .global_index_meta
                 .as_ref()
-                .is_some_and(|meta| meta.index_field_id == field_id)
+                .is_none_or(|meta| meta.index_field_id != field_id)
         {
             continue;
         }
