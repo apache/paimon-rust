@@ -33,8 +33,6 @@ async fn context(files: &[(&str, &[u8])]) -> SQLContext {
     ctx.ctx()
         .runtime_env()
         .register_object_store(&url::Url::parse("memory://files").unwrap(), store);
-    ctx.register_read_files_location("memory://files/allowed")
-        .unwrap();
     ctx
 }
 
@@ -70,6 +68,44 @@ async fn fails(ctx: &SQLContext, sql: &str, expected: &str) {
 
 fn text(value: &str) -> ScalarValue {
     ScalarValue::Utf8(Some(value.to_string()))
+}
+
+#[tokio::test]
+async fn csv_rejects_unterminated_fields_at_eof_without_reading_past_limit() {
+    let ctx = context(&[
+        ("allowed/single.csv", b"id,name\n1,\"broken"),
+        ("allowed/multi.csv", b"id,name\n1,\"broken\n2,valid\n"),
+        ("allowed/escape.csv", b"id,name\n1,\"broken\\"),
+        ("allowed/tail.csv", b"id,name\n1,valid\n2,\"broken"),
+        ("allowed/valid.csv", b"id,name\n1,\"closed\""),
+    ])
+    .await;
+    for explicit_schema in [false, true] {
+        let schema = if explicit_schema {
+            ", schema => 'id BIGINT, name STRING', header => true"
+        } else {
+            ""
+        };
+        for (file, multi_line) in [
+            ("single.csv", false),
+            ("single.csv", true),
+            ("multi.csv", true),
+            ("escape.csv", true),
+        ] {
+            fails(&ctx, &format!("SELECT * FROM read_files('memory://files/allowed/{file}', format => 'csv', multiLine => {multi_line}{schema})"), "unterminated").await;
+        }
+    }
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT name FROM read_files('memory://files/allowed/valid.csv')"
+        )
+        .await,
+        vec![vec![text("closed")]]
+    );
+    for multi_line in [false, true] {
+        assert_eq!(rows(&ctx, &format!("SELECT id FROM read_files('memory://files/allowed/tail.csv', schema => 'id BIGINT, name STRING', header => true, multiLine => {multi_line}) LIMIT 1")).await, vec![vec![ScalarValue::Int64(Some(1))]]);
+    }
 }
 
 #[tokio::test]

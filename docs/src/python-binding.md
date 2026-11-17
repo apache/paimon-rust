@@ -123,22 +123,20 @@ on a Paimon table.
 ### Reading Files
 
 `SQLContext` also provides the Databricks-style `read_files` SQL table function.
-Register an authorized directory before reading it:
+It is available immediately, without a separate directory registration:
 
 ```python
-ctx.register_read_files_location("/path/to/imports")
 batches = ctx.sql("SELECT value FROM read_files('/path/to/imports/log.txt', format => 'text')")
-
-# For OSS/cloud storage, supply storage options explicitly.
-ctx.register_read_files_location("oss://my-bucket/imports/", storage_options)
 batches = ctx.sql("SELECT * FROM read_files('oss://my-bucket/imports/*.parquet')")
 ```
 
 The supported formats are CSV, Parquet, JSON/NDJSON, TEXT and `binaryFile`.
-Catalog credentials are not inherited. Registrations are local to the SQLContext
-and do not replace stores in a shared RuntimeEnv. HTTP/HTTPS file URLs and
-unregistered local directories are rejected. See [Reading files](sql.md#reading-files-with-read_files)
-for named options, metadata and compatibility limits.
+Matching Catalog/table FileIO instances are reused through the same session
+registry as blob reads. Other paths use a configured DataFusion object store or
+Paimon's default FileIO. Storage and local process permissions apply; raw file
+reads do not perform catalog table permission checks. HTTP/HTTPS file URLs are
+unsupported. See [Reading files](sql.md#reading-files-with-read_files) for named
+options, metadata and compatibility limits.
 
 ### Runtime Resource Configuration
 

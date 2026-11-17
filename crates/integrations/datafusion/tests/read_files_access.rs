@@ -18,11 +18,45 @@
 use datafusion::arrow::array::{Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::ScalarValue;
-use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::object_store::ObjectStoreRegistry;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::object_store::{memory::InMemory, path::Path, ObjectStoreExt};
 use paimon::io::{FileIO, FileIOBuilder};
 use paimon_datafusion::SQLContext;
 use std::sync::Arc;
+
+#[derive(Debug, Default)]
+struct ContainerStores(
+    std::sync::RwLock<
+        std::collections::HashMap<String, Arc<dyn datafusion::object_store::ObjectStore>>,
+    >,
+);
+
+impl ObjectStoreRegistry for ContainerStores {
+    fn register_store(
+        &self,
+        url: &url::Url,
+        store: Arc<dyn datafusion::object_store::ObjectStore>,
+    ) -> Option<Arc<dyn datafusion::object_store::ObjectStore>> {
+        self.0
+            .write()
+            .unwrap()
+            .insert(url[..url::Position::BeforePath].to_string(), store)
+    }
+    fn get_store(
+        &self,
+        url: &url::Url,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::object_store::ObjectStore>> {
+        self.0
+            .read()
+            .unwrap()
+            .get(&url[..url::Position::BeforePath])
+            .cloned()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Plan("container not configured".to_string())
+            })
+    }
+}
 
 async fn io(value: &str) -> FileIO {
     let io = FileIOBuilder::new("memory").build().unwrap();
@@ -57,14 +91,14 @@ async fn file_io_credentials_remain_isolated_with_a_shared_runtime() {
         .with_runtime_env(runtime.clone())
         .build();
     let b = SQLContext::builder().with_runtime_env(runtime).build();
-    a.register_read_files_location_with_file_io("memory://tenant/allowed", io("TENANT_A").await)
-        .unwrap();
+    a.blob_reader_registry()
+        .register("memory://tenant/allowed", io("TENANT_A").await);
     let planned_a = a
         .sql("SELECT value FROM read_files('memory://tenant/allowed/data.csv')")
         .await
         .unwrap();
-    b.register_read_files_location_with_file_io("memory://tenant/allowed", io("TENANT_B").await)
-        .unwrap();
+    b.blob_reader_registry()
+        .register("memory://tenant/allowed", io("TENANT_B").await);
     assert_eq!(value(&a).await, "TENANT_A");
     assert_eq!(value(&b).await, "TENANT_B");
     let batches = planned_a.collect().await.unwrap();
@@ -91,8 +125,8 @@ async fn file_io_registration_preserves_the_callers_object_store() {
     ctx.ctx()
         .runtime_env()
         .register_object_store(&url, original);
-    ctx.register_read_files_location_with_file_io("memory://tenant/allowed", io("private").await)
-        .unwrap();
+    ctx.blob_reader_registry()
+        .register("memory://tenant/allowed", io("private").await);
     let store = ctx
         .ctx()
         .runtime_env()
@@ -145,8 +179,8 @@ async fn parquet_scans_keep_their_credentials_and_metadata_separate() {
             .write(bytes.into())
             .await
             .unwrap();
-        ctx.register_read_files_location_with_file_io("memory://tenant/allowed", io)
-            .unwrap();
+        ctx.blob_reader_registry()
+            .register("memory://tenant/allowed", io);
     }
     // The underlying FileIO metadata also gives both files the epoch mtime.
     // Equal sizes force a collision in an incorrectly shared metadata cache.
@@ -171,8 +205,12 @@ async fn parquet_scans_keep_their_credentials_and_metadata_separate() {
 }
 
 #[tokio::test]
-async fn registered_stores_are_captured_and_adls_container_names_are_authorized() {
-    let ctx = SQLContext::new();
+async fn planned_stores_are_captured_and_adls_containers_remain_separate() {
+    let runtime = RuntimeEnvBuilder::new()
+        .with_object_store_registry(Arc::new(ContainerStores::default()))
+        .build_arc()
+        .unwrap();
+    let ctx = SQLContext::builder().with_runtime_env(runtime).build();
     let url = url::Url::parse("abfss://allowed@account.dfs.core.windows.net/").unwrap();
     let original = Arc::new(InMemory::new());
     original
@@ -182,8 +220,7 @@ async fn registered_stores_are_captured_and_adls_container_names_are_authorized(
     ctx.ctx()
         .runtime_env()
         .register_object_store(&url, original);
-    ctx.register_read_files_location("abfss://allowed@account.dfs.core.windows.net/imports/")
-        .unwrap();
+    let planned = ctx.sql("SELECT value FROM read_files('abfss://allowed@account.dfs.core.windows.net/imports/data.txt', format => 'text')").await.unwrap();
     let replacement = Arc::new(InMemory::new());
     replacement
         .put(&Path::from("imports/data.txt"), "replacement".into())
@@ -192,7 +229,7 @@ async fn registered_stores_are_captured_and_adls_container_names_are_authorized(
     ctx.ctx()
         .runtime_env()
         .register_object_store(&url, replacement);
-    let batches = ctx.sql("SELECT value FROM read_files('abfss://allowed@account.dfs.core.windows.net/imports/data.txt', format => 'text')").await.unwrap().collect().await.unwrap();
+    let batches = planned.collect().await.unwrap();
     assert_eq!(
         ScalarValue::try_from_array(batches[0].column(0), 0)
             .unwrap()
@@ -200,7 +237,7 @@ async fn registered_stores_are_captured_and_adls_container_names_are_authorized(
             .flatten(),
         Some("original")
     );
-    assert!(ctx.sql("SELECT * FROM read_files('abfss://other@account.dfs.core.windows.net/imports/data.txt', format => 'text')").await.unwrap_err().to_string().contains("not registered"));
+    assert!(ctx.sql("SELECT * FROM read_files('abfss://other@account.dfs.core.windows.net/imports/data.txt', format => 'text')").await.is_err());
 }
 
 #[cfg(unix)]
@@ -214,8 +251,6 @@ async fn local_discovery_skips_symlink_subtrees_and_accepts_directory_aliases() 
     let alias = outside.path().join("alias");
     std::os::unix::fs::symlink(allowed.path(), &alias).unwrap();
     let ctx = SQLContext::new();
-    ctx.register_read_files_location(alias.to_str().unwrap())
-        .unwrap();
     let batches = ctx
         .sql(&format!(
             "SELECT value FROM read_files('{}/', format => 'text')",
@@ -274,8 +309,6 @@ async fn local_symlink_swaps_cannot_escape_after_planning() {
             std::fs::write(&secret, unsafe_bytes).unwrap();
         }
         let ctx = SQLContext::new();
-        ctx.register_read_files_location(allowed.path().to_str().unwrap())
-            .unwrap();
         let frame = ctx
             .sql(&format!(
                 "SELECT * FROM read_files('{}', format => '{format}')",
@@ -287,7 +320,7 @@ async fn local_symlink_swaps_cannot_escape_after_planning() {
         std::os::unix::fs::symlink(secret, &source).unwrap();
         assert!(
             frame.collect().await.is_err(),
-            "{format} followed a symlink outside the registered directory"
+            "{format} followed a symlink outside the planned directory"
         );
     }
 }
@@ -303,8 +336,6 @@ async fn local_special_files_are_rejected_without_waiting_for_a_writer() {
         .unwrap()
         .success());
     let ctx = SQLContext::new();
-    ctx.register_read_files_location(directory.path().to_str().unwrap())
-        .unwrap();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         ctx.sql(&format!(
@@ -320,5 +351,217 @@ async fn local_special_files_are_rejected_without_waiting_for_a_writer() {
         error.to_string().contains("Not a directory")
             || error.to_string().contains("not a regular file"),
         "{error}"
+    );
+}
+
+#[tokio::test]
+async fn filesystem_catalog_file_io_is_available_before_loading_any_table() {
+    let mut options = paimon::Options::new();
+    options.set("warehouse", "memory://catalog/warehouse/");
+    let catalog = Arc::new(paimon::FileSystemCatalog::new(options).unwrap());
+    catalog
+        .file_io()
+        .new_output("memory://catalog/warehouse/imports/file.txt")
+        .unwrap()
+        .write(b"catalog credentials".to_vec().into())
+        .await
+        .unwrap();
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog_with_default_db("paimon", catalog, None)
+        .await
+        .unwrap();
+    for path in [
+        "memory://catalog/warehouse/imports/file.txt",
+        "memory://catalog/warehouse/",
+        "memory://catalog/warehouse",
+    ] {
+        let batches = ctx
+            .sql(&format!(
+                "SELECT value FROM read_files('{path}', format => 'text')"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            ScalarValue::try_from_array(batches[0].column(0), 0)
+                .unwrap()
+                .try_as_str()
+                .flatten(),
+            Some("catalog credentials")
+        );
+    }
+}
+
+#[tokio::test]
+async fn normalized_paths_cannot_borrow_an_unmatched_catalog_file_io() {
+    let mut options = paimon::Options::new();
+    options.set("warehouse", "memory://catalog/warehouse");
+    let catalog = Arc::new(paimon::FileSystemCatalog::new(options).unwrap());
+    catalog
+        .file_io()
+        .new_output("memory://catalog/outside/file.txt")
+        .unwrap()
+        .write(b"catalog secret".to_vec().into())
+        .await
+        .unwrap();
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog_with_default_db("paimon", catalog, None)
+        .await
+        .unwrap();
+    let fallback = Arc::new(InMemory::new());
+    fallback
+        .put(&Path::from("outside/file.txt"), "fallback".into())
+        .await
+        .unwrap();
+    ctx.ctx()
+        .runtime_env()
+        .register_object_store(&url::Url::parse("memory://catalog").unwrap(), fallback);
+    let batches = ctx.sql("SELECT value FROM read_files('memory://catalog/warehouse/../outside/file.txt', format => 'text')").await.unwrap().collect().await.unwrap();
+    assert_eq!(
+        ScalarValue::try_from_array(batches[0].column(0), 0)
+            .unwrap()
+            .try_as_str()
+            .flatten(),
+        Some("fallback")
+    );
+}
+
+#[tokio::test]
+async fn adls_containers_cannot_silently_alias_a_host_only_store() {
+    let ctx = SQLContext::new();
+    ctx.ctx().runtime_env().register_object_store(
+        &url::Url::parse("abfss://allowed@account.dfs.core.windows.net/").unwrap(),
+        Arc::new(InMemory::new()),
+    );
+    let error = ctx.sql("SELECT value FROM read_files('abfss://other@account.dfs.core.windows.net/data.txt', format => 'text')").await.unwrap_err();
+    assert!(error.to_string().contains("container-aware"), "{error}");
+}
+
+#[tokio::test]
+async fn local_catalog_file_io_preserves_literal_file_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("space %20.txt");
+    std::fs::write(&path, "literal key").unwrap();
+    let mut options = paimon::Options::new();
+    options.set("warehouse", directory.path().to_str().unwrap());
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog_with_default_db(
+        "paimon",
+        Arc::new(paimon::FileSystemCatalog::new(options).unwrap()),
+        None,
+    )
+    .await
+    .unwrap();
+    let batches = ctx
+        .sql(&format!(
+            "SELECT value, _metadata.file_name FROM read_files('{}', format => 'text')",
+            path.display()
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        ScalarValue::try_from_array(batches[0].column(0), 0)
+            .unwrap()
+            .try_as_str()
+            .flatten(),
+        Some("literal key")
+    );
+    assert_eq!(
+        ScalarValue::try_from_array(batches[0].column(1), 0)
+            .unwrap()
+            .try_as_str()
+            .flatten(),
+        Some("space %20.txt")
+    );
+}
+
+#[tokio::test]
+async fn more_specific_file_io_wins_across_directory_and_local_uri_forms() {
+    let ctx = SQLContext::new();
+    let parent = FileIOBuilder::new("memory").build().unwrap();
+    let child = FileIOBuilder::new("memory").build().unwrap();
+    for (io, value) in [(&parent, "parent"), (&child, "child")] {
+        io.new_output("memory://routes/warehouse/data.txt")
+            .unwrap()
+            .write(value.as_bytes().to_vec().into())
+            .await
+            .unwrap();
+    }
+    ctx.blob_reader_registry()
+        .register("memory://routes", parent);
+    ctx.blob_reader_registry()
+        .register("memory://routes/warehouse/", child);
+    for path in ["memory://routes/warehouse", "memory://routes/warehouse/"] {
+        let batches = ctx
+            .sql(&format!(
+                "SELECT value FROM read_files('{path}', format => 'text')"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            ScalarValue::try_from_array(batches[0].column(0), 0)
+                .unwrap()
+                .try_as_str()
+                .flatten(),
+            Some("child")
+        );
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let directory = std::fs::canonicalize(directory.path()).unwrap();
+    let tenant = directory.join("tenant");
+    std::fs::create_dir(&tenant).unwrap();
+    let path = tenant.join("data.txt");
+    std::fs::write(&path, "parent").unwrap();
+    let mut options = paimon::Options::new();
+    options.set(
+        "warehouse",
+        url::Url::from_directory_path(&directory).unwrap().as_str(),
+    );
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog_with_default_db(
+        "paimon",
+        Arc::new(paimon::FileSystemCatalog::new(options).unwrap()),
+        None,
+    )
+    .await
+    .unwrap();
+    let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+    let child = FileIOBuilder::new("fs")
+        .with_fs_operator(operator)
+        .build()
+        .unwrap();
+    child
+        .new_output(path.to_str().unwrap())
+        .unwrap()
+        .write(b"table-specific".to_vec().into())
+        .await
+        .unwrap();
+    ctx.blob_reader_registry()
+        .register(tenant.to_str().unwrap(), child);
+    let batches = ctx
+        .sql(&format!(
+            "SELECT value FROM read_files('{}', format => 'text')",
+            path.display()
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        ScalarValue::try_from_array(batches[0].column(0), 0)
+            .unwrap()
+            .try_as_str()
+            .flatten(),
+        Some("table-specific")
     );
 }

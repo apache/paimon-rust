@@ -43,10 +43,9 @@ does not provide every Spark SQL syntax or cast mode.
 ## Reading external files
 
 `SQLContext` registers `read_files(path, format => ..., ...)` for CSV, Parquet,
-JSON/NDJSON, TEXT and binary files. The caller must first authorize directory
-prefixes with `register_read_files_location`, using the session's object stores,
-or `register_read_files_location_with_file_io` for Paimon FileIO (including OSS).
-Catalog registration does not grant arbitrary file access. See the
+JSON/NDJSON, TEXT and binary files by default. It reuses the session's Catalog
+and table FileIO routes like blob reads, then configured DataFusion object stores
+or default Paimon FileIO. Storage/process permissions apply. See the
 [SQL guide](../../../docs/src/sql.md#reading-files-with-read_files) for the
 Databricks-compatible subset, named options and metadata differences.
 

@@ -149,32 +149,25 @@ SELECT path, length FROM read_files('oss://my-bucket/imports/images/',
     format => 'binaryFile');
 ```
 
-The embedding application must authorize and register each directory prefix.
-Registration is separate from Paimon catalog credentials and table permissions.
-Remote paths use a registered DataFusion object store, or a read-only Paimon
-FileIO binding supplied through `register_read_files_location_with_file_io`:
+The function is registered by default. Local paths use the process's filesystem
+permissions; no separate directory registration is required. Like blob reads,
+matching FileIO instances are reused from the session registry: filesystem
+catalogs contribute their warehouse FileIO when registered, and loaded tables
+contribute their table-specific FileIO, including REST credential refresh and FUSE
+routing. The longest matching location wins. Other paths use a configured
+DataFusion object store or Paimon's default FileIO for that path.
 
-```rust,ignore
-use paimon::io::FileIO;
-use paimon_datafusion::SQLContext;
+Each query captures its selected store and credentials without replacing the
+shared RuntimeEnv registry. Catalog FileIO credentials retain the permissions of
+the underlying storage provider; reading a raw file does not perform a catalog
+table permission check. Credentials are configured on the catalog or application,
+never as SQL arguments. Default local reads retain an open directory handle,
+reject special files and skip symlinks during recursive discovery. HTTP/HTTPS
+file URLs are unsupported.
 
-let ctx = SQLContext::new();
-let io = FileIO::from_path("oss://my-bucket/imports/")?
-    .with_props(storage_options) // fs.oss.endpoint, accessKeyId, accessKeySecret, etc.
-    .build()?;
-ctx.register_read_files_location_with_file_io("oss://my-bucket/imports/", io)?;
-```
-
-If an object store is already configured on the supplied `RuntimeEnv`, use
-`register_read_files_location(prefix)` instead. Registration captures the store
-for that prefix in this SQLContext; it does not change the shared RuntimeEnv.
-Queries retain their source binding even if another context registers the same
-URI with different credentials. Credentials are supplied by the application,
-never as SQL arguments. Local files also require explicit directory registration.
-Local reads resolve paths beneath an open directory handle, and directory
-discovery skips symlinks. This local reader is used even when a FileIO is
-supplied; custom FileIO bindings apply to remote locations. HTTP/HTTPS file URLs
-are unsupported.
+ADLS container URLs (`abfss://container@host/...`) require a matching FileIO
+route or a container-aware object store registry; DataFusion's default registry
+discards the container portion of those URLs and is rejected for these reads.
 
 Supported formats and options:
 

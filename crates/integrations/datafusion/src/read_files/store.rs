@@ -97,7 +97,7 @@ impl FileStore {
     fn relative(&self, path: &Path) -> object_store::Result<PathBuf> {
         let parts = path
             .prefix_match(&self.prefix)
-            .ok_or_else(|| failure("path is outside the registered location"))?;
+            .ok_or_else(|| failure("path is outside the file source"))?;
         let path: PathBuf = parts.map(|part| part.as_ref().to_string()).collect();
         Ok(if path.as_os_str().is_empty() {
             PathBuf::from(".")
@@ -106,17 +106,30 @@ impl FileStore {
         })
     }
     fn meta(&self, status: FileStatus) -> object_store::Result<ObjectMeta> {
-        let memory_root = format!("memory:/{}/", self.root.host_str().unwrap_or(""));
-        let path = status
-            .path
-            .strip_prefix(self.root.as_str())
-            .or_else(|| {
-                (self.root.scheme() == "memory")
-                    .then(|| status.path.strip_prefix(&memory_root))
-                    .flatten()
-            })
-            .ok_or_else(|| failure("FileIO returned a path outside the store"))?;
-        let location = Path::parse(path)?;
+        let location = if self.root.scheme() == "file" {
+            // FileIO paths contain literal keys, unlike the encoded SQL URL.
+            // Decoding a second time would turn a filename such as %20 into a space.
+            let path = status
+                .path
+                .strip_prefix("file://")
+                .or_else(|| status.path.strip_prefix("file:"))
+                .unwrap_or(&status.path);
+            #[cfg(windows)]
+            let path = path.replace('\\', "/");
+            Path::parse(path)?
+        } else {
+            let memory_root = format!("memory:/{}/", self.root.host_str().unwrap_or(""));
+            let path = status
+                .path
+                .strip_prefix(self.root.as_str())
+                .or_else(|| {
+                    (self.root.scheme() == "memory")
+                        .then(|| status.path.strip_prefix(&memory_root))
+                        .flatten()
+                })
+                .ok_or_else(|| failure("FileIO returned a path outside the store"))?;
+            Path::parse(path)?
+        };
         self.relative(&location)?;
         Ok(ObjectMeta {
             location,

@@ -31,7 +31,7 @@ use datafusion::catalog::Session;
 use datafusion::common::project_schema;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::file_format::csv::CsvFormat;
-use datafusion::datasource::{TableProvider, TableType, ViewTable};
+use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{lit, Expr};
@@ -87,7 +87,7 @@ pub(super) async fn infer_csv_schema(
             (
                 source,
                 CsvInput::new(options),
-                (!options.multi_line).then(|| CsvLines::new(options)),
+                Some(CsvLines::new(options)),
                 Vec::new(),
                 false,
             ),
@@ -114,7 +114,12 @@ pub(super) async fn infer_csv_schema(
                                 )));
                             }
                         }
-                        None => eof = true,
+                        None => {
+                            if let Some(validator) = &validator {
+                                validator.finish()?;
+                            }
+                            eof = true;
+                        }
                     }
                 }
                 if pending.is_empty() {
@@ -293,7 +298,7 @@ pub(super) async fn provider(
         .fields()
         .iter()
         .any(|field| field.name() == "_metadata");
-    let mut combined = None;
+    let mut plans = Vec::with_capacity(files.len());
     for file in files {
         let table = RawTable {
             store: store.clone(),
@@ -308,15 +313,9 @@ pub(super) async fn provider(
         } else {
             frame.with_column("_metadata", lit(metadata(&file)?))?
         };
-        combined = Some(match combined {
-            None => frame,
-            Some(previous) => frame.union(previous)?,
-        });
+        plans.push(frame.into_unoptimized_plan());
     }
-    Ok(Arc::new(ViewTable::new(
-        combined.unwrap().into_unoptimized_plan(),
-        None,
-    )))
+    super::combined_provider(plans)
 }
 
 #[derive(Clone, Debug)]
@@ -543,7 +542,7 @@ impl RawExec {
                     .build_decoder()?,
             )
         };
-        let validator = (csv && !options.multi_line).then(|| CsvLines::new(options));
+        let validator = csv.then(|| CsvLines::new(options));
         let json_validator = (!csv).then(JsonLines::default);
         let input = csv.then(|| CsvInput::new(options));
         let schema = self.schema.clone();
@@ -594,7 +593,12 @@ impl RawExec {
                                         continue;
                                     }
                                 }
-                                None => eof = true,
+                                None => {
+                                    if let Some(validator) = &validator {
+                                        validator.finish()?;
+                                    }
+                                    eof = true;
+                                }
                             }
                         }
                         let consumed = decoder.decode(&pending[offset..])?;
@@ -827,6 +831,7 @@ struct CsvLines {
     delimiter: u8,
     quote: u8,
     escape: Option<u8>,
+    multi_line: bool,
 }
 
 impl CsvLines {
@@ -836,13 +841,25 @@ impl CsvLines {
             delimiter: options.delimiter.unwrap_or(b','),
             quote: options.quote.unwrap_or(b'"'),
             escape: options.escape,
+            multi_line: options.multi_line,
+        }
+    }
+
+    fn finish(&self) -> Result<()> {
+        if matches!(self.position, CsvPosition::Quoted | CsvPosition::Escaped) {
+            Err(error("CSV quoted field is unterminated at end of input"))
+        } else {
+            Ok(())
         }
     }
 
     fn validate(&mut self, bytes: &[u8]) -> Result<()> {
         use CsvPosition::*;
         for &byte in bytes {
-            if matches!(self.position, Quoted | Escaped) && matches!(byte, b'\r' | b'\n') {
+            if !self.multi_line
+                && matches!(self.position, Quoted | Escaped)
+                && matches!(byte, b'\r' | b'\n')
+            {
                 return Err(error("CSV record spans lines; set multiLine => true"));
             }
             self.advance(byte);
@@ -917,6 +934,25 @@ impl CsvInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csv_eof_checks_quote_and_escape_state_across_chunks() {
+        let options =
+            Options::parse(&[lit("memory://files/data.csv"), lit("multiLine"), lit(true)]).unwrap();
+        for (csv, valid) in [
+            (b"1,\"closed\"".as_slice(), true),
+            (b"1,\"broken".as_slice(), false),
+            (b"1,\"broken\\".as_slice(), false),
+            (b"1,\"multi\nline\"".as_slice(), true),
+        ] {
+            for split in 0..=csv.len() {
+                let mut validator = CsvLines::new(&options);
+                validator.validate(&csv[..split]).unwrap();
+                validator.validate(&csv[split..]).unwrap();
+                assert_eq!(validator.finish().is_ok(), valid, "split at {split}");
+            }
+        }
+    }
 
     #[test]
     fn csv_line_validation_preserves_quote_state_at_chunk_boundaries() {

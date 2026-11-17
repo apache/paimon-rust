@@ -22,19 +22,18 @@ import pytest
 from pypaimon_rust.datafusion import SQLContext
 
 
-@pytest.mark.parametrize("storage_options", [None, {}])
-def test_read_files_registration_and_named_options(tmp_path, storage_options):
+@pytest.mark.parametrize("use_catalog", [False, True])
+def test_read_files_default_registration_and_named_options(tmp_path, use_catalog):
     source = tmp_path / "users.csv"
     source.write_text("id;name\n1;Alice\n2;Bob\n")
     ctx = SQLContext()
+    if use_catalog:
+        ctx.register_catalog("paimon", {"warehouse": str(tmp_path), "metastore": "filesystem"}, default_database="")
     query = (
         f"SELECT id, name FROM read_files('{source}', format => 'csv', "
         "schema => 'id BIGINT, name STRING', header => true, sep => ';') "
         "WHERE id = 2"
     )
-    with pytest.raises(ValueError, match="location is not registered"):
-        ctx.sql(query)
-    ctx.register_read_files_location(str(tmp_path), storage_options)
     result = pa.Table.from_batches(ctx.sql(query))
     assert result.to_pydict() == {"id": [2], "name": ["Bob"]}
 
@@ -43,7 +42,6 @@ def test_read_files_binary_and_streaming_text(tmp_path):
     source = tmp_path / "text.txt"
     source.write_bytes(b"one\r\ntwo\n")
     ctx = SQLContext()
-    ctx.register_read_files_location(str(tmp_path))
     reader = ctx.sql_stream(
         f"SELECT value FROM read_files('{source}', format => 'text')"
     )
@@ -71,7 +69,6 @@ def test_read_files_parquet_and_json(tmp_path):
     json_path = tmp_path / "data.json"
     json_path.write_text('[\n{"id": 3},\n{"id": 4}\n]')
     ctx = SQLContext()
-    ctx.register_read_files_location(str(tmp_path))
     result = pa.Table.from_batches(ctx.sql(
         f"SELECT sum(id) AS total FROM read_files('{parquet_path}')"
     ))
@@ -90,7 +87,6 @@ def test_read_files_stream_cannot_follow_a_replaced_symlink(tmp_path):
     secret = tmp_path / "secret.txt"
     secret.write_text("outside secret")
     ctx = SQLContext()
-    ctx.register_read_files_location(str(allowed))
     reader = ctx.sql_stream(f"SELECT value FROM read_files('{source}', format => 'text')")
     source.unlink()
     source.symlink_to(secret)

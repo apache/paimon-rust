@@ -25,7 +25,7 @@ struct BlobFileIO {
     file_io: FileIO,
 }
 
-/// Session-scoped registry of Paimon [`FileIO`] instances for BlobDescriptor reads.
+/// Session-scoped registry of Paimon [`FileIO`] instances for blob and external file reads.
 #[derive(Clone, Debug, Default)]
 pub struct BlobReaderRegistry {
     readers: Arc<RwLock<Vec<BlobFileIO>>>,
@@ -68,6 +68,36 @@ impl BlobReaderRegistry {
             return;
         }
         readers.push(BlobFileIO { prefix, file_io });
+    }
+
+    pub(crate) fn register_location_if_absent(&self, prefix: &str, file_io: FileIO) {
+        self.register_if_absent(prefix, file_io.clone());
+        if let Ok(url) = datafusion::datasource::listing::ListingTableUrl::parse(prefix) {
+            let url: &url::Url = url.as_ref();
+            if let Ok(path) = url
+                .to_file_path()
+                .and_then(|path| std::fs::canonicalize(path).map_err(|_| ()))
+            {
+                self.register_if_absent(path.to_string_lossy().to_string(), file_io);
+            }
+        }
+    }
+
+    /// Compare equivalent URI/path spellings before choosing the closest route.
+    pub(crate) fn resolve_paths(&self, paths: &[String]) -> Option<FileIO> {
+        let readers = self.readers.read().unwrap_or_else(|e| e.into_inner());
+        readers
+            .iter()
+            .filter_map(|reader| {
+                let remaining = paths
+                    .iter()
+                    .filter(|path| matches_location(path, &reader.prefix))
+                    .map(|path| path.len() - reader.prefix.len())
+                    .min()?;
+                Some((remaining, reader))
+            })
+            .min_by_key(|(remaining, reader)| (*remaining, std::cmp::Reverse(reader.prefix.len())))
+            .map(|(_, reader)| reader.file_io.clone())
     }
 
     pub fn resolve(&self, uri: &str) -> Option<FileIO> {

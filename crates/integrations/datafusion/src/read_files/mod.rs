@@ -21,7 +21,7 @@ mod raw;
 mod scoped;
 pub(crate) mod store;
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use self::glob::PathGlob;
 use datafusion::arrow::array::StructArray;
@@ -38,7 +38,7 @@ use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::logical_expr::planner::{
     PlannedRelation, RelationPlanner, RelationPlannerContext, RelationPlanning,
 };
-use datafusion::logical_expr::{lit, LogicalPlanBuilder};
+use datafusion::logical_expr::{lit, LogicalPlan, LogicalPlanBuilder, Union};
 use datafusion::object_store::{path::Path, ObjectMeta, ObjectStore, ObjectStoreExt};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{FunctionArg, FunctionArgExpr, TableFactor};
@@ -49,16 +49,6 @@ use options::{Format, Options};
 
 fn error(message: impl std::fmt::Display) -> DataFusionError {
     DataFusionError::Plan(format!("read_files: {message}"))
-}
-
-/// Explicitly authorized directory prefixes, independent of catalog table grants.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Locations(Arc<RwLock<Vec<Location>>>);
-
-#[derive(Clone, Debug)]
-struct Location {
-    url: Url,
-    store: Arc<dyn ObjectStore>,
 }
 
 fn parse_url(path: &str) -> Result<Url> {
@@ -118,99 +108,61 @@ fn file_url(base: &Url, path: &Path) -> Result<Url> {
     Ok(url)
 }
 
-impl Locations {
-    pub(crate) fn register(
-        &self,
-        ctx: &SessionContext,
-        prefix: &str,
-        file_io: Option<paimon::io::FileIO>,
-    ) -> Result<()> {
-        if prefix.contains(['*', '?', '[', '{']) {
-            return Err(error("registered locations must not contain glob patterns"));
-        }
-        let mut url = parse_url(prefix)?;
-        let store: Arc<dyn ObjectStore> = if url.scheme() == "file" {
-            let path = url
-                .to_file_path()
-                .map_err(|_| error("invalid local location"))?;
-            let path = std::fs::canonicalize(path)?;
-            if !path.is_dir() {
-                return Err(error("a registered location must be a directory"));
-            }
-            url = Url::from_directory_path(path).map_err(|_| error("invalid local location"))?;
-            // Local paths always use a directory capability. A general FileIO
-            // provider cannot safely enforce local path resolution at open time.
-            Arc::new(store::FileStore::local(url.clone())?)
-        } else {
-            if !url.path().ends_with('/') {
-                url.set_path(&format!("{}/", url.path()));
-            }
-            if let Some(file_io) = file_io {
-                Arc::new(store::FileStore::file_io(url.clone(), file_io)?)
-            } else {
-                ctx.runtime_env().object_store_registry.get_store(&url)?
-            }
-        };
-        let mut locations = self
-            .0
-            .write()
-            .map_err(|_| error("location registry is poisoned"))?;
-        locations.retain(|location| location.url != url);
-        locations.push(Location { url, store });
-        Ok(())
-    }
-
-    fn resolve(&self, url: &Url) -> Result<Arc<dyn ObjectStore>> {
-        self.authorize(url)?;
-        let target = Path::from_url_path(url.path())?;
-        self.0
-            .read()
-            .map_err(|_| error("location registry is poisoned"))?
-            .iter()
-            .filter(|location| {
-                same_authority(&location.url, url)
-                    && Path::from_url_path(location.url.path()).is_ok_and(|prefix| {
-                        target == prefix || target.prefix_match(&prefix).is_some()
-                    })
-            })
-            .max_by_key(|location| location.url.path().len())
-            .map(|location| location.store.clone())
-            .ok_or_else(|| error("location is not registered"))
-    }
-
-    fn authorize(&self, url: &Url) -> Result<()> {
-        let mut url = url.clone();
-        if url.scheme() == "file" {
-            let path = url
-                .to_file_path()
-                .map_err(|_| error("invalid local file path"))?;
-            // Resolve symlinks as well as '..'; a registered directory must not
-            // grant access to an unrelated local file through a symlink.
-            if path.exists() {
-                url = Url::from_file_path(std::fs::canonicalize(path)?)
-                    .map_err(|_| error("invalid local file path"))?;
-            }
-        }
-        let target = Path::from_url_path(url.path())?;
-        let locations = self
-            .0
-            .read()
-            .map_err(|_| error("location registry is poisoned"))?;
-        let allowed = locations.iter().any(|location| {
-            if !same_authority(&location.url, &url) {
-                return false;
-            }
-            let Ok(prefix) = Path::from_url_path(location.url.path()) else {
-                return false;
-            };
-            target == prefix || target.prefix_match(&prefix).is_some()
-        });
-        if allowed {
-            Ok(())
-        } else {
-            Err(error("location is not registered; register an authorized directory with SQLContext::register_read_files_location"))
+/// Resolve once per query using the same session FileIO routes as blob reads.
+fn source(
+    state: &SessionState,
+    readers: &crate::BlobReaderRegistry,
+    url: &Url,
+) -> Result<Arc<dyn ObjectStore>> {
+    let path = Path::from_url_path(url.path())?;
+    let literal_uri = format!("{}/{path}", &url[..url::Position::BeforePath]);
+    let directory_uri = format!("{}/", literal_uri.trim_end_matches('/'));
+    let mut paths = vec![literal_uri, directory_uri];
+    if let Ok(path) = url.to_file_path() {
+        let path = path.to_string_lossy().to_string();
+        let file_uri = format!("file:/{}", path.trim_start_matches('/'));
+        for path in [path, file_uri] {
+            paths.push(format!("{path}{}", std::path::MAIN_SEPARATOR));
+            paths.push(path);
         }
     }
+    let file_io = readers.resolve_paths(&paths);
+    let mut directory = url.clone();
+    if !directory.path().ends_with('/') {
+        directory
+            .path_segments_mut()
+            .map_err(|_| error("invalid file URL"))?
+            .pop();
+    }
+    if let Some(file_io) = file_io {
+        return Ok(Arc::new(store::FileStore::file_io(directory, file_io)?));
+    }
+    if url.scheme() == "file" {
+        // Pin the query's directory and reject special files without requiring
+        // a separate application registration.
+        return Ok(Arc::new(store::FileStore::local(directory)?));
+    }
+    if let Ok(store) = state.runtime_env().object_store_registry.get_store(url) {
+        if !url.username().is_empty() {
+            let mut unqualified = url.clone();
+            unqualified
+                .set_username("")
+                .map_err(|_| error("invalid container URL"))?;
+            if state
+                .runtime_env()
+                .object_store_registry
+                .get_store(&unqualified)
+                .is_ok_and(|other| Arc::ptr_eq(&store, &other))
+            {
+                return Err(error("ADLS container URLs require a container-aware object store registry or matching Catalog FileIO"));
+            }
+        }
+        return Ok(store);
+    }
+    let file_io = paimon::io::FileIO::from_path(url.as_str())
+        .and_then(|builder| builder.build())
+        .map_err(error)?;
+    Ok(Arc::new(store::FileStore::file_io(directory, file_io)?))
 }
 
 fn same_authority(a: &Url, b: &Url) -> bool {
@@ -220,8 +172,8 @@ fn same_authority(a: &Url, b: &Url) -> bool {
         && a.username() == b.username()
 }
 
-pub(crate) fn register(ctx: &SessionContext, locations: Locations) {
-    ctx.register_udtf("read_files", Arc::new(ReadFiles { locations }));
+pub(crate) fn register(ctx: &SessionContext, readers: crate::BlobReaderRegistry) {
+    ctx.register_udtf("read_files", Arc::new(ReadFiles { readers }));
 }
 
 /// Preserve option names before DataFusion's default table-function planning.
@@ -287,7 +239,7 @@ impl RelationPlanner for ReadFilesPlanner {
 
 #[derive(Debug)]
 struct ReadFiles {
-    locations: Locations,
+    readers: crate::BlobReaderRegistry,
 }
 
 impl TableFunctionImpl for ReadFiles {
@@ -299,9 +251,9 @@ impl TableFunctionImpl for ReadFiles {
             .downcast_ref::<SessionState>()
             .ok_or_else(|| error("requires a DataFusion SessionState"))?
             .clone();
-        let locations = self.locations.clone();
+        let readers = self.readers.clone();
         crate::runtime::block_on_with_runtime(
-            async move { build(&state, options, locations).await },
+            async move { build(&state, options, readers).await },
             "read_files: planning thread panicked",
         )
     }
@@ -314,9 +266,9 @@ struct File {
 }
 
 async fn discover(
-    _state: &SessionState,
+    state: &SessionState,
     options: &Options,
-    locations: &Locations,
+    readers: &crate::BlobReaderRegistry,
 ) -> Result<(Arc<dyn ObjectStore>, Vec<File>)> {
     // Split at the first wildcard *before* parsing the URI: '?' is a glob
     // operator here, not an HTTP query delimiter.
@@ -332,9 +284,8 @@ async fn discover(
         (options.path.as_str(), None)
     };
     let base = parse_url(base)?;
-    locations.authorize(&base)?;
     let listing = ListingTableUrl::try_new(base.clone(), None)?;
-    let store = locations.resolve(&base)?;
+    let store = source(state, readers, &base)?;
     let prefix = listing.prefix();
     let metas = if pattern.is_none() && !base.path().ends_with('/') {
         match store.head(prefix).await {
@@ -373,7 +324,6 @@ async fn discover(
             continue;
         }
         let url = file_url(&base, &meta.location)?;
-        locations.authorize(&url)?;
         files.push(File { url, meta });
     }
     files.sort_by(|a, b| a.meta.location.cmp(&b.meta.location));
@@ -386,9 +336,9 @@ async fn discover(
 async fn build(
     state: &SessionState,
     mut options: Options,
-    locations: Locations,
+    readers: crate::BlobReaderRegistry,
 ) -> Result<Arc<dyn TableProvider>> {
-    let (store, files) = discover(state, &options, &locations).await?;
+    let (store, files) = discover(state, &options, &readers).await?;
     let format = match options.format {
         Some(format) => format,
         None => Format::infer(&files[0].meta.location)?,
@@ -445,7 +395,7 @@ async fn build(
         .fields()
         .iter()
         .any(|field| field.name() == "_metadata");
-    let mut combined = None;
+    let mut plans = Vec::with_capacity(files.len());
     for file in files {
         let config = ListingTableConfig::new(ListingTableUrl::try_new(file.url.clone(), None)?)
             .with_listing_options(listing_options.clone())
@@ -461,15 +411,18 @@ async fn build(
         } else {
             frame.with_column("_metadata", lit(metadata(&file)?))?
         };
-        combined = Some(match combined {
-            None => frame,
-            Some(previous) => frame.union(previous)?,
-        });
+        plans.push(frame.into_unoptimized_plan());
     }
-    Ok(Arc::new(ViewTable::new(
-        combined.unwrap().into_unoptimized_plan(),
-        None,
-    )))
+    combined_provider(plans)
+}
+
+fn combined_provider(mut plans: Vec<LogicalPlan>) -> Result<Arc<dyn TableProvider>> {
+    let plan = if plans.len() == 1 {
+        plans.pop().unwrap()
+    } else {
+        LogicalPlan::Union(Union::try_new(plans.into_iter().map(Arc::new).collect())?)
+    };
+    Ok(Arc::new(ViewTable::new(plan, None)))
 }
 
 fn metadata(file: &File) -> Result<ScalarValue> {

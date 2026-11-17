@@ -930,29 +930,6 @@ impl PySQLContext {
             .map_err(df_to_py_err)
     }
 
-    /// Allows read_files to read a directory using explicitly supplied storage options.
-    #[pyo3(signature = (prefix, storage_options=None))]
-    fn register_read_files_location(
-        &self,
-        prefix: String,
-        storage_options: Option<HashMap<String, String>>,
-    ) -> PyResult<()> {
-        if let Some(options) = storage_options {
-            let io = paimon::io::FileIO::from_path(&prefix)
-                .map_err(to_py_err)?
-                .with_props(complete_storage_options(options))
-                .build()
-                .map_err(to_py_err)?;
-            self.inner
-                .register_read_files_location_with_file_io(&prefix, io)
-                .map_err(df_to_py_err)
-        } else {
-            self.inner
-                .register_read_files_location(&prefix)
-                .map_err(df_to_py_err)
-        }
-    }
-
     fn register_udf(&self, udf: &PyPythonScalarUDFObject) -> PyResult<()> {
         self.inner.ctx().register_udf(udf.datafusion_udf());
         Ok(())

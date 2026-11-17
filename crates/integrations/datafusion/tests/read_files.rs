@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::ScalarValue;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::object_store::{memory::InMemory, path::Path, ObjectStoreExt};
 use paimon_datafusion::SQLContext;
 
@@ -35,8 +37,6 @@ async fn context(files: &[(&str, &[u8])]) -> (SQLContext, Arc<InMemory>) {
     ctx.ctx()
         .runtime_env()
         .register_object_store(&url::Url::parse("memory://files").unwrap(), store.clone());
-    ctx.register_read_files_location("memory://files/allowed")
-        .unwrap();
     (ctx, store)
 }
 
@@ -78,17 +78,77 @@ fn text(value: &ScalarValue) -> &str {
 }
 
 #[tokio::test]
-async fn read_files_rejects_unregistered_locations() {
+async fn read_files_is_available_without_location_registration() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("file.txt");
+    std::fs::write(&path, "default reader").unwrap();
     let ctx = SQLContext::new();
-    let error = ctx
-        .sql("SELECT * FROM read_files('file:///etc/hostname', format => 'text')")
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("read_files: location is not registered"),
-        "{error}"
-    );
+    let result = rows(
+        &ctx,
+        &format!(
+            "SELECT value FROM read_files('{}', format => 'text')",
+            path.display()
+        ),
+    )
+    .await;
+    assert_eq!(text(&result[0][0]), "default reader");
+}
+
+fn union_widths(plan: &LogicalPlan, widths: &mut Vec<usize>) {
+    plan.apply(|node| {
+        if let LogicalPlan::Union(union) = node {
+            widths.push(union.inputs.len());
+        }
+        if let LogicalPlan::TableScan(scan) = node {
+            if let Some(plan) = scan.source.get_logical_plan() {
+                union_widths(plan.as_ref(), widths);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn large_directories_use_one_flat_union_for_text_and_parquet() {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    )
+    .unwrap();
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(Vec::new(), batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    let (ctx, store) = context(&[]).await;
+    for (format, payload) in [
+        ("text", b"row\n".to_vec()),
+        ("parquet", writer.into_inner().unwrap()),
+    ] {
+        for file in 0..1000 {
+            store
+                .put(
+                    &Path::from(format!("allowed/{format}/file-{file}")),
+                    payload.clone().into(),
+                )
+                .await
+                .unwrap();
+        }
+        let frame = ctx.sql(&format!("SELECT count(*), count(DISTINCT _metadata.file_name) FROM read_files('memory://files/allowed/{format}/', format => '{format}')")).await.unwrap();
+        let mut widths = Vec::new();
+        union_widths(frame.logical_plan(), &mut widths);
+        assert_eq!(
+            widths,
+            vec![1000],
+            "{format} should expose one flat per-file union"
+        );
+        let batches = frame.collect().await.unwrap();
+        for column in batches[0].columns() {
+            assert_eq!(
+                ScalarValue::try_from_array(column, 0).unwrap(),
+                ScalarValue::Int64(Some(1000))
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -309,18 +369,6 @@ async fn rejects_invalid_options_and_unsupported_sources() {
             "'http://example.com/a.csv', format => 'csv'",
             "HTTP and HTTPS",
         ),
-        (
-            "'memory://files/allowed-other/a.txt', format => 'text'",
-            "location is not registered",
-        ),
-        (
-            "'memory://files/allowed/../private/a.txt', format => 'text'",
-            "location is not registered",
-        ),
-        (
-            "'memory://other/allowed/a.txt', format => 'text'",
-            "location is not registered",
-        ),
     ] {
         fails(&ctx, &format!("SELECT * FROM read_files({args})"), expected).await;
     }
@@ -342,14 +390,12 @@ async fn rejects_invalid_options_and_unsupported_sources() {
 }
 
 #[tokio::test]
-async fn local_files_require_registration_and_symlinks_do_not_escape() {
+async fn local_files_use_process_permissions_and_resolve_initial_symlinks() {
     let directory = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("data.txt"), "inside").unwrap();
     std::fs::write(outside.path().join("secret.txt"), "outside").unwrap();
     let ctx = SQLContext::new();
-    ctx.register_read_files_location(directory.path().to_str().unwrap())
-        .unwrap();
     let path = directory.path().join("data.txt");
     let result = rows(
         &ctx,
@@ -367,15 +413,15 @@ async fn local_files_require_registration_and_symlinks_do_not_escape() {
             directory.path().join("link.txt"),
         )
         .unwrap();
-        fails(
+        let result = rows(
             &ctx,
             &format!(
-                "SELECT * FROM read_files('{}/link.txt', format => 'text')",
+                "SELECT value FROM read_files('{}/link.txt', format => 'text')",
                 directory.path().display()
             ),
-            "location is not registered",
         )
         .await;
+        assert_eq!(text(&result[0][0]), "outside");
     }
 }
 
@@ -399,8 +445,8 @@ async fn file_io_adapter_reads_ranges_lists_and_preserves_literal_keys() {
             .unwrap();
     }
     let ctx = SQLContext::new();
-    ctx.register_read_files_location_with_file_io("memory://fileio/allowed", io)
-        .unwrap();
+    ctx.blob_reader_registry()
+        .register("memory://fileio/allowed", io);
     let result = rows(
         &ctx,
         "SELECT value FROM read_files('memory://fileio/allowed/a.txt', format => 'text')",
@@ -416,7 +462,7 @@ async fn file_io_adapter_reads_ranges_lists_and_preserves_literal_keys() {
     let listing =
         datafusion::datasource::listing::ListingTableUrl::parse("memory://fileio/allowed/")
             .unwrap();
-    // Registration belongs to this SQLContext, not its shared RuntimeEnv.
+    // FileIO routes belong to this SQLContext, not its shared RuntimeEnv.
     assert!(ctx.ctx().runtime_env().object_store(&listing).is_err());
 }
 
@@ -437,8 +483,8 @@ async fn file_io_adapter_scans_parquet_with_range_reads() {
         .await
         .unwrap();
     let ctx = SQLContext::new();
-    ctx.register_read_files_location_with_file_io("memory://parquet/allowed/", io)
-        .unwrap();
+    ctx.blob_reader_registry()
+        .register("memory://parquet/allowed/", io);
     assert_eq!(
         rows(
             &ctx,
@@ -465,8 +511,8 @@ async fn text_stream_preserves_chunk_boundaries_and_batch_counts() {
         .write(input.into_bytes().into())
         .await
         .unwrap();
-    ctx.register_read_files_location_with_file_io("memory://chunks/allowed", io)
-        .unwrap();
+    ctx.blob_reader_registry()
+        .register("memory://chunks/allowed", io);
     let batches = ctx
         .sql("SELECT value FROM read_files('memory://chunks/allowed/text.txt', format => 'text')")
         .await
@@ -540,8 +586,8 @@ async fn file_io_permission_errors_are_not_treated_as_missing_files() {
         .build()
         .unwrap();
     let ctx = SQLContext::new();
-    ctx.register_read_files_location_with_file_io("memory://denied/allowed", io)
-        .unwrap();
+    ctx.blob_reader_registry()
+        .register("memory://denied/allowed", io);
     fails(
         &ctx,
         "SELECT * FROM read_files('memory://denied/allowed/a.csv', format => 'csv')",
