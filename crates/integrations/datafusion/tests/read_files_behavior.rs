@@ -253,6 +253,43 @@ async fn aliases_and_wildcard_options_preserve_visible_columns() {
 }
 
 #[tokio::test]
+async fn wildcard_replacements_preserve_aliases_for_outer_queries_and_ctas() {
+    let mut ctx = context(&[
+        ("data.txt", b"hello\n"),
+        ("mixed.json", b"{\"Mixed Name\":\"hello\"}\n"),
+    ])
+    .await;
+    for star in ["*", "f.*"] {
+        let query = format!("SELECT {star} REPLACE (upper(value) AS value) FROM read_files('memory://files/data.txt') f");
+        assert_eq!(columns(&ctx, &query).await, ["value"]);
+        let values = rows(&ctx, &format!("SELECT q.value FROM ({query}) q")).await;
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0][0].try_as_str().flatten(), Some("HELLO"));
+    }
+    let query = r#"SELECT * REPLACE (upper("Mixed Name") AS "Mixed Name") FROM read_files('memory://files/mixed.json')"#;
+    assert_eq!(columns(&ctx, query).await, ["Mixed Name"]);
+    let values = rows(&ctx, &format!(r#"SELECT q."Mixed Name" FROM ({query}) q"#)).await;
+    assert_eq!(values[0][0].try_as_str().flatten(), Some("HELLO"));
+
+    let warehouse = tempfile::tempdir().unwrap();
+    let mut options = paimon::Options::new();
+    options.set(
+        paimon::CatalogOptions::WAREHOUSE,
+        warehouse.path().to_str().unwrap(),
+    );
+    ctx.register_catalog(
+        "paimon",
+        Arc::new(paimon::FileSystemCatalog::new(options).unwrap()),
+    )
+    .await
+    .unwrap();
+    ctx.sql("CREATE TEMPORARY TABLE replaced AS SELECT * REPLACE (upper(value) AS value) FROM read_files('memory://files/data.txt')").await.unwrap();
+    assert_eq!(columns(&ctx, "SELECT * FROM replaced").await, ["value"]);
+    let values = rows(&ctx, "SELECT value FROM replaced").await;
+    assert_eq!(values[0][0].try_as_str().flatten(), Some("HELLO"));
+}
+
+#[tokio::test]
 async fn distinct_star_uses_data_columns_and_parquet_hides_metadata() {
     use datafusion::arrow::array::{Int64Array, RecordBatch};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};

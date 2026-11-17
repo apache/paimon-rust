@@ -29,7 +29,7 @@ use datafusion::execution::session_state::SessionState;
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{
-    Cte, Query, Select, SelectItem, TableFactor, VisitMut, VisitorMut,
+    Cte, Ident, Query, Select, SelectItem, TableFactor, VisitMut, VisitorMut,
 };
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use datafusion::sql::unparser::Unparser;
@@ -289,9 +289,13 @@ impl Wildcards {
                         continue;
                     }
                 }
-                projection.push(SelectItem::UnnamedExpr(
-                    Unparser::default().expr_to_sql(&expr)?,
-                ));
+                projection.push(match expr {
+                    Expr::Alias(alias) => SelectItem::ExprWithAlias {
+                        expr: Unparser::default().expr_to_sql(&alias.expr)?,
+                        alias: Ident::with_quote('"', alias.name),
+                    },
+                    expr => SelectItem::UnnamedExpr(Unparser::default().expr_to_sql(&expr)?),
+                });
             }
         }
         select.projection = projection;
