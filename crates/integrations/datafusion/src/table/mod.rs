@@ -301,8 +301,9 @@ fn quote_string_literal(text: &str) -> String {
 ///
 /// `NOT NULL` is a column constraint, not a type modifier — it is only valid
 /// at the top of a column definition, not nested inside `MAP`, `ARRAY`, or
-/// `STRUCT` arguments. Callers that render a column should append `NOT NULL`
-/// themselves when the field is non-nullable; recursive calls below must not.
+/// `STRUCT` arguments. Nested VECTORs and their elements accept `NOT NULL`.
+/// Callers that render a column should append `NOT NULL` themselves when the
+/// field is non-nullable; recursive calls below must not.
 pub(crate) fn data_type_to_sql(data_type: &DataType) -> DFResult<String> {
     match data_type {
         DataType::Boolean(_) => Ok("BOOLEAN".to_string()),
@@ -325,11 +326,14 @@ pub(crate) fn data_type_to_sql(data_type: &DataType) -> DFResult<String> {
         DataType::LocalZonedTimestamp(t) => {
             Ok(format!("TIMESTAMP({}) WITH TIME ZONE", t.precision()))
         }
-        DataType::Array(t) => Ok(format!("ARRAY<{}>", data_type_to_sql(t.element_type())?)),
+        DataType::Array(t) => Ok(format!(
+            "ARRAY<{}>",
+            nested_data_type_to_sql(t.element_type())?
+        )),
         DataType::Map(t) => Ok(format!(
             "MAP({}, {})",
-            data_type_to_sql(t.key_type())?,
-            data_type_to_sql(t.value_type())?
+            nested_data_type_to_sql(t.key_type())?,
+            nested_data_type_to_sql(t.value_type())?
         )),
         DataType::Multiset(_) => Err(unsupported_show_create_table_type("MULTISET")),
         DataType::Row(t) => {
@@ -337,7 +341,7 @@ pub(crate) fn data_type_to_sql(data_type: &DataType) -> DFResult<String> {
                 .fields()
                 .iter()
                 .map(|f| {
-                    let ty = data_type_to_sql(f.data_type())?;
+                    let ty = nested_data_type_to_sql(f.data_type())?;
                     if f.name().is_empty() {
                         Ok(ty)
                     } else {
@@ -347,8 +351,25 @@ pub(crate) fn data_type_to_sql(data_type: &DataType) -> DFResult<String> {
                 .collect::<DFResult<_>>()?;
             Ok(format!("STRUCT<{}>", inner.join(", ")))
         }
-        DataType::Vector(_) => Err(unsupported_show_create_table_type("VECTOR")),
+        DataType::Vector(t) => Ok(format!(
+            "VECTOR<{}{}, {}>",
+            data_type_to_sql(t.element_type())?,
+            if t.element_type().is_nullable() {
+                ""
+            } else {
+                " NOT NULL"
+            },
+            t.length()
+        )),
     }
+}
+
+fn nested_data_type_to_sql(data_type: &DataType) -> DFResult<String> {
+    let mut sql = data_type_to_sql(data_type)?;
+    if matches!(data_type, DataType::Vector(_)) && !data_type.is_nullable() {
+        sql.push_str(" NOT NULL");
+    }
+    Ok(sql)
 }
 
 fn unsupported_show_create_table_type(type_name: &str) -> DataFusionError {

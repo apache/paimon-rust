@@ -26,8 +26,6 @@ use datafusion::sql::sqlparser::ast::{
     visit_expressions, visit_expressions_mut, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
     FunctionArguments, Ident, ObjectName, Statement,
 };
-use datafusion::sql::sqlparser::dialect::GenericDialect;
-use datafusion::sql::sqlparser::parser::Parser;
 use paimon::catalog::{Catalog, Function, Identifier};
 
 const MAX_EXPANSION_DEPTH: usize = 32;
@@ -63,7 +61,7 @@ async fn expand_sql_internal(
 ) -> DFResult<String> {
     let regex_sql = crate::regex_operators::parseable_sql(sql)?;
     let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
-    let mut statements = Parser::parse_sql(&GenericDialect {}, parseable.as_ref())
+    let mut statements = crate::vector_type::parse_sql(parseable.as_ref())
         .map_err(|error| DataFusionError::Plan(format!("Invalid REST SQL: {error}")))?;
     if statements.len() != 1 {
         return Err(DataFusionError::Plan(format!(
@@ -273,10 +271,7 @@ fn function_dependencies(
     let Ok(parseable) = crate::regex_operators::parseable_sql(definition) else {
         return Vec::new();
     };
-    let Ok(mut parser) = Parser::new(&GenericDialect {}).try_with_sql(parseable.as_ref()) else {
-        return Vec::new();
-    };
-    let Ok(body) = parser.parse_expr() else {
+    let Ok(body) = crate::vector_type::parse_expr(parseable.as_ref()) else {
         return Vec::new();
     };
     let mut dependencies = Vec::new();
@@ -450,15 +445,9 @@ fn expand_call(
     }
 
     let parseable = crate::regex_operators::parseable_sql(definition)?;
-    let mut body = Parser::new(&GenericDialect {})
-        .try_with_sql(parseable.as_ref())
-        .map_err(|error| {
-            DataFusionError::Plan(format!("Invalid SQL function definition: {error}"))
-        })?
-        .parse_expr()
-        .map_err(|error| {
-            DataFusionError::Plan(format!("Invalid SQL function definition: {error}"))
-        })?;
+    let mut body = crate::vector_type::parse_expr(parseable.as_ref()).map_err(|error| {
+        DataFusionError::Plan(format!("Invalid SQL function definition: {error}"))
+    })?;
     let replacements: HashMap<String, SqlExpr> = input_params
         .iter()
         .zip(values)
@@ -525,21 +514,12 @@ fn expand_call(
             function.full_name()
         ))
     })?;
-    Parser::new(&GenericDialect {})
-        .try_with_sql(&format!("CAST(({body}) AS {sql_type})"))
-        .map_err(|error| {
-            DataFusionError::Plan(format!(
-                "Invalid return type for REST SQL function '{}': {error}",
-                function.full_name()
-            ))
-        })?
-        .parse_expr()
-        .map_err(|error| {
-            DataFusionError::Plan(format!(
-                "Invalid return type for REST SQL function '{}': {error}",
-                function.full_name()
-            ))
-        })
+    crate::vector_type::parse_expr(&format!("CAST(({body}) AS {sql_type})")).map_err(|error| {
+        DataFusionError::Plan(format!(
+            "Invalid return type for REST SQL function '{}': {error}",
+            function.full_name()
+        ))
+    })
 }
 
 fn bare_function_name(function: &datafusion::sql::sqlparser::ast::Function) -> Option<Ident> {
@@ -554,6 +534,32 @@ mod tests {
     use std::collections::HashMap;
 
     use super::expand_sql;
+
+    #[test]
+    fn vector_cast_preserves_function_dependency_detection() {
+        use paimon::catalog::{Function, FunctionDefinition, Identifier};
+
+        let identifier = Identifier::new("db", "cycle");
+        let function = Function::new(
+            identifier.clone(),
+            None,
+            None,
+            true,
+            HashMap::from([(
+                "datafusion".to_string(),
+                FunctionDefinition::Sql {
+                    definition: "CAST(cycle(x) AS VECTOR<FLOAT, 2>)".to_string(),
+                },
+            )]),
+            None,
+            HashMap::new(),
+        );
+        let state = datafusion::prelude::SessionContext::new().state();
+        assert_eq!(
+            super::function_dependencies(&function, "paimon", "db", &state),
+            vec![("paimon".to_string(), identifier)]
+        );
+    }
 
     #[tokio::test]
     async fn leaves_bare_functions_for_datafusion_without_a_paimon_catalog() {

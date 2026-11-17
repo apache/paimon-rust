@@ -3515,6 +3515,297 @@ async fn test_show_create_table_resolves_information_schema_like_queries() {
 }
 
 #[tokio::test]
+async fn test_vector_sql_types_round_trip() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog.clone()).await;
+    ctx.sql(
+        "CREATE TABLE vectors (embedding VECTOR<FLOAT NOT NULL, 3> NOT NULL, \
+         flags VECTOR<BOOLEAN, 1>, bytes VECTOR<TINYINT, 2>, shorts VECTOR<SMALLINT, 2>, \
+         ints VECTOR<INTEGER, 2>, longs VECTOR<BIGINT, 2>, doubles VECTOR<DOUBLE, 2>, \
+         nested ARRAY<STRUCT<v VECTOR<INT, 2>>>, upper_bound VECTOR<FLOAT, 2147483647>)",
+    )
+    .await
+    .unwrap();
+    ctx.sql("ALTER TABLE vectors ADD COLUMN extra vEcToR /* type */ <REAL, 4>")
+        .await
+        .unwrap();
+
+    let identifier = Identifier::new("default", "vectors");
+    let table = catalog.get_table(&identifier).await.unwrap();
+    assert_eq!(
+        table.schema().fields()[0].data_type(),
+        &DataType::Vector(
+            VectorType::try_new(false, 3, DataType::Float(FloatType::with_nullable(false)))
+                .unwrap()
+        )
+    );
+    assert_eq!(
+        table.schema().fields().last().unwrap().data_type(),
+        &DataType::Vector(VectorType::new(4, DataType::Float(FloatType::new())).unwrap())
+    );
+    let definition = collect_definition(&ctx, "vectors").await;
+    assert!(
+        definition.contains("VECTOR<FLOAT NOT NULL, 3> NOT NULL"),
+        "{definition}"
+    );
+    catalog.drop_table(&identifier, false).await.unwrap();
+    ctx.sql(&definition).await.unwrap();
+    let recreated = catalog.get_table(&identifier).await.unwrap();
+    assert_schema_equivalent(table.schema(), recreated.schema());
+}
+
+#[tokio::test]
+async fn test_vector_sql_round_trip_preserves_nested_not_null() {
+    use paimon::spec::{DataField, RowType, Schema};
+
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog.clone()).await;
+    let vector = DataType::Vector(
+        VectorType::try_new(false, 2, DataType::Float(FloatType::with_nullable(false))).unwrap(),
+    );
+    let schema = Schema::builder()
+        .column(
+            "array",
+            DataType::Array(ArrayType::with_nullable(false, vector.clone())),
+        )
+        .column(
+            "row",
+            DataType::Row(RowType::with_nullable(
+                false,
+                vec![DataField::new(0, "v".to_string(), vector.clone())],
+            )),
+        )
+        .column(
+            "deep",
+            DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                DataField::new(0, "v".to_string(), vector.clone()),
+            ])))),
+        )
+        .column(
+            "map",
+            DataType::Map(MapType::new(
+                DataType::Int(IntType::with_nullable(false)),
+                vector,
+            )),
+        )
+        .build()
+        .unwrap();
+    let identifier = Identifier::new("default", "nested_vectors");
+    catalog
+        .create_table(&identifier, schema, false)
+        .await
+        .unwrap();
+    let table = catalog.get_table(&identifier).await.unwrap();
+    let definition = collect_definition(&ctx, "nested_vectors").await;
+    catalog.drop_table(&identifier, false).await.unwrap();
+    ctx.sql(&definition).await.unwrap();
+    let recreated = catalog.get_table(&identifier).await.unwrap();
+    assert_schema_equivalent(table.schema(), recreated.schema());
+}
+
+#[tokio::test]
+async fn test_vector_sql_cast_preserves_nested_nullability() {
+    use datafusion::arrow::array::BooleanArray;
+    use datafusion::arrow::datatypes::DataType as ArrowType;
+
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    let batches = ctx
+        .sql(
+            "SELECT CAST([[1, 2]] AS ARRAY<VECTOR<FLOAT, 2> NOT NULL>) AS v, \
+         CAST(NULL AS MAP(STRING, VECTOR<FLOAT, 2> NOT NULL)) AS m, \
+         [1, 2]::VECTOR<FLOAT, 2> IS NOT NULL AS present, \
+         CAST([[1, 2], [3, 4], [5, 6]] AS VECTOR<FLOAT, 2>[3]) AS sized",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ArrowType::List(vector_field) = batches[0].column(0).data_type() else {
+        panic!("expected List");
+    };
+    assert!(!vector_field.is_nullable());
+    assert!(matches!(
+        vector_field.data_type(),
+        ArrowType::FixedSizeList(_, 2)
+    ));
+    let ArrowType::Map(entries, _) = batches[0].column(1).data_type() else {
+        panic!("expected Map");
+    };
+    let ArrowType::Struct(fields) = entries.data_type() else {
+        panic!("expected Map entries");
+    };
+    assert!(!fields[1].is_nullable());
+    assert!(matches!(
+        fields[1].data_type(),
+        ArrowType::FixedSizeList(_, 2)
+    ));
+    assert!(batches[0].column(1).is_null(0));
+    assert!(batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap()
+        .value(0));
+    assert!(matches!(
+        batches[0].column(3).data_type(),
+        ArrowType::FixedSizeList(_, 3)
+    ));
+
+    for sql_type in [
+        "MAP(STRING, VECTOR<FLOAT, 2>[3])",
+        "MAP(STRING, STRUCT<v VECTOR<FLOAT, 2>, extra FLOAT[3]>)",
+    ] {
+        let Err(err) = ctx.sql(&format!("SELECT CAST(NULL AS {sql_type})")).await else {
+            panic!("fixed-size arrays in vector maps must be rejected: {sql_type}");
+        };
+        assert!(
+            err.to_string()
+                .contains("Fixed-size SQL arrays inside vector MAP types"),
+            "{err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_vector_sql_cast_and_write() {
+    use datafusion::arrow::array::{BooleanArray, FixedSizeListArray, Float32Array, ListArray};
+
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    ctx.sql("CREATE TABLE vectors (embedding VECTOR<FLOAT, 2>)")
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO vectors VALUES (CAST([1, 2] AS VECTOR<FLOAT, 2>)), (NULL)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let batches = ctx
+        .sql("SELECT embedding FROM vectors")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let batch = datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    let vectors = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap();
+    assert_eq!(vectors.len(), 2);
+    assert_eq!(vectors.null_count(), 1);
+    let row = (0..vectors.len()).find(|i| !vectors.is_null(*i)).unwrap();
+    let value = vectors.value(row);
+    assert_eq!(
+        value
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values(),
+        &[1.0, 2.0]
+    );
+
+    // A column named vector and comparison operators must keep their SQL meaning,
+    // including when a VECTOR type occurs in the same query.
+    let batches = ctx
+        .sql(
+            "SELECT vector < f, 3 > x + 1, CAST([1, 2] AS VECTOR<INT, 2>) AS v \
+         FROM (VALUES (1, 2, 0)) AS t(vector, f, x)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches[0].num_columns(), 3);
+    assert_eq!(batches[0].num_rows(), 1);
+    for column in &batches[0].columns()[..2] {
+        assert!(column
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0));
+    }
+
+    let batches = ctx
+        .sql(
+            "SELECT [1, 2]::VECTOR<FLOAT NOT NULL, 2> AS required, \
+             CAST([[1, 2]] AS ARRAY<VECTOR<FLOAT, 2>>) AS nested",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = paimon::arrow::paimon_type_to_arrow(&DataType::Vector(
+        VectorType::new(2, DataType::Float(FloatType::with_nullable(false))).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(batches[0].column(0).data_type(), &expected);
+    let nested = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap()
+        .value(0);
+    let vector = nested
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        vector
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values(),
+        &[1.0, 2.0]
+    );
+
+    let err = ctx
+        .sql("SELECT CAST([1, 2, 3] AS VECTOR<FLOAT, 2>)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect_err("casting a three-element array to a two-element vector must fail");
+    assert!(
+        err.to_string().contains("Cannot cast to FixedSizeList(2)"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn test_vector_sql_rejects_invalid_types() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog.clone()).await;
+    for (sql_type, reason) in [
+        ("VECTOR<FLOAT, 0>", "Vector length must be between"),
+        ("VECTOR<FLOAT, -1>", "Invalid VECTOR type"),
+        ("VECTOR<FLOAT, 2147483648>", "Vector length must be between"),
+        ("VECTOR<FLOAT, 4294967296>", "Vector length must be between"),
+        ("VECTOR<FLOAT, 1.5>", "Invalid VECTOR type"),
+        ("VECTOR<STRING, 2>", "Invalid element type for vector"),
+        (
+            "VECTOR<DECIMAL(10, 2), 2>",
+            "Invalid element type for vector",
+        ),
+        ("VECTOR<ARRAY<FLOAT>, 2>", "Invalid element type for vector"),
+        ("VECTOR<FLOAT>", "Invalid VECTOR type"),
+        ("VECTOR<FLOAT, 2, 3>", "Invalid VECTOR type"),
+    ] {
+        let sql = format!("CREATE TABLE invalid_vector (v {sql_type})");
+        let err = ctx.sql(&sql).await.expect_err(&sql);
+        assert!(err.to_string().contains(reason), "{sql}: {err}");
+        assert!(catalog.list_tables("default").await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn test_show_create_table_rejects_non_round_trippable_types() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;
@@ -3530,11 +3821,6 @@ async fn test_show_create_table_rejects_non_round_trippable_types() {
             "multiset_t",
             DataType::Multiset(MultisetType::new(DataType::Int(IntType::new()))),
             "MULTISET",
-        ),
-        (
-            "vector_t",
-            DataType::Vector(VectorType::new(4, DataType::Float(FloatType::new())).unwrap()),
-            "VECTOR",
         ),
     ] {
         let identifier = Identifier::new("test_db", table_name);
@@ -3564,7 +3850,7 @@ async fn test_show_create_table_rejects_non_round_trippable_types() {
 }
 
 #[tokio::test]
-async fn test_vector_search_plans_vector_column_without_show_create_support() {
+async fn test_vector_search_plans_vector_column() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;
     let identifier = Identifier::new("default", "vector_t");
@@ -3588,5 +3874,5 @@ async fn test_vector_search_plans_vector_column_without_show_create_support() {
              'paimon.default.vector_t', 'embedding', '[1.0, 2.0]', 1)",
         )
         .await
-        .expect("vector_search should plan without requiring SHOW CREATE TABLE support");
+        .expect("vector_search should plan a VECTOR column");
 }
