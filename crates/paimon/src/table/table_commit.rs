@@ -1423,7 +1423,7 @@ impl TableCommit {
         // Once publication starts its outcome may be unknown. These files must
         // remain available even if the response is lost or a later retry fails.
         let base_snapshot_uuid = latest_snapshot.as_ref().and_then(Snapshot::uuid);
-        let publication_error = match self
+        let publication = self
             .snapshot_commit
             .commit(
                 base_snapshot_uuid,
@@ -1431,8 +1431,31 @@ impl TableCommit {
                 self.table.branch(),
                 &statistics,
             )
-            .await
-        {
+            .await;
+        // Storage may replay a successful conditional write after losing its
+        // response. REST POSTs are not replayed; success=false is a definite
+        // server rejection and must retain its cleanup semantics.
+        let publication = match publication {
+            Ok(false) if self.table.rest_env.is_some() => Ok(false),
+            Ok(false) => match self.snapshot_manager.get_snapshot_uncached(snapshot.id()).await {
+                Ok(current) if current.uuid() == snapshot.uuid() => Ok(true),
+                // Older writers can omit the UUID. Each attempt writes a
+                // unique delta manifest list before publication.
+                Ok(current) if current.delta_manifest_list() != snapshot.delta_manifest_list() => {
+                    Ok(false)
+                }
+                Ok(_) => Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Cannot verify ownership of snapshot {} after conditional publication was rejected",
+                        snapshot.id()
+                    ),
+                    source: None,
+                }),
+                Err(error) => Err(error),
+            },
+            result => result,
+        };
+        let publication_error = match publication {
             Ok(true) => {
                 if !self.commit_callbacks.is_empty() {
                     self.notify_commit_callbacks(snapshot.clone(), resolved.entries)

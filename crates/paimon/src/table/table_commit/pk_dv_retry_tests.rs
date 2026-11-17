@@ -18,11 +18,21 @@
 mod pk_dv_retry {
     use super::*;
     use arrow_array::{Int32Array, RecordBatch};
+    use futures::TryStreamExt;
     use indexmap::IndexMap;
     use roaring::RoaringBitmap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn write(table: &Table, ids: Vec<i32>, level: i32) -> (Vec<u8>, DataFileMeta) {
+        write_with_snapshot_format(table, ids, level, false).await
+    }
+
+    async fn write_with_snapshot_format(
+        table: &Table,
+        ids: Vec<i32>,
+        level: i32,
+        legacy: bool,
+    ) -> (Vec<u8>, DataFileMeta) {
         let batch = RecordBatch::try_from_iter([
             (
                 "id",
@@ -49,7 +59,11 @@ mod pk_dv_retry {
             messages[0].partition.clone(),
             messages[0].new_files[0].clone(),
         );
-        builder.new_commit().commit(messages).await.unwrap();
+        let mut commit = builder.new_commit();
+        if legacy {
+            commit.snapshot_commit = Arc::new(LegacySnapshotCommit(table.snapshot_manager()));
+        }
+        commit.commit(messages).await.unwrap();
         output
     }
 
@@ -74,6 +88,25 @@ mod pk_dv_retry {
         )
         .await
         .unwrap()
+    }
+
+    async fn count_rows(table: &Table, id: i32) -> usize {
+        let mut read = table.new_read_builder();
+        read.with_filter(
+            crate::spec::PredicateBuilder::new(table.schema().fields())
+                .equal("id", Datum::Int(id))
+                .unwrap(),
+        );
+        let plan = read.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = read
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        batches.iter().map(RecordBatch::num_rows).sum()
     }
 
     async fn replace_vectors(table: &Table, masks: &[(&str, &[u32])]) {
@@ -103,7 +136,10 @@ mod pk_dv_retry {
     }
 
     async fn fixture() -> (Table, String, String) {
-        let path = format!("memory:/pk-dv-retry/{}", uuid::Uuid::new_v4());
+        fixture_at(format!("memory:/pk-dv-retry/{}", uuid::Uuid::new_v4())).await
+    }
+
+    async fn fixture_at(path: String) -> (Table, String, String) {
         let mut options = crate::Options::new();
         options.set("warehouse", &path);
         options.set("local-cache.enabled", "true");
@@ -171,10 +207,42 @@ mod pk_dv_retry {
             .collect()
     }
 
+    fn snapshot_without_uuid(snapshot: &Snapshot) -> Snapshot {
+        let mut json = serde_json::to_value(snapshot).unwrap();
+        assert!(json.as_object_mut().unwrap().remove("uuid").is_some());
+        serde_json::from_value(json).unwrap()
+    }
+
+    struct LegacySnapshotCommit(SnapshotManager);
+
+    #[async_trait::async_trait]
+    impl SnapshotCommit for LegacySnapshotCommit {
+        async fn commit(
+            &self,
+            _: Option<&str>,
+            snapshot: &Snapshot,
+            _: &str,
+            _: &[PartitionStatistics],
+        ) -> Result<bool> {
+            self.0
+                .commit_snapshot(&snapshot_without_uuid(snapshot))
+                .await
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FirstPublication {
+        Conflict { legacy: bool },
+        LostResponse,
+        Replay { legacy: bool },
+        Deferred,
+    }
+
     struct RacingCommit {
         table: Table,
         calls: AtomicUsize,
-        publish_first: bool,
+        first: FirstPublication,
+        deferred: std::sync::Mutex<Option<Snapshot>>,
         paths: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
@@ -189,31 +257,365 @@ mod pk_dv_retry {
         ) -> Result<bool> {
             let paths = dv_paths(&self.table, snapshot).await;
             self.paths.lock().unwrap().push(paths);
+            let manager = self.table.snapshot_manager();
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                if self.publish_first {
-                    assert!(
-                        self.table
-                            .snapshot_manager()
-                            .commit_snapshot(snapshot)
-                            .await?
-                    );
-                    return Err(crate::Error::IoUnsupported {
-                        message: "lost compact response".into(),
-                    });
+                match self.first {
+                    FirstPublication::Conflict { legacy } => {
+                        write_with_snapshot_format(&self.table, vec![4000], 0, legacy).await;
+                        assert_eq!(
+                            manager.get_snapshot(snapshot.id()).await?.uuid().is_none(),
+                            legacy
+                        );
+                        return Ok(false);
+                    }
+                    FirstPublication::LostResponse => {
+                        assert!(manager.commit_snapshot(snapshot).await?);
+                        return Err(crate::Error::IoUnsupported {
+                            message: "lost compact response".into(),
+                        });
+                    }
+                    FirstPublication::Replay { legacy } => {
+                        let stored = legacy.then(|| snapshot_without_uuid(snapshot));
+                        assert!(
+                            manager
+                                .commit_snapshot(stored.as_ref().unwrap_or(snapshot))
+                                .await?
+                        );
+                    }
+                    FirstPublication::Deferred => {
+                        *self.deferred.lock().unwrap() = Some(snapshot.clone());
+                        return Ok(false);
+                    }
                 }
-                write(&self.table, vec![4000], 0).await;
-                return Ok(false);
             }
-            self.table
-                .snapshot_manager()
-                .commit_snapshot(snapshot)
-                .await
+            manager.commit_snapshot(snapshot).await
         }
     }
 
     #[tokio::test]
     async fn compact_cas_loss_cleans_only_new_dv_but_publication_error_preserves_it() {
-        for publish_first in [false, true] {
+        check_compact_publications(&[
+            FirstPublication::Conflict { legacy: false },
+            FirstPublication::LostResponse,
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn compact_cas_loss_cleans_new_dv_when_a_legacy_writer_wins() {
+        check_compact_publications(&[FirstPublication::Conflict { legacy: true }]).await;
+    }
+
+    #[tokio::test]
+    async fn compact_replayed_publication_preserves_published_dv() {
+        check_compact_publications(&[FirstPublication::Replay { legacy: false }]).await;
+    }
+
+    #[tokio::test]
+    async fn rest_compact_conflict_cleans_unpublished_dv_without_snapshot_file() {
+        check_rest_compact_publication(RestPublication::Conflict).await;
+    }
+
+    #[tokio::test]
+    async fn rest_compact_rejection_with_catalog_only_base_cleans_unpublished_dv() {
+        check_rest_compact_publication(RestPublication::Rejection).await;
+    }
+
+    #[tokio::test]
+    async fn rest_compact_lost_response_preserves_published_dv() {
+        check_rest_compact_publication(RestPublication::LostResponse).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum RestPublication {
+        Conflict,
+        Rejection,
+        LostResponse,
+    }
+
+    async fn check_rest_compact_publication(mode: RestPublication) {
+        use crate::api::rest_api::RESTApi;
+        use axum::{
+            body::Bytes,
+            http::{Method, StatusCode, Uri},
+            response::IntoResponse,
+            Json, Router,
+        };
+        use std::sync::Mutex;
+
+        let (table, anchor, _) = fixture().await;
+        write(&table, vec![42], 0).await;
+        let current = Arc::new(Mutex::new(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap(),
+        ));
+        let submitted = Arc::new(Mutex::new(Vec::<Snapshot>::new()));
+        let app = Router::new().fallback({
+            let current = current.clone();
+            let submitted = submitted.clone();
+            let table = table.clone();
+            move |method: Method, uri: Uri, body: Bytes| {
+                let current = current.clone();
+                let submitted = submitted.clone();
+                let table = table.clone();
+                async move {
+                    let response = if method == Method::POST && uri.path().ends_with("/commit") {
+                        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let next: Snapshot = serde_json::from_value(request["snapshot"].clone()).unwrap();
+                        assert_eq!(next.id(), current.lock().unwrap().id() + 1);
+                        let first = {
+                            let mut submitted = submitted.lock().unwrap();
+                            submitted.push(next.clone());
+                            submitted.len() == 1
+                        };
+                        if first && matches!(mode, RestPublication::Conflict) {
+                            write(&table, vec![4000], 0).await;
+                            let manager = table.snapshot_manager();
+                            let winner = manager.get_latest_snapshot().await.unwrap().unwrap();
+                            assert_eq!(winner.id(), next.id());
+                            // The catalog keeps the snapshot; clients only need its manifests.
+                            manager.delete_snapshot(winner.id()).await.unwrap();
+                            *current.lock().unwrap() = winner;
+                        } else if !first || matches!(mode, RestPublication::LostResponse) {
+                            *current.lock().unwrap() = next;
+                        }
+                        if first && matches!(mode, RestPublication::LostResponse) {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"code": 500, "message": "lost commit response"})),
+                            ).into_response();
+                        }
+                        serde_json::json!({"success": !first})
+                    } else if uri.path().ends_with("/snapshot") {
+                        serde_json::json!({"snapshot": {"snapshot": *current.lock().unwrap(), "recordCount": 0}})
+                    } else {
+                        serde_json::json!({"schemaId": table.schema().id()})
+                    };
+                    Json(response).into_response()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut options = crate::Options::new();
+        options.set("uri", format!("http://{}", listener.local_addr().unwrap()));
+        options.set("prefix", "test");
+        options.set("token.provider", "bear");
+        options.set("token", "test-token");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let env = crate::table::RESTEnv::new(
+            table.identifier().clone(),
+            "uuid".into(),
+            Arc::new(RESTApi::new(options.clone(), false).await.unwrap()),
+            options.clone(),
+            false,
+            None,
+            crate::io::FileIOCacheContext::from_props(options.to_map()).unwrap(),
+        );
+        let rest = Table::new(
+            table.file_io().clone(),
+            table.identifier().clone(),
+            table.location().into(),
+            table.schema().clone(),
+            Some(env),
+        );
+        let builder = rest.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        let result = builder
+            .new_executor()
+            .unwrap()
+            .execute(&plan.tasks()[0])
+            .await
+            .unwrap();
+        if matches!(mode, RestPublication::Rejection) {
+            write(&table, vec![4000], 0).await;
+            let manager = table.snapshot_manager();
+            let advanced = manager.get_latest_snapshot().await.unwrap().unwrap();
+            manager.delete_snapshot(advanced.id()).await.unwrap();
+            *current.lock().unwrap() = advanced;
+        }
+        let mut commit = TableCommit::new(rest.clone(), "rest-compactor".into());
+        commit.commit_min_retry_wait_ms = 0;
+        commit.commit_max_retry_wait_ms = 0;
+        let unknown = matches!(mode, RestPublication::LostResponse);
+        if !matches!(mode, RestPublication::Conflict) {
+            commit.commit_max_retries = 0;
+            let error = commit
+                .commit_compact(vec![result.clone()])
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string().contains("Commit outcome may be unknown"),
+                unknown,
+                "{error}",
+            );
+            let first = submitted.lock().unwrap()[0].clone();
+            for path in dv_paths(&rest, &first).await {
+                assert_eq!(rest.file_io().exists(&path).await.unwrap(), unknown);
+            }
+        }
+        let metrics = commit.commit_compact(vec![result.clone()]).await.unwrap();
+        let attempts = submitted.lock().unwrap().clone();
+        assert_eq!(attempts.len(), if unknown { 1 } else { 2 });
+        let first_paths = dv_paths(&rest, &attempts[0]).await;
+        let published_paths = dv_paths(&rest, attempts.last().unwrap()).await;
+        assert_eq!(first_paths.len(), 1);
+        assert_eq!(published_paths.contains(&first_paths[0]), unknown);
+        assert_eq!(
+            rest.file_io().exists(&first_paths[0]).await.unwrap(),
+            unknown
+        );
+        for path in &published_paths {
+            assert!(rest.file_io().exists(path).await.unwrap());
+        }
+        for snapshot in &attempts {
+            assert!(!rest
+                .file_io()
+                .exists(&rest.snapshot_manager().snapshot_path(snapshot.id()))
+                .await
+                .unwrap());
+        }
+        assert_eq!(
+            vectors(&rest).await.0[&anchor],
+            [42, 500].into_iter().collect()
+        );
+        let readable = rest.copy_with_options(HashMap::from([(
+            "deletion-vectors.merge-on-read".into(),
+            "true".into(),
+        )]));
+        assert_eq!(count_rows(&readable, 4000).await, usize::from(!unknown));
+        assert_eq!(count_rows(&readable, 42).await, 1);
+        assert_eq!(commit.commit_compact(vec![result]).await.unwrap(), metrics);
+        assert_eq!(submitted.lock().unwrap().len(), attempts.len());
+        server.abort();
+    }
+
+    #[cfg(feature = "storage-fs")]
+    struct ReplayAfterRollback {
+        table: Table,
+        storage: SnapshotManager,
+    }
+
+    #[cfg(feature = "storage-fs")]
+    #[async_trait::async_trait]
+    impl SnapshotCommit for ReplayAfterRollback {
+        async fn commit(
+            &self,
+            _: Option<&str>,
+            snapshot: &Snapshot,
+            _: &str,
+            _: &[PartitionStatistics],
+        ) -> Result<bool> {
+            write(&self.table, vec![4000], 0).await;
+            let cached = self
+                .table
+                .snapshot_manager()
+                .get_snapshot(snapshot.id())
+                .await?;
+            assert_ne!(cached.uuid(), snapshot.uuid());
+            // A different client rolls back without invalidating our local cache.
+            self.storage.write_latest_hint(snapshot.id() - 1).await?;
+            self.storage.delete_snapshot(snapshot.id()).await?;
+            assert!(self.storage.commit_snapshot(snapshot).await?);
+            self.storage.commit_snapshot(snapshot).await
+        }
+    }
+
+    #[cfg(feature = "storage-fs")]
+    #[tokio::test]
+    async fn compact_replayed_publication_ignores_snapshot_cached_before_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let (table, anchor, _) = fixture_at(path.clone()).await;
+        let storage =
+            SnapshotManager::new(FileIO::from_path(&path).unwrap().build().unwrap(), path);
+        assert!(table.file_io().has_local_cache());
+        write(&table, vec![42], 0).await;
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        let result = builder
+            .new_executor()
+            .unwrap()
+            .execute(&plan.tasks()[0])
+            .await
+            .unwrap();
+        let mut commit = builder.new_commit().unwrap();
+        commit.snapshot_commit = Arc::new(ReplayAfterRollback {
+            table: table.clone(),
+            storage: storage.clone(),
+        });
+        commit.commit_max_retries = 0;
+        let outcome = commit.commit_compact(vec![result]).await;
+
+        let published = storage
+            .get_snapshot(plan.snapshot_id().unwrap() + 1)
+            .await
+            .unwrap();
+        assert_eq!(published.commit_kind(), &CommitKind::COMPACT);
+        let (masks, _) = crate::table::deletion_vector_index::read_bucket(
+            &table,
+            &EMPTY_SERIALIZED_ROW,
+            0,
+            &published,
+            None,
+        )
+        .await
+        .expect("the published deletion-vector file must survive the replay");
+        assert_eq!(masks[&anchor], [42, 500].into_iter().collect());
+        outcome.unwrap();
+
+        let cached = table.copy_with_options(HashMap::from([(
+            "deletion-vectors.merge-on-read".into(),
+            "true".into(),
+        )]));
+        let fresh = Table::new(
+            storage.file_io().clone(),
+            cached.identifier().clone(),
+            cached.location().into(),
+            cached.schema().clone(),
+            None,
+        );
+        assert!(!fresh.file_io().has_local_cache());
+        for (reader, name) in [(&fresh, "fresh"), (&cached, "committing")] {
+            for (id, expected_rows) in [(4000, 0), (2001, 1)] {
+                assert_eq!(
+                    count_rows(reader, id).await,
+                    expected_rows,
+                    "{name} reader, id={id}",
+                );
+            }
+        }
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .uuid(),
+            published.uuid(),
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_unverified_publication_preserves_dv_for_recovery() {
+        check_compact_publications(&[
+            FirstPublication::Replay { legacy: true },
+            FirstPublication::Deferred,
+        ])
+        .await;
+    }
+
+    async fn check_compact_publications(cases: &[FirstPublication]) {
+        for &first in cases {
+            let conflict = matches!(first, FirstPublication::Conflict { .. });
+            let unverifiable = matches!(
+                first,
+                FirstPublication::Replay { legacy: true } | FirstPublication::Deferred
+            );
             let (table, anchor, unrelated) = fixture().await;
             let old = table
                 .snapshot_manager()
@@ -238,24 +640,46 @@ mod pk_dv_retry {
             let publisher = Arc::new(RacingCommit {
                 table: table.clone(),
                 calls: AtomicUsize::new(0),
-                publish_first,
+                first,
+                deferred: std::sync::Mutex::new(None),
                 paths: std::sync::Mutex::new(vec![]),
             });
             let mut commit = builder.new_commit().unwrap();
             commit.snapshot_commit = publisher.clone();
             commit.commit_min_retry_wait_ms = 0;
             commit.commit_max_retry_wait_ms = 0;
-            let metrics = commit.commit_compact(vec![result.clone()]).await.unwrap();
+            if unverifiable {
+                commit.commit_max_retries = 0;
+            }
+            let outcome = commit.commit_compact(vec![result.clone()]).await;
+            let manager = table.snapshot_manager();
+            let metrics = if unverifiable {
+                let error = outcome.unwrap_err();
+                assert!(
+                    error.to_string().contains("Commit outcome may be unknown"),
+                    "{error}"
+                );
+                let deferred = publisher.deferred.lock().unwrap().take();
+                if let Some(snapshot) = deferred {
+                    assert!(manager.commit_snapshot(&snapshot).await.unwrap());
+                }
+                let before = manager.get_latest_snapshot_id().await.unwrap();
+                let metrics = commit.commit_compact(vec![result.clone()]).await.unwrap();
+                assert_eq!(manager.get_latest_snapshot_id().await.unwrap(), before);
+                metrics
+            } else {
+                outcome.unwrap()
+            };
             assert_eq!(
                 publisher.calls.load(Ordering::SeqCst),
-                if publish_first { 1 } else { 2 }
+                if conflict { 2 } else { 1 }
             );
             let attempts = publisher.paths.lock().unwrap().clone();
             assert_eq!(attempts[0].len(), 1);
             assert!(!original_paths.contains(&attempts[0][0]));
             assert_eq!(
                 table.file_io().exists(&attempts[0][0]).await.unwrap(),
-                publish_first
+                !conflict
             );
             for path in original_paths.iter().chain(attempts.last().unwrap()) {
                 assert!(
@@ -269,6 +693,13 @@ mod pk_dv_retry {
                     assert!(table.file_io().exists(&path).await.unwrap());
                 }
             }
+            let published = manager.get_latest_snapshot().await.unwrap().unwrap();
+            assert_eq!(*published.commit_kind(), CommitKind::COMPACT);
+            assert!(!commit
+                .read_delta_entries(None, &published)
+                .await
+                .unwrap()
+                .is_empty());
             let masks = vectors(&table).await.0;
             assert_eq!(masks[&anchor], [42, 500].into_iter().collect());
             assert_eq!(masks[&unrelated], [0].into_iter().collect());

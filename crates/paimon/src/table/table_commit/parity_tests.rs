@@ -1117,7 +1117,8 @@ async fn rest_commit_uses_catalog_snapshot_schema_and_retry_identity() {
     use crate::common::Options;
     use axum::{
         body::Bytes,
-        http::{Method, Uri},
+        http::{Method, StatusCode, Uri},
+        response::IntoResponse,
         Json, Router,
     };
     use std::sync::Mutex;
@@ -1144,14 +1145,17 @@ async fn rest_commit_uses_catalog_snapshot_schema_and_retry_identity() {
                 let next: Snapshot = serde_json::from_value(request["snapshot"].clone()).unwrap();
                 assert_eq!(next.id(), snapshot.lock().unwrap().id() + 1);
                 *snapshot.lock().unwrap() = next;
-                // Force the retry/deduplication path after catalog publication.
-                serde_json::json!({"success": false})
+                // The publication succeeded, but its response was lost.
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"code": 500, "message": "lost commit response"})),
+                ).into_response();
             } else if uri.path().ends_with("/snapshot") {
                 serde_json::json!({"snapshot": {"snapshot": *snapshot.lock().unwrap(), "recordCount": 10}})
             } else {
                 serde_json::json!({"schemaId": 3})
             };
-            Json(response)
+            Json(response).into_response()
         }
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

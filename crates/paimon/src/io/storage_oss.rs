@@ -154,8 +154,9 @@ mod tests {
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::{header, HeaderMap, Response, StatusCode};
-    use axum::routing::get;
+    use axum::routing::{get, put};
     use axum::Router;
+    use bytes::Bytes;
 
     use super::*;
 
@@ -284,6 +285,53 @@ mod tests {
         let op = oss_config_build(&storage_config(cfg), "oss://bucket/path").unwrap();
         assert_eq!(op.read("object").await.unwrap().to_bytes(), "ok");
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_oss_replayed_conditional_put_reports_conflict_after_publication() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let object = Arc::new(Mutex::new(None));
+        let app = Router::new().fallback(put({
+            let attempts = attempts.clone();
+            let object = object.clone();
+            move |headers: HeaderMap, body: Bytes| {
+                let object = object.clone();
+                let attempts = attempts.clone();
+                async move {
+                    assert_eq!(headers["x-oss-forbid-overwrite"], "true");
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let mut object = object.lock().unwrap();
+                    if let Some(published) = object.as_ref() {
+                        assert_eq!(published, &body);
+                        return Response::builder()
+                            .status(StatusCode::CONFLICT)
+                            .body(Body::from("<Error><Code>FileAlreadyExists</Code><Message>exists</Message></Error>"))
+                            .unwrap();
+                    }
+                    *object = Some(body);
+                    temporary_failure()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = OssConfig::default();
+        cfg.endpoint = Some(format!("http://{}", listener.local_addr().unwrap()));
+        cfg.addressing_style = Some("path".into());
+        cfg.skip_signature = true;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let operator = oss_config_build(&storage_config(cfg), "oss://bucket/table").unwrap();
+        let io = crate::io::FileIOBuilder::new("file")
+            .with_fs_operator(operator)
+            .build()
+            .unwrap();
+        let body = Bytes::from_static(b"snapshot contents");
+        let published = io
+            .write_atomic_if_not_exists("/table/snapshot/snapshot-1", body.clone())
+            .await;
+        server.abort();
+        assert!(!published.unwrap());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(object.lock().unwrap().as_ref(), Some(&body));
     }
 
     #[tokio::test]

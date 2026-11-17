@@ -34,9 +34,11 @@ use std::sync::Arc;
 /// - `RESTSnapshotCommit` — via Catalog API (e.g. REST)
 #[async_trait]
 pub trait SnapshotCommit: Send + Sync {
-    /// Commit the given snapshot. Returns true if successful, false if
-    /// another writer won the race. `branch` selects the snapshot namespace;
-    /// data files and manifests remain shared under the table location.
+    /// Commit the given snapshot. Returns true on success and false if publication
+    /// was rejected. REST rejection is definite; file publication can reject a
+    /// replay after an earlier storage attempt succeeded.
+    /// `branch` selects the snapshot namespace; data files and manifests remain
+    /// shared under the table location.
     async fn commit(
         &self,
         base_snapshot_uuid: Option<&str>,
