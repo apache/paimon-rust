@@ -61,8 +61,8 @@ pub enum Datum {
     SmallInt(i16),
     Int(i32),
     Long(i64),
-    Float(#[serde(with = "datum_float_bits")] f32),
-    Double(#[serde(with = "datum_double_bits")] f64),
+    Float(f32),
+    Double(f64),
     String(String),
     /// Epoch days since 1970-01-01.
     Date(i32),
@@ -88,25 +88,6 @@ pub enum Datum {
         value: Vec<u8>,
         metadata: Vec<u8>,
     },
-}
-
-// Opaque search tasks preserve NaNs, signed zero and literal bits. REST
-// predicates continue to use the separate Java-compatible JSON codec below.
-mod datum_float_bits {
-    pub fn serialize<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_u32(v.to_bits())
-    }
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
-        <u32 as serde::Deserialize>::deserialize(d).map(f32::from_bits)
-    }
-}
-mod datum_double_bits {
-    pub fn serialize<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_u64(v.to_bits())
-    }
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
-        <u64 as serde::Deserialize>::deserialize(d).map(f64::from_bits)
-    }
 }
 
 impl fmt::Display for Datum {

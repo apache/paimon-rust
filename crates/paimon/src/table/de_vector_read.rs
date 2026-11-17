@@ -25,7 +25,8 @@ use crate::spec::{
 use crate::table::de_vector_scan::DeVectorScanPlan;
 use crate::table::global_index_scanner::{
     deleted_row_ranges_for_data_evolution_dvs, search_limit_with_deleted_rows,
-    unindexed_ranges_for_global_index_entries, GlobalIndexScanner, RowRangeIndex,
+    unindexed_ranges_for_global_index_entries, unindexed_ranges_for_indexed_coverage,
+    GlobalIndexScanner, RowRangeIndex,
 };
 use crate::table::global_index_search_filter::matching_row_ids_for_filter;
 use crate::table::global_index_types::normalize_queryable_global_index_type;
@@ -215,7 +216,6 @@ impl DeVectorRead {
             timing,
             skip_search,
             source_splits,
-            raw_sources_are_automatic,
         } = plan;
         let table = Arc::new(table);
         let make_results = |results: Vec<ScoredRowIds>| {
@@ -262,7 +262,6 @@ impl DeVectorRead {
                 &vector_searches,
                 executor,
                 source_splits.as_deref(),
-                raw_sources_are_automatic,
             )
             .await?
         };
@@ -730,14 +729,11 @@ async fn evaluate_vector_search(
     crate::table::vector_search_common::take_only_result(results, "vector search")?.to_row_ranges()
 }
 
-/// None means the scalar index cannot evaluate the filter: Java routes all
-/// vector-index-covered ranges to raw scoring in that case, even in FAST mode.
-async fn scalar_matched_row_ids(
+/// Search pre-filters and coverage planning use the same single-field indexes.
+pub(super) fn scalar_filter_scanner(
     evaluation: VectorSearchEvaluation<'_>,
     entries: &[IndexManifestEntry],
-    vector_ranges: &[RowRange],
-    filter: &Predicate,
-) -> crate::Result<Option<RoaringTreemap>> {
+) -> crate::Result<Option<GlobalIndexScanner>> {
     // Java search pre-filters use per-column coverage and exclude multi-field
     // definitions, even though ordinary table scans can use composite indexes.
     let scalar_entries: Vec<_> = entries
@@ -775,10 +771,21 @@ async fn scalar_matched_row_ids(
             crate::fm_index::FMReadOptions::default()
         },
     )?;
-    let Some(scanner) = scanner else {
+    scanner
+        .map(|scanner| scanner.with_field_options(evaluation.table_options, &scalar_entries))
+        .transpose()
+}
+
+/// None selects one ANN query followed by exact candidate filtering.
+async fn scalar_matched_row_ids(
+    evaluation: VectorSearchEvaluation<'_>,
+    entries: &[IndexManifestEntry],
+    vector_ranges: &[RowRange],
+    filter: &Predicate,
+) -> crate::Result<Option<RoaringTreemap>> {
+    let Some(scanner) = scalar_filter_scanner(evaluation, entries)? else {
         return Ok(None);
     };
-    let scanner = scanner.with_field_options(evaluation.table_options, &scalar_entries)?;
     let Some((ranges, exact, candidate_ranges)) =
         scanner.matching_ranges_with_exactness(filter).await?
     else {
@@ -798,7 +805,7 @@ async fn scalar_matched_row_ids(
     if candidates.is_empty() {
         return Ok(Some(matched));
     }
-    if !core.global_index_filter_refine_from_data() {
+    if !CoreOptions::new(evaluation.table_options).global_index_filter_refine_from_data() {
         log::warn!("Scalar global index only provides candidates for {filter:?}; global-index.filter.refine-from-data is false, so indexed candidates are excluded");
         return Ok(Some(matched));
     }
@@ -810,7 +817,7 @@ async fn scalar_matched_row_ids(
     Ok(Some(matched))
 }
 
-fn scalar_row_ids(ranges: &[RowRange]) -> crate::Result<RoaringTreemap> {
+pub(super) fn scalar_row_ids(ranges: &[RowRange]) -> crate::Result<RoaringTreemap> {
     let mut row_ids = RoaringTreemap::new();
     for range in ranges {
         let start = u64::try_from(range.from()).map_err(|_| crate::Error::DataInvalid {
@@ -838,7 +845,6 @@ async fn evaluate_batch_vector_search(
         vector_searches,
         None,
         None,
-        false,
     )
     .await
 }
@@ -849,7 +855,6 @@ async fn evaluate_batch_vector_search_with_executor(
     vector_searches: &[VectorSearch],
     executor: Option<&dyn SearchTaskExecutor>,
     sources: Option<&[crate::table::SearchScanSplit]>,
-    raw_sources_are_automatic: bool,
 ) -> crate::Result<Vec<ScoredRowIds>> {
     let timing_enabled = vector_search_timing_enabled();
     let total_start = timing_enabled.then(Instant::now);
@@ -1312,14 +1317,17 @@ async fn evaluate_batch_vector_search_with_executor(
                 &detail_ranges,
                 is_vector_global_index_file,
             );
-            if let (Some(filter), Some(scalar_mode)) = (&scalar_filter, scalar_search_mode) {
+            if let (Some(filter), Some(scalar_mode), None) =
+                (&scalar_filter, scalar_search_mode, &post_filter_predicate)
+            {
                 let mut scalar_ranges = scalar_unindexed_ranges(
                     evaluation,
                     index_entries,
                     filter,
                     scalar_mode,
                     &detail_ranges,
-                );
+                )
+                .await?;
                 // Scalar FULL/DETAIL also recover gaps inside vector coverage. In
                 // vector FAST they must not expand beyond the indexed corpus.
                 if search_mode == GlobalIndexSearchMode::Fast {
@@ -1329,11 +1337,6 @@ async fn evaluate_batch_vector_search_with_executor(
             }
             ranges
         };
-        if (sources.is_none() || raw_sources_are_automatic) && post_filter_predicate.is_some() {
-            // Only trim automatically derived scalar gaps. Explicit source
-            // plans retain all of their requested exact-scoring work.
-            raw_ranges = super::source::exclude_row_ranges(&raw_ranges, &vector_ranges);
-        }
         raw_ranges = merge_row_ranges(raw_ranges);
         if !raw_ranges.is_empty() {
             let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
@@ -1432,27 +1435,70 @@ async fn evaluate_batch_vector_search_with_executor(
     Ok(results)
 }
 
-/// Predicate coverage requires every referenced field to be covered by a
-/// single-field scalar index. Reuse the table scanner's coverage accounting.
-pub(super) fn scalar_unindexed_ranges(
+/// Recover partial row coverage only when an index can evaluate the predicate.
+/// An unsupported predicate uses post-filtering and needs no scalar-gap scan.
+pub(super) async fn scalar_unindexed_ranges(
     evaluation: VectorSearchEvaluation<'_>,
     entries: &[IndexManifestEntry],
     filter: &Predicate,
     search_mode: GlobalIndexSearchMode,
     data_ranges: &[RowRange],
-) -> Vec<RowRange> {
-    if evaluation.next_row_id.is_none_or(|next| next <= 0) {
-        return Vec::new();
+) -> crate::Result<Vec<RowRange>> {
+    if search_mode == GlobalIndexSearchMode::Fast {
+        return Ok(Vec::new());
     }
     let mut leaf_refs = Vec::new();
     crate::arrow::residual::collect_predicate_leaf_refs(filter, &mut leaf_refs);
-    let field_ids = leaf_refs
+    let field_ids: HashSet<_> = leaf_refs
         .into_iter()
         .filter_map(|(column, _)| find_field_id_by_name(evaluation.schema_fields, column))
         .collect();
+    let data_ranges = scalar_coverage_gaps(
+        evaluation,
+        entries,
+        &HashSet::new(),
+        search_mode,
+        data_ranges,
+    );
+    // Most queries have either full coverage or no scalar indexes. Avoid
+    // opening index readers in planning unless a field has partial coverage.
+    let has_partial_coverage = field_ids.into_iter().any(|field_id| {
+        let gaps = scalar_coverage_gaps(
+            evaluation,
+            entries,
+            &HashSet::from([field_id]),
+            search_mode,
+            &data_ranges,
+        );
+        !gaps.is_empty() && gaps != data_ranges
+    });
+    if !has_partial_coverage {
+        return Ok(Vec::new());
+    }
+    let Some(scanner) = scalar_filter_scanner(evaluation, entries)? else {
+        return Ok(Vec::new());
+    };
+    let Some(coverage) = scanner.matching_indexed_coverage(filter).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(unindexed_ranges_for_indexed_coverage(
+        &coverage,
+        search_mode,
+        evaluation.next_row_id,
+        &data_ranges,
+    ))
+}
+
+pub(super) fn scalar_coverage_gaps(
+    evaluation: VectorSearchEvaluation<'_>,
+    entries: &[IndexManifestEntry],
+    field_ids: &HashSet<i32>,
+    search_mode: GlobalIndexSearchMode,
+    data_ranges: &[RowRange],
+) -> Vec<RowRange> {
     unindexed_ranges_for_global_index_entries(
         entries,
-        &field_ids,
+        field_ids,
         search_mode,
         evaluation.next_row_id,
         data_ranges,

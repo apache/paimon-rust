@@ -54,6 +54,75 @@ fn same_vector_search_table(left: &Table, right: &Table) -> bool {
 }
 
 impl Table {
+    /// Pin and reuse a scalar index answer when it is exact and covers every
+    /// snapshot row. Returns `None` for unsupported or partially covered
+    /// predicates without reading scalar data files.
+    pub async fn try_prepare_indexed_vector_search_filter(
+        &self,
+        filter: Predicate,
+    ) -> crate::Result<Option<PreparedVectorSearchFilter>> {
+        let core = CoreOptions::new(self.schema().options());
+        core.ensure_read_authorized()?;
+        if !core.data_evolution_enabled() {
+            return Ok(None);
+        }
+        let plan = DeVectorScan::new(self, Some(&filter), None, None)
+            .plan()
+            .await?;
+        if plan.skip_search {
+            return Ok(Some(PreparedVectorSearchFilter {
+                table: plan.table.copy_with_pinned_snapshot(None),
+                include_row_ids: Arc::new(RoaringTreemap::new()),
+            }));
+        }
+        let Some(next_row_id) = plan.next_row_id.filter(|id| *id > 0) else {
+            return Ok(None);
+        };
+        let table = &plan.table;
+        let evaluation = super::de_vector_read::VectorSearchEvaluation {
+            table: Some(table),
+            file_io: table.file_io(),
+            table_path: table.location(),
+            table_options: table.schema().options(),
+            schema_fields: table.schema().fields(),
+            next_row_id: Some(next_row_id),
+            filter: Some(&filter),
+        };
+        let mut leaves = Vec::new();
+        crate::arrow::residual::collect_predicate_leaf_refs(&filter, &mut leaves);
+        let field_ids = leaves
+            .into_iter()
+            .filter_map(|(column, _)| super::find_field_id_by_name(table.schema().fields(), column))
+            .collect();
+        if !super::de_vector_read::scalar_coverage_gaps(
+            evaluation,
+            &plan.index_entries,
+            &field_ids,
+            crate::spec::GlobalIndexSearchMode::Full,
+            &[],
+        )
+        .is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(scanner) =
+            super::de_vector_read::scalar_filter_scanner(evaluation, &plan.index_entries)?
+        else {
+            return Ok(None);
+        };
+        let Some(ranges) = scanner
+            .matching_exact_ranges(&filter, &[super::RowRange::new(0, next_row_id - 1)])
+            .await?
+        else {
+            return Ok(None);
+        };
+        let include_row_ids = super::de_vector_read::scalar_row_ids(&ranges)?;
+        Ok(Some(PreparedVectorSearchFilter {
+            table: plan.table,
+            include_row_ids: Arc::new(include_row_ids),
+        }))
+    }
+
     /// Resolve a scalar predicate once and pin all later vector-search/read
     /// stages to the same snapshot.
     pub async fn prepare_vector_search_filter(
@@ -112,7 +181,6 @@ pub(super) struct DeVectorScanPlan {
     pub(super) skip_search: bool,
     /// Source metadata supplied by a transportable public plan.
     pub(super) source_splits: Option<Vec<crate::table::SearchScanSplit>>,
-    pub(super) raw_sources_are_automatic: bool,
 }
 
 impl DeVectorScanPlan {
@@ -126,7 +194,6 @@ impl DeVectorScanPlan {
             next_row_id: None,
             timing,
             source_splits: None,
-            raw_sources_are_automatic: false,
         }
     }
 }

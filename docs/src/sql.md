@@ -2850,6 +2850,8 @@ Increase the factor to check more candidates, at additional query and scalar
 read cost. Post-filtering retains ANN's approximate recall. Raw work outside
 vector-index coverage still follows `fast`, `full`, and `detail` search modes;
 explicitly supplied Raw sources retain their exact scoring.
+When a scalar index can evaluate the predicate but covers only part of the row
+range, scalar `full` and `detail` modes still plan Raw work for its coverage gaps.
 
 Only predicates that can be translated completely to Paimon predicates are
 pushed into vector search. DataFusion keeps its residual filter for ordinary

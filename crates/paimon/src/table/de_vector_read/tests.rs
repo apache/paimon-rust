@@ -1683,7 +1683,7 @@ async fn filtered_rerank_rejects_metric_from_a_skipped_shard() {
 }
 
 #[test]
-fn scalar_unindexed_coverage_intersects_all_predicate_fields() {
+fn scalar_coverage_gaps_use_single_field_definitions() {
     let io = FileIOBuilder::new("memory").build().unwrap();
     let options = HashMap::new();
     let fields = vec![make_field(1, "id"), make_field(2, "other")];
@@ -1700,40 +1700,32 @@ fn scalar_unindexed_coverage_intersects_all_predicate_fields() {
     let meta = composite.index_file.global_index_meta.as_mut().unwrap();
     meta.row_range_end = 19;
     meta.extra_field_ids = Some(vec![2]);
-    let builder = crate::spec::PredicateBuilder::new(&fields);
-    let predicates = vec![
-        builder.equal("id", crate::spec::Datum::Int(7)).unwrap(),
-        builder.equal("other", crate::spec::Datum::Int(7)).unwrap(),
-    ];
-    for filter in [
-        Predicate::and(predicates.clone()),
-        Predicate::or(predicates),
-    ] {
+    for field_ids in [HashSet::from([2]), HashSet::from([1, 2])] {
         let entries = vec![id.clone(), other.clone(), composite.clone()];
         assert_eq!(
-            scalar_unindexed_ranges(
+            scalar_coverage_gaps(
                 evaluation,
                 &entries,
-                &filter,
+                &field_ids,
                 GlobalIndexSearchMode::Full,
                 &[]
             ),
             vec![RowRange::new(5, 19)]
         );
         assert_eq!(
-            scalar_unindexed_ranges(
+            scalar_coverage_gaps(
                 evaluation,
                 &entries,
-                &filter,
+                &field_ids,
                 GlobalIndexSearchMode::Detail,
                 &[RowRange::new(0, 9), RowRange::new(15, 17)]
             ),
             vec![RowRange::new(5, 9), RowRange::new(15, 17)]
         );
-        assert!(scalar_unindexed_ranges(
+        assert!(scalar_coverage_gaps(
             evaluation,
             &entries,
-            &filter,
+            &field_ids,
             GlobalIndexSearchMode::Fast,
             &[]
         )
@@ -1741,10 +1733,10 @@ fn scalar_unindexed_coverage_intersects_all_predicate_fields() {
         // An index from another family cannot fill scalar coverage.
         id.index_file.index_type = "full-text".to_string();
         assert_eq!(
-            scalar_unindexed_ranges(
+            scalar_coverage_gaps(
                 evaluation,
                 &[id.clone(), other.clone()],
-                &filter,
+                &HashSet::from([1, 2]),
                 GlobalIndexSearchMode::Full,
                 &[]
             ),
@@ -2017,11 +2009,7 @@ async fn explicit_overlapping_raw_source_recovers_an_ann_miss() {
         index_type: Some("ivf-flat".into()),
     });
     let plan = crate::table::VectorScanPlan::new(plan.snapshot().cloned(), sources).unwrap();
-    // Plans transported before provenance was introduced remain authoritative.
-    let mut wire = serde_json::to_value(&plan).unwrap();
-    wire.as_object_mut()
-        .unwrap()
-        .remove("raw_sources_are_automatic");
+    let wire = serde_json::to_value(&plan).unwrap();
     let plan = serde_json::from_value(wire).unwrap();
     let result = builder
         .new_read()

@@ -85,22 +85,8 @@ mod tests {
         }
     }
     #[test]
-    fn task_literal_transport_preserves_nan_signed_zero_and_decimal() {
+    fn task_literal_transport_preserves_decimal() {
         use crate::spec::Datum;
-        for bits in [f32::NAN.to_bits(), (-0.0f32).to_bits()] {
-            let json = serde_json::to_value(Datum::Float(f32::from_bits(bits))).unwrap();
-            let Datum::Float(value) = serde_json::from_value(json).unwrap() else {
-                panic!()
-            };
-            assert_eq!(value.to_bits(), bits);
-        }
-        for bits in [f64::NAN.to_bits(), (-0.0f64).to_bits()] {
-            let json = serde_json::to_value(Datum::Double(f64::from_bits(bits))).unwrap();
-            let Datum::Double(value) = serde_json::from_value(json).unwrap() else {
-                panic!()
-            };
-            assert_eq!(value.to_bits(), bits);
-        }
         let decimal = Datum::Decimal {
             unscaled: i128::MAX,
             precision: 38,

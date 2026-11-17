@@ -33,9 +33,9 @@ mod row_ranges;
 pub(crate) use deletion_vectors::deleted_row_ranges_for_data_evolution_dvs;
 use entry::{validate_fm_file_sets, GlobalIndexEntry, GlobalIndexEntryMeta, GlobalIndexFileKind};
 pub(super) use row_ranges::intersect_sorted_ranges;
-use row_ranges::unindexed_ranges_for_indexed_coverage;
 pub(crate) use row_ranges::{
-    search_limit_with_deleted_rows, unindexed_ranges_for_global_index_entries, RowRangeIndex,
+    search_limit_with_deleted_rows, unindexed_ranges_for_global_index_entries,
+    unindexed_ranges_for_indexed_coverage, RowRangeIndex,
 };
 
 use super::global_index_types::{
@@ -549,6 +549,37 @@ impl GlobalIndexScanner {
         let exact = result.fully_evaluated
             && self.is_exact_predicate(predicate, &result.evaluated_field_ids);
         Ok(Some((result.row_ranges, exact, result.candidate_ranges)))
+    }
+
+    /// Coverage of indexes which actually contributed to this evaluation.
+    pub(super) async fn matching_indexed_coverage(
+        &self,
+        predicate: &Predicate,
+    ) -> Result<Option<Vec<RowRange>>> {
+        Ok(self
+            .evaluate(predicate)
+            .await?
+            .map(|result| result.indexed_coverage))
+    }
+
+    /// An exact reusable answer must also cover every row the caller can read.
+    pub(super) async fn matching_exact_ranges(
+        &self,
+        predicate: &Predicate,
+        required_coverage: &[RowRange],
+    ) -> Result<Option<Vec<RowRange>>> {
+        let Some(result) = self.evaluate(predicate).await? else {
+            return Ok(None);
+        };
+        if !result.fully_evaluated
+            || !self.is_exact_predicate(predicate, &result.evaluated_field_ids)
+            || !result.candidate_ranges.is_empty()
+            || !super::source::exclude_row_ranges(required_coverage, &result.indexed_coverage)
+                .is_empty()
+        {
+            return Ok(None);
+        }
+        Ok(Some(result.row_ranges))
     }
 
     fn is_exact_predicate(
