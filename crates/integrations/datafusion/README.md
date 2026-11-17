@@ -77,7 +77,7 @@ allocation overhead are not fully accounted, so the pool is not an RSS limit.
 
 ## REST Catalog views and SQL functions
 
-`SQLContext` can read, execute, create, and drop persistent views and can create SQL scalar functions in a Paimon REST Catalog:
+`SQLContext` can read, execute, create, and drop persistent views and SQL scalar functions in a Paimon REST Catalog:
 
 ```sql
 CREATE VIEW [IF NOT EXISTS] view_name [(column_name, ...)] AS query;
@@ -87,6 +87,8 @@ CREATE FUNCTION [IF NOT EXISTS] function_name([parameter_name data_type, ...])
 RETURNS data_type
 [LANGUAGE SQL]
 RETURN scalar_expression;
+
+DROP FUNCTION [IF EXISTS] function_name;
 ```
 
 - A persistent view is resolved lazily like a table. The `datafusion` dialect is preferred and the
@@ -109,8 +111,12 @@ RETURN scalar_expression;
   inferred and validated from the planned expression before sending the REST create request. Bare,
   two-part, and three-part creation targets are supported; calls remain limited to bare and
   three-part names.
+- Persistent `DROP FUNCTION` accepts bare, two-part, and three-part names and sends one direct
+  REST delete request. `IF EXISTS` ignores only a missing function. Multiple targets, argument
+  signatures, `CASCADE`, `RESTRICT`, and `DROP TEMPORARY FUNCTION` are not supported for Paimon catalogs.
+  Catalogs without persistent function support may return `Unsupported`.
 - `CREATE OR REPLACE VIEW`, materialized/secure views, comments/options, persistent `ALTER VIEW`,
-  `CREATE OR REPLACE/ALTER/TEMPORARY FUNCTION`, and persistent `ALTER FUNCTION` / `DROP FUNCTION`
+  `CREATE OR REPLACE/ALTER/TEMPORARY FUNCTION`, and persistent `ALTER FUNCTION`
   are not supported. Lambda/file, aggregate/table/multi-return, non-deterministic, Stable/Volatile,
   and non-SQL functions are also not supported.
 
