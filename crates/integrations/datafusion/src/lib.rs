@@ -69,6 +69,7 @@ mod partition_functions;
 mod physical_plan;
 mod primary_key_dml;
 mod procedures;
+mod read_files;
 mod regex_operators;
 mod relation_planner;
 pub mod runtime;

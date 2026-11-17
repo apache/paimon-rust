@@ -120,6 +120,25 @@ stream.
 not statements Paimon handles itself, such as `DELETE`, `UPDATE`, or `DROP TABLE`
 on a Paimon table.
 
+### Reading Files
+
+`SQLContext` also provides the Databricks-style `read_files` SQL table function.
+It is available immediately, without a separate directory registration:
+
+```python
+batches = ctx.sql("SELECT value FROM read_files('/path/to/imports/log.txt', format => 'text')")
+batches = ctx.sql("SELECT * FROM read_files('oss://my-bucket/imports/*.parquet')")
+```
+
+The supported formats are CSV, Parquet, JSON/NDJSON, TEXT and `binaryFile`.
+Matching Catalog/table FileIO instances are reused from the session. Table IO
+routes are shared with blob readers; Catalog warehouse fallbacks apply only to
+`read_files`. Other paths use a configured DataFusion object store or
+Paimon's default FileIO. Storage and local process permissions apply; raw file
+reads do not perform catalog table permission checks. HTTP/HTTPS file URLs are
+unsupported. See [Reading files](sql.md#reading-files-with-read_files) for named
+options, metadata and compatibility limits.
+
 ### Runtime Resource Configuration
 
 `SQLContext` can use a bounded DataFusion memory pool and a dedicated temporary

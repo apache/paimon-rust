@@ -161,8 +161,7 @@ impl PaimonTableProvider {
     ) -> DFResult<Self> {
         let identifier = table.identifier().clone();
         crate::table_loader::ensure_paimon_served(&table, &identifier)?;
-        blob_reader_registry
-            .register_if_absent(table.location().to_string(), table.file_io().clone());
+        blob_reader_registry.register_location_if_absent(table.location(), table.file_io().clone());
         Self::try_new(table)
     }
 
@@ -173,8 +172,7 @@ impl PaimonTableProvider {
     ) -> DFResult<Self> {
         let identifier = table.identifier().clone();
         crate::table_loader::ensure_paimon_served(&table, &identifier)?;
-        blob_reader_registry
-            .register_if_absent(table.location().to_string(), table.file_io().clone());
+        blob_reader_registry.register_location_if_absent(table.location(), table.file_io().clone());
         Self::try_new_with_table_definition(table, table_definition)
     }
 
