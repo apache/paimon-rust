@@ -22,7 +22,6 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Int32Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::ScalarValue;
-use datafusion::datasource::MemTable;
 use paimon_datafusion::SQLContext;
 
 async fn rows(ctx: &SQLContext, sql: &str) -> Vec<Vec<String>> {
@@ -47,107 +46,6 @@ async fn rows(ctx: &SQLContext, sql: &str) -> Vec<Vec<String>> {
             })
         })
         .collect()
-}
-
-#[tokio::test]
-async fn sort_by_sorts_each_partition_without_merging() {
-    let ctx = SQLContext::new();
-    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
-    let batch = |values: Vec<Option<i32>>| {
-        RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(values))],
-        )
-        .unwrap()
-    };
-    let table = MemTable::try_new(
-        schema.clone(),
-        vec![
-            vec![batch(vec![Some(8), None]), batch(vec![Some(2), Some(6)])],
-            vec![batch(vec![Some(9), Some(1)]), batch(vec![Some(7), Some(3)])],
-        ],
-    )
-    .unwrap();
-    ctx.ctx()
-        .register_table("numbers", Arc::new(table))
-        .unwrap();
-    let partitions = ctx
-        .sql("SELECT v FROM numbers SORT BY v ASC NULLS FIRST")
-        .await
-        .unwrap()
-        .collect_partitioned()
-        .await
-        .unwrap();
-    let values = partitions
-        .iter()
-        .map(|batches| {
-            batches
-                .iter()
-                .flat_map(|batch| {
-                    batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .unwrap()
-                        .iter()
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        values,
-        vec![
-            vec![None, Some(2), Some(6), Some(8)],
-            vec![Some(1), Some(3), Some(7), Some(9)]
-        ]
-    );
-    assert_eq!(
-        rows(
-            &ctx,
-            "SELECT v FROM numbers ORDER BY v DESC NULLS LAST LIMIT 3"
-        )
-        .await,
-        vec![vec!["9"], vec!["8"], vec!["7"]]
-    );
-}
-
-#[tokio::test]
-async fn sort_by_handles_nested_queries_aliases_hidden_keys_and_limit() {
-    let ctx = SQLContext::new();
-    assert_eq!(
-        rows(
-            &ctx,
-            "SELECT v AS x FROM (VALUES (3,1),(1,3),(2,2)) t(v,k) SORT BY k DESC LIMIT 2"
-        )
-        .await,
-        vec![vec!["1"], vec!["2"]]
-    );
-    assert_eq!(
-        rows(&ctx, "WITH t AS (SELECT v FROM (VALUES (3),(1),(2)) t(v) SORT BY v DESC) SELECT v + 10 AS x FROM t SORT BY x").await,
-        vec![vec!["11"], vec!["12"], vec!["13"]]
-    );
-    assert_eq!(
-        rows(
-            &ctx,
-            "SELECT v IS NULL AS missing FROM (VALUES (1),(NULL)) t(v) SORT BY v"
-        )
-        .await,
-        vec![vec!["true"], vec!["false"]]
-    );
-    assert_eq!(
-        rows(
-            &ctx,
-            "SELECT v IS NULL AS missing FROM (VALUES (NULL),(1)) t(v) SORT BY v DESC"
-        )
-        .await,
-        vec![vec!["false"], vec!["true"]]
-    );
-    common::assert_sql_error(
-        &ctx,
-        "SELECT v FROM (VALUES (1)) t(v) SORT BY v ORDER BY v",
-        "ORDER BY",
-    )
-    .await;
 }
 
 #[tokio::test]
@@ -319,88 +217,6 @@ async fn show_create_native_view_preserves_creation_namespace() {
 }
 
 #[tokio::test]
-async fn sort_by_limit_all_preserves_sort() {
-    let ctx = SQLContext::new();
-    assert_eq!(
-        rows(
-            &ctx,
-            "SELECT v FROM (VALUES (3),(1),(2)) t(v) SORT BY v LIMIT ALL"
-        )
-        .await,
-        vec![vec!["1"], vec!["2"], vec!["3"]]
-    );
-}
-
-#[tokio::test]
-async fn sort_by_preserves_pipe_limit_and_projection() {
-    let ctx = SQLContext::new();
-    assert_eq!(
-        rows(
-            &ctx,
-            "SELECT v FROM (VALUES (3),(1),(2)) t(v) SORT BY v |> LIMIT 1"
-        )
-        .await,
-        vec![vec!["1"]]
-    );
-    assert_eq!(
-        rows(
-            &ctx,
-            "SELECT v FROM (VALUES (3),(1),(2)) t(v) SORT BY v |> SELECT v + 10 AS x"
-        )
-        .await,
-        vec![vec!["11"], vec!["12"], vec!["13"]]
-    );
-    assert_eq!(
-        rows(
-            &ctx,
-            "SELECT v FROM (VALUES (3),(1),(2)) t(v) SORT BY v DESC |> ORDER BY v ASC"
-        )
-        .await,
-        vec![vec!["1"], vec!["2"], vec!["3"]]
-    );
-}
-
-#[tokio::test]
-async fn sort_by_distinct_on_reports_user_error() {
-    let ctx = SQLContext::new();
-    let error = ctx
-        .sql("SELECT DISTINCT ON (v) v FROM (VALUES (3),(1),(2)) t(v) SORT BY v")
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, datafusion::common::DataFusionError::Plan(_)),
-        "{error}"
-    );
-}
-
-#[tokio::test]
-async fn sort_by_orders_all_union_partitions() {
-    let ctx = SQLContext::new();
-    let partitions = ctx.sql("SELECT v FROM (VALUES (3),(1)) t(v) UNION ALL SELECT v FROM (VALUES (2),(0)) u(v) SORT BY v")
-        .await.unwrap().collect_partitioned().await.unwrap();
-    let mut all = Vec::new();
-    for batches in partitions {
-        let values = batches
-            .iter()
-            .flat_map(|batch| {
-                (0..batch.num_rows()).map(|row| {
-                    match ScalarValue::try_from_array(batch.column(0), row).unwrap() {
-                        ScalarValue::Int64(Some(value)) => value,
-                        value => panic!("unexpected value: {value:?}"),
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut sorted = values.clone();
-        sorted.sort();
-        assert_eq!(values, sorted);
-        all.extend(values);
-    }
-    all.sort();
-    assert_eq!(all, vec![0, 1, 2, 3]);
-}
-
-#[tokio::test]
 async fn group_concat_order_position_refers_to_aggregate_arguments() {
     let ctx = SQLContext::new();
     assert_eq!(
@@ -489,11 +305,4 @@ async fn group_concat_formats_single_and_multiple_arguments_consistently() {
         let result = rows(&ctx, &format!("SELECT group_concat(v SEPARATOR '|'), group_concat(v, '' SEPARATOR '|') FROM (VALUES ({value})) t(v)")).await;
         assert_eq!(result[0][0], result[0][1], "{value}: {result:?}");
     }
-}
-
-#[tokio::test]
-async fn sort_by_preserves_ctes_in_pipe_operators() {
-    let ctx = SQLContext::new();
-    assert_eq!(rows(&ctx, "WITH t AS (SELECT 1 AS v), u AS (SELECT 2 AS w) SELECT v FROM t SORT BY v |> JOIN u ON true").await,
-        vec![vec!["1", "2"]]);
 }

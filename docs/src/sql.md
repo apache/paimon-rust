@@ -49,18 +49,6 @@ For the exact delegated SQL grammar, see the [DataFusion SQL Reference](https://
 
 ### SQL compatibility
 
-`SORT BY` sorts rows within each execution partition and preserves the input
-partitions. Use `ORDER BY` when the result must be globally ordered. Sort keys
-support expressions, output aliases, column positions, `ASC`/`DESC`, and
-`NULLS FIRST`/`NULLS LAST`. The default is `ASC NULLS FIRST` or `DESC NULLS LAST`.
-Trailing `SORT BY` applies to an entire set query, including `UNION`.
-CTEs and pipe operators retain their query scopes. `SORT BY` cannot be combined
-with `ORDER BY` or PostgreSQL's `DISTINCT ON` in the same query block.
-
-```sql
-SELECT id, name FROM users SORT BY name ASC, id DESC;
-```
-
 `GROUP_CONCAT` joins non-NULL values with a comma by default. `SEPARATOR` accepts
 a string literal, including an empty string. Multiple arguments are concatenated
 within each row; a row with any NULL argument is skipped. Empty groups and
@@ -79,7 +67,7 @@ deduplication and sorting.
 SELECT group_concat(DISTINCT name ORDER BY name SEPARATOR ' | ') FROM users;
 ```
 
-These query forms also work in Paimon persistent and temporary view definitions.
+`GROUP_CONCAT` also works in Paimon persistent and temporary view definitions.
 
 ### DataFusion 55 integration
 

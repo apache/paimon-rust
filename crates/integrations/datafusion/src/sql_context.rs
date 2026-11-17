@@ -163,7 +163,6 @@ impl SQLContextBuilder {
             .with_spark_features()
             .with_type_planner(Arc::new(crate::binary_cast::BinaryTypePlanner))
             .with_relation_planners(vec![
-                Arc::new(crate::sort_by::SortByRelationPlanner),
                 Arc::new(crate::lateral_views::ExplodeRelationPlanner),
                 Arc::new(crate::relation_planner::PaimonRelationPlanner::new()),
             ])
@@ -520,8 +519,7 @@ impl SQLContext {
             let lateral_changed = crate::lateral_views::rewrite(&mut statements[0])?;
             let compat_changed =
                 crate::expression_compat::rewrite(&mut statements[0], &self.ctx.state())?;
-            let sort_changed = crate::sort_by::rewrite(&mut statements[0])?;
-            binary_changed || regex_changed || lateral_changed || compat_changed || sort_changed
+            binary_changed || regex_changed || lateral_changed || compat_changed
         };
         let sql = if changed {
             rewritten = statements[0].to_string();
@@ -5446,10 +5444,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn views_preserve_and_execute_sort_by_and_group_concat_sql() {
+    async fn views_preserve_and_execute_group_concat_sql() {
         let catalog = Arc::new(MockCatalog::new());
         let ctx = make_sql_context(Arc::clone(&catalog)).await;
-        let query = "SELECT group_concat(v ORDER BY v SEPARATOR '|') AS joined FROM (VALUES ('b'),('a')) t(v) SORT BY joined";
+        let query = "SELECT group_concat(v ORDER BY v SEPARATOR '|') AS joined FROM (VALUES ('b'),('a')) t(v)";
         for (modifier, name) in [
             ("", "persistent_compat"),
             ("TEMPORARY ", "temporary_compat"),
@@ -5462,7 +5460,7 @@ mod tests {
                 definition.contains("GROUP_CONCAT") || definition.contains("group_concat"),
                 "{definition}"
             );
-            assert!(definition.contains("SORT BY joined"), "{definition}");
+            assert!(definition.contains("SEPARATOR '|'"), "{definition}");
             assert!(!definition.contains("__paimon"), "{definition}");
             let batches = ctx
                 .sql(&format!("SELECT joined FROM {name}"))
@@ -5482,7 +5480,7 @@ mod tests {
             .get_view(&Identifier::new("default", "persistent_compat"))
             .await
             .unwrap();
-        assert!(view.query_for("datafusion").contains("SORT BY joined"));
+        assert!(view.query_for("datafusion").contains("SEPARATOR '|'"));
     }
 
     #[tokio::test]

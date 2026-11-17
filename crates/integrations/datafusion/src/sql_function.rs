@@ -374,7 +374,6 @@ async fn expand_statement_internal(
             crate::expression_compat::rewrite(&mut statement, state)?;
             crate::binary_cast::rewrite(&mut statement)?;
             crate::regex_operators::rewrite(&mut statement);
-            crate::sort_by::rewrite(&mut statement)?;
             return Ok(statement);
         }
     }
