@@ -358,6 +358,14 @@ The offset must be non-negative, and lengths below `-1` are invalid.
 
 The same directives are supported by `ALTER TABLE ... ADD COLUMN`.
 
+Append-only data-evolution tables can set `video-frame-field` to a
+comma-separated list of scalar BLOB columns. Native writers accept serialized
+`VideoFrameDescriptor` values for these columns and pack complete encoded videos
+into `.video` files, deduplicating each source URI/range within one file and
+indexing logical frame runs. Readers return lazy frame descriptors. Video packing
+does not decode or re-encode frames. Raw video bytes, ordinary BlobDescriptors,
+video-column updates, video compaction, and BlobConsumer callbacks are unsupported.
+
 ### Blob Descriptor Functions
 
 `path_to_descriptor(path)` converts a string path into Java-compatible

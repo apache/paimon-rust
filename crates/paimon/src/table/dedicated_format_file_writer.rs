@@ -46,7 +46,7 @@ struct VectorFieldWriter {
 ///
 /// Remaining columns go to the table's normal append `DataFileWriter`.
 /// Each non-descriptor blob column gets its own `DataFileWriter` with
-/// `file_format = "blob"` and `write_cols = Some(vec![field_name])`.
+/// `file_format = "blob"` (or "video" for video-frame-field) and one write column.
 /// When `vector.file.format` is configured, all VECTOR columns are written
 /// together to a dedicated `*.vector.<format>` file.
 ///
@@ -106,6 +106,7 @@ impl AppendDedicatedFormatFileWriter {
         let mut vector_arrow_fields = Vec::new();
         let mut vector_table_fields = Vec::new();
         let mut vector_field_names = Vec::new();
+        let video_fields = CoreOptions::new(format_options).video_frame_fields();
 
         for (idx, field) in write_fields.iter().enumerate() {
             let is_blob = field.data_type().is_blob_file_field();
@@ -130,7 +131,12 @@ impl AppendDedicatedFormatFileWriter {
                         String::new(),
                         0,
                         write_buffer_size,
-                        "blob".to_string(),
+                        if video_fields.contains(field.name()) {
+                            "video"
+                        } else {
+                            "blob"
+                        }
+                        .to_string(),
                         vec![field.clone()],
                         format_options.clone(),
                         Some(0),

@@ -28,6 +28,65 @@ use super::{
     VectorRead, VectorScanPlan,
 };
 
+/// Low-level packed video encoder for language bindings. The caller owns the
+/// output stream and publication; table writers should use the normal write API.
+pub struct PackedVideoWriter {
+    inner: Option<Box<crate::arrow::format::video::writer::VideoFormatWriter>>,
+}
+
+impl PackedVideoWriter {
+    pub fn new(
+        output: Box<dyn crate::io::FileWrite>,
+        file_io: Option<crate::io::FileIO>,
+        uri_reader_factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
+        copy_buffer_size: usize,
+    ) -> crate::Result<Self> {
+        Ok(Self {
+            inner: Some(Box::new(
+                crate::arrow::format::video::writer::VideoFormatWriter::new(
+                    output,
+                    file_io,
+                    uri_reader_factory,
+                    copy_buffer_size,
+                )?,
+            )),
+        })
+    }
+
+    pub async fn write(&mut self, batch: &arrow_array::RecordBatch) -> crate::Result<()> {
+        use crate::arrow::format::FormatFileWriter;
+        self.inner
+            .as_mut()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "Video writer is closed".into(),
+                source: None,
+            })?
+            .write(batch)
+            .await
+    }
+
+    pub fn num_bytes(&self) -> usize {
+        use crate::arrow::format::FormatFileWriter;
+        self.inner.as_ref().map_or(0, |writer| writer.num_bytes())
+    }
+
+    pub async fn close(&mut self) -> crate::Result<u64> {
+        use crate::arrow::format::FormatFileWriter;
+        let writer = self.inner.take().ok_or_else(|| crate::Error::DataInvalid {
+            message: "Video writer is closed".into(),
+            source: None,
+        })?;
+        Ok(writer.close().await?.file_size)
+    }
+
+    pub async fn abort(&mut self) -> crate::Result<()> {
+        if let Some(writer) = self.inner.take() {
+            writer.abort().await?;
+        }
+        Ok(())
+    }
+}
+
 pub async fn execute_search_task(
     table: &Table,
     task: &[u8],
