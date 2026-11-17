@@ -436,7 +436,7 @@ async fn de_scalar_filter_applies_to_unindexed_raw_fallback() {
 }
 
 #[tokio::test]
-async fn unevaluable_scalar_filter_preserves_matches_in_every_mode() {
+async fn unevaluable_scalar_filter_preserves_ann_hits_in_every_mode() {
     let table = de_vector_table().await;
     for mode in ["fast", "full", "detail"] {
         let table = table.copy_with_options(HashMap::from([(
@@ -449,7 +449,8 @@ async fn unevaluable_scalar_filter_preserves_matches_in_every_mode() {
             .await
             .unwrap();
         // Keep the committed IVF shards but remove the scalar index from this
-        // plan. A data-derived ANN allow-list can lose hits with nprobe=1.
+        // plan. With nprobe=1 the ANN may legitimately return fewer than K;
+        // post-filtering an all-matching predicate must preserve those hits.
         plan.index_entries
             .retain(|entry| entry.index_file.index_type == "ivf-flat");
         let read = DeVectorRead::new(
@@ -459,20 +460,25 @@ async fn unevaluable_scalar_filter_preserves_matches_in_every_mode() {
             &HashMap::from([("ivf.nprobe".to_string(), "1".to_string())]),
         )
         .unwrap();
+        let mut unfiltered = plan.clone();
+        unfiltered.filter = None;
+        let expected = read.read(unfiltered).await.unwrap();
         let results = read.read(plan).await.unwrap();
-        for result in results {
+        for (result, expected) in results.into_iter().zip(expected) {
             let mut ids = result.row_ids().unwrap().row_ids.clone();
             ids.sort_unstable();
-            assert_eq!(ids, vec![0, 1, 2], "{mode}");
+            let mut expected = expected.row_ids().unwrap().row_ids.clone();
+            expected.sort_unstable();
+            assert_eq!(ids, expected, "{mode}");
         }
     }
 }
 
 /// Two physical data files, one vector shard, and no scalar index. Keeping the
 /// files separate lets a missing unrelated file expose accidental full scans.
-async fn iterative_filter_table(shard_size: usize) -> (Table, Vec<String>) {
+async fn post_filter_table(shard_size: usize) -> (Table, Vec<String>) {
     let table =
-        vector_test_table_at("memory:/iterative_vector_filter").copy_with_options(HashMap::from([
+        vector_test_table_at("memory:/post_vector_filter").copy_with_options(HashMap::from([
             ("row-tracking.enabled".into(), "true".into()),
             ("data-evolution.enabled".into(), "true".into()),
             (
@@ -531,8 +537,8 @@ async fn iterative_filter_table(shard_size: usize) -> (Table, Vec<String>) {
 }
 
 #[tokio::test]
-async fn iterative_filter_does_not_scan_unrelated_scalar_data() {
-    let (table, tail_files) = iterative_filter_table(128).await;
+async fn post_filter_does_not_scan_unrelated_scalar_data() {
+    let (table, tail_files) = post_filter_table(128).await;
     for path in tail_files {
         table.file_io().delete_file(&path).await.unwrap();
     }
@@ -560,10 +566,10 @@ async fn iterative_filter_does_not_scan_unrelated_scalar_data() {
 }
 
 #[tokio::test]
-async fn iterative_filter_refills_and_falls_back_with_exact_batch_results() {
-    let (table, _) = iterative_filter_table(128).await;
+async fn post_filter_returns_short_results_without_retry_or_raw_scoring() {
+    let (table, _) = post_filter_table(128).await;
     for mode in ["fast", "full", "detail"] {
-        for (enabled, factor) in [("true", "64"), ("true", "16"), ("false", "16")] {
+        for factor in ["2", "64"] {
             let table = table.copy_with_options(HashMap::from([
                 ("vector-index.search-mode".into(), mode.into()),
                 ("scalar-index.search-mode".into(), "full".into()),
@@ -574,36 +580,30 @@ async fn iterative_filter_refills_and_falls_back_with_exact_batch_results() {
                 .with_query_vectors(vec![vec![0.0, 0.0], vec![127.0, 0.0]])
                 .with_limit(2)
                 .with_filter(id_gt_filter(&table, 90))
-                .with_options(HashMap::from([
-                    (
-                        "vector-index.iterative-filter.enabled".into(),
-                        enabled.into(),
-                    ),
-                    (
-                        "vector-index.iterative-filter.max-candidates-factor".into(),
-                        factor.into(),
-                    ),
-                ]))
+                .with_options(HashMap::from([(
+                    "vector-index.post-filter.candidates-factor".into(),
+                    factor.into(),
+                )]))
                 .execute()
                 .await
                 .unwrap();
             assert_eq!(
                 results[0].row_ids().unwrap().row_ids,
-                vec![91, 92],
-                "{mode} {enabled} {factor}"
+                if factor == "2" { vec![] } else { vec![91, 92] },
+                "{mode} {factor}"
             );
             assert_eq!(
                 results[1].row_ids().unwrap().row_ids,
                 vec![127, 126],
-                "{mode} {enabled} {factor}"
+                "{mode} {factor}"
             );
         }
     }
 }
 
 #[tokio::test]
-async fn iterative_filter_with_an_unindexed_or_arm_avoids_duplicate_raw_scan() {
-    let (table, tail_files) = iterative_filter_table(128).await;
+async fn post_filter_with_an_unindexed_or_arm_avoids_duplicate_raw_scan() {
+    let (table, tail_files) = post_filter_table(128).await;
     table
         .new_global_index_build_builder()
         .with_index_type("btree")
@@ -642,8 +642,38 @@ async fn iterative_filter_with_an_unindexed_or_arm_avoids_duplicate_raw_scan() {
 }
 
 #[tokio::test]
-async fn iterative_filter_keeps_shard_offsets_and_input_allow_lists_on_fallback() {
-    let (table, _) = iterative_filter_table(64).await;
+async fn post_filter_large_batch_reuses_the_reader_across_candidate_chunks() {
+    let (table, _) = post_filter_table(128).await;
+    let queries = (0..8193)
+        .map(|i| vec![if i % 2 == 0 { 0.0 } else { 127.0 }, 0.0])
+        .collect();
+    // C=128 puts 8192 queries in the first candidate chunk and one in the
+    // second. Reopening the stream instead of retaining the reader is an error.
+    let results = table
+        .new_batch_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vectors(queries)
+        .with_limit(1)
+        .with_filter(id_gt_filter(&table, 90))
+        .with_options(HashMap::from([(
+            "vector-index.post-filter.candidates-factor".into(),
+            "128".into(),
+        )]))
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 8193);
+    for (i, result) in results.into_iter().enumerate() {
+        assert_eq!(
+            result.row_ids().unwrap().row_ids,
+            vec![if i % 2 == 0 { 91 } else { 127 }]
+        );
+    }
+}
+
+#[tokio::test]
+async fn post_filter_preserves_shard_offsets_and_input_allow_lists() {
+    let (table, _) = post_filter_table(64).await;
     let filter = id_gt_filter(&table, 105);
     let include = Arc::new(RoaringTreemap::from_iter(99..=110));
     for factor in ["2", "32"] {
@@ -661,7 +691,7 @@ async fn iterative_filter_keeps_shard_offsets_and_input_allow_lists_on_fallback(
             &[&[0.0, 0.0], &[127.0, 0.0]],
             2,
             &HashMap::from([(
-                "vector-index.iterative-filter.max-candidates-factor".into(),
+                "vector-index.post-filter.candidates-factor".into(),
                 factor.into(),
             )]),
         )
@@ -669,7 +699,11 @@ async fn iterative_filter_keeps_shard_offsets_and_input_allow_lists_on_fallback(
         let results = reader.read(plan).await.unwrap();
         assert_eq!(
             results[0].row_ids().unwrap().row_ids,
-            vec![106, 107],
+            if factor == "2" {
+                vec![]
+            } else {
+                vec![106, 107]
+            },
             "{factor}"
         );
         assert_eq!(

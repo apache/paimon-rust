@@ -1860,15 +1860,15 @@ fn filtered_batch_preserves_buffered_search_without_tokio() {
     plan.index_entries
         .retain(|entry| entry.index_file.index_type == IVF_FLAT_IDENTIFIER);
     assert!(tokio::runtime::Handle::try_current().is_err());
-    for enabled in [false, true] {
+    for factor in [1, 10] {
         let reader = DeVectorRead::new(
             "embedding",
             &[&[1.0, 0.0], &[0.0, 1.0]],
             1,
             &HashMap::from([
                 (
-                    "vector-index.iterative-filter.enabled".into(),
-                    enabled.to_string(),
+                    "vector-index.post-filter.candidates-factor".into(),
+                    factor.to_string(),
                 ),
                 ("refine_factor".into(), "2".into()),
             ]),
@@ -1884,7 +1884,7 @@ fn filtered_batch_preserves_buffered_search_without_tokio() {
                 plan.clone(),
                 scheduled.then_some(&executor as &dyn SearchTaskExecutor),
             ))
-            .unwrap_or_else(|error| panic!("enabled={enabled}, scheduled={scheduled}: {error}"));
+            .unwrap_or_else(|error| panic!("factor={factor}, scheduled={scheduled}: {error}"));
             assert_eq!(results[0].row_ids().unwrap().row_ids, vec![2]);
             assert_eq!(results[1].row_ids().unwrap().row_ids, vec![1]);
         }

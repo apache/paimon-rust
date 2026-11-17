@@ -51,7 +51,7 @@ pub struct VectorScanPlan {
     snapshot: Option<Snapshot>,
     splits: Vec<SearchScanSplit>,
     // Automatically generated scalar gaps can overlap vector coverage. Only
-    // these may be pruned when the reader actually selects iterative filtering.
+    // these may be pruned when the reader actually selects post-filtering.
     raw_sources_are_automatic: bool,
 }
 

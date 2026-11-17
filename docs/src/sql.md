@@ -2832,33 +2832,24 @@ WHERE event_time >= TIMESTAMP '2026-08-01 00:00:00';
 
 On data-evolution tables, exact scalar global-index answers are passed to each
 vector shard as a row-ID filter. When no scalar index can evaluate the
-predicate, Paimon instead retrieves ANN candidates and reads their scalar
-values from the pinned snapshot. Candidate limits grow until enough matches
-are found, the indexed corpus is exhausted, or the candidate budget is reached.
-Only newly encountered row IDs are checked, shared across queries in a batch.
-An insufficient result at the budget falls back to exact raw scoring for that
-query and shard. This avoids a mandatory full-table scalar pre-scan.
+predicate, each shard retrieves ANN candidates once and checks their scalar
+values against the same pinned snapshot before returning results. Batch queries
+share a candidate row-ID union for each filtering read.
 
-`vector-index.iterative-filter.enabled` defaults to `true`; set it to `false` to
-restore the immediate raw fallback used by Java. The per-query, per-shard
-`vector-index.iterative-filter.max-candidates-factor` defaults to `100`.
-The budget is `max(original Top-K * factor, required candidate limit)`, capped
-by the shard's indexed vector count and the backend limit (`2147483647`).
-The required candidate limit includes reranking/deletion slack; that slack
-and the number of queries in a batch do not multiply the budget. For example,
-with the default factor and no larger required allowance, Top-K 10 permits
-1000 candidates and Top-K 100 permits 10000, subject to those caps.
-The first search requests at least 32 candidates, bounded by that budget and
-the indexed corpus; later searches double the limit. The index reader is
-reused, but the backend currently has no cursor across these calls, so ANN
-traversal may repeat. Iterative filtering checks the predicate exactly while
-retaining ANN's approximate recall; finding K matches is not an exact-neighbor
-guarantee. Raw work outside the selected vector-index coverage continues to
-follow `fast`, `full`, and `detail` search modes.
+`vector-index.post-filter.candidates-factor` defaults to `10`. Each query's
+candidate count is `max(original Top-K * factor, required candidate limit)`,
+capped by shard size and the backend limit (`2147483647`). The required limit
+includes reranking/deletion slack; neither that slack nor batch size multiplies
+the factor. For example, Top-K 10 requests 100 candidates with the default
+factor unless a larger required allowance applies.
 
-Debug logs under `paimon::vector_search` include
-`event=paimon_vector_iterative_filter` with iteration count, unique candidates
-checked, and the number of queries requiring raw fallback.
+Every returned row satisfies the predicate, but filtering may leave fewer than
+Top-K rows, including no rows even when matches exist outside the candidates.
+There is no retry or automatic raw scoring of indexed ranges to fill results.
+Increase the factor to check more candidates, at additional query and scalar
+read cost. Post-filtering retains ANN's approximate recall. Raw work outside
+vector-index coverage still follows `fast`, `full`, and `detail` search modes;
+explicitly supplied Raw sources retain their exact scoring.
 
 Only predicates that can be translated completely to Paimon predicates are
 pushed into vector search. DataFusion keeps its residual filter for ordinary
@@ -3955,8 +3946,7 @@ optimization may be disabled. Full-text builds reject deletion-vector tables.
 | `btree-index.fallback-scan-max-size` | `256mb` | Maximum total size of BTree global-index files requiring fallback scans for range/between and suffix/contains/complex LIKE predicates; files proven to match completely by metadata need no scan and are excluded. `0` disables BTree fallback index scans. |
 | `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected bitmap global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
 | `global-index.search-mode` | `fast` | Global index coverage mode for reads: `fast`, `full`, or `detail`. |
-| `vector-index.iterative-filter.enabled` | `true` | DE vector filtering when no scalar index can evaluate the predicate: check ANN candidates iteratively, or set to `false` for immediate raw scoring. |
-| `vector-index.iterative-filter.max-candidates-factor` | `100` | Multiplier of each query's original Top-K for the iterative candidate budget; raised to the required reranking/deletion allowance and capped by shard size and the backend limit. Positive integer no greater than `2147483647`. |
+| `vector-index.post-filter.candidates-factor` | `10` | Multiplier of each query's original Top-K for one ANN query followed by exact scalar post-filtering. At least the required reranking/deletion allowance, capped by shard size and the backend limit. Positive integer no greater than `2147483647`. Short results are returned without retry. |
 | `global-index.thread-num` | `32` | Number of concurrent global-index search tasks; must be greater than 0 and must not exceed the runtime's task limit. This does not limit Vindex file range reads. |
 | `global-index.vindex.read-thread-num` | `64` | Maximum number of concurrent Vindex file range reads shared by one search operation; must be greater than 0 and must not exceed the runtime semaphore limit. |
 | `global-index.column-update-action` | `THROW_ERROR` | What a commit does when it updates an indexed column: `THROW_ERROR` rejects the commit, `DROP_PARTITION_INDEX` drops the affected partition index instead. |
