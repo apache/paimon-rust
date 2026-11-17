@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{assert_sql_error, create_sql_context, create_test_env, dml_count, exec};
+use common::{assert_sql_error, create_sql_context, create_test_env, dml_count, exec, files_under};
 use paimon::catalog::Identifier;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::SQLContext;
@@ -662,19 +662,6 @@ async fn primary_key_delete_pins_snapshot_and_respects_concurrent_upsert_sequenc
                 .collect::<Vec<_>>()
         );
     }
-}
-
-fn files_under(path: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
-    let mut files = std::collections::BTreeSet::new();
-    for entry in std::fs::read_dir(path).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            files.extend(files_under(&path));
-        } else {
-            files.insert(path);
-        }
-    }
-    files
 }
 
 #[tokio::test]

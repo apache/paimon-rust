@@ -1024,7 +1024,33 @@ For append-only tables (no primary key), updates are executed using Copy-on-Writ
 UPDATE paimon.my_db.t SET name = 'a_new' WHERE id = 1;
 ```
 
-For data-evolution row-tracking tables without primary keys, updates are executed with row-id-based partial-column writes. Primary-key tables are not supported for `UPDATE`.
+For data-evolution row-tracking tables without primary keys, updates are executed with row-id-based partial-column writes.
+
+Ordinary primary-key tables using `merge-engine=deduplicate` support `UPDATE` by
+writing complete updated rows with the `UPDATE_AFTER` row kind. All SET
+expressions use the original row; unassigned columns retain their values.
+Primary-key and partition columns cannot be assigned.
+
+The target and its live self-references in predicates and SET expressions use
+one captured snapshot, including uncompacted deletion-vector versions. Target
+validation and read-option restrictions follow the primary-key DELETE rules
+below. Explicit historical and incremental views keep their selected read view.
+
+Configured sequence values are preserved unless assigned by SET, and the normal
+sequence sort order applies to the updated rows. A lower-priority assigned
+sequence or a higher-priority concurrent upsert can leave the stored row
+unchanged. The affected-row count reports rows matching the predicate in the
+captured snapshot, including updates that lose under these merge rules. This
+does not provide serializable updates.
+
+No matches publish no snapshot. Publication retries reuse prepared files without
+rescanning; repeating the SQL statement is a new operation. A commit error can
+occur after publication, so prepared files are retained and the error identifies
+the table and commit user.
+
+Other merge engines, `rowkind.field`, query-authorized targets, aliases, joins,
+`FROM`, `RETURNING`, `OUTPUT`, `ORDER BY`, `LIMIT`, target modifiers and tuple or
+qualified/nested SET targets are not supported by this primary-key UPDATE path.
 
 ### DELETE
 
