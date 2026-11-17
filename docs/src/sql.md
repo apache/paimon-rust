@@ -172,7 +172,9 @@ Queries retain their source binding even if another context registers the same
 URI with different credentials. Credentials are supplied by the application,
 never as SQL arguments. Local files also require explicit directory registration.
 Local reads resolve paths beneath an open directory handle, and directory
-discovery skips symlinks. HTTP/HTTPS file URLs are unsupported.
+discovery skips symlinks. This local reader is used even when a FileIO is
+supplied; custom FileIO bindings apply to remote locations. HTTP/HTTPS file URLs
+are unsupported.
 
 Supported formats and options:
 
