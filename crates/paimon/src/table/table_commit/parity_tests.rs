@@ -358,23 +358,45 @@ async fn publication_errors_retry_without_duplicate_snapshots() {
 }
 
 #[tokio::test]
-async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_published_vectors() {
-    use arrow_array::{Int32Array, RecordBatch};
+async fn data_evolution_compact_retries_preserve_concurrent_changes_and_published_files() {
+    use arrow_array::{Int32Array, Int64Array, LargeBinaryArray, RecordBatch};
     use futures::TryStreamExt;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Race {
+        Delete,
+        BlobUpdate,
+        Publish,
+        PublishThenDelete,
+    }
+
     async fn dv_paths(table: &Table, snapshot: &Snapshot) -> Result<Vec<String>> {
-        let entries = IndexManifest::read(table.file_io(), &table.snapshot_manager().manifest_path(snapshot.index_manifest().unwrap())).await?;
+        let entries = IndexManifest::read(
+            table.file_io(),
+            &table
+                .snapshot_manager()
+                .manifest_path(snapshot.index_manifest().unwrap()),
+        )
+        .await?;
         let commit = table.new_write_builder().new_commit();
-        entries.into_iter().filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE).map(|entry| {
-            Ok(committed_index_file_path(table.location(), &commit.bucket_path(&entry.partition, entry.bucket)?, table.schema().core_options().index_file_in_data_file_dir(), &entry.index_file))
-        }).collect()
+        entries
+            .into_iter()
+            .filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
+            .map(|entry| {
+                Ok(committed_index_file_path(
+                    table.location(),
+                    &commit.bucket_path(&entry.partition, entry.bucket)?,
+                    table.schema().core_options().index_file_in_data_file_dir(),
+                    &entry.index_file,
+                ))
+            })
+            .collect()
     }
 
     struct RacingCompactCommit {
         table: Table,
         calls: std::sync::atomic::AtomicUsize,
-        publish_first: bool,
-        delete_after_publish: bool,
+        race: Race,
         paths: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
@@ -390,92 +412,307 @@ async fn data_evolution_compact_retries_preserve_concurrent_deletes_and_publishe
             let paths = dv_paths(&self.table, snapshot).await?;
             self.paths.lock().unwrap().push(paths);
             if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                if self.publish_first {
-                    assert!(self.table.snapshot_manager().commit_snapshot(snapshot).await?);
-                    if self.delete_after_publish {
-                        // The retry must find its successful COMPACT even when
-                        // a newer DELETE has already replaced the migrated DV.
+                let publish_first = matches!(self.race, Race::Publish | Race::PublishThenDelete);
+                if publish_first {
+                    assert!(
+                        self.table
+                            .snapshot_manager()
+                            .commit_snapshot(snapshot)
+                            .await?
+                    );
+                }
+                match self.race {
+                    Race::Delete | Race::PublishThenDelete => {
                         let mut delete = crate::table::DataEvolutionDeleteWriter::new(&self.table)?;
                         delete.add_row_ids([2])?;
-                        self.table.new_write_builder().new_commit().commit(delete.prepare_commit().await?).await?;
+                        self.table
+                            .new_write_builder()
+                            .new_commit()
+                            .commit(delete.prepare_commit().await?)
+                            .await?;
                     }
-                    return Err(crate::Error::IoUnsupported { message: "lost compact response".into() });
+                    Race::BlobUpdate => {
+                        let builder = self.table.new_write_builder();
+                        let messages = builder
+                            .new_update()?
+                            .update_by_arrow_with_row_id(vec![RecordBatch::try_from_iter([
+                                (
+                                    "_ROW_ID",
+                                    Arc::new(Int64Array::from(vec![2])) as arrow_array::ArrayRef,
+                                ),
+                                (
+                                    "payload",
+                                    Arc::new(LargeBinaryArray::from(vec![Some(
+                                        b"concurrent".as_slice(),
+                                    )]))
+                                        as arrow_array::ArrayRef,
+                                ),
+                            ])
+                            .unwrap()])
+                            .await?;
+                        builder.new_commit().commit(messages).await?;
+                    }
+                    Race::Publish => {}
                 }
-                // Commit another DELETE after compact prepared its DV file,
-                // then force its CAS to lose. Retry must remap the newer DV.
-                let mut delete = crate::table::DataEvolutionDeleteWriter::new(&self.table)?;
-                delete.add_row_ids([2])?;
-                self.table.new_write_builder().new_commit().commit(delete.prepare_commit().await?).await?;
+                if publish_first {
+                    return Err(crate::Error::IoUnsupported {
+                        message: "lost compact response".into(),
+                    });
+                }
                 return Ok(false);
             }
-            self.table.snapshot_manager().commit_snapshot(snapshot).await
+            self.table
+                .snapshot_manager()
+                .commit_snapshot(snapshot)
+                .await
         }
     }
 
-    for (publish_first, delete_after_publish) in [(false, false), (true, false), (true, true)] {
+    for (compact_blob, race) in [
+        (false, Race::Delete),
+        (false, Race::BlobUpdate),
+        (false, Race::Publish),
+        (false, Race::PublishThenDelete),
+        (true, Race::Delete),
+        (true, Race::BlobUpdate),
+        (true, Race::Publish),
+        (true, Race::PublishThenDelete),
+    ] {
+        let publish_first = matches!(race, Race::Publish | Race::PublishThenDelete);
+        let conflicts = compact_blob && race == Race::BlobUpdate;
         let io = test_file_io();
-        let path = format!("memory:/de-compact-cas-{publish_first}-{delete_after_publish}");
+        let path = format!("memory:/de-compact-cas-{compact_blob}-{race:?}");
         setup_dirs(&io, &path).await;
         let schema = crate::spec::Schema::builder()
             .column("id", DataType::Int(crate::spec::IntType::new()))
+            .column("payload", DataType::Blob(crate::spec::BlobType::new()))
             .option("row-tracking.enabled", "true")
             .option("data-evolution.enabled", "true")
             .option("deletion-vectors.enabled", "true")
             .option("compaction.min.file-num", "2")
             .option("write-only", "true")
-            .build().unwrap();
-        let table = Table::new(io.clone(), Identifier::new("default", "de_compact_cas"), path.clone(), TableSchema::new(0, &schema), None);
+            .build()
+            .unwrap();
+        let table = Table::new(
+            io.clone(),
+            Identifier::new("default", "de_compact_cas"),
+            path.clone(),
+            TableSchema::new(0, &schema),
+            None,
+        );
         io.mkdirs(&format!("{path}/schema")).await.unwrap();
-        io.new_output(&format!("{path}/schema/schema-0")).unwrap().write(serde_json::to_vec(table.schema()).unwrap().into()).await.unwrap();
+        io.new_output(&format!("{path}/schema/schema-0"))
+            .unwrap()
+            .write(serde_json::to_vec(table.schema()).unwrap().into())
+            .await
+            .unwrap();
         for ids in [vec![0, 1], vec![2, 3]] {
             let builder = table.new_write_builder();
             let mut write = builder.new_write().unwrap();
-            write.write_arrow_batch(&RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(ids)) as arrow_array::ArrayRef)]).unwrap()).await.unwrap();
-            builder.new_commit().commit(write.prepare_commit().await.unwrap()).await.unwrap();
+            let payloads = LargeBinaryArray::from(vec![Some(b"payload".as_slice()); ids.len()]);
+            write
+                .write_arrow_batch(
+                    &RecordBatch::try_from_iter([
+                        (
+                            "id",
+                            Arc::new(Int32Array::from(ids)) as arrow_array::ArrayRef,
+                        ),
+                        ("payload", Arc::new(payloads) as arrow_array::ArrayRef),
+                    ])
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            builder
+                .new_commit()
+                .commit(write.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
         }
         let mut delete = crate::table::DataEvolutionDeleteWriter::new(&table).unwrap();
         delete.add_row_ids([1]).unwrap();
-        table.new_write_builder().new_commit().commit(delete.prepare_commit().await.unwrap()).await.unwrap();
-        let captured = table.snapshot_manager().get_latest_snapshot().await.unwrap().unwrap();
+        table
+            .new_write_builder()
+            .new_commit()
+            .commit(delete.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        let captured = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
         let original_paths = dv_paths(&table, &captured).await.unwrap();
-        let builder = table.new_compact_builder();
+        let builder = table
+            .new_compact_builder()
+            .with_blob_compaction(compact_blob);
         let plan = builder.new_planner().unwrap().plan().await.unwrap();
-        let result = builder.new_executor().unwrap().execute(&plan.tasks()[0]).await.unwrap();
+        assert_eq!(plan.tasks().len(), if compact_blob { 2 } else { 1 });
+        let executor = builder.new_executor().unwrap();
+        let mut results = Vec::new();
+        for task in plan.tasks() {
+            results.push(executor.execute(task).await.unwrap());
+        }
         let publisher = Arc::new(RacingCompactCommit {
-            table: table.clone(), calls: std::sync::atomic::AtomicUsize::new(0), publish_first, delete_after_publish,
+            table: table.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            race,
             paths: std::sync::Mutex::new(Vec::new()),
         });
         let mut commit = builder.new_commit().unwrap();
         commit.snapshot_commit = publisher.clone();
         commit.commit_min_retry_wait_ms = 0;
         commit.commit_max_retry_wait_ms = 0;
-        let metrics = commit.commit_compact(vec![result.clone()]).await.unwrap();
-        assert_eq!(publisher.calls.load(std::sync::atomic::Ordering::SeqCst), if publish_first { 1 } else { 2 });
-        let after = table.snapshot_manager().get_latest_snapshot().await.unwrap().unwrap();
-        assert_eq!(after.id(), if publish_first && !delete_after_publish { 4 } else { 5 });
-        assert_eq!(after.commit_kind(), if delete_after_publish { &CommitKind::OVERWRITE } else { &CommitKind::COMPACT });
+        let outcome = commit.commit_compact(results.clone()).await;
+        assert_eq!(
+            publisher.calls.load(std::sync::atomic::Ordering::SeqCst),
+            if publish_first || conflicts { 1 } else { 2 }
+        );
+        let after = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.id(),
+            if race == Race::Publish || conflicts {
+                4
+            } else {
+                5
+            }
+        );
+        let expected_kind = if conflicts {
+            CommitKind::APPEND
+        } else if race == Race::PublishThenDelete {
+            CommitKind::OVERWRITE
+        } else {
+            CommitKind::COMPACT
+        };
+        assert_eq!(after.commit_kind(), &expected_kind);
         let attempts = publisher.paths.lock().unwrap().clone();
         assert_eq!(attempts[0].len(), 1);
         assert!(!original_paths.contains(&attempts[0][0]));
-        assert_eq!(io.exists(&attempts[0][0]).await.unwrap(), publish_first,
-            "CAS false must remove its unpublished DV; publish-then-error must retain it");
+        assert_eq!(
+            io.exists(&attempts[0][0]).await.unwrap(),
+            publish_first,
+            "CAS false must remove its unpublished DV; publish-then-error must retain it"
+        );
         let current_paths = dv_paths(&table, &after).await.unwrap();
-        for path in original_paths.iter().chain(attempts.last().unwrap()).chain(&current_paths) {
-            assert!(io.exists(path).await.unwrap(), "deleted old-snapshot or published DV: {path}");
+        for path in original_paths.iter().chain(&current_paths) {
+            assert!(
+                io.exists(path).await.unwrap(),
+                "deleted old-snapshot or published DV: {path}"
+            );
         }
-        assert_eq!(commit.commit_compact(vec![result.clone()]).await.unwrap(), metrics);
-        // Recovery after coordinator restart must not need the captured source
-        // snapshot once the COMPACT identity is already present in history.
-        io.delete_file(&table.snapshot_manager().snapshot_path(plan.snapshot_id().unwrap())).await.unwrap();
-        let recovered = table.new_compact_builder().with_commit_user(commit.commit_user.clone()).unwrap().new_commit().unwrap();
-        assert_eq!(recovered.commit_compact(vec![result]).await.unwrap(), metrics);
-        assert_eq!(table.snapshot_manager().get_latest_snapshot_id().await.unwrap(), Some(after.id()));
+        if conflicts {
+            let error = outcome.unwrap_err();
+            assert!(error.to_string().contains("omit overlapping"), "{error}");
+            assert_eq!(current_paths, original_paths);
+        } else {
+            let metrics = outcome.unwrap();
+            for path in attempts.last().unwrap() {
+                assert!(
+                    io.exists(path).await.unwrap(),
+                    "deleted published DV: {path}"
+                );
+            }
+            assert_eq!(
+                commit.commit_compact(results.clone()).await.unwrap(),
+                metrics
+            );
+            io.delete_file(
+                &table
+                    .snapshot_manager()
+                    .snapshot_path(plan.snapshot_id().unwrap()),
+            )
+            .await
+            .unwrap();
+            let recovered = table
+                .new_compact_builder()
+                .with_commit_user(commit.commit_user.clone())
+                .unwrap()
+                .new_commit()
+                .unwrap();
+            assert_eq!(
+                recovered.commit_compact(results.clone()).await.unwrap(),
+                metrics
+            );
+        }
+        for file in results.iter().flat_map(|result| result.files()) {
+            assert!(
+                io.exists(&format!("{path}/bucket-0/{}", file.file_name))
+                    .await
+                    .unwrap(),
+                "deleted submitted output: {}",
+                file.file_name
+            );
+        }
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap(),
+            Some(after.id())
+        );
         let read = table.new_read_builder();
         let scan = read.new_scan().plan().await.unwrap();
-        let batches: Vec<RecordBatch> = read.new_read().unwrap().to_arrow(scan.splits()).unwrap().try_collect().await.unwrap();
-        let mut ids = batches.iter().flat_map(|batch| batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap().values().iter().copied()).collect::<Vec<_>>();
+        let batches: Vec<RecordBatch> = read
+            .new_read()
+            .unwrap()
+            .to_arrow(scan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        for batch in &batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let payloads = batch
+                .column_by_name("payload")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            for (id, value) in ids.values().iter().zip(payloads.iter()) {
+                assert_eq!(
+                    value,
+                    Some(if race == Race::BlobUpdate && *id == 2 {
+                        b"concurrent".as_slice()
+                    } else {
+                        b"payload".as_slice()
+                    })
+                );
+            }
+        }
+        let mut ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
         ids.sort_unstable();
-        assert_eq!(ids, if publish_first && !delete_after_publish { vec![0, 2, 3] } else { vec![0, 3] });
+        assert_eq!(
+            ids,
+            if matches!(race, Race::Publish | Race::BlobUpdate) {
+                vec![0, 2, 3]
+            } else {
+                vec![0, 3]
+            }
+        );
     }
 }
 

@@ -228,6 +228,34 @@ pub unsafe extern "C" fn paimon_catalog_create_tag(
     snapshot_id: *const i64,
     ignore_if_exists: bool,
 ) -> *mut paimon_error {
+    paimon_catalog_create_tag_with_retention(
+        catalog,
+        identifier,
+        tag_name,
+        snapshot_id,
+        std::ptr::null(),
+        ignore_if_exists,
+    )
+}
+
+/// Create a tag with an optional retention duration such as `"1d"` or `"12h"`.
+///
+/// Pass a null `time_retained` to create a tag without retention metadata.
+///
+/// # Safety
+/// `catalog` and `identifier` must be valid pointers from previous paimon C calls.
+/// `tag_name` must be a valid null-terminated C string.
+/// If non-null, `snapshot_id` must point to a valid `i64`.
+/// If non-null, `time_retained` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_catalog_create_tag_with_retention(
+    catalog: *const paimon_catalog,
+    identifier: *const paimon_identifier,
+    tag_name: *const c_char,
+    snapshot_id: *const i64,
+    time_retained: *const c_char,
+    ignore_if_exists: bool,
+) -> *mut paimon_error {
     if let Err(error) = check_non_null(catalog, "catalog") {
         return error;
     }
@@ -238,14 +266,23 @@ pub unsafe extern "C" fn paimon_catalog_create_tag(
         Ok(tag_name) => tag_name,
         Err(error) => return error,
     };
+    let time_retained = if time_retained.is_null() {
+        None
+    } else {
+        match validate_cstr(time_retained, "time_retained") {
+            Ok(value) => Some(value),
+            Err(error) => return error,
+        }
+    };
 
     let catalog = &*((*catalog).inner as *const Arc<dyn Catalog>);
     let identifier = &*((*identifier).inner as *const Identifier);
     let snapshot_id = snapshot_id.as_ref().copied();
-    match runtime().block_on(catalog.create_tag(
+    match runtime().block_on(catalog.create_tag_with_retention(
         identifier,
         &tag_name,
         snapshot_id,
+        time_retained.as_deref(),
         ignore_if_exists,
     )) {
         Ok(()) => std::ptr::null_mut(),

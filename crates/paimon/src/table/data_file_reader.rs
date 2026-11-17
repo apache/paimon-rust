@@ -238,6 +238,13 @@ impl DataFileReader {
         self
     }
 
+    pub(super) fn without_parquet_prefetch(mut self) -> Self {
+        self.parquet_read_budget = self
+            .parquet_read_budget
+            .map(|budget| Arc::new(budget.without_prefetch()));
+        self
+    }
+
     pub(crate) fn with_table_options(
         mut self,
         options: impl Into<Arc<HashMap<String, String>>>,
@@ -4102,7 +4109,9 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-            assert_eq!(collect_ids(&batches), vec![1, 2], "enabled={enabled}");
+            // `added` is NULL in the old file, so for id 2 the predicate is
+            // NOT(true AND unknown), which is unknown. Java filters it out too.
+            assert_eq!(collect_ids(&batches), vec![1], "enabled={enabled}");
         }
     }
 

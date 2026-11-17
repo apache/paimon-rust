@@ -17,6 +17,7 @@
 
 //! Paimon table provider for DataFusion.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -200,6 +201,20 @@ impl PaimonTableProvider {
         self.table = self.table.copy_with_pinned_snapshot(Some(snapshot));
         self
     }
+
+    pub(crate) fn with_primary_key_mutation_snapshot(
+        mut self,
+        snapshot: Option<&Snapshot>,
+    ) -> Self {
+        // Merge L0 versions before evaluating mutations, even when
+        // ordinary deletion-vector reads are compacted-only.
+        self.table = self.table.copy_with_options(HashMap::from([(
+            "deletion-vectors.merge-on-read".to_string(),
+            "true".to_string(),
+        )]));
+        self.table = self.table.copy_with_pinned_snapshot(snapshot);
+        self
+    }
 }
 
 /// Build a `CREATE TABLE` DDL string for a Paimon table.
@@ -290,8 +305,9 @@ fn quote_string_literal(text: &str) -> String {
 ///
 /// `NOT NULL` is a column constraint, not a type modifier — it is only valid
 /// at the top of a column definition, not nested inside `MAP`, `ARRAY`, or
-/// `STRUCT` arguments. Callers that render a column should append `NOT NULL`
-/// themselves when the field is non-nullable; recursive calls below must not.
+/// `STRUCT` arguments. Nested VECTORs and their elements accept `NOT NULL`.
+/// Callers that render a column should append `NOT NULL` themselves when the
+/// field is non-nullable; recursive calls below must not.
 pub(crate) fn data_type_to_sql(data_type: &DataType) -> DFResult<String> {
     match data_type {
         DataType::Boolean(_) => Ok("BOOLEAN".to_string()),
@@ -314,11 +330,14 @@ pub(crate) fn data_type_to_sql(data_type: &DataType) -> DFResult<String> {
         DataType::LocalZonedTimestamp(t) => {
             Ok(format!("TIMESTAMP({}) WITH TIME ZONE", t.precision()))
         }
-        DataType::Array(t) => Ok(format!("ARRAY<{}>", data_type_to_sql(t.element_type())?)),
+        DataType::Array(t) => Ok(format!(
+            "ARRAY<{}>",
+            nested_data_type_to_sql(t.element_type())?
+        )),
         DataType::Map(t) => Ok(format!(
             "MAP({}, {})",
-            data_type_to_sql(t.key_type())?,
-            data_type_to_sql(t.value_type())?
+            nested_data_type_to_sql(t.key_type())?,
+            nested_data_type_to_sql(t.value_type())?
         )),
         DataType::Multiset(_) => Err(unsupported_show_create_table_type("MULTISET")),
         DataType::Row(t) => {
@@ -326,7 +345,7 @@ pub(crate) fn data_type_to_sql(data_type: &DataType) -> DFResult<String> {
                 .fields()
                 .iter()
                 .map(|f| {
-                    let ty = data_type_to_sql(f.data_type())?;
+                    let ty = nested_data_type_to_sql(f.data_type())?;
                     if f.name().is_empty() {
                         Ok(ty)
                     } else {
@@ -336,8 +355,25 @@ pub(crate) fn data_type_to_sql(data_type: &DataType) -> DFResult<String> {
                 .collect::<DFResult<_>>()?;
             Ok(format!("STRUCT<{}>", inner.join(", ")))
         }
-        DataType::Vector(_) => Err(unsupported_show_create_table_type("VECTOR")),
+        DataType::Vector(t) => Ok(format!(
+            "VECTOR<{}{}, {}>",
+            data_type_to_sql(t.element_type())?,
+            if t.element_type().is_nullable() {
+                ""
+            } else {
+                " NOT NULL"
+            },
+            t.length()
+        )),
     }
+}
+
+fn nested_data_type_to_sql(data_type: &DataType) -> DFResult<String> {
+    let mut sql = data_type_to_sql(data_type)?;
+    if matches!(data_type, DataType::Vector(_)) && !data_type.is_nullable() {
+        sql.push_str(" NOT NULL");
+    }
+    Ok(sql)
 }
 
 fn unsupported_show_create_table_type(type_name: &str) -> DataFusionError {
@@ -1383,5 +1419,342 @@ mod tests {
         }
         // Old data fully replaced
         assert_eq!(rows, vec![(4, 40), (5, 50)]);
+    }
+
+    /// An INSERT of 8 in-memory batches with 2 rows each into a memory table
+    /// with columns `id`, `value` and `pt`.
+    struct EightBatchInsert<'a> {
+        name: &'a str,
+        options: &'a [(&'a str, &'a str)],
+        primary_keys: &'a [&'a str],
+        partition_keys: &'a [&'a str],
+        overwrite: bool,
+        target_partitions: usize,
+    }
+
+    /// Outcome of an [`EightBatchInsert`].
+    #[derive(Debug)]
+    struct InsertOutcome {
+        /// Row count reported by the INSERT.
+        count: u64,
+        latest_snapshot_id: Option<i64>,
+        /// Row counts of the committed data files, sorted.
+        file_rows: Vec<i64>,
+        /// `(id, value, pt)` read back, sorted.
+        rows: Vec<(i32, i32, i32)>,
+    }
+
+    impl EightBatchInsert<'_> {
+        fn new(name: &str) -> EightBatchInsert<'_> {
+            EightBatchInsert {
+                name,
+                options: &[],
+                primary_keys: &[],
+                partition_keys: &[],
+                overwrite: false,
+                // Fixed so that the writer cap does not depend on the host's cores.
+                target_partitions: 8,
+            }
+        }
+
+        /// The source is one in-memory partition; batch `i` holds ids `2i` and
+        /// `2i + 1`, with `value = id * 10` and `pt = id % 2`.
+        async fn run(&self) -> DFResult<InsertOutcome> {
+            use datafusion::arrow::array::{Int32Array, UInt64Array};
+            use datafusion::arrow::datatypes::{DataType as ArrowType, Field, Schema};
+            use datafusion::arrow::record_batch::RecordBatch;
+            use datafusion::datasource::MemTable;
+            use paimon::io::FileIOBuilder;
+            use paimon::spec::{DataType, IntType, Schema as PaimonSchema, TableSchema};
+
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let table_path = format!("memory:/{}", self.name);
+            for dir in ["snapshot", "manifest"] {
+                file_io
+                    .mkdirs(&format!("{table_path}/{dir}/"))
+                    .await
+                    .unwrap();
+            }
+            let mut builder = PaimonSchema::builder()
+                .column("id", DataType::Int(IntType::with_nullable(false)))
+                .column("value", DataType::Int(IntType::new()))
+                .column("pt", DataType::Int(IntType::with_nullable(false)))
+                .primary_key(self.primary_keys.iter().copied())
+                .partition_keys(self.partition_keys.iter().copied());
+            for (key, value) in self.options {
+                builder = builder.option(*key, *value);
+            }
+            let table = paimon::table::Table::new(
+                file_io,
+                Identifier::new("default", self.name),
+                table_path,
+                TableSchema::new(0, &builder.build().unwrap()),
+                None,
+            );
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", ArrowType::Int32, false),
+                Field::new("value", ArrowType::Int32, true),
+                Field::new("pt", ArrowType::Int32, false),
+            ]));
+            let batches = (0..8)
+                .map(|i| {
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from(vec![2 * i, 2 * i + 1])),
+                            Arc::new(Int32Array::from(vec![20 * i, 20 * i + 10])),
+                            Arc::new(Int32Array::from(vec![0, 1])),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let config = SessionConfig::new().with_target_partitions(self.target_partitions);
+            let ctx = SessionContext::new_with_config(config);
+            ctx.register_table("src", Arc::new(MemTable::try_new(schema, vec![batches])?))?;
+            ctx.register_table("t", Arc::new(PaimonTableProvider::try_new(table.clone())?))?;
+
+            let verb = if self.overwrite {
+                "INSERT OVERWRITE"
+            } else {
+                "INSERT INTO"
+            };
+            let result = ctx
+                .sql(&format!("{verb} t SELECT id, value, pt FROM src"))
+                .await?
+                .collect()
+                .await?;
+            let count = result[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0);
+
+            let latest_snapshot_id = table
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap();
+            let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+            let mut file_rows = plan
+                .splits()
+                .iter()
+                .flat_map(|split| split.data_files().iter().map(|file| file.row_count))
+                .collect::<Vec<_>>();
+            file_rows.sort();
+
+            let mut rows = Vec::new();
+            for batch in ctx
+                .sql("SELECT id, value, pt FROM t")
+                .await?
+                .collect()
+                .await?
+            {
+                let column = |index: usize| {
+                    batch
+                        .column(index)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .clone()
+                };
+                let (ids, values, pts) = (column(0), column(1), column(2));
+                rows.extend(
+                    (0..batch.num_rows()).map(|i| (ids.value(i), values.value(i), pts.value(i))),
+                );
+            }
+            rows.sort();
+            Ok(InsertOutcome {
+                count,
+                latest_snapshot_id,
+                file_rows,
+                rows,
+            })
+        }
+    }
+
+    /// The 16 source rows of an [`EightBatchInsert`].
+    fn expected_rows() -> Vec<(i32, i32, i32)> {
+        (0..16).map(|id| (id, id * 10, id % 2)).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_insert_into_parallel_writers_commit_once() {
+        let outcome = EightBatchInsert {
+            options: &[("sink.parallelism", "4")],
+            ..EightBatchInsert::new("test_df_parallel_insert")
+        }
+        .run()
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.count, 16);
+        assert_eq!(outcome.rows, expected_rows());
+        // All writers' messages go into one commit, so one snapshot.
+        assert_eq!(outcome.latest_snapshot_id, Some(1));
+        // 8 batches dealt round-robin to 4 writers: each writer receives
+        // 2 batches (4 rows) and closes one file. A single writer would
+        // leave one file of 16 rows.
+        assert_eq!(outcome.file_rows, vec![4, 4, 4, 4]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_insert_into_parallel_writers_on_partitioned_table() {
+        let outcome = EightBatchInsert {
+            options: &[("sink.parallelism", "4")],
+            partition_keys: &["pt"],
+            ..EightBatchInsert::new("test_df_parallel_partitioned_insert")
+        }
+        .run()
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.count, 16);
+        assert_eq!(outcome.rows, expected_rows());
+        assert_eq!(outcome.latest_snapshot_id, Some(1));
+        // Every batch holds one row of each of the 2 partitions, so each of
+        // the 4 writers writes a 2-row file in both partitions: 4 x 2 files.
+        assert_eq!(outcome.file_rows, vec![2; 4 * 2]);
+    }
+
+    #[tokio::test]
+    async fn test_insert_into_caps_writers_at_target_partitions() {
+        let outcome = EightBatchInsert {
+            options: &[("sink.parallelism", "4")],
+            target_partitions: 2,
+            ..EightBatchInsert::new("test_df_capped_parallel_insert")
+        }
+        .run()
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.rows, expected_rows());
+        // min(4, 2) writers, each receiving 4 batches (8 rows).
+        assert_eq!(outcome.file_rows, vec![8, 8]);
+    }
+
+    #[tokio::test]
+    async fn test_insert_into_without_sink_parallelism_uses_one_writer() {
+        let outcome = EightBatchInsert::new("test_df_default_insert")
+            .run()
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.count, 16);
+        assert_eq!(outcome.rows, expected_rows());
+        assert_eq!(outcome.latest_snapshot_id, Some(1));
+        assert_eq!(outcome.file_rows, vec![16]);
+    }
+
+    #[tokio::test]
+    async fn test_sink_parallelism_keeps_single_writer_outside_unaware_append_insert() {
+        let parallel: &[(&str, &str)] = &[("sink.parallelism", "4")];
+        let fixed_bucket: &[(&str, &str)] = &[
+            ("bucket", "1"),
+            ("bucket-key", "id"),
+            ("sink.parallelism", "4"),
+        ];
+        let cases = [
+            // A fixed bucket is owned by one writer.
+            EightBatchInsert {
+                options: fixed_bucket,
+                ..EightBatchInsert::new("test_df_single_writer_fixed_bucket")
+            },
+            // A primary-key table with the default dynamic bucket (-1).
+            EightBatchInsert {
+                options: parallel,
+                primary_keys: &["id"],
+                ..EightBatchInsert::new("test_df_single_writer_primary_key")
+            },
+            // INSERT OVERWRITE into a bucket-unaware append-only table.
+            EightBatchInsert {
+                options: parallel,
+                overwrite: true,
+                ..EightBatchInsert::new("test_df_single_writer_overwrite")
+            },
+        ];
+        for case in cases {
+            let outcome = case.run().await.unwrap();
+            assert_eq!(outcome.count, 16, "{}", case.name);
+            assert_eq!(outcome.rows, expected_rows(), "{}", case.name);
+            assert_eq!(outcome.latest_snapshot_id, Some(1), "{}", case.name);
+            // One writer leaves one file with all 16 rows; 4 writers would
+            // leave 4 files.
+            assert_eq!(outcome.file_rows, vec![16], "{}", case.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sink_parallelism_minus_one_keeps_single_writer() {
+        // -1 is Flink's PARALLELISM_DEFAULT, and Java FlinkSinkBuilder treats
+        // null or -1 as an unset sink parallelism. A table configured that
+        // way for Flink stays writable and keeps the single writer, as
+        // without the option.
+        let minus_one: &[(&str, &str)] = &[("sink.parallelism", "-1")];
+        let fixed_bucket: &[(&str, &str)] = &[
+            ("bucket", "1"),
+            ("bucket-key", "id"),
+            ("sink.parallelism", "-1"),
+        ];
+        let cases = [
+            EightBatchInsert {
+                options: minus_one,
+                ..EightBatchInsert::new("test_df_minus_one_append")
+            },
+            EightBatchInsert {
+                options: fixed_bucket,
+                ..EightBatchInsert::new("test_df_minus_one_fixed_bucket")
+            },
+            EightBatchInsert {
+                options: minus_one,
+                primary_keys: &["id"],
+                ..EightBatchInsert::new("test_df_minus_one_primary_key")
+            },
+            EightBatchInsert {
+                options: minus_one,
+                overwrite: true,
+                ..EightBatchInsert::new("test_df_minus_one_overwrite")
+            },
+        ];
+        for case in cases {
+            let outcome = case.run().await.unwrap();
+            assert_eq!(outcome.count, 16, "{}", case.name);
+            assert_eq!(outcome.rows, expected_rows(), "{}", case.name);
+            assert_eq!(outcome.latest_snapshot_id, Some(1), "{}", case.name);
+            assert_eq!(outcome.file_rows, vec![16], "{}", case.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_insert_into_rejects_invalid_sink_parallelism() {
+        // Java Integer.parseInt rejects " 4", and Flink accepts only a
+        // positive parallelism or -1 (OperatorValidationUtils). The option is
+        // checked before deciding whether it applies, so a primary-key table
+        // fails too.
+        let cases: [(&str, &str, &[&str]); 4] = [
+            ("test_df_invalid_parallelism_zero", "0", &[]),
+            ("test_df_invalid_parallelism_negative", "-2", &[]),
+            ("test_df_invalid_parallelism_space", " 4", &[]),
+            ("test_df_invalid_parallelism_primary_key", "0", &["id"]),
+        ];
+        for (name, value, primary_keys) in cases {
+            let error = EightBatchInsert {
+                options: &[("sink.parallelism", value)],
+                primary_keys,
+                ..EightBatchInsert::new(name)
+            }
+            .run()
+            .await
+            .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("'sink.parallelism' must be a positive integer or -1"),
+                "{name}: {error}"
+            );
+        }
     }
 }

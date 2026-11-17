@@ -58,6 +58,8 @@ pub(crate) async fn execute_analyze(
         ));
     }
     SQLContext::ensure_partition_command_target(table_name, "ANALYZE TABLE")?;
+    ctx.reject_temporary_write_target(table_name, "ANALYZE TABLE")
+        .await?;
     let (catalog, _catalog_name, identifier) = ctx.resolve_catalog_and_table(table_name)?;
     let table = catalog
         .get_table(&identifier)

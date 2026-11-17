@@ -27,6 +27,72 @@ const EVOLUTION_OPTIONS: &[(&str, &str)] = &[
 ];
 
 #[tokio::test]
+async fn transported_shard_plans_refresh_authorization_even_for_empty_workers() {
+    for empty in [false, true] {
+        for response in [None, Some(serde_json::json!({}))]
+            .into_iter()
+            .chain(restricted_responses().into_iter().map(Some))
+        {
+            let fixture = RestTable::new(false, EVOLUTION_OPTIONS).await;
+            fixture.append("seed", &[(1, "a", 10)], false).await;
+            fixture.state.deny_query.store(false, Ordering::SeqCst);
+            let plan = fixture
+                .table
+                .new_read_builder()
+                .new_scan()
+                .plan_all()
+                .await
+                .unwrap();
+            let plan = if empty {
+                plan.map_splits(|_| Ok(vec![])).unwrap()
+            } else {
+                plan
+            };
+            let requests = fixture.state.query_requests.load(Ordering::SeqCst);
+            let allowed = response
+                .as_ref()
+                .is_some_and(|response| response == &serde_json::json!({}));
+            if let Some(response) = response {
+                *fixture.state.query_response.lock().await = response;
+            } else {
+                fixture.state.deny_query.store(true, Ordering::SeqCst);
+            }
+            let before = fixture
+                .table
+                .file_io()
+                .list_status_recursive(fixture.table.location())
+                .await
+                .unwrap()
+                .len();
+            let mut update = fixture.table.new_write_builder().new_update().unwrap();
+            update.with_plan(plan).unwrap();
+            let result = update.new_shard_updater(0, 1, None).await;
+            assert_eq!(result.is_ok(), allowed, "empty={empty}");
+            assert!(fixture.state.query_requests.load(Ordering::SeqCst) > requests);
+            assert_eq!(
+                fixture
+                    .table
+                    .file_io()
+                    .list_status_recursive(fixture.table.location())
+                    .await
+                    .unwrap()
+                    .len(),
+                before
+            );
+            if let Ok(mut shard) = result {
+                let batches: Vec<RecordBatch> =
+                    shard.arrow_reader().unwrap().try_collect().await.unwrap();
+                assert_eq!(
+                    batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    usize::from(!empty)
+                );
+                shard.close();
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn transported_row_id_plans_keep_the_rest_snapshot_after_concurrent_append() {
     for delete in [false, true] {
         let fixture = RestTable::new(false, EVOLUTION_OPTIONS).await;

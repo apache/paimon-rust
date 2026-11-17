@@ -82,7 +82,7 @@ fn validate_non_empty_multi(values: &[(&str, &str)]) -> Result<()> {
 }
 
 /// `url` normalizes dot segments even when their dots are percent encoded.
-/// Reject them before a branch mutation can be redirected to a parent resource.
+/// Reject them before a metadata request can be redirected to a parent resource.
 fn validate_resource_path(values: &[(&str, &str)]) -> Result<()> {
     validate_non_empty_multi(values)?;
     for (value, field_name) in values {
@@ -674,6 +674,15 @@ impl RESTApi {
         self.client.get(&path, None::<&[(&str, &str)]>).await
     }
 
+    /// Drop a persistent function.
+    pub async fn drop_function(&self, identifier: &Identifier) -> Result<()> {
+        let database = identifier.database();
+        let function = identifier.object();
+        validate_resource_path(&[(database, "database name"), (function, "function name")])?;
+        let path = self.resource_paths.function(database, function);
+        self.client.delete_without_response(&path).await
+    }
+
     // ==================== Partition Operations ====================
 
     /// Create table partitions in a single REST request.
@@ -1059,8 +1068,12 @@ impl RESTApi {
     ) -> Result<()> {
         let database = identifier.database();
         let table = identifier.object();
-        validate_resource_path(&[(database, "database name"), (table, "table name")])?;
-        validate_non_empty(tag_name, "tag name")?;
+        // Get and delete put the name in the URL path, so reject dot segments here too.
+        validate_resource_path(&[
+            (database, "database name"),
+            (table, "table name"),
+            (tag_name, "tag name"),
+        ])?;
         let path = self.resource_paths.tags(database, table);
         let mut request = CreateTagRequest::new(tag_name.to_string(), snapshot_id);
         request.time_retained = time_retained.map(str::to_string);
@@ -1076,7 +1089,51 @@ impl RESTApi {
             (tag_name, "tag name"),
         ])?;
         let path = self.resource_paths.tag(database, table, tag_name);
-        self.client.get(&path, None::<&[(&str, &str)]>).await
+        let response: GetTagResponse = self.client.get(&path, None::<&[(&str, &str)]>).await?;
+        if response.tag_name != tag_name {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "REST catalog returned tag '{}' for requested tag '{tag_name}'",
+                    response.tag_name
+                ),
+                source: None,
+            });
+        }
+        Ok(response)
+    }
+
+    /// List every tag name of a table, following nonempty continuation tokens.
+    /// Empty pages end listing, as in Java's `PagedList.listAllFromPagedApi`.
+    /// Repeated tokens are rejected so a malformed response cannot loop forever.
+    pub async fn list_tags(&self, identifier: &Identifier) -> Result<Vec<String>> {
+        let mut results = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut seen_page_tokens = HashSet::new();
+        loop {
+            let paged = self
+                .list_tags_paged(identifier, None, page_token.as_deref(), None)
+                .await?;
+            if paged.elements.is_empty() {
+                break;
+            }
+            results.extend(paged.elements);
+            let Some(next_page_token) = paged.next_page_token.filter(|token| !token.is_empty())
+            else {
+                break;
+            };
+            if !seen_page_tokens.insert(next_page_token.clone()) {
+                return Err(crate::Error::UnexpectedError {
+                    message: format!(
+                        "REST catalog returned tag page token '{next_page_token}' more than \
+                         once for table {}",
+                        identifier.full_name()
+                    ),
+                    source: None,
+                });
+            }
+            page_token = Some(next_page_token);
+        }
+        Ok(results)
     }
 
     /// Fetch one tag-name page, preserving server ordering and opaque tokens.

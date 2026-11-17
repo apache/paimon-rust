@@ -20,7 +20,9 @@
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
 use crate::api::GetTableResponse;
-use crate::catalog::{FusePathResolver, Identifier, RESTToken, RESTTokenFileIO};
+use crate::catalog::{
+    FusePathResolver, Identifier, RESTToken, RESTTokenFileIO, DEFAULT_MAIN_BRANCH,
+};
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
 use crate::io::cache::{create_local_cache_with_namespace_async, LocalCache};
@@ -620,6 +622,64 @@ impl RESTEnv {
             }) if resource_type.as_deref() == Some("SNAPSHOT") => Ok(None),
             Err(error) => Err(map_rest_error_for_table(error, &identifier)),
         }
+    }
+
+    /// Load a tag of this table's branch from the catalog, or None when the
+    /// catalog has no such tag.
+    pub(crate) async fn get_tag(
+        &self,
+        branch: &str,
+        tag_name: &str,
+    ) -> Result<Option<crate::api::GetTagResponse>> {
+        let identifier = self.identifier.with_branch(branch)?;
+        match self.api.get_tag(&identifier, tag_name).await {
+            Ok(response) => Ok(Some(response)),
+            Err(Error::RestApi {
+                source: RestError::NoSuchResource { resource_type, .. },
+            }) if resource_type.as_deref() == Some("TAG") => Ok(None),
+            Err(error) => Err(map_rest_error_for_table(error, &identifier)),
+        }
+    }
+
+    /// List the tag names of this table's branch from the catalog, sorted.
+    pub(crate) async fn list_tag_names(&self, branch: &str) -> Result<Vec<String>> {
+        let identifier = self.identifier.with_branch(branch)?;
+        let mut names = self
+            .api
+            .list_tags(&identifier)
+            .await
+            .map_err(|error| map_rest_error_for_table(error, &identifier))?;
+        names.sort_unstable();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// List the table's non-main branches from the catalog, even when this
+    /// environment belongs to a branch. Validate names and suffix parsing before
+    /// using storage paths or addressing branch-scoped tag metadata.
+    pub(crate) async fn list_branch_names(&self) -> Result<Vec<String>> {
+        let identifier = self.identifier.with_branch(DEFAULT_MAIN_BRANCH)?;
+        let mut names = self
+            .api
+            .list_branches(&identifier)
+            .await
+            .map_err(|error| map_rest_error_for_table(error, &identifier))?;
+        names.retain(|name| name != DEFAULT_MAIN_BRANCH);
+        for name in &names {
+            let parsed = identifier.with_branch(name)?.parsed_object_name()?;
+            if parsed.branch() != Some(name.as_str()) || parsed.system_table().is_some() {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "REST catalog returned an unaddressable branch name {name:?} for table {}",
+                        identifier.full_name()
+                    ),
+                    source: None,
+                });
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        Ok(names)
     }
 
     /// Create a `RESTSnapshotCommit` from this environment.

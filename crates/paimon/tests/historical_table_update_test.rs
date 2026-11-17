@@ -515,12 +515,23 @@ async fn historical_append_mutations_keep_original_field_ids() {
                 .all(|file| file.schema_id == 0));
             // The committer's historical read schema must not replace the
             // latest schema used for publication or conflict validation.
+            if change == "drop_readd" {
+                let before = rows(&latest).await;
+                let error = historical
+                    .new_write_builder()
+                    .new_commit()
+                    .commit(messages)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("dropped field"),
+                    "{operation}: {error}"
+                );
+                assert_eq!(rows(&latest).await, before);
+                continue;
+            }
             commit(&historical, messages).await;
-            let values = if change == "drop_readd" {
-                [None; 4]
-            } else {
-                [Some(11), Some(20), Some(30), Some(40)]
-            };
+            let values = [Some(11), Some(20), Some(30), Some(40)];
             let expected = vec![
                 vec![Some(1), values[0], Some(100), None],
                 vec![Some(2), values[1], Some(200), None],
@@ -602,7 +613,30 @@ async fn historical_partial_files_follow_field_ids_after_schema_changes() {
             .iter()
             .flat_map(|message| &message.new_files)
             .all(|file| file.schema_id == 0 && file.write_cols == Some(vec!["value".into()])));
-        commit(&historical, messages).await;
+        if change == "drop_readd" {
+            let before = latest
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap();
+            let error = historical
+                .new_write_builder()
+                .new_commit()
+                .commit(messages)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("dropped field"), "{error}");
+            assert_eq!(
+                latest
+                    .snapshot_manager()
+                    .get_latest_snapshot_id()
+                    .await
+                    .unwrap(),
+                before
+            );
+        } else {
+            commit(&historical, messages).await;
+        }
         let expected = if change == "drop_readd" {
             [None, None, None]
         } else {

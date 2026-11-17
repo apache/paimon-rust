@@ -25,7 +25,7 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
-use paimon::api::RestError;
+use paimon::api::{rest_api::RESTApi, RestError};
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::common::Options;
 use paimon::Error;
@@ -223,6 +223,90 @@ async fn tag_page_nulls_and_empty_parameters_match_java() {
 }
 
 #[tokio::test]
+async fn all_tag_pages_stop_on_empty_tokens_or_pages() {
+    for (response, expected) in [
+        (json!({"tags":["release"]}), vec!["release"]),
+        (
+            json!({"tags":["release"],"nextPageToken":""}),
+            vec!["release"],
+        ),
+        (json!({"tags":[],"nextPageToken":"unused"}), vec![]),
+        (json!({"tags":null,"nextPageToken":"unused"}), vec![]),
+        (json!({"nextPageToken":"unused"}), vec![]),
+    ] {
+        let ctx = TestCatalog::new(vec![(StatusCode::OK, response)]).await;
+        let names = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.api.list_tags(&Identifier::new("db", "t")),
+        )
+        .await
+        .expect("tag pagination did not terminate")
+        .unwrap();
+        assert_eq!(names, expected);
+        assert_eq!(ctx.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn all_tag_pages_preserve_names_order_and_opaque_tokens() {
+    let token = "next +/%一";
+    let ctx = TestCatalog::new(vec![
+        (
+            StatusCode::OK,
+            json!({"tags":["z","a"],"nextPageToken":token}),
+        ),
+        (StatusCode::OK, json!({"tags":["a","一"]})),
+    ])
+    .await;
+    assert_eq!(
+        ctx.api
+            .list_tags(&Identifier::new("db", "t$branch_dev"))
+            .await
+            .unwrap(),
+        ["z", "a", "a", "一"]
+    );
+    let requests = ctx.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].uri.ends_with("t%24branch_dev/tags"));
+    let url = reqwest::Url::parse(&format!("http://server{}", requests[1].uri)).unwrap();
+    assert_eq!(
+        url.query_pairs().collect::<Vec<_>>(),
+        [("pageToken".into(), token.into())]
+    );
+}
+
+#[tokio::test]
+async fn all_tag_pages_reject_repeated_or_cyclic_tokens() {
+    for tokens in [vec!["same", "same"], vec!["a", "b", "a"]] {
+        let ctx = TestCatalog::new(
+            tokens
+                .iter()
+                .map(|token| {
+                    (
+                        StatusCode::OK,
+                        json!({"tags":["release"],"nextPageToken":token}),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.api.list_tags(&Identifier::new("db", "t")),
+        )
+        .await
+        .expect("tag pagination did not terminate")
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::UnexpectedError { ref message, .. }
+            if message.contains("tag page token") && message.contains("more than once")),
+            "{error}"
+        );
+        assert_eq!(ctx.requests().len(), tokens.len());
+    }
+}
+
+#[tokio::test]
 async fn tag_page_errors_are_table_errors_and_keep_permissions() {
     for status in [StatusCode::NOT_FOUND, StatusCode::FORBIDDEN] {
         let ctx = TestCatalog::new(vec![(
@@ -349,6 +433,25 @@ async fn tag_retention_and_metadata_are_opaque_and_mutations_ignore_success_bodi
 }
 
 #[tokio::test]
+async fn tag_response_for_another_name_is_rejected() {
+    let ctx = TestCatalog::new_raw(vec![(
+        StatusCode::OK,
+        json!({"tagName":"other","snapshot":version_snapshot(7)}).to_string(),
+    )])
+    .await;
+    let error = ctx
+        .catalog
+        .get_tag(&Identifier::new("db", "t"), "release")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::DataInvalid { ref message, .. }
+            if message.contains("returned tag 'other' for requested tag 'release'")),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn version_paths_reject_parent_resources_before_requests() {
     use paimon::table::Instant;
     let ctx = TestCatalog::new(vec![]).await;
@@ -371,6 +474,11 @@ async fn version_paths_reject_parent_resources_before_requests() {
             .is_err());
     }
     for name in ["", " ", ".", ".."] {
+        assert!(ctx
+            .catalog
+            .create_tag(&Identifier::new("db", "t"), name, None, false)
+            .await
+            .is_err());
         assert!(ctx
             .catalog
             .get_tag(&Identifier::new("db", "t"), name)
@@ -400,6 +508,7 @@ struct ServerState {
 
 struct TestCatalog {
     catalog: RESTCatalog,
+    api: RESTApi,
     state: Arc<Mutex<ServerState>>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -459,9 +568,11 @@ impl TestCatalog {
         options.set("prefix", "tenant /一");
         options.set("token.provider", "bear");
         options.set("token", "test-token");
+        let api = RESTApi::new(options.clone(), false).await.unwrap();
         let catalog = RESTCatalog::new(options, false).await.unwrap();
         Self {
             catalog,
+            api,
             state,
             server,
         }

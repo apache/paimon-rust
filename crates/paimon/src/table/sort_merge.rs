@@ -71,6 +71,18 @@ impl BufferedBatch {
             Self::Materialized(batch) => batch.column(output_col_idx).as_ref(),
         }
     }
+
+    /// [`Self::column_for_output`] as the `ArrayRef` the batch holds.
+    pub(super) fn column_ref_for_output(
+        &self,
+        output_col_idx: usize,
+        source_output_col_indices: &[usize],
+    ) -> &arrow_array::ArrayRef {
+        match self {
+            Self::Source(batch) => batch.column(source_output_col_indices[output_col_idx]),
+            Self::Materialized(batch) => batch.column(output_col_idx),
+        }
+    }
 }
 
 /// A row reference as an index into the batch buffer.
@@ -136,6 +148,23 @@ pub(crate) enum MergeResult {
     Omit,
 }
 
+/// A live merged row whose user columns are copied from the input rows, so the
+/// reader can gather it with the rest of its output instead of building a one-row
+/// batch per key.
+pub(crate) struct PickedRow {
+    /// Per output column, the input row to copy, or `None` for NULL and for the
+    /// `_SEQUENCE_NUMBER` / `_VALUE_KIND` columns.
+    columns: Vec<Option<(usize, usize)>>,
+    sequence_number: i64,
+}
+
+/// What [`MergeFunction::merge_picked`] returns.
+pub(crate) enum PickedMerge {
+    Picked(PickedRow),
+    /// Any other result, as [`MergeFunction::merge`] returns it.
+    Result(MergeResult),
+}
+
 /// Java's reducer wrapper returns its first KeyValue unchanged when no
 /// second version arrives. The user-row reader drops a lone retract.
 fn singleton_reducer_result(rows: &[MergeRow]) -> crate::Result<Option<MergeResult>> {
@@ -150,6 +179,15 @@ fn singleton_reducer_result(rows: &[MergeRow]) -> crate::Result<Option<MergeResu
     } else {
         MergeResult::Omit
     }))
+}
+
+/// Whether a merge function also reduces a key with a single version. Only the
+/// lookup changelog producer needs that; otherwise the lone version is returned
+/// as is (see [`singleton_reducer_result`]).
+pub(crate) fn reduces_singletons(table_options: &HashMap<String, String>) -> bool {
+    table_options
+        .get("changelog-producer")
+        .is_some_and(|value| value.eq_ignore_ascii_case("lookup"))
 }
 
 /// Merge function applied to rows sharing the same primary key.
@@ -177,6 +215,19 @@ pub(crate) trait MergeFunction: Send + Sync {
         schema: &SchemaRef,
     ) -> crate::Result<(MergeResult, Option<RecordBatch>)> {
         Ok((self.merge(rows, batches, columns, schema)?, None))
+    }
+
+    /// Merge without materializing a live row, for merge functions that only copy
+    /// input values and emit no changelog. `None` means the caller should use
+    /// [`Self::merge_with_changelog`].
+    fn merge_picked(
+        &self,
+        _rows: &[MergeRow],
+        _batches: &[BufferedBatch],
+        _columns: &[usize],
+        _schema: &SchemaRef,
+    ) -> crate::Result<Option<PickedMerge>> {
+        Ok(None)
     }
 }
 
@@ -389,6 +440,13 @@ pub(crate) struct PartialUpdateMergeFunction {
 
 type FieldAggregatorSlots = Vec<Option<Box<dyn FieldAggregator>>>;
 
+fn is_merged_metadata_field(field: &arrow_schema::Field) -> bool {
+    matches!(
+        field.name().as_str(),
+        crate::spec::SEQUENCE_NUMBER_FIELD_NAME | crate::spec::VALUE_KIND_FIELD_NAME
+    )
+}
+
 /// KV metadata belongs to the merged record, outside user-field aggregation.
 /// Java merge functions carry the latest effective sequence separately and
 /// normalize surviving records to INSERT, even when the last input retracts.
@@ -455,9 +513,7 @@ impl PartialUpdateMergeFunction {
         PartialUpdateConfig::new(table_options).validate_write_mode(true, table_name)?;
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
-            reduce_singletons: table_options
-                .get("changelog-producer")
-                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
+            reduce_singletons: reduces_singletons(table_options),
             remove_record_on_delete: PartialUpdateConfig::new(table_options)
                 .remove_record_on_delete(),
             sequence_group_partial_delete: HashSet::new(),
@@ -570,9 +626,7 @@ impl PartialUpdateMergeFunction {
 
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
-            reduce_singletons: table_options
-                .get("changelog-producer")
-                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
+            reduce_singletons: reduces_singletons(table_options),
             remove_record_on_delete: config.remove_record_on_delete(),
             sequence_group_partial_delete,
             sequence_group_enabled,
@@ -601,6 +655,28 @@ impl MergeFunction for PartialUpdateMergeFunction {
         }
         self.merge_unreduced(rows, batch_buffer, source_output_col_indices, output_schema)
     }
+
+    fn merge_picked(
+        &self,
+        rows: &[MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<Option<PickedMerge>> {
+        // Aggregated fields have no input row to copy, and a lone version is
+        // already returned as a source row by `merge`.
+        if self.aggregators.is_some() || (!self.reduce_singletons && rows.len() == 1) {
+            return Ok(None);
+        }
+        self.merge_rows(
+            rows,
+            batch_buffer,
+            source_output_col_indices,
+            output_schema,
+            true,
+        )
+        .map(Some)
+    }
 }
 
 impl PartialUpdateMergeFunction {
@@ -611,6 +687,27 @@ impl PartialUpdateMergeFunction {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult> {
+        match self.merge_rows(
+            rows,
+            batch_buffer,
+            source_output_col_indices,
+            output_schema,
+            false,
+        )? {
+            PickedMerge::Result(result) => Ok(result),
+            PickedMerge::Picked(_) => unreachable!("picked rows are only returned when requested"),
+        }
+    }
+
+    /// With `pick`, a live row is returned as the input rows its columns come from.
+    fn merge_rows(
+        &self,
+        rows: &[MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+        pick: bool,
+    ) -> crate::Result<PickedMerge> {
         if rows.is_empty() {
             return Err(Error::UnexpectedError {
                 message: "merge called with empty rows".to_string(),
@@ -775,7 +872,11 @@ impl PartialUpdateMergeFunction {
                     .and_then(|aggregators| aggregators.get_mut(output_col_idx))
                     .and_then(Option::as_mut)
                 {
-                    aggregator.agg(source_array, row.row_idx)?;
+                    aggregator.agg_array(
+                        batch_buffer[row.batch_idx]
+                            .column_ref_for_output(output_col_idx, source_output_col_indices),
+                        row.row_idx,
+                    )?;
                 } else if !source_array.is_null(row.row_idx) {
                     *selected = Some((row.batch_idx, row.row_idx));
                 }
@@ -842,7 +943,7 @@ impl PartialUpdateMergeFunction {
         }
 
         if !initialized {
-            return Ok(MergeResult::Omit);
+            return Ok(PickedMerge::Result(MergeResult::Omit));
         }
         let deleted = current_delete_row || !saw_add;
         // Ignored legacy retracts seed the value but do not advance Java's
@@ -852,6 +953,34 @@ impl PartialUpdateMergeFunction {
             ..rows[0].clone()
         });
         let latest_row = latest_row.or(ignored_retract_metadata.as_ref()).unwrap();
+
+        if pick && !deleted {
+            let mut columns = selected_by_col;
+            for (output_col_idx, field) in output_schema.fields().iter().enumerate() {
+                if is_merged_metadata_field(field) {
+                    columns[output_col_idx] = None;
+                    continue;
+                }
+                let is_null = columns[output_col_idx].is_none_or(|(batch_idx, row_idx)| {
+                    batch_buffer[batch_idx]
+                        .column_for_output(output_col_idx, source_output_col_indices)
+                        .is_null(row_idx)
+                });
+                if is_null && !field.is_nullable() {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "merge-engine=partial-update produced NULL for non-nullable field '{}'",
+                            field.name()
+                        ),
+                        source: None,
+                    });
+                }
+            }
+            return Ok(PickedMerge::Picked(PickedRow {
+                columns,
+                sequence_number: latest_row.sequence_number,
+            }));
+        }
 
         let output_columns: Vec<ArrayRef> = output_schema
             .fields()
@@ -895,9 +1024,11 @@ impl PartialUpdateMergeFunction {
         })?;
 
         if deleted {
-            Ok(MergeResult::MaterializedDeleteRow(batch))
+            Ok(PickedMerge::Result(MergeResult::MaterializedDeleteRow(
+                batch,
+            )))
         } else {
-            Ok(MergeResult::MaterializedRow(batch))
+            Ok(PickedMerge::Result(MergeResult::MaterializedRow(batch)))
         }
     }
 }
@@ -1042,9 +1173,7 @@ impl AggregateMergeFunction {
         Ok(Self {
             aggregators: Mutex::new(aggregators),
             remove_record_on_delete: config.remove_record_on_delete(),
-            reduce_singletons: table_options
-                .get("changelog-producer")
-                .is_some_and(|value| value.eq_ignore_ascii_case("lookup")),
+            reduce_singletons: reduces_singletons(table_options),
         })
     }
 
@@ -1096,11 +1225,11 @@ impl AggregateMergeFunction {
             for (col_idx, slot) in aggregators.iter_mut().enumerate() {
                 if let Some(agg) = slot.as_mut() {
                     let source_array = batch_buffer[row.batch_idx]
-                        .column_for_output(col_idx, source_output_col_indices);
+                        .column_ref_for_output(col_idx, source_output_col_indices);
                     if kind.is_add() {
-                        agg.agg(source_array, row.row_idx)?;
+                        agg.agg_array(source_array, row.row_idx)?;
                     } else {
-                        agg.retract(source_array, row.row_idx)?;
+                        agg.retract(source_array.as_ref(), row.row_idx)?;
                     }
                 }
             }
@@ -1614,6 +1743,8 @@ fn sort_merge_stream(
 
         // Output indices: (batch_buffer_idx, row_idx) for interleave.
         let mut output_indices: Vec<(usize, usize)> = Vec::with_capacity(batch_size);
+        // Output rows at `(PICKED_ROW, i)` are `picked_rows[i]`.
+        let mut picked_rows: Vec<PickedRow> = Vec::new();
         // Reused for every key, so grouping allocates nothing per key.
         let mut winner_key: Vec<u8> = Vec::new();
         let mut same_key_rows: Vec<MergeRow> = Vec::new();
@@ -1717,9 +1848,20 @@ fn sort_merge_stream(
                     }
                 }
             }
-            let (merged, changelog) = merge_function.merge_with_changelog(
+            let (merged, changelog) = match merge_function.merge_picked(
                 &same_key_rows, &batch_buffer, &source_output_col_indices, &output_schema,
-            )?;
+            )? {
+                Some(PickedMerge::Picked(row)) => {
+                    output_indices.push((PICKED_ROW, picked_rows.len()));
+                    picked_rows.push(row);
+                    // Already queued above.
+                    (MergeResult::Omit, None)
+                }
+                Some(PickedMerge::Result(result)) => (result, None),
+                None => merge_function.merge_with_changelog(
+                    &same_key_rows, &batch_buffer, &source_output_col_indices, &output_schema,
+                )?,
+            };
             match merged {
                 MergeResult::SourceRow { batch_idx, row_idx } => {
                     output_indices.push((batch_idx, row_idx));
@@ -1763,13 +1905,15 @@ fn sort_merge_stream(
 
             // Yield a batch when we've accumulated enough rows.
             if output_indices.len() >= batch_size {
-                let batch = build_output_interleave(
+                let batch = build_output(
                     &output_schema,
                     &batch_buffer,
                     &source_output_col_indices,
                     &output_indices,
+                    &picked_rows,
                 )?;
                 output_indices.clear();
+                picked_rows.clear();
                 // Compact batch buffer after the pending output rows have been
                 // materialized. Source batches still referenced by cursors stay
                 // alive; materialized batches can be dropped here because they
@@ -1785,16 +1929,78 @@ fn sort_merge_stream(
 
         // Yield remaining rows.
         if !output_indices.is_empty() {
-            let batch = build_output_interleave(
+            let batch = build_output(
                 &output_schema,
                 &batch_buffer,
                 &source_output_col_indices,
                 &output_indices,
+                &picked_rows,
             )?;
             yield batch;
         }
     }
     .boxed())
+}
+
+/// Batch index marking an output row as a [`PickedRow`].
+const PICKED_ROW: usize = usize::MAX;
+
+fn build_output(
+    schema: &SchemaRef,
+    batch_buffer: &[BufferedBatch],
+    source_output_col_indices: &[usize],
+    indices: &[(usize, usize)],
+    picked_rows: &[PickedRow],
+) -> crate::Result<RecordBatch> {
+    if picked_rows.is_empty() {
+        return build_output_interleave(schema, batch_buffer, source_output_col_indices, indices);
+    }
+    // Picked rows take each column from its own input row. Their NULLs and KV
+    // metadata come from one extra array per column, at the picked row's index.
+    let extra_idx = batch_buffer.len();
+    let columns: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(output_col_idx, field)| {
+            let extra: ArrayRef = match field.name().as_str() {
+                crate::spec::SEQUENCE_NUMBER_FIELD_NAME => Arc::new(Int64Array::from_iter_values(
+                    picked_rows.iter().map(|row| row.sequence_number),
+                )),
+                crate::spec::VALUE_KIND_FIELD_NAME => {
+                    Arc::new(Int8Array::from(vec![
+                        RowKind::Insert as i8;
+                        picked_rows.len()
+                    ]))
+                }
+                _ => new_null_array(field.data_type(), picked_rows.len()),
+            };
+            let mut arrays: Vec<&dyn arrow_array::Array> = batch_buffer
+                .iter()
+                .map(|batch| batch.column_for_output(output_col_idx, source_output_col_indices))
+                .collect();
+            arrays.push(extra.as_ref());
+            let column_indices: Vec<(usize, usize)> = indices
+                .iter()
+                .map(|&(batch_idx, row_idx)| {
+                    if batch_idx == PICKED_ROW {
+                        picked_rows[row_idx].columns[output_col_idx].unwrap_or((extra_idx, row_idx))
+                    } else {
+                        (batch_idx, row_idx)
+                    }
+                })
+                .collect();
+            interleave(&arrays, &column_indices).map_err(|e| Error::UnexpectedError {
+                message: format!("Failed to interleave output column {output_col_idx}: {e}"),
+                source: Some(Box::new(e)),
+            })
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    RecordBatch::try_new(schema.clone(), columns).map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to build interleaved RecordBatch: {e}"),
+        source: Some(Box::new(e)),
+    })
 }
 
 /// Build an output RecordBatch using `interleave` to gather rows from the
@@ -2914,6 +3120,120 @@ mod tests {
 
         assert_eq!(pks, vec![1, 2, 3]);
         assert_eq!(values, vec!["merged", "merged", "merged"]);
+    }
+
+    /// Picked partial-update rows read the same as materialized ones, across output
+    /// batches and next to lone versions, including NULL columns and KV metadata.
+    #[tokio::test]
+    async fn test_partial_update_picked_rows_match_materialized_rows() {
+        struct Materializing(PartialUpdateMergeFunction);
+        impl MergeFunction for Materializing {
+            fn merge(
+                &self,
+                rows: &[MergeRow],
+                batch_buffer: &[BufferedBatch],
+                source_output_col_indices: &[usize],
+                output_schema: &SchemaRef,
+            ) -> crate::Result<MergeResult> {
+                self.0
+                    .merge(rows, batch_buffer, source_output_col_indices, output_schema)
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("v_int", DataType::Int32, true),
+            Field::new("v_str", DataType::Utf8, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("v_int", DataType::Int32, true),
+            Field::new("v_str", DataType::Utf8, true),
+        ]));
+        let streams = || {
+            let batch =
+                |pk: Vec<i32>, seq: Vec<i64>, v_int: Vec<Option<i32>>, v_str: Vec<Option<&str>>| {
+                    let kinds = vec![0i8; pk.len()];
+                    stream_from_batches(vec![RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from(pk)),
+                            Arc::new(Int64Array::from(seq)),
+                            Arc::new(Int8Array::from(kinds)),
+                            Arc::new(Int32Array::from(v_int)),
+                            Arc::new(StringArray::from(v_str)),
+                        ],
+                    )
+                    .unwrap()])
+                };
+            vec![
+                batch(
+                    vec![1, 2, 3, 4],
+                    vec![1, 1, 1, 1],
+                    vec![Some(10), Some(20), Some(30), None],
+                    vec![Some("a1"), Some("a2"), None, Some("a4")],
+                ),
+                batch(
+                    vec![1, 2, 4, 5],
+                    vec![2, 2, 2, 1],
+                    vec![None, Some(21), None, Some(50)],
+                    vec![Some("b1"), None, None, None],
+                ),
+                batch(
+                    vec![1, 3, 5, 6],
+                    vec![3, 3, 2, 1],
+                    vec![Some(12), None, None, Some(60)],
+                    vec![None, Some("c3"), None, Some("c6")],
+                ),
+            ]
+        };
+        let read = |merge: Box<dyn MergeFunction>| {
+            SortMergeReaderBuilder::new(
+                streams(),
+                schema.clone(),
+                vec![0],
+                1,
+                2,
+                vec![],
+                vec![1, 2, 3, 4],
+                output_schema.clone(),
+                merge,
+            )
+            .with_batch_size(2)
+            .build()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+        };
+        let new_merge = || PartialUpdateMergeFunction::new(&HashMap::new(), "test_table").unwrap();
+        let picked = read(Box::new(new_merge())).await.unwrap();
+        let materialized = read(Box::new(Materializing(new_merge()))).await.unwrap();
+        assert_eq!(picked, materialized);
+
+        let picked = arrow_select::concat::concat_batches(&output_schema, &picked).unwrap();
+        assert_eq!(
+            picked.column(1).as_ref(),
+            &Int64Array::from(vec![3, 2, 3, 2, 2, 1]) as &dyn arrow_array::Array
+        );
+        assert_eq!(
+            picked.column(3).as_ref(),
+            &Int32Array::from(vec![Some(12), Some(21), Some(30), None, Some(50), Some(60)])
+                as &dyn arrow_array::Array
+        );
+        assert_eq!(
+            picked.column(4).as_ref(),
+            &StringArray::from(vec![
+                Some("b1"),
+                Some("a2"),
+                Some("c3"),
+                Some("a4"),
+                None,
+                Some("c6")
+            ]) as &dyn arrow_array::Array
+        );
     }
 
     #[tokio::test]

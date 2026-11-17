@@ -64,6 +64,9 @@ func TestCatalogTagLifecycle(t *testing.T) {
 	if tag.TagName != "release-1" || tag.Snapshot.ID != 1 {
 		t.Fatalf("unexpected tag: %#v", tag)
 	}
+	if tag.TagTimeRetained != nil {
+		t.Fatalf("plain CreateTag retention = %#v, want nil", tag.TagTimeRetained)
+	}
 	if tag.Snapshot.CommitKind != paimon.CommitKindAppend {
 		t.Fatalf("commit kind = %q, want %q", tag.Snapshot.CommitKind, paimon.CommitKindAppend)
 	}
@@ -79,9 +82,44 @@ func TestCatalogTagLifecycle(t *testing.T) {
 	if err := catalog.CreateTag(id, "release-explicit", &snapshotID, false); err != nil {
 		t.Fatal(err)
 	}
+	explicit, err := catalog.GetTag(id, "release-explicit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicit.TagTimeRetained != nil {
+		t.Fatalf("explicit CreateTag retention = %#v, want nil", explicit.TagTimeRetained)
+	}
+
+	timeRetained := "1d"
+	if err := catalog.CreateTagWithRetention(id, "release-retained", &snapshotID, &timeRetained, false); err != nil {
+		t.Fatal(err)
+	}
+	retained, err := catalog.GetTag(id, "release-retained")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retained.TagName != "release-retained" || retained.Snapshot.ID != 1 {
+		t.Fatalf("unexpected retained tag: %#v", retained)
+	}
+	if retained.TagTimeRetained == nil || *retained.TagTimeRetained != "PT24H" {
+		t.Fatalf("tag time retained = %#v, want PT24H", retained.TagTimeRetained)
+	}
+	if retained.TagCreateTime == nil {
+		t.Fatal("expected tag create time for retained tag")
+	}
+
+	invalidRetained := "-1d"
+	err = catalog.CreateTagWithRetention(id, "release-invalid", &snapshotID, &invalidRetained, false)
+	var paimonErr *paimon.Error
+	if !errors.As(err, &paimonErr) || paimonErr.Code() != paimon.CodeInvalidInput {
+		t.Fatalf("invalid retention error = %v", err)
+	}
+	_, err = catalog.GetTag(id, "release-invalid")
+	if !errors.As(err, &paimonErr) || paimonErr.Code() != paimon.CodeNotFound {
+		t.Fatalf("invalid retention should not create tag: %v", err)
+	}
 
 	err = catalog.CreateTag(id, "release-1", nil, false)
-	var paimonErr *paimon.Error
 	if !errors.As(err, &paimonErr) || paimonErr.Code() != paimon.CodeAlreadyExist {
 		t.Fatalf("duplicate tag error = %v", err)
 	}
@@ -103,10 +141,16 @@ func TestCatalogTagLifecycle(t *testing.T) {
 	if err := catalog.DeleteTag(id, "release-explicit"); err != nil {
 		t.Fatal(err)
 	}
+	if err := catalog.DeleteTag(id, "release-retained"); err != nil {
+		t.Fatal(err)
+	}
 
 	catalog.Close()
 	if err := catalog.CreateTag(id, "closed", nil, false); !errors.Is(err, paimon.ErrClosed) {
 		t.Fatalf("closed catalog error = %v", err)
+	}
+	if err := catalog.CreateTagWithRetention(id, "closed-retained", nil, &timeRetained, false); !errors.Is(err, paimon.ErrClosed) {
+		t.Fatalf("closed catalog CreateTagWithRetention error = %v", err)
 	}
 }
 

@@ -41,7 +41,7 @@ and writes to ordinary Paimon tables can create them with `file.format=mosaic`.
 SQL support has two layers:
 
 - DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
-- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `MSCK REPAIR TABLE`, `ANALYZE TABLE`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`. `MERGE INTO` uses DataFusion's native planner and the Paimon table provider for execution.
+- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, `CREATE FUNCTION`, and `DROP FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `MSCK REPAIR TABLE`, `ANALYZE TABLE`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`. `MERGE INTO` uses DataFusion's native planner and the Paimon table provider for execution.
 
 Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. Persistent `CREATE FUNCTION` is supported only for the REST Catalog SQL scalar form documented below. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
 
@@ -134,7 +134,7 @@ It also manages session-scoped dynamic options internally for `SET`/`RESET` supp
 
 ### REST Catalog Views and SQL Functions
 
-When the registered catalog is a Paimon REST Catalog, `SQLContext` can read, execute, create, and drop persistent views and can create SQL scalar functions.
+When the registered catalog is a Paimon REST Catalog, `SQLContext` can read, execute, create, and drop persistent views and SQL scalar functions.
 
 Create a persistent view with this syntax:
 
@@ -222,6 +222,21 @@ RETURN amount * DECIMAL '1.10';
 SELECT add_tax(total) FROM orders;
 ```
 
+Drop a persistent function using a bare, two-part, or three-part name:
+
+```sql
+DROP FUNCTION add_tax;
+DROP FUNCTION IF EXISTS reporting.add_tax;
+DROP FUNCTION IF EXISTS paimon.reporting.add_tax;
+```
+
+Persistent `DROP FUNCTION` is implemented by REST Catalog and sends a direct
+delete request. `IF EXISTS` ignores only a missing function; permission and
+server errors are preserved. Only one function may be dropped per statement.
+Argument signatures, `CASCADE`, `RESTRICT`, and `DROP TEMPORARY FUNCTION` are not
+supported for Paimon catalogs. Catalogs without persistent function support may
+return `Unsupported`.
+
 Bare, two-part (`database.function`), and three-part
 (`catalog.database.function`) names are accepted as creation targets. Unquoted
 names are normalized and quoted names are preserved. Calls remain limited to
@@ -275,9 +290,9 @@ functions. Two-part function names such as `database.function(...)`, lambda or
 file definitions, aggregate/table/multi-return functions, and non-deterministic
 functions are not supported. `CREATE OR REPLACE/ALTER/TEMPORARY FUNCTION`,
 non-SQL bodies, `STABLE`/`VOLATILE`, null-input/parallel/security/SET clauses,
-options/remote functions, and persistent `ALTER FUNCTION` / `DROP FUNCTION`
-are also not supported. Catalog implementations other than REST Catalog may
-return `Unsupported` for persistent function creation.
+options/remote functions, and persistent `ALTER FUNCTION` are also not supported.
+Catalog implementations other than REST Catalog may return `Unsupported` for
+persistent function creation or deletion.
 
 ## Data Types
 
@@ -303,14 +318,25 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `TIMESTAMP WITH TIME ZONE` | LocalZonedTimestampType | |
 | `DECIMAL(p, s)` | DecimalType | |
 | `ARRAY<element>` | ArrayType | e.g. `ARRAY<INT>` |
+| `VECTOR<element, n>` | VectorType | Fixed-size vector; `n` is between 1 and 2147483647 |
 | `MAP(key, value)` | MapType | e.g. `MAP(STRING, INT)` |
 | `STRUCT<field TYPE, ...>` | RowType | e.g. `STRUCT<city STRING, zip INT>` |
 
-For vector search tables created from SQL, use `ARRAY<FLOAT>` for embedding
-columns. Existing Paimon tables may also expose logical `VECTOR<FLOAT,N>`
-columns; DataFusion reads those as Arrow `FixedSizeList<Float32>`, and vindex
-index creation uses `N` as the vector dimension. `SHOW CREATE TABLE` currently
-does not round-trip `VECTOR` columns.
+`VECTOR<element, n>` follows Paimon's logical vector type. Elements must be
+`BOOLEAN`, `TINYINT`, `SMALLINT`, `INT` / `INTEGER`, `BIGINT`, `FLOAT` / `REAL`,
+or `DOUBLE` / `DOUBLE PRECISION`. The vector and its elements are nullable by
+default; for example, `embedding VECTOR<FLOAT NOT NULL, 128> NOT NULL` disallows
+both null vectors and null elements. The syntax is supported in `CREATE TABLE`,
+`ALTER TABLE`, and `CAST`, including vectors nested in arrays, maps, and structs.
+`SHOW CREATE TABLE` preserves the element type, dimension, and nullability.
+Nested vectors can also be non-null, for example
+`ARRAY<VECTOR<FLOAT NOT NULL, 128> NOT NULL>`.
+In `CAST` targets, SQL fixed-size arrays (`T[n]`) inside a `MAP` containing
+vectors are not supported; use `ARRAY<T>` for variable-length collections.
+
+For vector search embeddings, use `VECTOR<FLOAT, n>` or `ARRAY<FLOAT>`.
+DataFusion represents `VECTOR<FLOAT, n>` as Arrow `FixedSizeList<Float32>`, and
+vindex index creation uses `n` from the type as the vector dimension.
 
 ### Blob Columns
 
@@ -357,6 +383,14 @@ For serialized `BlobDescriptor` values supplied by another Paimon engine,
 The offset must be non-negative, and lengths below `-1` are invalid.
 
 The same directives are supported by `ALTER TABLE ... ADD COLUMN`.
+
+Append-only data-evolution tables can set `video-frame-field` to a
+comma-separated list of scalar BLOB columns. Native writers accept serialized
+`VideoFrameDescriptor` values for these columns and pack complete encoded videos
+into `.video` files, deduplicating each source URI/range within one file and
+indexing logical frame runs. Readers return lazy frame descriptors. Video packing
+does not decode or re-encode frames. Raw video bytes, ordinary BlobDescriptors,
+video-column updates, video compaction, and BlobConsumer callbacks are unsupported.
 
 ### Blob Descriptor Functions
 
@@ -918,10 +952,10 @@ The table type determines which row-level DML operations are supported:
 | `TRUNCATE TABLE` | Supported | Supported | Supported |
 | `ALTER TABLE ... DROP PARTITION` | Supported for partitioned tables | Supported for partitioned tables | Supported for partitioned tables |
 | `UPDATE` | Supported via Copy-on-Write | Not supported | Supported via row-id update |
-| `DELETE` | Supported via Copy-on-Write | Not supported | Supported when deletion vectors are enabled |
+| `DELETE` | Supported via Copy-on-Write | Supported for [eligible `deduplicate` tables](#delete) | Supported when deletion vectors are enabled |
 | `MERGE INTO` | Supported via Copy-on-Write | Not supported | Supported for matched `UPDATE`, matched `DELETE` with deletion vectors, and not-matched `INSERT` |
 
-A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. `DELETE` and matched `DELETE` in `MERGE INTO` additionally require `'deletion-vectors.enabled' = 'true'`. Primary-key row-level `UPDATE`, `DELETE`, and `MERGE INTO` are not supported even when data evolution is enabled.
+A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. `DELETE` and matched `DELETE` in `MERGE INTO` additionally require `'deletion-vectors.enabled' = 'true'`. Primary-key row-level `UPDATE` and `MERGE INTO` are not supported.
 
 ### INSERT INTO
 
@@ -933,6 +967,26 @@ INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol');
 
 ```sql
 INSERT INTO paimon.my_db.users SELECT * FROM source_table;
+```
+
+An `INSERT INTO` an append-only table with `'bucket' = '-1'` (the default) can
+encode data files with several writers. The writer count is the table option
+`sink.parallelism`, capped at `datafusion.execution.target_partitions`; the sink
+deals input batches to the writers round-robin, and their files are committed
+together as one snapshot. Without the option, or with `-1` (Flink's default
+parallelism), one writer is used. Primary-key tables, fixed-bucket tables and
+`INSERT OVERWRITE` always use one writer, but the option must still be a
+positive integer or `-1`.
+
+Each writer rolls its own files in every partition it receives rows for, so on
+a partitioned table the file count grows to writers × partitions where one
+writer leaves one file per partition.
+`sink.parallelism` is the same option Flink reads for its sink, so a table that
+already sets it for Flink jobs also writes in parallel from DataFusion, with at
+most `target_partitions` writers whatever the Flink value is.
+
+```sql
+ALTER TABLE paimon.my_db.events SET TBLPROPERTIES ('sink.parallelism' = '4');
 ```
 
 For `VARIANT` columns, convert JSON text with `parse_json` or `try_parse_json`:
@@ -996,7 +1050,33 @@ For append-only tables (no primary key), updates are executed using Copy-on-Writ
 UPDATE paimon.my_db.t SET name = 'a_new' WHERE id = 1;
 ```
 
-For data-evolution row-tracking tables without primary keys, updates are executed with row-id-based partial-column writes. Primary-key tables are not supported for `UPDATE`.
+For data-evolution row-tracking tables without primary keys, updates are executed with row-id-based partial-column writes.
+
+Ordinary primary-key tables using `merge-engine=deduplicate` support `UPDATE` by
+writing complete updated rows with the `UPDATE_AFTER` row kind. All SET
+expressions use the original row; unassigned columns retain their values.
+Primary-key and partition columns cannot be assigned.
+
+The target and its live self-references in predicates and SET expressions use
+one captured snapshot, including uncompacted deletion-vector versions. Target
+validation and read-option restrictions follow the primary-key DELETE rules
+below. Explicit historical and incremental views keep their selected read view.
+
+Configured sequence values are preserved unless assigned by SET, and the normal
+sequence sort order applies to the updated rows. A lower-priority assigned
+sequence or a higher-priority concurrent upsert can leave the stored row
+unchanged. The affected-row count reports rows matching the predicate in the
+captured snapshot, including updates that lose under these merge rules. This
+does not provide serializable updates.
+
+No matches publish no snapshot. Publication retries reuse prepared files without
+rescanning; repeating the SQL statement is a new operation. A commit error can
+occur after publication, so prepared files are retained and the error identifies
+the table and commit user.
+
+Other merge engines, `rowkind.field`, query-authorized targets, aliases, joins,
+`FROM`, `RETURNING`, `OUTPUT`, `ORDER BY`, `LIMIT`, target modifiers and tuple or
+qualified/nested SET targets are not supported by this primary-key UPDATE path.
 
 ### DELETE
 
@@ -1008,7 +1088,46 @@ DELETE FROM paimon.my_db.t WHERE name = 'b';
 
 For data-evolution row-tracking tables without primary keys, deletes are executed via deletion vectors and require `'deletion-vectors.enabled' = 'true'`.
 
-`DELETE` is not supported on primary-key tables.
+Primary-key tables using `merge-engine=deduplicate` with data evolution disabled
+support `DELETE` by writing tombstones for the logical rows matching the
+predicate. `DELETE` without `WHERE` targets every row in the captured read
+snapshot. A delete with no matches returns zero without publishing a snapshot.
+
+The target and its live self-references, including those through views, use one
+captured snapshot and merge uncompacted primary-key versions before applying
+predicates. On deletion-vector tables this applies even when
+`deletion-vectors.merge-on-read` is disabled. Ordinary queries retain their
+configured read behavior. Explicitly historical and incremental views retain
+their selected snapshots or timestamp windows and configured read behavior.
+DELETE targets cannot use time-travel or incremental read options.
+
+The target and its live self-references must use the table's configured merge
+engine, sequence fields, sort order, bucket count, bucket keys and bucket
+function. Conflicting session options or options captured by a view are rejected
+before scanning, as are overrides that enable or disable deletion vectors or
+data evolution, or change row-kind handling or query authorization. Read tuning
+options, such as `read.batch-size`, remain supported.
+
+Tombstones preserve configured sequence values and sort order, so
+concurrent upserts follow the normal primary-key merge rules. With the default
+ascending order, a higher-sequence upsert survives; without a sequence field,
+normal write ordering applies. This does not provide serializable predicate
+deletion.
+
+The affected-row count reports logical rows matching the predicate in the
+captured snapshot. It includes keys whose concurrent upserts survive under the
+merge rules above.
+
+Publication retries reuse prepared files without rescanning. Repeating the SQL
+statement scans a new snapshot and is a new operation. A commit error does not
+necessarily mean that the deletion was rolled back. Prepared files are retained
+on publication errors; the error identifies the table and commit user for
+investigating an uncertain outcome.
+
+Other primary-key merge engines, `ignore-delete=true` (including its fallback
+options), `rowkind.field`, query-authorized primary-key tables, aliases,
+multi-target/join deletes, `USING`, `RETURNING`, `ORDER BY`, `LIMIT`, `OUTPUT`, and
+target table modifiers are not supported by this path.
 
 ### MERGE INTO
 
@@ -1056,14 +1175,16 @@ are published in one commit. Multiple source rows selecting conflicting actions
 for the same target row fail without publishing any actions. A sole unconditional
 matched DELETE collapses duplicate matches and counts each deleted target once.
 
-Append-only tables support multiple conditional matched clauses with the first
-true clause taking effect; NULL predicates fall through. Data-evolution tables
-retain the restriction of one unconditional matched clause. Both support
-conditional not-matched inserts. `NOT MATCHED BY SOURCE` and subqueries inside
-`ON` or action expressions are not supported by the Paimon executor. Native
-planner restrictions also apply, including `UPDATE SET *`, `INSERT *`, `OUTPUT`,
-and action-level `WHERE` predicates. After declaring a table alias, use that
-alias in column references.
+Append-only tables support multiple matched clauses and execute the first
+applicable action. Data-evolution tables support a single matched `UPDATE` or
+`DELETE` with an optional predicate. A clause predicate must evaluate to `TRUE`
+for its action to apply. If no matched action applies, the target row is
+preserved. Both table types support conditional `WHEN NOT MATCHED` inserts,
+which apply only to source rows without an `ON` match. The Paimon executor
+does not support `NOT MATCHED BY SOURCE` or subqueries inside `ON` or action
+expressions. Native planner restrictions also apply, including `UPDATE SET *`,
+`INSERT *`, `OUTPUT`, and action-level `WHERE` predicates. After declaring a
+table alias, use that alias in column references.
 
 `SQLContext` expands positional MERGE inserts to persisted column names for
 data-evolution tables, excluding the virtual `_ROW_ID`. When using a raw
@@ -1459,10 +1580,16 @@ CALL sys.create_tag(
 );
 ```
 
-When `time_retained` is specified, retention and tag creation time are persisted in
-the tag file. For example, `'1d'` appears as `PT24H` in the `time_retained` column
-of `$tags`. Omitting `time_retained` creates a tag without these metadata fields.
-This procedure does not automatically delete expired tags.
+For filesystem-managed tables, specifying `time_retained` persists retention and
+tag creation time in the tag file. For example, `'1d'` appears as `PT24H` in the
+`time_retained` column of `$tags`. Omitting `time_retained` creates a tag without
+these metadata fields. This procedure does not automatically delete expired tags.
+
+For tables managed by a REST catalog, the tag is created through the catalog:
+`snapshot_id` and `time_retained` are forwarded unchanged, and the server resolves
+the snapshot (the latest one when `snapshot_id` is omitted), validates retention,
+and stores the tag. The table's `tag/` directory is not read or written. An
+existing tag name fails with `Tag '...' already exists`, as for other tables.
 
 ### replace_tag
 
@@ -1513,6 +1640,10 @@ Create a named tag from an epoch timestamp in milliseconds (finds the earliest r
 CALL sys.create_tag_from_timestamp(table => 'paimon.my_db.my_table', tag => 'my_tag', timestamp => 1234567890000);
 ```
 
+This procedure is not supported for tables managed by a REST catalog. Their
+snapshots may exist only in the catalog, while timestamp selection currently
+relies on stored snapshot files.
+
 ### create_tag_from_watermark
 
 This procedure is not supported for tables managed by a REST catalog. Their
@@ -1554,6 +1685,23 @@ Delete a named tag:
 CALL sys.delete_tag(table => 'paimon.my_db.my_table', tag => 'my_tag');
 ```
 
+`tag` accepts a comma-separated list. Each name is trimmed, empty names are
+skipped, and missing tags are ignored. For tables managed by a REST catalog,
+each tag is deleted through the catalog, and the table's `tag/` directory is not
+read or written. Any other error stops the batch; earlier deletions are not
+rolled back.
+
+### rename_tag
+
+Rename a tag:
+
+```sql
+CALL sys.rename_tag(table => 'paimon.my_db.my_table', tag => 'old_tag', target_tag => 'new_tag');
+```
+
+The source tag must exist and the target tag must not. This procedure is not
+supported for tables managed by a REST catalog, which has no tag-rename endpoint.
+
 ### rollback_to
 
 Rollback a table to a specific snapshot or tag:
@@ -1574,6 +1722,10 @@ Rollback a table to an epoch timestamp in milliseconds (selects the latest retai
 CALL sys.rollback_to_timestamp(table => 'paimon.my_db.my_table', timestamp => 1234567890000);
 ```
 
+This procedure is not supported for tables managed by a REST catalog, for the
+same reason as `create_tag_from_timestamp`. Use `rollback_to` with an explicit
+`snapshot_id` or `tag` instead.
+
 Both timestamp procedures take epoch milliseconds. The `$snapshots.commit_time`
 column is a local `TIMESTAMP`; its raw Arrow value includes the local timezone
 offset and must not be passed directly as an epoch timestamp.
@@ -1581,6 +1733,10 @@ offset and must not be passed directly as an epoch timestamp.
 ### create_global_index
 
 Build and commit a global index for a table column.
+
+As in Paimon's Flink SQL and Spark SQL integrations, global indexes are created
+through `CALL sys.create_global_index`. `CREATE INDEX ... ON ...` DDL is not
+supported.
 
 To maintain indexes synchronously after writes, declare columns through options
 such as `global-index.btree.index-columns='id'`. Maintenance runs by default
@@ -1624,6 +1780,26 @@ CALL sys.create_global_index(
   options => 'full-text.tokenizer=jieba,full-text.remove-stop-words=false'
 );
 ```
+
+Set `partitions` to build indexes only for matching partitions. As in Flink SQL
+and Spark SQL, `,` combines constraints with AND and `;` combines alternatives
+with OR. Omitted partition keys are unrestricted; omitting `partitions` builds
+all partitions. Values are parsed using each partition column's type, and the
+table's `partition.default-name` selects NULL values. Invalid filters and
+partition filters on unpartitioned tables are rejected before files are written.
+
+```sql
+CALL sys.create_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'id',
+  index_type => 'btree',
+  partitions => 'dt=2026-10-10,hr=1;dt=2026-10-11,hr=2'
+);
+```
+
+Index coverage outside the selected partitions is preserved. If the selected
+data is already indexed and unchanged, or no data matches, no snapshot is
+committed.
 
 `index_type` defaults to `btree`. It is case-insensitive and surrounding
 whitespace is ignored. BTree and bitmap global indexes support scalar columns.
@@ -1816,7 +1992,7 @@ Supported vindex options:
 
 | Option | Default | Applies To | Description |
 |---|---:|---|---|
-| `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. Existing `VECTOR<FLOAT,N>` columns use `N` from the type. |
+| `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. `VECTOR<FLOAT,N>` columns use `N` from the type. |
 | `<index-type>.distance.metric` | `inner_product` | all vindex types | Distance metric: `inner_product`, `cosine`, or `l2`. |
 | `<index-type>.nlist` | automatic | all IVF types | Number of IVF lists. When omitted or `auto`, infer it from `expected-vector-count`. DiskANN rejects this option. |
 | `<index-type>.expected-vector-count` | unset, or inferred | all vindex types | Expected number of vectors used for automatic sizing. When omitted, an automatic IVF build counts the shard's non-NULL vectors before training. |
@@ -1914,7 +2090,9 @@ when `N` is zero. `dry_run` defaults to `false`; an explicit `false` or an
 omitted argument performs the drop and returns `OK`. Other values are rejected.
 The preview uses the latest snapshot at the time of the call; concurrent changes
 can affect the number of files matched by a later drop. Reads retain the usual
-local-cache behavior. Partition filtering is not supported by this procedure.
+local-cache behavior. The optional `partitions` argument uses the same filter
+syntax as [create_global_index](#create_global_index) and restricts the drop to
+matching partitions.
 
 ### compact
 
@@ -2898,7 +3076,16 @@ Use a quoted tag name with `VERSION AS OF`:
 SELECT * FROM paimon.default.my_table VERSION AS OF 'my_tag';
 ```
 
-Resolution order: first checks if a tag with that name exists, then tries to parse it as a snapshot ID.
+Resolution order: first resolves a tag with that name, then tries
+`watermark-<value>` or a numeric snapshot ID.
+
+For tables managed by a REST catalog, tags named by `VERSION AS OF` or
+`scan.tag-name` are resolved through the catalog; tag files in table storage are
+ignored. Legacy tags named `.` or `..` cannot be resolved through the REST API.
+If the tag endpoint returns HTTP 501, `scan.version` (including `VERSION AS OF`)
+can still resolve a numeric snapshot ID or `watermark-<value>` from stored
+snapshots. `scan.tag-name` always requires the tag endpoint, including for
+numeric tag names. Other catalog errors fail the query.
 
 ### By Timestamp
 
@@ -3170,6 +3357,17 @@ Columns:
 | `create_time` | TIMESTAMP | Tag creation time; `NULL` for tags written without one |
 | `time_retained` | STRING | Tag retention as an ISO-8601 duration (for example `PT72H`); `NULL` for tags written without one |
 
+For tables managed by a REST catalog, the tags are listed from the catalog
+rather than from tag files in table storage. Legacy tags named `.` or `..`, which
+cannot be addressed safely by the REST API, are omitted with a warning so they
+cannot prevent other tags from being queried. Their storage files are ignored,
+and direct time travel by these legacy names is rejected.
+
+`create_time` is a local `TIMESTAMP` without a timezone. REST catalog creation
+times are converted from epoch milliseconds to the client's local time, matching
+the local date-time fields in filesystem tag metadata. Its raw Arrow integer is
+not an epoch timestamp.
+
 ### $branches
 
 View all branches of a table:
@@ -3342,9 +3540,18 @@ Columns:
 | `index_file_size` | BIGINT | Total size of index files (bytes) |
 
 The output contains one row per scope:
-- `total` — sum across all branches and tags
+- `total` — unique referenced files across all branches and tags
 - `branch:main` — main branch snapshots + tag snapshots
 - `branch:<name>` — one row per other branch
+
+For tables managed by a REST catalog, branches and tags come from the catalog,
+including branches with no corresponding storage directory. Current snapshots
+and tag snapshots returned by the catalog are counted even when their snapshot
+files are absent, together with the snapshot history visible in table storage.
+REST metadata API failures, including HTTP 501, fail the query rather than return
+an incomplete count. Invalid or unaddressable branch names also fail the query.
+Legacy `.` or `..` tags fail this query because their catalog snapshots cannot
+be read safely; they are not replaced by storage files.
 
 To estimate possible orphan file size for recognized data files:
 
@@ -3439,39 +3646,97 @@ clients may ignore it.
 Existing partial-update tables may also configure
 `fields.<field>.aggregate-function` or
 `fields.default-aggregate-function`. Rust supports the same aggregate-function
-set as the basic aggregation engine: `sum`, `product`, `min`, `max`,
-`last_value`, `first_value`, `last_non_null_value`,
-`first_non_null_value`, `bool_and`, `bool_or`, and `listagg`.
+set as the basic aggregation engine (see below).
 `last_non_null_value` may be used without a sequence group; other functions
 require the target field to be protected by a sequence group. When a
 lower-precedence group sequence arrives, order-sensitive functions use Java
 compatible reversed aggregation. Unknown functions and incompatible
 function/type combinations fail closed.
 
-Rust can read fully materialized compacted files from deletion-vector-enabled
-partial-update and aggregation tables. Every split must be raw-convertible,
-every file must have a known zero delete-row count, and
-`deletion-vectors.merge-on-read` must remain disabled. Writing these table
-combinations and reading plans that still require per-key merging are not
-supported.
+Rust can read deletion-vector-enabled partial-update and aggregation tables.
+Fully materialized compacted files can be read as raw-convertible splits when
+every file has a known zero delete-row count. Uncompacted overlapping files can
+also be read with `deletion-vectors.merge-on-read=true`. Primary-key
+deletion-vector compaction still requires `merge-engine=deduplicate`, so these
+engines do not produce DV compaction output in Rust.
 
 Rust currently supports `merge-engine=aggregation` in basic mode only. It works
-with fixed buckets and ordinary dynamic buckets (`'bucket' = '-1'`) when the
-primary key includes all partition columns. It supports per-field aggregate
-functions such as `sum`, `min`, `max`, value functions, boolean functions, and
-`listagg`, plus `fields.default-aggregate-function`. Each write-buffer flush
-aggregates duplicate primary keys before writing data files, so a file contains
-at most one row per key. Input changelog files retain the original rows.
+with fixed buckets and dynamic buckets (`'bucket' = '-1'`). Cross-partition
+updates (`'bucket' = '-1'` when the primary key does not contain every partition
+field) keep the existing partition/bucket location, matching Java
+`UseOldExistingProcessor`. Each write-buffer flush aggregates duplicate primary
+keys before writing data files, so a file contains at most one row per key.
+Input changelog files retain the original rows.
 
-Sequence fields are always merged with `last_value`. Defining
+Per-field aggregate functions are selected in this order: sequence fields always
+use `last_value`; primary-key columns pass through without an aggregator;
+otherwise `fields.<field>.aggregate-function`, then
+`fields.default-aggregate-function`, then `last_non_null_value`. Defining
 `fields.<sequence-field>.aggregate-function` is rejected, matching Java schema
-validation.
+validation. The undocumented Java SPI alias `first_not_null_value` is accepted
+and resolved to `first_non_null_value`.
 
-This is not full Java feature parity. Aggregation tables do not support retract
-rows (`DELETE` / `UPDATE_BEFORE`), deletion-vector writes or merge-on-read
-plans, cross-partition dynamic bucket writes, or advanced aggregation options
-such as `ignore-retract`, `distinct`, `nested-key`, `count-limit`, and sequence
-groups.
+Supported aggregate functions:
+
+| Function | Column type |
+|---|---|
+| `sum`, `product` | integer, `FLOAT`, `DOUBLE`, `DECIMAL` |
+| `min`, `max` | comparable scalars (not `MAP`, `MULTISET`, `ROW`, `ARRAY`, `VECTOR`, `VARIANT`, or `BLOB`) |
+| `last_value`, `first_value`, `last_non_null_value`, `first_non_null_value`, `primary-key` | any |
+| `bool_and`, `bool_or` | `BOOLEAN` |
+| `listagg` | unbounded `STRING` (`VARCHAR` with max length) |
+| `collect` | `ARRAY` |
+| `merge_map` | `MAP` |
+| `merge_map_with_keytime` | `MAP` whose value is a `ROW` with at least two fields |
+| `nested_update`, `nested_partial_update` | `ARRAY<ROW>` |
+| `rbm32`, `rbm64`, `hll_sketch`, `theta_sketch` | `VARBINARY` |
+
+Field-scoped options used by these functions:
+
+- `fields.<field>.ignore-retract=true` ignores retract cells for that field.
+  It conflicts with `aggregation.remove-record-on-delete=true`.
+- `fields.<field>.list-agg-delimiter` and `fields.<field>.distinct` for
+  `listagg`; `fields.<field>.distinct` also applies to `collect`.
+- `fields.<field>.sum.fail-on-overflow` / `fields.<field>.product.fail-on-overflow`
+  reject integer overflow instead of wrapping. Floating-point addition is
+  unaffected; Decimal overflow still yields NULL as in Java.
+- `fields.<field>.ts-field` selects the key-time field for
+  `merge_map_with_keytime` (defaults to the last ROW field).
+- `fields.<field>.nested-key`, `fields.<field>.nested-sequence-field`,
+  `fields.<field>.nested-key-null-strategy`, and `fields.<field>.count-limit`
+  for nested array aggregators. `nested_partial_update` requires
+  `nested-key`.
+- `fields.<field>.count-limit` also applies to `collect`, see below.
+
+`collect` supports `fields.<field>.distinct` and `fields.<field>.count-limit`.
+A positive limit `N` keeps the first `N` elements in merge order, a negative
+limit `-N` keeps the last `N`, and `0` keeps none. There is no limit by
+default. With `distinct=true`, the limit counts distinct elements: a positive
+limit keeps the first occurrence of each element and a negative limit keeps the
+last, both in their original order. For example, merging rows `[1, 2]` and
+`[1, 3]` of one key with `distinct=true` gives `[1, 2]` for `count-limit=2` and
+`[1, 3]` for `count-limit=-2`. Both options apply when two or more rows of the
+same key are merged, including in write-buffer flushes and compaction, and the
+merged array is what gets written to data files. As in Java, a key with only
+one row keeps the array it was written with until another row of that key
+arrives or, with `changelog-producer=lookup`, until it is compacted.
+
+`DELETE` / `UPDATE_BEFORE` rows are fed to each field aggregator's retract path
+(`AggregateMergeFunction`), except that
+`aggregation.remove-record-on-delete=true` turns a `DELETE` into a full-row
+tombstone via `replace_with_delete` instead of `retract`. Native retract is
+implemented for `sum`, `product`, `collect`, `merge_map`, `nested_update`,
+`last_value`, `last_non_null_value`, and `primary-key` (which applies `agg` on
+retract). Aggregators without native retract — including `min`, `max`,
+`bool_and` / `bool_or`, `listagg`, `first_value`, `first_non_null_value`,
+`nested_partial_update`, `merge_map_with_keytime`, and the bitmap/sketch
+functions — reject retract unless `fields.<field>.ignore-retract=true`.
+
+This is not full Java feature parity. Aggregation tables still reject
+`fields.*.sequence-group`. Primary-key deletion-vector compaction remains
+limited to `deduplicate`, so aggregation tables do not write deletion-vector
+compaction output; reading DV-enabled aggregation tables, including
+merge-on-read of uncompacted files, is supported.
 
 Primary-key compaction supports `changelog-producer=lookup`, including
 deletion-vector-enabled `deduplicate` tables, generating INSERT, UPDATE_BEFORE, UPDATE_AFTER and DELETE events when

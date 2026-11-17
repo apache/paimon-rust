@@ -32,7 +32,7 @@ use crate::spec::{
     bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta, IndexManifest, Manifest,
     ManifestEntry, ManifestFileMeta, PartitionComputer,
 };
-use crate::table::{BranchManager, SnapshotManager, TagManager};
+use crate::table::{BranchManager, RESTEnv, SnapshotManager, Table, TagManager};
 use futures::future::try_join_all;
 use futures::stream::{self, StreamExt, TryStreamExt};
 
@@ -164,6 +164,9 @@ impl ExtraFileResolver {
 
 /// Collect per-scope deduplicated referenced file size summaries for a table.
 ///
+/// Branches, snapshots and tags are read from table storage only. For a table
+/// managed by a REST catalog, use [`collect_table_referenced_files_summary`].
+///
 /// Returns rows:
 /// 1. `"total"` — union of all referenced files from main branch, tags, and branches
 /// 2. `"branch:main"` — main branch snapshots + tag snapshots
@@ -199,6 +202,8 @@ pub async fn collect_referenced_files_summary(
 }
 
 /// Collect referenced sizes using the table's data-directory and partition options.
+///
+/// Like [`collect_referenced_files_summary`], this reads table storage only.
 pub async fn collect_referenced_files_summary_with_options(
     file_io: &FileIO,
     table_location: &str,
@@ -206,6 +211,53 @@ pub async fn collect_referenced_files_summary_with_options(
     schema_fields: &[DataField],
     options: &CoreOptions<'_>,
 ) -> crate::Result<Vec<ReferencedFilesSummary>> {
+    collect_summary(
+        file_io,
+        table_location,
+        partition_keys,
+        schema_fields,
+        options,
+        None,
+    )
+    .await
+}
+
+/// Collect referenced sizes for a table with its data-directory and partition options.
+///
+/// For a table managed by a REST catalog, branches, tags and each branch's current
+/// snapshot come from the catalog, together with the snapshot files in storage.
+/// REST metadata failures propagate: unknown metadata must not be reported as an
+/// empty set of references. Other tables read table storage only.
+pub async fn collect_table_referenced_files_summary(
+    table: &Table,
+) -> crate::Result<Vec<ReferencedFilesSummary>> {
+    let schema = table.schema();
+    collect_summary(
+        table.file_io(),
+        table.location(),
+        schema.partition_keys(),
+        &schema.partition_fields(),
+        &schema.core_options(),
+        table.rest_env().cloned(),
+    )
+    .await
+}
+
+async fn collect_summary(
+    file_io: &FileIO,
+    table_location: &str,
+    partition_keys: &[String],
+    schema_fields: &[DataField],
+    options: &CoreOptions<'_>,
+    rest_env: Option<RESTEnv>,
+) -> crate::Result<Vec<ReferencedFilesSummary>> {
+    let branch_names = if let Some(rest) = &rest_env {
+        rest.list_branch_names().await?
+    } else {
+        BranchManager::new(file_io.clone(), table_location.to_string())
+            .list_all()
+            .await?
+    };
     let manifest_cache: ManifestCache = Mutex::new(HashMap::new());
     let manifest_cache_ref = &manifest_cache;
     let mut extra_resolver = ExtraFileResolver::new(
@@ -223,29 +275,29 @@ pub async fn collect_referenced_files_summary_with_options(
     }
     let extra_resolver_ref = &extra_resolver;
 
-    let sm = SnapshotManager::new(file_io.clone(), table_location.to_string());
-    let tm = TagManager::new(file_io.clone(), table_location.to_string());
+    let include_catalog_snapshot = rest_env.is_some();
+    // Collection always starts at the table root, even for a branch table.
+    let sm = SnapshotManager::new(file_io.clone(), table_location.to_string())
+        .with_rest_env(rest_env.clone());
+    let tm = TagManager::new(file_io.clone(), table_location.to_string()).with_rest_env(rest_env);
 
     // 1. Main branch snapshots + tags (concurrently)
     // For main branch, snapshot reading and manifest resolution both use root SM.
     let (main_files, tag_files) = tokio::try_join!(
-        collect_scope_files(file_io, &sm, &sm, manifest_cache_ref, extra_resolver_ref),
-        collect_tag_files(
+        collect_scope_files(
             file_io,
             &sm,
             &sm,
-            &tm,
             manifest_cache_ref,
-            extra_resolver_ref
+            extra_resolver_ref,
+            include_catalog_snapshot
         ),
+        collect_tag_files(file_io, &sm, &tm, manifest_cache_ref, extra_resolver_ref),
     )?;
     let mut main_files = main_files;
     main_files.merge(&tag_files);
 
-    // 2. Branch file sets
-    let bm = BranchManager::new(file_io.clone(), table_location.to_string());
-    let branch_names = bm.list_all().await?;
-
+    // 2. Branch file sets, using the catalog's branch list for REST tables.
     let mut total_files = ScopeFileSet::default();
     total_files.merge(&main_files);
     let mut branch_summaries = Vec::with_capacity(branch_names.len());
@@ -253,20 +305,21 @@ pub async fn collect_referenced_files_summary_with_options(
         let branch_sm = sm.with_branch(branch_name);
         let branch_tm = tm.with_branch(branch_name);
 
-        // Branch SM reads snapshot/tag files from branch path, but manifest paths
-        // are always resolved from the table root. Process one branch at a time
-        // so completed branch file sets can be summarized and released.
+        // Historical snapshot files use the branch path; current snapshots and
+        // tags also consult the catalog for REST tables. Manifest paths use the
+        // table root. Process one branch at a time so completed file sets can
+        // be summarized and released.
         let (mut branch_files, branch_tag_files) = tokio::try_join!(
             collect_scope_files(
                 file_io,
                 &branch_sm,
                 &sm,
                 manifest_cache_ref,
-                extra_resolver_ref
+                extra_resolver_ref,
+                include_catalog_snapshot
             ),
             collect_tag_files(
                 file_io,
-                &branch_sm,
                 &sm,
                 &branch_tm,
                 manifest_cache_ref,
@@ -307,10 +360,11 @@ async fn collect_scope_files(
     manifest_sm: &SnapshotManager,
     manifest_cache: &ManifestCache,
     extra_resolver: &ExtraFileResolver,
+    include_catalog_snapshot: bool,
 ) -> crate::Result<ScopeFileSet> {
     let snapshot_ids = sm.list_all_ids().await?;
 
-    merge_scope_file_sets(
+    let mut files = merge_scope_file_sets(
         stream::iter(snapshot_ids)
             .map(|snapshot_id| {
                 let sm = sm.clone();
@@ -328,12 +382,30 @@ async fn collect_scope_files(
             })
             .buffer_unordered(SNAPSHOT_CONCURRENCY),
     )
-    .await
+    .await?;
+
+    // A REST branch can have a current snapshot with no visible snapshot file.
+    // Merge it by file name, since it may also be present in the stored history.
+    if include_catalog_snapshot {
+        if let Some(snapshot) = sm.get_latest_snapshot().await? {
+            if let Some(current) = collect_snapshot_files(
+                file_io,
+                manifest_sm,
+                &snapshot,
+                manifest_cache,
+                extra_resolver,
+            )
+            .await?
+            {
+                files.merge(&current);
+            }
+        }
+    }
+    Ok(files)
 }
 
 async fn collect_tag_files(
     file_io: &FileIO,
-    _sm: &SnapshotManager,
     manifest_sm: &SnapshotManager,
     tm: &TagManager,
     manifest_cache: &ManifestCache,

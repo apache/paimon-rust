@@ -41,6 +41,7 @@
 //! - `CREATE VIEW [IF NOT EXISTS] view [(col, ...)] AS query`
 //! - `DROP VIEW [IF EXISTS] view`
 //! - `CREATE FUNCTION name(args) RETURNS type [LANGUAGE SQL] RETURN expression`
+//! - `DROP FUNCTION [IF EXISTS] name`
 //! - `TRUNCATE TABLE db.t`
 //! - `TRUNCATE TABLE db.t PARTITION (col = val, ...)`
 
@@ -53,24 +54,25 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::{plan_datafusion_err, TableReference};
+use datafusion::common::{plan_datafusion_err, DFSchema, ScalarValue, TableReference};
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::context::SQLOptions;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::session_state::SessionState;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan, Volatility};
+use datafusion::logical_expr::{ColumnarValue, Expr as LogicalExpr, LogicalPlan, Volatility};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::planner::{object_name_to_table_reference, IdentNormalizer};
 use datafusion::sql::sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, BinaryLength, CharacterLength, ColumnDef,
     ColumnOption, CommentDef, CommentObject, CreateFunction, CreateFunctionBody, CreateTable,
-    CreateTableOptions, CreateView, Delete, Expr as SqlExpr, FromTable, FunctionBehavior,
-    FunctionReturnType, Ident, Insert, Merge, ObjectName, ObjectType, RenameTableNameKind, Reset,
-    ResetStatement, Set, ShowCreateObject, SqlOption, Statement, TableFactor, TableObject,
-    Truncate, Update, Use, Value as SqlValue,
+    CreateTableOptions, CreateView, DataType as SqlDataType, Delete, Expr as SqlExpr,
+    ExprWithAlias, FromTable, FunctionBehavior, FunctionReturnType, Ident, Insert, Merge,
+    ObjectName, ObjectType, RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject,
+    SqlOption, Statement, TableFactor, TableObject, Truncate, Update, Use, Value as SqlValue,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
@@ -159,7 +161,7 @@ impl SQLContextBuilder {
             .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
             .with_spark_features()
-            .with_type_planner(Arc::new(crate::binary_cast::BinaryTypePlanner))
+            .with_type_planner(Arc::new(crate::vector_type::PaimonTypePlanner))
             .with_relation_planners(vec![
                 Arc::new(crate::lateral_views::ExplodeRelationPlanner),
                 Arc::new(crate::relation_planner::PaimonRelationPlanner::new()),
@@ -496,8 +498,8 @@ impl SQLContext {
 
         let alter_comment = parse_alter_column_comment(&rewritten_sql)?;
         let from_alter_comment = alter_comment.is_some();
-        let mut statements = if let Some(statement) = alter_comment {
-            vec![statement]
+        let (mut statements, vector_changed) = if let Some(statement) = alter_comment {
+            (vec![statement], false)
         } else {
             parse_sql_statements(&rewritten_sql)?
         };
@@ -519,7 +521,7 @@ impl SQLContext {
                 crate::expression_compat::rewrite(&mut statements[0], &self.ctx.state())?;
             binary_changed || regex_changed || lateral_changed || compat_changed
         };
-        let sql = if changed {
+        let sql = if changed || vector_changed {
             rewritten = statements[0].to_string();
             rewritten.as_str()
         } else {
@@ -739,6 +741,49 @@ impl SQLContext {
                 } else {
                     self.ctx.sql_with_options(sql, options).await
                 }
+            }
+            Statement::DropFunction(drop_function)
+                if drop_function
+                    .func_desc
+                    .iter()
+                    .any(|function| self.is_paimon_function_name(&function.name)) =>
+            {
+                // sqlparser consumes TEMPORARY without retaining it in the function AST.
+                let temporary = {
+                    let mut parser = Parser::new(&GenericDialect {})
+                        .try_with_sql(&rewritten_sql)
+                        .map_err(|error| {
+                            DataFusionError::Plan(format!("SQL parse error: {error}"))
+                        })?;
+                    while parser.consume_token(&Token::SemiColon) {}
+                    parser.parse_keywords(&[Keyword::DROP, Keyword::TEMPORARY, Keyword::FUNCTION])
+                };
+                if temporary {
+                    return Err(DataFusionError::NotImplemented(
+                        "DROP TEMPORARY FUNCTION is not supported for Paimon catalogs".to_string(),
+                    ));
+                }
+                let [function] = drop_function.func_desc.as_slice() else {
+                    return Err(DataFusionError::Plan(
+                        "Persistent DROP FUNCTION does not support multiple functions".to_string(),
+                    ));
+                };
+                if let Some(behavior) = &drop_function.drop_behavior {
+                    return Err(DataFusionError::Plan(format!(
+                        "DROP FUNCTION {behavior} is not supported"
+                    )));
+                }
+                if function.args.is_some() {
+                    return Err(DataFusionError::Plan(
+                        "DROP FUNCTION argument signatures are not supported".to_string(),
+                    ));
+                }
+                let (catalog, _, identifier) = self.resolve_catalog_and_function(&function.name)?;
+                catalog
+                    .drop_function(&identifier, drop_function.if_exists)
+                    .await
+                    .map_err(to_datafusion_error)?;
+                ok_result(&self.ctx)
             }
             Statement::Drop {
                 object_type: ObjectType::Database,
@@ -1468,6 +1513,21 @@ impl SQLContext {
             .map(|temp| (catalog_name, database, table, temp)))
     }
 
+    /// Reject writes that would bypass a temporary object and mutate the
+    /// persistent table it shadows.
+    pub(crate) async fn reject_temporary_write_target(
+        &self,
+        name: &ObjectName,
+        operation: &str,
+    ) -> DFResult<()> {
+        if self.temp_table_for(name).await?.is_some() {
+            return Err(DataFusionError::NotImplemented(format!(
+                "{operation} on temporary tables or views is not supported"
+            )));
+        }
+        Ok(())
+    }
+
     fn show_create_result(
         &self,
         catalog_name: String,
@@ -1557,6 +1617,8 @@ impl SQLContext {
         } else {
             Self::ensure_main_branch_write_target(name, "ALTER TABLE")?;
         }
+        self.reject_temporary_write_target(name, "ALTER TABLE")
+            .await?;
         let identifier = self.resolve_table_name(name)?;
 
         if operations.len() > 1
@@ -1647,11 +1709,6 @@ impl SQLContext {
                     options,
                     column_position,
                 } => {
-                    if self.temp_table_for(name).await?.is_some() {
-                        return Err(DataFusionError::NotImplemented(
-                            "MODIFY COLUMN on temporary tables or views is not supported".into(),
-                        ));
-                    }
                     if column_position.is_some() {
                         return Err(DataFusionError::Plan(
                             "MODIFY COLUMN FIRST/AFTER is not supported".into(),
@@ -1936,6 +1993,8 @@ impl SQLContext {
             }
         };
         Self::ensure_main_branch_write_target(&table_name, "INSERT OVERWRITE")?;
+        self.reject_temporary_write_target(&table_name, "INSERT OVERWRITE")
+            .await?;
         let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
         let table = catalog
             .get_table(&identifier)
@@ -1951,6 +2010,7 @@ impl SQLContext {
             &partition_fields,
             table.schema().fields(),
             enable_ident_normalization,
+            &self.ctx.state(),
         )?;
 
         let source = insert.source.as_ref().ok_or_else(|| {
@@ -2131,6 +2191,7 @@ impl SQLContext {
                 table.schema().fields(),
                 table.schema().partition_keys(),
                 enable_ident_normalization,
+                &self.ctx.state(),
             )?;
             commit
                 .truncate_partitions(partition_values)
@@ -2439,6 +2500,7 @@ impl SQLContext {
                 table.schema().fields(),
                 table.schema().partition_keys(),
                 enable_ident_normalization,
+                &self.ctx.state(),
             )?);
         }
         let commit = table
@@ -2816,9 +2878,9 @@ fn validate_persistent_create_function(create_function: &CreateFunction) -> DFRe
     Ok(())
 }
 
-fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
+fn parse_sql_statements(sql: &str) -> DFResult<(Vec<Statement>, bool)> {
     if let Some(statement) = crate::extended_describe::parse_describe(sql)? {
-        return Ok(vec![statement]);
+        return Ok((vec![statement], false));
     }
     let regex_sql = crate::regex_operators::parseable_sql(sql)?;
     let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
@@ -2869,9 +2931,7 @@ fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
             .map(|(_, token)| token)
             .collect();
     }
-    let mut statements = Parser::new(&dialect)
-        .with_tokens_with_locations(tokens)
-        .parse_statements()
+    let (mut statements, vector_changed) = crate::vector_type::parse_statements(tokens)
         .map_err(|error| DataFusionError::Plan(format!("SQL parse error: {error}")))?;
     if create_function_if_not_exists {
         let Some(Statement::CreateFunction(create_function)) = statements.first_mut() else {
@@ -2889,7 +2949,7 @@ fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
         };
         create_function.or_alter = true;
     }
-    Ok(statements)
+    Ok((statements, vector_changed))
 }
 
 /// Parse the Paimon/Flink column-comment spelling into the standard COMMENT AST.
@@ -3441,13 +3501,17 @@ fn column_def_nullable(col: &ColumnDef) -> bool {
 ///
 /// DDL schema translation must use this function instead of going through Arrow,
 /// because Arrow cannot preserve logical distinctions such as `BLOB` vs `VARBINARY`.
-fn sql_data_type_to_paimon_type(
+pub(crate) fn sql_data_type_to_paimon_type(
     sql_type: &datafusion::sql::sqlparser::ast::DataType,
     nullable: bool,
 ) -> DFResult<PaimonDataType> {
     use datafusion::sql::sqlparser::ast::{
         ArrayElemTypeDef, DataType as SqlType, ExactNumberInfo, TimezoneInfo,
     };
+
+    if let Some(vector) = crate::vector_type::sql_type_to_vector(sql_type, nullable)? {
+        return Ok(PaimonDataType::Vector(vector));
+    }
 
     match sql_type {
         SqlType::Boolean => Ok(PaimonDataType::Boolean(BooleanType::with_nullable(
@@ -3688,6 +3752,7 @@ fn parse_partition_values(
     all_fields: &[PaimonDataField],
     partition_keys: &[String],
     enable_ident_normalization: bool,
+    state: &SessionState,
 ) -> DFResult<Vec<HashMap<String, Option<Datum>>>> {
     let field_map: HashMap<&str, &PaimonDataField> =
         all_fields.iter().map(|f| (f.name(), f)).collect();
@@ -3711,7 +3776,7 @@ fn parse_partition_values(
         let field = field_map.get(col_name.as_str()).ok_or_else(|| {
             DataFusionError::Plan(format!("Column '{col_name}' not found in table schema"))
         })?;
-        let datum = sql_expr_to_datum(val_expr, field.data_type())?;
+        let datum = sql_expr_to_datum(val_expr, field.data_type(), state)?;
         partition.insert(col_name, Some(datum));
     }
 
@@ -3738,6 +3803,7 @@ fn parse_static_partitions(
     partition_fields: &[PaimonDataField],
     all_fields: &[PaimonDataField],
     enable_ident_normalization: bool,
+    state: &SessionState,
 ) -> DFResult<HashMap<String, Option<Datum>>> {
     let mut result = HashMap::new();
     let mut seen_columns = HashSet::new();
@@ -3793,7 +3859,7 @@ fn parse_static_partitions(
         let field = field_map.get(col_name.as_str()).ok_or_else(|| {
             DataFusionError::Plan(format!("Column '{col_name}' not found in table schema"))
         })?;
-        let datum = sql_expr_to_datum(val_expr, field.data_type())?;
+        let datum = sql_expr_to_datum(val_expr, field.data_type(), state)?;
         result.insert(col_name, Some(datum));
     }
 
@@ -3801,7 +3867,34 @@ fn parse_static_partitions(
 }
 
 /// Convert a SQL literal expression to a Paimon Datum.
-fn sql_expr_to_datum(expr: &SqlExpr, data_type: &PaimonDataType) -> DFResult<Datum> {
+fn sql_expr_to_datum(
+    expr: &SqlExpr,
+    data_type: &PaimonDataType,
+    state: &SessionState,
+) -> DFResult<Datum> {
+    let literal = match expr {
+        SqlExpr::Value(_) | SqlExpr::TypedString(_) => true,
+        SqlExpr::UnaryOp {
+            op: datafusion::sql::sqlparser::ast::UnaryOperator::Minus,
+            expr: inner,
+        } => matches!(inner.as_ref(), SqlExpr::Value(_)),
+        _ => false,
+    };
+    let typed_date = matches!(
+        (expr, data_type),
+        (SqlExpr::TypedString(typed), PaimonDataType::Date(_)) if typed.data_type == SqlDataType::Date
+    );
+    if literal
+        && (typed_date
+            || matches!(
+                data_type,
+                PaimonDataType::Decimal(_)
+                    | PaimonDataType::Timestamp(_)
+                    | PaimonDataType::LocalZonedTimestamp(_)
+            ))
+    {
+        return eval_partition_value(expr, data_type, state);
+    }
     let (value, negate) = match expr {
         SqlExpr::Value(v) => (&v.value, false),
         SqlExpr::UnaryOp {
@@ -3828,6 +3921,14 @@ fn sql_expr_to_datum(expr: &SqlExpr, data_type: &PaimonDataType) -> DFResult<Dat
         (SqlValue::SingleQuotedString(s), PaimonDataType::VarChar(_)) if !negate => {
             Ok(Datum::String(s.clone()))
         }
+        (SqlValue::SingleQuotedString(s), PaimonDataType::Char(typ)) if !negate => {
+            if s.chars().count() > typ.length() {
+                return Err(DataFusionError::Plan(format!(
+                    "Invalid partition value '{s}' for type {data_type:?}"
+                )));
+            }
+            Ok(Datum::String(s.clone()))
+        }
         (SqlValue::SingleQuotedString(s), PaimonDataType::Date(_)) if !negate => {
             let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                 .map_err(|e| DataFusionError::Plan(format!("Invalid DATE '{s}': {e}")))?;
@@ -3842,6 +3943,45 @@ fn sql_expr_to_datum(expr: &SqlExpr, data_type: &PaimonDataType) -> DFResult<Dat
             "Cannot convert {value} to {data_type:?}"
         ))),
     }
+}
+
+/// Evaluates a partition value the way INSERT evaluates a value for the column: planned with
+/// the session's SQL semantics, such as its time zone, and cast to the column's Arrow type.
+/// The written column and the partition predicate then hold the same value.
+fn eval_partition_value(
+    expr: &SqlExpr,
+    data_type: &PaimonDataType,
+    state: &SessionState,
+) -> DFResult<Datum> {
+    let invalid = || {
+        DataFusionError::Plan(format!(
+            "Invalid partition value {expr} for type {data_type:?}"
+        ))
+    };
+    let arrow_type = paimon::arrow::paimon_type_to_arrow(data_type).map_err(to_datafusion_error)?;
+    let schema = DFSchema::empty();
+    let value = state.create_logical_expr_from_sql_expr(
+        ExprWithAlias {
+            expr: expr.clone(),
+            alias: None,
+        },
+        &schema,
+    )?;
+    let value = datafusion::logical_expr::cast(value, arrow_type);
+    let batch = RecordBatch::try_new_with_options(
+        Arc::new(Schema::empty()),
+        vec![],
+        &RecordBatchOptions::new().with_row_count(Some(1)),
+    )?;
+    let scalar = match state
+        .create_physical_expr(value, &schema)?
+        .evaluate(&batch)
+        .map_err(|e| DataFusionError::Plan(format!("{}: {e}", invalid())))?
+    {
+        ColumnarValue::Scalar(scalar) => scalar,
+        ColumnarValue::Array(array) => ScalarValue::try_from_array(&array, 0)?,
+    };
+    crate::filter_pushdown::scalar_to_datum(&scalar, data_type).ok_or_else(invalid)
 }
 
 fn parse_number_datum(n: &str, data_type: &PaimonDataType, negate: bool) -> DFResult<Datum> {
@@ -3970,14 +4110,20 @@ fn datum_to_constant_array(
             Datum::Double(v) => Ok(Arc::new(Float64Array::from(vec![*v; num_rows]))),
             Datum::String(v) => Ok(Arc::new(StringArray::from(vec![v.as_str(); num_rows]))),
             Datum::Date(v) => Ok(Arc::new(Date32Array::from(vec![*v; num_rows]))),
-            Datum::Time(_)
-            | Datum::Timestamp { .. }
-            | Datum::LocalZonedTimestamp { .. }
-            | Datum::Decimal { .. }
-            | Datum::Bytes(_)
-            | Datum::Variant { .. } => Err(DataFusionError::Plan(format!(
-                "Unsupported datum type for partition column: {d}"
-            ))),
+            Datum::Timestamp { .. } | Datum::LocalZonedTimestamp { .. } | Datum::Decimal { .. } => {
+                let arrow_type =
+                    paimon::arrow::paimon_type_to_arrow(data_type).map_err(to_datafusion_error)?;
+                crate::physical_plan::scan::datum_to_scalar(d.clone(), &arrow_type)
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(format!(
+                            "Unsupported datum type for partition column: {d}"
+                        ))
+                    })?
+                    .to_array_of_size(num_rows)
+            }
+            Datum::Time(_) | Datum::Bytes(_) | Datum::Variant { .. } => Err(DataFusionError::Plan(
+                format!("Unsupported datum type for partition column: {d}"),
+            )),
         },
     }
 }
@@ -4002,23 +4148,41 @@ enum TimeTravelClause {
     TimestampMillis(i64),
 }
 
-/// Check whether a SQL string contains a time-travel keyword (`VERSION AS OF` or
-/// `TIMESTAMP AS OF`) **outside** of single-quoted string literals, `--` line
-/// comments, and `/* */` block comments.
+/// Locate the table before a time-travel keyword without treating delimiters
+/// inside quoted identifiers as boundaries.
+fn time_travel_table_before(prefix: &str) -> (usize, &str) {
+    let prefix = prefix.trim_end();
+    let mut quote = None;
+    for (index, ch) in prefix.char_indices().rev() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+        } else if matches!(ch, '"' | '`') {
+            // Adjacent escaped quotes toggle the quote state twice.
+            quote = Some(ch);
+        } else if ch.is_whitespace() || matches!(ch, ',' | '(') {
+            let start = index + ch.len_utf8();
+            return (start, &prefix[start..]);
+        }
+    }
+    (0, prefix)
+}
+
+/// Check for a time-travel keyword outside quoted strings, identifiers, and comments.
 fn contains_time_travel_keyword(sql: &str) -> bool {
-    let lower = sql.to_lowercase();
-    let bytes = lower.as_bytes();
+    let bytes = sql.as_bytes();
     let len = bytes.len();
     let mut i = 0;
     while i < len {
         match bytes[i] {
-            b'\'' => {
-                // Skip string literal
+            quote @ (b'\'' | b'"' | b'`') => {
+                // Skip a quoted string or identifier, including doubled quotes.
                 i += 1;
                 while i < len {
-                    if bytes[i] == b'\'' {
+                    if bytes[i] == quote {
                         i += 1;
-                        if i < len && bytes[i] == b'\'' {
+                        if i < len && bytes[i] == quote {
                             i += 1; // escaped quote
                         } else {
                             break;
@@ -4062,24 +4226,22 @@ fn contains_time_travel_keyword(sql: &str) -> bool {
 }
 
 /// Extract **all** `VERSION AS OF <n>` or `VERSION AS OF '<tag>'` clauses from a
-/// SQL string, skipping string literals and comments.
+/// SQL string, skipping quoted strings, identifiers, and comments.
 fn extract_all_version_as_of(sql: &str) -> Vec<VersionAsOfInfo> {
-    let lower = sql.to_lowercase();
-    let bytes = lower.as_bytes();
+    let bytes = sql.as_bytes();
     let len = bytes.len();
-    let sql_bytes = sql.as_bytes();
     let mut i = 0;
     let mut results = Vec::new();
 
     while i < len {
         match bytes[i] {
-            b'\'' => {
-                // Skip string literal
+            quote @ (b'\'' | b'"' | b'`') => {
+                // Skip a quoted string or identifier, including doubled quotes.
                 i += 1;
                 while i < len {
-                    if sql_bytes[i] == b'\'' {
+                    if bytes[i] == quote {
                         i += 1;
-                        if i < len && sql_bytes[i] == b'\'' {
+                        if i < len && bytes[i] == quote {
                             i += 1; // escaped quote
                         } else {
                             break;
@@ -4142,17 +4304,11 @@ fn extract_all_version_as_of(sql: &str) -> Vec<VersionAsOfInfo> {
                         val_start + version.len()
                     };
 
-                    // Walk backwards from kw_start to find the table name boundary
-                    let table_end = sql[..kw_start].trim_end_matches(' ').len();
-                    let table_start = sql[..table_end]
-                        .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(')
-                        .map(|idx| idx + 1)
-                        .unwrap_or(0);
-                    let table_name = sql[table_start..table_end].to_string();
+                    let (table_start, table_name) = time_travel_table_before(&sql[..kw_start]);
 
                     if !table_name.is_empty() {
                         results.push(VersionAsOfInfo {
-                            table_name,
+                            table_name: table_name.to_string(),
                             version,
                             clause_range: (table_start, val_end),
                         });
@@ -4169,25 +4325,23 @@ fn extract_all_version_as_of(sql: &str) -> Vec<VersionAsOfInfo> {
     results
 }
 
-/// Extract **all** `TIMESTAMP AS OF '<ts>'` clauses from a SQL string, skipping
-/// string literals and comments.
+/// Extract all time-travel timestamp clauses outside quoted strings,
+/// identifiers, and comments.
 fn extract_all_timestamp_as_of(sql: &str) -> Vec<TimestampAsOfInfo> {
-    let lower = sql.to_lowercase();
-    let bytes = lower.as_bytes();
+    let bytes = sql.as_bytes();
     let len = bytes.len();
-    let sql_bytes = sql.as_bytes();
     let mut i = 0;
     let mut results = Vec::new();
 
     while i < len {
         match bytes[i] {
-            b'\'' => {
-                // Skip string literal
+            quote @ (b'\'' | b'"' | b'`') => {
+                // Skip a quoted string or identifier, including doubled quotes.
                 i += 1;
                 while i < len {
-                    if sql_bytes[i] == b'\'' {
+                    if bytes[i] == quote {
                         i += 1;
-                        if i < len && sql_bytes[i] == b'\'' {
+                        if i < len && bytes[i] == quote {
                             i += 1; // escaped quote
                         } else {
                             break;
@@ -4230,17 +4384,11 @@ fn extract_all_timestamp_as_of(sql: &str) -> Vec<TimestampAsOfInfo> {
                         let timestamp = remaining[1..close_quote + 1].to_string();
                         let val_end = val_start + close_quote + 2; // skip both quotes
 
-                        // Walk backwards to find the table name boundary
-                        let table_end = sql[..kw_start].trim_end_matches(' ').len();
-                        let table_start = sql[..table_end]
-                            .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(')
-                            .map(|idx| idx + 1)
-                            .unwrap_or(0);
-                        let table_name = sql[table_start..table_end].to_string();
+                        let (table_start, table_name) = time_travel_table_before(&sql[..kw_start]);
 
                         if !table_name.is_empty() {
                             results.push(TimestampAsOfInfo {
-                                table_name,
+                                table_name: table_name.to_string(),
                                 timestamp,
                                 clause_range: (table_start, val_end),
                             });
@@ -4312,6 +4460,14 @@ mod tests {
         DataField as PaimonDataField, DataType as PaimonDataType, IntType, Schema as PaimonSchema,
     };
     use paimon::table::Table;
+
+    #[test]
+    fn test_sql_context_sql_future_is_send() {
+        fn assert_send(_: impl Send) {}
+        let ctx = SQLContext::new();
+        assert_send(ctx.sql("DROP FUNCTION db.fn"));
+        assert_send(ctx.sql_with_options("DROP FUNCTION db.fn", SQLOptions::new()));
+    }
 
     #[test]
     fn test_sql_context_builder_uses_custom_runtime_env() {
@@ -4510,6 +4666,20 @@ mod tests {
             Ok(())
         }
 
+        async fn drop_function(
+            &self,
+            identifier: &Identifier,
+            ignore_if_not_exists: bool,
+        ) -> paimon::Result<()> {
+            if self.functions.lock().unwrap().remove(identifier).is_some() || ignore_if_not_exists {
+                Ok(())
+            } else {
+                Err(paimon::Error::FunctionNotExist {
+                    full_name: identifier.full_name(),
+                })
+            }
+        }
+
         async fn get_function(
             &self,
             identifier: &Identifier,
@@ -4690,6 +4860,84 @@ mod tests {
             Identifier::new(database, name),
             schema,
         ));
+    }
+
+    #[tokio::test]
+    async fn vector_sql_types_in_persistent_functions_and_views() {
+        use datafusion::arrow::array::{FixedSizeListArray, Float32Array};
+
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog.clone()).await;
+        ctx.sql(
+            "CREATE FUNCTION vector_identity(x VECTOR<FLOAT, 2>) \
+             RETURNS VECTOR<FLOAT, 2> RETURN CAST(x AS VECTOR<FLOAT, 2>)",
+        )
+        .await
+        .unwrap();
+        let function = catalog
+            .get_function(&Identifier::new("default", "vector_identity"))
+            .await
+            .unwrap();
+        let expected = PaimonDataType::Vector(
+            paimon::spec::VectorType::new(2, PaimonDataType::Float(FloatType::new())).unwrap(),
+        );
+        assert_eq!(function.input_params().unwrap()[0].data_type(), &expected);
+        assert_eq!(function.return_params().unwrap()[0].data_type(), &expected);
+        ctx.sql(
+            "CREATE VIEW vector_view AS SELECT \
+             vector_identity(CAST([1, 2] AS VECTOR<FLOAT, 2>)) AS embedding",
+        )
+        .await
+        .unwrap();
+        let batches = ctx
+            .sql("SELECT embedding FROM vector_view")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let vectors = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let value = vectors.value(0);
+        assert_eq!(
+            value
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .values(),
+            &[1.0, 2.0]
+        );
+
+        for (name, sql_type) in [
+            ("vector_map_identity", "MAP(STRING, VECTOR<FLOAT, 2>)"),
+            ("vector_array_identity", "ARRAY<VECTOR<FLOAT, 2>>"),
+            ("vector_struct_identity", "STRUCT<v VECTOR<FLOAT, 2>>"),
+        ] {
+            ctx.sql(&format!(
+                "CREATE FUNCTION {name}(x {sql_type}) RETURNS {sql_type} RETURN x"
+            ))
+            .await
+            .unwrap();
+            let batches = ctx
+                .sql(&format!("SELECT {name}(CAST(NULL AS {sql_type})) AS v"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let function = catalog
+                .get_function(&Identifier::new("default", name))
+                .await
+                .unwrap();
+            let actual =
+                paimon::arrow::arrow_to_paimon_type(batches[0].column(0).data_type(), true)
+                    .unwrap();
+            assert_eq!(&actual, function.return_params().unwrap()[0].data_type());
+            assert!(batches[0].column(0).is_null(0));
+        }
     }
 
     #[tokio::test]
@@ -5024,6 +5272,165 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_resolves_supported_name_forms() {
+        let catalog = Arc::new(MockCatalog::new());
+        let other_catalog = Arc::new(MockCatalog::new());
+        let mut ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.register_catalog("other", other_catalog.clone())
+            .await
+            .unwrap();
+        ctx.set_current_database("session_db").await.unwrap();
+        for (sql, target, database, name) in [
+            ("DROP FUNCTION BARE", &catalog, "session_db", "bare"),
+            (
+                "DROP FUNCTION IF EXISTS DB.QUALIFIED",
+                &catalog,
+                "db",
+                "qualified",
+            ),
+            ("DROP FUNCTION OTHER.DB.FULL", &other_catalog, "db", "full"),
+            (
+                "DROP FUNCTION \"other\".\"Db\".\"Fn\"",
+                &other_catalog,
+                "Db",
+                "Fn",
+            ),
+            ("DROP FUNCTION \"Db\".\"Fn\"", &catalog, "Db", "Fn"),
+            (
+                "DROP FUNCTION \"TEMPORARY\"",
+                &catalog,
+                "session_db",
+                "TEMPORARY",
+            ),
+            (
+                "; /* empty */ ; DROP FUNCTION db.\"quoted.fn\";",
+                &catalog,
+                "db",
+                "quoted.fn",
+            ),
+        ] {
+            add_unary_sql_function_in_database(target, database, name, "x + 1", true);
+            ctx.sql(sql).await.unwrap();
+            assert!(target.function_lookups.lock().unwrap().is_empty());
+            assert!(matches!(
+                target.get_function(&Identifier::new(database, name)).await,
+                Err(paimon::Error::FunctionNotExist { .. })
+            ));
+            target.function_lookups.lock().unwrap().clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_honors_if_exists() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog).await;
+
+        let error = ctx.sql("DROP FUNCTION db.missing").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Function db.missing does not exist"),
+            "{error}"
+        );
+        ctx.sql("DROP FUNCTION IF EXISTS db.missing").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_rejects_unsupported_forms_before_deleting() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "kept", "x + 1", true);
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        for (sql, expected) in [
+            ("DROP FUNCTION kept CASCADE", "CASCADE"),
+            ("DROP FUNCTION kept RESTRICT", "RESTRICT"),
+            ("DROP FUNCTION kept()", "signatures"),
+            ("DROP FUNCTION kept(BIGINT)", "signatures"),
+            ("DROP FUNCTION kept; SELECT 1", "exactly one SQL statement"),
+            (
+                "DROP FUNCTION datafusion.public.other, paimon.default.kept",
+                "multiple functions",
+            ),
+        ] {
+            let error = ctx.sql(sql).await.unwrap_err();
+            assert!(error.to_string().contains(expected), "{sql}: {error}");
+            assert!(catalog
+                .functions
+                .lock()
+                .unwrap()
+                .contains_key(&Identifier::new("default", "kept")));
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_preserves_local_function_with_same_name() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "abs", "x + 1", true);
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.sql("DROP FUNCTION abs").await.unwrap();
+        assert!(catalog.functions.lock().unwrap().is_empty());
+        ctx.sql("DROP FUNCTION IF EXISTS abs").await.unwrap();
+        assert!(ctx.ctx.state().scalar_functions().contains_key("abs"));
+        ctx.sql("SELECT abs(-1)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_rejects_temporary_before_deleting() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "abs", "x + 1", true);
+        add_unary_sql_function_in_database(&catalog, "db", "kept", "x + 1", true);
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        for sql in [
+            "DROP TEMPORARY FUNCTION abs",
+            "-- leading comment\nDROP /* modifier */ TEMPORARY FUNCTION IF EXISTS db.kept",
+            "; /* empty statements */ ; dRoP TeMpOrArY FuNcTiOn IF EXISTS db.kept;",
+        ] {
+            let error = ctx
+                .sql(sql)
+                .await
+                .expect_err("temporary function drop must be rejected");
+            assert!(
+                error.to_string().contains("DROP TEMPORARY FUNCTION"),
+                "{error}"
+            );
+            assert_eq!(catalog.functions.lock().unwrap().len(), 2);
+            assert!(ctx.ctx.state().scalar_functions().contains_key("abs"));
+        }
+    }
+
+    #[tokio::test]
+    async fn function_drop_delegates_without_paimon_catalog() {
+        for sql in ["DROP FUNCTION abs", "DROP TEMPORARY FUNCTION abs"] {
+            let ctx = SQLContext::new();
+            assert!(ctx.ctx.state().scalar_functions().contains_key("abs"));
+            ctx.sql(sql).await.unwrap();
+            assert!(!ctx.ctx.state().scalar_functions().contains_key("abs"));
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_preserves_unsupported_catalog_error() {
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog_with_default_db("paimon", Arc::new(ProbeTrackingCatalog::new()), None)
+            .await
+            .unwrap();
+        let error = ctx
+            .sql("DROP FUNCTION IF EXISTS db.missing")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Catalog does not support functions"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -8831,6 +9238,171 @@ mod tests {
         );
     }
 
+    async fn ordered_ids(sql_context: &SQLContext, table: &str) -> Vec<i32> {
+        let batches = sql_context
+            .sql(&format!("SELECT id FROM {table} ORDER BY id"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                ids.values().to_vec()
+            })
+            .collect()
+    }
+
+    /// Writes rows 1 (`value`) and 2 (`other`) to a table partitioned by `k`, then checks that
+    /// `INSERT OVERWRITE`, `TRUNCATE` and `DROP PARTITION` with `spec` all target row 1.
+    async fn check_partition_spec(
+        sql_context: &SQLContext,
+        table: &str,
+        data_type: &str,
+        value: &str,
+        other: &str,
+        spec: &str,
+    ) {
+        sql_context
+            .sql(&format!(
+                "CREATE TABLE {table} (id INT, k {data_type}) PARTITIONED BY (k)"
+            ))
+            .await
+            .unwrap();
+        sql_context
+            .sql(&format!(
+                "INSERT INTO {table} VALUES (1, {value}), (2, {other})"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        sql_context
+            .sql(&format!(
+                "INSERT OVERWRITE {table} PARTITION (k = {spec}) VALUES (9)"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(ordered_ids(sql_context, table).await, [2, 9], "{spec}");
+
+        sql_context
+            .sql(&format!("TRUNCATE TABLE {table} PARTITION (k = {spec})"))
+            .await
+            .unwrap();
+        assert_eq!(ordered_ids(sql_context, table).await, [2], "{spec}");
+
+        sql_context
+            .sql(&format!("INSERT INTO {table} VALUES (3, {value})"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        sql_context
+            .sql(&format!("ALTER TABLE {table} DROP PARTITION (k = {spec})"))
+            .await
+            .unwrap();
+        assert_eq!(ordered_ids(sql_context, table).await, [2], "{spec}");
+    }
+
+    #[tokio::test]
+    async fn test_partition_specs_on_char_decimal_timestamp_and_typed_literals() {
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
+        let cases = [
+            ("CHAR(3)", "'ab'", "'ab'"),
+            ("DECIMAL(10, 2)", "12.50", "12.50"),
+            ("DECIMAL(10, 2)", "-12.50", "-12.50"),
+            ("DECIMAL(10, 2)", "12.50", "'12.50'"),
+            ("DATE", "DATE '2024-03-01'", "DATE '2024-03-01'"),
+            (
+                "TIMESTAMP(3)",
+                "TIMESTAMP '2024-03-01 10:11:12.5'",
+                "'2024-03-01 10:11:12.5'",
+            ),
+            (
+                "TIMESTAMP(3)",
+                "TIMESTAMP '2024-03-01 10:11:12.5'",
+                "TIMESTAMP '2024-03-01 10:11:12.5'",
+            ),
+            (
+                "TIMESTAMP WITH TIME ZONE",
+                "TIMESTAMP '2024-03-01 10:11:12.5'",
+                "'2024-03-01 10:11:12.5'",
+            ),
+        ];
+        for (index, (data_type, value, spec)) in cases.iter().enumerate() {
+            let table = format!("paimon.test_db.spec_{index}");
+            check_partition_spec(&sql_context, &table, data_type, value, "NULL", spec).await;
+        }
+    }
+
+    /// A partition value means what the same literal means in INSERT, so the statement never
+    /// targets the neighbouring partition that a different reading would pick.
+    #[tokio::test]
+    async fn test_partition_specs_evaluate_values_like_insert() {
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
+        sql_context
+            .sql("SET datafusion.execution.time_zone = '+08:00'")
+            .await
+            .unwrap();
+        let cases = [
+            // Read in the session time zone: 02:00 UTC, while 10:00 UTC is row 2.
+            (
+                "TIMESTAMP WITH TIME ZONE",
+                "TIMESTAMP WITH TIME ZONE '2024-03-01 10:00:00'",
+                "TIMESTAMP WITH TIME ZONE '2024-03-01 18:00:00'",
+                "TIMESTAMP WITH TIME ZONE '2024-03-01 10:00:00'",
+            ),
+            // Stored as .123: digits past the column precision are dropped, not rounded.
+            (
+                "TIMESTAMP(3)",
+                "TIMESTAMP '2024-03-01 10:11:12.123856'",
+                "TIMESTAMP '2024-03-01 10:11:12.124'",
+                "TIMESTAMP '2024-03-01 10:11:12.123856'",
+            ),
+            (
+                "TIMESTAMP(3)",
+                "TIMESTAMP '2024-03-01 10:11:12.123'",
+                "TIMESTAMP '2024-03-01 10:11:12.124'",
+                "TIMESTAMP '2024-03-01 10:11:12.123'",
+            ),
+            // Stored as 12.51: the third decimal digit is rounded half up.
+            ("DECIMAL(10, 2)", "'12.505'", "'12.50'", "'12.505'"),
+        ];
+        for (index, (data_type, value, other, spec)) in cases.iter().enumerate() {
+            let table = format!("paimon.test_db.insert_semantics_{index}");
+            check_partition_spec(&sql_context, &table, data_type, value, other, spec).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partition_spec_rejects_a_value_the_key_cannot_hold() {
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
+        sql_context
+            .sql("CREATE TABLE paimon.test_db.t (id INT, k CHAR(3)) PARTITIONED BY (k)")
+            .await
+            .unwrap();
+        let err = sql_context
+            .sql("ALTER TABLE paimon.test_db.t DROP PARTITION (k = 'abcd')")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid partition value 'abcd'"),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_truncate_table_if_exists_nonexistent() {
         let (_tmp, sql_context) = setup_fs_sql_context().await;
@@ -9205,6 +9777,28 @@ mod tests {
     }
 
     #[test]
+    fn test_time_travel_keeps_quoted_table_reference() {
+        let table = r#"paimon."my db"."with ""quote"", (space""#;
+        let version_sql = format!("SELECT 'İ' FROM {table} VERSION AS OF 1");
+        let versions = extract_all_version_as_of(&version_sql);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].table_name, table);
+        assert_eq!(
+            &version_sql[versions[0].clause_range.0..versions[0].clause_range.1],
+            format!("{table} VERSION AS OF 1")
+        );
+
+        let timestamp_sql = format!("SELECT 'İ' FROM {table} TIMESTAMP AS OF '2024-01-01'");
+        let timestamps = extract_all_timestamp_as_of(&timestamp_sql);
+        assert_eq!(timestamps.len(), 1);
+        assert_eq!(timestamps[0].table_name, table);
+        assert_eq!(
+            &timestamp_sql[timestamps[0].clause_range.0..timestamps[0].clause_range.1],
+            format!("{table} TIMESTAMP AS OF '2024-01-01'")
+        );
+    }
+
+    #[test]
     fn test_contains_time_travel_keyword() {
         assert!(contains_time_travel_keyword(
             "SELECT * FROM t VERSION AS OF 1"
@@ -9222,6 +9816,12 @@ mod tests {
         ));
         assert!(!contains_time_travel_keyword(
             "SELECT * FROM t /* timestamp as of now */ WHERE id > 0"
+        ));
+        assert!(!contains_time_travel_keyword(
+            r#"SELECT * FROM "version as of 1""#
+        ));
+        assert!(!contains_time_travel_keyword(
+            "SELECT * FROM `timestamp as of now`"
         ));
         // No keyword at all
         assert!(!contains_time_travel_keyword("SELECT * FROM t"));

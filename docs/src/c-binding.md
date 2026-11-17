@@ -78,6 +78,28 @@ LD_LIBRARY_PATH=target/release ./example /path/to/warehouse
 DYLD_LIBRARY_PATH=target/release ./example /path/to/warehouse
 ```
 
+## Structured Projections
+
+`paimon_read_builder_with_read_type_json` accepts a JSON array of Paimon
+DataFields for nested projections. Each field retains its schema ID and selected
+recursive type, for example:
+
+```json
+[{"id":1,"name":"payload","type":{"type":"ROW","fields":[{"id":2,"name":"selected","type":"INT"}]}}]
+```
+
+Use the IDs from the resolved table schema. This selects `payload.selected`
+without requesting the other fields of `payload`; ARRAY elements and MAP values
+can likewise carry projected ROW types. It uses the core `with_read_type`
+contract, including schema-evolution and format-specific validation. It changes
+the read type, not the table's stored schema.
+
+The JSON is copied during the call. The last successful call to this API or
+`paimon_read_builder_with_projection` selects the projection; JSON decoding errors
+leave the previous selection intact. `[]` selects zero columns while retaining
+row counts, and a null pointer clears the projection. Case sensitivity applies
+to name projections; an explicit read type keeps its supplied field identities.
+
 ## Opening and Scanning a Table
 
 The following program opens `default.my_table` from a filesystem catalog and
@@ -175,6 +197,85 @@ paimon_option options[] = {
 
 paimon_result_catalog_new result = paimon_catalog_create(options, 3);
 ```
+
+### Time Travel
+
+Create a read builder with scan options through
+`paimon_table_new_read_builder_with_options`. At most one time-travel selector
+may be set. A selector that does not resolve to a snapshot is an error; it never
+silently falls back to the latest snapshot.
+
+Supported selectors:
+
+- `scan.snapshot-id`
+- `scan.tag-name`
+- `scan.timestamp-millis`
+- `scan.timestamp`
+- `scan.watermark`
+- `scan.version`
+
+```c
+paimon_option travel[] = {
+    {.key = "scan.snapshot-id", .value = "1"},
+};
+paimon_result_read_builder builder_result =
+    paimon_table_new_read_builder_with_options(table, travel, 1);
+CHECK_RESULT(builder_result);
+read_builder = builder_result.read_builder;
+```
+
+`paimon_table_new_read_builder(table)` is equivalent to calling the options
+variant with an empty option list.
+
+### Tag Management
+
+Catalog tags pin table snapshots:
+
+```c
+/* Tag the latest snapshot. Pass a non-null i64* to pin an explicit snapshot. */
+paimon_error *error =
+    paimon_catalog_create_tag(catalog, identifier, "release-1.0", NULL, false);
+if (error != NULL) {
+    /* handle error */
+    paimon_error_free(error);
+}
+
+paimon_result_get_tag tag_result =
+    paimon_catalog_get_tag(catalog, identifier, "release-1.0");
+if (tag_result.error != NULL) {
+    /* handle error */
+    paimon_error_free(tag_result.error);
+} else {
+    /* tag_result.tag holds JSON bytes owned by the caller */
+    paimon_bytes_free(tag_result.tag);
+}
+
+error = paimon_catalog_delete_tag(catalog, identifier, "release-1.0");
+if (error != NULL) {
+    paimon_error_free(error);
+}
+```
+
+`ignore_if_exists` on create ignores a duplicate tag name. Delete does not
+ignore a missing tag. The C binding does not expose tag listing; read a known
+tag with `paimon_catalog_get_tag`, or use time travel with `scan.tag-name`.
+
+`paimon_catalog_create_tag` keeps the no-retention path by calling
+`paimon_catalog_create_tag_with_retention` with a null `time_retained`. Pass a
+duration such as `"1d"` or `"12h"` to persist retention on the tag file; this
+does not expire or delete tags automatically:
+
+```c
+/* Optional retention. NULL time_retained omits retention metadata. */
+error = paimon_catalog_create_tag_with_retention(
+    catalog, identifier, "release-retained", NULL, "1d", false);
+if (error != NULL) {
+    paimon_error_free(error);
+}
+```
+
+`paimon_catalog_get_tag` JSON may include `tagTimeRetained` as an ISO-8601
+duration (for example `"1d"` becomes `"PT24H"`).
 
 ## Caller-managed File Cache
 
@@ -324,6 +425,41 @@ range is clamped to the number of available splits.
     `ArrowSchema` container structs. When writing, the ownership direction is
     reversed: `paimon_table_write_write_arrow_batch` consumes the exported
     Arrow structures, so the caller must not release them again.
+
+## Current-state Audit Reads
+
+Use `paimon_read_builder_plan_audit` to plan a current-state audit scan from an
+ordinary read builder. It preserves retracts and complete merge groups using
+the core audit planner. The builder's table view, user-column projection,
+case-sensitivity setting and filters are applied. Planning does not use the
+builder's limit to prune input; apply the final limit in the caller.
+
+Create a read with `paimon_read_builder_new_read`, then execute its assigned
+splits with `paimon_table_read_to_audit_log_arrow(read, plan, offset, length)`.
+The offset and length select complete logical splits, as in ordinary reads.
+The plan may also come from `paimon_plan_from_split_bytes`. Externally planned
+splits must preserve audit merge groups, including first-row merge and
+deletion-vector overlap boundaries; an ordinary scan plan that already pruned
+retract-only groups is not sufficient.
+
+Output prepends `rowkind` and, when configured by
+`table-read.sequence-number.enabled`, `_SEQUENCE_NUMBER` to the selected user
+fields. An empty user-column projection reads only these system columns.
+`paimon_table_export_audit_arrow_schema` exports the full audit schema to an
+initialized, empty `ArrowSchema`; the batch reader exports the actual projected
+schema with each batch. Release the standalone schema through its Arrow release
+callback, and release each batch with `paimon_arrow_batch_free`.
+
+The reader owns the inputs needed by its stream and may outlive the read,
+builder, table and plan handles. Use the existing record-batch reader functions
+to consume and free it. Attached resource contexts are retained by the stream.
+Apply system-column predicates in the caller; builder predicates address the
+base table's fields.
+
+These APIs read the merged current state, retaining winning delete rows. They
+do not return every historical event and do not execute incremental Delta,
+Changelog or Diff plans. Incremental planning and transport require separate
+interfaces.
 
 ## Projection and Predicates
 
@@ -868,6 +1004,13 @@ unflushed format-writer input batches. Sorting, encoding, transient routing
 batches, file indexes, caller-owned Arrow input, and allocation overhead are
 not fully charged. A reservation failure does not automatically flush or retry
 a writer; handle the error as a failed write operation.
+
+For append and postpone-bucket writes, formats that support flushing also flush
+when the current file's retained-input reservation reaches
+`write.parquet-buffer-size` (default 256 MiB). This accounts for inputs such as
+repeated strings whose Arrow buffers can be much larger than the encoded row
+group. The flush decision uses only that file's reservation. Each batch must
+still fit within the available budget before it can be flushed.
 
 The input Arrow schema must match the table schema exactly, including field
 count, order, names, and types. A non-nullable table field must not contain null

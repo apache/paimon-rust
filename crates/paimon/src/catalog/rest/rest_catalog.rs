@@ -480,21 +480,10 @@ impl Catalog for RESTCatalog {
     }
 
     async fn get_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<GetTagResponse> {
-        let response = self
-            .api
+        self.api
             .get_tag(identifier, tag_name)
             .await
-            .map_err(|error| map_rest_error_for_tag(error, identifier, tag_name, None))?;
-        if response.tag_name != tag_name {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "REST catalog returned tag '{}' for requested tag '{tag_name}'",
-                    response.tag_name
-                ),
-                source: None,
-            });
-        }
-        Ok(response)
+            .map_err(|error| map_rest_error_for_tag(error, identifier, tag_name, None))
     }
 
     async fn delete_tag(
@@ -650,6 +639,21 @@ impl Catalog for RESTCatalog {
             .map_err(|error| map_rest_error_for_create_function(error, function.identifier()));
         ignore_error_if(result, |error| {
             ignore_if_exists && matches!(error, Error::FunctionAlreadyExist { .. })
+        })
+    }
+
+    async fn drop_function(
+        &self,
+        identifier: &Identifier,
+        ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        let result = self
+            .api
+            .drop_function(identifier)
+            .await
+            .map_err(|error| map_rest_error_for_function(error, identifier));
+        ignore_error_if(result, |error| {
+            ignore_if_not_exists && matches!(error, Error::FunctionNotExist { .. })
         })
     }
 

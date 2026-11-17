@@ -258,6 +258,57 @@ async fn test_write_commit_read_roundtrip() {
     assert_eq!(total, 3, "expected 3 rows read back, got {total}");
 }
 
+#[tokio::test]
+async fn test_scan_version_without_tag_endpoint() {
+    let ctx = setup().await;
+    let cat = &ctx.catalog;
+
+    cat.create_database("tt_db", false, HashMap::new())
+        .await
+        .unwrap();
+    let ident = Identifier::new("tt_db", "users");
+    cat.create_table(&ident, append_only_schema(), false)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let table = cat.get_table(&ident).await.unwrap();
+        let write_builder = table.new_write_builder();
+        let mut writer = write_builder.new_write().unwrap();
+        writer.write_arrow_batch(&sample_batch()).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        write_builder.new_commit().commit(messages).await.unwrap();
+    }
+
+    let table = cat.get_table(&ident).await.unwrap();
+    let travel = |version: &str| {
+        table.copy_with_time_travel_strict(HashMap::from([(
+            "scan.version".to_string(),
+            version.to_string(),
+        )]))
+    };
+    let snapshot_1 = travel("1").await.unwrap();
+    let read_builder = snapshot_1.new_read_builder();
+    let plan = read_builder.new_scan().plan().await.unwrap();
+    let read = read_builder.new_read().unwrap();
+    let mut stream = read.to_arrow(plan.splits()).unwrap();
+    let mut total = 0usize;
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        total += batch.num_rows();
+    }
+    assert_eq!(total, 3, "snapshot 1 holds one of the two batches");
+
+    for error in [
+        travel("release").await.unwrap_err(),
+        cat.create_tag(&ident, "release", None, false)
+            .await
+            .unwrap_err(),
+        cat.delete_tag(&ident, "release", true).await.unwrap_err(),
+    ] {
+        let error = error.to_string();
+        assert!(error.contains("Tags are not supported"), "{error}");
+    }
+}
+
 // ==================== alter table over REST ====================
 
 #[tokio::test]

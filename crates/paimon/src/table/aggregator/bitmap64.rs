@@ -18,6 +18,8 @@
 //! Java Roaring64Bitmap 1.2.1 wire format: ART over high 48 bits followed by
 //! serialized 16-bit containers. This is distinct from Rust RoaringTreemap.
 
+use std::borrow::Cow;
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -78,14 +80,16 @@ impl FieldAggregator for Roaring64Agg {
             ),
             source: None,
         })?;
-        for (key, ranges) in decode(bytes).map_err(|message| Error::DataInvalid {
+        for (key, container) in decode(bytes).map_err(|message| Error::DataInvalid {
             message: format!("Invalid rbm64 input for '{}': {message}", self.field_name),
             source: None,
         })? {
-            values.entry(key).or_default().extend(ranges);
-        }
-        for ranges in values.values_mut() {
-            normalize_ranges(ranges);
+            match values.entry(key) {
+                Entry::Vacant(vacant) => {
+                    vacant.insert(container);
+                }
+                Entry::Occupied(mut occupied) => occupied.get_mut().union(container),
+            }
         }
         self.value = Some(encode(&values)?);
         Ok(())
@@ -195,7 +199,114 @@ fn read_art_node(
     Ok(())
 }
 
-type Ranges = BTreeMap<[u8; 6], Vec<(u16, u16)>>;
+type Ranges = BTreeMap<[u8; 6], Container>;
+
+/// One decoded 16-bit container. Dense bitset containers (Java kind 1)
+/// stay as their 1024 words so unions are word-wise ORs, like Java's
+/// bitmap container; every other shape is a normalized inclusive range
+/// list.
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
+enum Container {
+    Ranges(Vec<(u16, u16)>),
+    Words(Box<[u64; 1024]>),
+}
+
+impl Container {
+    fn cardinality(&self) -> usize {
+        match self {
+            Container::Ranges(ranges) => ranges
+                .iter()
+                .map(|(start, end)| usize::from(*end) - usize::from(*start) + 1)
+                .sum(),
+            Container::Words(words) => words.iter().map(|word| word.count_ones() as usize).sum(),
+        }
+    }
+
+    /// Number of maximal runs of set bits, i.e. `self.ranges().len()`.
+    fn run_count(&self) -> usize {
+        match self {
+            Container::Ranges(ranges) => ranges.len(),
+            Container::Words(words) => {
+                // A run starts at each set bit whose lower neighbor is
+                // clear; bit 0 looks at bit 63 of the previous word.
+                let mut carry = 0;
+                let mut runs = 0;
+                for &word in words.iter() {
+                    runs += (word & !((word << 1) | carry)).count_ones() as usize;
+                    carry = word >> 63;
+                }
+                runs
+            }
+        }
+    }
+
+    /// Normalized inclusive ranges, borrowed for range containers.
+    fn ranges(&self) -> Cow<'_, [(u16, u16)]> {
+        match self {
+            Container::Ranges(ranges) => Cow::Borrowed(ranges),
+            Container::Words(words) => Cow::Owned(word_ranges(words)),
+        }
+    }
+
+    /// OR `other` into `self`. A bitset on either side makes the result a
+    /// bitset; two range lists stay a normalized range list.
+    fn union(&mut self, other: Container) {
+        match (&mut *self, other) {
+            (Container::Ranges(own), Container::Ranges(input)) => {
+                own.extend(input);
+                normalize_ranges(own);
+            }
+            (Container::Words(own), Container::Ranges(input)) => set_ranges(own, &input),
+            (Container::Words(own), Container::Words(input)) => {
+                for (own, input) in own.iter_mut().zip(input.iter()) {
+                    *own |= input;
+                }
+            }
+            (Container::Ranges(own), Container::Words(mut input)) => {
+                set_ranges(&mut input, own);
+                *self = Container::Words(input);
+            }
+        }
+    }
+}
+
+/// Maximal runs of set bits as inclusive ranges, merged across words.
+fn word_ranges(words: &[u64; 1024]) -> Vec<(u16, u16)> {
+    let mut ranges: Vec<(u16, u16)> = Vec::new();
+    for (index, &word) in words.iter().enumerate() {
+        let mut remaining = word;
+        while remaining != 0 {
+            let low = remaining.trailing_zeros();
+            let len = (remaining >> low).trailing_ones();
+            let start = (index * 64) as u16 + low as u16;
+            let end = start + (len - 1) as u16;
+            match ranges.last_mut() {
+                Some(last) if u32::from(last.1) + 1 == u32::from(start) => last.1 = end,
+                _ => ranges.push((start, end)),
+            }
+            // `len` can be 64, so shift MAX down rather than `1 << len`.
+            remaining &= !((u64::MAX >> (64 - len)) << low);
+        }
+    }
+    ranges
+}
+
+/// Set the bits of inclusive `ranges` a word at a time.
+fn set_ranges(words: &mut [u64; 1024], ranges: &[(u16, u16)]) {
+    for &(start, end) in ranges {
+        let (first, last) = (usize::from(start / 64), usize::from(end / 64));
+        let head = u64::MAX << (start % 64);
+        let tail = u64::MAX >> (63 - end % 64);
+        if first == last {
+            words[first] |= head & tail;
+        } else {
+            words[first] |= head;
+            words[first + 1..last].fill(u64::MAX);
+            words[last] |= tail;
+        }
+    }
+}
 
 fn normalize_ranges(ranges: &mut Vec<(u16, u16)>) {
     ranges.sort_unstable();
@@ -257,10 +368,10 @@ fn decode(bytes: &[u8]) -> Result<Ranges, String> {
             if cardinality > 65536 {
                 return Err("invalid rbm64 container cardinality".into());
             }
-            let mut ranges = Vec::new();
-            match kind {
+            let container = match kind {
                 0 => {
                     let runs = usize::from(reader.u16()?);
+                    let mut ranges = Vec::with_capacity(runs);
                     for _ in 0..runs {
                         let start = reader.u16()?;
                         let length = reader.u16()?;
@@ -270,37 +381,34 @@ fn decode(bytes: &[u8]) -> Result<Ranges, String> {
                         }
                         ranges.push((start, end as u16));
                     }
+                    normalize_ranges(&mut ranges);
+                    Container::Ranges(ranges)
                 }
+                // Dense bitsets stay as words: unions become word-wise
+                // ORs and the encode path writes the words back without
+                // per-bit expansion, like Java's bitmap container.
                 1 => {
-                    for word_index in 0..1024u32 {
-                        let word = reader.u64()?;
-                        let mut remaining = word;
-                        while remaining != 0 {
-                            let bit = remaining.trailing_zeros();
-                            let low = (word_index * 64 + bit) as u16;
-                            ranges.push((low, low));
-                            remaining &= remaining - 1;
-                        }
+                    let mut words = Box::new([0u64; 1024]);
+                    for word in words.iter_mut() {
+                        *word = reader.u64()?;
                     }
+                    Container::Words(words)
                 }
                 2 => {
+                    let mut ranges = Vec::with_capacity(cardinality);
                     for _ in 0..cardinality {
                         let low = reader.u16()?;
                         ranges.push((low, low));
                     }
+                    normalize_ranges(&mut ranges);
+                    Container::Ranges(ranges)
                 }
                 _ => return Err(format!("unknown rbm64 container type {kind}")),
-            }
-            normalize_ranges(&mut ranges);
-            if ranges
-                .iter()
-                .map(|(start, end)| usize::from(*end) - usize::from(*start) + 1)
-                .sum::<usize>()
-                != cardinality
-            {
+            };
+            if container.cardinality() != cardinality {
                 return Err("rbm64 container cardinality mismatch".into());
             }
-            inner.push(Some(ranges));
+            inner.push(Some(container));
         }
         containers.push(inner);
     }
@@ -380,13 +488,10 @@ fn encode(values: &Ranges) -> crate::Result<Vec<u8>> {
     out.extend_from_slice(&1u32.to_le_bytes()); // one first-level container array
     out.push(0xfe); // NOT_TRIMMED_MARK
     out.extend_from_slice(&count.to_le_bytes());
-    for ranges in values.values() {
-        let cardinality: usize = ranges
-            .iter()
-            .map(|(start, end)| usize::from(*end) - usize::from(*start) + 1)
-            .sum();
+    for container in values.values() {
+        let cardinality = container.cardinality();
         let array_bytes = cardinality * 2;
-        let run_bytes = 2 + ranges.len() * 4;
+        let run_bytes = 2 + container.run_count() * 4;
         let kind = if run_bytes <= array_bytes && run_bytes <= 8192 {
             0
         } else if array_bytes <= 8192 {
@@ -397,26 +502,34 @@ fn encode(values: &Ranges) -> crate::Result<Vec<u8>> {
         out.push(1); // non-null
         out.push(kind);
         out.extend_from_slice(&(cardinality as u32).to_le_bytes());
-        if kind == 0 {
-            out.extend_from_slice(&(ranges.len() as u16).to_le_bytes());
-            for &(start, end) in ranges {
-                out.extend_from_slice(&start.to_le_bytes());
-                out.extend_from_slice(&(end - start).to_le_bytes());
-            }
-        } else if kind == 1 {
-            let mut words = [0u64; 1024];
-            for &(start, end) in ranges {
-                for low in start..=end {
-                    words[usize::from(low) / 64] |= 1u64 << (low % 64);
+        match (kind, container) {
+            (0, _) => {
+                let ranges = container.ranges();
+                out.extend_from_slice(&(ranges.len() as u16).to_le_bytes());
+                for &(start, end) in ranges.iter() {
+                    out.extend_from_slice(&start.to_le_bytes());
+                    out.extend_from_slice(&(end - start).to_le_bytes());
                 }
             }
-            for word in words {
-                out.extend_from_slice(&word.to_le_bytes());
+            // The dense shape writes its words straight through, without
+            // per-bit expansion on either side of the union.
+            (1, Container::Words(words)) => {
+                for word in words.iter() {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
             }
-        } else {
-            for &(start, end) in ranges {
-                for low in start..=end {
-                    out.extend_from_slice(&low.to_le_bytes());
+            (1, Container::Ranges(ranges)) => {
+                let mut words = [0u64; 1024];
+                set_ranges(&mut words, ranges);
+                for word in words {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+            }
+            (_, _) => {
+                for &(start, end) in container.ranges().iter() {
+                    for low in start..=end {
+                        out.extend_from_slice(&low.to_le_bytes());
+                    }
                 }
             }
         }
@@ -436,7 +549,7 @@ mod tests {
     const JAVA_BITMAP: &str = "AQIAAAAAAAAAAAIAAwAAAAAAAQAEAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAQAAAQAAAAAAAAABAAAA/gIAAAABAgEAAAABAAECAQAAAAEAAgAAAAAAAAAAAAAAAQAAAA==";
 
     fn ranges_from_values(values: impl IntoIterator<Item = u64>) -> Ranges {
-        let mut result = Ranges::new();
+        let mut result = BTreeMap::<[u8; 6], Vec<(u16, u16)>>::new();
         for value in values {
             let bytes = value.to_be_bytes();
             let low = value as u16;
@@ -445,22 +558,26 @@ mod tests {
                 .or_default()
                 .push((low, low));
         }
-        for ranges in result.values_mut() {
-            normalize_ranges(ranges);
-        }
         result
+            .into_iter()
+            .map(|(key, mut ranges)| {
+                normalize_ranges(&mut ranges);
+                (key, Container::Ranges(ranges))
+            })
+            .collect()
     }
 
     fn values_from_ranges(ranges: &Ranges) -> BTreeSet<u64> {
         ranges
             .iter()
-            .flat_map(|(high, ranges)| {
+            .flat_map(|(high, container)| {
                 let high = high
                     .iter()
                     .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
-                ranges.iter().flat_map(move |&(start, end)| {
-                    (start..=end).map(move |low| (high << 16) | u64::from(low))
-                })
+                let lows = container.ranges().into_owned();
+                let highs = move |low: u16| (high << 16) | u64::from(low);
+                lows.into_iter()
+                    .flat_map(move |(start, end)| (start..=end).map(highs))
             })
             .collect()
     }
@@ -516,5 +633,159 @@ mod tests {
         let java = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, JAVA_BITMAP)
             .unwrap();
         assert!(decode(&java[..java.len() - 1]).is_err());
+    }
+
+    const JAVA_BITSET: &[u8] = include_bytes!("../goldens/roaring64_java_bitset.bin");
+
+    fn key(value: u64) -> [u8; 6] {
+        value.to_be_bytes()[..6].try_into().unwrap()
+    }
+
+    /// Values of `JAVA_BITSET`: two bitset containers and one array container.
+    fn java_bitset_values() -> BTreeSet<u64> {
+        (0..65536u64)
+            .filter(|v| v % 3 == 0)
+            .chain((0..65536u64).filter(|v| v % 3 == 1).map(|v| (1 << 40) | v))
+            .chain([(1 << 40) | (1 << 16) | 5])
+            .collect()
+    }
+
+    fn union_rows(rows: &[&[u8]]) -> Vec<u8> {
+        let input = BinaryArray::from(rows.iter().map(|row| Some(*row)).collect::<Vec<_>>());
+        let mut agg = Roaring64Agg::new(
+            "bitmap",
+            &DataType::VarBinary(VarBinaryType::new(VarBinaryType::MAX_LENGTH).unwrap()),
+        )
+        .unwrap();
+        for row in 0..rows.len() {
+            agg.agg(&input, row).unwrap();
+        }
+        let output = agg.result().unwrap();
+        let output = output.as_any().downcast_ref::<BinaryArray>().unwrap();
+        output.value(0).to_vec()
+    }
+
+    #[test]
+    fn decodes_java_bitset_containers_as_words() {
+        let decoded = decode(JAVA_BITSET).unwrap();
+        assert!(matches!(decoded[&key(0)], Container::Words(_)));
+        assert!(matches!(decoded[&key(1 << 40)], Container::Words(_)));
+        assert!(matches!(
+            decoded[&key((1 << 40) | (1 << 16))],
+            Container::Ranges(_)
+        ));
+        assert_eq!(values_from_ranges(&decoded), java_bitset_values());
+        assert_eq!(decode(&encode(&decoded).unwrap()).unwrap(), decoded);
+    }
+
+    /// Bitset with range, range with bitset, bitset with bitset, and a
+    /// bitset key that only the input has.
+    #[test]
+    fn unions_java_bitset_containers_with_ranges_and_bitsets() {
+        let sparse_values = [1u64, 2];
+        let sparse = encode(&ranges_from_values(sparse_values)).unwrap();
+        let rest_values: Vec<u64> = (0..65536u64).filter(|v| v % 3 != 0).collect();
+        let rest = encode(&ranges_from_values(rest_values.iter().copied())).unwrap();
+        assert!(matches!(
+            decode(&sparse).unwrap()[&key(0)],
+            Container::Ranges(_)
+        ));
+        assert!(matches!(
+            decode(&rest).unwrap()[&key(0)],
+            Container::Words(_)
+        ));
+
+        let with_sparse: BTreeSet<u64> = java_bitset_values()
+            .into_iter()
+            .chain(sparse_values)
+            .collect();
+        let with_rest: BTreeSet<u64> = java_bitset_values()
+            .into_iter()
+            .chain(rest_values)
+            .collect();
+        for (rows, expected) in [
+            (vec![JAVA_BITSET, &sparse], &with_sparse),
+            (vec![&sparse, JAVA_BITSET], &with_sparse),
+            // Key 0 becomes all 65536 values and is written as one run.
+            (vec![JAVA_BITSET, &rest], &with_rest),
+        ] {
+            let output = union_rows(&rows);
+            assert_eq!(&values_from_ranges(&decode(&output).unwrap()), expected);
+            assert_eq!(
+                output,
+                encode(&ranges_from_values(expected.iter().copied())).unwrap()
+            );
+        }
+    }
+
+    fn ranges_bit_by_bit(words: &[u64; 1024]) -> Vec<(u16, u16)> {
+        let mut ranges: Vec<(u16, u16)> = Vec::new();
+        for low in 0..=u16::MAX {
+            if (words[usize::from(low / 64)] >> (low % 64)) & 1 == 1 {
+                match ranges.last_mut() {
+                    Some(last) if last.1 + 1 == low => last.1 = low,
+                    _ => ranges.push((low, low)),
+                }
+            }
+        }
+        ranges
+    }
+
+    #[test]
+    fn word_runs_match_a_bit_by_bit_scan() {
+        let patterns: [fn(usize) -> u64; 6] = [
+            |_| 0xAAAA_AAAA_AAAA_AAAA,
+            |_| u64::MAX,
+            // 1025 runs: run encoding, while counting per word gives 2048.
+            |_| 0xFFFF_0000_0000_FFFF,
+            |index| match index {
+                0 | 1 => u64::MAX,
+                2 => 1,
+                _ => 0,
+            },
+            |index| if index % 2 == 0 { 1 << 63 } else { 1 },
+            |index| (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        ];
+        for pattern in patterns {
+            let words = Box::new(std::array::from_fn(pattern));
+            let expected = ranges_bit_by_bit(&words);
+            let container = Container::Words(words);
+            assert_eq!(container.ranges().as_ref(), expected.as_slice());
+            assert_eq!(container.run_count(), expected.len());
+            let from_words = encode(&BTreeMap::from([(key(0), container)])).unwrap();
+            let from_ranges =
+                encode(&BTreeMap::from([(key(0), Container::Ranges(expected))])).unwrap();
+            assert_eq!(from_words, from_ranges);
+        }
+    }
+
+    #[test]
+    fn set_ranges_matches_a_bit_loop() {
+        let ranges = [
+            (0, 0),
+            (5, 10),
+            (60, 70),
+            (63, 64),
+            (64, 127),
+            (200, 1000),
+            (65472, 65535),
+            (65535, 65535),
+            (0, 65535),
+        ];
+        for range in ranges
+            .iter()
+            .map(std::slice::from_ref)
+            .chain([&ranges[..8]])
+        {
+            let mut words = [0x5555_5555_5555_5555u64; 1024];
+            let mut expected = words;
+            set_ranges(&mut words, range);
+            for &(start, end) in range {
+                for low in start..=end {
+                    expected[usize::from(low / 64)] |= 1 << (low % 64);
+                }
+            }
+            assert_eq!(words, expected, "{range:?}");
+        }
     }
 }

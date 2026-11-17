@@ -501,7 +501,8 @@ impl Table {
     }
 
     pub fn tag_manager(&self) -> TagManager {
-        let manager = TagManager::new(self.file_io.clone(), self.location.clone());
+        let manager = TagManager::new(self.file_io.clone(), self.location.clone())
+            .with_rest_env(self.rest_env.clone());
         if self.is_main_branch() {
             manager
         } else {

@@ -16,6 +16,7 @@
 // under the License.
 
 mod blob_fallback;
+mod vector_versions;
 
 use super::blob_resolver::BlobReadLimiter;
 use super::data_file_reader::{
@@ -103,6 +104,84 @@ fn reader_file_groups(files: &[DataFileMeta]) -> Vec<Vec<DataFileMeta>> {
     } else {
         group_by_overlapping_row_id(files.to_vec())
     }
+}
+
+/// Reuse the field merger without an anchor or deletion mask. The compactor
+/// has already checked contiguous physical coverage for every written field.
+pub(super) fn read_vector_compaction(
+    table: &crate::table::Table,
+    split: &DataSplit,
+    fields: Vec<DataField>,
+    first: i64,
+    last: i64,
+    resources: Option<crate::resource::ResourceContext>,
+) -> crate::Result<ArrowRecordBatchStream> {
+    let budget = super::table_read::configured_parquet_read_budget(table)?;
+    let budget = resources.map_or_else(
+        || budget.clone(),
+        |resources| Arc::new(budget.with_resources(resources)),
+    );
+    let reader = DataEvolutionReader::new(
+        table.file_io().clone(),
+        table.schema_manager().clone(),
+        table.schema().id(),
+        table.schema().fields().to_vec(),
+        fields,
+        Vec::new(),
+        true,
+        HashSet::new(),
+        HashSet::new(),
+        false,
+        None,
+    )?
+    .with_batch_size(Some(table.schema().core_options().read_batch_size()?))
+    .with_table_options(table.schema().options().clone())
+    .with_mosaic_prefetch(super::table_read::configured_mosaic_prefetch(table)?)
+    .with_parquet_read_budget(Some(budget));
+    reader.merge_files_by_columns(
+        split,
+        &PreparedMergeGroup {
+            files: normalize_merge_group(split.data_files().to_vec())?,
+            logical_row_count: last - first + 1,
+            first_row_id: first,
+        },
+        None,
+        None,
+        usize::try_from(last - first + 1).map_err(|_| Error::DataInvalid {
+            message: "Vector compaction range exceeds addressable rows".into(),
+            source: None,
+        })?,
+        None,
+    )
+}
+
+/// Read one validated BLOB compaction range without a normal-file anchor or
+/// deletion filtering. Descriptors let the writer stream the payload copies.
+pub(super) fn read_blob_compaction(
+    split: &DataSplit,
+    field: DataField,
+    file_io: FileIO,
+    first: i64,
+    last: i64,
+    batch_size: usize,
+) -> crate::Result<ArrowRecordBatchStream> {
+    let mut bunch = BlobBunch::new(first, last - first + 1);
+    for file in split.data_files() {
+        bunch.add(file.clone())?;
+    }
+    bunch.finalize()?;
+    bunch.validate_logical_range()?;
+    blob_fallback::read(
+        split,
+        bunch,
+        vec![field],
+        None,
+        Some(batch_size),
+        file_io,
+        true,
+        DEFAULT_BLOB_READ_PARALLELISM,
+        None,
+    )
 }
 
 /// Reads data files in data evolution mode, merging columns from files
@@ -268,11 +347,10 @@ impl DataEvolutionReader {
     }
 
     /// Managed BLOB payloads are fetched by the format reader, before the
-    /// residual predicate. A LIMIT with a predicate on ordinary columns must
-    /// therefore select matching row IDs before opening those payloads.
+    /// residual predicate. Select rows using ordinary-column predicates before
+    /// opening payloads, including when the query has no output limit.
     fn needs_managed_blob_preselection(&self, splits: &[DataSplit]) -> bool {
-        if self.limit.is_none()
-            || self.predicates.is_empty()
+        if self.predicates.is_empty()
             || self.blob_as_descriptor
             || !self.blob_view_read_fields().is_empty()
             || !self
@@ -311,12 +389,10 @@ impl DataEvolutionReader {
         &self,
         splits: &[DataSplit],
     ) -> crate::Result<Vec<DataSplit>> {
-        let Some(mut remaining) = self.limit else {
-            return Ok(splits.to_vec());
-        };
+        let mut remaining = self.limit;
         let mut selected = Vec::new();
         for split in splits {
-            if remaining == 0 {
+            if remaining == Some(0) {
                 break;
             }
             // This read projects only synthesized row IDs. Predicate columns
@@ -337,7 +413,7 @@ impl DataEvolutionReader {
             )?
             .with_partition_fields(self.partition_fields.clone())
             .with_batch_size(self.batch_size)
-            .with_limit(Some(remaining))
+            .with_limit(remaining)
             .with_parquet_read_budget(self.parquet_read_budget.clone())
             .with_table_options(Arc::clone(&self.table_options))
             .with_mosaic_prefetch(self.mosaic_prefetch)
@@ -375,7 +451,7 @@ impl DataEvolutionReader {
                         .with_selected_row_ranges(crate::table::merge_row_ranges(ranges)),
                 );
             }
-            remaining = remaining.saturating_sub(selected_count);
+            remaining = remaining.map(|limit| limit.saturating_sub(selected_count));
         }
         Ok(selected)
     }
@@ -1865,7 +1941,13 @@ fn open_source_stream(
             row_ranges.as_deref(),
             anchor_deletion_vector.map(|context| context.deletion_vector.as_ref()),
         )?;
-        if let Some(selected_ranges) = selected_ranges.as_deref() {
+        // The normal file owns the logical rows. A compacted normal file can
+        // span rows appended without this BLOB column, even on a full scan.
+        let expected_range = bunch.expected_range()?;
+        {
+            let selected_ranges = selected_ranges
+                .as_deref()
+                .unwrap_or(std::slice::from_ref(&expected_range));
             let uncovered_ranges =
                 crate::table::source::exclude_row_ranges(selected_ranges, bunch.logical_ranges());
             if !uncovered_ranges.is_empty() {
@@ -1930,6 +2012,29 @@ fn open_source_stream(
     .with_read_timing(read_timing);
 
     match source {
+        FieldSource::VectorVersions {
+            files,
+            first,
+            rows,
+            read_fields,
+        } => {
+            let selected = selected_absolute_row_ranges_for_file(
+                *first,
+                *rows,
+                row_ranges.as_deref(),
+                anchor_deletion_vector.map(|context| context.deletion_vector.as_ref()),
+            )?;
+            vector_versions::read(
+                file_reader,
+                split,
+                files,
+                *first,
+                *rows,
+                selected,
+                read_fields,
+                batch_size,
+            )
+        }
         FieldSource::DataFile {
             file, data_fields, ..
         } => {
@@ -2555,6 +2660,7 @@ fn build_source_plan_with_row_id_pushdown(
         nested_enabled,
     } = context;
     let mut sources = Vec::new();
+    let versioned_vectors = vector_versions::required(prepared_group, file_infos);
     let mut normal_providers: HashMap<i32, usize> = HashMap::new(); // field_id -> source_idx
     let mut vector_field_providers: HashMap<i32, usize> = HashMap::new(); // field_id -> source_idx
     let mut vector_bunch_indices: HashMap<(i64, String, Vec<String>), usize> = HashMap::new();
@@ -2591,6 +2697,24 @@ fn build_source_plan_with_row_id_pushdown(
                 .unwrap()
                 .add(file.clone())?;
         } else if is_vector_store_file_name(&file.file_name) {
+            if versioned_vectors {
+                for &field_id in &info.field_ids {
+                    let source_idx = *vector_field_providers.entry(field_id).or_insert_with(|| {
+                        let index = sources.len();
+                        sources.push(FieldSource::VectorVersions {
+                            files: Vec::new(),
+                            first: prepared_group.first_row_id,
+                            rows: prepared_group.logical_row_count,
+                            read_fields: Vec::new(),
+                        });
+                        index
+                    });
+                    if let FieldSource::VectorVersions { files, .. } = &mut sources[source_idx] {
+                        files.push(file.clone());
+                    }
+                }
+                continue;
+            }
             // A vector file is a column provider only; unlike a normal data file it does
             // NOT update `expected_blob_row_count` (it must not anchor a following blob's
             // row count). Segments sharing the same (schema_id, format, normalized
@@ -2795,7 +2919,7 @@ fn build_source_plan_with_row_id_pushdown(
         {
             bunch.finalize()?;
             if !read_fields.is_empty() && !row_id_pushdown {
-                bunch.validate_logical_range()?;
+                bunch.validate_anchor_bounds()?;
             }
         }
     }
@@ -2845,6 +2969,12 @@ fn resolve_blob_field_id(file: &DataFileMeta, info: &ResolvedFileInfo) -> crate:
 
 #[derive(Debug, Clone)]
 enum FieldSource {
+    VectorVersions {
+        files: Vec<DataFileMeta>,
+        first: i64,
+        rows: i64,
+        read_fields: Vec<DataField>,
+    },
     DataFile {
         file: Box<DataFileMeta>,
         data_fields: Option<Vec<DataField>>,
@@ -2864,7 +2994,8 @@ enum FieldSource {
 impl FieldSource {
     fn read_fields(&self) -> &[DataField] {
         match self {
-            FieldSource::DataFile { read_fields, .. }
+            FieldSource::VectorVersions { read_fields, .. }
+            | FieldSource::DataFile { read_fields, .. }
             | FieldSource::VectorBunch { read_fields, .. }
             | FieldSource::BlobBunch { read_fields, .. } => read_fields,
         }
@@ -2872,7 +3003,8 @@ impl FieldSource {
 
     fn add_read_field(&mut self, field: DataField) -> usize {
         let read_fields = match self {
-            FieldSource::DataFile { read_fields, .. }
+            FieldSource::VectorVersions { read_fields, .. }
+            | FieldSource::DataFile { read_fields, .. }
             | FieldSource::VectorBunch { read_fields, .. }
             | FieldSource::BlobBunch { read_fields, .. } => read_fields,
         };
@@ -2890,14 +3022,18 @@ impl FieldSource {
     fn blob_bunch_mut(&mut self) -> Option<&mut BlobBunch> {
         match self {
             FieldSource::BlobBunch { bunch, .. } => Some(bunch),
-            FieldSource::DataFile { .. } | FieldSource::VectorBunch { .. } => None,
+            FieldSource::VectorVersions { .. }
+            | FieldSource::DataFile { .. }
+            | FieldSource::VectorBunch { .. } => None,
         }
     }
 
     fn vector_bunch_mut(&mut self) -> Option<&mut VectorBunch> {
         match self {
             FieldSource::VectorBunch { bunch, .. } => Some(bunch),
-            FieldSource::DataFile { .. } | FieldSource::BlobBunch { .. } => None,
+            FieldSource::VectorVersions { .. }
+            | FieldSource::DataFile { .. }
+            | FieldSource::BlobBunch { .. } => None,
         }
     }
 }
@@ -2937,7 +3073,8 @@ impl BlobBunch {
 
         blob_file_row_range(&file)?;
         if let Some(first_file) = self.files.first() {
-            if file.write_cols != first_file.write_cols {
+            // Sources are grouped by field ID; names can differ across schemas.
+            if file.schema_id == first_file.schema_id && file.write_cols != first_file.write_cols {
                 return Err(Error::DataInvalid {
                     message: "All files in a blob bunch should have the same write columns."
                         .to_string(),
@@ -3057,6 +3194,23 @@ impl BlobBunch {
                 ),
                 source: None,
             });
+        }
+        Ok(())
+    }
+
+    /// Java BlobFileBunch uses the normal file's logical range. Physical BLOB
+    /// ranges may leave gaps, but cannot extend beyond that anchor on a full scan.
+    fn validate_anchor_bounds(&self) -> crate::Result<()> {
+        let expected = self.expected_range()?;
+        for range in self.logical_ranges() {
+            if range.from() < expected.from() || range.to() > expected.to() {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Blob file range {range:?} should be within normal file range {expected:?}"
+                    ),
+                    source: None,
+                });
+            }
         }
         Ok(())
     }
@@ -3918,8 +4072,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_source_plan_rejects_field_id_across_two_bunch_keys() {
-        // Same field id 2 advertised by two DIFFERENT bunch keys (different write col sets) -> error (#6).
+    fn test_build_source_plan_merges_field_id_across_two_bunch_keys() {
         let files = vec![
             data_file("d1.parquet", 0, 10, 1, Some(vec!["id"])),
             data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
@@ -3952,8 +4105,15 @@ mod tests {
             DataField::new(2, "emb".to_string(), vector_float_type(2)),
             DataField::new(3, "other".to_string(), vector_float_type(2)),
         ];
-        let err = build_source_plan(&prepared_group, &file_infos, &read_type, &HashSet::new());
-        assert!(matches!(err, Err(Error::DataInvalid { .. })));
+        let plan =
+            build_source_plan(&prepared_group, &file_infos, &read_type, &HashSet::new()).unwrap();
+        assert_eq!(
+            plan.column_plan,
+            vec![Some((0, 0)), Some((1, 0)), Some((2, 0))]
+        );
+        assert!(
+            matches!(&plan.sources[1], FieldSource::VectorVersions { files, .. } if files.len() == 2)
+        );
     }
 
     #[test]
@@ -4548,7 +4708,9 @@ mod tests {
                     ]
                 );
             }
-            FieldSource::DataFile { .. } | FieldSource::VectorBunch { .. } => {
+            FieldSource::VectorVersions { .. }
+            | FieldSource::DataFile { .. }
+            | FieldSource::VectorBunch { .. } => {
                 panic!("expected blob bunch source")
             }
         }
@@ -4611,7 +4773,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_source_plan_validates_complete_range_only_for_read_blob_source() {
+    fn test_build_source_plan_accepts_incomplete_read_blob_source() {
         let files = vec![
             data_file("data.parquet", 0, 100, 1, None),
             data_file("payload.blob", 10, 90, 1, Some(vec!["payload"])),
@@ -4634,16 +4796,61 @@ mod tests {
             DataField::new(1, "id".to_string(), DataType::Int(IntType::new())),
             DataField::new(2, "payload".to_string(), DataType::Blob(BlobType::new())),
         ];
-        let err = build_source_plan(
+        let plan = build_source_plan(
             &prepared_group,
             &file_infos,
             &read_type_with_blob,
             &HashSet::new(),
         )
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::DataInvalid { message, .. } if message.contains("logical row ranges"))
-        );
+        .unwrap();
+        assert_eq!(plan.column_plan, vec![Some((0, 0)), Some((1, 0))]);
+    }
+
+    #[test]
+    fn test_blob_anchor_bounds_allow_gaps_but_reject_shifted_ranges() {
+        for extension in ["blob", "video"] {
+            let mut bunch = BlobBunch::new(10, 10);
+            for (index, first) in [11, 16].into_iter().enumerate() {
+                bunch
+                    .add(data_file(
+                        &format!("gap-{index}.{extension}"),
+                        first,
+                        2,
+                        1,
+                        Some(vec!["payload"]),
+                    ))
+                    .unwrap();
+            }
+            bunch.finalize().unwrap();
+            bunch.validate_anchor_bounds().unwrap();
+            // Compaction of a physical range still requires complete coverage.
+            assert!(bunch.validate_logical_range().is_err());
+            for first in [9, 19] {
+                let files = vec![
+                    data_file("normal.parquet", 10, 10, 1, Some(vec!["id"])),
+                    data_file(
+                        &format!("outside.{extension}"),
+                        first,
+                        2,
+                        1,
+                        Some(vec!["payload"]),
+                    ),
+                ];
+                let group = PreparedMergeGroup::new(&files).unwrap();
+                let fields = vec![
+                    DataField::new(1, "id".into(), DataType::Int(IntType::new())),
+                    DataField::new(2, "payload".into(), DataType::Blob(BlobType::new())),
+                ];
+                let error = build_source_plan(
+                    &group,
+                    &[resolved_info(vec![1]), resolved_info(vec![2])],
+                    &fields,
+                    &HashSet::new(),
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("within normal file range"));
+            }
+        }
     }
 
     #[test]
@@ -4752,7 +4959,9 @@ mod tests {
                     ]
                 );
             }
-            FieldSource::DataFile { .. } | FieldSource::VectorBunch { .. } => {
+            FieldSource::VectorVersions { .. }
+            | FieldSource::DataFile { .. }
+            | FieldSource::VectorBunch { .. } => {
                 panic!("expected blob bunch source")
             }
         }
@@ -4767,7 +4976,9 @@ mod tests {
                     ]
                 );
             }
-            FieldSource::DataFile { .. } | FieldSource::VectorBunch { .. } => {
+            FieldSource::VectorVersions { .. }
+            | FieldSource::DataFile { .. }
+            | FieldSource::VectorBunch { .. } => {
                 panic!("expected blob bunch source")
             }
         }
@@ -5513,6 +5724,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_full_blob_and_video_reads_fill_nullable_anchor_gaps() {
+        use crate::arrow::format::create_format_writer;
+        use crate::spec::VideoFrameDescriptor;
+
+        for extension in ["blob", "video"] {
+            for nullable in [true, false] {
+                let directory = tempdir().unwrap();
+                let table_path = local_file_path(directory.path());
+                let bucket_dir = directory.path().join("bucket-0");
+                fs::create_dir_all(&bucket_dir).unwrap();
+                let parquet_path = bucket_dir.join("data.parquet");
+                write_int_parquet_file(&parquet_path, vec![("id", vec![0, 1, 2, 3, 4])], None);
+                let source_path = directory.path().join("source.mp4");
+                fs::write(&source_path, b"payload").unwrap();
+                let file_io = FileIOBuilder::new("file").build().unwrap();
+                let mut schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("payload", DataType::Blob(BlobType::with_nullable(nullable)))
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true");
+                if extension == "video" {
+                    schema = schema.option("video-frame-field", "payload");
+                }
+                let table = Table::new(
+                    file_io.clone(),
+                    Identifier::new("default", "gaps"),
+                    table_path,
+                    TableSchema::new(0, &schema.build().unwrap()),
+                    None,
+                );
+                let mut files = vec![data_file_meta_with_path(
+                    "data.parquet",
+                    100,
+                    5,
+                    1,
+                    parquet_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                )];
+                for (index, first) in [101, 103].into_iter().enumerate() {
+                    let name = format!("payload-{index}.{extension}");
+                    let output = file_io
+                        .new_output(&local_file_path(&bucket_dir.join(&name)))
+                        .unwrap();
+                    let value = if extension == "video" {
+                        VideoFrameDescriptor::new(local_file_path(&source_path), 0, 7, index as i64)
+                            .unwrap()
+                            .serialize()
+                    } else {
+                        b"payload".to_vec()
+                    };
+                    let batch = RecordBatch::try_from_iter([(
+                        "payload",
+                        Arc::new(LargeBinaryArray::from(vec![Some(value.as_slice())]))
+                            as arrow_array::ArrayRef,
+                    )])
+                    .unwrap();
+                    let mut writer = create_format_writer(
+                        &output,
+                        batch.schema(),
+                        "",
+                        0,
+                        Some(file_io.clone()),
+                        Some(&table.schema().fields()[1..]),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    writer.write(&batch).await.unwrap();
+                    let size = writer.close().await.unwrap().file_size;
+                    files.push(data_file_meta_with_path(
+                        &name,
+                        first,
+                        1,
+                        1,
+                        size as i64,
+                        Some(vec!["payload"]),
+                    ));
+                }
+                for selected in [false, true] {
+                    let mut builder = DataSplitBuilder::new()
+                        .with_snapshot(1)
+                        .with_partition(BinaryRow::new(0))
+                        .with_bucket(0)
+                        .with_bucket_path(local_file_path(&bucket_dir))
+                        .with_total_buckets(1)
+                        .with_data_files(files.clone());
+                    if selected {
+                        builder = builder.with_row_ranges(vec![
+                            RowRange::new(101, 101),
+                            RowRange::new(103, 103),
+                        ]);
+                    }
+                    let split = builder.build().unwrap();
+                    let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+                    let result = read
+                        .to_arrow(&[split])
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await;
+                    if !nullable && !selected {
+                        assert!(result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("non-nullable BLOB"));
+                        continue;
+                    }
+                    let batches = result.unwrap();
+                    assert_eq!(
+                        collect_int_values(&batches, "id"),
+                        if selected {
+                            vec![1, 3]
+                        } else {
+                            vec![0, 1, 2, 3, 4]
+                        }
+                    );
+                    let values = collect_binary_values(&batches, "payload");
+                    let present: Vec<_> = values
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, value)| value.as_ref().map(|_| index))
+                        .collect();
+                    assert_eq!(present, if selected { vec![0, 1] } else { vec![1, 3] });
+                    for (index, value) in values.into_iter().flatten().enumerate() {
+                        if extension == "video" {
+                            assert_eq!(
+                                VideoFrameDescriptor::deserialize(&value)
+                                    .unwrap()
+                                    .frame_index(),
+                                index as i64
+                            );
+                        } else {
+                            assert_eq!(value, b"payload");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_selected_blob_fallback_fills_uncovered_nullable_range() {
         use BlobFixtureValue::{Placeholder, Value};
 
@@ -5776,6 +6127,131 @@ mod tests {
             collect_binary_values(std::slice::from_ref(&first_batch), "payload"),
             vec![Some(b"first-0".to_vec()), Some(b"first-1".to_vec())]
         );
+    }
+
+    #[tokio::test]
+    async fn test_blob_filter_without_limit_reads_only_matching_latest_rows() {
+        for split_blob_files in [false, true] {
+            let tempdir = tempdir().unwrap();
+            let table_path = local_file_path(tempdir.path());
+            let bucket_dir = tempdir.path().join("bucket-0");
+            fs::create_dir_all(&bucket_dir).unwrap();
+            let mut files = Vec::new();
+            // The update changes which physical rows match. Filtering the old
+            // column would select the corrupt fourth payload and miss row one.
+            for (name, ids, sequence) in [
+                ("old.parquet", vec![1, 2, 3, 4], 1),
+                ("new.parquet", vec![4, 2, 3, 1], 2),
+            ] {
+                let path = bucket_dir.join(name);
+                write_int_parquet_file(&path, vec![("id", ids)], None);
+                files.push(data_file_meta_with_path(
+                    name,
+                    100,
+                    4,
+                    sequence,
+                    path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ));
+            }
+            let blob_groups: Vec<(i64, Vec<Option<&[u8]>>)> = if split_blob_files {
+                vec![
+                    (100, vec![Some(b"first"), Some(b"second")]),
+                    (102, vec![Some(b"third"), Some(b"fourth")]),
+                ]
+            } else {
+                vec![(
+                    100,
+                    vec![
+                        Some(b"first"),
+                        Some(b"second"),
+                        Some(b"third"),
+                        Some(b"fourth"),
+                    ],
+                )]
+            };
+            for (index, (first_row_id, values)) in blob_groups.into_iter().enumerate() {
+                let name = format!("payload-{index}.blob");
+                let path = bucket_dir.join(&name);
+                write_blob_file(&path, &values);
+                if values.iter().any(|value| *value == Some(&b"fourth"[..])) {
+                    // Leave the descriptor index readable, but invalidate the
+                    // excluded payload's entry header so decoding it fails.
+                    let mut bytes = fs::read(&path).unwrap();
+                    let offset = bytes
+                        .windows(b"fourth".len())
+                        .position(|window| window == b"fourth")
+                        .unwrap()
+                        - 4;
+                    bytes[offset] ^= 1;
+                    fs::write(&path, bytes).unwrap();
+                }
+                files.push(data_file_meta_with_path(
+                    &name,
+                    first_row_id,
+                    values.len() as i64,
+                    1,
+                    path.metadata().unwrap().len() as i64,
+                    Some(vec!["payload"]),
+                ));
+            }
+            let schema = TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("payload", DataType::Blob(BlobType::new()))
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true")
+                    .option("read.batch-size", "2")
+                    .build()
+                    .unwrap(),
+            );
+            let table = Table::new(
+                FileIOBuilder::new("file").build().unwrap(),
+                Identifier::new("default", "blob_filtered_latest_t"),
+                table_path,
+                schema,
+                None,
+            );
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(local_file_path(&bucket_dir))
+                .with_total_buckets(1)
+                .with_data_files(files)
+                .build()
+                .unwrap();
+            for threshold in [1, 4] {
+                let mut builder = table.new_read_builder();
+                builder.with_filter(
+                    PredicateBuilder::new(table.schema().fields())
+                        .greater_than("id", Datum::Int(threshold))
+                        .unwrap(),
+                );
+                let batches = builder
+                    .new_read()
+                    .unwrap()
+                    .to_arrow(std::slice::from_ref(&split))
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                if threshold == 1 {
+                    assert_eq!(collect_int_values(&batches, "id"), vec![4, 2, 3]);
+                    assert_eq!(
+                        collect_binary_values(&batches, "payload"),
+                        vec![
+                            Some(b"first".to_vec()),
+                            Some(b"second".to_vec()),
+                            Some(b"third".to_vec())
+                        ]
+                    );
+                } else {
+                    assert!(collect_int_values(&batches, "id").is_empty());
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -7721,82 +8197,138 @@ mod tests {
         assert_eq!(collect_binary_values(&batches, "payload"), vec![None]);
     }
 
-    /// (6) Row-range mismatch: normal file row_count=3 but `.vector.parquet` row_count=2
-    /// must surface as DataInvalid.
     #[tokio::test]
-    async fn test_read_vector_file_row_range_mismatch_errors() {
+    async fn test_read_missing_vector_rows_respects_nullability_and_selected_ranges() {
         let tempdir = tempdir().unwrap();
         let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
         fs::create_dir_all(&bucket_dir).unwrap();
 
         let normal_path = bucket_dir.join("data.parquet");
-        write_int_parquet_file(&normal_path, vec![("id", vec![1, 2, 3])], None);
-
-        let vector_path = bucket_dir.join("data.vector.parquet");
-        write_fixed_size_list_parquet(
-            &vector_path,
-            "embedding",
-            2,
-            &[Some(vec![1.0, 2.0]), Some(vec![3.0, 4.0])],
-        );
-
-        let file_io = FileIOBuilder::new("file").build().unwrap();
-        let table_schema = TableSchema::new(
+        write_int_parquet_file(&normal_path, vec![("id", (1..=7).collect())], None);
+        let mut files = vec![data_file_meta_with_path(
+            "data.parquet",
             0,
-            &Schema::builder()
-                .column("id", DataType::Int(IntType::new()))
-                .column("embedding", vector_float_type(2))
-                .option("data-evolution.enabled", "true")
-                .option("row-tracking.enabled", "true")
-                .build()
-                .unwrap(),
-        );
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "vec_mismatch_t"),
-            table_path,
-            table_schema,
-            None,
-        );
+            7,
+            1,
+            normal_path.metadata().unwrap().len() as i64,
+            Some(vec!["id"]),
+        )];
+        for first in [1, 4] {
+            let name = format!("{first}.vector.parquet");
+            let path = bucket_dir.join(&name);
+            write_fixed_size_list_parquet(
+                &path,
+                "embedding",
+                2,
+                &[Some(vec![1.0, 2.0]), Some(vec![3.0, 4.0])],
+            );
+            files.push(data_file_meta_with_path(
+                &name,
+                first,
+                2,
+                1,
+                path.metadata().unwrap().len() as i64,
+                Some(vec!["embedding"]),
+            ));
+        }
 
-        let split = DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path(local_file_path(&bucket_dir))
-            .with_total_buckets(1)
-            .with_data_files(vec![
-                data_file_meta_with_path(
-                    "data.parquet",
-                    0,
-                    3,
-                    1,
-                    normal_path.metadata().unwrap().len() as i64,
-                    Some(vec!["id"]),
+        for nullable in [false, true] {
+            let table_schema = TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column(
+                        "embedding",
+                        vector_float_type(2).copy_with_nullable(nullable).unwrap(),
+                    )
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true")
+                    .option("read.batch-size", "1")
+                    .build()
+                    .unwrap(),
+            );
+            let table = Table::new(
+                FileIOBuilder::new("file").build().unwrap(),
+                Identifier::new("default", "missing_vectors"),
+                table_path.clone(),
+                table_schema,
+                None,
+            );
+            for (ranges, expected_ids) in [
+                (None, vec![1, 2, 3, 4, 5, 6, 7]),
+                (
+                    Some(vec![RowRange::new(1, 2), RowRange::new(4, 5)]),
+                    vec![2, 3, 5, 6],
                 ),
-                data_file_meta_with_path(
-                    "data.vector.parquet",
-                    0,
-                    2, // row_count mismatch vs the normal file's 3
-                    1,
-                    vector_path.metadata().unwrap().len() as i64,
-                    Some(vec!["embedding"]),
+                (
+                    Some(vec![
+                        RowRange::new(0, 0),
+                        RowRange::new(3, 3),
+                        RowRange::new(6, 6),
+                    ]),
+                    vec![1, 4, 7],
                 ),
-            ])
-            .build()
-            .unwrap();
-
-        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
-        let result = read.to_arrow(&[split]);
-        let collected = match result {
-            Ok(stream) => stream.try_collect::<Vec<_>>().await,
-            Err(e) => Err(e),
-        };
-        assert!(
-            matches!(collected, Err(Error::DataInvalid { .. })),
-            "expected DataInvalid, got {collected:?}"
-        );
+                (Some(vec![RowRange::new(7, 8)]), vec![]),
+            ] {
+                let mut split = DataSplitBuilder::new()
+                    .with_snapshot(1)
+                    .with_partition(BinaryRow::new(0))
+                    .with_bucket(0)
+                    .with_bucket_path(local_file_path(&bucket_dir))
+                    .with_total_buckets(1)
+                    .with_data_files(files.clone());
+                if let Some(ranges) = ranges {
+                    split = split.with_row_ranges(ranges);
+                }
+                let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+                let collected = match read.to_arrow(&[split.build().unwrap()]) {
+                    Ok(stream) => stream.try_collect::<Vec<_>>().await,
+                    Err(error) => Err(error),
+                };
+                if !nullable && expected_ids.iter().any(|id| [1, 4, 7].contains(id)) {
+                    let error = collected.unwrap_err();
+                    assert!(matches!(error, Error::DataInvalid { .. }));
+                    assert!(error
+                        .to_string()
+                        .contains("do not cover the requested row-ID range"));
+                    continue;
+                }
+                let batches = collected.unwrap();
+                assert_eq!(collect_int_values(&batches, "id"), expected_ids);
+                for batch in batches {
+                    let ids = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    let vectors = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<FixedSizeListArray>()
+                        .unwrap();
+                    assert_eq!(vectors.value_length(), 2);
+                    for row in 0..batch.num_rows() {
+                        let id = ids.value(row);
+                        assert_eq!(vectors.is_null(row), [1, 4, 7].contains(&id));
+                        if !vectors.is_null(row) {
+                            let value = vectors.value(row);
+                            let value = value
+                                .as_any()
+                                .downcast_ref::<arrow_array::Float32Array>()
+                                .unwrap();
+                            let expected = if [2, 5].contains(&id) {
+                                [1.0, 2.0]
+                            } else {
+                                [3.0, 4.0]
+                            };
+                            assert_eq!(value.null_count(), 0);
+                            assert_eq!(value.values().as_ref(), expected);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn resolved_info(field_ids: Vec<i32>) -> ResolvedFileInfo {
@@ -7846,7 +8378,7 @@ mod tests {
         }
     }
 
-    fn data_file_meta_with_path(
+    pub(super) fn data_file_meta_with_path(
         file_name: &str,
         first_row_id: i64,
         row_count: i64,

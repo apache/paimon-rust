@@ -116,6 +116,7 @@ impl DataFileWriter {
         let row_sidecar_enabled = options.data_evolution_enabled()
             && options.data_evolution_row_sidecar_enabled()?
             && !file_format.eq_ignore_ascii_case("blob")
+            && !file_format.eq_ignore_ascii_case("video")
             && !file_format.starts_with("vector.");
         Ok(Self {
             row_sidecar_enabled,
@@ -169,6 +170,22 @@ impl DataFileWriter {
         uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
     ) -> Result<()> {
         debug_assert!(self.current_writer.is_none());
+        if self.file_format.eq_ignore_ascii_case("video") {
+            if consumer.is_some() {
+                return Err(crate::Error::Unsupported {
+                    message: "BlobConsumer is not supported for video frame fields".into(),
+                });
+            }
+            self.format_writer_factory = Some(Arc::new(
+                crate::arrow::format::video::VideoWriterFactory::new(
+                    Some(self.file_io.clone()),
+                    Some(&self.write_fields),
+                    Some(&self.format_options),
+                )?
+                .with_uri_reader_factory(uri_reader_factory),
+            ));
+            return Ok(());
+        }
         let mut factory = self.blob_writer_factory()?;
         // Java BlobFormatWriter relinquishes deletion rights whenever a
         // consumer can expose a descriptor, even if a later callback fails.
@@ -264,7 +281,11 @@ impl DataFileWriter {
         }
 
         if let Some(writer) = self.current_writer.as_mut() {
-            if writer.in_progress_size() as i64 >= self.write_buffer_size {
+            // Dictionary encoding may be much smaller than the retained input.
+            // Only this file's reservation belongs in its flush decision.
+            if writer.in_progress_size().max(writer.retained_input_size()) as i64
+                >= self.write_buffer_size
+            {
                 writer.flush().await?;
             }
         }
@@ -623,6 +644,125 @@ mod tests {
     use arrow_schema::{DataType as ArrowDataType, Field, Schema};
     use opendal::Operator;
     use std::sync::{Arc, Mutex};
+
+    fn dictionary_batch(rows: usize) -> RecordBatch {
+        let value = "x".repeat(4096);
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "id",
+                ArrowDataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(arrow_array::StringArray::from(vec![value; rows]))],
+        )
+        .unwrap()
+    }
+
+    fn dictionary_writer(io: FileIO, path: &str, buffer_size: i64) -> DataFileWriter {
+        DataFileWriter::new(
+            io,
+            path.into(),
+            String::new(),
+            0,
+            0,
+            i64::MAX,
+            "zstd".into(),
+            1,
+            buffer_size,
+            "parquet".into(),
+            vec![DataField::new(
+                0,
+                "id".into(),
+                DataType::VarChar(crate::spec::VarCharType::string_type()),
+            )],
+            HashMap::new(),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn retained_input_flushes_dictionary_batches_within_budget() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        // Without accounting, the same input keeps the original encoded-size
+        // policy. With accounting, each batch must be flushed before the next.
+        for account_input in [false, true] {
+            let io = FileIOBuilder::new("memory").build().unwrap();
+            let path = "memory:/dictionary-input";
+            let resources = ResourceContext::builder()
+                .memory_limit(6 * 1024 * 1024)
+                .build()
+                .unwrap();
+            let mut writer = dictionary_writer(io.clone(), path, 1024 * 1024)
+                .with_resources(account_input.then(|| resources.clone()));
+            for _ in 0..4 {
+                // Each write owns distinct Arrow buffers, despite identical values.
+                writer.write(&dictionary_batch(1024)).await.unwrap();
+                assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+            }
+            let files = writer.prepare_commit().await.unwrap();
+            assert_eq!(files.len(), 1);
+            let bytes = io
+                .new_input(&format!("{path}/bucket-0/{}", files[0].file_name))
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+            assert_eq!(
+                reader.metadata().num_row_groups(),
+                if account_input { 4 } else { 1 }
+            );
+            let mut rows = 0;
+            let expected_value = "x".repeat(4096);
+            for batch in reader.build().unwrap() {
+                let batch = batch.unwrap();
+                let values = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+                assert!(values
+                    .iter()
+                    .all(|value| value == Some(expected_value.as_str())));
+                rows += batch.num_rows();
+            }
+            assert_eq!(rows, 4096);
+            assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+            assert!(resources.metrics().peak_reserved_memory_bytes <= 6 * 1024 * 1024);
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_input_flush_ignores_other_files_in_shared_context() {
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let resources = ResourceContext::builder().build().unwrap();
+        let mut first = dictionary_writer(io.clone(), "memory:/first", i64::MAX)
+            .with_resources(Some(resources.clone()));
+        first.write(&dictionary_batch(512)).await.unwrap();
+        let first_bytes = resources.metrics().reserved_memory_bytes;
+        assert!(first_bytes > 1024 * 1024);
+
+        let mut second = dictionary_writer(io, "memory:/second", 1024 * 1024)
+            .with_resources(Some(resources.clone()));
+        second.write(&dictionary_batch(1)).await.unwrap();
+        assert!(
+            second
+                .current_writer
+                .as_ref()
+                .unwrap()
+                .retained_input_size()
+                > 0
+        );
+        assert!(resources.metrics().reserved_memory_bytes > first_bytes);
+        second.close_current_file().await.unwrap();
+        assert_eq!(resources.metrics().reserved_memory_bytes, first_bytes);
+        first.abort().await;
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+    }
 
     #[derive(Debug)]
     struct RecordingProvider {

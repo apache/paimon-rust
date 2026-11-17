@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch};
-use paimon::api::ConfigResponse;
+use paimon::api::{ConfigResponse, CreateTagRequest};
 use paimon::catalog::RESTCatalog;
 use paimon::spec::{DataType, IntType, Schema};
 use paimon::{CatalogOptions, Options};
@@ -37,20 +37,20 @@ const DATABASE: &str = "sales";
 const TABLE: &str = "orders";
 const WAREHOUSE: &str = "test_warehouse";
 
-async fn setup() -> (tempfile::TempDir, RESTServer, SQLContext) {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let server = start_mock_server(
+async fn start_server(warehouse: &Path) -> RESTServer {
+    start_mock_server(
         WAREHOUSE.to_string(),
-        temp_dir.path().to_string_lossy().into_owned(),
+        warehouse.to_string_lossy().into_owned(),
         ConfigResponse::new(HashMap::from([(
             CatalogOptions::PREFIX.to_string(),
             "mock-test".to_string(),
         )])),
         vec![DATABASE.to_string()],
     )
-    .await;
-    server.add_table(DATABASE, TABLE);
+    .await
+}
 
+async fn connect(server: &RESTServer) -> (Arc<RESTCatalog>, SQLContext) {
     let mut options = Options::new();
     options.set(CatalogOptions::URI, server.url().unwrap());
     options.set(CatalogOptions::WAREHOUSE, WAREHOUSE);
@@ -58,7 +58,18 @@ async fn setup() -> (tempfile::TempDir, RESTServer, SQLContext) {
     options.set(CatalogOptions::TOKEN, "test-token");
     let catalog = Arc::new(RESTCatalog::new(options, true).await.unwrap());
     let mut context = SQLContext::new();
-    context.register_catalog("paimon", catalog).await.unwrap();
+    context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+    (catalog, context)
+}
+
+async fn setup() -> (tempfile::TempDir, RESTServer, SQLContext) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let server = start_server(temp_dir.path()).await;
+    server.add_table(DATABASE, TABLE);
+    let (_, context) = connect(&server).await;
     (temp_dir, server, context)
 }
 
@@ -685,36 +696,6 @@ async fn test_consumer_procedures_rejected_on_rest_catalog_without_changing_prog
     assert_eq!(std::fs::read(&consumer_path).unwrap(), original);
 }
 
-#[tokio::test]
-async fn test_replace_tag_rejected_on_rest_catalog_without_changing_metadata() {
-    let (tmp, server, context) = setup().await;
-    let schema = Schema::builder()
-        .column("id", DataType::Int(IntType::new()))
-        .build()
-        .unwrap();
-    let path = format!("file://{}/{DATABASE}.db/{TABLE}", tmp.path().display());
-    server.add_table_with_schema(DATABASE, TABLE, schema, &path);
-    let tag_dir = tmp.path().join(format!("{DATABASE}.db/{TABLE}/tag"));
-    std::fs::create_dir_all(&tag_dir).unwrap();
-    let tag_path = tag_dir.join("tag-release");
-    // Invalid metadata must remain unread: REST rejection precedes storage access.
-    let original = b"{";
-    std::fs::write(&tag_path, original).unwrap();
-
-    for snapshot in ["", ", snapshot_id => 1"] {
-        common::assert_sql_error(
-            &context,
-            &format!(
-                "CALL sys.replace_tag(table => '{DATABASE}.{TABLE}', tag => 'release'{snapshot})"
-            ),
-            "replace_tag is not supported for tables managed by a REST catalog",
-        )
-        .await;
-        assert_eq!(std::fs::read(&tag_path).unwrap(), original);
-        assert_eq!(std::fs::read_dir(&tag_dir).unwrap().count(), 1);
-    }
-}
-
 fn register_rest_table(
     tmp: &tempfile::TempDir,
     server: &RESTServer,
@@ -1080,8 +1061,838 @@ async fn test_rename_branch_rejected_on_rest_catalog() {
     .await;
 }
 
+fn tag_names(server: &RESTServer) -> Vec<String> {
+    server
+        .tags(DATABASE, TABLE)
+        .into_iter()
+        .map(|tag| tag.tag_name)
+        .collect()
+}
+
+#[tokio::test]
+async fn test_create_tag_goes_through_rest_catalog() {
+    let (tmp, server, context) = setup().await;
+    let root = register_rest_table(&tmp, &server, &[]);
+    let storage_only = root.join("tag/tag-stale");
+    std::fs::create_dir_all(storage_only.parent().unwrap()).unwrap();
+    std::fs::write(&storage_only, b"{").unwrap();
+    let original_files = table_files(&root);
+    let create = |args: &str| format!("CALL sys.create_tag(table => '{DATABASE}.{TABLE}', {args})");
+
+    for args in [
+        "tag => 'latest'",
+        "tag => 'stale'",
+        "tag => 'retained', time_retained => ' 12 HOURS '",
+        "tag => ' keep +一', snapshot_id => 1, time_retained => '1d'",
+    ] {
+        let sql = create(args);
+        assert_ok_row(&context, &sql).await;
+        assert_eq!(table_files(&root), original_files, "{sql}");
+    }
+    let tags = server.tags(DATABASE, TABLE);
+    let summary: Vec<_> = tags
+        .iter()
+        .map(|tag| {
+            (
+                tag.tag_name.as_str(),
+                tag.snapshot.id(),
+                tag.tag_time_retained.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (" keep +一", 1, Some("1d")),
+            ("latest", 1, None),
+            ("retained", 1, Some(" 12 HOURS ")),
+            ("stale", 1, None),
+        ]
+    );
+
+    for (args, message) in [
+        (
+            "tag => 'retained', snapshot_id => 1, time_retained => '2d'",
+            "Tag 'retained' already exists",
+        ),
+        (
+            "tag => 'other', snapshot_id => 2",
+            "Snapshot 2 does not exist",
+        ),
+        ("tag => '.'", "tag name must not be a dot path segment"),
+        ("tag => '..'", "tag name must not be a dot path segment"),
+    ] {
+        let sql = create(args);
+        common::assert_sql_error(&context, &sql, message).await;
+        assert_eq!(server.tags(DATABASE, TABLE), tags, "{sql}");
+        assert_eq!(table_files(&root), original_files, "{sql}");
+    }
+
+    let request = |tag: &str, snapshot_id, retention: Option<&str>| {
+        (
+            DATABASE.to_string(),
+            TABLE.to_string(),
+            CreateTagRequest {
+                tag_name: tag.to_string(),
+                snapshot_id,
+                time_retained: retention.map(str::to_string),
+            },
+        )
+    };
+    assert_eq!(
+        server.create_tag_calls(),
+        [
+            request("latest", None, None),
+            request("stale", None, None),
+            request("retained", None, Some(" 12 HOURS ")),
+            request(" keep +一", Some(1), Some("1d")),
+            request("retained", Some(1), Some("2d")),
+            request("other", Some(2), None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_delete_tag_goes_through_rest_catalog() {
+    let (tmp, server, context) = setup().await;
+    let root = register_rest_table(&tmp, &server, &[]);
+    for tag in ["v1", "v2", "keep", "a+b c"] {
+        server.add_tag(DATABASE, TABLE, tag);
+    }
+    let tag_dir = root.join("tag");
+    std::fs::create_dir_all(&tag_dir).unwrap();
+    std::fs::write(tag_dir.join("tag-v1"), b"{").unwrap();
+    std::fs::write(tag_dir.join("tag-storage_only"), b"{").unwrap();
+    let original_files = table_files(&root);
+    let delete =
+        |tags: &str| format!("CALL sys.delete_tag(table => '{DATABASE}.{TABLE}', tag => '{tags}')");
+    let call = |tag: &str| (DATABASE.to_string(), TABLE.to_string(), tag.to_string());
+
+    assert_ok_row(&context, &delete("v1, missing,,a+b c ,v1")).await;
+    assert_eq!(tag_names(&server), ["keep", "v2"]);
+    let mut expected_calls: Vec<_> = ["v1", "missing", "a+b c", "v1"].map(call).to_vec();
+    assert_eq!(server.delete_tag_calls(), expected_calls);
+    assert_eq!(table_files(&root), original_files);
+
+    assert_ok_row(&context, &delete("storage_only")).await;
+    expected_calls.push(call("storage_only"));
+    assert_eq!(server.delete_tag_calls(), expected_calls);
+    assert_eq!(table_files(&root), original_files);
+
+    assert_ok_row(&context, &delete(" , ,")).await;
+    assert_eq!(server.delete_tag_calls(), expected_calls);
+    assert_eq!(tag_names(&server), ["keep", "v2"]);
+    assert_eq!(table_files(&root), original_files);
+
+    common::assert_sql_error(
+        &context,
+        &delete("keep,..,v2"),
+        "tag name must not be a dot path segment",
+    )
+    .await;
+    expected_calls.push(call("keep"));
+    assert_eq!(server.delete_tag_calls(), expected_calls);
+    assert_eq!(tag_names(&server), ["v2"]);
+    assert_eq!(table_files(&root), original_files);
+}
+
+async fn rest_table_with_two_snapshots() -> (
+    tempfile::TempDir,
+    RESTServer,
+    Arc<RESTCatalog>,
+    SQLContext,
+    PathBuf,
+) {
+    use paimon::catalog::Identifier;
+    use paimon::Catalog;
+
+    let (tmp, fs_catalog) = common::create_test_env();
+    let identifier = Identifier::new(DATABASE, TABLE);
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    fs_catalog
+        .create_database(DATABASE, false, HashMap::new())
+        .await
+        .unwrap();
+    fs_catalog
+        .create_table(&identifier, schema.clone(), false)
+        .await
+        .unwrap();
+    let writer = common::create_sql_context(fs_catalog.clone()).await;
+    for id in [1, 2] {
+        common::exec(
+            &writer,
+            &format!("INSERT INTO paimon.{DATABASE}.{TABLE} VALUES ({id})"),
+        )
+        .await;
+    }
+    let location = fs_catalog
+        .get_table(&identifier)
+        .await
+        .unwrap()
+        .location()
+        .to_string();
+    let root = tmp.path().join(format!("{DATABASE}.db/{TABLE}"));
+    let server = start_server(tmp.path()).await;
+    server.add_table_with_schema(DATABASE, TABLE, schema, &location);
+    let (catalog, context) = connect(&server).await;
+    (tmp, server, catalog, context, root)
+}
+
+fn write_storage_tag(root: &Path, tag: &str, snapshot_id: i64) {
+    let tag_dir = root.join("tag");
+    std::fs::create_dir_all(&tag_dir).unwrap();
+    std::fs::copy(
+        root.join(format!("snapshot/snapshot-{snapshot_id}")),
+        tag_dir.join(format!("tag-{tag}")),
+    )
+    .unwrap();
+}
+
+fn id_rows(ids: &[&str]) -> Vec<Vec<Option<String>>> {
+    ids.iter().map(|id| vec![Some(id.to_string())]).collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_create_tag_from_watermark_rejects_readable_rest_catalog_table() {
+async fn test_tag_reads_go_through_rest_catalog() {
+    use paimon::catalog::Identifier;
+    use paimon::Catalog;
+
+    let (_tmp, server, catalog, context, root) = rest_table_with_two_snapshots().await;
+    write_storage_tag(&root, "release", 2);
+    write_storage_tag(&root, "storage_only", 1);
+    let catalog_latest_path = root.join("snapshot/snapshot-2");
+    let catalog_latest: paimon::spec::Snapshot =
+        serde_json::from_slice(&std::fs::read(&catalog_latest_path).unwrap()).unwrap();
+    server.set_catalog_snapshot(DATABASE, TABLE, catalog_latest.clone());
+    std::fs::remove_file(catalog_latest_path).unwrap();
+
+    let original_files = table_files(&root);
+    for args in [
+        "tag => 'release', snapshot_id => 1",
+        "tag => 'catalog_only'",
+        "tag => 'retained', snapshot_id => 1, time_retained => '1d'",
+    ] {
+        assert_ok_row(
+            &context,
+            &format!("CALL sys.create_tag(table => '{DATABASE}.{TABLE}', {args})"),
+        )
+        .await;
+    }
+    assert_eq!(table_files(&root), original_files);
+    let catalog_only = server
+        .tags(DATABASE, TABLE)
+        .into_iter()
+        .find(|tag| tag.tag_name == "catalog_only")
+        .unwrap();
+    assert_eq!(catalog_only.snapshot, catalog_latest);
+
+    std::fs::remove_file(root.join("snapshot/snapshot-1")).unwrap();
+    let original_files = table_files(&root);
+
+    let tags_sql = format!(
+        "SELECT tag_name, CAST(snapshot_id AS VARCHAR) AS snapshot, time_retained \
+         FROM paimon.{DATABASE}.`{TABLE}$tags` ORDER BY tag_name"
+    );
+    let row = |tag: &str, snapshot: &str, retained: Option<&str>| {
+        vec![
+            Some(tag.to_string()),
+            Some(snapshot.to_string()),
+            retained.map(str::to_string),
+        ]
+    };
+    assert_eq!(
+        rows(&call(&context, &tags_sql).await),
+        [
+            row("catalog_only", "2", None),
+            row("release", "1", None),
+            row("retained", "1", Some("PT24H")),
+        ]
+    );
+
+    let select_ids = |clause: &str| {
+        format!(
+            "SELECT CAST(id AS VARCHAR) AS id_text FROM paimon.{DATABASE}.{TABLE} \
+             {clause} ORDER BY id_text"
+        )
+    };
+    let ids = |version: &str| select_ids(&format!("VERSION AS OF '{version}'"));
+    assert_eq!(
+        rows(&call(&context, &ids("release")).await),
+        id_rows(&["1"])
+    );
+    assert_eq!(
+        rows(&call(&context, &ids("catalog_only")).await),
+        id_rows(&["1", "2"])
+    );
+    common::assert_sql_error(&context, &ids("storage_only"), "storage_only").await;
+
+    call(&context, "SET 'paimon.scan.tag-name' = 'release'").await;
+    assert_eq!(
+        rows(&call(&context, &select_ids("")).await),
+        id_rows(&["1"])
+    );
+    call(&context, "RESET 'paimon.scan.tag-name'").await;
+
+    let tag_manager = catalog
+        .get_table(&Identifier::new(DATABASE, TABLE))
+        .await
+        .unwrap()
+        .tag_manager();
+    let snapshot = tag_manager.get("release").await.unwrap().unwrap();
+    assert_eq!(snapshot.id(), 1);
+    for result in [
+        tag_manager.create("blocked", &snapshot).await,
+        tag_manager.replace("release", &snapshot, None).await,
+        tag_manager.rename("release", "blocked").await,
+        tag_manager.delete("catalog_only").await,
+    ] {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, paimon::Error::Unsupported { .. }),
+            "{error}"
+        );
+    }
+    assert_eq!(tag_names(&server), ["catalog_only", "release", "retained"]);
+    assert_eq!(table_files(&root), original_files);
+
+    assert_ok_row(
+        &context,
+        &format!("CALL sys.delete_tag(table => '{DATABASE}.{TABLE}', tag => 'release')"),
+    )
+    .await;
+    assert_eq!(table_files(&root), original_files);
+    common::assert_sql_error(&context, &ids("release"), "release").await;
+    assert_eq!(
+        rows(&call(&context, &tags_sql).await),
+        [
+            row("catalog_only", "2", None),
+            row("retained", "1", Some("PT24H")),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_snapshot_versions_resolve_without_rest_tag_endpoint() {
+    use paimon::catalog::Identifier;
+    use paimon::Catalog;
+
+    let (_tmp, server, catalog, context, root) = rest_table_with_two_snapshots().await;
+    for id in [1, 2] {
+        let path = root.join(format!("snapshot/snapshot-{id}"));
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snapshot["watermark"] = serde_json::json!(id * 1000);
+        std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    }
+    for tag in ["2", "watermark-2000"] {
+        assert_ok_row(
+            &context,
+            &format!(
+                "CALL sys.create_tag(table => '{DATABASE}.{TABLE}', tag => '{tag}', snapshot_id => 1)"
+            ),
+        )
+        .await;
+    }
+    let original_files = table_files(&root);
+    let table = catalog
+        .get_table(&Identifier::new(DATABASE, TABLE))
+        .await
+        .unwrap();
+    for version in ["2", "watermark-2000"] {
+        let calls_before = server.get_tag_calls().len();
+        let view = table
+            .copy_with_time_travel_strict(HashMap::from([(
+                "scan.version".to_string(),
+                version.to_string(),
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(
+            view.travel_snapshot().map(|snapshot| snapshot.id()),
+            Some(1)
+        );
+        assert_eq!(
+            &server.get_tag_calls()[calls_before..],
+            &[(DATABASE.to_string(), TABLE.to_string(), version.to_string())]
+        );
+    }
+    let versions = ["2", "'watermark-2000'"].map(|version| {
+        format!(
+            "SELECT CAST(id AS VARCHAR) AS id_text FROM paimon.{DATABASE}.{TABLE} \
+             VERSION AS OF {version} ORDER BY id_text"
+        )
+    });
+
+    for sql in &versions {
+        assert_eq!(rows(&call(&context, sql).await), id_rows(&["1"]), "{sql}");
+    }
+    server.set_tag_read_error(Some(error_response(501, "tags unsupported")));
+    for sql in &versions {
+        assert_eq!(
+            rows(&call(&context, sql).await),
+            id_rows(&["1", "2"]),
+            "{sql}"
+        );
+    }
+    let error = table
+        .copy_with_time_travel_strict(HashMap::from([(
+            "scan.tag-name".to_string(),
+            "2".to_string(),
+        )]))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("tags unsupported"), "{error}");
+    server.set_tag_read_error(Some(error_response(403, "tag access denied")));
+    for sql in &versions {
+        common::assert_sql_error(&context, sql, "tag access denied").await;
+    }
+    assert_eq!(table_files(&root), original_files);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_referenced_files_size_counts_rest_catalog_tags() {
+    let (_tmp, server, _catalog, context, root) = rest_table_with_two_snapshots().await;
+    let sql = format!(
+        "SELECT CAST(manifest_file_count AS VARCHAR), CAST(manifest_file_size AS VARCHAR), \
+         CAST(data_file_count AS VARCHAR), CAST(data_file_size AS VARCHAR), \
+         CAST(index_file_count AS VARCHAR), CAST(index_file_size AS VARCHAR) \
+         FROM paimon.{DATABASE}.`{TABLE}$referenced_files_size` WHERE source = 'total'"
+    );
+    let files = table_files(&root);
+    let count_and_size = |dir: &str| {
+        let sizes: Vec<_> = files
+            .iter()
+            .filter(|(path, _)| path.starts_with(root.join(dir)))
+            .map(|(_, content)| content.len())
+            .collect();
+        (sizes.len(), sizes.iter().sum::<usize>())
+    };
+    let (manifest_count, manifest_size) = count_and_size("manifest");
+    let (data_count, data_size) = count_and_size("bucket-0");
+    assert_eq!((manifest_count, data_count), (6, 2));
+    let expected = vec![[manifest_count, manifest_size, data_count, data_size, 0, 0]
+        .map(|value| Some(value.to_string()))
+        .to_vec()];
+    assert_eq!(rows(&call(&context, &sql).await), expected);
+
+    assert_ok_row(
+        &context,
+        &format!(
+            "CALL sys.create_tag(table => '{DATABASE}.{TABLE}', tag => 'keep', snapshot_id => 1)"
+        ),
+    )
+    .await;
+    assert!(!root.join("tag/tag-keep").exists());
+    std::fs::remove_file(root.join("snapshot/snapshot-1")).unwrap();
+    let original_files = table_files(&root);
+    assert_eq!(rows(&call(&context, &sql).await), expected);
+
+    for (code, message) in [(403, "tag access denied"), (501, "tags unsupported")] {
+        server.set_tag_read_error(Some(error_response(code, message)));
+        common::assert_sql_error(&context, &sql, message).await;
+        assert_eq!(tag_names(&server), ["keep"]);
+        assert_eq!(table_files(&root), original_files);
+    }
+    server.set_tag_read_error(None);
+    assert_eq!(rows(&call(&context, &sql).await), expected);
+    assert_eq!(table_files(&root), original_files);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_referenced_files_size_counts_catalog_only_branch_tags() {
+    use paimon::catalog::Identifier;
+    use paimon::Catalog;
+
+    let (_tmp, server, catalog, context, root) = rest_table_with_two_snapshots().await;
+    let summary = |table: &str, columns: &str, filter: &str| {
+        format!("SELECT {columns} FROM paimon.{DATABASE}.`{table}$referenced_files_size` {filter}")
+    };
+    let counts = "CAST(manifest_file_count AS VARCHAR), CAST(data_file_count AS VARCHAR)";
+    let sql = summary(TABLE, counts, "WHERE source = 'total'");
+    let before = rows(&call(&context, &sql).await);
+
+    let branch_table = format!("{TABLE}$branch_dev");
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    server.add_table_with_schema(
+        DATABASE,
+        &branch_table,
+        schema,
+        &format!("file://{}", root.display()),
+    );
+    for name in ["dev", "main", "dev"] {
+        server.add_branch(DATABASE, TABLE, name);
+    }
+    let identifier = Identifier::new(DATABASE, &branch_table);
+    catalog
+        .create_tag(&identifier, "keep", Some(1), false)
+        .await
+        .unwrap();
+    let branch = catalog.get_table(&identifier).await.unwrap();
+    assert_eq!(
+        branch
+            .tag_manager()
+            .get("keep")
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        1
+    );
+    assert!(!root.join("branch/branch-dev").exists());
+    std::fs::remove_file(root.join("snapshot/snapshot-1")).unwrap();
+
+    let stale_branch = root.join("branch/branch-stale/snapshot");
+    std::fs::create_dir_all(&stale_branch).unwrap();
+    std::fs::write(stale_branch.join("snapshot-1"), b"{").unwrap();
+    let original_files = table_files(&root);
+    let expected_scopes =
+        ["branch:dev", "branch:main", "total"].map(|source| vec![Some(source.to_string())]);
+    for table in [TABLE, branch_table.as_str()] {
+        assert_eq!(
+            rows(&call(&context, &summary(table, counts, "WHERE source = 'total'")).await),
+            before
+        );
+        assert_eq!(
+            rows(&call(&context, &summary(table, "source", "ORDER BY source")).await),
+            expected_scopes
+        );
+    }
+    for (code, message) in [(403, "branch access denied"), (501, "branches unsupported")] {
+        server.set_list_branches_error(Some(error_response(code, message)));
+        common::assert_sql_error(&context, &sql, message).await;
+    }
+    assert_eq!(table_files(&root), original_files);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_referenced_files_size_counts_catalog_only_current_snapshots() {
+    let (_tmp, server, _catalog, context, root) = rest_table_with_two_snapshots().await;
+    let sql = format!(
+        "SELECT CAST(manifest_file_count AS VARCHAR), CAST(data_file_count AS VARCHAR) \
+         FROM paimon.{DATABASE}.`{TABLE}$referenced_files_size` WHERE source = 'total'"
+    );
+    let before = rows(&call(&context, &sql).await);
+    let snapshot = |id| -> paimon::spec::Snapshot {
+        serde_json::from_slice(
+            &std::fs::read(root.join(format!("snapshot/snapshot-{id}"))).unwrap(),
+        )
+        .unwrap()
+    };
+    let first = snapshot(1);
+    let second = snapshot(2);
+    server.set_catalog_snapshot(DATABASE, TABLE, second.clone());
+    std::fs::remove_file(root.join("snapshot/snapshot-2")).unwrap();
+    let original_files = table_files(&root);
+    assert_eq!(rows(&call(&context, &sql).await), before);
+
+    let branch_table = format!("{TABLE}$branch_dev");
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    server.add_table_with_schema(
+        DATABASE,
+        &branch_table,
+        schema,
+        &format!("file://{}", root.display()),
+    );
+    server.add_branch(DATABASE, TABLE, "dev");
+    server.set_catalog_snapshot(DATABASE, TABLE, first);
+    server.set_catalog_snapshot(DATABASE, &branch_table, second);
+    assert!(!root.join("branch/branch-dev").exists());
+    assert_eq!(rows(&call(&context, &sql).await), before);
+    assert_eq!(table_files(&root), original_files);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_referenced_files_size_rejects_unaddressable_catalog_branches() {
+    for (name, message) in [
+        ("..", "branch name cannot be '.' or '..'"),
+        ("../escape", "branch name cannot contain path separators"),
+        ("dev$tags", "unaddressable branch name"),
+    ] {
+        let (tmp, server, context) = setup().await;
+        let root = register_rest_table(&tmp, &server, &[]);
+        server.add_branch(DATABASE, TABLE, name);
+        let original_files = table_files(&root);
+        let sql = format!("SELECT * FROM paimon.{DATABASE}.`{TABLE}$referenced_files_size`");
+        common::assert_sql_error(&context, &sql, message).await;
+        assert_eq!(table_files(&root), original_files);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_legacy_dot_segment_tags_on_rest_tables() {
+    use paimon::catalog::Identifier;
+    use paimon::Catalog;
+
+    const DOT_SEGMENT: &str = "tag name must not be a dot path segment";
+    let (_tmp, server, catalog, context, root) = rest_table_with_two_snapshots().await;
+    write_storage_tag(&root, "..", 2);
+    std::fs::write(root.join("tag/tag-."), b"{").unwrap();
+    let original_files = table_files(&root);
+    let tag_manager = catalog
+        .get_table(&Identifier::new(DATABASE, TABLE))
+        .await
+        .unwrap()
+        .tag_manager();
+    let tags = |filter: &str| {
+        format!(
+            "SELECT tag_name, CAST(snapshot_id AS VARCHAR) AS snapshot \
+             FROM paimon.{DATABASE}.`{TABLE}$tags` {filter} ORDER BY tag_name"
+        )
+    };
+    let release = vec![Some("release".to_string()), Some("1".to_string())];
+
+    for (catalog_tags, readable) in [
+        (vec![], vec![]),
+        (vec![".", "..", "release"], vec![release]),
+    ] {
+        for tag in &catalog_tags {
+            server.add_tag(DATABASE, TABLE, tag);
+        }
+        assert_eq!(tag_manager.list_all_names().await.unwrap(), catalog_tags);
+        let listed: Vec<_> = tag_manager
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(name, snapshot)| vec![Some(name), Some(snapshot.id().to_string())])
+            .collect();
+        assert_eq!(listed, readable);
+        assert_eq!(rows(&call(&context, &tags("")).await), readable);
+        assert_eq!(
+            rows(&call(&context, &tags("WHERE tag_name = 'release'")).await),
+            readable
+        );
+
+        for name in [".", ".."] {
+            for error in [
+                tag_manager.tag_exists(name).await.unwrap_err(),
+                tag_manager.get(name).await.unwrap_err(),
+                tag_manager.get_with_metadata(name).await.unwrap_err(),
+            ] {
+                assert!(error.to_string().contains(DOT_SEGMENT), "{error}");
+            }
+            let sql = format!("SELECT * FROM paimon.{DATABASE}.{TABLE} VERSION AS OF '{name}'");
+            common::assert_sql_error(&context, &sql, DOT_SEGMENT).await;
+            call(&context, &format!("SET 'paimon.scan.tag-name' = '{name}'")).await;
+            common::assert_sql_error(
+                &context,
+                &format!("SELECT * FROM paimon.{DATABASE}.{TABLE}"),
+                DOT_SEGMENT,
+            )
+            .await;
+            call(&context, "RESET 'paimon.scan.tag-name'").await;
+        }
+    }
+    common::assert_sql_error(
+        &context,
+        &format!("SELECT * FROM paimon.{DATABASE}.`{TABLE}$referenced_files_size`"),
+        DOT_SEGMENT,
+    )
+    .await;
+    assert_eq!(table_files(&root), original_files);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rest_tag_metadata_uses_local_timestamp_and_branch() {
+    use arrow_array::{StringArray, TimestampMillisecondArray};
+    use chrono::TimeZone;
+    use paimon::catalog::Identifier;
+    use paimon::Catalog;
+
+    let (tmp, server, _) = setup().await;
+    let root = register_rest_table(&tmp, &server, &[]);
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    let branch_table = format!("{TABLE}$branch_dev");
+    server.add_table_with_schema(
+        DATABASE,
+        &branch_table,
+        schema,
+        &format!("file://{}", root.display()),
+    );
+    let (catalog, context) = connect(&server).await;
+    for (table_name, only_tag, epoch_millis, retention, seconds) in [
+        (TABLE, "main_only", 1_704_067_200_000, "PT24H", 86_400.0),
+        (
+            branch_table.as_str(),
+            "branch_only",
+            1_704_153_600_000,
+            "PT2H",
+            7_200.0,
+        ),
+    ] {
+        server.add_tag(DATABASE, table_name, "release");
+        server.add_tag(DATABASE, table_name, only_tag);
+        server.set_tag_metadata(
+            DATABASE,
+            table_name,
+            "release",
+            Some(epoch_millis),
+            Some(retention),
+        );
+        let table = catalog
+            .get_table(&Identifier::new(DATABASE, table_name))
+            .await
+            .unwrap();
+        let tag_manager = table.tag_manager();
+        assert_eq!(
+            tag_manager.list_all_names().await.unwrap(),
+            [only_tag, "release"]
+        );
+        let offset = chrono::Local
+            .timestamp_millis_opt(epoch_millis)
+            .single()
+            .unwrap()
+            .offset()
+            .local_minus_utc();
+        let expected_time = epoch_millis + i64::from(offset) * 1_000;
+        let (_, created, retained) = tag_manager
+            .get_with_metadata("release")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(created, Some(expected_time));
+        assert_eq!(retained, Some(seconds));
+        assert_eq!(
+            server
+                .tags(DATABASE, table_name)
+                .iter()
+                .find(|tag| tag.tag_name == "release")
+                .unwrap()
+                .tag_create_time,
+            Some(epoch_millis)
+        );
+
+        let batches = call(
+            &context,
+            &format!(
+                "SELECT tag_name, create_time, time_retained FROM paimon.{DATABASE}.`{table_name}$tags` ORDER BY tag_name"
+            ),
+        ).await;
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), only_tag);
+        assert_eq!(names.value(1), "release");
+        let times = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert!(times.is_null(0));
+        assert_eq!(times.value(1), expected_time);
+        let retentions = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(retentions.is_null(0));
+        assert_eq!(retentions.value(1), retention);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tag_catalog_errors_do_not_fall_back_to_storage() {
+    let (tmp, server, context) = setup().await;
+    let root = register_rest_table(&tmp, &server, &[]);
+    server.add_tag(DATABASE, TABLE, "release");
+    let tag_path = root.join("tag/tag-release");
+    std::fs::create_dir_all(tag_path.parent().unwrap()).unwrap();
+    std::fs::write(tag_path, b"{").unwrap();
+    let original_files = table_files(&root);
+    let reads = [
+        format!("SELECT * FROM paimon.{DATABASE}.`{TABLE}$tags`"),
+        format!("SELECT * FROM paimon.{DATABASE}.{TABLE} VERSION AS OF 'release'"),
+    ];
+    let snapshot_read = format!("SELECT * FROM paimon.{DATABASE}.{TABLE} VERSION AS OF 1");
+    let mutations = [
+        format!("CALL sys.create_tag(table => '{DATABASE}.{TABLE}', tag => 'new')"),
+        format!("CALL sys.delete_tag(table => '{DATABASE}.{TABLE}', tag => 'release')"),
+    ];
+
+    for (code, message) in [
+        (400, "invalid request"),
+        (403, "denied"),
+        (404, "Table sales.orders does not exist"),
+        (501, "remote operation unsupported"),
+    ] {
+        let error = Some(error_response(code, message));
+        server.set_tag_read_error(error.clone());
+        for sql in &reads {
+            common::assert_sql_error(&context, sql, message).await;
+        }
+        if code != 501 {
+            common::assert_sql_error(&context, &snapshot_read, message).await;
+        }
+        server.set_tag_read_error(None);
+        server.set_tag_mutation_error(error);
+        for sql in &mutations {
+            common::assert_sql_error(&context, sql, message).await;
+        }
+        server.set_tag_mutation_error(None);
+        assert_eq!(tag_names(&server), ["release"]);
+        assert_eq!(table_files(&root), original_files);
+    }
+    assert_eq!(server.create_tag_calls().len(), 4);
+    assert_eq!(server.delete_tag_calls().len(), 4);
+}
+
+#[tokio::test]
+async fn test_unsupported_tag_procedures_rejected_on_rest_catalog() {
+    let (tmp, server, context) = setup().await;
+    let root = register_rest_table(&tmp, &server, &[]);
+    server.add_tag(DATABASE, TABLE, "v1");
+    for file in ["tag/tag-v1", "snapshot/snapshot-1", "snapshot/LATEST"] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"{").unwrap();
+    }
+    let original_files = table_files(&root);
+    let table = format!("{DATABASE}.{TABLE}");
+
+    for (procedure, args) in [
+        ("replace_tag", "tag => 'v1'"),
+        ("replace_tag", "tag => 'v1', snapshot_id => 1"),
+        ("rename_tag", "tag => 'v1', target_tag => 'v2'"),
+        ("create_tag_from_timestamp", "tag => 'v2', timestamp => 0"),
+        ("rollback_to_timestamp", "timestamp => 0"),
+    ] {
+        let sql = format!("CALL sys.{procedure}(table => '{table}', {args})");
+        let error = context.sql(&sql).await.unwrap_err();
+        assert!(
+            matches!(error, datafusion::error::DataFusionError::NotImplemented(_)),
+            "{sql}: {error}"
+        );
+        assert!(
+            error.to_string().contains(&format!(
+                "{procedure} is not supported for tables managed by a REST catalog"
+            )),
+            "{sql}: {error}"
+        );
+        assert_eq!(tag_names(&server), ["v1"], "{sql}");
+        assert_eq!(table_files(&root), original_files, "{sql}");
+    }
+    assert!(server.create_tag_calls().is_empty());
+    assert!(server.delete_tag_calls().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_snapshot_selection_procedures_reject_readable_rest_catalog_table() {
     use arrow_array::Int32Array;
     use axum::http::{Method, StatusCode, Uri};
     use axum::{Json, Router};
@@ -1111,8 +1922,6 @@ async fn test_create_tag_from_watermark_rejects_readable_rest_catalog_table() {
         "CALL sys.create_tag(table => 'test_db.t1', tag => 'keep', snapshot_id => 1, time_retained => '1d')",
     )
     .await;
-    let tag_path = table_dir.join("tag/tag-keep");
-    let original_tag = std::fs::read(&tag_path).unwrap();
     let table = catalog
         .get_table(&Identifier::new("test_db", "t1"))
         .await
@@ -1200,23 +2009,40 @@ async fn test_create_tag_from_watermark_rejects_readable_rest_catalog_table() {
         .any(|(_, path)| path.ends_with("/snapshot")));
     requests.lock().unwrap().clear();
 
-    for (watermark, tag) in [(2000, "checkpoint"), (1000, "older"), (1000, "keep")] {
-        let error = context.sql(&format!(
-            "CALL sys.create_tag_from_watermark(table => 'test_db.t1', tag => '{tag}', watermark => {watermark})"
-        )).await.unwrap_err();
+    let original_files = table_files(&table_dir);
+    for (procedure, args) in [
+        (
+            "create_tag_from_watermark",
+            "tag => 'checkpoint', watermark => 2000",
+        ),
+        (
+            "create_tag_from_watermark",
+            "tag => 'older', watermark => 1000",
+        ),
+        (
+            "create_tag_from_watermark",
+            "tag => 'keep', watermark => 1000",
+        ),
+        (
+            "create_tag_from_timestamp",
+            "tag => 'checkpoint', timestamp => 0",
+        ),
+        ("rollback_to_timestamp", "timestamp => 9223372036854775807"),
+    ] {
+        let sql = format!("CALL sys.{procedure}(table => 'test_db.t1', {args})");
+        let error = context.sql(&sql).await.unwrap_err();
         assert!(
             matches!(error, datafusion::error::DataFusionError::NotImplemented(_)),
-            "{error}"
+            "{sql}: {error}"
         );
         assert!(
-            error.to_string().contains(
-                "create_tag_from_watermark is not supported for tables managed by a REST catalog"
-            ),
-            "{error}"
+            error.to_string().contains(&format!(
+                "{procedure} is not supported for tables managed by a REST catalog"
+            )),
+            "{sql}: {error}"
         );
+        assert_eq!(table_files(&table_dir), original_files, "{sql}");
     }
-    assert_eq!(std::fs::read(tag_path).unwrap(), original_tag);
-    assert_eq!(std::fs::read_dir(table_dir.join("tag")).unwrap().count(), 1);
     let requests = requests.lock().unwrap();
     assert!(!requests.is_empty());
     assert!(requests

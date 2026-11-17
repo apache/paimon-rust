@@ -88,10 +88,14 @@ records by comparing the before and after images. If table option
 `Diff` currently:
 
 - requires a primary-key table with `merge-engine=deduplicate`;
-- does not support deletion vectors or bucket rescaling between the two
-  snapshots;
-- supports `BOOLEAN`, integer, floating-point, character, string, and `DATE`
-  columns;
+- reads each endpoint snapshot's deletion-vector state when deletion vectors
+  are enabled (merge-on-read or materialized); it does not support bucket
+  rescaling between the two snapshots;
+- supports these scalar types for primary-key columns and nested value columns:
+  `BOOLEAN`, integers, floating-point, character/string, `DATE`, `BINARY` /
+  `VARBINARY`, `DECIMAL`, `TIME`, `TIMESTAMP`, and `LocalZonedTimestamp`.
+  Non-key values may also be nested `ROW`, `ARRAY`, `MAP`, `MULTISET`, or
+  `VECTOR` of those scalars;
 - uses table option `diff.parallelism` to control concurrent
   partition-and-bucket comparisons (default: `4`, minimum: `1`).
 

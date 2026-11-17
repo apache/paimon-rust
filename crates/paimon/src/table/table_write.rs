@@ -67,12 +67,14 @@ enum AppendPrepareIdentifier {
 }
 
 /// Java's append writer captures its factory settings per partition/bucket.
-/// Keep only these settings across prepares, not completed file resources.
+/// Keep these settings and its sequence counter across prepares, not completed
+/// file resources.
 #[derive(Clone)]
 struct AppendWriteConfig {
     blob_consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
     blob_uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
     last_modified_prepare: Option<AppendPrepareIdentifier>,
+    next_sequence: i64,
 }
 
 /// Enum to hold either an append-only writer, a key-value writer, or a postpone writer.
@@ -297,11 +299,6 @@ impl TableWrite {
         let write_schema = build_target_arrow_schema(schema.fields())?;
         let core_options = CoreOptions::new(schema.options());
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
-        if !core_options.video_frame_fields().is_empty() {
-            return Err(crate::Error::Unsupported {
-                message: "Writing packed video files is not supported yet".into(),
-            });
-        }
         let blob_view_fields = core_options.blob_view_fields();
         let blob_inline_fields = core_options.blob_inline_fields();
 
@@ -766,6 +763,15 @@ impl TableWrite {
         if self.format_writer.is_some() {
             return Err(crate::Error::Unsupported {
                 message: "with_blob_consumer requires a Paimon table".into(),
+            });
+        }
+        if consumer.is_some()
+            && !CoreOptions::new(self.table.schema().options())
+                .video_frame_fields()
+                .is_empty()
+        {
+            return Err(crate::Error::Unsupported {
+                message: "BlobConsumer is not supported for video frame fields".into(),
             });
         }
         self.blob_consumer = consumer;
@@ -1483,8 +1489,8 @@ impl TableWrite {
     }
 
     /// Flush all writers and collect CommitMessages for use with TableCommit.
-    /// Append writers are closed; primary-key writers retain their sequence
-    /// counters after handing off the prepared files, as Java does.
+    /// Append writers are closed; their configuration retains the sequence
+    /// counter. Primary-key writers retain their own counters, as Java does.
     /// Captured append settings survive active prepares. Empty prepares retire
     /// idle bucket-unaware writers. This generic operation has no checkpoint
     /// identifier, so it conservatively retains fixed-bucket settings because
@@ -1562,7 +1568,20 @@ impl TableWrite {
                     .insert((partition_bytes.clone(), bucket), writer);
             }
             match result {
-                Ok(files) if !files.data_files.is_empty() || !files.changelog_files.is_empty() => {
+                Ok(mut files)
+                    if !files.data_files.is_empty() || !files.changelog_files.is_empty() =>
+                {
+                    if fixed_bucket && self.primary_key_indices.is_empty() {
+                        let config = self
+                            .append_write_configs
+                            .get_mut(&(partition_bytes.clone(), bucket))
+                            .expect("append writer has captured configuration");
+                        for file in &mut files.data_files {
+                            file.min_sequence_number = config.next_sequence;
+                            config.next_sequence += file.row_count;
+                            file.max_sequence_number = config.next_sequence - 1;
+                        }
+                    }
                     let mut message = CommitMessage::new(partition_bytes, bucket, files.data_files);
                     message.new_changelog_files = files.changelog_files;
                     messages.push(message);
@@ -1698,6 +1717,11 @@ impl TableWrite {
 
         let writer = if self.primary_key_indices.is_empty() {
             let key = (partition_bytes.clone(), bucket);
+            let next_sequence = if bucket >= 0 && !self.append_write_configs.contains_key(&key) {
+                self.next_bucket_sequence(&partition_bytes, bucket).await?
+            } else {
+                0
+            };
             let config = self
                 .append_write_configs
                 .get(&key)
@@ -1706,6 +1730,7 @@ impl TableWrite {
                     blob_consumer: self.blob_consumer.clone(),
                     blob_uri_reader_factory: self.blob_uri_reader_factory.clone(),
                     last_modified_prepare: None,
+                    next_sequence,
                 });
             let writer = self.create_append_writer(partition_path, bucket, &config)?;
             self.append_write_configs.insert(key, config);
@@ -1850,13 +1875,8 @@ impl TableWrite {
         ))
     }
 
-    /// Create a key-value writer for PK tables with normal buckets.
-    async fn create_kv_writer(
-        &mut self,
-        partition_path: String,
-        bucket: i32,
-        partition_bytes: &[u8],
-    ) -> Result<FileWriter> {
+    /// Restore the per-bucket counter shared by fixed append and PK writers.
+    async fn next_bucket_sequence(&mut self, partition_bytes: &[u8], bucket: i32) -> Result<i64> {
         if !self.is_overwrite && self.sequence_snapshot.is_none() {
             if let Some(id) = self.restore_snapshot_id {
                 self.sequence_snapshot = Some(if id == 0 {
@@ -1877,12 +1897,22 @@ impl TableWrite {
             self.partition_seq_cache
                 .insert(partition_bytes.to_vec(), bucket_seq);
         }
-        let next_seq = self
+        Ok(self
             .partition_seq_cache
             .get(partition_bytes)
             .and_then(|m| m.get(&bucket))
             .copied()
-            .unwrap_or(0);
+            .unwrap_or(0))
+    }
+
+    /// Create a key-value writer for PK tables with normal buckets.
+    async fn create_kv_writer(
+        &mut self,
+        partition_path: String,
+        bucket: i32,
+        partition_bytes: &[u8],
+    ) -> Result<FileWriter> {
+        let next_seq = self.next_bucket_sequence(partition_bytes, bucket).await?;
 
         Ok(FileWriter::KeyValue(
             KeyValueFileWriter::new(
@@ -4168,6 +4198,72 @@ pub(in crate::table) mod tests {
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
+    }
+
+    #[tokio::test]
+    async fn fixed_bucket_append_sequence_bounds_survive_roll_prepare_and_restore() {
+        let file_io = test_file_io();
+        let path = "memory:/append_sequence_bounds";
+        setup_dirs(&file_io, path).await;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("bucket", "1")
+            .option("bucket-key", "id")
+            .option("target-file-row-num", "2")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "append_sequences"),
+            path.into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut writer = TableWrite::new(&table, "writer".into()).unwrap();
+        let mut messages = Vec::new();
+        for (count, expected) in [(5, vec![(0, 1), (2, 3), (4, 4)]), (3, vec![(5, 6), (7, 7)])] {
+            for start in (0..count).step_by(2) {
+                let rows = (count - start).min(2);
+                writer
+                    .write_arrow_batch(&make_batch(vec![1; rows], vec![2; rows]))
+                    .await
+                    .unwrap();
+            }
+            let prepared = writer.prepare_commit().await.unwrap();
+            let bounds = prepared
+                .iter()
+                .flat_map(|message| &message.new_files)
+                .map(|file| (file.min_sequence_number, file.max_sequence_number))
+                .collect::<Vec<_>>();
+            assert_eq!(bounds, expected);
+            messages.extend(prepared);
+        }
+        TableCommit::new(table.clone(), "writer".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        let mut restored = TableWrite::new(&table, "restored".into()).unwrap();
+        restored
+            .write_arrow_batch(&make_batch(vec![1, 1], vec![3, 4]))
+            .await
+            .unwrap();
+        let restored_files = restored.prepare_commit().await.unwrap();
+        assert_eq!(restored_files[0].new_files[0].min_sequence_number, 8);
+        assert_eq!(restored_files[0].new_files[0].max_sequence_number, 9);
+
+        let mut overwrite = table
+            .new_write_builder()
+            .with_overwrite()
+            .new_write()
+            .unwrap();
+        overwrite
+            .write_arrow_batch(&make_batch(vec![1, 1], vec![5, 6]))
+            .await
+            .unwrap();
+        let overwrite_files = overwrite.prepare_commit().await.unwrap();
+        assert_eq!(overwrite_files[0].new_files[0].min_sequence_number, 0);
+        assert_eq!(overwrite_files[0].new_files[0].max_sequence_number, 1);
     }
 
     fn test_bucketed_table(file_io: &FileIO, table_path: &str) -> Table {

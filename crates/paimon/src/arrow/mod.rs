@@ -46,7 +46,7 @@ mod variant;
 
 pub use read_budget::ReadBudget;
 pub use row_filter::{RowFilter, RowFilterContext, RowFilterFactory};
-pub use variant::variant_get_numeric_fields;
+pub use variant::{variant_get, variant_get_numeric_fields};
 
 use crate::spec::{
     ArrayType, BigIntType, BinaryType, BooleanType, DataField, DataType as PaimonDataType,
@@ -353,14 +353,19 @@ fn arrow_field_with_paimon_id(
     ArrowField::new(name, data_type, nullable).with_metadata(metadata)
 }
 
-/// Convert Arrow fields to Paimon [`DataField`]s with auto-assigned IDs starting from 0.
+/// Convert Arrow fields to Paimon [`DataField`]s, preserving explicit field IDs.
+/// Fields without IDs receive positional IDs starting from 0.
 pub fn arrow_fields_to_paimon(fields: &[ArrowField]) -> crate::Result<Vec<DataField>> {
     fields
         .iter()
         .enumerate()
         .map(|(i, f)| {
             let paimon_type = arrow_to_paimon_type(f.data_type(), f.is_nullable())?;
-            Ok(DataField::new(i as i32, f.name().clone(), paimon_type))
+            Ok(DataField::new(
+                arrow_field_id(f).unwrap_or(i as i32),
+                f.name().clone(),
+                paimon_type,
+            ))
         })
         .collect()
 }

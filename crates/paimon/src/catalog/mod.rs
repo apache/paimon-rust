@@ -557,8 +557,9 @@ pub trait Catalog: Send + Sync {
 
     /// Delete a tag.
     ///
-    /// `FileSystemCatalog` returns [`crate::Error::Unsupported`] when the tagged snapshot has
-    /// expired because Rust does not yet implement Java's tag file cleanup.
+    /// Deletes the tag meta file even when the tagged snapshot has already
+    /// expired (Java `TagManager.deleteTag`). Referenced data files are left
+    /// for orphan cleanup.
     async fn delete_tag(
         &self,
         _identifier: &Identifier,
@@ -694,6 +695,21 @@ pub trait Catalog: Send + Sync {
     /// * [`crate::Error::FunctionAlreadyExist`] - function already exists when
     ///   `ignore_if_exists` is false.
     async fn create_function(&self, _function: &Function, _ignore_if_exists: bool) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support functions".to_string(),
+        })
+    }
+
+    /// Drop a persistent function.
+    ///
+    /// # Errors
+    /// * [`crate::Error::FunctionNotExist`] - function does not exist when
+    ///   `ignore_if_not_exists` is false.
+    async fn drop_function(
+        &self,
+        _identifier: &Identifier,
+        _ignore_if_not_exists: bool,
+    ) -> Result<()> {
         Err(Error::Unsupported {
             message: "Catalog does not support functions".to_string(),
         })

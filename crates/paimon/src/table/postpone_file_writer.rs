@@ -221,10 +221,13 @@ impl PostponeFileWriter {
             self.close_current_file().await?;
         }
 
-        // Flush row group if in-progress buffer exceeds write_buffer_size
-        if let Some(w) = self.current_writer.as_mut() {
-            if w.in_progress_size() as i64 >= self.config.write_buffer_size {
-                w.flush().await?;
+        if let Some(writer) = self.current_writer.as_mut() {
+            // Dictionary encoding can leave the row group much smaller than
+            // this file's retained-input reservation.
+            if writer.in_progress_size().max(writer.retained_input_size()) as i64
+                >= self.config.write_buffer_size
+            {
+                writer.flush().await?;
             }
         }
 

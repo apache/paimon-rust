@@ -67,6 +67,10 @@ impl SchemaManager {
             .or_insert_with(|| Arc::new(schema));
     }
 
+    pub(super) fn cached_schema(&self, schema_id: i64) -> Option<Arc<TableSchema>> {
+        self.cache.lock().unwrap().get(&schema_id).cloned()
+    }
+
     /// Carry immutable, already loaded metadata to a same-table read view.
     /// Copy the source under its lock before locking the destination so clones
     /// sharing one cache cannot deadlock each other.

@@ -19,11 +19,16 @@ use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
 use arrow_array::types::Int32Type;
-use arrow_array::{Array, BinaryArray, DictionaryArray, FixedSizeListArray, StructArray};
+use arrow_array::{
+    Array, BinaryArray, DictionaryArray, FixedSizeListArray, LargeBinaryArray, StructArray,
+};
 use arrow_schema::{DataType, Field};
 
 use crate::variant::VariantFloat32Projection;
 use crate::{Error, Result};
+
+mod exact;
+pub use exact::variant_get;
 
 /// Extracts literal top-level numeric fields from an Arrow Variant column.
 ///
@@ -126,11 +131,50 @@ pub(crate) fn extract_numeric_fields(
 
 /// Variant metadata read either as plain binary or, without per-row copies, dictionary-encoded.
 enum VariantMetadataColumn<'a> {
-    Plain(&'a BinaryArray),
+    Plain(VariantBinaryColumn<'a>),
     Dictionary {
         keys: &'a DictionaryArray<Int32Type>,
-        values: &'a BinaryArray,
+        values: VariantBinaryColumn<'a>,
     },
+}
+
+/// Borrow either Arrow offset width without casting or copying Variant buffers.
+enum VariantBinaryColumn<'a> {
+    Binary(&'a BinaryArray),
+    LargeBinary(&'a LargeBinaryArray),
+}
+
+impl<'a> VariantBinaryColumn<'a> {
+    fn new(column: &'a StructArray, index: usize, name: &str) -> Result<Self> {
+        if column.num_columns() != 2 || column.fields()[index].name() != name {
+            return data_invalid("Expected Variant struct fields value and metadata");
+        }
+        Self::from_array(column.column(index).as_ref())
+    }
+
+    fn from_array(array: &'a dyn Array) -> Result<Self> {
+        if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
+            Ok(Self::Binary(array))
+        } else if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+            Ok(Self::LargeBinary(array))
+        } else {
+            data_invalid("Variant child must be Binary or LargeBinary")
+        }
+    }
+
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Binary(array) => array.is_null(row),
+            Self::LargeBinary(array) => array.is_null(row),
+        }
+    }
+
+    fn value(&self, row: usize) -> &'a [u8] {
+        match self {
+            Self::Binary(array) => array.value(row),
+            Self::LargeBinary(array) => array.value(row),
+        }
+    }
 }
 
 /// Identifies the metadata a projection was built for; dictionary keys avoid comparing bytes.
@@ -161,9 +205,12 @@ impl<'a> VariantMetadataColumn<'a> {
             return data_invalid("Expected Variant struct fields value and metadata");
         }
         match field.data_type() {
-            DataType::Binary => Ok(Self::Plain(variant_binary_child(column, 1, "metadata")?)),
+            DataType::Binary | DataType::LargeBinary => Ok(Self::Plain(VariantBinaryColumn::new(
+                column, 1, "metadata",
+            )?)),
             DataType::Dictionary(key, value)
-                if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Binary =>
+                if key.as_ref() == &DataType::Int32
+                    && matches!(value.as_ref(), DataType::Binary | DataType::LargeBinary) =>
             {
                 let keys = column
                     .column(1)
@@ -173,14 +220,7 @@ impl<'a> VariantMetadataColumn<'a> {
                         message: "Variant metadata dictionary must use Int32 keys".to_string(),
                         source: None,
                     })?;
-                let values = keys
-                    .values()
-                    .as_any()
-                    .downcast_ref::<BinaryArray>()
-                    .ok_or_else(|| Error::DataInvalid {
-                        message: "Variant metadata dictionary values must be Binary".to_string(),
-                        source: None,
-                    })?;
+                let values = VariantBinaryColumn::from_array(keys.values().as_ref())?;
                 Ok(Self::Dictionary { keys, values })
             }
             _ => data_invalid("Expected Variant struct fields value and metadata"),
@@ -190,7 +230,9 @@ impl<'a> VariantMetadataColumn<'a> {
     fn is_null(&self, row: usize) -> bool {
         match self {
             Self::Plain(array) => array.is_null(row),
-            Self::Dictionary { keys, .. } => keys.is_null(row),
+            Self::Dictionary { keys, values } => {
+                keys.is_null(row) || values.is_null(keys.keys().value(row) as usize)
+            }
         }
     }
 
