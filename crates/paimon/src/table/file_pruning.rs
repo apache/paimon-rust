@@ -62,13 +62,7 @@ fn safe_for_file_bounds<'f>(
         {
             // Java ORC bounds may include CHAR padding removed from decoded values.
             !field_source(*index).is_some_and(|(file, field)| {
-                matches!(field.data_type(), DataType::Char(_))
-                    && file
-                        .external_path
-                        .as_deref()
-                        .unwrap_or(&file.file_name)
-                        .rsplit_once('.')
-                        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("orc"))
+                matches!(field.data_type(), DataType::Char(_)) && file.is_orc()
             })
         }
         _ => true,

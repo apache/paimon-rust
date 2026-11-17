@@ -37,6 +37,7 @@ pub(super) struct FileStatsRows {
     min_values: Option<BinaryRow>,
     max_values: Option<BinaryRow>,
     null_counts: Vec<Option<i64>>,
+    is_orc: bool,
     supports_in_min_max_pruning: bool,
     /// Maps schema field index → stats index. `None` means identity mapping
     /// (stats cover all schema fields in order). `Some` maps dense stats such
@@ -72,6 +73,7 @@ impl FileStatsRows {
             min_values,
             max_values,
             null_counts,
+            is_orc: false,
             supports_in_min_max_pruning: false,
             stats_col_mapping: None,
         }
@@ -94,6 +96,7 @@ impl FileStatsRows {
             min_values: BinaryRow::from_serialized_bytes(file.value_stats.min_values()).ok(),
             max_values: BinaryRow::from_serialized_bytes(file.value_stats.max_values()).ok(),
             null_counts: file.value_stats.null_counts().clone(),
+            is_orc: file.is_orc(),
             supports_in_min_max_pruning: true,
             stats_col_mapping,
         }
@@ -113,6 +116,7 @@ impl FileStatsRows {
             min_values: BinaryRow::from_serialized_bytes(file.key_stats.min_values()).ok(),
             max_values: BinaryRow::from_serialized_bytes(file.key_stats.max_values()).ok(),
             null_counts: file.key_stats.null_counts().clone(),
+            is_orc: file.is_orc(),
             supports_in_min_max_pruning: true,
             stats_col_mapping: Some(dense_stats_col_mapping(schema_fields, key_fields)),
         }
@@ -124,6 +128,14 @@ impl FileStatsRows {
             None => Some(schema_index),
             Some(mapping) => mapping.get(schema_index).copied().flatten(),
         }
+    }
+
+    fn bound(&self, row: Option<&BinaryRow>, index: usize, data_type: &DataType) -> Option<Datum> {
+        // Java legacy ORC bounds use the writer JVM's zone. File metadata does not record that zone.
+        if self.is_orc && matches!(data_type, DataType::LocalZonedTimestamp(_)) {
+            return None;
+        }
+        extract_stats_datum(row?, self.stats_index(index)?, data_type)
     }
 
     fn stats_null_count(&self, stats_index: usize) -> Option<i64> {
@@ -142,17 +154,11 @@ impl StatsAccessor for FileStatsRows {
     }
 
     fn min_value(&self, index: usize, data_type: &DataType) -> Option<Datum> {
-        let stats_index = self.stats_index(index)?;
-        self.min_values
-            .as_ref()
-            .and_then(|row| extract_stats_datum(row, stats_index, data_type))
+        self.bound(self.min_values.as_ref(), index, data_type)
     }
 
     fn max_value(&self, index: usize, data_type: &DataType) -> Option<Datum> {
-        let stats_index = self.stats_index(index)?;
-        self.max_values
-            .as_ref()
-            .and_then(|row| extract_stats_datum(row, stats_index, data_type))
+        self.bound(self.max_values.as_ref(), index, data_type)
     }
 
     fn supports_in_min_max_pruning(&self) -> bool {

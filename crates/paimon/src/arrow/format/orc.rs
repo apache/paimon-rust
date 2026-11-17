@@ -30,6 +30,7 @@ use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
+use chrono::{Offset, TimeZone};
 use futures::{future::BoxFuture, StreamExt};
 use orc_rust::predicate::PredicateValue;
 use orc_rust::projection::ProjectionMask;
@@ -44,7 +45,181 @@ use tokio::sync::{mpsc, oneshot};
 
 const ORC_IN_PREDICATE_MAX_LITERALS: usize = 20;
 
-pub(crate) struct OrcFormatReader;
+pub(crate) struct OrcFormatReader {
+    legacy_time_zone: Option<String>,
+}
+
+impl OrcFormatReader {
+    pub(crate) fn with_options(options: &HashMap<String, String>) -> Self {
+        // Java Paimon defaults to its legacy LTZ representation. The embedding
+        // engine supplies the JVM's zone, not the SQL session's display zone.
+        let legacy = crate::spec::CoreOptions::new(options).orc_legacy_ltz();
+        Self {
+            legacy_time_zone: legacy.then(|| {
+                options
+                    .get("orc.timestamp-ltz.legacy.time-zone")
+                    .cloned()
+                    .unwrap_or_else(|| "UTC".to_string())
+            }),
+        }
+    }
+}
+
+// OpenJDK ZoneInfoFile starts its transition table at 1900-01-01T00:00:00Z.
+// Before the first entry, java.util.TimeZone uses the zone's last standard offset.
+const JAVA_ZONEINFO_START: i64 = -2_208_988_800;
+
+fn java_raw_offset_seconds(zone: &str, tz: arrow_array::timezone::Tz) -> i64 {
+    use chrono_tz::{OffsetComponents, Tz};
+
+    let last = chrono::DateTime::<chrono::Utc>::MAX_UTC.naive_utc();
+    match zone.parse::<Tz>() {
+        // IANA models winter time in these zones as negative DST. The JDK
+        // represents the same rules with winter as standard and nonnegative DST.
+        Ok(Tz::Europe__Dublin | Tz::Eire | Tz::Africa__Casablanca | Tz::Africa__El_Aaiun) => 0,
+        Ok(Tz::Africa__Windhoek) => 3600,
+        Ok(named) => named
+            .offset_from_utc_datetime(&last)
+            .base_utc_offset()
+            .num_seconds(),
+        Err(_) => i64::from(tz.offset_from_utc_datetime(&last).fix().local_minus_utc()),
+    }
+}
+
+// java.time.ZoneId.SHORT_IDS defines how the default JVM interprets three-letter IDs.
+fn java_ltz_zone_id(zone: &str) -> &str {
+    match zone {
+        "ACT" => "Australia/Darwin",
+        "AET" => "Australia/Sydney",
+        "AGT" => "America/Argentina/Buenos_Aires",
+        "ART" => "Africa/Cairo",
+        "AST" => "America/Anchorage",
+        "BET" => "America/Sao_Paulo",
+        "BST" => "Asia/Dhaka",
+        "CAT" => "Africa/Harare",
+        "CNT" => "America/St_Johns",
+        "CST" => "America/Chicago",
+        "CTT" => "Asia/Shanghai",
+        "EAT" => "Africa/Addis_Ababa",
+        "ECT" => "Europe/Paris",
+        "IET" => "America/Indiana/Indianapolis",
+        "IST" => "Asia/Kolkata",
+        "JST" => "Asia/Tokyo",
+        "MIT" => "Pacific/Apia",
+        "NET" => "Asia/Yerevan",
+        "NST" => "Pacific/Auckland",
+        "PLT" => "Asia/Karachi",
+        "PNT" => "America/Phoenix",
+        "PRT" => "America/Puerto_Rico",
+        "PST" => "America/Los_Angeles",
+        "SST" => "Pacific/Guadalcanal",
+        "VST" => "Asia/Ho_Chi_Minh",
+        "EST" => "-05:00",
+        "MST" => "-07:00",
+        "HST" => "-10:00",
+        // Arrow accepts the numeric portion of Java's GMT-prefixed fixed offsets.
+        _ => zone
+            .strip_prefix("GMT")
+            .filter(|suffix| suffix.starts_with(['+', '-']))
+            .unwrap_or(zone),
+    }
+}
+
+fn normalize_legacy_ltz(array: &ArrayRef, zone: &str) -> crate::Result<ArrayRef> {
+    if zone == "UTC" {
+        return Ok(Arc::clone(array));
+    }
+    // Arrow casts can merely relabel timezone metadata. Legacy Java Paimon
+    // instead adds the JVM offset to the stored UTC instant's numeric value.
+    if let ArrowDataType::Timestamp(unit, Some(_)) = array.data_type() {
+        let arrow_zone = java_ltz_zone_id(zone);
+        let tz: arrow_array::timezone::Tz =
+            arrow_zone.parse().map_err(|error| Error::DataInvalid {
+                message: format!("Invalid legacy ORC LTZ zone {zone}: {error}"),
+                source: None,
+            })?;
+        let raw_offset = std::cell::OnceCell::new();
+        macro_rules! shift {
+            ($array_type:ty, $factor:expr) => {{
+                let input = array
+                    .as_any()
+                    .downcast_ref::<$array_type>()
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: "Invalid ORC timestamp array".to_string(),
+                        source: None,
+                    })?;
+                let values = input
+                    .iter()
+                    .map(|value| {
+                        value
+                            .map(|value| {
+                                let utc = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                                    value.div_euclid($factor),
+                                    0,
+                                )
+                                .ok_or_else(|| Error::DataInvalid {
+                                    message: "Legacy ORC LTZ timestamp is out of range".to_string(),
+                                    source: None,
+                                })?;
+                                let offset = if utc.timestamp() < JAVA_ZONEINFO_START {
+                                    *raw_offset
+                                        .get_or_init(|| java_raw_offset_seconds(arrow_zone, tz))
+                                } else {
+                                    i64::from(
+                                        tz.offset_from_utc_datetime(&utc.naive_utc())
+                                            .fix()
+                                            .local_minus_utc(),
+                                    )
+                                };
+                                value.checked_add(offset * $factor).ok_or_else(|| {
+                                    Error::DataInvalid {
+                                        message: "Legacy ORC LTZ timestamp overflow".to_string(),
+                                        source: None,
+                                    }
+                                })
+                            })
+                            .transpose()
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+                Ok(
+                    Arc::new(<$array_type>::from(values).with_timezone_opt(input.timezone()))
+                        as ArrayRef,
+                )
+            }};
+        }
+        return match unit {
+            arrow_schema::TimeUnit::Second => shift!(arrow_array::TimestampSecondArray, 1),
+            arrow_schema::TimeUnit::Millisecond => {
+                shift!(arrow_array::TimestampMillisecondArray, 1_000)
+            }
+            arrow_schema::TimeUnit::Microsecond => {
+                shift!(arrow_array::TimestampMicrosecondArray, 1_000_000)
+            }
+            arrow_schema::TimeUnit::Nanosecond => {
+                shift!(arrow_array::TimestampNanosecondArray, 1_000_000_000)
+            }
+        };
+    }
+    let data = array.to_data();
+    if data.child_data().is_empty() {
+        return Ok(Arc::clone(array));
+    }
+    let children = data
+        .child_data()
+        .iter()
+        .map(|child| {
+            normalize_legacy_ltz(&arrow_array::make_array(child.clone()), zone).map(|a| a.to_data())
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    data.into_builder()
+        .child_data(children)
+        .build()
+        .map(arrow_array::make_array)
+        .map_err(|error| Error::DataInvalid {
+            message: format!("Invalid nested legacy ORC LTZ array: {error}"),
+            source: Some(Box::new(error)),
+        })
+}
 
 /// Java/PyPaimon store field metadata in a base64 Arrow IPC schema in the ORC
 /// user metadata. Keep ORC's physical types and use the IPC schema only for
@@ -538,6 +713,9 @@ impl FormatFileReader for OrcFormatReader {
         let map_read_plan = MapShreddingReadPlan::create(&scan_fields, &file_schema)?;
         let projected_names: Vec<String> =
             scan_fields.iter().map(|f| f.name().to_string()).collect();
+        // Timestamp comparisons are not pushed into ORC statistics (see
+        // datum_to_orc_value). The exact residual runs on normalized values.
+        let legacy_time_zone = self.legacy_time_zone.clone();
         let orc_predicate = build_orc_predicate(predicates);
         let projection =
             ProjectionMask::named_roots(builder.file_metadata().root_data_type(), &projected_names);
@@ -593,6 +771,25 @@ impl FormatFileReader for OrcFormatReader {
                     Some(plan) => plan.assemble_batch(&batch)?,
                     None => batch,
                 };
+                if let Some(zone) = &legacy_time_zone {
+                    let columns = batch
+                        .columns()
+                        .iter()
+                        .map(|column| normalize_legacy_ltz(column, zone))
+                        .collect::<crate::Result<Vec<_>>>()?;
+                    if columns
+                        .iter()
+                        .zip(batch.columns())
+                        .any(|(a, b)| !Arc::ptr_eq(a, b))
+                    {
+                        batch = RecordBatch::try_new(batch.schema(), columns).map_err(|e| {
+                            Error::DataInvalid {
+                                message: format!("Failed to rebuild legacy ORC batch: {e}"),
+                                source: Some(Box::new(e)),
+                            }
+                        })?;
+                    }
+                }
                 let schema = batch.schema();
                 let columns = schema
                     .fields()
@@ -971,6 +1168,152 @@ mod tests {
 
     use crate::spec::{DateType, DecimalType, DoubleType, FloatType, IntType};
 
+    #[test]
+    fn legacy_ltz_normalization_preserves_nulls_and_respects_dst() {
+        use arrow_array::TimestampMicrosecondArray;
+        let input: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![
+                Some(-28_800_000_000),
+                Some(1_699_971_200_123_456),
+                None,
+            ])
+            .with_timezone("UTC"),
+        );
+        let output = normalize_legacy_ltz(&input, "Asia/Shanghai").unwrap();
+        let values = output
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(values.value(0), 0);
+        assert_eq!(values.value(1), 1_700_000_000_123_456);
+        assert!(values.is_null(2));
+        // New York: winter UTC-5, summer UTC-4. Never use a constant offset.
+        let input: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![1_704_067_200_000_000, 1_719_792_000_000_000])
+                .with_timezone("UTC"),
+        );
+        let output = normalize_legacy_ltz(&input, "America/New_York").unwrap();
+        let values = output
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(values.value(0), 1_704_049_200_000_000);
+        assert_eq!(values.value(1), 1_719_777_600_000_000);
+        let modern = OrcFormatReader::with_options(&HashMap::from([
+            (
+                "orc.timestamp-ltz.legacy.type".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "orc.timestamp-ltz.legacy.time-zone".to_string(),
+                "Asia/Shanghai".to_string(),
+            ),
+        ]));
+        assert!(modern.legacy_time_zone.is_none());
+    }
+
+    #[tokio::test]
+    async fn reads_orc_ltz_with_java_time_zone_ids() {
+        use crate::io::FileIOBuilder;
+        use crate::spec::LocalZonedTimestampType;
+        use arrow_array::TimestampNanosecondArray;
+
+        const NANOS: i64 = 1_000_000_000;
+        // 1890-01-01 UTC, the last second before the JDK transition table,
+        // its first second, then 2024-01-01 and 2024-07-01 UTC.
+        let seconds = [
+            -2_524_521_600,
+            -2_208_988_801,
+            -2_208_988_800,
+            1_704_067_200,
+            1_719_792_000,
+        ];
+        let instants = TimestampNanosecondArray::from_iter(
+            seconds.iter().map(|s| Some(s * NANOS)).chain([None]),
+        )
+        .with_timezone("UTC");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            instants.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(instants)]).unwrap();
+        let bytes = Bytes::from(write_single_stripe_orc(schema, &batch));
+        let size = bytes.len() as u64;
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/historical-and-fixed-offsets.orc";
+        io.new_output(path).unwrap().write(bytes).await.unwrap();
+        let fields = [field(
+            0,
+            "ts",
+            DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(9).unwrap()),
+        )];
+
+        for (zone, legacy, offsets) in [
+            (
+                "Asia/Shanghai",
+                true,
+                [28_800, 28_800, 29_143, 28_800, 28_800],
+            ),
+            ("Asia/Shanghai", false, [0; 5]),
+            ("PST", true, [-28_800, -28_800, -28_800, -28_800, -25_200]),
+            ("EST", true, [-18_000; 5]),
+            ("GMT+05:30", true, [19_800; 5]),
+            ("GMT-03:30", true, [-12_600; 5]),
+            ("+05:30", true, [19_800; 5]),
+        ] {
+            let reader = OrcFormatReader::with_options(&HashMap::from([
+                ("orc.timestamp-ltz.legacy.time-zone".into(), zone.into()),
+                ("orc.timestamp-ltz.legacy.type".into(), legacy.to_string()),
+            ]));
+            let input = io.new_input(path).unwrap().reader().await.unwrap();
+            let mut stream = reader
+                .read_batch_stream(Box::new(input), size, &fields, None, None, None)
+                .await
+                .unwrap();
+            let batch = stream.next().await.unwrap().unwrap();
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            let expected = seconds
+                .iter()
+                .zip(offsets)
+                .map(|(s, offset)| Some((s + offset) * NANOS))
+                .chain([None])
+                .collect::<Vec<_>>();
+            assert_eq!(
+                values.iter().collect::<Vec<_>>(),
+                expected,
+                "{zone} legacy={legacy}"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_1900_java_raw_offset_uses_standard_time() {
+        use arrow_array::TimestampSecondArray;
+
+        let seconds = -2_524_521_600;
+        let input: ArrayRef =
+            Arc::new(TimestampSecondArray::from(vec![seconds]).with_timezone("UTC"));
+        for (zone, raw) in [
+            ("America/New_York", -18_000),
+            ("Australia/Sydney", 36_000),
+            ("Europe/Dublin", 0),
+            ("Africa/Casablanca", 0),
+            ("Africa/Windhoek", 3600),
+        ] {
+            let output = normalize_legacy_ltz(&input, zone).unwrap();
+            let values = output
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap();
+            assert_eq!(values.value(0), seconds + raw, "{zone}");
+        }
+    }
+
     fn field(index: i32, name: &str, data_type: DataType) -> DataField {
         DataField::new(index, name.to_string(), data_type)
     }
@@ -1347,7 +1690,7 @@ mod tests {
         };
         let fields = vec![field(0, "id", DataType::Int(IntType::new()))];
 
-        let error = match OrcFormatReader
+        let error = match OrcFormatReader::with_options(&HashMap::new())
             .read_batch_stream(
                 Box::new(file_read.clone()),
                 file_size,
@@ -1372,7 +1715,7 @@ mod tests {
         assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
 
         fail.store(false, std::sync::atomic::Ordering::SeqCst);
-        let mut stream = OrcFormatReader
+        let mut stream = OrcFormatReader::with_options(&HashMap::new())
             .read_batch_stream(Box::new(file_read), file_size, &fields, None, None, None)
             .await
             .unwrap();
@@ -1450,7 +1793,7 @@ mod tests {
             (vec![id], None, None, vec![]),
         ] {
             let input = io.new_input(path).unwrap();
-            let mut stream = OrcFormatReader
+            let mut stream = OrcFormatReader::with_options(&HashMap::new())
                 .read_batch_stream(
                     Box::new(input.reader().await.unwrap()),
                     bytes.len() as u64,
@@ -1625,7 +1968,7 @@ mod tests {
         let input = file_io.new_input(path).unwrap();
         let size = input.metadata().await.unwrap().size;
         let read_fields = [field(0, "id", DataType::Int(IntType::new()))];
-        let mut stream = OrcFormatReader
+        let mut stream = OrcFormatReader::with_options(&HashMap::new())
             .read_batch_stream(
                 Box::new(input.reader().await.unwrap()),
                 size,
@@ -1680,7 +2023,7 @@ mod tests {
             let input = file_io.new_input(&path).unwrap();
             let size = input.metadata().await.unwrap().size;
             let fields = [field(0, "id", DataType::Int(IntType::new()))];
-            let mut stream = OrcFormatReader
+            let mut stream = OrcFormatReader::with_options(&HashMap::new())
                 .read_batch_stream(
                     Box::new(input.reader().await.unwrap()),
                     size,
@@ -1745,7 +2088,7 @@ mod tests {
         );
 
         let reader_input = input.reader().await.unwrap();
-        let reader = OrcFormatReader;
+        let reader = OrcFormatReader::with_options(&HashMap::new());
         let mut stream = reader
             .read_batch_stream(
                 Box::new(reader_input),
@@ -1806,7 +2149,7 @@ mod tests {
             fields.clone(),
         );
         let input = io.new_input(path).unwrap().reader().await.unwrap();
-        let mut stream = OrcFormatReader
+        let mut stream = OrcFormatReader::with_options(&HashMap::new())
             .read_batch_stream(
                 Box::new(input),
                 size,
@@ -1892,7 +2235,7 @@ mod tests {
         );
 
         let reader_input = input.reader().await.unwrap();
-        let reader = OrcFormatReader;
+        let reader = OrcFormatReader::with_options(&HashMap::new());
         let mut stream = reader
             .read_batch_stream(
                 Box::new(reader_input),
@@ -1970,7 +2313,7 @@ mod tests {
         );
 
         let reader_input = input.reader().await.unwrap();
-        let reader = OrcFormatReader;
+        let reader = OrcFormatReader::with_options(&HashMap::new());
         let mut stream = reader
             .read_batch_stream(
                 Box::new(reader_input),

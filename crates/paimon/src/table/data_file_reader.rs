@@ -350,6 +350,7 @@ impl DataFileReader {
                             &reader.table_fields,
                             file_fields,
                             &reader.predicates,
+                            core_options.orc_legacy_ltz(),
                         )
                         .await?
                     } else {

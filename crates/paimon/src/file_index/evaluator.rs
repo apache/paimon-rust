@@ -34,12 +34,15 @@ pub(crate) async fn evaluate_file_index(
     table_fields: &[DataField],
     data_fields: &[DataField],
     predicates: &[Predicate],
+    orc_legacy_ltz: bool,
 ) -> crate::Result<FileIndexResult> {
     if predicates.is_empty() || !(0..=i64::from(i32::MAX)).contains(&file.row_count) {
         return Ok(FileIndexResult::Remain);
     }
 
-    let Some(predicate) = remap_predicates(table_fields, data_fields, predicates) else {
+    let skip_ltz_values = orc_legacy_ltz && file.is_orc();
+    let Some(predicate) = remap_predicates(table_fields, data_fields, predicates, skip_ltz_values)
+    else {
         return Ok(FileIndexResult::Remain);
     };
     let mut required_columns = HashSet::new();
@@ -92,10 +95,13 @@ fn remap_predicates(
     table_fields: &[DataField],
     data_fields: &[DataField],
     predicates: &[Predicate],
+    skip_ltz_values: bool,
 ) -> Option<Predicate> {
     let remapped = predicates
         .iter()
-        .filter_map(|predicate| remap_predicate(table_fields, data_fields, predicate))
+        .filter_map(|predicate| {
+            remap_predicate(table_fields, data_fields, predicate, skip_ltz_values)
+        })
         .collect::<Vec<_>>();
     (!remapped.is_empty()).then(|| Predicate::and(remapped))
 }
@@ -104,6 +110,7 @@ fn remap_predicate(
     table_fields: &[DataField],
     data_fields: &[DataField],
     predicate: &Predicate,
+    skip_ltz_values: bool,
 ) -> Option<Predicate> {
     match predicate {
         Predicate::NestedLeaf { .. } => None,
@@ -122,6 +129,18 @@ fn remap_predicate(
                 .iter()
                 .enumerate()
                 .find(|(_, field)| field.id() == table_field.id())?;
+            // The index stores the writer's LTZ values, before legacy ORC
+            // normalization. Nullness is invariant across that conversion.
+            if skip_ltz_values
+                && matches!(data_field.data_type(), DataType::LocalZonedTimestamp(_))
+                && !matches!(
+                    op,
+                    crate::spec::PredicateOperator::IsNull
+                        | crate::spec::PredicateOperator::IsNotNull
+                )
+            {
+                return None;
+            }
             let literals = devolve_literals(data_type, data_field.data_type(), literals)?;
             Some(Predicate::Leaf {
                 column: data_field.name().to_string(),
@@ -134,19 +153,22 @@ fn remap_predicate(
         Predicate::And(children) => {
             let remapped = children
                 .iter()
-                .filter_map(|child| remap_predicate(table_fields, data_fields, child))
+                .filter_map(|child| {
+                    remap_predicate(table_fields, data_fields, child, skip_ltz_values)
+                })
                 .collect::<Vec<_>>();
             (!remapped.is_empty()).then(|| Predicate::and(remapped))
         }
         Predicate::Or(children) => {
             let remapped = children
                 .iter()
-                .map(|child| remap_predicate(table_fields, data_fields, child))
+                .map(|child| remap_predicate(table_fields, data_fields, child, skip_ltz_values))
                 .collect::<Option<Vec<_>>>()?;
             Some(Predicate::or(remapped))
         }
         Predicate::Not(inner) => {
-            remap_predicate_exact(table_fields, data_fields, inner).map(Predicate::negate)
+            remap_predicate_exact(table_fields, data_fields, inner, skip_ltz_values)
+                .map(Predicate::negate)
         }
         Predicate::AlwaysTrue => Some(Predicate::AlwaysTrue),
         Predicate::AlwaysFalse => Some(Predicate::AlwaysFalse),
@@ -158,24 +180,26 @@ fn remap_predicate_exact(
     table_fields: &[DataField],
     data_fields: &[DataField],
     predicate: &Predicate,
+    skip_ltz_values: bool,
 ) -> Option<Predicate> {
     match predicate {
         Predicate::NestedLeaf { .. } => None,
         Predicate::And(children) => children
             .iter()
-            .map(|child| remap_predicate_exact(table_fields, data_fields, child))
+            .map(|child| remap_predicate_exact(table_fields, data_fields, child, skip_ltz_values))
             .collect::<Option<Vec<_>>>()
             .map(Predicate::and),
         Predicate::Or(children) => children
             .iter()
-            .map(|child| remap_predicate_exact(table_fields, data_fields, child))
+            .map(|child| remap_predicate_exact(table_fields, data_fields, child, skip_ltz_values))
             .collect::<Option<Vec<_>>>()
             .map(Predicate::or),
         Predicate::Not(inner) => {
-            remap_predicate_exact(table_fields, data_fields, inner).map(Predicate::negate)
+            remap_predicate_exact(table_fields, data_fields, inner, skip_ltz_values)
+                .map(Predicate::negate)
         }
         Predicate::Leaf { .. } | Predicate::AlwaysTrue | Predicate::AlwaysFalse => {
-            remap_predicate(table_fields, data_fields, predicate)
+            remap_predicate(table_fields, data_fields, predicate, skip_ltz_values)
         }
     }
 }
@@ -426,7 +450,7 @@ mod tests {
                     builder.is_not_null("value").unwrap(),
                 ] {
                     assert!(
-                        remap_predicate(&table_fields, &data_fields, &predicate).is_none(),
+                        remap_predicate(&table_fields, &data_fields, &predicate, false).is_none(),
                         "{data_type:?} -> {table_type:?}: {predicate:?} must fall back"
                     );
                 }
@@ -450,7 +474,7 @@ mod tests {
         let combined = Predicate::and(vec![safe.clone(), narrowing.clone()]);
 
         assert_eq!(
-            remap_predicate(&table_fields, &data_fields, &combined),
+            remap_predicate(&table_fields, &data_fields, &combined, false),
             Some(safe.clone())
         );
         for predicate in [
@@ -458,7 +482,7 @@ mod tests {
             Predicate::negate(narrowing),
             Predicate::negate(combined),
         ] {
-            assert!(remap_predicate(&table_fields, &data_fields, &predicate).is_none());
+            assert!(remap_predicate(&table_fields, &data_fields, &predicate, false).is_none());
         }
     }
 
@@ -476,7 +500,7 @@ mod tests {
             .equal("new_id", Datum::Long(42))
             .unwrap();
 
-        let remapped = remap_predicate(&table_fields, &data_fields, &predicate).unwrap();
+        let remapped = remap_predicate(&table_fields, &data_fields, &predicate, false).unwrap();
 
         assert_int_leaf(remapped, "old_id", 1, 42);
     }
@@ -496,12 +520,14 @@ mod tests {
             &builder
                 .equal("id", Datum::Long(i64::from(i32::MAX) + 1))
                 .unwrap(),
+            false,
         )
         .is_none());
         assert!(remap_predicate(
             &table_fields,
             &data_fields,
             &builder.equal("added", Datum::Int(1)).unwrap(),
+            false,
         )
         .is_none());
 
@@ -509,7 +535,9 @@ mod tests {
         let promoted_predicate = PredicateBuilder::new(&promoted_table)
             .equal("id", Datum::Float(1.0))
             .unwrap();
-        assert!(remap_predicate(&promoted_table, &data_fields, &promoted_predicate).is_none());
+        assert!(
+            remap_predicate(&promoted_table, &data_fields, &promoted_predicate, false).is_none()
+        );
     }
 
     #[test]
@@ -527,6 +555,7 @@ mod tests {
             &table_fields,
             &data_fields,
             &Predicate::and(vec![safe.clone(), unsafe_predicate.clone()]),
+            false,
         )
         .unwrap();
         assert_int_leaf(remapped_and, "id", 0, 1);
@@ -534,18 +563,20 @@ mod tests {
             &table_fields,
             &data_fields,
             &Predicate::or(vec![safe.clone(), unsafe_predicate.clone()]),
+            false,
         )
         .is_none());
         assert!(remap_predicate(
             &table_fields,
             &data_fields,
             &Predicate::negate(unsafe_predicate.clone()),
+            false,
         )
         .is_none());
 
         let exact_double_not = Predicate::Not(Box::new(Predicate::Not(Box::new(safe.clone()))));
         assert_int_leaf(
-            remap_predicate(&table_fields, &data_fields, &exact_double_not).unwrap(),
+            remap_predicate(&table_fields, &data_fields, &exact_double_not, false).unwrap(),
             "id",
             0,
             1,
@@ -555,7 +586,7 @@ mod tests {
             Predicate::negate(safe),
             unsafe_predicate,
         ]));
-        assert!(remap_predicate(&table_fields, &data_fields, &nested_not).is_none());
+        assert!(remap_predicate(&table_fields, &data_fields, &nested_not, false).is_none());
     }
 
     #[tokio::test]
@@ -581,6 +612,7 @@ mod tests {
             &fields,
             &fields,
             &[predicate],
+            true,
         )
         .await?;
 
@@ -631,6 +663,7 @@ mod tests {
                 &fields,
                 &fields,
                 std::slice::from_ref(&predicate),
+                true,
             )
             .await?;
             assert_eq!(
@@ -661,6 +694,7 @@ mod tests {
             &fields,
             &fields,
             &[predicate],
+            true,
         )
         .await
         .unwrap_err();
@@ -687,6 +721,7 @@ mod tests {
                 &fields,
                 &fields,
                 std::slice::from_ref(&predicate),
+                true,
             )
             .await?,
             FileIndexResult::Remain
@@ -714,6 +749,7 @@ mod tests {
                 &fields,
                 &fields,
                 &[predicate],
+                true,
             )
             .await?,
             FileIndexResult::Remain
@@ -738,6 +774,7 @@ mod tests {
                     &fields,
                     &fields,
                     std::slice::from_ref(&predicate),
+                    true,
                 )
                 .await?,
                 FileIndexResult::Remain
@@ -755,6 +792,7 @@ mod tests {
                     &fields,
                     &fields,
                     std::slice::from_ref(&predicate),
+                    true,
                 )
                 .await,
                 Err(Error::FileIndexFormatInvalid { .. })

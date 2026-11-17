@@ -141,9 +141,166 @@ async fn evaluate(
         table.schema().fields(),
         table.schema().fields(),
         &[predicate],
+        crate::spec::CoreOptions::new(table.schema().options()).orc_legacy_ltz(),
     )
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn legacy_orc_ltz_file_index_preserves_matching_rows() {
+    use crate::spec::{BinaryTableStats, DataType, LocalZonedTimestampType, EMPTY_SERIALIZED_ROW};
+    use crate::table::CommitMessage;
+    use arrow_array::TimestampMillisecondArray;
+
+    const STORED: i64 = 1_705_321_800_000; // 2024-01-15 12:30 UTC
+    const LOCAL: i64 = STORED - 5 * 3_600_000;
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "ts",
+            DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(3).unwrap()),
+        )
+        .option("file.format", "orc")
+        .option("file-index.range-bitmap.columns", "id,ts")
+        .build()
+        .unwrap();
+    let table = table(memory_io(), schema).await;
+    let batch = RecordBatch::try_new(
+        crate::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 1, 2])),
+            Arc::new(
+                TimestampMillisecondArray::from(vec![STORED, STORED + 1_000, STORED])
+                    .with_timezone("UTC"),
+            ),
+        ],
+    )
+    .unwrap();
+    // Encode the physical UTC instants directly, as in a file from an external writer.
+    let mut bytes = Vec::new();
+    let mut orc = orc_rust::ArrowWriterBuilder::new(&mut bytes, batch.schema())
+        .try_build()
+        .unwrap();
+    orc.write(&batch).unwrap();
+    orc.close().unwrap();
+    let mut index = FileIndexOptions::parse(table.schema().options(), table.schema().fields())
+        .unwrap()
+        .unwrap()
+        .create_writer()
+        .unwrap();
+    index.write(&batch).unwrap();
+    let file = DataFileMeta {
+        file_name: "part-legacy.orc".into(),
+        file_size: bytes.len() as i64,
+        row_count: batch.num_rows() as i64,
+        schema_id: table.schema().id(),
+        min_key: EMPTY_SERIALIZED_ROW.clone(),
+        max_key: EMPTY_SERIALIZED_ROW.clone(),
+        key_stats: BinaryTableStats::empty(),
+        value_stats: BinaryTableStats::empty(),
+        min_sequence_number: 0,
+        max_sequence_number: 0,
+        level: 0,
+        extra_files: vec![],
+        creation_time: None,
+        delete_row_count: Some(0),
+        embedded_index: Some(index.serialize().unwrap().to_vec()),
+        file_source: None,
+        value_stats_cols: Some(vec![]),
+        external_path: None,
+        first_row_id: None,
+        write_cols: None,
+        column_max_sequence_numbers: None,
+    };
+    let bucket = format!("{}/bucket-0", table.location());
+    table.file_io().mkdirs(&bucket).await.unwrap();
+    table
+        .file_io()
+        .new_output(&file.data_file_path(&bucket))
+        .unwrap()
+        .write(bytes.into())
+        .await
+        .unwrap();
+    table
+        .new_write_builder()
+        .new_commit()
+        .commit(vec![CommitMessage::new(
+            EMPTY_SERIALIZED_ROW.clone(),
+            0,
+            vec![file.clone()],
+        )])
+        .await
+        .unwrap();
+
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let ts = pb
+        .equal(
+            "ts",
+            Datum::LocalZonedTimestamp {
+                millis: LOCAL,
+                nanos: 0,
+            },
+        )
+        .unwrap();
+    let id = pb.equal("id", Datum::Int(1)).unwrap();
+    // The writer's timestamp index cannot prune this comparison. The ID index still can.
+    assert_eq!(
+        evaluate(&table, "", &file, ts.clone()).await,
+        FileIndexResult::Remain
+    );
+    assert_eq!(
+        evaluate(
+            &table,
+            "",
+            &file,
+            Predicate::and(vec![id.clone(), ts.clone()])
+        )
+        .await,
+        FileIndexResult::Selection([0_u32, 1].into_iter().collect())
+    );
+    let table = table.copy_with_options(HashMap::from([(
+        "orc.timestamp-ltz.legacy.time-zone".into(),
+        "America/New_York".into(),
+    )]));
+    for (options, expected) in [
+        (HashMap::new(), vec![1]),
+        (
+            HashMap::from([("file-index.read.enabled".into(), "false".into())]),
+            vec![1],
+        ),
+        (
+            HashMap::from([("orc.timestamp-ltz.legacy.type".into(), "false".into())]),
+            vec![],
+        ),
+    ] {
+        let table = table.copy_with_options(options);
+        let mut read = table.new_read_builder();
+        read.with_projection(&["id"]).unwrap();
+        read.with_filter(Predicate::and(vec![id.clone(), ts.clone()]));
+        let plan = read.new_scan().plan().await.unwrap();
+        let batches: Vec<_> = read
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let ids: Vec<_> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(ids, expected);
+    }
 }
 
 #[tokio::test]

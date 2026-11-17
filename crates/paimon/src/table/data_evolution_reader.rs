@@ -633,6 +633,7 @@ impl DataEvolutionReader {
                                     &self.table_fields,
                                     data_fields.as_deref().unwrap_or(&self.table_fields),
                                     &self.predicates,
+                                    CoreOptions::new(&self.table_options).orc_legacy_ltz(),
                                 ).await? {
                                     FileIndexResult::Skip => continue,
                                     FileIndexResult::Selection(selection) => {
@@ -1135,6 +1136,7 @@ impl DataEvolutionReader {
                 &self.table_fields,
                 data_fields,
                 &predicates,
+                CoreOptions::new(&self.table_options).orc_legacy_ltz(),
             )
             .await?;
             if !file_result.remain() {
