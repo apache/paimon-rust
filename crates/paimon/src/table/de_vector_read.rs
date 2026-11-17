@@ -1272,7 +1272,7 @@ pub(super) fn scalar_unindexed_ranges(
     search_mode: GlobalIndexSearchMode,
     data_ranges: &[RowRange],
 ) -> Vec<RowRange> {
-    if !evaluation.next_row_id.is_some_and(|next| next > 0) {
+    if evaluation.next_row_id.is_none_or(|next| next <= 0) {
         return Vec::new();
     }
     let mut leaf_refs = Vec::new();
@@ -1759,11 +1759,11 @@ async fn resolve_raw_vector_metric_resolved(
     let mut persisted = None;
     for entry in index_entries {
         if entry.kind != FileKind::Add
-            || !entry
+            || entry
                 .index_file
                 .global_index_meta
                 .as_ref()
-                .is_some_and(|meta| meta.index_field_id == field_id)
+                .is_none_or(|meta| meta.index_field_id != field_id)
         {
             continue;
         }

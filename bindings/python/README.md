@@ -318,6 +318,49 @@ and closure for scalar, array and map Blob writes, including managed primary-key
 Blob packs. Exceptions raised by Python source callbacks are propagated to the
 caller. The Python layer does not copy payloads or cache source streams.
 
+### Packed video frame writes
+
+Append-only tables with `data-evolution.enabled=true` can store scalar BLOB
+columns as packed videos by setting `video-frame-field` to their comma-separated
+names. Supply serialized `VideoFrameDescriptor` values in Arrow binary columns;
+the batch and stream table writers route these columns to `.video` files and
+commit them alongside normal columns. Reads return lazy frame descriptors.
+Raw video bytes and ordinary BlobDescriptors are rejected for these columns.
+Video-column updates, video compaction, and BlobConsumer callbacks are unsupported.
+
+For PyPaimon format-writer adapters, the low-level API owns a Python binary
+output stream and accepts the same descriptor bytes as PyPaimon:
+
+```python
+from pypaimon_rust.data import VideoFormatWriter, VideoFrameDescriptor
+
+output = open("packed.video", "wb")
+writer = VideoFormatWriter(output, copy_buffer_size=4096)
+try:
+    frames = [VideoFrameDescriptor("file:///data/source.mp4", 0, -1, i).serialize()
+              for i in range(100)]
+    writer.write_frames(frames)  # PyPaimon VideoFrameDescriptor.serialize() also works
+    file_size = writer.close()  # writes indexes and closes output; safe to repeat
+except BaseException:
+    writer.abort()
+    raise
+```
+
+`write_arrow(batch)` accepts one `large_binary` column of descriptors and NULLs.
+The same video URI/range is copied once per output file, and consecutive frame
+ordinals share one run. `num_bytes()` reports payload bytes before close and total
+file bytes after close. Packing does not require the optional video decoding
+dependencies.
+
+Pass `uri_reader_factory=file_io.uri_reader_factory` to use PyPaimon's source
+readers; the factory/stream protocol is described above. Without a custom
+factory, the low-level API resolves local files and HTTP sources. Each distinct
+physical video is copied with bounded reads and its source stream is closed.
+The output stream must provide `write(bytes)` and `close()`; `flush()` is optional.
+Write and close errors preserve the original Python exception and close the output
+stream. `abort()` closes without writing a footer. The caller removes incomplete
+destinations and owns table metadata and commit handling for this low-level API.
+
 ### Native commit from serialized messages
 
 The Python binding follows Java's batch/stream builder structure. Use

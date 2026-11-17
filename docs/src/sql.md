@@ -41,7 +41,7 @@ and writes to ordinary Paimon tables can create them with `file.format=mosaic`.
 SQL support has two layers:
 
 - DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
-- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `MSCK REPAIR TABLE`, `ANALYZE TABLE`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`. `MERGE INTO` uses DataFusion's native planner and the Paimon table provider for execution.
+- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, `CREATE FUNCTION`, and `DROP FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `MSCK REPAIR TABLE`, `ANALYZE TABLE`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`. `MERGE INTO` uses DataFusion's native planner and the Paimon table provider for execution.
 
 Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. Persistent `CREATE FUNCTION` is supported only for the REST Catalog SQL scalar form documented below. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
 
@@ -156,7 +156,7 @@ It also manages session-scoped dynamic options internally for `SET`/`RESET` supp
 
 ### REST Catalog Views and SQL Functions
 
-When the registered catalog is a Paimon REST Catalog, `SQLContext` can read, execute, create, and drop persistent views and can create SQL scalar functions.
+When the registered catalog is a Paimon REST Catalog, `SQLContext` can read, execute, create, and drop persistent views and SQL scalar functions.
 
 Create a persistent view with this syntax:
 
@@ -260,6 +260,21 @@ RETURN amount * DECIMAL '1.10';
 SELECT add_tax(total) FROM orders;
 ```
 
+Drop a persistent function using a bare, two-part, or three-part name:
+
+```sql
+DROP FUNCTION add_tax;
+DROP FUNCTION IF EXISTS reporting.add_tax;
+DROP FUNCTION IF EXISTS paimon.reporting.add_tax;
+```
+
+Persistent `DROP FUNCTION` is implemented by REST Catalog and sends a direct
+delete request. `IF EXISTS` ignores only a missing function; permission and
+server errors are preserved. Only one function may be dropped per statement.
+Argument signatures, `CASCADE`, `RESTRICT`, and `DROP TEMPORARY FUNCTION` are not
+supported for Paimon catalogs. Catalogs without persistent function support may
+return `Unsupported`.
+
 Bare, two-part (`database.function`), and three-part
 (`catalog.database.function`) names are accepted as creation targets. Unquoted
 names are normalized and quoted names are preserved. Calls remain limited to
@@ -313,9 +328,9 @@ functions. Two-part function names such as `database.function(...)`, lambda or
 file definitions, aggregate/table/multi-return functions, and non-deterministic
 functions are not supported. `CREATE OR REPLACE/ALTER/TEMPORARY FUNCTION`,
 non-SQL bodies, `STABLE`/`VOLATILE`, null-input/parallel/security/SET clauses,
-options/remote functions, and persistent `ALTER FUNCTION` / `DROP FUNCTION`
-are also not supported. Catalog implementations other than REST Catalog may
-return `Unsupported` for persistent function creation.
+options/remote functions, and persistent `ALTER FUNCTION` are also not supported.
+Catalog implementations other than REST Catalog may return `Unsupported` for
+persistent function creation or deletion.
 
 ## Data Types
 
@@ -341,14 +356,25 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `TIMESTAMP WITH TIME ZONE` | LocalZonedTimestampType | |
 | `DECIMAL(p, s)` | DecimalType | |
 | `ARRAY<element>` | ArrayType | e.g. `ARRAY<INT>` |
+| `VECTOR<element, n>` | VectorType | Fixed-size vector; `n` is between 1 and 2147483647 |
 | `MAP(key, value)` | MapType | e.g. `MAP(STRING, INT)` |
 | `STRUCT<field TYPE, ...>` | RowType | e.g. `STRUCT<city STRING, zip INT>` |
 
-For vector search tables created from SQL, use `ARRAY<FLOAT>` for embedding
-columns. Existing Paimon tables may also expose logical `VECTOR<FLOAT,N>`
-columns; DataFusion reads those as Arrow `FixedSizeList<Float32>`, and vindex
-index creation uses `N` as the vector dimension. `SHOW CREATE TABLE` currently
-does not round-trip `VECTOR` columns.
+`VECTOR<element, n>` follows Paimon's logical vector type. Elements must be
+`BOOLEAN`, `TINYINT`, `SMALLINT`, `INT` / `INTEGER`, `BIGINT`, `FLOAT` / `REAL`,
+or `DOUBLE` / `DOUBLE PRECISION`. The vector and its elements are nullable by
+default; for example, `embedding VECTOR<FLOAT NOT NULL, 128> NOT NULL` disallows
+both null vectors and null elements. The syntax is supported in `CREATE TABLE`,
+`ALTER TABLE`, and `CAST`, including vectors nested in arrays, maps, and structs.
+`SHOW CREATE TABLE` preserves the element type, dimension, and nullability.
+Nested vectors can also be non-null, for example
+`ARRAY<VECTOR<FLOAT NOT NULL, 128> NOT NULL>`.
+In `CAST` targets, SQL fixed-size arrays (`T[n]`) inside a `MAP` containing
+vectors are not supported; use `ARRAY<T>` for variable-length collections.
+
+For vector search embeddings, use `VECTOR<FLOAT, n>` or `ARRAY<FLOAT>`.
+DataFusion represents `VECTOR<FLOAT, n>` as Arrow `FixedSizeList<Float32>`, and
+vindex index creation uses `n` from the type as the vector dimension.
 
 ### Blob Columns
 
@@ -395,6 +421,14 @@ For serialized `BlobDescriptor` values supplied by another Paimon engine,
 The offset must be non-negative, and lengths below `-1` are invalid.
 
 The same directives are supported by `ALTER TABLE ... ADD COLUMN`.
+
+Append-only data-evolution tables can set `video-frame-field` to a
+comma-separated list of scalar BLOB columns. Native writers accept serialized
+`VideoFrameDescriptor` values for these columns and pack complete encoded videos
+into `.video` files, deduplicating each source URI/range within one file and
+indexing logical frame runs. Readers return lazy frame descriptors. Video packing
+does not decode or re-encode frames. Raw video bytes, ordinary BlobDescriptors,
+video-column updates, video compaction, and BlobConsumer callbacks are unsupported.
 
 ### Blob Descriptor Functions
 
@@ -1054,7 +1088,33 @@ For append-only tables (no primary key), updates are executed using Copy-on-Writ
 UPDATE paimon.my_db.t SET name = 'a_new' WHERE id = 1;
 ```
 
-For data-evolution row-tracking tables without primary keys, updates are executed with row-id-based partial-column writes. Primary-key tables are not supported for `UPDATE`.
+For data-evolution row-tracking tables without primary keys, updates are executed with row-id-based partial-column writes.
+
+Ordinary primary-key tables using `merge-engine=deduplicate` support `UPDATE` by
+writing complete updated rows with the `UPDATE_AFTER` row kind. All SET
+expressions use the original row; unassigned columns retain their values.
+Primary-key and partition columns cannot be assigned.
+
+The target and its live self-references in predicates and SET expressions use
+one captured snapshot, including uncompacted deletion-vector versions. Target
+validation and read-option restrictions follow the primary-key DELETE rules
+below. Explicit historical and incremental views keep their selected read view.
+
+Configured sequence values are preserved unless assigned by SET, and the normal
+sequence sort order applies to the updated rows. A lower-priority assigned
+sequence or a higher-priority concurrent upsert can leave the stored row
+unchanged. The affected-row count reports rows matching the predicate in the
+captured snapshot, including updates that lose under these merge rules. This
+does not provide serializable updates.
+
+No matches publish no snapshot. Publication retries reuse prepared files without
+rescanning; repeating the SQL statement is a new operation. A commit error can
+occur after publication, so prepared files are retained and the error identifies
+the table and commit user.
+
+Other merge engines, `rowkind.field`, query-authorized targets, aliases, joins,
+`FROM`, `RETURNING`, `OUTPUT`, `ORDER BY`, `LIMIT`, target modifiers and tuple or
+qualified/nested SET targets are not supported by this primary-key UPDATE path.
 
 ### DELETE
 
@@ -1712,6 +1772,10 @@ offset and must not be passed directly as an epoch timestamp.
 
 Build and commit a global index for a table column.
 
+As in Paimon's Flink SQL and Spark SQL integrations, global indexes are created
+through `CALL sys.create_global_index`. `CREATE INDEX ... ON ...` DDL is not
+supported.
+
 To maintain indexes synchronously after writes, declare columns through options
 such as `global-index.btree.index-columns='id'`. Maintenance runs by default
 when `write-only=false`; see
@@ -1754,6 +1818,26 @@ CALL sys.create_global_index(
   options => 'full-text.tokenizer=jieba,full-text.remove-stop-words=false'
 );
 ```
+
+Set `partitions` to build indexes only for matching partitions. As in Flink SQL
+and Spark SQL, `,` combines constraints with AND and `;` combines alternatives
+with OR. Omitted partition keys are unrestricted; omitting `partitions` builds
+all partitions. Values are parsed using each partition column's type, and the
+table's `partition.default-name` selects NULL values. Invalid filters and
+partition filters on unpartitioned tables are rejected before files are written.
+
+```sql
+CALL sys.create_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'id',
+  index_type => 'btree',
+  partitions => 'dt=2026-10-10,hr=1;dt=2026-10-11,hr=2'
+);
+```
+
+Index coverage outside the selected partitions is preserved. If the selected
+data is already indexed and unchanged, or no data matches, no snapshot is
+committed.
 
 `index_type` defaults to `btree`. It is case-insensitive and surrounding
 whitespace is ignored. BTree and bitmap global indexes support scalar columns.
@@ -1946,7 +2030,7 @@ Supported vindex options:
 
 | Option | Default | Applies To | Description |
 |---|---:|---|---|
-| `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. Existing `VECTOR<FLOAT,N>` columns use `N` from the type. |
+| `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. `VECTOR<FLOAT,N>` columns use `N` from the type. |
 | `<index-type>.distance.metric` | `inner_product` | all vindex types | Distance metric: `inner_product`, `cosine`, or `l2`. |
 | `<index-type>.nlist` | automatic | all IVF types | Number of IVF lists. When omitted or `auto`, infer it from `expected-vector-count`. DiskANN rejects this option. |
 | `<index-type>.expected-vector-count` | unset, or inferred | all vindex types | Expected number of vectors used for automatic sizing. When omitted, an automatic IVF build counts the shard's non-NULL vectors before training. |
@@ -2044,7 +2128,9 @@ when `N` is zero. `dry_run` defaults to `false`; an explicit `false` or an
 omitted argument performs the drop and returns `OK`. Other values are rejected.
 The preview uses the latest snapshot at the time of the call; concurrent changes
 can affect the number of files matched by a later drop. Reads retain the usual
-local-cache behavior. Partition filtering is not supported by this procedure.
+local-cache behavior. The optional `partitions` argument uses the same filter
+syntax as [create_global_index](#create_global_index) and restricts the drop to
+matching partitions.
 
 ### compact
 

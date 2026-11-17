@@ -168,6 +168,35 @@ async fn show_create_view_supports_native_datafusion_views() {
 }
 
 #[tokio::test]
+async fn show_create_view_round_trip_preserves_vector_values_and_type() {
+    let (_tmp, ctx) = common::setup_sql_context().await;
+    for (modifier, view) in [
+        ("", "datafusion.public.vector_view"),
+        ("TEMPORARY ", "paimon.test_db.vector_view"),
+    ] {
+        ctx.sql(&format!(
+            "CREATE {modifier}VIEW {view} AS SELECT CAST([1, 2] AS VECTOR<FLOAT, 2>) AS embedding"
+        ))
+        .await
+        .unwrap();
+        let select = format!("SELECT embedding FROM {view}");
+        let original = ctx.sql(&select).await.unwrap().collect().await.unwrap();
+        assert!(matches!(
+            original[0].schema().field(0).data_type(),
+            DataType::FixedSizeList(element, 2) if element.data_type() == &DataType::Float32
+        ));
+
+        let shown = rows(&ctx, &format!("SHOW CREATE VIEW {view}")).await;
+        ctx.sql(&format!("DROP {modifier}VIEW {view}"))
+            .await
+            .unwrap();
+        ctx.sql(&shown[0][3]).await.unwrap();
+        let recreated = ctx.sql(&select).await.unwrap().collect().await.unwrap();
+        assert_eq!(recreated, original);
+    }
+}
+
+#[tokio::test]
 async fn show_create_native_view_preserves_creation_namespace() {
     let ctx = SQLContext::new();
     ctx.ctx().sql("CREATE SCHEMA other").await.unwrap();

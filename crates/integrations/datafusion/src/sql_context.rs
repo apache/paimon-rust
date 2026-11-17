@@ -41,6 +41,7 @@
 //! - `CREATE VIEW [IF NOT EXISTS] view [(col, ...)] AS query`
 //! - `DROP VIEW [IF EXISTS] view`
 //! - `CREATE FUNCTION name(args) RETURNS type [LANGUAGE SQL] RETURN expression`
+//! - `DROP FUNCTION [IF EXISTS] name`
 //! - `TRUNCATE TABLE db.t`
 //! - `TRUNCATE TABLE db.t PARTITION (col = val, ...)`
 
@@ -161,7 +162,7 @@ impl SQLContextBuilder {
             .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
             .with_spark_features()
-            .with_type_planner(Arc::new(crate::binary_cast::BinaryTypePlanner))
+            .with_type_planner(Arc::new(crate::vector_type::PaimonTypePlanner))
             .with_relation_planners(vec![
                 Arc::new(crate::lateral_views::ExplodeRelationPlanner),
                 Arc::new(crate::relation_planner::PaimonRelationPlanner::new()),
@@ -498,8 +499,8 @@ impl SQLContext {
 
         let alter_comment = parse_alter_column_comment(&rewritten_sql)?;
         let from_alter_comment = alter_comment.is_some();
-        let mut statements = if let Some(statement) = alter_comment {
-            vec![statement]
+        let (mut statements, vector_changed) = if let Some(statement) = alter_comment {
+            (vec![statement], false)
         } else {
             parse_sql_statements(&rewritten_sql)?
         };
@@ -521,7 +522,7 @@ impl SQLContext {
                 crate::expression_compat::rewrite(&mut statements[0], &self.ctx.state())?;
             binary_changed || regex_changed || lateral_changed || compat_changed
         };
-        let sql = if changed {
+        let sql = if changed || vector_changed {
             rewritten = statements[0].to_string();
             rewritten.as_str()
         } else {
@@ -768,6 +769,49 @@ impl SQLContext {
                 } else {
                     self.ctx.sql_with_options(sql, options).await
                 }
+            }
+            Statement::DropFunction(drop_function)
+                if drop_function
+                    .func_desc
+                    .iter()
+                    .any(|function| self.is_paimon_function_name(&function.name)) =>
+            {
+                // sqlparser consumes TEMPORARY without retaining it in the function AST.
+                let temporary = {
+                    let mut parser = Parser::new(&GenericDialect {})
+                        .try_with_sql(&rewritten_sql)
+                        .map_err(|error| {
+                            DataFusionError::Plan(format!("SQL parse error: {error}"))
+                        })?;
+                    while parser.consume_token(&Token::SemiColon) {}
+                    parser.parse_keywords(&[Keyword::DROP, Keyword::TEMPORARY, Keyword::FUNCTION])
+                };
+                if temporary {
+                    return Err(DataFusionError::NotImplemented(
+                        "DROP TEMPORARY FUNCTION is not supported for Paimon catalogs".to_string(),
+                    ));
+                }
+                let [function] = drop_function.func_desc.as_slice() else {
+                    return Err(DataFusionError::Plan(
+                        "Persistent DROP FUNCTION does not support multiple functions".to_string(),
+                    ));
+                };
+                if let Some(behavior) = &drop_function.drop_behavior {
+                    return Err(DataFusionError::Plan(format!(
+                        "DROP FUNCTION {behavior} is not supported"
+                    )));
+                }
+                if function.args.is_some() {
+                    return Err(DataFusionError::Plan(
+                        "DROP FUNCTION argument signatures are not supported".to_string(),
+                    ));
+                }
+                let (catalog, _, identifier) = self.resolve_catalog_and_function(&function.name)?;
+                catalog
+                    .drop_function(&identifier, drop_function.if_exists)
+                    .await
+                    .map_err(to_datafusion_error)?;
+                ok_result(&self.ctx)
             }
             Statement::Drop {
                 object_type: ObjectType::Database,
@@ -1551,7 +1595,7 @@ impl SQLContext {
                 // DataFusion stores CREATE VIEW, whereas Paimon temporary views
                 // store only their query. Neither the provider nor a bare table
                 // scan reliably records the namespace used at creation.
-                let statements = parse_sql_statements(stored)?;
+                let (statements, _) = parse_sql_statements(stored)?;
                 let (query, query_sql) = match statements.as_slice() {
                     [Statement::CreateView(create)] => {
                         (create.query.as_ref(), create.query.to_string())
@@ -2898,7 +2942,7 @@ fn typed_view_query(view: &paimon::catalog::View) -> DFResult<String> {
         )
     };
     let query = match parse_sql_statements(view.query_for("datafusion")) {
-        Ok(mut statements)
+        Ok((mut statements, _))
             if statements.len() == 1 && matches!(statements[0], Statement::Query(_)) =>
         {
             let Statement::Query(query) = statements.remove(0) else {
@@ -2911,7 +2955,9 @@ fn typed_view_query(view: &paimon::catalog::View) -> DFResult<String> {
             if let SetExpr::Select(select) = query.body.as_ref() {
                 if let [from] = select.from.as_slice() {
                     if let TableFactor::Derived { subquery, .. } = &from.relation {
-                        if let Ok(expected) = parse_sql_statements(&render(&subquery.to_string())) {
+                        if let Ok((expected, _)) =
+                            parse_sql_statements(&render(&subquery.to_string()))
+                        {
                             if expected.len() == 1 && expected[0].to_string() == normalized {
                                 return Ok(normalized);
                             }
@@ -3091,9 +3137,9 @@ fn validate_persistent_create_function(create_function: &CreateFunction) -> DFRe
     Ok(())
 }
 
-fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
+fn parse_sql_statements(sql: &str) -> DFResult<(Vec<Statement>, bool)> {
     if let Some(statement) = crate::extended_describe::parse_describe(sql)? {
-        return Ok(vec![statement]);
+        return Ok((vec![statement], false));
     }
     let regex_sql = crate::regex_operators::parseable_sql(sql)?;
     let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
@@ -3144,9 +3190,7 @@ fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
             .map(|(_, token)| token)
             .collect();
     }
-    let mut statements = Parser::new(&dialect)
-        .with_tokens_with_locations(tokens)
-        .parse_statements()
+    let (mut statements, vector_changed) = crate::vector_type::parse_statements(tokens)
         .map_err(|error| DataFusionError::Plan(format!("SQL parse error: {error}")))?;
     if create_function_if_not_exists {
         let Some(Statement::CreateFunction(create_function)) = statements.first_mut() else {
@@ -3164,7 +3208,7 @@ fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
         };
         create_function.or_alter = true;
     }
-    Ok(statements)
+    Ok((statements, vector_changed))
 }
 
 /// Parse the Paimon/Flink column-comment spelling into the standard COMMENT AST.
@@ -3678,13 +3722,17 @@ fn column_def_nullable(col: &ColumnDef) -> bool {
 ///
 /// DDL schema translation must use this function instead of going through Arrow,
 /// because Arrow cannot preserve logical distinctions such as `BLOB` vs `VARBINARY`.
-fn sql_data_type_to_paimon_type(
+pub(crate) fn sql_data_type_to_paimon_type(
     sql_type: &datafusion::sql::sqlparser::ast::DataType,
     nullable: bool,
 ) -> DFResult<PaimonDataType> {
     use datafusion::sql::sqlparser::ast::{
         ArrayElemTypeDef, DataType as SqlType, ExactNumberInfo, TimezoneInfo,
     };
+
+    if let Some(vector) = crate::vector_type::sql_type_to_vector(sql_type, nullable)? {
+        return Ok(PaimonDataType::Vector(vector));
+    }
 
     match sql_type {
         SqlType::Boolean => Ok(PaimonDataType::Boolean(BooleanType::with_nullable(
@@ -4635,6 +4683,14 @@ mod tests {
     use paimon::table::Table;
 
     #[test]
+    fn test_sql_context_sql_future_is_send() {
+        fn assert_send(_: impl Send) {}
+        let ctx = SQLContext::new();
+        assert_send(ctx.sql("DROP FUNCTION db.fn"));
+        assert_send(ctx.sql_with_options("DROP FUNCTION db.fn", SQLOptions::new()));
+    }
+
+    #[test]
     fn test_sql_context_builder_uses_custom_runtime_env() {
         let runtime_env = RuntimeEnvBuilder::new()
             .with_memory_pool(Arc::new(FairSpillPool::new(1024)))
@@ -4831,6 +4887,20 @@ mod tests {
             Ok(())
         }
 
+        async fn drop_function(
+            &self,
+            identifier: &Identifier,
+            ignore_if_not_exists: bool,
+        ) -> paimon::Result<()> {
+            if self.functions.lock().unwrap().remove(identifier).is_some() || ignore_if_not_exists {
+                Ok(())
+            } else {
+                Err(paimon::Error::FunctionNotExist {
+                    full_name: identifier.full_name(),
+                })
+            }
+        }
+
         async fn get_function(
             &self,
             identifier: &Identifier,
@@ -5011,6 +5081,84 @@ mod tests {
             Identifier::new(database, name),
             schema,
         ));
+    }
+
+    #[tokio::test]
+    async fn vector_sql_types_in_persistent_functions_and_views() {
+        use datafusion::arrow::array::{FixedSizeListArray, Float32Array};
+
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog.clone()).await;
+        ctx.sql(
+            "CREATE FUNCTION vector_identity(x VECTOR<FLOAT, 2>) \
+             RETURNS VECTOR<FLOAT, 2> RETURN CAST(x AS VECTOR<FLOAT, 2>)",
+        )
+        .await
+        .unwrap();
+        let function = catalog
+            .get_function(&Identifier::new("default", "vector_identity"))
+            .await
+            .unwrap();
+        let expected = PaimonDataType::Vector(
+            paimon::spec::VectorType::new(2, PaimonDataType::Float(FloatType::new())).unwrap(),
+        );
+        assert_eq!(function.input_params().unwrap()[0].data_type(), &expected);
+        assert_eq!(function.return_params().unwrap()[0].data_type(), &expected);
+        ctx.sql(
+            "CREATE VIEW vector_view AS SELECT \
+             vector_identity(CAST([1, 2] AS VECTOR<FLOAT, 2>)) AS embedding",
+        )
+        .await
+        .unwrap();
+        let batches = ctx
+            .sql("SELECT embedding FROM vector_view")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let vectors = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let value = vectors.value(0);
+        assert_eq!(
+            value
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .values(),
+            &[1.0, 2.0]
+        );
+
+        for (name, sql_type) in [
+            ("vector_map_identity", "MAP(STRING, VECTOR<FLOAT, 2>)"),
+            ("vector_array_identity", "ARRAY<VECTOR<FLOAT, 2>>"),
+            ("vector_struct_identity", "STRUCT<v VECTOR<FLOAT, 2>>"),
+        ] {
+            ctx.sql(&format!(
+                "CREATE FUNCTION {name}(x {sql_type}) RETURNS {sql_type} RETURN x"
+            ))
+            .await
+            .unwrap();
+            let batches = ctx
+                .sql(&format!("SELECT {name}(CAST(NULL AS {sql_type})) AS v"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let function = catalog
+                .get_function(&Identifier::new("default", name))
+                .await
+                .unwrap();
+            let actual =
+                paimon::arrow::arrow_to_paimon_type(batches[0].column(0).data_type(), true)
+                    .unwrap();
+            assert_eq!(&actual, function.return_params().unwrap()[0].data_type());
+            assert!(batches[0].column(0).is_null(0));
+        }
     }
 
     #[tokio::test]
@@ -5255,7 +5403,7 @@ mod tests {
         let before_type = before.schema().field(0).data_type().clone();
         assert_eq!(before_type, ArrowDataType::Int32);
         let mut definition = shown_view_definition(&ctx, "typed_view").await;
-        let canonical = parse_sql_statements(&definition).unwrap()[0].to_string();
+        let canonical = parse_sql_statements(&definition).unwrap().0[0].to_string();
         for cycle in 0..4 {
             ctx.sql("DROP VIEW typed_view").await.unwrap();
             ctx.sql(&definition).await.unwrap();
@@ -5268,7 +5416,7 @@ mod tests {
             );
             definition = shown_view_definition(&ctx, "typed_view").await;
             assert_eq!(
-                parse_sql_statements(&definition).unwrap()[0].to_string(),
+                parse_sql_statements(&definition).unwrap().0[0].to_string(),
                 canonical,
                 "cycle {cycle}"
             );
@@ -5705,6 +5853,165 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_resolves_supported_name_forms() {
+        let catalog = Arc::new(MockCatalog::new());
+        let other_catalog = Arc::new(MockCatalog::new());
+        let mut ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.register_catalog("other", other_catalog.clone())
+            .await
+            .unwrap();
+        ctx.set_current_database("session_db").await.unwrap();
+        for (sql, target, database, name) in [
+            ("DROP FUNCTION BARE", &catalog, "session_db", "bare"),
+            (
+                "DROP FUNCTION IF EXISTS DB.QUALIFIED",
+                &catalog,
+                "db",
+                "qualified",
+            ),
+            ("DROP FUNCTION OTHER.DB.FULL", &other_catalog, "db", "full"),
+            (
+                "DROP FUNCTION \"other\".\"Db\".\"Fn\"",
+                &other_catalog,
+                "Db",
+                "Fn",
+            ),
+            ("DROP FUNCTION \"Db\".\"Fn\"", &catalog, "Db", "Fn"),
+            (
+                "DROP FUNCTION \"TEMPORARY\"",
+                &catalog,
+                "session_db",
+                "TEMPORARY",
+            ),
+            (
+                "; /* empty */ ; DROP FUNCTION db.\"quoted.fn\";",
+                &catalog,
+                "db",
+                "quoted.fn",
+            ),
+        ] {
+            add_unary_sql_function_in_database(target, database, name, "x + 1", true);
+            ctx.sql(sql).await.unwrap();
+            assert!(target.function_lookups.lock().unwrap().is_empty());
+            assert!(matches!(
+                target.get_function(&Identifier::new(database, name)).await,
+                Err(paimon::Error::FunctionNotExist { .. })
+            ));
+            target.function_lookups.lock().unwrap().clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_honors_if_exists() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog).await;
+
+        let error = ctx.sql("DROP FUNCTION db.missing").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Function db.missing does not exist"),
+            "{error}"
+        );
+        ctx.sql("DROP FUNCTION IF EXISTS db.missing").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_rejects_unsupported_forms_before_deleting() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "kept", "x + 1", true);
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        for (sql, expected) in [
+            ("DROP FUNCTION kept CASCADE", "CASCADE"),
+            ("DROP FUNCTION kept RESTRICT", "RESTRICT"),
+            ("DROP FUNCTION kept()", "signatures"),
+            ("DROP FUNCTION kept(BIGINT)", "signatures"),
+            ("DROP FUNCTION kept; SELECT 1", "exactly one SQL statement"),
+            (
+                "DROP FUNCTION datafusion.public.other, paimon.default.kept",
+                "multiple functions",
+            ),
+        ] {
+            let error = ctx.sql(sql).await.unwrap_err();
+            assert!(error.to_string().contains(expected), "{sql}: {error}");
+            assert!(catalog
+                .functions
+                .lock()
+                .unwrap()
+                .contains_key(&Identifier::new("default", "kept")));
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_preserves_local_function_with_same_name() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "abs", "x + 1", true);
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.sql("DROP FUNCTION abs").await.unwrap();
+        assert!(catalog.functions.lock().unwrap().is_empty());
+        ctx.sql("DROP FUNCTION IF EXISTS abs").await.unwrap();
+        assert!(ctx.ctx.state().scalar_functions().contains_key("abs"));
+        ctx.sql("SELECT abs(-1)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_rejects_temporary_before_deleting() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_unary_sql_function(&catalog, "abs", "x + 1", true);
+        add_unary_sql_function_in_database(&catalog, "db", "kept", "x + 1", true);
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        for sql in [
+            "DROP TEMPORARY FUNCTION abs",
+            "-- leading comment\nDROP /* modifier */ TEMPORARY FUNCTION IF EXISTS db.kept",
+            "; /* empty statements */ ; dRoP TeMpOrArY FuNcTiOn IF EXISTS db.kept;",
+        ] {
+            let error = ctx
+                .sql(sql)
+                .await
+                .expect_err("temporary function drop must be rejected");
+            assert!(
+                error.to_string().contains("DROP TEMPORARY FUNCTION"),
+                "{error}"
+            );
+            assert_eq!(catalog.functions.lock().unwrap().len(), 2);
+            assert!(ctx.ctx.state().scalar_functions().contains_key("abs"));
+        }
+    }
+
+    #[tokio::test]
+    async fn function_drop_delegates_without_paimon_catalog() {
+        for sql in ["DROP FUNCTION abs", "DROP TEMPORARY FUNCTION abs"] {
+            let ctx = SQLContext::new();
+            assert!(ctx.ctx.state().scalar_functions().contains_key("abs"));
+            ctx.sql(sql).await.unwrap();
+            assert!(!ctx.ctx.state().scalar_functions().contains_key("abs"));
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_drop_preserves_unsupported_catalog_error() {
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog_with_default_db("paimon", Arc::new(ProbeTrackingCatalog::new()), None)
+            .await
+            .unwrap();
+        let error = ctx
+            .sql("DROP FUNCTION IF EXISTS db.missing")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Catalog does not support functions"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

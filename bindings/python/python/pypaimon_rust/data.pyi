@@ -15,9 +15,54 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import Sequence
+from typing import BinaryIO, Optional, Sequence
 
 import pyarrow
+
+from .uri_reader import UriReaderFactory
+
+class VideoFrameDescriptor:
+    """Java/PyPaimon-compatible reference to one frame of a complete encoded video."""
+    def __init__(self, uri: str, offset: int, length: int, frame_index: int,
+                 moov_offset: int = 0, moov_length: int = 0) -> None: ...
+    @property
+    def uri(self) -> str: ...
+    @property
+    def offset(self) -> int: ...
+    @property
+    def length(self) -> int: ...
+    @property
+    def frame_index(self) -> int: ...
+    @property
+    def moov_offset(self) -> int: ...
+    @property
+    def moov_length(self) -> int: ...
+    def serialize(self) -> bytes: ...
+    @staticmethod
+    def deserialize(value: bytes) -> "VideoFrameDescriptor": ...
+
+class VideoFormatWriter:
+    """Own an output stream and pack encoded videos without decoding them.
+
+    Sources default to local files/HTTP. Supply a URI factory for PyPaimon FileIO.
+    A failed write closes the stream; callers remove the incomplete destination.
+    """
+    def __init__(self, output_stream: BinaryIO, *,
+                 uri_reader_factory: Optional[UriReaderFactory] = None,
+                 copy_buffer_size: int = 4096) -> None: ...
+    def write_frames(self, frames: Sequence[Optional[bytes]]) -> None:
+        """Accept serialized VideoFrameDescriptors from Rust or PyPaimon, and NULLs."""
+        ...
+    def write_arrow(self, batch: pyarrow.RecordBatch) -> None:
+        """Accept one large_binary column of frame descriptors."""
+        ...
+    def num_bytes(self) -> int: ...
+    def close(self) -> int:
+        """Finalize and close; return the total file size. Repeated close is safe."""
+        ...
+    def abort(self) -> None:
+        """Close without finalizing. The caller removes the incomplete output."""
+        ...
 
 def read_arrow_schema(fields: str) -> pyarrow.Schema:
     """Build the runtime read schema from Paimon fields (JSON)."""

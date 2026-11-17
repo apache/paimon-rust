@@ -1576,6 +1576,116 @@ async fn global_index_entries(
 }
 
 #[tokio::test]
+async fn test_create_global_index_partitions_select_and_extend_coverage() {
+    for (column, index_type) in [("id", "btree"), ("name", "full-text")] {
+        let (tmp, sql_context, table) =
+            setup_partitioned_global_index_table("create_partitions", false).await;
+        exec(
+            &sql_context,
+            "INSERT INTO paimon.test_db.create_partitions (id, dt, name, hr) VALUES \
+             (1, DATE '2026-10-10', 'alpha', 1), (2, DATE '2026-10-10', 'beta', 2), \
+             (3, DATE '2026-10-11', 'gamma', 1), (4, DATE '2026-10-11', 'delta', 2), \
+             (5, DATE '2026-10-12', 'epsilon', 1), (6, NULL, 'zeta', 1)",
+        )
+        .await;
+        let call = format!(
+            "CALL paimon.sys.create_global_index(\
+             `table` => 'test_db.create_partitions', `index_column` => '{column}', \
+             `index_type` => '{index_type}'"
+        );
+        let selected_call =
+            format!("{call}, partitions => ' dt = 2026-10-10, hr = 01 ; hr=2,dt=2026-10-11 ')");
+        exec(&sql_context, &selected_call).await;
+        let selected = global_index_entries(&table).await;
+        let mut partitions = selected
+            .values()
+            .map(|entry| {
+                assert_eq!(entry.index_file.index_type, index_type);
+                assert_eq!(entry.index_file.row_count, 1);
+                let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+                (row.get_int(0).unwrap(), row.get_int(1).unwrap())
+            })
+            .collect::<Vec<_>>();
+        partitions.sort_unstable();
+        let day = |text: &str| {
+            (chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
+                - chrono::DateTime::UNIX_EPOCH.date_naive())
+            .num_days() as i32
+        };
+        assert_eq!(
+            partitions,
+            vec![(1, day("2026-10-10")), (2, day("2026-10-11"))]
+        );
+
+        // Rebuilding covered partitions or selecting no data must not commit.
+        let before = table_files(tmp.path());
+        exec(&sql_context, &selected_call).await;
+        exec(
+            &sql_context,
+            &format!("{call}, partitions => 'dt=2026-10-09')"),
+        )
+        .await;
+        assert_eq!(table_files(tmp.path()), before, "{index_type}");
+
+        exec(
+            &sql_context,
+            &format!("{call}, partitions => 'dt=__DEFAULT_PARTITION__')"),
+        )
+        .await;
+        let with_null = global_index_entries(&table).await;
+        assert_eq!(with_null.len(), 3);
+        assert!(with_null.values().any(|entry| {
+            let row = paimon::spec::BinaryRow::from_serialized_bytes(&entry.partition).unwrap();
+            row.get_int(0).unwrap() == 1 && row.is_null_at(1)
+        }));
+
+        // Omitting the filter fills remaining partitions and preserves existing files.
+        exec(&sql_context, &format!("{call})")).await;
+        let all = global_index_entries(&table).await;
+        assert_eq!(all.len(), 6);
+        for (file, entry) in with_null {
+            assert_eq!(all.get(&file), Some(&entry));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_create_global_index_partitions_reject_invalid_filters_without_writes() {
+    let (tmp, sql_context, _) =
+        setup_partitioned_global_index_table("create_invalid_partitions", false).await;
+    let before = table_files(tmp.path());
+    for (argument, message) in [
+        ("'dt'", "Expected key=value"),
+        ("'id=1'", "not a partition column"),
+        ("'dt=2026-02-30'", "Invalid partitions value"),
+        ("'hr=1,hr=2'", "Duplicate partition column"),
+        ("'dt='", "Empty partitions value"),
+        ("NULL", "NULL"),
+    ] {
+        assert_sql_error(
+            &sql_context,
+            &format!(
+                "CALL sys.create_global_index(table => 'test_db.create_invalid_partitions', \
+                 index_column => 'id', partitions => {argument})"
+            ),
+            message,
+        )
+        .await;
+        assert_eq!(table_files(tmp.path()), before, "{argument}");
+    }
+    let (tmp, sql_context) = setup_btree_global_index_table("create_unpartitioned").await;
+    let before = table_files(tmp.path());
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.create_unpartitioned', \
+         index_column => 'id', partitions => 'dt=2026-10-10')",
+        "unpartitioned table",
+    )
+    .await;
+    assert_eq!(table_files(tmp.path()), before);
+}
+
+#[tokio::test]
 async fn test_drop_global_index_partitions_preserve_other_partitions_and_definitions() {
     let day = |text: &str| {
         (chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()

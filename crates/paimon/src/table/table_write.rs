@@ -299,11 +299,6 @@ impl TableWrite {
         let write_schema = build_target_arrow_schema(schema.fields())?;
         let core_options = CoreOptions::new(schema.options());
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
-        if !core_options.video_frame_fields().is_empty() {
-            return Err(crate::Error::Unsupported {
-                message: "Writing packed video files is not supported yet".into(),
-            });
-        }
         let blob_view_fields = core_options.blob_view_fields();
         let blob_inline_fields = core_options.blob_inline_fields();
 
@@ -768,6 +763,15 @@ impl TableWrite {
         if self.format_writer.is_some() {
             return Err(crate::Error::Unsupported {
                 message: "with_blob_consumer requires a Paimon table".into(),
+            });
+        }
+        if consumer.is_some()
+            && !CoreOptions::new(self.table.schema().options())
+                .video_frame_fields()
+                .is_empty()
+        {
+            return Err(crate::Error::Unsupported {
+                message: "BlobConsumer is not supported for video frame fields".into(),
             });
         }
         self.blob_consumer = consumer;

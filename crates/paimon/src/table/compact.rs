@@ -49,7 +49,7 @@ use crate::{Error, Result};
 
 /// Creates planners, executors and a committer with one shared configuration.
 /// Output size and append task selection use the captured table options.
-/// Supports ordinary append, data-evolution normal and opt-in BLOB files,
+/// Supports ordinary append, data-evolution normal and opt-in BLOB/Vector files,
 /// and fixed or dynamic bucket PK tables. Data evolution preserves row IDs
 /// and logical deletions.
 pub struct CompactBuilder<'a> {
@@ -58,6 +58,7 @@ pub struct CompactBuilder<'a> {
     resources: Option<ResourceContext>,
     commit_user: String,
     compact_blob: bool,
+    compact_vector: bool,
 }
 
 impl<'a> CompactBuilder<'a> {
@@ -68,6 +69,7 @@ impl<'a> CompactBuilder<'a> {
             resources: None,
             commit_user: uuid::Uuid::new_v4().to_string(),
             compact_blob: false,
+            compact_vector: false,
         }
     }
 
@@ -94,6 +96,14 @@ impl<'a> CompactBuilder<'a> {
         self
     }
 
+    /// Include dedicated Data Evolution Vector files in planning.
+    /// Disabled by default. Cross-group outputs require the normal merge in
+    /// the same or an earlier commit.
+    pub fn with_vector_compaction(mut self, enabled: bool) -> Self {
+        self.compact_vector = enabled;
+        self
+    }
+
     pub fn with_commit_user(mut self, commit_user: impl Into<String>) -> Result<Self> {
         let commit_user = commit_user.into();
         validate_commit_user(&commit_user)?;
@@ -109,6 +119,11 @@ impl<'a> CompactBuilder<'a> {
                 message: "Dedicated BLOB compaction requires a Data Evolution table".into(),
             });
         }
+        if self.compact_vector && !options.data_evolution_enabled() {
+            return Err(Error::Unsupported {
+                message: "Dedicated Vector compaction requires a Data Evolution table".into(),
+            });
+        }
         if options.target_file_size() <= 0 {
             return Err(Error::ConfigInvalid {
                 message: "Compaction requires a positive target-file-size".into(),
@@ -117,7 +132,8 @@ impl<'a> CompactBuilder<'a> {
         let kind = if options.data_evolution_enabled() {
             CompactPlannerKind::DataEvolution(
                 data_evolution::DataEvolutionCompactPlanner::new(&options)?
-                    .with_blob_compaction(self.compact_blob),
+                    .with_blob_compaction(self.compact_blob)
+                    .with_vector_compaction(self.compact_vector),
             )
         } else if self.table.schema().primary_keys().is_empty() {
             CompactPlannerKind::Append(append::AppendCompactPlanner::new(&options)?)
@@ -236,7 +252,7 @@ struct CompactContext {
 }
 
 /// An immutable, serializable set of independently executable compaction tasks.
-/// A BLOB result spanning normal groups must be published with or after their merge.
+/// A dedicated result spanning normal groups must be published with or after their merge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactPlan {
     snapshot_id: Option<i64>,
@@ -267,6 +283,9 @@ pub struct CompactTask {
     /// Stable field ID for dedicated BLOB tasks; historical names can differ.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blob_field_id: Option<i32>,
+    /// Stable IDs of current Vector fields represented by the inputs, in table order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vector_field_ids: Option<Vec<i32>>,
 }
 
 impl CompactTask {
@@ -838,8 +857,10 @@ impl CompactTask {
             ));
         }
         ensure_snapshot_supported(table, &self.context.snapshot)?;
-        if self.blob_field_id.is_some() && !self.is_data_evolution() {
-            return Err(invalid("BLOB compaction requires Data Evolution"));
+        if (self.blob_field_id.is_some() || self.vector_field_ids.is_some())
+            && !self.is_data_evolution()
+        {
+            return Err(invalid("Dedicated compaction requires Data Evolution"));
         }
         let incremental =
             self.is_primary_key() && primary_key::planner::enabled(&self.context.schema)?;

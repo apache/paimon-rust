@@ -700,6 +700,21 @@ pub trait Catalog: Send + Sync {
         })
     }
 
+    /// Drop a persistent function.
+    ///
+    /// # Errors
+    /// * [`crate::Error::FunctionNotExist`] - function does not exist when
+    ///   `ignore_if_not_exists` is false.
+    async fn drop_function(
+        &self,
+        _identifier: &Identifier,
+        _ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support functions".to_string(),
+        })
+    }
+
     /// List persistent function names in a database.
     async fn list_functions(&self, _database_name: &str) -> Result<Vec<String>> {
         Err(Error::Unsupported {
