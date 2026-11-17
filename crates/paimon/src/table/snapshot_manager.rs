@@ -231,8 +231,10 @@ impl SnapshotManager {
 
     /// Read snapshot identity directly from storage for publication checks.
     /// An external rollback can reuse an ID whose old snapshot is cached.
+    /// Invalidate that entry so subsequent ordinary reads see the verified state.
     pub(super) async fn get_snapshot_uncached(&self, snapshot_id: i64) -> crate::Result<Snapshot> {
         let input = self.file_io.new_input(&self.snapshot_path(snapshot_id))?;
+        input.invalidate_cache().await?;
         Self::read_snapshot(snapshot_id, input.without_cache()).await
     }
 

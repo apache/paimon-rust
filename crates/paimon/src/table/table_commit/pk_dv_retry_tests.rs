@@ -18,6 +18,7 @@
 mod pk_dv_retry {
     use super::*;
     use arrow_array::{Int32Array, RecordBatch};
+    use futures::TryStreamExt;
     use indexmap::IndexMap;
     use roaring::RoaringBitmap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -364,6 +365,53 @@ mod pk_dv_retry {
         .expect("the published deletion-vector file must survive the replay");
         assert_eq!(masks[&anchor], [42, 500].into_iter().collect());
         outcome.unwrap();
+
+        let cached = table.copy_with_options(HashMap::from([(
+            "deletion-vectors.merge-on-read".into(),
+            "true".into(),
+        )]));
+        let fresh = Table::new(
+            storage.file_io().clone(),
+            cached.identifier().clone(),
+            cached.location().into(),
+            cached.schema().clone(),
+            None,
+        );
+        assert!(!fresh.file_io().has_local_cache());
+        for (reader, name) in [(&fresh, "fresh"), (&cached, "committing")] {
+            for (id, expected_rows) in [(4000, 0), (2001, 1)] {
+                let mut read = reader.new_read_builder();
+                read.with_filter(
+                    crate::spec::PredicateBuilder::new(reader.schema().fields())
+                        .equal("id", Datum::Int(id))
+                        .unwrap(),
+                );
+                let plan = read.new_scan().plan().await.unwrap();
+                let batches: Vec<RecordBatch> = read
+                    .new_read()
+                    .unwrap()
+                    .to_arrow(plan.splits())
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    expected_rows,
+                    "{name} reader, id={id}",
+                );
+            }
+        }
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .uuid(),
+            published.uuid(),
+        );
     }
 
     #[tokio::test]

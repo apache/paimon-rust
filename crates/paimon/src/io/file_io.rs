@@ -1774,6 +1774,16 @@ pub struct InputFile {
 }
 
 impl InputFile {
+    pub(crate) async fn invalidate_cache(&self) -> crate::Result<()> {
+        if let Some(cache) = &self.cache {
+            let (_, _, cache_path) = self.source.resolve(&self.path).await?;
+            if let Some(cache_path) = cache_path {
+                cache.invalidate_path(&cache_path).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn without_cache(mut self) -> Self {
         self.cache = None;
         self
@@ -3658,6 +3668,33 @@ mod input_output_test {
             reader.read(1..7).await.unwrap(),
             Bytes::from_static(b"ached ")
         );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_input_file_cache_invalidation_refreshes_shared_readers() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let source_path = source_directory.path().join("snapshot-1");
+        std::fs::write(&source_path, b"old metadata").unwrap();
+        let file_io = setup_cached_fs_file_io(cache_directory.path());
+        let input = file_io
+            .new_input(&format!("file:{}", source_path.display()))
+            .unwrap();
+        let peer = file_io
+            .clone()
+            .new_input(&source_path.to_string_lossy())
+            .unwrap();
+        let old = Bytes::from_static(b"old metadata");
+        assert_eq!(input.read().await.unwrap(), old);
+        assert_eq!(peer.read().await.unwrap(), old);
+
+        let replacement = Bytes::from_static(b"replacement metadata is longer");
+        std::fs::write(&source_path, &replacement).unwrap();
+        assert_eq!(input.read().await.unwrap(), old);
+        peer.invalidate_cache().await.unwrap();
+        assert_eq!(input.read().await.unwrap(), replacement);
+        assert_eq!(peer.read().await.unwrap(), replacement);
     }
 
     #[cfg(not(windows))]
