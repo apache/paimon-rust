@@ -5571,6 +5571,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orc_padded_char_bounds_keep_matching_split() {
+        let schema = PaimonSchema::builder()
+            .column("v", DataType::Char(crate::spec::CharType::new(4).unwrap()))
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("db", "t"),
+            "memory:/orc_stats".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let pred = Predicate::and(vec![
+            pb.equal("v", Datum::String("AB".into())).unwrap(),
+            pb.greater_than("id", Datum::Int(10)).unwrap(),
+        ]);
+        setup_scan_stats_dirs(&table).await;
+        let files = [("part.orc", 12), ("small.orc", 3), ("part.parquet", 12)]
+            .into_iter()
+            .map(|(file_name, id)| {
+                let mut file = make_evo_file(file_name, 10, 2, 1, None);
+                let mut min = BinaryRowBuilder::new(2);
+                let mut max = BinaryRowBuilder::new(2);
+                min.write_string(0, "AB  ");
+                max.write_string(0, "CD  ");
+                min.write_int(1, id);
+                max.write_int(1, id);
+                file.value_stats = BinaryTableStats::new(
+                    min.build_serialized(),
+                    max.build_serialized(),
+                    vec![Some(0), Some(0)],
+                );
+                file
+            })
+            .collect();
+        TableCommit::new(table.clone(), "orc-stats".into())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                files,
+            )])
+            .await
+            .unwrap();
+        let mut builder = table.new_read_builder();
+        builder.with_filter(pred);
+        let plan = builder.new_scan().plan().await.unwrap();
+        let kept: Vec<_> = plan
+            .splits()
+            .iter()
+            .flat_map(|split| split.data_files())
+            .map(|file| file.file_name.as_str())
+            .collect();
+        assert_eq!(kept, ["part.orc"]);
+        assert_eq!(plan.stats().manifest_entries_pruned_by_data_stats, 2);
+    }
+
+    #[tokio::test]
+    async fn char_pruning_uses_the_physical_field_and_its_provider() {
+        use crate::table::stats_filter::data_evolution_group_matches_predicates_for_table;
+
+        let old_schema = TableSchema::new(
+            0,
+            &PaimonSchema::builder()
+                .column(
+                    "old_code",
+                    DataType::Char(crate::spec::CharType::new(4).unwrap()),
+                )
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let current_schema = old_schema
+            .apply_changes(vec![
+                SchemaChange::rename_column("old_code".into(), "code".into()),
+                SchemaChange::update_column_position(ColumnMove::move_first("id".into())),
+            ])
+            .unwrap();
+        let table = data_evolution_test_table("memory:/mixed_char_stats", current_schema);
+        write_schema_file(&table, &old_schema).await;
+
+        let mut code = make_evo_file_with_cols("code.parquet", 2, 1, 0, &["old_code"]);
+        let mut bound = BinaryRowBuilder::new(1);
+        bound.write_string(0, "AB  ");
+        let bound = bound.build_serialized();
+        code.value_stats = BinaryTableStats::new(bound.clone(), bound, vec![Some(0)]);
+        let mut id = make_evo_file_with_cols("id.orc", 2, 2, 0, &["id"]);
+        let bound = int_stats_row(Some(5));
+        id.value_stats = BinaryTableStats::new(bound.clone(), bound, vec![Some(0)]);
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let eq = pb.equal("code", Datum::String("AB".into())).unwrap();
+        let none = pb.greater_than("id", Datum::Int(10)).unwrap();
+        let all = pb.greater_than("id", Datum::Int(0)).unwrap();
+        let mut cache = HashMap::new();
+        for (path, is_orc) in [("memory:/code.ORC", true), ("memory:/code.parquet", false)] {
+            code.external_path = Some(path.into());
+            assert_eq!(
+                data_file_matches_predicates_for_table(
+                    &table,
+                    &code,
+                    std::slice::from_ref(&eq),
+                    &[],
+                    &mut cache
+                )
+                .await,
+                is_orc
+            );
+            let group = [id.clone(), code.clone()];
+            for (predicate, expected) in [
+                (eq.clone(), is_orc),
+                (Predicate::and(vec![eq.clone(), none.clone()]), false),
+                // With unsafe bounds inside OR/NOT the whole subtree stays for row filtering.
+                (
+                    Predicate::or(vec![
+                        Predicate::and(vec![eq.clone(), none.clone()]),
+                        none.clone(),
+                    ]),
+                    is_orc,
+                ),
+                (
+                    Predicate::Not(Box::new(Predicate::or(vec![eq.clone(), all.clone()]))),
+                    is_orc,
+                ),
+                (pb.is_null("code").unwrap(), false),
+            ] {
+                assert_eq!(
+                    data_evolution_group_matches_predicates_for_table(
+                        &table,
+                        &group,
+                        std::slice::from_ref(&predicate),
+                        &mut cache
+                    )
+                    .await,
+                    expected,
+                    "{path}: {predicate:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_data_evolution_stats_require_unique_full_range_provider() {
         let table = data_evolution_test_table(
             "memory:/de_stats_providers",
