@@ -313,24 +313,38 @@ mod pk_dv_retry {
 
     #[tokio::test]
     async fn rest_compact_conflict_cleans_unpublished_dv_without_snapshot_file() {
+        check_rest_compact_publication(RestPublication::Conflict).await;
+    }
+
+    #[tokio::test]
+    async fn rest_compact_rejection_with_catalog_only_base_cleans_unpublished_dv() {
+        check_rest_compact_publication(RestPublication::Rejection).await;
+    }
+
+    #[tokio::test]
+    async fn rest_compact_lost_response_preserves_published_dv() {
+        check_rest_compact_publication(RestPublication::LostResponse).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum RestPublication {
+        Conflict,
+        Rejection,
+        LostResponse,
+    }
+
+    async fn check_rest_compact_publication(mode: RestPublication) {
         use crate::api::rest_api::RESTApi;
         use axum::{
             body::Bytes,
-            http::{Method, Uri},
+            http::{Method, StatusCode, Uri},
+            response::IntoResponse,
             Json, Router,
         };
         use std::sync::Mutex;
 
         let (table, anchor, _) = fixture().await;
         write(&table, vec![42], 0).await;
-        let builder = table.new_compact_builder();
-        let plan = builder.new_planner().unwrap().plan().await.unwrap();
-        let result = builder
-            .new_executor()
-            .unwrap()
-            .execute(&plan.tasks()[0])
-            .await
-            .unwrap();
         let current = Arc::new(Mutex::new(
             table
                 .snapshot_manager()
@@ -358,7 +372,7 @@ mod pk_dv_retry {
                             submitted.push(next.clone());
                             submitted.len() == 1
                         };
-                        if first {
+                        if first && matches!(mode, RestPublication::Conflict) {
                             write(&table, vec![4000], 0).await;
                             let manager = table.snapshot_manager();
                             let winner = manager.get_latest_snapshot().await.unwrap().unwrap();
@@ -366,8 +380,14 @@ mod pk_dv_retry {
                             // The catalog keeps the snapshot; clients only need its manifests.
                             manager.delete_snapshot(winner.id()).await.unwrap();
                             *current.lock().unwrap() = winner;
-                        } else {
+                        } else if !first || matches!(mode, RestPublication::LostResponse) {
                             *current.lock().unwrap() = next;
+                        }
+                        if first && matches!(mode, RestPublication::LostResponse) {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"code": 500, "message": "lost commit response"})),
+                            ).into_response();
                         }
                         serde_json::json!({"success": !first})
                     } else if uri.path().ends_with("/snapshot") {
@@ -375,7 +395,7 @@ mod pk_dv_retry {
                     } else {
                         serde_json::json!({"schemaId": table.schema().id()})
                     };
-                    Json(response)
+                    Json(response).into_response()
                 }
             }
         });
@@ -402,17 +422,52 @@ mod pk_dv_retry {
             table.schema().clone(),
             Some(env),
         );
+        let builder = rest.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        let result = builder
+            .new_executor()
+            .unwrap()
+            .execute(&plan.tasks()[0])
+            .await
+            .unwrap();
+        if matches!(mode, RestPublication::Rejection) {
+            write(&table, vec![4000], 0).await;
+            let manager = table.snapshot_manager();
+            let advanced = manager.get_latest_snapshot().await.unwrap().unwrap();
+            manager.delete_snapshot(advanced.id()).await.unwrap();
+            *current.lock().unwrap() = advanced;
+        }
         let mut commit = TableCommit::new(rest.clone(), "rest-compactor".into());
         commit.commit_min_retry_wait_ms = 0;
         commit.commit_max_retry_wait_ms = 0;
+        let unknown = matches!(mode, RestPublication::LostResponse);
+        if !matches!(mode, RestPublication::Conflict) {
+            commit.commit_max_retries = 0;
+            let error = commit
+                .commit_compact(vec![result.clone()])
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string().contains("Commit outcome may be unknown"),
+                unknown,
+                "{error}",
+            );
+            let first = submitted.lock().unwrap()[0].clone();
+            for path in dv_paths(&rest, &first).await {
+                assert_eq!(rest.file_io().exists(&path).await.unwrap(), unknown);
+            }
+        }
         let metrics = commit.commit_compact(vec![result.clone()]).await.unwrap();
         let attempts = submitted.lock().unwrap().clone();
-        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts.len(), if unknown { 1 } else { 2 });
         let first_paths = dv_paths(&rest, &attempts[0]).await;
-        let published_paths = dv_paths(&rest, &attempts[1]).await;
+        let published_paths = dv_paths(&rest, attempts.last().unwrap()).await;
         assert_eq!(first_paths.len(), 1);
-        assert!(!published_paths.contains(&first_paths[0]));
-        assert!(!rest.file_io().exists(&first_paths[0]).await.unwrap());
+        assert_eq!(published_paths.contains(&first_paths[0]), unknown);
+        assert_eq!(
+            rest.file_io().exists(&first_paths[0]).await.unwrap(),
+            unknown
+        );
         for path in &published_paths {
             assert!(rest.file_io().exists(path).await.unwrap());
         }
@@ -431,10 +486,10 @@ mod pk_dv_retry {
             "deletion-vectors.merge-on-read".into(),
             "true".into(),
         )]));
-        assert_eq!(count_rows(&readable, 4000).await, 1);
+        assert_eq!(count_rows(&readable, 4000).await, usize::from(!unknown));
         assert_eq!(count_rows(&readable, 42).await, 1);
         assert_eq!(commit.commit_compact(vec![result]).await.unwrap(), metrics);
-        assert_eq!(submitted.lock().unwrap().len(), 2);
+        assert_eq!(submitted.lock().unwrap().len(), attempts.len());
         server.abort();
     }
 

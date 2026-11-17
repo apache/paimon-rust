@@ -35,7 +35,8 @@ use std::sync::Arc;
 #[async_trait]
 pub trait SnapshotCommit: Send + Sync {
     /// Commit the given snapshot. Returns true on success and false if publication
-    /// was rejected. A replay can be rejected after the original request succeeded.
+    /// was rejected. REST rejection is definite; file publication can reject a
+    /// replay after an earlier storage attempt succeeded.
     /// `branch` selects the snapshot namespace; data files and manifests remain
     /// shared under the table location.
     async fn commit(

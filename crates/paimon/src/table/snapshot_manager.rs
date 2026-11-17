@@ -229,18 +229,10 @@ impl SnapshotManager {
         Self::read_snapshot(snapshot_id, input).await
     }
 
-    /// Read snapshot identity from the catalog or directly from storage.
-    /// A different catalog head leaves ownership of the attempted ID unknown.
-    /// An external rollback can reuse an ID whose old file snapshot is cached.
+    /// Read file snapshot identity directly from storage for publication checks.
+    /// An external rollback can reuse an ID whose old snapshot is cached.
     /// Invalidate that entry so subsequent ordinary reads see the verified state.
     pub(super) async fn get_snapshot_uncached(&self, snapshot_id: i64) -> crate::Result<Snapshot> {
-        if let Some(env) = &self.rest_env {
-            return env
-                .load_snapshot(&self.branch)
-                .await?
-                .filter(|snapshot| snapshot.id() == snapshot_id)
-                .ok_or(crate::Error::SnapshotNotExist { snapshot_id });
-        }
         let input = self.file_io.new_input(&self.snapshot_path(snapshot_id))?;
         input.invalidate_cache().await?;
         Self::read_snapshot(snapshot_id, input.without_cache()).await
@@ -651,33 +643,6 @@ mod tests {
             *fixture.requests.lock().unwrap(),
             vec!["/v1/test/databases/database/tables/table/snapshot"; 2]
         );
-    }
-
-    #[tokio::test]
-    async fn rest_publication_check_uses_catalog_without_falling_back_to_files() {
-        let fixture = rest_fixture().await;
-        let sm = fixture.table.snapshot_manager();
-        assert_eq!(sm.get_snapshot_uncached(7).await.unwrap().id(), 7);
-        assert!(sm.file_io().exists(&sm.snapshot_path(2)).await.unwrap());
-        for snapshot_id in [2, 8] {
-            assert!(matches!(
-                sm.get_snapshot_uncached(snapshot_id).await,
-                Err(crate::Error::SnapshotNotExist { .. })
-            ));
-        }
-        *fixture.response.lock().unwrap() = (200, serde_json::json!({"snapshot": null}));
-        assert!(matches!(
-            sm.get_snapshot_uncached(2).await,
-            Err(crate::Error::SnapshotNotExist { .. })
-        ));
-        *fixture.response.lock().unwrap() = (
-            500,
-            serde_json::json!({"code": 500, "message": "unavailable"}),
-        );
-        assert!(matches!(
-            sm.get_snapshot_uncached(2).await,
-            Err(crate::Error::RestApi { .. })
-        ));
     }
 
     #[tokio::test]

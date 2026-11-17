@@ -1433,8 +1433,10 @@ impl TableCommit {
             )
             .await;
         // Storage may replay a successful conditional write after losing its
-        // response. Establish ownership before treating false as a rejection.
+        // response. REST POSTs are not replayed; success=false is a definite
+        // server rejection and must retain its cleanup semantics.
         let publication = match publication {
+            Ok(false) if self.table.rest_env.is_some() => Ok(false),
             Ok(false) => match self.snapshot_manager.get_snapshot_uncached(snapshot.id()).await {
                 Ok(current) if current.uuid() == snapshot.uuid() => Ok(true),
                 // Older writers can omit the UUID. Each attempt writes a
