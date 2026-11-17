@@ -19,7 +19,7 @@
 //!
 //! Reference:[org.apache.paimon.utils.SnapshotManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java).
 use crate::catalog::DEFAULT_MAIN_BRANCH;
-use crate::io::{FileIO, InputFile};
+use crate::io::FileIO;
 use crate::spec::Snapshot;
 use futures::future::try_join_all;
 use std::str;
@@ -225,20 +225,8 @@ impl SnapshotManager {
 
     /// Get a snapshot by id.
     pub async fn get_snapshot(&self, snapshot_id: i64) -> crate::Result<Snapshot> {
-        let input = self.file_io.new_input(&self.snapshot_path(snapshot_id))?;
-        Self::read_snapshot(snapshot_id, input).await
-    }
-
-    /// Read file snapshot identity directly from storage for publication checks.
-    /// An external rollback can reuse an ID whose old snapshot is cached.
-    /// Invalidate that entry so subsequent ordinary reads see the verified state.
-    pub(super) async fn get_snapshot_uncached(&self, snapshot_id: i64) -> crate::Result<Snapshot> {
-        let input = self.file_io.new_input(&self.snapshot_path(snapshot_id))?;
-        input.invalidate_cache().await?;
-        Self::read_snapshot(snapshot_id, input.without_cache()).await
-    }
-
-    async fn read_snapshot(snapshot_id: i64, snap_input: InputFile) -> crate::Result<Snapshot> {
+        let snapshot_path = self.snapshot_path(snapshot_id);
+        let snap_input = self.file_io.new_input(&snapshot_path)?;
         if !snap_input.exists().await? {
             return Err(crate::Error::SnapshotNotExist { snapshot_id });
         }
@@ -278,7 +266,7 @@ impl SnapshotManager {
     /// Atomically commit a snapshot.
     ///
     /// Writes the snapshot JSON to the target path. Returns `false` if the
-    /// target already exists. A storage retry can encounter its own publication.
+    /// target already exists (another writer won the race).
     ///
     /// Uses atomic no-replace publication: a staged file on the local filesystem,
     /// conditional rename, or a conditional object write. Backends without a

@@ -726,7 +726,6 @@ async fn recovery_finishes_indexing_after_data_publication_for_append_and_overwr
 enum Publication {
     Conflict,
     LoseResponse,
-    Replay,
     FailBeforePublish,
 }
 
@@ -755,12 +754,13 @@ impl SnapshotCommit for InjectIndexPublication {
                     other.commit(messages(&self.table, vec![99]).await).await?;
                     return Ok(false);
                 }
-                Publication::LoseResponse | Publication::Replay => {
-                    let manager = self.table.snapshot_manager();
-                    assert!(manager.commit_snapshot(snapshot).await?);
-                    if matches!(self.mode, Publication::Replay) {
-                        return manager.commit_snapshot(snapshot).await;
-                    }
+                Publication::LoseResponse => {
+                    assert!(
+                        self.table
+                            .snapshot_manager()
+                            .commit_snapshot(snapshot)
+                            .await?
+                    );
                     return Err(crate::Error::UnexpectedError {
                         message: "lost index response".into(),
                         source: None,
@@ -852,20 +852,11 @@ async fn conflicting_replacement_replans_instead_of_deleting_a_competitors_paylo
 
 #[tokio::test]
 async fn lost_index_response_is_recovered_without_deleting_published_files() {
-    check_index_publication_recovery(Publication::LoseResponse).await;
-}
-
-#[tokio::test]
-async fn replayed_index_publication_preserves_published_files() {
-    check_index_publication_recovery(Publication::Replay).await;
-}
-
-async fn check_index_publication_recovery(mode: Publication) {
     let table = table(Some(true), false).await;
     let mut commit = TableCommit::new(table.clone(), "writer".into());
     commit.snapshot_commit = Arc::new(InjectIndexPublication {
         table: table.clone(),
-        mode,
+        mode: Publication::LoseResponse,
         fired: AtomicBool::new(false),
     });
     let input = messages(&table, vec![1, 2]).await;
