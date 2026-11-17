@@ -38,7 +38,7 @@ use crate::spec::{
 };
 use crate::table::dedicated_format_file_writer::is_blob_or_video_file_name;
 use crate::table::schema_manager::SchemaManager;
-use crate::table::source::any_range_overlaps_file;
+use crate::table::source::{any_range_overlaps_file, is_data_evolution_normal_file};
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::{ArrowRecordBatchStream, RESTEnv, RowRange};
 use crate::{DataSplit, Error};
@@ -89,6 +89,26 @@ fn is_raw_convertible(files: &[DataFileMeta]) -> bool {
         }
     }
     true
+}
+
+/// Whether the files of one row-id group are column slices of a single row range.
+///
+/// Every normal file must cover the same rows, and every dedicated (BLOB or
+/// vector) file must lie inside that range. Only such a group is merged
+/// column-wise; any other group holds files that were not written as slices of
+/// each other.
+fn is_data_evolution_column_slice_group(files: &[DataFileMeta]) -> bool {
+    let mut normal_files = files
+        .iter()
+        .filter(|file| is_data_evolution_normal_file(file));
+    let Some((first, last)) = normal_files.next().and_then(DataFileMeta::row_id_range) else {
+        return false;
+    };
+    normal_files.all(|file| file.row_id_range() == Some((first, last)))
+        && files.iter().all(|file| {
+            file.row_id_range()
+                .is_some_and(|(from, to)| from >= first && to <= last)
+        })
 }
 
 /// Split a reader input into independently readable row-id groups.
@@ -551,7 +571,12 @@ impl DataEvolutionReader {
                     if remaining == Some(0) {
                         break 'splits;
                     }
-                    if is_raw_convertible(&files) {
+                    // Change events are physical file changes. Files of a streaming
+                    // split that are not column slices of one row range are
+                    // independent changes and are read as they are stored.
+                    if is_raw_convertible(&files)
+                        || (split.is_streaming() && !is_data_evolution_column_slice_group(&files))
+                    {
                         for file_meta in files {
                             if remaining == Some(0) {
                                 break 'splits;
@@ -4142,6 +4167,34 @@ mod tests {
             PreparedMergeGroup::new(&groups[1]).unwrap().first_row_id,
             10
         );
+    }
+
+    #[test]
+    fn test_column_slice_groups_have_a_normal_file_covering_every_file() {
+        let slices = vec![
+            data_file("base.parquet", 0, 10, 1, Some(vec!["id"])),
+            data_file("partial.parquet", 0, 10, 2, Some(vec!["value"])),
+            data_file("payload.blob", 2, 5, 2, Some(vec!["payload"])),
+        ];
+        assert!(is_data_evolution_column_slice_group(&slices));
+
+        // A compaction merged two inserts, then an update covered the result.
+        let compacted = vec![
+            data_file("base-0.parquet", 0, 2, 1, Some(vec!["id"])),
+            data_file("base-2.parquet", 2, 2, 1, Some(vec!["id"])),
+            data_file("update.parquet", 0, 4, 2, Some(vec!["value"])),
+        ];
+        assert!(!is_data_evolution_column_slice_group(&compacted));
+
+        // A dedicated file outside the normal files' range is no slice of them.
+        let outside = vec![
+            data_file("base.parquet", 0, 10, 1, Some(vec!["id"])),
+            data_file("payload.blob", 8, 5, 2, Some(vec!["payload"])),
+        ];
+        assert!(!is_data_evolution_column_slice_group(&outside));
+
+        let only_dedicated = vec![data_file("payload.blob", 0, 5, 1, Some(vec!["payload"]))];
+        assert!(!is_data_evolution_column_slice_group(&only_dedicated));
     }
 
     #[test]
