@@ -18,11 +18,11 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::BooleanArray;
-use datafusion::arrow::compute::{cast, filter_record_batch};
+use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{
     DataType as ArrowDataType, SchemaRef as ArrowSchemaRef, TimeUnit,
 };
-use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
@@ -63,33 +63,6 @@ use paimon::DataSplit;
 
 use crate::error::to_datafusion_error;
 use crate::filter_pushdown::{is_float_zero, scalar_to_datum};
-
-fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
-    if batch.num_columns() != schema.fields().len() {
-        return Err(datafusion::error::DataFusionError::Execution(format!(
-            "Paimon reader returned {} columns for DataFusion schema with {} fields",
-            batch.num_columns(),
-            schema.fields().len()
-        )));
-    }
-
-    let row_count = batch.num_rows();
-    let columns = batch
-        .columns()
-        .iter()
-        .zip(schema.fields())
-        .map(|(column, field)| {
-            if column.data_type() == field.data_type() {
-                Ok(Arc::clone(column))
-            } else {
-                cast(column.as_ref(), field.data_type()).map_err(Into::into)
-            }
-        })
-        .collect::<DFResult<Vec<_>>>()?;
-    let options = RecordBatchOptions::new().with_row_count(Some(row_count));
-
-    RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options).map_err(Into::into)
-}
 
 #[derive(Debug)]
 struct DataFusionRowFilterFactory {
@@ -1125,7 +1098,7 @@ impl PaimonTableScan {
             let stream = stream.map(move |result| {
                 let mut batch = result
                     .map_err(to_datafusion_error)
-                    .and_then(|batch| to_datafusion_batch(batch, &batch_schema))?;
+                    .and_then(|batch| super::cast_batch_to_schema(batch, &batch_schema))?;
                 // The decoder hook is an optimization and may be unavailable
                 // for a file/path. Retain every original live expression as
                 // the exact fallback; evaluating it on decoder survivors is

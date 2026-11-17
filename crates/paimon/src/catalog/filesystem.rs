@@ -47,6 +47,15 @@ fn make_path(parent: &str, child: &str) -> String {
     format!("{parent}/{child}")
 }
 
+fn serialize_table_schema(schema: &TableSchema) -> Result<Bytes> {
+    serde_json::to_vec(schema)
+        .map(Bytes::from)
+        .map_err(|error| Error::DataInvalid {
+            message: format!("Failed to serialize schema: {error}"),
+            source: Some(Box::new(error)),
+        })
+}
+
 /// Filesystem catalog implementation.
 ///
 /// This catalog stores metadata on a filesystem with the following structure:
@@ -259,15 +268,7 @@ impl FileSystemCatalog {
         self.file_io.mkdirs(&schema_dir).await?;
         let schema_path = self.schema_file_path(table_path, schema.id());
         let output_file = self.file_io.new_output(&schema_path)?;
-        let content =
-            Bytes::from(
-                serde_json::to_string(schema).map_err(|e| Error::DataInvalid {
-                    message: format!("Failed to serialize schema: {e}"),
-                    source: Some(Box::new(e)),
-                })?,
-            );
-        output_file.write(content).await?;
-        Ok(())
+        output_file.write(serialize_table_schema(schema)?).await
     }
 
     /// Check if a database exists.
@@ -463,11 +464,23 @@ impl Catalog for FileSystemCatalog {
             });
         }
 
-        // todo: consider with lock
         if !table_exists {
-            self.file_io.mkdirs(&table_path).await?;
+            self.file_io
+                .mkdirs(&self.schema_dir_path(&table_path))
+                .await?;
             let table_schema = TableSchema::new(0, &creation);
-            self.save_table_schema(&table_path, &table_schema).await?;
+            let created = self
+                .file_io
+                .write_atomic_if_not_exists(
+                    &self.schema_file_path(&table_path, 0),
+                    serialize_table_schema(&table_schema)?,
+                )
+                .await?;
+            if !created && !ignore_if_exists {
+                return Err(Error::TableAlreadyExist {
+                    full_name: identifier.full_name(),
+                });
+            }
         }
 
         Ok(())
@@ -1750,6 +1763,80 @@ mod tests {
                 .unwrap(),
             "and not in the table index directory"
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_atomically_rejects_a_raced_creator() {
+        #[derive(Debug)]
+        struct SharedMemoryStorage {
+            operator: opendal::Operator,
+            publication: tokio::sync::Barrier,
+        }
+
+        #[async_trait]
+        impl crate::io::FileIOProvider for SharedMemoryStorage {
+            async fn create(&self, path: &str) -> Result<(opendal::Operator, String)> {
+                Ok((
+                    self.operator.clone(),
+                    path.trim_start_matches("memory:/").into(),
+                ))
+            }
+
+            async fn write_atomic_if_not_exists(
+                &self,
+                _path: &str,
+                _bytes: Bytes,
+            ) -> Result<Option<bool>> {
+                self.publication.wait().await;
+                Ok(None)
+            }
+        }
+
+        for ignore_if_exists in [false, true] {
+            let storage = std::sync::Arc::new(SharedMemoryStorage {
+                operator:
+                    opendal::Operator::from_config(opendal::services::MemoryConfig::default())
+                        .unwrap(),
+                publication: tokio::sync::Barrier::new(2),
+            });
+            let mut first = create_memory_catalog();
+            let mut second = create_memory_catalog();
+            first.file_io = first.file_io.clone().with_provider(storage.clone());
+            second.file_io = second.file_io.clone().with_provider(storage);
+            first
+                .create_database("db", false, HashMap::new())
+                .await
+                .unwrap();
+            let identifier = Identifier::new("db", "raced");
+            let schema = |name: &str| {
+                Schema::builder()
+                    .column(name, DataType::Int(IntType::new()))
+                    .build()
+                    .unwrap()
+            };
+            let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(
+                    first.create_table(&identifier, schema("first"), ignore_if_exists),
+                    second.create_table(&identifier, schema("second"), ignore_if_exists),
+                )
+            })
+            .await
+            .unwrap();
+            if ignore_if_exists {
+                a.unwrap();
+                b.unwrap();
+            } else {
+                assert_ne!(a.is_ok(), b.is_ok());
+                let (winner, loser) = if a.is_ok() {
+                    ("first", b)
+                } else {
+                    ("second", a)
+                };
+                assert!(matches!(loser, Err(Error::TableAlreadyExist { .. })));
+                let table = first.get_table(&identifier).await.unwrap();
+                assert_eq!(table.schema().fields()[0].name(), winner);
+            }
+        }
     }
 
     #[tokio::test]

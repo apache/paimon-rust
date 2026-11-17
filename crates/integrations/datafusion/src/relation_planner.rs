@@ -39,6 +39,26 @@ use crate::catalog::{
 };
 use crate::table::{ObjectTableProvider, PaimonTableProvider};
 
+#[derive(Debug)]
+pub(crate) struct SnapshotRelationPlanner(
+    pub HashMap<String, (TableReference, Arc<dyn TableProvider>)>,
+);
+
+impl RelationPlanner for SnapshotRelationPlanner {
+    fn plan_relation(
+        &self,
+        relation: TableFactor,
+        _: &mut dyn RelationPlannerContext,
+    ) -> DFResult<RelationPlanning> {
+        if let TableFactor::Table { name, .. } = &relation {
+            if let Some((table, provider)) = self.0.get(&name.to_string()) {
+                return plan_scan(relation, table.clone(), provider.clone());
+            }
+        }
+        Ok(RelationPlanning::Original(Box::new(relation)))
+    }
+}
+
 /// Resolves Paimon time travel, and registered engine snapshot IDs and timestamps.
 #[derive(Debug)]
 pub struct PaimonRelationPlanner;

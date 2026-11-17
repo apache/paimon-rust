@@ -112,7 +112,7 @@ pub(crate) async fn execute_show_partitions(
     show_partitions: &ShowPartitionsStatement,
     enable_ident_normalization: bool,
 ) -> DFResult<DataFrame> {
-    SQLContext::ensure_partition_command_target(&show_partitions.table_name, "SHOW PARTITIONS")?;
+    SQLContext::ensure_main_branch_base_table(&show_partitions.table_name, "SHOW PARTITIONS")?;
     let (catalog, _catalog_name, identifier) =
         ctx.resolve_catalog_and_table(&show_partitions.table_name)?;
     let table = catalog

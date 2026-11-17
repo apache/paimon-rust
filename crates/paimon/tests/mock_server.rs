@@ -220,7 +220,7 @@ fn paginate<T: Clone>(
 #[derive(Clone)]
 pub struct RESTServer {
     warehouse: String,
-    _data_path: String,
+    data_path: String,
     config: ConfigResponse,
     inner: Arc<Mutex<MockState>>,
     resource_paths: ResourcePaths,
@@ -233,7 +233,7 @@ impl RESTServer {
     /// Create a new RESTServer with initial databases.
     pub fn new(
         warehouse: String,
-        _data_path: String,
+        data_path: String,
         config: ConfigResponse,
         initial_dbs: Vec<String>,
     ) -> Self {
@@ -255,7 +255,7 @@ impl RESTServer {
             .collect();
 
         RESTServer {
-            _data_path,
+            data_path,
             config,
             warehouse,
             inner: Arc::new(Mutex::new(MockState {
@@ -828,15 +828,25 @@ impl RESTServer {
             return (StatusCode::CONFLICT, Json(err)).into_response();
         }
 
-        // Create table response
+        let schema = match serde_json::from_value(payload["schema"].clone()) {
+            Ok(schema) => schema,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"code": 400, "message": error.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+        let path = format!("{}/{db}.db/{table_name}", state.data_path);
         let response = GetTableResponse::new(
-            Some(table_name.clone()),
+            Some(uuid::Uuid::new_v4().to_string()),
             Some(db.clone()),
             Some(table_name),
-            None,
+            Some(path),
             Some(true),
-            None,
-            None,
+            Some(0),
+            Some(schema),
             AuditRESTResponse::new(None, None, None, None, None),
         );
         s.tables.insert(key, response);
