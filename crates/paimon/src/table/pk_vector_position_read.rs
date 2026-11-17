@@ -54,11 +54,20 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
 /// `PrimaryKeyVectorPositionReader`.
 pub(crate) struct PkVectorPositionRead<'a> {
     reader: &'a DataFileReader,
+    score_only: Option<String>,
 }
 
 impl<'a> PkVectorPositionRead<'a> {
     pub(crate) fn new(reader: &'a DataFileReader) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            score_only: None,
+        }
+    }
+
+    pub(super) fn with_score_only(mut self, name: Option<String>) -> Self {
+        self.score_only = name;
+        self
     }
 
     pub(crate) fn read(
@@ -106,7 +115,14 @@ impl<'a> PkVectorPositionRead<'a> {
 
         // (3) reserved-column-name check against the requested output fields
         for field in self.reader.read_type() {
-            if field.name() == PKEY_VECTOR_POSITION_COLUMN || field.name() == SEARCH_SCORE_COLUMN {
+            let conflicts = match self.score_only.as_deref() {
+                Some(name) => field.name() == name,
+                None => {
+                    field.name() == PKEY_VECTOR_POSITION_COLUMN
+                        || field.name() == SEARCH_SCORE_COLUMN
+                }
+            };
+            if conflicts {
                 return Err(data_invalid(format!(
                     "Reserved metadata column name conflicts with a table column: {}",
                     field.name()
@@ -147,7 +163,7 @@ impl<'a> PkVectorPositionRead<'a> {
             self.reader
                 .read_single_file_stream_local(split, file_meta, data_fields, dv, sorted)?;
 
-        let want_score_col = scores.is_some();
+        let score_only = self.score_only.clone();
 
         let stream = async_stream::try_stream! {
             futures::pin_mut!(inner);
@@ -167,7 +183,7 @@ impl<'a> PkVectorPositionRead<'a> {
                 let out = append_metadata_columns(
                     batch,
                     &effective[cursor..end],
-                    want_score_col,
+                    score_only.as_deref(),
                     scores.as_ref(),
                 )?;
                 cursor = end;
@@ -185,16 +201,12 @@ impl<'a> PkVectorPositionRead<'a> {
     }
 }
 
-/// Append `_PKEY_VECTOR_POSITION` (and, when `want_score_col`, `__paimon_search_score`)
-/// to `batch`. `positions` are the file-LOCAL physical positions of the batch's
-/// rows, supplied by the caller's cursor into the effective (DV-filtered)
-/// selection, so they align 1:1 with the batch rows in order. Scores are looked
-/// up by position. The batch carries no `_ROW_ID` column, so every existing
-/// column is retained.
+/// Append the metadata requested by the caller. Positions are the surviving
+/// physical rows after applying the deletion vector and align one-to-one with the batch.
 fn append_metadata_columns(
     batch: RecordBatch,
     positions: &[i64],
-    want_score_col: bool,
+    score_only: Option<&str>,
     scores: Option<&BTreeMap<i64, f32>>,
 ) -> crate::Result<RecordBatch> {
     debug_assert_eq!(
@@ -204,16 +216,14 @@ fn append_metadata_columns(
     );
     let schema = batch.schema();
 
-    let score_vals = if want_score_col {
+    let score_vals = if let Some(scores) = scores {
         let mut sv = Vec::with_capacity(positions.len());
         for &position in positions {
-            let score = scores
-                .and_then(|m| m.get(&position).copied())
-                .ok_or_else(|| {
-                    data_invalid(format!(
-                        "internal: no score for returned position {position}"
-                    ))
-                })?;
+            let score = scores.get(&position).copied().ok_or_else(|| {
+                data_invalid(format!(
+                    "internal: no score for returned position {position}"
+                ))
+            })?;
             sv.push(score);
         }
         Some(sv)
@@ -224,22 +234,27 @@ fn append_metadata_columns(
     // Retain every existing column (no `_ROW_ID` to strip), then append metadata.
     let mut fields: Vec<ArrowField> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
     let mut columns: Vec<Arc<dyn Array>> = batch.columns().to_vec();
-    fields.push(ArrowField::new(
-        PKEY_VECTOR_POSITION_COLUMN,
-        ArrowDataType::Int64,
-        false,
-    ));
-    columns.push(Arc::new(Int64Array::from(positions.to_vec())));
+    if score_only.is_none() {
+        fields.push(ArrowField::new(
+            PKEY_VECTOR_POSITION_COLUMN,
+            ArrowDataType::Int64,
+            false,
+        ));
+        columns.push(Arc::new(Int64Array::from(positions.to_vec())));
+    }
     if let Some(sv) = score_vals {
         fields.push(ArrowField::new(
-            SEARCH_SCORE_COLUMN,
+            score_only.unwrap_or(SEARCH_SCORE_COLUMN),
             ArrowDataType::Float32,
-            false,
+            score_only.is_some(),
         ));
         columns.push(Arc::new(Float32Array::from(sv)));
     }
 
-    let out_schema = Arc::new(ArrowSchema::new(Fields::from(fields)));
+    let out_schema = Arc::new(ArrowSchema::new_with_metadata(
+        Fields::from(fields),
+        schema.metadata().clone(),
+    ));
     RecordBatch::try_new(out_schema, columns).map_err(|e| crate::Error::UnexpectedError {
         message: format!("Failed to build position-read batch: {e}"),
         source: Some(Box::new(e)),

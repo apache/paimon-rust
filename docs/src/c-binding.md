@@ -100,6 +100,16 @@ leave the previous selection intact. `[]` selects zero columns while retaining
 row counts, and a null pointer clears the projection. Case sensitivity applies
 to name projections; an explicit read type keeps its supplied field identities.
 
+Use `paimon_plan_from_split_bytes` with a Java DataSplit body, an IndexedSplit
+body, or a SplitSerializer v1 frame. To read a split's scores, call
+`paimon_read_builder_with_index_score(builder, "similarity")` and select one
+indexed split in `paimon_table_read_to_arrow`. The reader appends a nullable
+Float32 column with that name to the projected table fields. An unscored split
+produces nulls. Passing a null name clears the score request. A projected table
+column and the score must have distinct output names. Tracked reads preserve the
+scores of surviving rows after filtering. File-position reads apply deletion
+vectors and require a predicate-free builder.
+
 ## Opening and Scanning a Table
 
 The following program opens `default.my_table` from a filesystem catalog and

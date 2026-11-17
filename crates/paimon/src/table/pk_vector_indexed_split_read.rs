@@ -156,6 +156,14 @@ impl PkVectorIndexedSplitRead {
         &self,
         split: &PkVectorIndexedSplit,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_projected(split, None)
+    }
+
+    pub(super) fn read_projected(
+        &self,
+        split: &PkVectorIndexedSplit,
+        score_only: Option<String>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         let (file_meta, positions, score_map) = validate_and_expand(split)?;
         let reader = self.reader.clone();
         let data_split = split.split.clone();
@@ -168,7 +176,7 @@ impl PkVectorIndexedSplitRead {
             );
             let data_fields = reader.derive_data_fields(&file_meta).await?;
 
-            let inner = PkVectorPositionRead::new(&reader).read(
+            let inner = PkVectorPositionRead::new(&reader).with_score_only(score_only).read(
                 &data_split,
                 file_meta,
                 data_fields,

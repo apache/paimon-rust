@@ -479,6 +479,7 @@ unsafe fn new_read_builder_state(
         resources: None,
         projected_columns: None,
         read_type: None,
+        index_score_name: None,
         filter: None,
         case_sensitive: true,
         limit: None,
@@ -666,6 +667,40 @@ pub unsafe extern "C" fn paimon_read_builder_with_projection(
 
     state.projected_columns = Some(col_names);
     state.read_type = None;
+    std::ptr::null_mut()
+}
+
+/// Append a nullable Float32 field containing the selected IndexedSplit's score.
+/// The caller supplies the output name. A null name clears this projection.
+/// Ordinary projection calls affect only table fields. An unscored selection
+/// produces nulls. The reader accepts one indexed split per call.
+///
+/// # Safety
+/// `rb` must be a live builder. A non-null `name` must be a UTF-8 C string.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_read_builder_with_index_score(
+    rb: *mut paimon_read_builder,
+    name: *const c_char,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(rb, "rb") {
+        return error;
+    }
+    let name = if name.is_null() {
+        None
+    } else {
+        match validate_cstr(name, "name") {
+            Ok(name) if !name.is_empty() => Some(name),
+            Ok(_) => {
+                return paimon_error::new(
+                    PaimonErrorCode::InvalidInput,
+                    "Empty score field name".into(),
+                )
+            }
+            Err(error) => return error,
+        }
+    };
+    let state = &mut *((*rb).inner as *mut ReadBuilderState);
+    state.index_score_name = name;
     std::ptr::null_mut()
 }
 
@@ -870,7 +905,8 @@ pub unsafe extern "C" fn paimon_read_builder_new_read(
                 table: state.table.clone(),
                 resources: state.resources.clone(),
                 read_type: table_read.read_type().to_vec(),
-                data_predicates: table_read.data_predicates().to_vec(),
+                filter: state.filter.clone(),
+                index_score_name: state.index_score_name.clone(),
             };
             paimon_result_new_read {
                 read: box_table_read_state(read_state),
@@ -947,9 +983,9 @@ pub unsafe extern "C" fn paimon_table_scan_plan(
 // ======================= Plan ===============================
 
 /// Build a one-split `paimon_plan` from a serialized Paimon-native `DataSplit`
-/// byte buffer (the wire form produced by `DataSplit::serialize` / Java
-/// `DataSplit#serialize`). `data` must be raw bytes (Base64 already decoded by
-/// the caller).
+/// or raw Java `IndexedSplit` byte buffer. `data` must be raw bytes (Base64
+/// already decoded by the caller). IndexedSplit row ranges and scores are
+/// preserved for `paimon_table_read_to_arrow`.
 ///
 /// The returned plan is usable with `paimon_table_read_to_arrow` and must be
 /// freed with `paimon_plan_free`.
@@ -1073,16 +1109,17 @@ pub unsafe extern "C" fn paimon_table_read_to_arrow(
     let end = (offset.saturating_add(length)).min(all_splits.len());
     let selected = &all_splits[start..end];
 
-    let mut table_read = paimon::table::TableRead::new(
-        &state.table,
-        state.read_type.clone(),
-        state.data_predicates.clone(),
-    );
-    if let Some(resources) = &state.resources {
-        table_read = table_read.with_resources(resources.clone());
-    }
+    let table_read = state.table_read(state.read_type.clone());
 
-    match table_read.to_arrow(selected) {
+    let stream = match (state.index_score_name.as_deref(), selected) {
+        (Some(name), [split]) => table_read.to_arrow_with_index_score(split, name),
+        (Some(_), [_, _, ..]) => Err(paimon::Error::DataInvalid {
+            message: "Index score projection requires at most one selected split".into(),
+            source: None,
+        }),
+        _ => table_read.to_arrow(selected),
+    };
+    match stream {
         Ok(stream) => {
             let reader = Box::new(stream);
             let wrapper = Box::new(paimon_record_batch_reader {
