@@ -1682,6 +1682,10 @@ offset and must not be passed directly as an epoch timestamp.
 
 Build and commit a global index for a table column.
 
+As in Paimon's Flink SQL and Spark SQL integrations, global indexes are created
+through `CALL sys.create_global_index`. `CREATE INDEX ... ON ...` DDL is not
+supported.
+
 To maintain indexes synchronously after writes, declare columns through options
 such as `global-index.btree.index-columns='id'`. Maintenance runs by default
 when `write-only=false`; see
@@ -1724,6 +1728,26 @@ CALL sys.create_global_index(
   options => 'full-text.tokenizer=jieba,full-text.remove-stop-words=false'
 );
 ```
+
+Set `partitions` to build indexes only for matching partitions. As in Flink SQL
+and Spark SQL, `,` combines constraints with AND and `;` combines alternatives
+with OR. Omitted partition keys are unrestricted; omitting `partitions` builds
+all partitions. Values are parsed using each partition column's type, and the
+table's `partition.default-name` selects NULL values. Invalid filters and
+partition filters on unpartitioned tables are rejected before files are written.
+
+```sql
+CALL sys.create_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'id',
+  index_type => 'btree',
+  partitions => 'dt=2026-10-10,hr=1;dt=2026-10-11,hr=2'
+);
+```
+
+Index coverage outside the selected partitions is preserved. If the selected
+data is already indexed and unchanged, or no data matches, no snapshot is
+committed.
 
 `index_type` defaults to `btree`. It is case-insensitive and surrounding
 whitespace is ignored. BTree and bitmap global indexes support scalar columns.
@@ -2014,7 +2038,9 @@ when `N` is zero. `dry_run` defaults to `false`; an explicit `false` or an
 omitted argument performs the drop and returns `OK`. Other values are rejected.
 The preview uses the latest snapshot at the time of the call; concurrent changes
 can affect the number of files matched by a later drop. Reads retain the usual
-local-cache behavior. Partition filtering is not supported by this procedure.
+local-cache behavior. The optional `partitions` argument uses the same filter
+syntax as [create_global_index](#create_global_index) and restricts the drop to
+matching partitions.
 
 ### compact
 

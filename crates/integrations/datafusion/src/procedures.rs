@@ -226,7 +226,13 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
         "rename_branch" => &["table", "from_branch", "to_branch"],
         "delete_branch" => &["table", "branch"],
         "fast_forward" => &["table", "branch"],
-        "create_global_index" => &["table", "index_column", "index_type", "options"],
+        "create_global_index" => &[
+            "table",
+            "index_column",
+            "index_type",
+            "partitions",
+            "options",
+        ],
         "drop_global_index" => &[
             "table",
             "index_column",
@@ -1270,6 +1276,11 @@ async fn proc_create_global_index(
         .with_index_type(index_type_arg);
     if let Some(options) = args.get("options") {
         builder.with_options(parse_key_value_options(options)?);
+    }
+    if let Some(partitions) = args.get("partitions") {
+        builder
+            .with_partition_filter(parse_partitions(&table, partitions)?)
+            .map_err(to_datafusion_error)?;
     }
     builder.execute().await.map_err(to_datafusion_error)?;
     ok_result(ctx)
