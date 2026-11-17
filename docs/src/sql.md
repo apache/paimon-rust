@@ -47,6 +47,28 @@ Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Pai
 
 For the exact delegated SQL grammar, see the [DataFusion SQL Reference](https://datafusion.apache.org/user-guide/sql/index.html).
 
+### SQL compatibility
+
+`GROUP_CONCAT` joins non-NULL values with a comma by default. `SEPARATOR` accepts
+a string literal, including an empty string. Multiple arguments are concatenated
+within each row; a row with any NULL argument is skipped. Empty groups and
+groups containing only NULL values return NULL. `DISTINCT`, aggregate `ORDER BY`,
+and `FILTER` are supported. `DISTINCT` accepts one expression, and its ordering
+expressions must match that expression, as required by DataFusion's distinct
+aggregation.
+Numeric `ORDER BY` positions refer to the aggregate arguments. Calls reject
+positions that reference volatile expressions, because those
+arguments cannot safely be evaluated again as native aggregate sort keys.
+Compute such a value in a subquery first, then pass its column to `GROUP_CONCAT`.
+String conversion follows DataFusion's `CAST(... AS STRING)` after typed
+deduplication and sorting.
+
+```sql
+SELECT group_concat(DISTINCT name ORDER BY name SEPARATOR ' | ') FROM users;
+```
+
+`GROUP_CONCAT` also works in Paimon persistent and temporary view definitions.
+
 ### DataFusion 55 integration
 
 Paimon Parquet scans refresh supported dynamic predicates before reading each
@@ -243,6 +265,22 @@ Unqualified relations and REST SQL functions in the defining query resolve in
 the new view's owning catalog and database, not the session's current database.
 The canonical query is stored as both the default query and the `datafusion`
 dialect definition.
+
+`SHOW CREATE VIEW view_name` returns the owning catalog, database, view name,
+and a fully qualified `CREATE VIEW` definition with its declared column names
+and types. The exported query includes the same type casts as view reads.
+It prefers the stored `datafusion` query and reads catalog metadata directly,
+without planning or executing the defining query. Temporary views shadow
+persistent objects and return `CREATE TEMPORARY VIEW`; session-native
+DataFusion views are also supported. Temporary definitions bind table and
+Catalog function names to the namespace used at creation, so recreating them
+after `USE` preserves their dependencies. Native views created through
+`SQLContext::sql` also bind their table dependencies at creation. Definitions
+created directly through `SessionContext` must fully qualify physical table
+references as `catalog.schema.table`; exports with unqualified dependencies
+are rejected because their creation namespace cannot be recovered reliably.
+Repeated exports and recreations keep the type projection stable. Table targets
+are rejected.
 
 Persistent `CREATE VIEW` and `DROP VIEW` are currently implemented by REST
 Catalog. `DROP VIEW` sends a direct delete request; `IF EXISTS` ignores only a

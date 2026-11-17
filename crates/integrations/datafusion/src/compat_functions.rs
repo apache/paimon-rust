@@ -33,6 +33,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(crate) fn register_compat_functions(ctx: &SessionContext) {
+    ctx.register_udf(ScalarUDF::from(GroupConcatRow {
+        signature: Signature::variadic(vec![DataType::Utf8], Volatility::Immutable),
+    }));
     crate::approx_percentile::register(ctx);
     for (name, alias) in [
         ("current_date", "curdate"),
@@ -57,6 +60,70 @@ pub(crate) fn register_compat_functions(ctx: &SessionContext) {
                 Volatility::Immutable,
             ),
         }));
+    }
+}
+
+/// Concatenate a GROUP_CONCAT row, skipping the entire row if any input is NULL.
+/// DataFusion evaluates the arguments before invoking the UDF, including
+/// volatile expressions, so each SQL argument is evaluated exactly once.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GroupConcatRow {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for GroupConcatRow {
+    fn name(&self) -> &str {
+        "__paimon_group_concat_row"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let scalar = args
+            .args
+            .iter()
+            .all(|arg| matches!(arg, ColumnarValue::Scalar(_)));
+        let arrays = ColumnarValue::values_to_arrays(&args.args)?;
+        let arrays = arrays
+            .iter()
+            .map(|array| cast(array, &DataType::Utf8))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let strings = arrays
+            .iter()
+            .map(|array| array.as_any().downcast_ref::<StringArray>().unwrap())
+            .collect::<Vec<_>>();
+        let Some(first) = strings.first() else {
+            return Err(DataFusionError::Execution(
+                "GROUP_CONCAT row requires arguments".into(),
+            ));
+        };
+        let mut output = StringBuilder::new();
+        let mut value = String::new();
+        for row in 0..first.len() {
+            if strings.iter().any(|array| array.is_null(row)) {
+                output.append_null();
+            } else {
+                value.clear();
+                for array in &strings {
+                    value.push_str(array.value(row));
+                }
+                output.append_value(&value);
+            }
+        }
+        let output: ArrayRef = Arc::new(output.finish());
+        if scalar {
+            Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                &output, 0,
+            )?))
+        } else {
+            Ok(ColumnarValue::Array(output))
+        }
     }
 }
 
