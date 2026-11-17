@@ -361,6 +361,100 @@ async fn test_query_auth_filters_masked_partition_values() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_max_pt_refuses_filtered_or_masked_partition_metadata() {
+    let (_tmp, server, context) = restricted_people_with_schema(None, |options| {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .column("secret", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .partition_keys(["name"]);
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        builder.build().unwrap()
+    })
+    .await;
+
+    server.set_auth_response(
+        "default",
+        "people",
+        AuthTableQueryResponse {
+            filter: None,
+            column_masking: None,
+        },
+    );
+    query(
+        &context,
+        &format!("CREATE VIEW latest_partition AS SELECT max_pt('{TABLE}') AS latest"),
+    )
+    .await;
+
+    for (response, visible_maximum) in [
+        (
+            AuthTableQueryResponse {
+                filter: Some(vec![json!({
+                    "kind": "LEAF",
+                    "transform": {
+                        "name": "FIELD_REF",
+                        "fieldRef": {"index": 0, "name": "id", "type": "INT"},
+                    },
+                    "function": "LESS_THAN",
+                    "literals": [4],
+                })
+                .to_string()]),
+                column_masking: None,
+            },
+            "carol",
+        ),
+        (
+            AuthTableQueryResponse {
+                filter: None,
+                column_masking: masks(),
+            },
+            "JUDY",
+        ),
+    ] {
+        server.set_auth_response("default", "people", response);
+        let maximum = single(&query(&context, &format!("SELECT MAX(name) FROM {TABLE}")).await);
+        assert_eq!(common::string_value(maximum.as_ref(), 0), visible_maximum);
+        for sql in [
+            format!("SELECT max_pt('{TABLE}')"),
+            format!("SELECT sys.max_pt('{TABLE}')"),
+            format!("SELECT paimon.sys.max_pt('{TABLE}')"),
+            "SELECT latest FROM latest_partition".to_string(),
+        ] {
+            let error = match context.sql(&sql).await {
+                Err(error) => error,
+                Ok(frame) => panic!(
+                    "max_pt exposed raw partition metadata: {:?}",
+                    frame.collect().await.unwrap()
+                ),
+            };
+            assert!(
+                error.to_string().contains("unrestricted table metadata"),
+                "{sql}: {error}"
+            );
+        }
+    }
+
+    server.set_auth_response(
+        "default",
+        "people",
+        AuthTableQueryResponse {
+            filter: None,
+            column_masking: None,
+        },
+    );
+    for sql in [
+        format!("SELECT max_pt('{TABLE}')"),
+        "SELECT latest FROM latest_partition".to_string(),
+    ] {
+        let maximum = single(&query(&context, &sql).await);
+        assert_eq!(common::string_value(maximum.as_ref(), 0), "judy");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_query_auth_aggregates_see_masked_values_not_the_manifest_statistics() {
     let (_tmp, _server, context) = restricted_people(masks()).await;
 

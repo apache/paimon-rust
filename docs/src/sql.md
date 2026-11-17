@@ -2448,6 +2448,7 @@ with a custom escape is unsupported.
 | `curdate()` | Alias of `current_date()` |
 | `timestamp_millis(value)` | Alias of `to_timestamp_millis(value)`, preserving millisecond epoch units |
 | `to_timestamp_ltz(value[, format...])` | Alias of `to_timestamp`, preserving its session time zone and nanosecond result |
+| `approx_percentile(value, percentage[, accuracy])` | Spark-compatible discrete approximate percentile; `percentage` is a scalar or array; alias `percentile_approx` |
 
 Regular expressions use Rust regex syntax, like DataFusion's existing regex
 functions, rather than the full Java regex dialect. No match or an unmatched
@@ -2460,6 +2461,75 @@ including dictionary encodings and null dictionary values.
 The timestamp aliases retain DataFusion semantics: optional formats are Chrono
 strftime strings, not Spark/Java patterns; numeric `to_timestamp_ltz` inputs
 are epoch seconds. The Flink `(number, precision)` overload is not implemented.
+The existing `date_format` function also retains DataFusion's Chrono format
+strings; Java-style Spark/Flink datetime patterns are not translated.
+
+`approx_percentile` and `percentile_approx` follow Spark's Greenwald–Khanna
+summary algorithm and select observed values rather than interpolate between
+them. `accuracy` is a constant integer in `[1, 2147483647]`, defaulting to 10000;
+the relative rank error is `1 / accuracy`. Higher accuracy retains a larger
+summary. The percentage must be a constant number or array of numbers between
+0 and 1, inclusive. Constant expressions such as `1.0 / 2` are accepted. NULL
+percentages, NULL array elements, and invalid accuracy values are errors.
+SQL literal parsing and implicit casts retain DataFusion semantics.
+
+Scalar percentages produce the input column's type. Percentage arrays produce
+an array of that type, retaining the order and duplicates in the percentage
+array. NULL inputs are ignored. Empty/all-NULL groups and an empty percentage
+array produce NULL. Numeric, date, timestamp, and ANSI year-month or day-time
+interval inputs are supported; a mixture of the two interval families is rejected.
+`GROUP BY`, `FILTER`, `DISTINCT`, and window aggregation use the same contract.
+DISTINCT aggregation additionally retains the distinct input values for merging.
+Moving window frames retain their current rows and rebuild the summary when rows
+leave; ordinary aggregation and growing frames retain only the compact summary.
+Timestamp observations use Spark's microsecond precision, flooring Arrow
+timestamps to whole microseconds. Decimal results use Spark's decimal rounding
+and become NULL on precision overflow. Decimal result arrays expose nullable Arrow
+elements so those overflow positions can be represented safely; Spark's declared
+non-null element metadata can otherwise fail during result decoding.
+DataFusion's `approx_percentile_cont` remains available with its native t-digest
+and continuous interpolation semantics.
+
+```sql
+SELECT approx_percentile(latency_ms, 0.95, 10000) FROM events;
+SELECT approx_percentile(latency_ms, array(0.5, 0.9, 0.99), 10000) FROM events;
+-- Spark example: [1, 1, 0], preserving the order of requested percentages.
+SELECT approx_percentile(v, array(0.5, 0.4, 0.1), 100)
+FROM (VALUES (0), (1), (2), (10)) AS t(v);
+```
+
+### Maximum partition
+
+`max_pt('table')`, `sys.max_pt('database.table')`, and
+`catalog.sys.max_pt('catalog.database.table')` return the maximum non-null
+first-level partition value as a string, matching Paimon's `max_pt` contract.
+Comparison uses the partition column's logical type: integer 10 is greater than
+9, while string '9' is greater than '10'. Subpartition columns do not affect the
+result. Only partitions containing live data files qualify; empty catalog
+partitions and dropped partitions are skipped. Unpartitioned tables and tables
+without any qualifying partition produce an error.
+
+The argument must be one non-null string literal. Table names can have one,
+two, or three components, with SQL quoting for individual identifiers. Omitted
+table components use the session's current catalog/database even when the
+function is catalog-qualified. An explicit catalog in the table argument takes
+precedence. Paimon branch references are supported; system tables are
+rejected. Resolution reads scan metadata during planning and substitutes a
+literal so partition filters can be pushed down. Repeated calls are resolved
+once per statement, and later statements read fresh metadata.
+The metadata lookup follows the same session scan options, including historical
+snapshots, as a normal table read. Temporary shadows are resolved normally and
+must still be Paimon data tables; a view cannot be passed as the source table.
+Because the result comes from raw partition metadata, grants with row filters or
+column masks are rejected; unrestricted grants are supported.
+Catalog SQL functions are required to be immutable and cannot contain `max_pt`,
+which reads table metadata that can change between statements.
+
+```sql
+SELECT * FROM events WHERE dt = max_pt('events');
+SELECT * FROM daily_counts WHERE day_id = CAST(sys.max_pt('default.daily_counts') AS INT);
+SELECT approx_percentile(latency_ms, 0.95) FROM events;
+```
 
 ### Additional scalar compatibility functions
 
