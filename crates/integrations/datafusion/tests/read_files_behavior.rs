@@ -271,6 +271,14 @@ async fn wildcard_replacements_preserve_aliases_for_outer_queries_and_ctas() {
     let values = rows(&ctx, &format!(r#"SELECT q."Mixed Name" FROM ({query}) q"#)).await;
     assert_eq!(values[0][0].try_as_str().flatten(), Some("HELLO"));
 
+    ctx.sql("CREATE VIEW datafusion.public.replaced_view AS SELECT * REPLACE (upper(value) AS value) FROM read_files('memory://files/data.txt')").await.unwrap();
+    assert_eq!(
+        columns(&ctx, "SELECT * FROM datafusion.public.replaced_view").await,
+        ["value"]
+    );
+    let values = rows(&ctx, "SELECT value FROM datafusion.public.replaced_view").await;
+    assert_eq!(values[0][0].try_as_str().flatten(), Some("HELLO"));
+
     let warehouse = tempfile::tempdir().unwrap();
     let mut options = paimon::Options::new();
     options.set(
