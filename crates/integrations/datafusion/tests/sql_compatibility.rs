@@ -197,8 +197,11 @@ async fn show_create_view_round_trip_preserves_vector_values_and_type() {
 }
 
 #[tokio::test]
-async fn show_create_native_view_preserves_creation_namespace() {
-    let ctx = SQLContext::new();
+async fn show_create_view_preserves_creation_namespace() {
+    let (_tmp, ctx) = common::setup_sql_context().await;
+    ctx.sql("SET datafusion.catalog.default_catalog = 'datafusion'")
+        .await
+        .unwrap();
     ctx.ctx().sql("CREATE SCHEMA other").await.unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     for (name, id) in [
@@ -213,35 +216,56 @@ async fn show_create_native_view_preserves_creation_namespace() {
         ctx.ctx().register_batch(name, batch).unwrap();
     }
 
-    // The destination schema can differ from the namespace that binds the query.
-    for destination in ["public", "other"] {
-        ctx.sql("SET datafusion.catalog.default_schema = 'public'")
-            .await
-            .unwrap();
-        let view = format!("datafusion.{destination}.bound_view");
-        ctx.sql(&format!("CREATE VIEW {view} AS SELECT id FROM source"))
-            .await
-            .unwrap();
-        ctx.sql("SET datafusion.catalog.default_schema = 'other'")
-            .await
-            .unwrap();
-        assert_eq!(
-            rows(&ctx, &format!("SELECT id FROM {view}")).await,
-            vec![vec!["1"]]
-        );
+    let seed = "WITH RECURSIVE seed AS (SELECT id FROM datafusion.public.source \
+                UNION ALL SELECT id FROM datafusion.other.source)";
+    // The destination and temporary catalog do not determine dependency bindings.
+    for (modifier, view) in [
+        ("", "datafusion.public.bound_view"),
+        ("", "datafusion.other.bound_view"),
+        ("TEMPORARY ", "paimon.test_db.bound_view"),
+    ] {
+        for (query, expected) in [
+            ("SELECT id FROM source".to_string(), vec![vec!["1"]]),
+            (
+                format!("{seed}, source AS (SELECT id FROM source) SELECT id FROM source"),
+                vec![vec!["1"]],
+            ),
+            (
+                format!("{seed}, a AS (SELECT id FROM source), source AS (SELECT 99 AS id) SELECT id FROM a"),
+                vec![vec!["1"]],
+            ),
+            (
+                format!("{seed}, source AS (SELECT id FROM source UNION ALL SELECT id + 1 FROM source WHERE id < 3) SELECT id FROM source ORDER BY id"),
+                vec![vec!["1"], vec!["2"], vec!["3"]],
+            ),
+            (
+                format!("{seed}, r AS (WITH unused AS (SELECT id FROM source) SELECT 1 AS id UNION ALL SELECT id + 1 FROM r WHERE id < 3) SELECT id FROM r ORDER BY id"),
+                vec![vec!["1"], vec!["2"], vec!["3"]],
+            ),
+        ] {
+            ctx.sql("SET datafusion.catalog.default_schema = 'public'")
+                .await
+                .unwrap();
+            ctx.sql(&format!("CREATE {modifier}VIEW {view} AS {query}"))
+                .await
+                .unwrap();
+            ctx.sql("SET datafusion.catalog.default_schema = 'other'")
+                .await
+                .unwrap();
+            let select = format!("SELECT id FROM {view} ORDER BY id");
+            assert_eq!(rows(&ctx, &select).await, expected);
 
-        let shown = rows(&ctx, &format!("SHOW CREATE VIEW {view}")).await;
-        let definition = &shown[0][3];
-        assert!(
-            definition.contains("FROM \"datafusion\".\"public\".\"source\""),
-            "{definition}"
-        );
-        ctx.sql(&format!("DROP VIEW {view}")).await.unwrap();
-        ctx.sql(definition).await.unwrap();
-        assert_eq!(
-            rows(&ctx, &format!("SELECT id FROM {view}")).await,
-            vec![vec!["1"]]
-        );
+            let shown = rows(&ctx, &format!("SHOW CREATE VIEW {view}")).await;
+            let definition = &shown[0][3];
+            assert!(
+                definition.contains("FROM \"datafusion\".\"public\".\"source\""),
+                "{definition}"
+            );
+            ctx.sql(&format!("DROP {modifier}VIEW {view}")).await.unwrap();
+            ctx.sql(definition).await.unwrap();
+            assert_eq!(rows(&ctx, &select).await, expected);
+            ctx.sql(&format!("DROP {modifier}VIEW {view}")).await.unwrap();
+        }
     }
 }
 
@@ -290,6 +314,14 @@ async fn show_create_direct_native_view_requires_bound_dependencies() {
                 false,
             ),
             ("SELECT id FROM datafusion.public.source", true),
+            (
+                "WITH RECURSIVE r AS (WITH unused AS (SELECT id FROM source) SELECT 1 AS id UNION ALL SELECT id + 1 FROM r WHERE id < 2) SELECT id FROM r WHERE id = 1",
+                false,
+            ),
+            (
+                "WITH RECURSIVE r AS (WITH unused AS (SELECT id FROM datafusion.public.source) SELECT 1 AS id UNION ALL SELECT id + 1 FROM r WHERE id < 2) SELECT id FROM r WHERE id = 1",
+                true,
+            ),
             (
                 "WITH source AS (SELECT 1 AS id) SELECT id FROM source",
                 true,

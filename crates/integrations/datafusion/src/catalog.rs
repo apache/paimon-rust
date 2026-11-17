@@ -31,7 +31,7 @@ use datafusion::execution::SessionState;
 use datafusion::logical_expr::{expr_fn::cast, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::planner::IdentNormalizer;
-use datafusion::sql::sqlparser::ast::{Ident, ObjectName, Query, Statement, Visit, Visitor};
+use datafusion::sql::sqlparser::ast::{Ident, ObjectName, Statement};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use paimon::catalog::{Catalog, Identifier, View};
@@ -1428,7 +1428,7 @@ async fn validate_view_dependencies(
 fn view_relation_identifiers(view: &View, catalog_name: &str) -> DFResult<Vec<Identifier>> {
     let regex_sql = crate::regex_operators::parseable_sql(view.query_for("datafusion"))?;
     let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
-    let statements =
+    let mut statements =
         Parser::parse_sql(&GenericDialect {}, parseable.as_ref()).map_err(|error| {
             plan_datafusion_err!(
                 "Invalid SQL for REST catalog view '{}': {error}",
@@ -1441,139 +1441,41 @@ fn view_relation_identifiers(view: &View, catalog_name: &str) -> DFResult<Vec<Id
             view.full_name()
         ));
     }
-    if !matches!(statements.first(), Some(Statement::Query(_))) {
+    let Some(Statement::Query(query)) = statements.first() else {
         return Err(plan_datafusion_err!(
             "REST catalog view '{}' must contain a single read-only query",
             view.full_name()
         ));
-    }
+    };
 
-    let mut visitor = ViewRelationVisitor::new(catalog_name, view.identifier().database());
-    let _: std::ops::ControlFlow<()> = statements.visit(&mut visitor);
-    Ok(visitor.identifiers)
+    let mut identifiers = Vec::new();
+    crate::sql_function::visit_view_table_dependencies(query, true, &mut |relation| {
+        if let Some(identifier) =
+            relation_identifier(relation, catalog_name, view.identifier().database())
+        {
+            identifiers.push(identifier);
+        }
+        Ok(())
+    })?;
+    // Preserve all native metadata lookup edges too, including prefetch-only
+    // syntax, without interpreting every relation lookup as a physical binding.
+    let statement = datafusion::sql::parser::Statement::Statement(Box::new(statements.remove(0)));
+    let (prefetched, _) = datafusion::sql::resolve::resolve_table_references(&statement, true)?;
+    let mut seen = identifiers.iter().cloned().collect::<HashSet<_>>();
+    for reference in prefetched {
+        let resolved = reference.resolve(catalog_name, view.identifier().database());
+        if resolved.catalog.as_ref() == catalog_name {
+            let identifier =
+                Identifier::new(resolved.schema.to_string(), resolved.table.to_string());
+            if seen.insert(identifier.clone()) {
+                identifiers.push(identifier);
+            }
+        }
+    }
+    Ok(identifiers)
 }
 
 type SqlIdentifierKey = String;
-
-struct QueryCteScope {
-    visible: HashSet<SqlIdentifierKey>,
-    cte_query_visibility: HashMap<usize, HashSet<SqlIdentifierKey>>,
-}
-
-/// The CTE names visible at each query, including sequential non-recursive CTEs.
-/// Shared by dependency discovery and canonical view SQL binding.
-#[derive(Default)]
-pub(crate) struct ViewQueryScopes {
-    scopes: Vec<QueryCteScope>,
-}
-
-impl ViewQueryScopes {
-    pub(crate) fn enter(&mut self, query: &Query, normalize_identifiers: bool) {
-        let query_address = query as *const Query as usize;
-        let inherited = self
-            .scopes
-            .last()
-            .map(|scope| {
-                scope
-                    .cte_query_visibility
-                    .get(&query_address)
-                    .unwrap_or(&scope.visible)
-                    .clone()
-            })
-            .unwrap_or_default();
-        let mut visible = inherited.clone();
-        let mut cte_query_visibility = HashMap::new();
-
-        if let Some(with) = &query.with {
-            let local_ctes = with
-                .cte_tables
-                .iter()
-                .map(|cte| {
-                    IdentNormalizer::new(normalize_identifiers).normalize(cte.alias.name.clone())
-                })
-                .collect::<Vec<_>>();
-            if with.recursive {
-                visible.extend(local_ctes);
-                for cte in &with.cte_tables {
-                    cte_query_visibility
-                        .insert(cte.query.as_ref() as *const Query as usize, visible.clone());
-                }
-            } else {
-                for (cte, alias) in with.cte_tables.iter().zip(local_ctes) {
-                    cte_query_visibility
-                        .insert(cte.query.as_ref() as *const Query as usize, visible.clone());
-                    visible.insert(alias);
-                }
-            }
-        }
-
-        self.scopes.push(QueryCteScope {
-            visible,
-            cte_query_visibility,
-        });
-    }
-
-    pub(crate) fn leave(&mut self) {
-        self.scopes.pop();
-    }
-
-    pub(crate) fn is_cte(&self, relation: &ObjectName, normalize_identifiers: bool) -> bool {
-        match relation.0.as_slice() {
-            [part] => part.as_ident().is_some_and(|identifier| {
-                self.scopes.last().is_some_and(|scope| {
-                    scope.visible.contains(
-                        &IdentNormalizer::new(normalize_identifiers).normalize(identifier.clone()),
-                    )
-                })
-            }),
-            _ => false,
-        }
-    }
-}
-
-struct ViewRelationVisitor<'a> {
-    catalog_name: &'a str,
-    current_database: &'a str,
-    scopes: ViewQueryScopes,
-    identifiers: Vec<Identifier>,
-}
-
-impl<'a> ViewRelationVisitor<'a> {
-    fn new(catalog_name: &'a str, current_database: &'a str) -> Self {
-        Self {
-            catalog_name,
-            current_database,
-            scopes: ViewQueryScopes::default(),
-            identifiers: Vec::new(),
-        }
-    }
-}
-
-impl Visitor for ViewRelationVisitor<'_> {
-    type Break = ();
-
-    fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<Self::Break> {
-        self.scopes.enter(query, true);
-        std::ops::ControlFlow::Continue(())
-    }
-
-    fn post_visit_query(&mut self, _query: &Query) -> std::ops::ControlFlow<Self::Break> {
-        self.scopes.leave();
-        std::ops::ControlFlow::Continue(())
-    }
-
-    fn pre_visit_relation(&mut self, relation: &ObjectName) -> std::ops::ControlFlow<Self::Break> {
-        let is_cte = self.scopes.is_cte(relation, true);
-        if !is_cte {
-            if let Some(identifier) =
-                relation_identifier(relation, self.catalog_name, self.current_database)
-            {
-                self.identifiers.push(identifier);
-            }
-        }
-        std::ops::ControlFlow::Continue(())
-    }
-}
 
 fn sql_identifier_key(identifier: &Ident) -> SqlIdentifierKey {
     IdentNormalizer::default().normalize(identifier.clone())

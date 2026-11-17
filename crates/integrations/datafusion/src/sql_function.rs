@@ -52,31 +52,26 @@ pub(crate) fn bind_view_query(
             "View SQL must contain one query".into(),
         ));
     }
+    let mut physical_tables = HashSet::new();
+    if let Statement::Query(query) = &statements[0] {
+        visit_view_table_dependencies(
+            query,
+            state.config_options().sql_parser.enable_ident_normalization,
+            &mut |name| {
+                physical_tables.insert(name as *const ObjectName as usize);
+                Ok(())
+            },
+        )?;
+    }
     struct Binder<'a> {
         state: &'a SessionState,
         catalog: &'a str,
         database: &'a str,
-        scopes: crate::catalog::ViewQueryScopes,
+        physical_tables: HashSet<usize>,
         table_functions: HashSet<usize>,
     }
     impl VisitorMut for Binder<'_> {
         type Break = ();
-
-        fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-            self.scopes.enter(
-                query,
-                self.state
-                    .config_options()
-                    .sql_parser
-                    .enable_ident_normalization,
-            );
-            ControlFlow::Continue(())
-        }
-
-        fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
-            self.scopes.leave();
-            ControlFlow::Continue(())
-        }
 
         fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
             if let TableFactor::TableFunction {
@@ -98,7 +93,10 @@ pub(crate) fn bind_view_query(
                 .config_options()
                 .sql_parser
                 .enable_ident_normalization;
-            if self.scopes.is_cte(name, normalize) {
+            if !self
+                .physical_tables
+                .contains(&(name as *const ObjectName as usize))
+            {
                 return ControlFlow::Continue(());
             }
             let parts = name
@@ -143,7 +141,7 @@ pub(crate) fn bind_view_query(
         state,
         catalog: current_catalog,
         database: current_database,
-        scopes: crate::catalog::ViewQueryScopes::default(),
+        physical_tables,
         table_functions: HashSet::new(),
     };
     let _: ControlFlow<()> = statements[0].visit(&mut binder);
@@ -163,13 +161,36 @@ fn quoted_name(parts: &[&str]) -> ObjectName {
 /// its logical plan still holds the original table providers. Only export SQL
 /// whose physical table references are independent of the session defaults.
 pub(crate) fn validate_bound_view_query(query: &Query, normalize: bool) -> DFResult<()> {
-    struct Validator<'a> {
+    visit_view_table_dependencies(query, normalize, &mut |name| {
+        if name.0.len() < 3 {
+            return Err(DataFusionError::Plan(format!(
+                "Cannot export view with unqualified dependency '{name}': its creation \
+                 namespace is unavailable; use fully qualified catalog.schema.table \
+                 names in the view definition"
+            )));
+        }
+        Ok(())
+    })
+}
+
+/// Visit physical table names using DataFusion's sequential CTE visibility and
+/// recursive UNION branch scopes, including metadata prefetches from ignored
+/// query clauses. Binding, export validation, and catalog
+/// dependency discovery must agree on which references are physical tables.
+pub(crate) fn visit_view_table_dependencies(
+    query: &Query,
+    normalize: bool,
+    visit_relation: &mut dyn FnMut(&ObjectName) -> DFResult<()>,
+) -> DFResult<()> {
+    struct DependencyVisitor<'a> {
         visible_ctes: &'a HashSet<String>,
+        visit_relation: &'a mut dyn FnMut(&ObjectName) -> DFResult<()>,
+        processed_cte_queries: HashSet<usize>,
         normalize: bool,
         skip_root_query: bool,
         nested_queries: usize,
     }
-    impl Visitor for Validator<'_> {
+    impl Visitor for DependencyVisitor<'_> {
         type Break = DataFusionError;
 
         fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
@@ -177,8 +198,17 @@ pub(crate) fn validate_bound_view_query(query: &Query, normalize: bool) -> DFRes
                 self.skip_root_query = false;
                 return ControlFlow::Continue(());
             }
-            if self.nested_queries == 0 {
-                if let Err(error) = validate_query(query, self.visible_ctes, self.normalize) {
+            if self.nested_queries == 0
+                && !self
+                    .processed_cte_queries
+                    .contains(&(query as *const Query as usize))
+            {
+                if let Err(error) = visit_query(
+                    query,
+                    self.visible_ctes,
+                    self.normalize,
+                    self.visit_relation,
+                ) {
                     return ControlFlow::Break(error);
                 }
             }
@@ -208,22 +238,21 @@ pub(crate) fn validate_bound_view_query(query: &Query, normalize: bool) -> DFRes
                     }),
                     _ => false,
                 };
-                if name.0.len() < 3 && !is_cte {
-                    return ControlFlow::Break(DataFusionError::Plan(format!(
-                        "Cannot export view with unqualified dependency '{name}': its creation \
-                         namespace is unavailable; use fully qualified catalog.schema.table \
-                         names in the view definition"
-                    )));
+                if !is_cte {
+                    if let Err(error) = (self.visit_relation)(name) {
+                        return ControlFlow::Break(error);
+                    }
                 }
             }
             ControlFlow::Continue(())
         }
     }
 
-    fn validate_query(
+    fn visit_query(
         query: &Query,
         inherited_ctes: &HashSet<String>,
         normalize: bool,
+        visit_relation: &mut dyn FnMut(&ObjectName) -> DFResult<()>,
     ) -> DFResult<()> {
         let mut visible_ctes = inherited_ctes.clone();
         if let Some(with) = &query.with {
@@ -247,43 +276,123 @@ pub(crate) fn validate_bound_view_query(query: &Query, normalize: bool) -> DFRes
                         if recursive {
                             branch_ctes.insert(name.clone());
                         }
-                        let mut validator = Validator {
+                        let mut visitor = DependencyVisitor {
                             visible_ctes: &branch_ctes,
+                            visit_relation,
+                            processed_cte_queries: HashSet::new(),
                             normalize,
                             skip_root_query: false,
                             nested_queries: 0,
                         };
                         if let ControlFlow::Break(error) =
-                            datafusion::sql::sqlparser::ast::Visit::visit(operand, &mut validator)
+                            datafusion::sql::sqlparser::ast::Visit::visit(operand, &mut visitor)
                         {
                             return Err(error);
                         }
                     }
                 } else {
-                    validate_query(&cte.query, &visible_ctes, normalize)?;
+                    visit_query(&cte.query, &visible_ctes, normalize, visit_relation)?;
                 }
                 visible_ctes.insert(name);
             }
         }
 
-        // Check the rest of the query once its WITH definitions are processed.
-        // Delegate nested queries to validate_query instead of inheriting all
-        // names from their parent's WITH block indiscriminately.
-        let mut body = query.clone();
-        body.with = None;
-        let mut validator = Validator {
+        // WITH definitions were processed in their own scopes above. Skip them
+        // during this visit, retaining original AST addresses for the binder's
+        // later mutable pass. The mutable pass only replaces names in place.
+        let mut visitor = DependencyVisitor {
             visible_ctes: &visible_ctes,
+            visit_relation,
+            processed_cte_queries: query
+                .with
+                .iter()
+                .flat_map(|with| &with.cte_tables)
+                .map(|cte| cte.query.as_ref() as *const Query as usize)
+                .collect(),
             normalize,
             skip_root_query: true,
             nested_queries: 0,
         };
-        match datafusion::sql::sqlparser::ast::Visit::visit(&body, &mut validator) {
+        match datafusion::sql::sqlparser::ast::Visit::visit(query, &mut visitor) {
             ControlFlow::Break(error) => Err(error),
             ControlFlow::Continue(()) => Ok(()),
         }
     }
 
-    validate_query(query, &HashSet::new(), normalize)
+    // SQL planning also prefetches references from the complete AST, including
+    // WITH/ORDER/LIMIT fields that recursive_cte does not execute. Match that
+    // resolver's CTE visibility in a second pass without changing the actual
+    // anchor/recursive-branch classification above.
+    struct PrefetchVisitor<'a> {
+        visible_ctes: Vec<String>,
+        normalize: bool,
+        visit_relation: &'a mut dyn FnMut(&ObjectName) -> DFResult<()>,
+    }
+    impl Visitor for PrefetchVisitor<'_> {
+        type Break = DataFusionError;
+
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+            if let Some(with) = &query.with {
+                for cte in &with.cte_tables {
+                    if !with.recursive {
+                        datafusion::sql::sqlparser::ast::Visit::visit(cte, self)?;
+                    }
+                    self.visible_ctes.push(
+                        IdentNormalizer::new(self.normalize).normalize(cte.alias.name.clone()),
+                    );
+                }
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+            if let Some(with) = &query.with {
+                self.visible_ctes
+                    .truncate(self.visible_ctes.len() - with.cte_tables.len());
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+            if let TableFactor::Table {
+                name, args: None, ..
+            } = factor
+            {
+                let is_cte = match name.0.as_slice() {
+                    [part] => part.as_ident().is_some_and(|identifier| {
+                        self.visible_ctes.contains(
+                            &IdentNormalizer::new(self.normalize).normalize(identifier.clone()),
+                        )
+                    }),
+                    _ => false,
+                };
+                if !is_cte {
+                    if let Err(error) = (self.visit_relation)(name) {
+                        return ControlFlow::Break(error);
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visited = HashSet::new();
+    let mut visit_once = |name: &ObjectName| {
+        if visited.insert(name as *const ObjectName as usize) {
+            visit_relation(name)?;
+        }
+        Ok(())
+    };
+    visit_query(query, &HashSet::new(), normalize, &mut visit_once)?;
+    let mut visitor = PrefetchVisitor {
+        visible_ctes: Vec::new(),
+        normalize,
+        visit_relation: &mut visit_once,
+    };
+    match datafusion::sql::sqlparser::ast::Visit::visit(query, &mut visitor) {
+        ControlFlow::Break(error) => Err(error),
+        ControlFlow::Continue(()) => Ok(()),
+    }
 }
 
 pub(crate) async fn expand_sql(
@@ -804,6 +913,31 @@ mod tests {
             bind_view_query(&state, recursive, "lake", "db").unwrap(),
             recursive
         );
+    }
+
+    #[test]
+    fn view_binding_distinguishes_recursive_anchors_and_forward_references() {
+        let state = datafusion::prelude::SessionContext::new().state();
+        for (sql, expected) in [
+            (
+                "WITH RECURSIVE t AS (SELECT id FROM t) SELECT id FROM t",
+                "WITH RECURSIVE t AS (SELECT id FROM \"lake\".\"db\".\"t\") SELECT id FROM t",
+            ),
+            (
+                "WITH RECURSIVE a AS (SELECT id FROM t), t AS (SELECT 1 AS id) SELECT id FROM a",
+                "WITH RECURSIVE a AS (SELECT id FROM \"lake\".\"db\".\"t\"), t AS (SELECT 1 AS id) SELECT id FROM a",
+            ),
+            (
+                "WITH RECURSIVE t AS (SELECT id FROM t UNION ALL SELECT id + 1 FROM t WHERE id < 3) SELECT id FROM t",
+                "WITH RECURSIVE t AS (SELECT id FROM \"lake\".\"db\".\"t\" UNION ALL SELECT id + 1 FROM t WHERE id < 3) SELECT id FROM t",
+            ),
+            (
+                "WITH RECURSIVE t AS (WITH unused AS (SELECT id FROM source) SELECT 1 AS id UNION ALL SELECT id + 1 FROM t WHERE id < 3) SELECT id FROM t",
+                "WITH RECURSIVE t AS (WITH unused AS (SELECT id FROM \"lake\".\"db\".\"source\") SELECT 1 AS id UNION ALL SELECT id + 1 FROM t WHERE id < 3) SELECT id FROM t",
+            ),
+        ] {
+            assert_eq!(bind_view_query(&state, sql, "lake", "db").unwrap(), expected);
+        }
     }
 
     #[test]

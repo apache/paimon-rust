@@ -6958,6 +6958,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rest_catalog_view_cycles_are_not_hidden_by_recursive_cte_names() {
+        for query in [
+            "WITH RECURSIVE recursive_view AS (SELECT answer FROM recursive_view) SELECT answer FROM recursive_view",
+            "WITH RECURSIVE a AS (SELECT answer FROM recursive_view), recursive_view AS (SELECT 99 AS answer) SELECT answer FROM a",
+            "WITH RECURSIVE recursive_view AS (SELECT answer FROM recursive_view UNION ALL SELECT answer + 1 FROM recursive_view WHERE answer < 3) SELECT answer FROM recursive_view",
+            "WITH RECURSIVE r AS (WITH unused AS (SELECT answer FROM recursive_view) SELECT CAST(1 AS BIGINT) AS answer UNION ALL SELECT answer + 1 FROM r WHERE answer < 3) SELECT answer FROM r",
+        ] {
+            let catalog = Arc::new(MockCatalog::new());
+            add_bigint_view(&catalog, "default", "recursive_view", query);
+            let ctx = make_sql_context(catalog).await;
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                ctx.sql("SELECT * FROM recursive_view"),
+            )
+            .await
+            .expect("recursive view planning should terminate")
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("recursive REST catalog view"), "{query}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_catalog_view_allows_recursive_cte_work_table() {
+        let catalog = Arc::new(MockCatalog::new());
+        add_bigint_view(
+            &catalog,
+            "default",
+            "recursive_view",
+            "WITH RECURSIVE recursive_view AS (SELECT CAST(1 AS BIGINT) AS answer \
+             UNION ALL SELECT answer + 1 FROM recursive_view WHERE answer < 3) \
+             SELECT answer FROM recursive_view",
+        );
+        let ctx = make_sql_context(catalog).await;
+        let batches = ctx
+            .sql("SELECT answer FROM recursive_view ORDER BY answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
     async fn rest_catalog_view_allows_cte_with_same_name() {
         let catalog = Arc::new(MockCatalog::new());
         add_bigint_view(
