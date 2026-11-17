@@ -69,7 +69,9 @@ pub struct OssStorageConfig {
 /// Extracts OSS-related configuration keys (endpoint, access key, secret key,
 /// optional security token, retry and User-Agent settings) from the provided properties.
 ///
-/// Returns an error if any required configuration key is missing.
+/// Static credentials must be complete when specified. If both the access key
+/// and secret are omitted, OpenDAL uses its default credential chain, including
+/// environment variables and ECS RAM roles.
 pub(crate) fn oss_config_parse(mut props: HashMap<String, String>) -> Result<OssStorageConfig> {
     let mut cfg = OssConfig::default();
     let user_agent = super::user_agent::oss_user_agent(&props);
@@ -81,22 +83,23 @@ pub(crate) fn oss_config_parse(mut props: HashMap<String, String>) -> Result<Oss
                 message: format!("Missing required OSS config: {OSS_ENDPOINT}"),
             })?,
     );
-    cfg.access_key_id =
-        Some(
-            props
-                .remove(OSS_ACCESS_KEY_ID)
-                .ok_or_else(|| Error::ConfigInvalid {
-                    message: format!("Missing required OSS config: {OSS_ACCESS_KEY_ID}"),
-                })?,
-        );
-    cfg.access_key_secret =
-        Some(
-            props
-                .remove(OSS_ACCESS_KEY_SECRET)
-                .ok_or_else(|| Error::ConfigInvalid {
-                    message: format!("Missing required OSS config: {OSS_ACCESS_KEY_SECRET}"),
-                })?,
-        );
+    let access_key_id = props.remove(OSS_ACCESS_KEY_ID);
+    let access_key_secret = props.remove(OSS_ACCESS_KEY_SECRET);
+    match (&access_key_id, &access_key_secret) {
+        (Some(_), Some(_)) | (None, None) => {}
+        (Some(_), None) => {
+            return Err(Error::ConfigInvalid {
+                message: format!("Missing required OSS config: {OSS_ACCESS_KEY_SECRET}"),
+            });
+        }
+        (None, Some(_)) => {
+            return Err(Error::ConfigInvalid {
+                message: format!("Missing required OSS config: {OSS_ACCESS_KEY_ID}"),
+            });
+        }
+    }
+    cfg.access_key_id = access_key_id;
+    cfg.access_key_secret = access_key_secret;
 
     cfg.security_token = props.remove(OSS_SECURITY_TOKEN);
     let retry_count = parse_retry_option(&mut props, OSS_RETRY_COUNT, DEFAULT_OSS_RETRY_COUNT)?;
@@ -227,6 +230,37 @@ mod tests {
         assert_eq!(cfg.service.access_key_secret.as_deref(), Some("test-sk"));
         assert_eq!(cfg.retry_count, 7);
         assert_eq!(cfg.retry_interval, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn test_oss_config_parse_with_default_credentials() {
+        let props = HashMap::from([(
+            OSS_ENDPOINT.to_string(),
+            "https://oss-cn-hangzhou.aliyuncs.com".to_string(),
+        )]);
+
+        let cfg = oss_config_parse(props).unwrap();
+        assert!(cfg.service.access_key_id.is_none());
+        assert!(cfg.service.access_key_secret.is_none());
+    }
+
+    #[test]
+    fn test_oss_config_parse_rejects_partial_static_credentials() {
+        let mut props = HashMap::from([(
+            OSS_ENDPOINT.to_string(),
+            "https://oss-cn-hangzhou.aliyuncs.com".to_string(),
+        )]);
+        props.insert(OSS_ACCESS_KEY_ID.to_string(), "test-ak".to_string());
+        let error = oss_config_parse(props).unwrap_err();
+        assert!(error.to_string().contains(OSS_ACCESS_KEY_SECRET));
+
+        let mut props = HashMap::from([(
+            OSS_ENDPOINT.to_string(),
+            "https://oss-cn-hangzhou.aliyuncs.com".to_string(),
+        )]);
+        props.insert(OSS_ACCESS_KEY_SECRET.to_string(), "test-sk".to_string());
+        let error = oss_config_parse(props).unwrap_err();
+        assert!(error.to_string().contains(OSS_ACCESS_KEY_ID));
     }
 
     #[test]

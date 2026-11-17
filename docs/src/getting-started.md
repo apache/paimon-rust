@@ -305,6 +305,7 @@ let catalog = CatalogFactory::create(options).await?;
 // Alibaba Cloud OSS
 let mut options = Options::new();
 options.set(CatalogOptions::WAREHOUSE, "oss://bucket/warehouse");
+// Omit both key options to use OpenDAL's credential chain, for example an ECS RAM role.
 options.set("fs.oss.accessKeyId", "your-access-key-id");
 options.set("fs.oss.accessKeySecret", "your-access-key-secret");
 options.set("fs.oss.endpoint", "oss-cn-hangzhou.aliyuncs.com");
