@@ -238,6 +238,13 @@ impl DataFileReader {
         self
     }
 
+    pub(super) fn without_parquet_prefetch(mut self) -> Self {
+        self.parquet_read_budget = self
+            .parquet_read_budget
+            .map(|budget| Arc::new(budget.without_prefetch()));
+        self
+    }
+
     pub(crate) fn with_table_options(
         mut self,
         options: impl Into<Arc<HashMap<String, String>>>,

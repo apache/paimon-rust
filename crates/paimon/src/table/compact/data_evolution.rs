@@ -18,6 +18,7 @@
 //! Data Evolution compaction. Physical slots and logical deletions survive.
 
 mod blob;
+mod vector;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -76,7 +77,7 @@ pub(super) fn ensure_supported(table: &Table) -> Result<()> {
 }
 
 pub(super) fn validate_file(file: &DataFileMeta) -> Result<()> {
-    if (!is_data_evolution_normal_file(file) && !blob::is_blob(file))
+    if (!is_data_evolution_normal_file(file) && !blob::is_blob(file) && !vector::is_vector(file))
         || file.file_size < 0
         || file.row_count <= 0
         || file.level != 0
@@ -91,7 +92,7 @@ pub(super) fn validate_file(file: &DataFileMeta) -> Result<()> {
                 .any(|name| crate::spec::is_row_tracking_column(name))
         })
     {
-        return Err(invalid("Data-evolution compaction requires normal or BLOB files with valid row IDs, row counts and sequence bounds"));
+        return Err(invalid("Data-evolution compaction requires normal or dedicated files with valid row IDs, row counts and sequence bounds"));
     }
     Ok(())
 }
@@ -100,6 +101,9 @@ pub(super) fn validate_file(file: &DataFileMeta) -> Result<()> {
 pub(super) fn row_range(files: &[DataFileMeta]) -> Result<(i64, i64)> {
     if files.first().is_some_and(blob::is_blob) {
         return blob::row_range(files);
+    }
+    if files.first().is_some_and(vector::is_vector) {
+        return vector::row_range(files);
     }
     let groups = group_by_overlapping_row_id(files.to_vec());
     let mut range: Option<(i64, i64)> = None;
@@ -148,13 +152,14 @@ fn output_range(files: &[DataFileMeta], deletion_vectors_enabled: bool) -> Resul
     Ok((first, last))
 }
 
-/// Select complete normal-file groups and optional BLOB tasks within their ranges.
+/// Select complete normal-file groups and optional dedicated tasks within their ranges.
 pub(super) struct DataEvolutionCompactPlanner {
     min_file_num: usize,
     target_file_size: i128,
     open_file_cost: i64,
     deletion_vectors_enabled: bool,
     compact_blob: bool,
+    compact_vector: bool,
 }
 
 impl DataEvolutionCompactPlanner {
@@ -165,11 +170,17 @@ impl DataEvolutionCompactPlanner {
             open_file_cost: options.source_split_open_file_cost(),
             deletion_vectors_enabled: options.deletion_vectors_enabled(),
             compact_blob: false,
+            compact_vector: false,
         })
     }
 
     pub(super) fn with_blob_compaction(mut self, enabled: bool) -> Self {
         self.compact_blob = enabled;
+        self
+    }
+
+    pub(super) fn with_vector_compaction(mut self, enabled: bool) -> Self {
+        self.compact_vector = enabled;
         self
     }
 
@@ -182,6 +193,10 @@ impl DataEvolutionCompactPlanner {
     ) -> Result<Vec<CompactTask>> {
         let mut groups = BucketFiles::new();
         let mut blobs = BucketFiles::new();
+        let mut vectors = BucketFiles::new();
+        if self.compact_vector {
+            vector::ensure_supported(&table.schema().core_options())?;
+        }
         if self.compact_blob {
             blob::ensure_supported(&table.schema().core_options())?;
         }
@@ -196,6 +211,16 @@ impl DataEvolutionCompactPlanner {
                 ))
             }) {
                 continue;
+            }
+            if self.compact_vector && vector::is_vector(entry.file()) {
+                vectors
+                    .entry((
+                        entry.partition().to_vec(),
+                        entry.bucket(),
+                        entry.total_buckets(),
+                    ))
+                    .or_default()
+                    .push(entry.file().clone());
             }
             if !is_data_evolution_normal_file(entry.file()) {
                 if self.compact_blob && is_blob_or_video_file_name(&entry.file().file_name) {
@@ -223,13 +248,21 @@ impl DataEvolutionCompactPlanner {
         let mut tasks = Vec::new();
         for (key, files) in groups {
             let blob_files = blobs.remove(&key).unwrap_or_default();
+            let vector_files = vectors.remove(&key).unwrap_or_default();
             let (partition, bucket, total_buckets) = key;
-            let (normal_tasks, blob_tasks) = if blob_files.is_empty() {
-                (self.plan(files)?, Vec::new())
+            let (normal_tasks, blob_tasks, vector_tasks) = if blob_files.is_empty()
+                && vector_files.is_empty()
+            {
+                (self.plan(files)?, Vec::new(), Vec::new())
             } else {
                 let normal_tasks = self.plan(files.clone())?;
-                let blob_tasks = blob::plan(table, &files, &normal_tasks, blob_files).await?;
-                (normal_tasks, blob_tasks)
+                let blob_tasks = if blob_files.is_empty() {
+                    Vec::new()
+                } else {
+                    blob::plan(table, &files, &normal_tasks, blob_files).await?
+                };
+                let vector_tasks = vector::plan(table, &files, &normal_tasks, vector_files).await?;
+                (normal_tasks, blob_tasks, vector_tasks)
             };
             for files in normal_tasks {
                 validate_storage_layout(table, &files).await?;
@@ -242,6 +275,7 @@ impl DataEvolutionCompactPlanner {
                     files,
                     output_level: None,
                     blob_field_id: None,
+                    vector_field_ids: None,
                 });
             }
             for (field_id, files) in blob_tasks {
@@ -254,6 +288,20 @@ impl DataEvolutionCompactPlanner {
                     files,
                     output_level: None,
                     blob_field_id: Some(field_id),
+                    vector_field_ids: None,
+                });
+            }
+            for (field_ids, files) in vector_tasks {
+                tasks.push(CompactTask {
+                    context: context.clone(),
+                    task_id: tasks.len(),
+                    partition: partition.clone(),
+                    bucket,
+                    total_buckets,
+                    files,
+                    output_level: None,
+                    blob_field_id: None,
+                    vector_field_ids: Some(field_ids),
                 });
             }
         }
@@ -311,6 +359,9 @@ pub(super) async fn validate_inputs(
     if files.first().is_some_and(blob::is_blob) {
         return blob::validate_inputs(table, partition, bucket, files, active).await;
     }
+    if files.first().is_some_and(vector::is_vector) {
+        return vector::validate_inputs(table, partition, bucket, files, active).await;
+    }
     let (first, last) = row_range(files)?;
     let names = files
         .iter()
@@ -349,21 +400,33 @@ pub(in crate::table) async fn validate_replacement_inputs(
             None
         };
         buckets
-            .entry((entry.partition().to_vec(), entry.bucket(), field_id))
+            .entry((
+                entry.partition().to_vec(),
+                entry.bucket(),
+                vector::is_vector(entry.file()),
+                field_id,
+            ))
             .or_default()
             .push(entry.file().clone());
     }
-    for ((partition, bucket, _), files) in buckets {
+    for ((partition, bucket, _, _), files) in buckets {
         for group in group_by_overlapping_row_id(files) {
             validate_inputs(table, &partition, bucket, &group, active).await?;
         }
     }
     blob::validate_replacement_outputs(table, delta).await?;
+    vector::validate_replacement_outputs(table, delta).await?;
     Ok(())
 }
 
 pub(super) fn validate_task(task: &CompactTask) -> Result<()> {
-    if task.blob_field_id.is_some() {
+    if task.vector_field_ids.is_some() {
+        vector::validate_task(task)
+    } else if task.files.iter().any(vector::is_vector) {
+        Err(invalid(
+            "Vector compaction task is missing its field identities",
+        ))
+    } else if task.blob_field_id.is_some() {
         blob::validate_task(task)
     } else if task.files.iter().any(blob::is_blob) {
         Err(invalid(
@@ -477,6 +540,9 @@ pub(super) async fn execute(
     partition_path: String,
     resources: Option<ResourceContext>,
 ) -> Result<Vec<DataFileMeta>> {
+    if task.vector_field_ids.is_some() {
+        return vector::execute(table, task, split, partition_path, resources).await;
+    }
     if task.blob_field_id.is_some() {
         return blob::execute(table, task, split, partition_path, resources).await;
     }
@@ -566,6 +632,9 @@ pub(super) async fn execute(
 }
 
 pub(super) fn validate_outputs(task: &CompactTask, files: &[DataFileMeta]) -> Result<()> {
+    if task.vector_field_ids.is_some() {
+        return vector::validate_outputs(task, files);
+    }
     if task.blob_field_id.is_some() {
         return blob::validate_outputs(task, files);
     }
