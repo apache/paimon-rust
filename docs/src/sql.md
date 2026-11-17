@@ -132,6 +132,86 @@ function `blob_view` (alias `sys.blob_view`) and the built-in table-valued
 functions (`vector_search`, `hybrid_search`, and `full_text_search`) against it.
 It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
 
+### Reading files with `read_files`
+
+`SQLContext` registers a Databricks-style batch table function without requiring
+a catalog:
+
+```sql
+SELECT * FROM read_files('oss://my-bucket/imports/users.csv',
+    format => 'csv', header => true, schema => 'id BIGINT, name STRING');
+SELECT id FROM read_files('oss://my-bucket/imports/*.parquet');
+SELECT * FROM read_files('oss://my-bucket/imports/events.ndjson', format => 'json');
+SELECT * FROM read_files('oss://my-bucket/imports/document.json',
+    format => 'json', multiLine => true);
+SELECT value FROM read_files('oss://my-bucket/imports/logs/', format => 'text');
+SELECT path, length FROM read_files('oss://my-bucket/imports/images/',
+    format => 'binaryFile');
+```
+
+The embedding application must authorize and register each directory prefix.
+Registration is separate from Paimon catalog credentials and table permissions.
+Remote paths use a registered DataFusion object store, or a read-only Paimon
+FileIO binding supplied through `register_read_files_location_with_file_io`:
+
+```rust,ignore
+use paimon::io::FileIO;
+use paimon_datafusion::SQLContext;
+
+let ctx = SQLContext::new();
+let io = FileIO::from_path("oss://my-bucket/imports/")?
+    .with_props(storage_options) // fs.oss.endpoint, accessKeyId, accessKeySecret, etc.
+    .build()?;
+ctx.register_read_files_location_with_file_io("oss://my-bucket/imports/", io)?;
+```
+
+If an object store is already configured on the supplied `RuntimeEnv`, use
+`register_read_files_location(prefix)` instead. Registration captures the store
+for that prefix in this SQLContext; it does not change the shared RuntimeEnv.
+Queries retain their source binding even if another context registers the same
+URI with different credentials. Credentials are supplied by the application,
+never as SQL arguments. Local files also require explicit directory registration.
+Local reads resolve paths beneath an open directory handle, and directory
+discovery skips symlinks. HTTP/HTTPS file URLs are unsupported.
+
+Supported formats and options:
+
+| Format | Behavior and options |
+| --- | --- |
+| `csv` | Infer columns or use a DDL `schema`; `header`, `sep`/`delimiter`, `quote`, `escape`, `nullValue`, `multiLine`. Without `schema`, headers default to enabled; with `schema`, headers default to disabled. The default escape is backslash. Quoted line breaks require `multiLine => true`. |
+| `parquet` | Native Parquet schema, column pruning and predicate pushdown; optional `schema`. |
+| `json` | One object per line by default, including `.jsonl`/`.ndjson` files. `multiLine => true` reads one object or an array of objects per file. Optional `schema`. |
+| `text` | One UTF-8 line per `value STRING` row; default separators are LF, CRLF and CR. `lineSep` sets a separator; `wholeText => true` reads each file as one row, including empty files. |
+| `binaryFile` | One row per file: `path STRING`, `modificationTime TIMESTAMP`, `length BIGINT`, `content BINARY`. Selecting only metadata avoids reading file contents. |
+
+Options are named, case-insensitive and must evaluate to constants. Duplicate,
+unknown and format-inappropriate options are rejected. `format` can be omitted
+for recognized extensions; mixed formats require an explicit format. Directories
+are scanned recursively. Path globs support `*`, `?` and character classes.
+Each wildcard matches one path component; a matched directory includes its descendants.
+`pathGlobFilter` (alias `fileNamePattern`) filters leaf names. Hidden path
+components beginning with `.` or `_` are skipped. No matching files is an error.
+
+Every source row exposes `_metadata` with `file_path`, `file_name`, `file_size`
+and `file_modification_time`, unless the data already contains a column named
+`_metadata`, which takes precedence. Unlike Databricks, the generated struct is
+currently included in `SELECT *`; select data columns explicitly when a stable
+output schema is needed.
+With DataFusion's default identifier normalization, quote the camel-case binary
+column as `"modificationTime"` when selecting it explicitly.
+CSV and Parquet inference uses DataFusion's inference limits. NDJSON inference
+samples up to 1,000 records per file; multi-line JSON inference uses the whole
+document. JSON merges fields across the discovered files, including numeric
+widening. Supply `schema` for a fixed contract.
+
+This is a supported subset of [Databricks `read_files`](https://docs.databricks.com/aws/en/sql/language-manual/functions/read_files).
+It does not add the `read_csv`, `read_parquet`, `read_json`, `read_text`, `read_blob`
+or `read_ndjson` aliases. Hive partition inference, compressed text inputs, schema
+hints/rescued-data modes, streaming ingestion, Avro, ORC, XML and service-specific
+connections are not implemented. Malformed input fails rather than being rescued
+or silently dropped. Whole-file text, binary content and multi-line JSON
+materialize a file in memory; ordinary text and CSV are streamed in batches.
+
 ### REST Catalog Views and SQL Functions
 
 When the registered catalog is a Paimon REST Catalog, `SQLContext` can read, execute, create, and drop persistent views and can create SQL scalar functions.

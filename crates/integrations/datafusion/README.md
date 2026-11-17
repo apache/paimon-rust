@@ -40,6 +40,16 @@ the supported subset and migration differences, including legacy `size(NULL)`
 behavior, ANSI remainder handling and date-difference result types. This package
 does not provide every Spark SQL syntax or cast mode.
 
+## Reading external files
+
+`SQLContext` registers `read_files(path, format => ..., ...)` for CSV, Parquet,
+JSON/NDJSON, TEXT and binary files. The caller must first authorize directory
+prefixes with `register_read_files_location`, using the session's object stores,
+or `register_read_files_location_with_file_io` for Paimon FileIO (including OSS).
+Catalog registration does not grant arbitrary file access. See the
+[SQL guide](../../../docs/src/sql.md#reading-files-with-read_files) for the
+Databricks-compatible subset, named options and metadata differences.
+
 ## External engine snapshots
 
 Implement `TableEngineResolver::resolve_table_snapshot` to support

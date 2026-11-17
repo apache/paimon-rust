@@ -107,6 +107,7 @@ pub struct SQLContext {
     /// Session-scoped dynamic options set via `SET 'paimon.key' = 'value'`.
     dynamic_options: DynamicOptions,
     blob_reader_registry: BlobReaderRegistry,
+    read_files_locations: crate::read_files::Locations,
 }
 
 /// Builder for [`SQLContext`].
@@ -156,12 +157,14 @@ impl SQLContextBuilder {
 
     /// Builds a [`SQLContext`].
     pub fn build(self) -> SQLContext {
+        let read_files_locations = crate::read_files::Locations::default();
         let mut state_builder = SessionStateBuilder::new()
             .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
             .with_spark_features()
             .with_type_planner(Arc::new(crate::binary_cast::BinaryTypePlanner))
             .with_relation_planners(vec![
+                Arc::new(crate::read_files::ReadFilesPlanner),
                 Arc::new(crate::lateral_views::ExplodeRelationPlanner),
                 Arc::new(crate::relation_planner::PaimonRelationPlanner::new()),
             ])
@@ -190,11 +193,13 @@ impl SQLContextBuilder {
         crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
         crate::json_functions::register_json_functions(&ctx);
+        crate::read_files::register(&ctx, read_files_locations.clone());
         SQLContext {
             ctx,
             catalogs: HashMap::new(),
             dynamic_options: Default::default(),
             blob_reader_registry: BlobReaderRegistry::default(),
+            read_files_locations,
         }
     }
 }
@@ -218,6 +223,30 @@ impl SQLContext {
 
     pub fn blob_reader_registry(&self) -> BlobReaderRegistry {
         self.blob_reader_registry.clone()
+    }
+
+    /// Allows `read_files` to read a directory prefix in this session.
+    ///
+    /// The caller must authorize this location before registering it. Remote
+    /// locations use the object store registered in this context's RuntimeEnv;
+    /// catalog credentials and table permissions are not inherited. Local
+    /// directories require an explicit registration as well. HTTP(S) is unsupported.
+    pub fn register_read_files_location(&self, prefix: &str) -> DFResult<()> {
+        self.read_files_locations.register(&self.ctx, prefix, None)
+    }
+
+    /// Registers an authorized `read_files` location using Paimon FileIO.
+    ///
+    /// This enables OSS and application-managed storage/credential providers.
+    /// The binding is session-local and does not modify the RuntimeEnv's object
+    /// store registry, even when several contexts share that RuntimeEnv.
+    pub fn register_read_files_location_with_file_io(
+        &self,
+        prefix: &str,
+        file_io: paimon::io::FileIO,
+    ) -> DFResult<()> {
+        self.read_files_locations
+            .register(&self.ctx, prefix, Some(file_io))
     }
 
     /// Registers a Paimon catalog under the given name.

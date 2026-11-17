@@ -66,6 +66,7 @@ mod merge_into;
 mod partition_count_pushdown;
 mod physical_plan;
 mod procedures;
+mod read_files;
 mod regex_operators;
 mod relation_planner;
 pub mod runtime;
