@@ -1179,17 +1179,7 @@ impl SQLContext {
             builder = builder.column_with_description(column_name.clone(), paimon_type, comment);
         }
 
-        // Primary key from constraints: PRIMARY KEY (col, ...)
-        for constraint in &ct.constraints {
-            if let datafusion::sql::sqlparser::ast::TableConstraint::PrimaryKey(pk) = constraint {
-                let pk_cols: Vec<String> = pk
-                    .columns
-                    .iter()
-                    .map(|c| primary_key_column_name(&c.column.expr, enable_ident_normalization))
-                    .collect();
-                builder = builder.primary_key(pk_cols);
-            }
-        }
+        builder = builder.primary_key(extract_primary_keys(ct, enable_ident_normalization)?);
 
         // Partition keys (extracted and validated before parsing)
         if !partition_keys.is_empty() {
@@ -3357,6 +3347,44 @@ fn column_def_comment(col: &ColumnDef) -> Option<String> {
         ColumnOption::Comment(comment) => Some(comment.clone()),
         _ => None,
     })
+}
+
+fn extract_primary_keys(
+    ct: &CreateTable,
+    enable_ident_normalization: bool,
+) -> DFResult<Vec<String>> {
+    let mut primary_keys = None;
+    for column in &ct.columns {
+        for option in &column.options {
+            if matches!(option.option, ColumnOption::PrimaryKey(_)) {
+                if primary_keys.is_some() {
+                    return Err(DataFusionError::Plan(
+                        "Multiple primary keys are not allowed".into(),
+                    ));
+                }
+                primary_keys = Some(vec![normalize_schema_identifier(
+                    &column.name,
+                    enable_ident_normalization,
+                )]);
+            }
+        }
+    }
+    for constraint in &ct.constraints {
+        if let datafusion::sql::sqlparser::ast::TableConstraint::PrimaryKey(pk) = constraint {
+            if primary_keys.is_some() {
+                return Err(DataFusionError::Plan(
+                    "Multiple primary keys are not allowed".into(),
+                ));
+            }
+            primary_keys = Some(
+                pk.columns
+                    .iter()
+                    .map(|c| primary_key_column_name(&c.column.expr, enable_ident_normalization))
+                    .collect(),
+            );
+        }
+    }
+    Ok(primary_keys.unwrap_or_default())
 }
 
 fn primary_key_column_name(expr: &SqlExpr, enable_ident_normalization: bool) -> String {
@@ -7284,6 +7312,69 @@ mod tests {
             assert_eq!(schema.primary_keys(), &["id"]);
         } else {
             panic!("expected CreateTable call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_table_column_primary_key() {
+        for (column, expected) in [("ID", "id"), ("\"ID\"", "ID")] {
+            let catalog = Arc::new(MockCatalog::new());
+            let sql_context = make_sql_context(catalog.clone()).await;
+
+            for definition in [
+                format!("{column} INT PRIMARY KEY, name VARCHAR"),
+                format!("{column} INT, name VARCHAR, PRIMARY KEY ({column})"),
+            ] {
+                sql_context
+                    .sql(&format!("CREATE TABLE mydb.t1 ({definition})"))
+                    .await
+                    .unwrap();
+            }
+
+            let calls = catalog.take_calls();
+            let [CatalogCall::CreateTable { schema: inline, .. }, CatalogCall::CreateTable { schema: table, .. }] =
+                calls.as_slice()
+            else {
+                panic!("expected two CreateTable calls, got {calls:?}");
+            };
+            assert_eq!(inline.primary_keys(), [expected]);
+            assert_eq!(inline.primary_keys(), table.primary_keys());
+            assert_eq!(inline.fields(), table.fields());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_table_composite_primary_key() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+        sql_context
+            .sql("CREATE TABLE mydb.t1 (a INT, b INT, PRIMARY KEY (a, b))")
+            .await
+            .unwrap();
+
+        let calls = catalog.take_calls();
+        let [CatalogCall::CreateTable { schema, .. }] = calls.as_slice() else {
+            panic!("expected one CreateTable call, got {calls:?}");
+        };
+        assert_eq!(schema.primary_keys(), ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn test_create_table_rejects_multiple_primary_keys() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+
+        for definition in [
+            "a INT PRIMARY KEY, b INT PRIMARY KEY",
+            "a INT PRIMARY KEY, b INT, PRIMARY KEY (b)",
+            "a INT, b INT, PRIMARY KEY (a), PRIMARY KEY (b)",
+        ] {
+            let err = sql_context
+                .sql(&format!("CREATE TABLE mydb.t1 ({definition})"))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("Multiple primary keys"), "{err}");
+            assert!(catalog.take_calls().is_empty());
         }
     }
 
