@@ -17,6 +17,10 @@
 
 //! Resolve Paimon's max_pt to a string literal before DataFusion plans partition filters.
 
+mod temporary_view;
+
+pub(crate) use temporary_view::{track_metadata_reads, MetadataView};
+
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
@@ -133,6 +137,7 @@ pub(crate) async fn rewrite(
     if calls.is_empty() {
         return Ok(false);
     }
+    temporary_view::record_metadata_read();
 
     // Resolve each distinct call once per statement; retain no cross-query cache.
     let mut values = HashMap::new();

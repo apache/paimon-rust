@@ -388,6 +388,13 @@ async fn test_max_pt_refuses_filtered_or_masked_partition_metadata() {
         &format!("CREATE VIEW latest_partition AS SELECT max_pt('{TABLE}') AS latest"),
     )
     .await;
+    for sql in [
+        format!("CREATE TEMPORARY VIEW latest_temp AS SELECT max_pt('{TABLE}') AS latest"),
+        "CREATE TEMPORARY VIEW nested_temp AS SELECT latest FROM latest_temp".into(),
+        "CREATE TEMPORARY VIEW persistent_temp AS SELECT latest FROM latest_partition".into(),
+    ] {
+        query(&context, &sql).await;
+    }
 
     for (response, visible_maximum) in [
         (
@@ -422,6 +429,9 @@ async fn test_max_pt_refuses_filtered_or_masked_partition_metadata() {
             format!("SELECT sys.max_pt('{TABLE}')"),
             format!("SELECT paimon.sys.max_pt('{TABLE}')"),
             "SELECT latest FROM latest_partition".to_string(),
+            "SELECT latest FROM latest_temp".to_string(),
+            "SELECT latest FROM nested_temp".to_string(),
+            "SELECT latest FROM persistent_temp".to_string(),
         ] {
             let error = match context.sql(&sql).await {
                 Err(error) => error,
@@ -448,6 +458,9 @@ async fn test_max_pt_refuses_filtered_or_masked_partition_metadata() {
     for sql in [
         format!("SELECT max_pt('{TABLE}')"),
         "SELECT latest FROM latest_partition".to_string(),
+        "SELECT latest FROM latest_temp".to_string(),
+        "SELECT latest FROM nested_temp".to_string(),
+        "SELECT latest FROM persistent_temp".to_string(),
     ] {
         let maximum = single(&query(&context, &sql).await);
         assert_eq!(common::string_value(maximum.as_ref(), 0), "judy");

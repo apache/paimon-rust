@@ -521,11 +521,12 @@ impl SQLContext {
             let compat_changed =
                 crate::expression_compat::rewrite(&mut statements[0], &self.ctx.state())?;
             let state = self.ctx.state();
-            // Queries resolve after catalog SQL functions have been expanded below.
+            // Queries and temporary view bodies resolve after SQL function expansion below.
             let max_pt_changed = if matches!(
                 statements[0],
                 Statement::Query(_) | Statement::Explain { .. }
-            ) {
+            ) || matches!(&statements[0], Statement::CreateView(view) if view.temporary)
+            {
                 false
             } else {
                 Box::pin(crate::partition_functions::rewrite(
@@ -2249,14 +2250,39 @@ impl SQLContext {
                 create_view.name.clone(),
                 self.ctx.enable_ident_normalization(),
             )?;
-            let df = self.ctx.sql_with_options(&query_sql, sql_options).await?;
+            let state = self.ctx.state();
+            let (df, reads_metadata) = crate::partition_functions::track_metadata_reads(async {
+                let expanded_query = crate::sql_function::expand_sql(
+                    &state,
+                    &query_sql,
+                    &self.catalogs,
+                    &state.config_options().catalog.default_catalog,
+                    &state.config_options().catalog.default_schema,
+                )
+                .await?;
+                self.ctx
+                    .sql_with_options(&expanded_query, sql_options)
+                    .await
+            })
+            .await?;
             let logical_plan = df.logical_plan().clone();
             if create_view.if_not_exists && self.temp_table_exist(table_ref.clone())? {
                 return ok_result(&self.ctx);
             }
-            // Create a ViewTable and register it as a temp table
-            let view_table = datafusion::datasource::ViewTable::new(logical_plan, Some(query_sql));
-            self.register_temp_table(table_ref, Arc::new(view_table))?;
+            let view_table: Arc<dyn TableProvider> = if reads_metadata {
+                Arc::new(crate::partition_functions::MetadataView::new(
+                    &logical_plan,
+                    query_sql,
+                    &state,
+                    self.catalogs.clone(),
+                ))
+            } else {
+                Arc::new(datafusion::datasource::ViewTable::new(
+                    logical_plan,
+                    Some(query_sql),
+                ))
+            };
+            self.register_temp_table(table_ref, view_table)?;
             ok_result(&self.ctx)
         } else {
             validate_persistent_create_view(create_view)?;

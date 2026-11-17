@@ -868,6 +868,16 @@ impl PaimonSchemaProvider {
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
         if let Some(temp) = &self.temp_provider {
             if let Some(table) = temp.table(name).await? {
+                if allow_views {
+                    if let Some(view) =
+                        table.downcast_ref::<crate::partition_functions::MetadataView>()
+                    {
+                        let state = self.session_state.as_ref().and_then(|provider| provider()).ok_or_else(|| {
+                            plan_datafusion_err!("DataFusion session is unavailable while planning temporary view '{name}'")
+                        })?;
+                        return Ok(Some(Arc::new(Box::pin(view.resolve(&state)).await?)));
+                    }
+                }
                 return Ok(Some(table));
             }
         }

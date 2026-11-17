@@ -2517,6 +2517,9 @@ precedence. Paimon branch references are supported; system tables are
 rejected. Resolution reads scan metadata during planning and substitutes a
 literal so partition filters can be pushed down. Repeated calls are resolved
 once per statement, and later statements read fresh metadata.
+Temporary SQL views that depend on `max_pt`, including through other views,
+retain their SQL and resolve it again for each query. They retain the creation
+namespace and output schema, while reading current scan options and grants.
 The metadata lookup follows the same session scan options, including historical
 snapshots, as a normal table read. Temporary shadows are resolved normally and
 must still be Paimon data tables; a view cannot be passed as the source table.

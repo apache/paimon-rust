@@ -118,6 +118,130 @@ async fn max_pt_uses_typed_top_level_partitions_and_refreshes_between_queries() 
 }
 
 #[tokio::test]
+async fn temporary_views_refresh_max_pt_including_nested_views_and_partition_filters() {
+    let (_directory, ctx) = context().await;
+    execute(&ctx, "CREATE TABLE t (id INT, p INT) PARTITIONED BY (p)").await;
+    execute(&ctx, "INSERT INTO t VALUES (1, 10)").await;
+    for (index, call) in [
+        "max_pt('t')",
+        "sys.max_pt('default.t')",
+        "paimon.sys.max_pt('paimon.default.t')",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        execute(
+            &ctx,
+            &format!("CREATE TEMPORARY VIEW latest_{index} AS SELECT {call} AS p"),
+        )
+        .await;
+        execute(
+            &ctx,
+            &format!("CREATE TEMPORARY VIEW nested_{index} AS SELECT p FROM latest_{index}"),
+        )
+        .await;
+    }
+    execute(
+        &ctx,
+        "CREATE TEMPORARY VIEW latest_rows AS SELECT id FROM t WHERE p = CAST(max_pt('t') AS INT)",
+    )
+    .await;
+    for (id, partition) in [(2, 11), (3, 12)] {
+        execute(&ctx, &format!("INSERT INTO t VALUES ({id}, {partition})")).await;
+        for index in 0..3 {
+            for prefix in ["latest", "nested"] {
+                assert_eq!(
+                    scalar(&ctx, &format!("SELECT p FROM {prefix}_{index}")).await,
+                    ScalarValue::Utf8(Some(partition.to_string()))
+                );
+            }
+        }
+        assert_eq!(
+            scalar(&ctx, "SELECT id FROM latest_rows WHERE id > 1 LIMIT 1").await,
+            ScalarValue::Int32(Some(id))
+        );
+    }
+    let provider = ctx.ctx().table_provider("latest_0").await.unwrap();
+    assert!(provider.get_table_definition().unwrap().contains("max_pt"));
+}
+
+#[tokio::test]
+async fn temporary_metadata_views_keep_creation_namespace_and_use_current_scan_options() {
+    let (_directory, ctx) = context().await;
+    execute(&ctx, "CREATE DATABASE other").await;
+    execute(&ctx, "CREATE TABLE t (id INT, p INT) PARTITIONED BY (p)").await;
+    execute(&ctx, "INSERT INTO t VALUES (1, 10)").await;
+    execute(
+        &ctx,
+        "CREATE TEMPORARY VIEW other.latest AS SELECT MAX_PT('t') AS p",
+    )
+    .await;
+    execute(&ctx, "INSERT INTO t VALUES (2, 11)").await;
+    ctx.set_current_database("other").await.unwrap();
+    execute(&ctx, "CREATE TABLE t (id INT, p INT) PARTITIONED BY (p)").await;
+    execute(&ctx, "INSERT INTO t VALUES (3, 99)").await;
+    execute(
+        &ctx,
+        "SET datafusion.sql_parser.enable_ident_normalization = false",
+    )
+    .await;
+    for (option, expected) in [
+        ("SET 'paimon.scan.version' = '1'", "10"),
+        ("RESET 'paimon.scan.version'", "11"),
+    ] {
+        execute(&ctx, option).await;
+        assert_eq!(
+            scalar(&ctx, "SELECT p FROM other.latest").await,
+            ScalarValue::Utf8(Some(expected.into()))
+        );
+    }
+    assert_error(
+        &ctx,
+        "SELECT max_pt('other.latest')",
+        "requires a Paimon data table",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn temporary_metadata_views_reject_schema_drift_and_recursive_expansion() {
+    let (_directory, ctx) = context().await;
+    execute(&ctx, "CREATE TABLE t (id INT, p INT) PARTITIONED BY (p)").await;
+    execute(&ctx, "INSERT INTO t VALUES (1, 10)").await;
+    execute(
+        &ctx,
+        "CREATE TEMPORARY VIEW latest AS SELECT * FROM t WHERE p = CAST(max_pt('t') AS INT)",
+    )
+    .await;
+    execute(&ctx, "ALTER TABLE t ADD COLUMN extra INT").await;
+    assert_error(
+        &ctx,
+        "SELECT * FROM latest",
+        "schema changed since creation",
+    )
+    .await;
+    execute(&ctx, "CREATE TABLE recursive_source (id INT)").await;
+    execute(
+        &ctx,
+        "CREATE TEMPORARY VIEW recursive_source AS SELECT id FROM recursive_source WHERE max_pt('t') IS NOT NULL",
+    )
+    .await;
+    // A metadata source view is rejected without recursively planning its body.
+    assert_error(
+        &ctx,
+        "SELECT max_pt('recursive_source')",
+        "requires a Paimon data table",
+    )
+    .await;
+    assert_error(
+        &ctx,
+        "SELECT * FROM recursive_source",
+        "recursive metadata-dependent temporary view",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn max_pt_preserves_strings_dates_and_current_namespace() {
     let (_directory, ctx) = context().await;
     execute(&ctx, "CREATE DATABASE other").await;
