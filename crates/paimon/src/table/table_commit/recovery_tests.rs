@@ -588,8 +588,7 @@ async fn rest_delete_writer_pins_catalog_snapshot_and_preserves_vectors() {
     use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
     use axum::{
         body::Bytes,
-        http::{Method, StatusCode, Uri},
-        response::IntoResponse,
+        http::{Method, Uri},
         Json, Router,
     };
     use futures::TryStreamExt;
@@ -646,18 +645,15 @@ async fn rest_delete_writer_pins_catalog_snapshot_and_preserves_vectors() {
                 let next: Snapshot = serde_json::from_value(request["snapshot"].clone()).unwrap();
                 assert_eq!(next.id(), snapshot.lock().unwrap().id() + 1);
                 *snapshot.lock().unwrap() = next;
-                // The publication succeeded, but its response was lost.
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"code": 500, "message": "lost commit response"})),
-                ).into_response();
+                // Force the retry/deduplication path after catalog publication.
+                serde_json::json!({"success": false})
             } else if uri.path().ends_with("/snapshot") {
                 loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 serde_json::json!({"snapshot": {"snapshot": *snapshot.lock().unwrap(), "recordCount": 10}})
             } else {
                 serde_json::json!({"schemaId": 0})
             };
-            Json(response).into_response()
+            Json(response)
         }
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
