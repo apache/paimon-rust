@@ -84,6 +84,7 @@ mod update;
 mod variant_functions;
 mod variant_pushdown;
 mod vector_search;
+mod vector_type;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};

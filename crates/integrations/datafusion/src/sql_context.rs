@@ -161,7 +161,7 @@ impl SQLContextBuilder {
             .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
             .with_spark_features()
-            .with_type_planner(Arc::new(crate::binary_cast::BinaryTypePlanner))
+            .with_type_planner(Arc::new(crate::vector_type::PaimonTypePlanner))
             .with_relation_planners(vec![
                 Arc::new(crate::lateral_views::ExplodeRelationPlanner),
                 Arc::new(crate::relation_planner::PaimonRelationPlanner::new()),
@@ -498,8 +498,8 @@ impl SQLContext {
 
         let alter_comment = parse_alter_column_comment(&rewritten_sql)?;
         let from_alter_comment = alter_comment.is_some();
-        let mut statements = if let Some(statement) = alter_comment {
-            vec![statement]
+        let (mut statements, vector_changed) = if let Some(statement) = alter_comment {
+            (vec![statement], false)
         } else {
             parse_sql_statements(&rewritten_sql)?
         };
@@ -521,7 +521,7 @@ impl SQLContext {
                 crate::expression_compat::rewrite(&mut statements[0], &self.ctx.state())?;
             binary_changed || regex_changed || lateral_changed || compat_changed
         };
-        let sql = if changed {
+        let sql = if changed || vector_changed {
             rewritten = statements[0].to_string();
             rewritten.as_str()
         } else {
@@ -2888,9 +2888,9 @@ fn validate_persistent_create_function(create_function: &CreateFunction) -> DFRe
     Ok(())
 }
 
-fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
+fn parse_sql_statements(sql: &str) -> DFResult<(Vec<Statement>, bool)> {
     if let Some(statement) = crate::extended_describe::parse_describe(sql)? {
-        return Ok(vec![statement]);
+        return Ok((vec![statement], false));
     }
     let regex_sql = crate::regex_operators::parseable_sql(sql)?;
     let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
@@ -2941,9 +2941,7 @@ fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
             .map(|(_, token)| token)
             .collect();
     }
-    let mut statements = Parser::new(&dialect)
-        .with_tokens_with_locations(tokens)
-        .parse_statements()
+    let (mut statements, vector_changed) = crate::vector_type::parse_statements(tokens)
         .map_err(|error| DataFusionError::Plan(format!("SQL parse error: {error}")))?;
     if create_function_if_not_exists {
         let Some(Statement::CreateFunction(create_function)) = statements.first_mut() else {
@@ -2961,7 +2959,7 @@ fn parse_sql_statements(sql: &str) -> DFResult<Vec<Statement>> {
         };
         create_function.or_alter = true;
     }
-    Ok(statements)
+    Ok((statements, vector_changed))
 }
 
 /// Parse the Paimon/Flink column-comment spelling into the standard COMMENT AST.
@@ -3475,13 +3473,17 @@ fn column_def_nullable(col: &ColumnDef) -> bool {
 ///
 /// DDL schema translation must use this function instead of going through Arrow,
 /// because Arrow cannot preserve logical distinctions such as `BLOB` vs `VARBINARY`.
-fn sql_data_type_to_paimon_type(
+pub(crate) fn sql_data_type_to_paimon_type(
     sql_type: &datafusion::sql::sqlparser::ast::DataType,
     nullable: bool,
 ) -> DFResult<PaimonDataType> {
     use datafusion::sql::sqlparser::ast::{
         ArrayElemTypeDef, DataType as SqlType, ExactNumberInfo, TimezoneInfo,
     };
+
+    if let Some(vector) = crate::vector_type::sql_type_to_vector(sql_type, nullable)? {
+        return Ok(PaimonDataType::Vector(vector));
+    }
 
     match sql_type {
         SqlType::Boolean => Ok(PaimonDataType::Boolean(BooleanType::with_nullable(
@@ -4830,6 +4832,84 @@ mod tests {
             Identifier::new(database, name),
             schema,
         ));
+    }
+
+    #[tokio::test]
+    async fn vector_sql_types_in_persistent_functions_and_views() {
+        use datafusion::arrow::array::{FixedSizeListArray, Float32Array};
+
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog.clone()).await;
+        ctx.sql(
+            "CREATE FUNCTION vector_identity(x VECTOR<FLOAT, 2>) \
+             RETURNS VECTOR<FLOAT, 2> RETURN CAST(x AS VECTOR<FLOAT, 2>)",
+        )
+        .await
+        .unwrap();
+        let function = catalog
+            .get_function(&Identifier::new("default", "vector_identity"))
+            .await
+            .unwrap();
+        let expected = PaimonDataType::Vector(
+            paimon::spec::VectorType::new(2, PaimonDataType::Float(FloatType::new())).unwrap(),
+        );
+        assert_eq!(function.input_params().unwrap()[0].data_type(), &expected);
+        assert_eq!(function.return_params().unwrap()[0].data_type(), &expected);
+        ctx.sql(
+            "CREATE VIEW vector_view AS SELECT \
+             vector_identity(CAST([1, 2] AS VECTOR<FLOAT, 2>)) AS embedding",
+        )
+        .await
+        .unwrap();
+        let batches = ctx
+            .sql("SELECT embedding FROM vector_view")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let vectors = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let value = vectors.value(0);
+        assert_eq!(
+            value
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .values(),
+            &[1.0, 2.0]
+        );
+
+        for (name, sql_type) in [
+            ("vector_map_identity", "MAP(STRING, VECTOR<FLOAT, 2>)"),
+            ("vector_array_identity", "ARRAY<VECTOR<FLOAT, 2>>"),
+            ("vector_struct_identity", "STRUCT<v VECTOR<FLOAT, 2>>"),
+        ] {
+            ctx.sql(&format!(
+                "CREATE FUNCTION {name}(x {sql_type}) RETURNS {sql_type} RETURN x"
+            ))
+            .await
+            .unwrap();
+            let batches = ctx
+                .sql(&format!("SELECT {name}(CAST(NULL AS {sql_type})) AS v"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let function = catalog
+                .get_function(&Identifier::new("default", name))
+                .await
+                .unwrap();
+            let actual =
+                paimon::arrow::arrow_to_paimon_type(batches[0].column(0).data_type(), true)
+                    .unwrap();
+            assert_eq!(&actual, function.return_params().unwrap()[0].data_type());
+            assert!(batches[0].column(0).is_null(0));
+        }
     }
 
     #[tokio::test]

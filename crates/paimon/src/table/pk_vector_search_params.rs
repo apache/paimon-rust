@@ -61,7 +61,7 @@ impl PkVectorSearchParams {
             !data.is_empty()
         });
         if has_data_predicate
-            && !(core.deletion_vectors_enabled() && !core.deletion_vectors_merge_on_read())
+            && (!core.deletion_vectors_enabled() || core.deletion_vectors_merge_on_read())
         {
             return Err(crate::Error::DataInvalid {
                 message:

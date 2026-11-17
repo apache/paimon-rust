@@ -318,14 +318,25 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `TIMESTAMP WITH TIME ZONE` | LocalZonedTimestampType | |
 | `DECIMAL(p, s)` | DecimalType | |
 | `ARRAY<element>` | ArrayType | e.g. `ARRAY<INT>` |
+| `VECTOR<element, n>` | VectorType | Fixed-size vector; `n` is between 1 and 2147483647 |
 | `MAP(key, value)` | MapType | e.g. `MAP(STRING, INT)` |
 | `STRUCT<field TYPE, ...>` | RowType | e.g. `STRUCT<city STRING, zip INT>` |
 
-For vector search tables created from SQL, use `ARRAY<FLOAT>` for embedding
-columns. Existing Paimon tables may also expose logical `VECTOR<FLOAT,N>`
-columns; DataFusion reads those as Arrow `FixedSizeList<Float32>`, and vindex
-index creation uses `N` as the vector dimension. `SHOW CREATE TABLE` currently
-does not round-trip `VECTOR` columns.
+`VECTOR<element, n>` follows Paimon's logical vector type. Elements must be
+`BOOLEAN`, `TINYINT`, `SMALLINT`, `INT` / `INTEGER`, `BIGINT`, `FLOAT` / `REAL`,
+or `DOUBLE` / `DOUBLE PRECISION`. The vector and its elements are nullable by
+default; for example, `embedding VECTOR<FLOAT NOT NULL, 128> NOT NULL` disallows
+both null vectors and null elements. The syntax is supported in `CREATE TABLE`,
+`ALTER TABLE`, and `CAST`, including vectors nested in arrays, maps, and structs.
+`SHOW CREATE TABLE` preserves the element type, dimension, and nullability.
+Nested vectors can also be non-null, for example
+`ARRAY<VECTOR<FLOAT NOT NULL, 128> NOT NULL>`.
+In `CAST` targets, SQL fixed-size arrays (`T[n]`) inside a `MAP` containing
+vectors are not supported; use `ARRAY<T>` for variable-length collections.
+
+For vector search embeddings, use `VECTOR<FLOAT, n>` or `ARRAY<FLOAT>`.
+DataFusion represents `VECTOR<FLOAT, n>` as Arrow `FixedSizeList<Float32>`, and
+vindex index creation uses `n` from the type as the vector dimension.
 
 ### Blob Columns
 
@@ -1955,7 +1966,7 @@ Supported vindex options:
 
 | Option | Default | Applies To | Description |
 |---|---:|---|---|
-| `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. Existing `VECTOR<FLOAT,N>` columns use `N` from the type. |
+| `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. `VECTOR<FLOAT,N>` columns use `N` from the type. |
 | `<index-type>.distance.metric` | `inner_product` | all vindex types | Distance metric: `inner_product`, `cosine`, or `l2`. |
 | `<index-type>.nlist` | automatic | all IVF types | Number of IVF lists. When omitted or `auto`, infer it from `expected-vector-count`. DiskANN rejects this option. |
 | `<index-type>.expected-vector-count` | unset, or inferred | all vindex types | Expected number of vectors used for automatic sizing. When omitted, an automatic IVF build counts the shard's non-NULL vectors before training. |
