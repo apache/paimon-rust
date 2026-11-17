@@ -134,9 +134,14 @@ fn rewrite_aggregate(aggregate: &Aggregate) -> DFResult<Option<LogicalPlan>> {
     let table = paimon.table();
     let table_schema = table.schema();
     // Manifest row counts of a primary-key table are physical: several versions
-    // of a key count separately until they are merged at read time.
-    if CoreOptions::new(table_schema.options()).is_format_table()
+    // of a key count separately until they are merged at read time. A table that
+    // sets an incremental window reads that window's changes rather than the
+    // table state the manifests describe, and an invalid window must still
+    // surface when the table is read.
+    let core_options = CoreOptions::new(table_schema.options());
+    if core_options.is_format_table()
         || !table_schema.primary_keys().is_empty()
+        || !matches!(core_options.incremental_timestamp_window(), Ok(None))
     {
         return Ok(None);
     }
