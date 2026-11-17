@@ -5287,8 +5287,7 @@ mod tests {
             let error = ctx
                 .sql(sql)
                 .await
-                .err()
-                .expect("temporary function drop must be rejected");
+                .expect_err("temporary function drop must be rejected");
             assert!(
                 error.to_string().contains("DROP TEMPORARY FUNCTION"),
                 "{error}"
