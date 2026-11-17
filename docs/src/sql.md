@@ -198,8 +198,13 @@ without planning or executing the defining query. Temporary views shadow
 persistent objects and return `CREATE TEMPORARY VIEW`; session-native
 DataFusion views are also supported. Temporary definitions bind table and
 Catalog function names to the namespace used at creation, so recreating them
-after `USE` preserves their dependencies. Repeated exports and recreations keep
-the type projection stable. Table targets are rejected.
+after `USE` preserves their dependencies. Native views created through
+`SQLContext::sql` also bind their table dependencies at creation. Definitions
+created directly through `SessionContext` must fully qualify physical table
+references as `catalog.schema.table`; exports with unqualified dependencies
+are rejected because their creation namespace cannot be recovered reliably.
+Repeated exports and recreations keep the type projection stable. Table targets
+are rejected.
 
 Persistent `CREATE VIEW` and `DROP VIEW` are currently implemented by REST
 Catalog. `DROP VIEW` sends a direct delete request; `IF EXISTS` ignores only a

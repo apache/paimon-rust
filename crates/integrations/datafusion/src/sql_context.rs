@@ -1545,18 +1545,33 @@ impl SQLContext {
             .iter()
             .map(|field| field.name().clone())
             .collect::<Vec<_>>();
-        let definition = provider.get_table_definition().map(|stored| {
-            // DataFusion stores CREATE VIEW, whereas Paimon temporary views
-            // store only their query. Return a fully qualified DDL in both cases.
-            let query = match parse_sql_statements(stored) {
-                Ok(statements) => match statements.as_slice() {
-                    [Statement::CreateView(create)] => create.query.to_string(),
-                    _ => stored.to_string(),
-                },
-                Err(_) => stored.to_string(),
-            };
-            view_definition(&catalog, &database, &view, &columns, &query, temporary)
-        });
+        let definition = provider
+            .get_table_definition()
+            .map(|stored| -> DFResult<String> {
+                // DataFusion stores CREATE VIEW, whereas Paimon temporary views
+                // store only their query. Neither the provider nor a bare table
+                // scan reliably records the namespace used at creation.
+                let statements = parse_sql_statements(stored)?;
+                let (query, query_sql) = match statements.as_slice() {
+                    [Statement::CreateView(create)] => {
+                        (create.query.as_ref(), create.query.to_string())
+                    }
+                    [Statement::Query(query)] => (query.as_ref(), stored.to_string()),
+                    _ => {
+                        return Err(plan_datafusion_err!(
+                            "Stored view definition must contain one query or CREATE VIEW statement"
+                        ));
+                    }
+                };
+                crate::sql_function::validate_bound_view_query(
+                    query,
+                    self.ctx.enable_ident_normalization(),
+                )?;
+                Ok(view_definition(
+                    &catalog, &database, &view, &columns, &query_sql, temporary,
+                ))
+            })
+            .transpose()?;
         self.show_create_result(catalog, database, view, definition.as_deref(), true)
     }
 

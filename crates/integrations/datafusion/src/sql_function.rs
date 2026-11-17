@@ -24,7 +24,8 @@ use datafusion::execution::SessionState;
 use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
     visit_expressions, visit_expressions_mut, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
-    FunctionArguments, Ident, ObjectName, Query, Statement, TableFactor, VisitMut, VisitorMut,
+    FunctionArguments, Ident, ObjectName, Query, SetExpr, SetOperator, Statement, TableFactor,
+    VisitMut, Visitor, VisitorMut,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -158,6 +159,133 @@ fn quoted_name(parts: &[&str]) -> ObjectName {
             .map(|part| Ident::with_quote('"', *part))
             .collect::<Vec<_>>(),
     )
+}
+
+/// A native provider's stored SQL may lack its creation namespace, even though
+/// its logical plan still holds the original table providers. Only export SQL
+/// whose physical table references are independent of the session defaults.
+pub(crate) fn validate_bound_view_query(query: &Query, normalize: bool) -> DFResult<()> {
+    struct Validator<'a> {
+        visible_ctes: &'a HashSet<String>,
+        normalize: bool,
+        skip_root_query: bool,
+        nested_queries: usize,
+    }
+    impl Visitor for Validator<'_> {
+        type Break = DataFusionError;
+
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+            if self.skip_root_query {
+                self.skip_root_query = false;
+                return ControlFlow::Continue(());
+            }
+            if self.nested_queries == 0 {
+                if let Err(error) = validate_query(query, self.visible_ctes, self.normalize) {
+                    return ControlFlow::Break(error);
+                }
+            }
+            self.nested_queries += 1;
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+            self.nested_queries = self.nested_queries.saturating_sub(1);
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+            // Nested queries have already been checked in their own CTE scope.
+            if self.nested_queries != 0 {
+                return ControlFlow::Continue(());
+            }
+            if let TableFactor::Table {
+                name, args: None, ..
+            } = factor
+            {
+                let is_cte = match name.0.as_slice() {
+                    [part] => part.as_ident().is_some_and(|identifier| {
+                        self.visible_ctes.contains(
+                            &IdentNormalizer::new(self.normalize).normalize(identifier.clone()),
+                        )
+                    }),
+                    _ => false,
+                };
+                if name.0.len() < 3 && !is_cte {
+                    return ControlFlow::Break(DataFusionError::Plan(format!(
+                        "Cannot export view with unqualified dependency '{name}': its creation \
+                         namespace is unavailable; use fully qualified catalog.schema.table \
+                         names in the view definition"
+                    )));
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn validate_query(
+        query: &Query,
+        inherited_ctes: &HashSet<String>,
+        normalize: bool,
+    ) -> DFResult<()> {
+        let mut visible_ctes = inherited_ctes.clone();
+        if let Some(with) = &query.with {
+            // DataFusion plans CTEs sequentially even with WITH RECURSIVE.
+            for cte in &with.cte_tables {
+                let name = IdentNormalizer::new(normalize).normalize(cte.alias.name.clone());
+                if let (
+                    true,
+                    SetExpr::SetOperation {
+                        op: SetOperator::Union,
+                        left,
+                        right,
+                        ..
+                    },
+                ) = (with.recursive, cte.query.body.as_ref())
+                {
+                    // recursive_cte plans these operands directly. The static
+                    // left operand cannot see the work table; only the right can.
+                    for (operand, recursive) in [(left, false), (right, true)] {
+                        let mut branch_ctes = visible_ctes.clone();
+                        if recursive {
+                            branch_ctes.insert(name.clone());
+                        }
+                        let mut validator = Validator {
+                            visible_ctes: &branch_ctes,
+                            normalize,
+                            skip_root_query: false,
+                            nested_queries: 0,
+                        };
+                        if let ControlFlow::Break(error) =
+                            datafusion::sql::sqlparser::ast::Visit::visit(operand, &mut validator)
+                        {
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    validate_query(&cte.query, &visible_ctes, normalize)?;
+                }
+                visible_ctes.insert(name);
+            }
+        }
+
+        // Check the rest of the query once its WITH definitions are processed.
+        // Delegate nested queries to validate_query instead of inheriting all
+        // names from their parent's WITH block indiscriminately.
+        let mut body = query.clone();
+        body.with = None;
+        let mut validator = Validator {
+            visible_ctes: &visible_ctes,
+            normalize,
+            skip_root_query: true,
+            nested_queries: 0,
+        };
+        match datafusion::sql::sqlparser::ast::Visit::visit(&body, &mut validator) {
+            ControlFlow::Break(error) => Err(error),
+            ControlFlow::Continue(()) => Ok(()),
+        }
+    }
+
+    validate_query(query, &HashSet::new(), normalize)
 }
 
 pub(crate) async fn expand_sql(

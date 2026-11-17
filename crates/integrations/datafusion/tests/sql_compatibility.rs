@@ -217,6 +217,95 @@ async fn show_create_native_view_preserves_creation_namespace() {
 }
 
 #[tokio::test]
+async fn show_create_direct_native_view_requires_bound_dependencies() {
+    let ctx = SQLContext::new();
+    ctx.ctx().sql("CREATE SCHEMA other").await.unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    for (name, id) in [
+        ("datafusion.public.source", 1),
+        ("datafusion.other.source", 2),
+    ] {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![id]))],
+        )
+        .unwrap();
+        ctx.ctx().register_batch(name, batch).unwrap();
+    }
+
+    for destination in ["public", "other"] {
+        for (query, can_export) in [
+            ("SELECT id FROM source", false),
+            ("SELECT id FROM public.source", false),
+            (
+                "WITH source AS (SELECT id FROM source) SELECT id FROM source",
+                false,
+            ),
+            (
+                "WITH RECURSIVE seed AS (SELECT id FROM datafusion.public.source \
+                 UNION ALL SELECT id FROM datafusion.other.source), \
+                 source AS (SELECT id FROM source) SELECT id FROM source",
+                false,
+            ),
+            (
+                "WITH RECURSIVE seed AS (SELECT id FROM datafusion.public.source \
+                 UNION ALL SELECT id FROM datafusion.other.source), \
+                 a AS (SELECT id FROM source), source AS (SELECT 99 AS id) SELECT id FROM a",
+                false,
+            ),
+            (
+                "WITH RECURSIVE seed AS (SELECT id FROM datafusion.public.source \
+                 UNION ALL SELECT id FROM datafusion.other.source), \
+                 source AS (SELECT id FROM source UNION ALL SELECT id + 1 FROM source WHERE id < 2) \
+                 SELECT id FROM source WHERE id = 1",
+                false,
+            ),
+            ("SELECT id FROM datafusion.public.source", true),
+            (
+                "WITH source AS (SELECT 1 AS id) SELECT id FROM source",
+                true,
+            ),
+            (
+                "WITH RECURSIVE source AS (SELECT id FROM datafusion.public.source UNION ALL SELECT id + 1 FROM source WHERE id < 2) SELECT id FROM source WHERE id = 1",
+                true,
+            ),
+            (
+                "WITH RECURSIVE seed AS (SELECT 1 AS id), source AS (SELECT id FROM seed) SELECT id FROM source",
+                true,
+            ),
+            ("SELECT 1 AS id FROM generate_series(1, 1)", true),
+        ] {
+            ctx.sql("SET datafusion.catalog.default_schema = 'public'")
+                .await
+                .unwrap();
+            let view = format!("datafusion.{destination}.direct_native");
+            ctx.ctx()
+                .sql(&format!("CREATE VIEW {view} AS {query}"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            ctx.sql("SET datafusion.catalog.default_schema = 'other'")
+                .await
+                .unwrap();
+            let select = format!("SELECT id FROM {view}");
+            assert_eq!(rows(&ctx, &select).await, vec![vec!["1"]]);
+            let show = format!("SHOW CREATE VIEW {view}");
+            if can_export {
+                let shown = rows(&ctx, &show).await;
+                ctx.sql(&format!("DROP VIEW {view}")).await.unwrap();
+                ctx.sql(&shown[0][3]).await.unwrap();
+            } else {
+                common::assert_sql_error(&ctx, &show, "unqualified dependency").await;
+            }
+            assert_eq!(rows(&ctx, &select).await, vec![vec!["1"]]);
+            ctx.sql(&format!("DROP VIEW {view}")).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn group_concat_order_position_refers_to_aggregate_arguments() {
     let ctx = SQLContext::new();
     assert_eq!(
