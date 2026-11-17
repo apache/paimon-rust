@@ -60,7 +60,7 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use datafusion::prelude::SessionConfig;
 use futures::{Stream, StreamExt, TryStreamExt};
 use paimon::spec::{Predicate, ROW_ID_FIELD_NAME};
-use paimon::table::{PreparedVectorSearchFilter, RowRange, Table};
+use paimon::table::{RowRange, Table};
 use paimon::vector_search::ScoredRowIds;
 use tokio::sync::OnceCell;
 
@@ -469,7 +469,7 @@ struct LateralVectorSearchExec {
 #[derive(Debug)]
 struct ExecutionPreparedFilterEntry {
     context: Weak<TaskContext>,
-    prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
+    prepared_filter: Arc<OnceCell<Table>>,
     partition_count: usize,
     completed_partitions: HashSet<usize>,
     active_partition_leases: HashMap<usize, usize>,
@@ -478,8 +478,9 @@ struct ExecutionPreparedFilterEntry {
 #[derive(Debug, Default)]
 struct ExecutionPreparedFilterCache {
     // DataFusion passes the same TaskContext Arc to every partition of one
-    // execution. Keep the prepared filter alive for that TaskContext so
-    // sequential partitions resolve the same target snapshot. DataFusion
+    // execution. Keep the pinned table alive for that TaskContext so
+    // sequential partitions resolve the same target snapshot. Filter execution
+    // stays in core and need not materialize a full-table row-ID bitmap. DataFusion
     // exposes no TaskContext drop hook, so one cache-level reaper observes the
     // weak contexts and removes subset executions after their context dies.
     entries: Mutex<Vec<ExecutionPreparedFilterEntry>>,
@@ -488,7 +489,7 @@ struct ExecutionPreparedFilterCache {
 
 #[derive(Clone)]
 struct ExecutionPreparedFilterLease {
-    prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
+    prepared_filter: Arc<OnceCell<Table>>,
     _completion: Arc<ExecutionPartitionCompletion>,
 }
 
@@ -496,7 +497,7 @@ impl ExecutionPreparedFilterLease {
     fn new(
         cache: &Arc<ExecutionPreparedFilterCache>,
         context: Arc<TaskContext>,
-        prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
+        prepared_filter: Arc<OnceCell<Table>>,
         partition: usize,
     ) -> Self {
         Self {
@@ -514,7 +515,7 @@ impl ExecutionPreparedFilterLease {
 struct ExecutionPartitionCompletion {
     cache: Weak<ExecutionPreparedFilterCache>,
     context: Arc<TaskContext>,
-    prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
+    prepared_filter: Arc<OnceCell<Table>>,
     partition: usize,
 }
 
@@ -622,7 +623,7 @@ impl ExecutionPreparedFilterCache {
     fn finish_partition(
         &self,
         context: &Arc<TaskContext>,
-        prepared_filter: &Arc<OnceCell<PreparedVectorSearchFilter>>,
+        prepared_filter: &Arc<OnceCell<Table>>,
         partition: usize,
     ) {
         let mut entries = self
@@ -745,7 +746,7 @@ impl LateralVectorSearchExec {
     async fn process_batch(
         &self,
         batch: RecordBatch,
-        prepared_filter: Option<&OnceCell<PreparedVectorSearchFilter>>,
+        prepared_filter: Option<&OnceCell<Table>>,
     ) -> DFResult<RecordBatch> {
         if batch.num_rows() == 0 {
             return empty_batch(self.output_schema.clone());
@@ -761,16 +762,19 @@ impl LateralVectorSearchExec {
         }
 
         let prepared_filter = match &self.filter {
-            Some(filter) => {
+            Some(_) => {
                 let prepared_filter = prepared_filter.ok_or_else(|| {
                     DataFusionError::Internal(
                         "filtered lateral vector search is missing execution state".to_string(),
                     )
                 })?;
                 let prepared = prepared_filter
-                    .get_or_try_init(|| {
-                        self.target_table
-                            .prepare_vector_search_filter(filter.clone())
+                    .get_or_try_init(|| async {
+                        let snapshot = self.target_table.resolve_read_snapshot().await?;
+                        Ok::<_, paimon::Error>(
+                            self.target_table
+                                .copy_with_pinned_snapshot(snapshot.as_ref()),
+                        )
                     })
                     .await
                     .map_err(to_datafusion_error)?;
@@ -778,16 +782,14 @@ impl LateralVectorSearchExec {
             }
             None => None,
         };
-        let target_table = prepared_filter
-            .map(PreparedVectorSearchFilter::table)
-            .unwrap_or(&self.target_table);
+        let target_table = prepared_filter.unwrap_or(&self.target_table);
         let mut builder = target_table.new_batch_vector_search_builder();
         builder
             .with_vector_column(&self.target_column)
             .with_query_vectors(query_vectors)
             .with_limit(self.limit);
-        if let Some(prepared_filter) = prepared_filter {
-            builder.with_prepared_filter(prepared_filter.clone());
+        if let Some(filter) = &self.filter {
+            builder.with_filter(filter.clone());
         }
         let results = builder
             .execute()

@@ -2303,6 +2303,29 @@ mod vector_search_tests {
     }
 
     #[tokio::test]
+    async fn test_vector_search_filters_without_scalar_index() {
+        let (ctx, _catalog, _tmp) = create_java_vindex_vector_search_context().await;
+        let batches = ctx.sql(
+            "SELECT id FROM vector_search('paimon.default.test_java_vindex_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 1) WHERE id = 2",
+        ).await.unwrap().collect().await.unwrap();
+        assert_eq!(extract_ids_in_order(&batches), vec![2]);
+
+        let queries = build_vector_batch(
+            vec![10, 20],
+            vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]],
+        );
+        let table = MemTable::try_new(queries.schema(), vec![vec![queries]]).unwrap();
+        ctx.register_temp_table("paimon.default.unindexed_filter_queries", Arc::new(table))
+            .unwrap();
+        let batches = ctx.sql(
+            "SELECT q.id AS query_id, r.id AS result_id FROM paimon.default.unindexed_filter_queries q \
+             CROSS JOIN LATERAL vector_search('paimon.default.test_java_vindex_vector', 'embedding', q.embedding, 1) AS r \
+             WHERE r.id = 2 ORDER BY query_id",
+        ).await.unwrap().collect().await.unwrap();
+        assert_eq!(extract_query_result_ids(&batches), vec![(10, 2), (20, 2)]);
+    }
+
+    #[tokio::test]
     async fn test_vector_search_lateral_join_uses_query_vectors() {
         let (ctx, _catalog, _tmp) = create_java_vindex_vector_search_context().await;
         ctx.sql(

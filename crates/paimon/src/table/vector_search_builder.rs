@@ -98,8 +98,15 @@ impl<'a> VectorSearchBuilder<'a> {
     /// refined against snapshot-pinned data when
     /// `global-index.filter.refine-from-data=true`; otherwise those candidates
     /// are excluded. If no scalar index can evaluate the predicate, indexed
-    /// ranges are scored from raw data even in FAST mode. Raw searches always
-    /// apply the row predicate before Top-K, matching Java.
+    /// searches iteratively retrieve candidates and check their scalar values
+    /// against the pinned data. Insufficient matches at the candidate budget
+    /// fall back to raw scoring within the affected shard. The budget is the
+    /// original Top-K times `vector-index.iterative-filter.max-candidates-factor`
+    /// (default 100), with at least the required reranking/deletion allowance.
+    /// Set
+    /// `vector-index.iterative-filter.enabled=false` for Java's immediate raw fallback.
+    /// Both paths apply the row predicate before the final Top-K; iterative
+    /// searches retain the vector backend's approximate recall.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         add_filter(&mut self.config.write().unwrap().filter, filter);
         self

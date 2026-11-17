@@ -50,6 +50,9 @@ pub(super) trait Scan: Sync {
 pub struct VectorScanPlan {
     snapshot: Option<Snapshot>,
     splits: Vec<SearchScanSplit>,
+    // Automatically generated scalar gaps can overlap vector coverage. Only
+    // these may be pruned when the reader actually selects iterative filtering.
+    raw_sources_are_automatic: bool,
 }
 
 impl VectorScanPlan {
@@ -91,7 +94,11 @@ impl VectorScanPlan {
                 }
             }
         }
-        Ok(Self { snapshot, splits })
+        Ok(Self {
+            snapshot,
+            splits,
+            raw_sources_are_automatic: false,
+        })
     }
 
     /// The complete snapshot captured by planning, including retained tags.
@@ -108,6 +115,10 @@ impl VectorScanPlan {
     pub fn snapshot_id(&self) -> Option<i64> {
         self.snapshot.as_ref().map(Snapshot::id)
     }
+
+    pub(super) fn raw_sources_are_automatic(&self) -> bool {
+        self.raw_sources_are_automatic
+    }
 }
 
 impl<'de> serde::Deserialize<'de> for VectorScanPlan {
@@ -118,10 +129,17 @@ impl<'de> serde::Deserialize<'de> for VectorScanPlan {
         struct Sources {
             snapshot: Option<Snapshot>,
             splits: Vec<SearchScanSplit>,
+            #[serde(default)]
+            raw_sources_are_automatic: bool,
         }
-        let Sources { snapshot, splits } =
-            <Sources as serde::Deserialize>::deserialize(deserializer)?;
-        Self::new(snapshot, splits).map_err(serde::de::Error::custom)
+        let Sources {
+            snapshot,
+            splits,
+            raw_sources_are_automatic,
+        } = <Sources as serde::Deserialize>::deserialize(deserializer)?;
+        let mut plan = Self::new(snapshot, splits).map_err(serde::de::Error::custom)?;
+        plan.raw_sources_are_automatic = raw_sources_are_automatic;
+        Ok(plan)
     }
 }
 
@@ -326,7 +344,9 @@ impl VectorScan {
                     )
                     .await?
                 };
-                VectorScanPlan::new(snapshot, splits)
+                let mut plan = VectorScanPlan::new(snapshot, splits)?;
+                plan.raw_sources_are_automatic = true;
+                Ok(plan)
             }
             VectorScanKind::PrimaryKey(scan) => {
                 let plan = scan.plan().await?;

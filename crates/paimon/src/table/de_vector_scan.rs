@@ -112,6 +112,7 @@ pub(super) struct DeVectorScanPlan {
     pub(super) skip_search: bool,
     /// Source metadata supplied by a transportable public plan.
     pub(super) source_splits: Option<Vec<crate::table::SearchScanSplit>>,
+    pub(super) raw_sources_are_automatic: bool,
 }
 
 impl DeVectorScanPlan {
@@ -125,6 +126,7 @@ impl DeVectorScanPlan {
             next_row_id: None,
             timing,
             source_splits: None,
+            raw_sources_are_automatic: false,
         }
     }
 }

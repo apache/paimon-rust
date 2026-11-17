@@ -436,7 +436,7 @@ async fn de_scalar_filter_applies_to_unindexed_raw_fallback() {
 }
 
 #[tokio::test]
-async fn unevaluable_scalar_filter_routes_covered_ranges_to_raw_in_every_mode() {
+async fn unevaluable_scalar_filter_preserves_matches_in_every_mode() {
     let table = de_vector_table().await;
     for mode in ["fast", "full", "detail"] {
         let table = table.copy_with_options(HashMap::from([(
@@ -465,6 +465,218 @@ async fn unevaluable_scalar_filter_routes_covered_ranges_to_raw_in_every_mode() 
             ids.sort_unstable();
             assert_eq!(ids, vec![0, 1, 2], "{mode}");
         }
+    }
+}
+
+/// Two physical data files, one vector shard, and no scalar index. Keeping the
+/// files separate lets a missing unrelated file expose accidental full scans.
+async fn iterative_filter_table(shard_size: usize) -> (Table, Vec<String>) {
+    let table =
+        vector_test_table_at("memory:/iterative_vector_filter").copy_with_options(HashMap::from([
+            ("row-tracking.enabled".into(), "true".into()),
+            ("data-evolution.enabled".into(), "true".into()),
+            (
+                "global-index.row-count-per-shard".into(),
+                shard_size.to_string(),
+            ),
+            ("ivf-flat.dimension".into(), "2".into()),
+            ("ivf-flat.nlist".into(), "1".into()),
+            ("ivf-flat.metric".into(), "l2".into()),
+        ]));
+    let mut tail_files = Vec::new();
+    for start in [0, 64] {
+        let field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut vectors = ListBuilder::new(Float32Builder::new()).with_field(field.clone());
+        for id in start..start + 64 {
+            vectors.values().append_value(id as f32);
+            vectors.values().append_value(0.0);
+            vectors.append(true);
+        }
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("embedding", ArrowDataType::List(field), true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from_iter_values(start..start + 64)),
+                Arc::new(vectors.finish()),
+            ],
+        )
+        .unwrap();
+        let mut writer = TableWrite::new(&table, "test".into()).unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        if start == 64 {
+            tail_files.extend(
+                messages
+                    .iter()
+                    .flat_map(|m| &m.new_files)
+                    .map(|file| file.data_file_path(&format!("{}/bucket-0", table.location()))),
+            );
+        }
+        TableCommit::new(table.clone(), "test".into())
+            .commit(messages)
+            .await
+            .unwrap();
+    }
+    table
+        .new_global_index_build_builder()
+        .with_index_type("ivf-flat")
+        .with_index_column("embedding")
+        .execute()
+        .await
+        .unwrap();
+    assert!(!tail_files.is_empty());
+    (table, tail_files)
+}
+
+#[tokio::test]
+async fn iterative_filter_does_not_scan_unrelated_scalar_data() {
+    let (table, tail_files) = iterative_filter_table(128).await;
+    for path in tail_files {
+        table.file_io().delete_file(&path).await.unwrap();
+    }
+    let filter = crate::spec::PredicateBuilder::new(table.schema().fields())
+        .less_than("id", crate::spec::Datum::Int(100))
+        .unwrap();
+    for mode in ["fast", "full", "detail"] {
+        let table = table.copy_with_options(HashMap::from([
+            ("vector-index.search-mode".into(), mode.into()),
+            ("scalar-index.search-mode".into(), "full".into()),
+        ]));
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![0.0, 0.0])
+            .with_limit(2)
+            .with_filter(filter.clone())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.row_ids().unwrap().row_ids, vec![0, 1], "{mode}");
+    }
+    // The old central pre-filter would have to open the missing second file.
+    assert!(table.prepare_vector_search_filter(filter).await.is_err());
+}
+
+#[tokio::test]
+async fn iterative_filter_refills_and_falls_back_with_exact_batch_results() {
+    let (table, _) = iterative_filter_table(128).await;
+    for mode in ["fast", "full", "detail"] {
+        for (enabled, factor) in [("true", "64"), ("true", "16"), ("false", "16")] {
+            let table = table.copy_with_options(HashMap::from([
+                ("vector-index.search-mode".into(), mode.into()),
+                ("scalar-index.search-mode".into(), "full".into()),
+            ]));
+            let results = table
+                .new_batch_vector_search_builder()
+                .with_vector_column("embedding")
+                .with_query_vectors(vec![vec![0.0, 0.0], vec![127.0, 0.0]])
+                .with_limit(2)
+                .with_filter(id_gt_filter(&table, 90))
+                .with_options(HashMap::from([
+                    (
+                        "vector-index.iterative-filter.enabled".into(),
+                        enabled.into(),
+                    ),
+                    (
+                        "vector-index.iterative-filter.max-candidates-factor".into(),
+                        factor.into(),
+                    ),
+                ]))
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(
+                results[0].row_ids().unwrap().row_ids,
+                vec![91, 92],
+                "{mode} {enabled} {factor}"
+            );
+            assert_eq!(
+                results[1].row_ids().unwrap().row_ids,
+                vec![127, 126],
+                "{mode} {enabled} {factor}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn iterative_filter_with_an_unindexed_or_arm_avoids_duplicate_raw_scan() {
+    let (table, tail_files) = iterative_filter_table(128).await;
+    table
+        .new_global_index_build_builder()
+        .with_index_type("btree")
+        .with_index_column("id")
+        .execute()
+        .await
+        .unwrap();
+    for path in tail_files {
+        table.file_io().delete_file(&path).await.unwrap();
+    }
+    let predicates = crate::spec::PredicateBuilder::new(table.schema().fields());
+    let filter = crate::spec::Predicate::or(vec![
+        predicates
+            .less_than("id", crate::spec::Datum::Int(0))
+            .unwrap(),
+        predicates.is_not_null("embedding").unwrap(),
+    ]);
+    for scalar_mode in ["full", "detail"] {
+        let table = table.copy_with_options(HashMap::from([(
+            "scalar-index.search-mode".into(),
+            scalar_mode.into(),
+        )]));
+        let mut builder = table.new_vector_search_builder();
+        builder
+            .with_vector_column("embedding")
+            .with_query_vector(vec![0.0, 0.0])
+            .with_limit(2)
+            .with_filter(filter.clone());
+        let plan = builder.new_scan().unwrap().plan().await.unwrap();
+        let wire = serde_json::to_value(&plan).unwrap();
+        assert_eq!(wire["raw_sources_are_automatic"], true);
+        let plan = serde_json::from_value(wire).unwrap();
+        let result = builder.new_read().unwrap().read(plan).await.unwrap();
+        assert_eq!(result.row_ids().unwrap().row_ids, vec![0, 1]);
+    }
+}
+
+#[tokio::test]
+async fn iterative_filter_keeps_shard_offsets_and_input_allow_lists_on_fallback() {
+    let (table, _) = iterative_filter_table(64).await;
+    let filter = id_gt_filter(&table, 105);
+    let include = Arc::new(RoaringTreemap::from_iter(99..=110));
+    for factor in ["2", "32"] {
+        let plan = DeVectorScan::new(&table, Some(&filter), Some(&include), None)
+            .plan()
+            .await
+            .unwrap();
+        assert!(plan.index_entries.iter().any(|entry| entry
+            .index_file
+            .global_index_meta
+            .as_ref()
+            .is_some_and(|meta| meta.row_range_start == 64)));
+        let reader = DeVectorRead::new(
+            "embedding",
+            &[&[0.0, 0.0], &[127.0, 0.0]],
+            2,
+            &HashMap::from([(
+                "vector-index.iterative-filter.max-candidates-factor".into(),
+                factor.into(),
+            )]),
+        )
+        .unwrap();
+        let results = reader.read(plan).await.unwrap();
+        assert_eq!(
+            results[0].row_ids().unwrap().row_ids,
+            vec![106, 107],
+            "{factor}"
+        );
+        assert_eq!(
+            results[1].row_ids().unwrap().row_ids,
+            vec![110, 109],
+            "{factor}"
+        );
     }
 }
 

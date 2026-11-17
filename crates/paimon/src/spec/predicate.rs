@@ -54,15 +54,15 @@ use std::fmt;
 /// e.g. `Decimal(10, scale=1)` == `Decimal(100, scale=2)`
 /// because both represent `1.0`.
 ///
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Datum {
     Bool(bool),
     TinyInt(i8),
     SmallInt(i16),
     Int(i32),
     Long(i64),
-    Float(f32),
-    Double(f64),
+    Float(#[serde(with = "datum_float_bits")] f32),
+    Double(#[serde(with = "datum_double_bits")] f64),
     String(String),
     /// Epoch days since 1970-01-01.
     Date(i32),
@@ -88,6 +88,25 @@ pub enum Datum {
         value: Vec<u8>,
         metadata: Vec<u8>,
     },
+}
+
+// Opaque search tasks preserve NaNs, signed zero and literal bits. REST
+// predicates continue to use the separate Java-compatible JSON codec below.
+mod datum_float_bits {
+    pub fn serialize<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u32(v.to_bits())
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+        <u32 as serde::Deserialize>::deserialize(d).map(f32::from_bits)
+    }
+}
+mod datum_double_bits {
+    pub fn serialize<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(v.to_bits())
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        <u64 as serde::Deserialize>::deserialize(d).map(f64::from_bits)
+    }
 }
 
 impl fmt::Display for Datum {
@@ -269,7 +288,7 @@ fn java_bytes_cmp(a: &[u8], b: &[u8]) -> Ordering {
 // ---------------------------------------------------------------------------
 
 /// Predicate operators for leaf predicates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PredicateOperator {
     IsNull,
     IsNotNull,
@@ -368,7 +387,7 @@ impl fmt::Display for PredicateOperator {
 /// - `And` / `Or`: N-ary logical connectives (auto-flattened)
 /// - `Not`: logical negation
 /// - `AlwaysTrue` / `AlwaysFalse`: constant predicates
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Predicate {
     /// Leaf: column op literal(s).
     Leaf {

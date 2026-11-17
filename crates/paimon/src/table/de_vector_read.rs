@@ -46,8 +46,7 @@ use crate::table::{
 };
 use crate::vector_search::{GlobalIndexIOMeta, GlobalIndexResult, ScoredRowIds, VectorSearch};
 use crate::vindex::executor::{
-    acquire_process_global_search_permit, drain_indexed_jobs,
-    ensure_global_index_executor_capacity, execute_global_index_with_guard,
+    acquire_process_global_search_permit, drain_indexed_jobs, ensure_global_index_executor_capacity,
 };
 use crate::vindex::range_reader::{RangeReadLimiter, VindexFileReader};
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
@@ -66,6 +65,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod iterative_filter;
 
 /// Owns the queries and executes the snapshot-scoped plan from `DeVectorScan`.
 pub(super) struct DeVectorRead {
@@ -213,6 +214,7 @@ impl DeVectorRead {
             timing,
             skip_search,
             source_splits,
+            raw_sources_are_automatic,
         } = plan;
         let table = Arc::new(table);
         let make_results = |results: Vec<ScoredRowIds>| {
@@ -259,6 +261,7 @@ impl DeVectorRead {
                 &vector_searches,
                 executor,
                 source_splits.as_deref(),
+                raw_sources_are_automatic,
             )
             .await?
         };
@@ -323,6 +326,7 @@ async fn execute_vector_index_work(
     let index_meta_bytes = global_meta.index_meta.clone().unwrap_or_default();
     let row_range_start = global_meta.row_range_start;
     let vector_searches = work.queries;
+    let fallback_metric = metric_check.clone();
     let options = if let Some(resolved) = work.resolved {
         if resolved.index_type.as_deref() != Some(work.entry.index_file.index_type.as_str()) {
             return Err(crate::table::search_task::invalid(
@@ -338,6 +342,29 @@ async fn execute_vector_index_work(
             &work.entry.index_file.index_type,
         )?
     };
+    let candidate_filter = work
+        .filter
+        .as_ref()
+        .map(|predicate| {
+            Ok::<_, crate::Error>(VectorIndexCandidateFilter {
+                table: evaluation
+                    .table
+                    .ok_or_else(|| {
+                        crate::table::search_task::invalid(
+                            "Iterative vector filtering requires table context",
+                        )
+                    })?
+                    .clone(),
+                predicate: predicate.clone(),
+                row_range_start,
+                row_range_end: global_meta.row_range_end,
+                max_candidates_factor: iterative_filter::Options::parse(&options)?
+                    .max_candidates_factor,
+                top_ks: work.top_ks.clone(),
+                runtime: tokio::runtime::Handle::try_current().ok(),
+            })
+        })
+        .transpose()?;
     let input = evaluation.file_io.new_input(&path);
     if vector_searches.iter().all(|search| {
         search
@@ -357,7 +384,10 @@ async fn execute_vector_index_work(
     let mut file_reader_open = Duration::ZERO;
     let mut full_file_read = None;
     let io_meta = GlobalIndexIOMeta::new(file_name.clone(), file_size, index_meta_bytes);
-    let results = match tokio::runtime::Handle::try_current() {
+    let VectorIndexSearchResult {
+        rows: results,
+        fallback,
+    } = match tokio::runtime::Handle::try_current() {
         Ok(runtime) => {
             let file_reader_open_start = timing_enabled.then(Instant::now);
             let file_reader = input
@@ -389,6 +419,7 @@ async fn execute_vector_index_work(
                 VectorIndexSearchContext {
                     parallelism: batch_index_parallelism,
                     metrics: metric_check,
+                    candidate_filter,
                 },
                 permit,
             )
@@ -398,7 +429,7 @@ async fn execute_vector_index_work(
             }
             results
         }
-        Err(_) if query_count > 1 => {
+        Err(_) if query_count > 1 || candidate_filter.is_some() => {
             let read_start = timing_enabled.then(Instant::now);
             let data = input.read().await.map_err(|e| crate::Error::DataInvalid {
                 message: format!("Failed to read vindex index file '{}': {}", file_name, e),
@@ -416,6 +447,7 @@ async fn execute_vector_index_work(
                 VectorIndexSearchContext {
                     parallelism: batch_index_parallelism,
                     metrics: metric_check,
+                    candidate_filter,
                 },
                 permit,
             )
@@ -450,16 +482,69 @@ async fn execute_vector_index_work(
         });
     }
 
-    Ok::<_, crate::Error>((
-        results
+    let mut results = results
+        .into_iter()
+        .map(|result| match result {
+            Some(scored_map) => ScoredRowIds::from_scored_map(scored_map).offset(row_range_start),
+            None => ScoredRowIds::empty(),
+        })
+        .collect::<Vec<_>>();
+    if !fallback.is_empty() {
+        let table = evaluation.table.ok_or_else(|| {
+            crate::table::search_task::invalid("Vector filter fallback requires table context")
+        })?;
+        let (fallback_indices, queries): (Vec<_>, Vec<_>) = fallback
             .into_iter()
-            .map(|result| match result {
-                Some(scored_map) => {
-                    ScoredRowIds::from_scored_map(scored_map).offset(row_range_start)
+            .map(|(i, mut query)| {
+                if let Some(ids) = query.effective_include_row_ids() {
+                    let offset = u64::try_from(row_range_start).map_err(|_| {
+                        crate::table::search_task::invalid(
+                            "Vector index has negative row-ID offset",
+                        )
+                    })?;
+                    let global = ids
+                        .iter()
+                        .map(|id| {
+                            id.checked_add(offset).ok_or_else(|| {
+                                crate::table::search_task::invalid(
+                                    "Vector filter row-ID offset overflow",
+                                )
+                            })
+                        })
+                        .collect::<crate::Result<RoaringTreemap>>()?;
+                    query.set_shared_include_row_ids(Arc::new(global));
                 }
-                None => ScoredRowIds::empty(),
+                Ok((i, query))
             })
-            .collect::<Vec<_>>(),
+            .collect::<crate::Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
+        // The index reader has already checked the persisted metric against
+        // the query; use it for the bounded shard's exact fallback as well.
+        let metric = fallback_metric
+            .persisted
+            .lock()
+            .map_err(|_| crate::table::search_task::invalid("Vector metric lock poisoned"))?
+            .ok_or_else(|| {
+                crate::table::search_task::invalid(
+                    "Vector fallback is missing the persisted metric",
+                )
+            })?;
+        let (raw, _) = read_raw_batch_vector_search_with_executor(
+            table,
+            &queries,
+            &[RowRange::new(row_range_start, global_meta.row_range_end)],
+            metric,
+            work.filter.as_ref(),
+            None,
+        )
+        .await?;
+        for (i, rows) in fallback_indices.into_iter().zip(raw) {
+            results[i] = rows;
+        }
+    }
+    Ok::<_, crate::Error>((
+        results,
         IndexSearchTiming {
             permit_wait,
             file_reader_open,
@@ -481,29 +566,93 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
     file_name: String,
     context: VectorIndexSearchContext,
     guard: G,
-) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
+) -> crate::Result<VectorIndexSearchResult> {
     let panic_context = if vector_searches.len() > 1 {
         "vindex global-index batch search task failed"
     } else {
         "vindex global-index search task failed"
     };
-    execute_global_index_with_guard(panic_context, guard, move || {
+    iterative_filter::execute_cancellable(panic_context, guard, move |cancellation| {
         let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options)
             .with_batch_index_parallelism(context.parallelism);
-        reader
-            .visit_batch_vector_search_validated(
-                &vector_searches,
-                |_| Ok(source),
-                |metadata| {
-                    context
-                        .metrics
-                        .check(RawVectorMetric::from_vindex(metadata.metric))
-                },
-            )
-            .map_err(|e| crate::Error::DataInvalid {
-                message: format!("Failed to read vindex index file '{}': {}", file_name, e),
-                source: Some(Box::new(e)),
-            })
+        let Some(filter) = context.candidate_filter else {
+            return reader
+                .visit_batch_vector_search_validated(
+                    &vector_searches,
+                    |_| Ok(source),
+                    |metadata| {
+                        context.metrics.check(RawVectorMetric::from_vindex(metadata.metric))
+                    },
+                )
+                .map_err(|e| crate::Error::DataInvalid {
+                    message: format!("Failed to read vindex index file '{}': {}", file_name, e),
+                    source: Some(Box::new(e)),
+                })
+                .map(|rows| VectorIndexSearchResult { rows, fallback: Vec::new() });
+        };
+        iterative_filter::ensure_active(&cancellation)?;
+        let query_count = vector_searches.len();
+        let mut total_vectors = 0;
+        reader.visit_batch_vector_search_validated(&[], |_| Ok(source), |metadata| {
+            total_vectors = usize::try_from(metadata.total_vectors).map_err(|_| {
+                crate::table::search_task::invalid("Vector count does not fit usize")
+            })?;
+            context.metrics.check(RawVectorMetric::from_vindex(metadata.metric))
+        })?;
+        let offset = u64::try_from(filter.row_range_start).map_err(|_| {
+            crate::table::search_task::invalid("Vector index has negative row-ID offset")
+        })?;
+        let result = iterative_filter::search(
+            vector_searches,
+            total_vectors,
+            &filter.top_ks,
+            filter.max_candidates_factor,
+            |queries| {
+                iterative_filter::ensure_active(&cancellation)?;
+                let rows = reader.visit_batch_vector_search(queries, |_| {
+                    Err::<Cursor<Vec<u8>>, _>(crate::table::search_task::invalid(
+                        "Vector reader was not retained",
+                    ))
+                })?;
+                iterative_filter::ensure_active(&cancellation)?;
+                Ok(rows.into_iter().map(|rows| {
+                    rows.map(ScoredRowIds::from_scored_map)
+                        .unwrap_or_else(ScoredRowIds::empty)
+                }).collect())
+            },
+            |candidates| {
+                let ids = candidates.iter().map(|id| {
+                    id.checked_add(offset)
+                        .filter(|id| *id <= filter.row_range_end as u64)
+                        .ok_or_else(|| crate::table::search_task::invalid(
+                            "Vector candidate lies outside its shard",
+                        ))
+                }).collect::<crate::Result<RoaringTreemap>>()?;
+                let ranges = sorted_row_ids_to_row_ranges(ids.iter())?;
+                let read = iterative_filter::read_or_cancel(
+                    &cancellation,
+                    matching_row_ids_for_filter(
+                        &filter.table, &filter.predicate, Some(ranges),
+                    ),
+                );
+                // Buffered searches on runtime-independent storage also work
+                // when the caller uses a plain futures executor.
+                let matched = match &filter.runtime {
+                    Some(runtime) => runtime.block_on(read),
+                    None => futures::executor::block_on(read),
+                }?;
+                Ok(matched.iter().map(|id| id - offset).collect())
+            },
+        )?;
+        log::debug!(target: "paimon::vector_search",
+            "event=paimon_vector_iterative_filter file={} nq={} rounds={} checked_candidates={} raw_fallback_queries={}",
+            file_name, query_count, result.rounds, result.checked, result.fallback.len());
+        Ok(VectorIndexSearchResult {
+            rows: result.rows.into_iter().map(|rows| {
+                Some(rows.row_ids.into_iter().zip(rows.scores).collect())
+            }).collect(),
+            fallback: result.fallback,
+        })
     })
     .await
 }
@@ -556,6 +705,22 @@ impl VectorMetricCheck {
 struct VectorIndexSearchContext {
     parallelism: usize,
     metrics: VectorMetricCheck,
+    candidate_filter: Option<VectorIndexCandidateFilter>,
+}
+
+struct VectorIndexSearchResult {
+    rows: Vec<Option<HashMap<u64, f32>>>,
+    fallback: Vec<(usize, VectorSearch)>,
+}
+
+struct VectorIndexCandidateFilter {
+    table: Table,
+    predicate: Predicate,
+    row_range_start: i64,
+    row_range_end: i64,
+    max_candidates_factor: usize,
+    top_ks: Vec<usize>,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 #[derive(Default)]
@@ -687,6 +852,7 @@ async fn evaluate_batch_vector_search(
         vector_searches,
         None,
         None,
+        false,
     )
     .await
 }
@@ -697,6 +863,7 @@ async fn evaluate_batch_vector_search_with_executor(
     vector_searches: &[VectorSearch],
     executor: Option<&dyn SearchTaskExecutor>,
     sources: Option<&[crate::table::SearchScanSplit]>,
+    raw_sources_are_automatic: bool,
 ) -> crate::Result<Vec<ScoredRowIds>> {
     let timing_enabled = vector_search_timing_enabled();
     let total_start = timing_enabled.then(Instant::now);
@@ -839,7 +1006,9 @@ async fn evaluate_batch_vector_search_with_executor(
             }
         }
     }
+    let filter_options = iterative_filter::Options::parse(&effective_options)?;
     let mut route_indexed_to_raw = false;
+    let mut iterative_predicate = None;
     // Partition predicates have already pruned manifest entries. They do not
     // make an otherwise exact scalar lookup candidate-only.
     let scalar_filter = evaluation.filter.and_then(|filter| match evaluation.table {
@@ -873,6 +1042,7 @@ async fn evaluate_batch_vector_search_with_executor(
                     }
                 }
             }
+            None if filter_options.enabled => iterative_predicate = evaluation.filter.cloned(),
             None => route_indexed_to_raw = true,
         }
     }
@@ -1014,6 +1184,12 @@ async fn evaluate_batch_vector_search_with_executor(
                     entry: entry.clone(),
                     queries: searches,
                     resolved: Some(configuration.resolved.clone()),
+                    filter: iterative_predicate.clone(),
+                    top_ks: if iterative_predicate.is_some() {
+                        vector_searches.iter().map(|query| query.limit).collect()
+                    } else {
+                        Vec::new()
+                    },
                 })
             });
         let results = if let Some(executor) = executor {
@@ -1031,10 +1207,18 @@ async fn evaluate_batch_vector_search_with_executor(
                             entry: work.entry,
                             queries: TaskVectorQueries::capture(&work.queries)?,
                             resolved: work.resolved,
+                            filter: work.filter,
+                            top_ks: work.top_ks,
                         };
                         SearchTask::new(
                             table,
-                            "vector-index",
+                            // Older workers must reject this work instead of
+                            // ignoring an unfamiliar predicate payload.
+                            if work.filter.is_some() {
+                                "vector-index-filtered"
+                            } else {
+                                "vector-index"
+                            },
                             serde_json::to_value(work).map_err(|error| {
                                 crate::table::search_task::invalid(error.to_string())
                             })?,
@@ -1162,6 +1346,11 @@ async fn evaluate_batch_vector_search_with_executor(
             }
             ranges
         };
+        if (sources.is_none() || raw_sources_are_automatic) && iterative_predicate.is_some() {
+            // Only trim automatically derived scalar gaps. Explicit source
+            // plans retain all of their requested exact-scoring work.
+            raw_ranges = super::source::exclude_row_ranges(&raw_ranges, &vector_ranges);
+        }
         if route_indexed_to_raw {
             raw_ranges.extend(vector_ranges);
         }
@@ -2765,11 +2954,17 @@ struct VectorIndexTask {
     queries: TaskVectorQueries,
     #[serde(default)]
     resolved: Option<crate::spec::VectorIndexOptions>,
+    #[serde(default)]
+    filter: Option<Predicate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    top_ks: Vec<usize>,
 }
 struct VectorIndexWork {
     entry: IndexManifestEntry,
     queries: Vec<VectorSearch>,
     resolved: Option<crate::spec::VectorIndexOptions>,
+    filter: Option<Predicate>,
+    top_ks: Vec<usize>,
 }
 #[derive(Serialize, Deserialize)]
 struct VectorRowsTask {
@@ -2826,9 +3021,14 @@ pub(super) async fn execute_search_task(
     payload: &serde_json::Value,
 ) -> crate::Result<serde_json::Value> {
     let scores = match kind {
-        "vector-index" => {
+        "vector-index" | "vector-index-filtered" => {
             let work: VectorIndexTask = serde_json::from_value(payload.clone())
                 .map_err(|error| crate::table::search_task::invalid(error.to_string()))?;
+            if kind == "vector-index-filtered" && work.filter.is_none() {
+                return Err(crate::table::search_task::invalid(
+                    "Filtered vector task is missing its predicate",
+                ));
+            }
             if work.queries.queries.is_empty() {
                 return Err(crate::table::search_task::invalid(
                     "Vector task has no queries",
@@ -2856,6 +3056,8 @@ pub(super) async fn execute_search_task(
                     entry: work.entry,
                     queries: work.queries.restore()?,
                     resolved: work.resolved,
+                    filter: work.filter,
+                    top_ks: work.top_ks,
                 },
                 metric_check.clone(),
                 RangeReadLimiter::new(range_concurrency),
