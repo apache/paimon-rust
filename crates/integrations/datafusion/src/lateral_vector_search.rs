@@ -85,6 +85,7 @@ impl QueryPlanner for PaimonQueryPlanner {
         session_state: &dyn Session,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let planner = DefaultPhysicalPlanner::with_extension_planners(vec![
+            Arc::new(crate::sort_by::SortByExtensionPlanner),
             Arc::new(LateralVectorSearchExtensionPlanner),
             Arc::new(crate::variant_pushdown::VariantExtractionExtensionPlanner),
         ]);

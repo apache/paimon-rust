@@ -24,7 +24,7 @@ use datafusion::execution::SessionState;
 use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
     visit_expressions, visit_expressions_mut, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
-    FunctionArguments, Ident, ObjectName, Statement,
+    FunctionArguments, Ident, ObjectName, Query, Statement, TableFactor, VisitMut, VisitorMut,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -34,6 +34,131 @@ const MAX_EXPANSION_DEPTH: usize = 32;
 const MAX_FUNCTION_REFERENCES: usize = 1024;
 const MAX_EXPANDED_CALLS: usize = 1024;
 type FunctionReference = (String, Identifier);
+
+/// Bind persistent catalog dependencies in a temporary view's stored SQL to
+/// the namespace used to create its logical plan. Keep CTEs, table functions,
+/// and native function calls in their original scopes.
+pub(crate) fn bind_view_query(
+    state: &SessionState,
+    sql: &str,
+    current_catalog: &str,
+    current_database: &str,
+) -> DFResult<String> {
+    let regex_sql = crate::regex_operators::parseable_sql(sql)?;
+    let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
+    let mut statements = Parser::parse_sql(&GenericDialect {}, parseable.as_ref())
+        .map_err(|error| DataFusionError::Plan(format!("Invalid view SQL: {error}")))?;
+    if statements.len() != 1 || !matches!(statements.first(), Some(Statement::Query(_))) {
+        return Err(DataFusionError::Plan(
+            "View SQL must contain one query".into(),
+        ));
+    }
+    struct Binder<'a> {
+        state: &'a SessionState,
+        catalog: &'a str,
+        database: &'a str,
+        scopes: crate::catalog::ViewQueryScopes,
+        table_functions: HashSet<usize>,
+    }
+    impl VisitorMut for Binder<'_> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+            self.scopes.enter(
+                query,
+                self.state
+                    .config_options()
+                    .sql_parser
+                    .enable_ident_normalization,
+            );
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+            self.scopes.leave();
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
+            if let TableFactor::TableFunction {
+                expr: SqlExpr::Function(call),
+                ..
+            } = factor
+            {
+                self.table_functions.insert(call as *const _ as usize);
+                return ControlFlow::Continue(());
+            }
+            let TableFactor::Table {
+                name, args: None, ..
+            } = factor
+            else {
+                return ControlFlow::Continue(());
+            };
+            let normalize = self
+                .state
+                .config_options()
+                .sql_parser
+                .enable_ident_normalization;
+            if self.scopes.is_cte(name, normalize) {
+                return ControlFlow::Continue(());
+            }
+            let parts = name
+                .0
+                .iter()
+                .map(|part| {
+                    part.as_ident()
+                        .cloned()
+                        .map(|identifier| IdentNormalizer::new(normalize).normalize(identifier))
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(parts) = parts {
+                let names = match parts.as_slice() {
+                    [table] => vec![self.catalog, self.database, table.as_str()],
+                    [database, table] => vec![self.catalog, database.as_str(), table.as_str()],
+                    _ => return ControlFlow::Continue(()),
+                };
+                *name = quoted_name(&names);
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_expr(&mut self, expr: &mut SqlExpr) -> ControlFlow<Self::Break> {
+            if let SqlExpr::Function(function) = expr {
+                if self
+                    .table_functions
+                    .remove(&(function as *const _ as usize))
+                {
+                    return ControlFlow::Continue(());
+                }
+                if let Some((catalog, identifier)) =
+                    function_reference(function, self.catalog, self.database, self.state)
+                {
+                    function.name =
+                        quoted_name(&[&catalog, identifier.database(), identifier.object()]);
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut binder = Binder {
+        state,
+        catalog: current_catalog,
+        database: current_database,
+        scopes: crate::catalog::ViewQueryScopes::default(),
+        table_functions: HashSet::new(),
+    };
+    let _: ControlFlow<()> = statements[0].visit(&mut binder);
+    Ok(statements.remove(0).to_string())
+}
+
+fn quoted_name(parts: &[&str]) -> ObjectName {
+    ObjectName::from(
+        parts
+            .iter()
+            .map(|part| Ident::with_quote('"', *part))
+            .collect::<Vec<_>>(),
+    )
+}
 
 pub(crate) async fn expand_sql(
     state: &SessionState,
@@ -249,6 +374,7 @@ async fn expand_statement_internal(
             crate::expression_compat::rewrite(&mut statement, state)?;
             crate::binary_cast::rewrite(&mut statement)?;
             crate::regex_operators::rewrite(&mut statement);
+            crate::sort_by::rewrite(&mut statement)?;
             return Ok(statement);
         }
     }
@@ -553,7 +679,66 @@ fn bare_function_name(function: &datafusion::sql::sqlparser::ast::Function) -> O
 mod tests {
     use std::collections::HashMap;
 
-    use super::expand_sql;
+    use super::{bind_view_query, expand_sql};
+
+    #[test]
+    fn view_binding_preserves_sequential_and_recursive_cte_scopes() {
+        let state = datafusion::prelude::SessionContext::new().state();
+        let bound = bind_view_query(
+            &state,
+            "WITH t AS (SELECT id FROM t), u AS (SELECT id FROM t) SELECT id FROM u",
+            "lake",
+            "db",
+        )
+        .unwrap();
+        assert_eq!(bound, "WITH t AS (SELECT id FROM \"lake\".\"db\".\"t\"), u AS (SELECT id FROM t) SELECT id FROM u");
+        let recursive = "WITH RECURSIVE t AS (SELECT 1 AS id UNION ALL SELECT id + 1 FROM t WHERE id < 2) SELECT id FROM t";
+        assert_eq!(
+            bind_view_query(&state, recursive, "lake", "db").unwrap(),
+            recursive
+        );
+    }
+
+    #[test]
+    fn view_binding_keeps_table_functions_and_qualifies_catalog_scalar_functions() {
+        let state = datafusion::prelude::SessionContext::new().state();
+        assert_eq!(
+            bind_view_query(
+                &state,
+                "SELECT upper(v), custom_fn(v) FROM other.source",
+                "lake",
+                "db"
+            )
+            .unwrap(),
+            "SELECT upper(v), \"lake\".\"db\".\"custom_fn\"(v) FROM \"lake\".\"other\".\"source\""
+        );
+        for sql in [
+            "SELECT * FROM generate_series(1, 2)",
+            "SELECT * FROM TABLE(generate_series(1, 2))",
+        ] {
+            assert_eq!(bind_view_query(&state, sql, "lake", "db").unwrap(), sql);
+        }
+    }
+
+    #[test]
+    fn view_binding_uses_session_identifier_normalization() {
+        let mut state = datafusion::prelude::SessionContext::new().state();
+        state
+            .config_mut()
+            .options_mut()
+            .sql_parser
+            .enable_ident_normalization = false;
+        assert_eq!(
+            bind_view_query(
+                &state,
+                "WITH \"Source\" AS (SELECT id FROM \"Source\") SELECT id FROM Source",
+                "lake",
+                "db"
+            )
+            .unwrap(),
+            "WITH \"Source\" AS (SELECT id FROM \"lake\".\"db\".\"Source\") SELECT id FROM Source"
+        );
+    }
 
     #[tokio::test]
     async fn leaves_bare_functions_for_datafusion_without_a_paimon_catalog() {

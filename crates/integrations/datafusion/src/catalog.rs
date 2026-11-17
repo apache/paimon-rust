@@ -1460,28 +1460,15 @@ struct QueryCteScope {
     cte_query_visibility: HashMap<usize, HashSet<SqlIdentifierKey>>,
 }
 
-struct ViewRelationVisitor<'a> {
-    catalog_name: &'a str,
-    current_database: &'a str,
+/// The CTE names visible at each query, including sequential non-recursive CTEs.
+/// Shared by dependency discovery and canonical view SQL binding.
+#[derive(Default)]
+pub(crate) struct ViewQueryScopes {
     scopes: Vec<QueryCteScope>,
-    identifiers: Vec<Identifier>,
 }
 
-impl<'a> ViewRelationVisitor<'a> {
-    fn new(catalog_name: &'a str, current_database: &'a str) -> Self {
-        Self {
-            catalog_name,
-            current_database,
-            scopes: Vec::new(),
-            identifiers: Vec::new(),
-        }
-    }
-}
-
-impl Visitor for ViewRelationVisitor<'_> {
-    type Break = ();
-
-    fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<Self::Break> {
+impl ViewQueryScopes {
+    pub(crate) fn enter(&mut self, query: &Query, normalize_identifiers: bool) {
         let query_address = query as *const Query as usize;
         let inherited = self
             .scopes
@@ -1501,7 +1488,9 @@ impl Visitor for ViewRelationVisitor<'_> {
             let local_ctes = with
                 .cte_tables
                 .iter()
-                .map(|cte| sql_identifier_key(&cte.alias.name))
+                .map(|cte| {
+                    IdentNormalizer::new(normalize_identifiers).normalize(cte.alias.name.clone())
+                })
                 .collect::<Vec<_>>();
             if with.recursive {
                 visible.extend(local_ctes);
@@ -1522,23 +1511,59 @@ impl Visitor for ViewRelationVisitor<'_> {
             visible,
             cte_query_visibility,
         });
+    }
+
+    pub(crate) fn leave(&mut self) {
+        self.scopes.pop();
+    }
+
+    pub(crate) fn is_cte(&self, relation: &ObjectName, normalize_identifiers: bool) -> bool {
+        match relation.0.as_slice() {
+            [part] => part.as_ident().is_some_and(|identifier| {
+                self.scopes.last().is_some_and(|scope| {
+                    scope.visible.contains(
+                        &IdentNormalizer::new(normalize_identifiers).normalize(identifier.clone()),
+                    )
+                })
+            }),
+            _ => false,
+        }
+    }
+}
+
+struct ViewRelationVisitor<'a> {
+    catalog_name: &'a str,
+    current_database: &'a str,
+    scopes: ViewQueryScopes,
+    identifiers: Vec<Identifier>,
+}
+
+impl<'a> ViewRelationVisitor<'a> {
+    fn new(catalog_name: &'a str, current_database: &'a str) -> Self {
+        Self {
+            catalog_name,
+            current_database,
+            scopes: ViewQueryScopes::default(),
+            identifiers: Vec::new(),
+        }
+    }
+}
+
+impl Visitor for ViewRelationVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<Self::Break> {
+        self.scopes.enter(query, true);
         std::ops::ControlFlow::Continue(())
     }
 
     fn post_visit_query(&mut self, _query: &Query) -> std::ops::ControlFlow<Self::Break> {
-        self.scopes.pop();
+        self.scopes.leave();
         std::ops::ControlFlow::Continue(())
     }
 
     fn pre_visit_relation(&mut self, relation: &ObjectName) -> std::ops::ControlFlow<Self::Break> {
-        let is_cte = match relation.0.as_slice() {
-            [part] => part.as_ident().is_some_and(|identifier| {
-                self.scopes
-                    .last()
-                    .is_some_and(|scope| scope.visible.contains(&sql_identifier_key(identifier)))
-            }),
-            _ => false,
-        };
+        let is_cte = self.scopes.is_cte(relation, true);
         if !is_cte {
             if let Some(identifier) =
                 relation_identifier(relation, self.catalog_name, self.current_database)
