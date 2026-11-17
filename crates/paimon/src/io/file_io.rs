@@ -1272,7 +1272,8 @@ pub(crate) fn looks_like_windows_drive_path(path: &str) -> bool {
 pub struct FileIOBuilder {
     scheme_str: Option<String>,
     props: HashMap<String, String>,
-    cache: Option<Arc<LocalCache>>,
+    // Unset uses properties; Some(None) preserves the caller's decision to disable caching.
+    cache: Option<Option<Arc<LocalCache>>>,
     file_format_metadata_cache: Option<Arc<FileFormatMetadataCacheContext>>,
     blob_index_cache: Option<Arc<BlobIndexCacheContext>>,
     operator: Option<Operator>,
@@ -1339,8 +1340,9 @@ impl FileIOBuilder {
         self
     }
 
-    pub(crate) fn with_local_cache(mut self, cache: Arc<LocalCache>) -> Self {
-        self.cache = Some(cache);
+    /// Use the caller's cache decision, including an explicitly disabled cache.
+    pub(crate) fn with_local_cache(mut self, cache: impl Into<Option<Arc<LocalCache>>>) -> Self {
+        self.cache = Some(cache.into());
         self
     }
 
@@ -1361,7 +1363,7 @@ impl FileIOBuilder {
 
     pub fn build(mut self) -> crate::Result<FileIO> {
         let cache = match &self.cache {
-            Some(cache) => Some(Arc::clone(cache)),
+            Some(cache) => cache.clone(),
             None => super::cache::create_local_cache(&crate::common::Options::from_map(
                 self.props.clone(),
             ))?,
