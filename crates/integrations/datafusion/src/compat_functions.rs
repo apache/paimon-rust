@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(crate) fn register_compat_functions(ctx: &SessionContext) {
+    crate::approx_percentile::register(ctx);
     for (name, alias) in [
         ("current_date", "curdate"),
         ("to_date", "date"),
