@@ -157,6 +157,7 @@ impl SQLContextBuilder {
 
     /// Builds a [`SQLContext`].
     pub fn build(self) -> SQLContext {
+        let blob_reader_registry = BlobReaderRegistry::default();
         let mut state_builder = SessionStateBuilder::new()
             .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
@@ -164,6 +165,7 @@ impl SQLContextBuilder {
             .with_analyzer_rule(Arc::new(crate::approx_percentile::ValidateParameters))
             .with_type_planner(Arc::new(crate::vector_type::PaimonTypePlanner))
             .with_relation_planners(vec![
+                Arc::new(crate::read_files::ReadFilesPlanner),
                 Arc::new(crate::lateral_views::ExplodeRelationPlanner),
                 Arc::new(crate::relation_planner::PaimonRelationPlanner::new()),
             ])
@@ -192,11 +194,12 @@ impl SQLContextBuilder {
         crate::blob_descriptor_functions::register_blob_descriptor_functions(&ctx);
         crate::variant_functions::register_variant_functions(&ctx);
         crate::json_functions::register_json_functions(&ctx);
+        crate::read_files::register(&ctx, blob_reader_registry.clone());
         SQLContext {
             ctx,
             catalogs: HashMap::new(),
             dynamic_options: Default::default(),
-            blob_reader_registry: BlobReaderRegistry::default(),
+            blob_reader_registry,
         }
     }
 }
@@ -275,6 +278,13 @@ impl SQLContext {
                 }
                 Err(e) => return Err(DataFusionError::External(Box::new(e))),
             }
+        }
+        if let Some(filesystem) = catalog
+            .as_any()
+            .and_then(|catalog| catalog.downcast_ref::<paimon::catalog::FileSystemCatalog>())
+        {
+            self.blob_reader_registry
+                .register_catalog_location(filesystem.warehouse(), filesystem.file_io().clone());
         }
         let weak_state = self.ctx.state_weak_ref();
         let session_state: crate::catalog::SessionStateProvider =
