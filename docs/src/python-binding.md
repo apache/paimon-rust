@@ -131,8 +131,9 @@ batches = ctx.sql("SELECT * FROM read_files('oss://my-bucket/imports/*.parquet')
 ```
 
 The supported formats are CSV, Parquet, JSON/NDJSON, TEXT and `binaryFile`.
-Matching Catalog/table FileIO instances are reused through the same session
-registry as blob reads. Other paths use a configured DataFusion object store or
+Matching Catalog/table FileIO instances are reused from the session. Table IO
+routes are shared with blob readers; Catalog warehouse fallbacks apply only to
+`read_files`. Other paths use a configured DataFusion object store or
 Paimon's default FileIO. Storage and local process permissions apply; raw file
 reads do not perform catalog table permission checks. HTTP/HTTPS file URLs are
 unsupported. See [Reading files](sql.md#reading-files-with-read_files) for named

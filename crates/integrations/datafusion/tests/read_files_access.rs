@@ -370,6 +370,11 @@ async fn filesystem_catalog_file_io_is_available_before_loading_any_table() {
     ctx.register_catalog_with_default_db("paimon", catalog, None)
         .await
         .unwrap();
+    // Catalog roots must not grant table-less blob descriptors a reader.
+    assert!(ctx
+        .blob_reader_registry()
+        .resolve("memory://catalog/warehouse/imports/file.txt")
+        .is_none());
     for path in [
         "memory://catalog/warehouse/imports/file.txt",
         "memory://catalog/warehouse/",

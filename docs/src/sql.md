@@ -150,11 +150,12 @@ SELECT path, length FROM read_files('oss://my-bucket/imports/images/',
 ```
 
 The function is registered by default. Local paths use the process's filesystem
-permissions; no separate directory registration is required. Like blob reads,
-matching FileIO instances are reused from the session registry: filesystem
-catalogs contribute their warehouse FileIO when registered, and loaded tables
-contribute their table-specific FileIO, including REST credential refresh and FUSE
-routing. The longest matching location wins. Other paths use a configured
+permissions; no separate directory registration is required. Loaded tables share
+their FileIO routes with blob readers, including REST credential refresh and FUSE
+routing. In addition, `read_files` can use the warehouse FileIO from a registered
+filesystem catalog; these warehouse fallbacks do not enable table-less blob reads.
+The longest matching location wins, with table IO preferred for equivalent
+locations. Other paths use a configured
 DataFusion object store or Paimon's default FileIO for that path.
 
 Each query captures its selected store and credentials without replacing the

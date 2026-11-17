@@ -282,7 +282,7 @@ impl SQLContext {
             .and_then(|catalog| catalog.downcast_ref::<paimon::catalog::FileSystemCatalog>())
         {
             self.blob_reader_registry
-                .register_location_if_absent(filesystem.warehouse(), filesystem.file_io().clone());
+                .register_catalog_location(filesystem.warehouse(), filesystem.file_io().clone());
         }
         let weak_state = self.ctx.state_weak_ref();
         let session_state: crate::catalog::SessionStateProvider =
