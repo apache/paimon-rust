@@ -1891,7 +1891,13 @@ fn open_source_stream(
             row_ranges.as_deref(),
             anchor_deletion_vector.map(|context| context.deletion_vector.as_ref()),
         )?;
-        if let Some(selected_ranges) = selected_ranges.as_deref() {
+        // The normal file owns the logical rows. A compacted normal file can
+        // span rows appended without this BLOB column, even on a full scan.
+        let expected_range = bunch.expected_range()?;
+        {
+            let selected_ranges = selected_ranges
+                .as_deref()
+                .unwrap_or(std::slice::from_ref(&expected_range));
             let uncovered_ranges =
                 crate::table::source::exclude_row_ranges(selected_ranges, bunch.logical_ranges());
             if !uncovered_ranges.is_empty() {
@@ -2821,7 +2827,7 @@ fn build_source_plan_with_row_id_pushdown(
         {
             bunch.finalize()?;
             if !read_fields.is_empty() && !row_id_pushdown {
-                bunch.validate_logical_range()?;
+                bunch.validate_anchor_bounds()?;
             }
         }
     }
@@ -3084,6 +3090,23 @@ impl BlobBunch {
                 ),
                 source: None,
             });
+        }
+        Ok(())
+    }
+
+    /// Java BlobFileBunch uses the normal file's logical range. Physical BLOB
+    /// ranges may leave gaps, but cannot extend beyond that anchor on a full scan.
+    fn validate_anchor_bounds(&self) -> crate::Result<()> {
+        let expected = self.expected_range()?;
+        for range in self.logical_ranges() {
+            if range.from() < expected.from() || range.to() > expected.to() {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Blob file range {range:?} should be within normal file range {expected:?}"
+                    ),
+                    source: None,
+                });
+            }
         }
         Ok(())
     }
@@ -4638,7 +4661,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_source_plan_validates_complete_range_only_for_read_blob_source() {
+    fn test_build_source_plan_accepts_incomplete_read_blob_source() {
         let files = vec![
             data_file("data.parquet", 0, 100, 1, None),
             data_file("payload.blob", 10, 90, 1, Some(vec!["payload"])),
@@ -4661,16 +4684,61 @@ mod tests {
             DataField::new(1, "id".to_string(), DataType::Int(IntType::new())),
             DataField::new(2, "payload".to_string(), DataType::Blob(BlobType::new())),
         ];
-        let err = build_source_plan(
+        let plan = build_source_plan(
             &prepared_group,
             &file_infos,
             &read_type_with_blob,
             &HashSet::new(),
         )
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::DataInvalid { message, .. } if message.contains("logical row ranges"))
-        );
+        .unwrap();
+        assert_eq!(plan.column_plan, vec![Some((0, 0)), Some((1, 0))]);
+    }
+
+    #[test]
+    fn test_blob_anchor_bounds_allow_gaps_but_reject_shifted_ranges() {
+        for extension in ["blob", "video"] {
+            let mut bunch = BlobBunch::new(10, 10);
+            for (index, first) in [11, 16].into_iter().enumerate() {
+                bunch
+                    .add(data_file(
+                        &format!("gap-{index}.{extension}"),
+                        first,
+                        2,
+                        1,
+                        Some(vec!["payload"]),
+                    ))
+                    .unwrap();
+            }
+            bunch.finalize().unwrap();
+            bunch.validate_anchor_bounds().unwrap();
+            // Compaction of a physical range still requires complete coverage.
+            assert!(bunch.validate_logical_range().is_err());
+            for first in [9, 19] {
+                let files = vec![
+                    data_file("normal.parquet", 10, 10, 1, Some(vec!["id"])),
+                    data_file(
+                        &format!("outside.{extension}"),
+                        first,
+                        2,
+                        1,
+                        Some(vec!["payload"]),
+                    ),
+                ];
+                let group = PreparedMergeGroup::new(&files).unwrap();
+                let fields = vec![
+                    DataField::new(1, "id".into(), DataType::Int(IntType::new())),
+                    DataField::new(2, "payload".into(), DataType::Blob(BlobType::new())),
+                ];
+                let error = build_source_plan(
+                    &group,
+                    &[resolved_info(vec![1]), resolved_info(vec![2])],
+                    &fields,
+                    &HashSet::new(),
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("within normal file range"));
+            }
+        }
     }
 
     #[test]
@@ -5537,6 +5605,146 @@ mod tests {
             collect_binary_values(&batches, "payload"),
             vec![Some(b"old-2".to_vec()), Some(b"old-3".to_vec())]
         );
+    }
+
+    #[tokio::test]
+    async fn test_full_blob_and_video_reads_fill_nullable_anchor_gaps() {
+        use crate::arrow::format::create_format_writer;
+        use crate::spec::VideoFrameDescriptor;
+
+        for extension in ["blob", "video"] {
+            for nullable in [true, false] {
+                let directory = tempdir().unwrap();
+                let table_path = local_file_path(directory.path());
+                let bucket_dir = directory.path().join("bucket-0");
+                fs::create_dir_all(&bucket_dir).unwrap();
+                let parquet_path = bucket_dir.join("data.parquet");
+                write_int_parquet_file(&parquet_path, vec![("id", vec![0, 1, 2, 3, 4])], None);
+                let source_path = directory.path().join("source.mp4");
+                fs::write(&source_path, b"payload").unwrap();
+                let file_io = FileIOBuilder::new("file").build().unwrap();
+                let mut schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("payload", DataType::Blob(BlobType::with_nullable(nullable)))
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true");
+                if extension == "video" {
+                    schema = schema.option("video-frame-field", "payload");
+                }
+                let table = Table::new(
+                    file_io.clone(),
+                    Identifier::new("default", "gaps"),
+                    table_path,
+                    TableSchema::new(0, &schema.build().unwrap()),
+                    None,
+                );
+                let mut files = vec![data_file_meta_with_path(
+                    "data.parquet",
+                    100,
+                    5,
+                    1,
+                    parquet_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                )];
+                for (index, first) in [101, 103].into_iter().enumerate() {
+                    let name = format!("payload-{index}.{extension}");
+                    let output = file_io
+                        .new_output(&local_file_path(&bucket_dir.join(&name)))
+                        .unwrap();
+                    let value = if extension == "video" {
+                        VideoFrameDescriptor::new(local_file_path(&source_path), 0, 7, index as i64)
+                            .unwrap()
+                            .serialize()
+                    } else {
+                        b"payload".to_vec()
+                    };
+                    let batch = RecordBatch::try_from_iter([(
+                        "payload",
+                        Arc::new(LargeBinaryArray::from(vec![Some(value.as_slice())]))
+                            as arrow_array::ArrayRef,
+                    )])
+                    .unwrap();
+                    let mut writer = create_format_writer(
+                        &output,
+                        batch.schema(),
+                        "",
+                        0,
+                        Some(file_io.clone()),
+                        Some(&table.schema().fields()[1..]),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    writer.write(&batch).await.unwrap();
+                    let size = writer.close().await.unwrap().file_size;
+                    files.push(data_file_meta_with_path(
+                        &name,
+                        first,
+                        1,
+                        1,
+                        size as i64,
+                        Some(vec!["payload"]),
+                    ));
+                }
+                for selected in [false, true] {
+                    let mut builder = DataSplitBuilder::new()
+                        .with_snapshot(1)
+                        .with_partition(BinaryRow::new(0))
+                        .with_bucket(0)
+                        .with_bucket_path(local_file_path(&bucket_dir))
+                        .with_total_buckets(1)
+                        .with_data_files(files.clone());
+                    if selected {
+                        builder = builder.with_row_ranges(vec![
+                            RowRange::new(101, 101),
+                            RowRange::new(103, 103),
+                        ]);
+                    }
+                    let split = builder.build().unwrap();
+                    let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+                    let result = read
+                        .to_arrow(&[split])
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await;
+                    if !nullable && !selected {
+                        assert!(result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("non-nullable BLOB"));
+                        continue;
+                    }
+                    let batches = result.unwrap();
+                    assert_eq!(
+                        collect_int_values(&batches, "id"),
+                        if selected {
+                            vec![1, 3]
+                        } else {
+                            vec![0, 1, 2, 3, 4]
+                        }
+                    );
+                    let values = collect_binary_values(&batches, "payload");
+                    let present: Vec<_> = values
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, value)| value.as_ref().map(|_| index))
+                        .collect();
+                    assert_eq!(present, if selected { vec![0, 1] } else { vec![1, 3] });
+                    for (index, value) in values.into_iter().flatten().enumerate() {
+                        if extension == "video" {
+                            assert_eq!(
+                                VideoFrameDescriptor::deserialize(&value)
+                                    .unwrap()
+                                    .frame_index(),
+                                index as i64
+                            );
+                        } else {
+                            assert_eq!(value, b"payload");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
