@@ -46,6 +46,7 @@ mod udf;
 mod update_assignment;
 mod variant;
 mod vector_search;
+mod video;
 mod vindex;
 mod write;
 mod write_routing;
@@ -62,5 +63,6 @@ fn pypaimon_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(temporal::temporal_match, m)?)?;
     variant::register_module(py, m)?;
     evolution::register_module(m)?;
+    video::register_module(m)?;
     Ok(())
 }

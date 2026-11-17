@@ -506,6 +506,7 @@ fn supported_write_formats() -> Vec<&'static str> {
     vec![
         ".parquet",
         ".blob",
+        ".video",
         ".orc",
         ".csv",
         ".json",
@@ -582,6 +583,13 @@ pub(crate) fn create_format_writer_factory(
         return Ok(Arc::new(blob::BlobWriterFactory::new(
             file_io,
             write_fields.and_then(|fields| fields.first()),
+            format_options,
+        )?));
+    }
+    if file_format.eq_ignore_ascii_case("video") {
+        return Ok(Arc::new(video::VideoWriterFactory::new(
+            file_io,
+            write_fields,
             format_options,
         )?));
     }
