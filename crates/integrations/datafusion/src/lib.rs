@@ -65,6 +65,7 @@ mod merge_condition;
 mod merge_into;
 mod partition_count_pushdown;
 mod physical_plan;
+mod primary_key_dml;
 mod procedures;
 mod regex_operators;
 mod relation_planner;
