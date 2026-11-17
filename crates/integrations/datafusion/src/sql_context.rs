@@ -737,7 +737,30 @@ impl SQLContext {
                     if self.is_paimon_catalog_ref(&table_ref) {
                         self.handle_create_view(create_view, options).await
                     } else {
-                        self.ctx.sql_with_options(sql, options).await
+                        // DataFusion stores the submitted SQL in its ViewTable. Bind
+                        // dependencies now so SHOW CREATE VIEW remains portable after
+                        // the session defaults change, even for a different target schema.
+                        let state = self.ctx.state();
+                        let namespace = &state.config_options().catalog;
+                        let query = crate::sql_function::bind_view_query(
+                            &state,
+                            &create_view.query.to_string(),
+                            &namespace.default_catalog,
+                            &namespace.default_schema,
+                        )?;
+                        let mut bound_view = create_view.clone();
+                        bound_view.query = Parser::new(&GenericDialect {})
+                            .try_with_sql(&query)
+                            .and_then(|mut parser| parser.parse_query())
+                            .map_err(|error| {
+                                DataFusionError::Plan(format!("Invalid view SQL: {error}"))
+                            })?;
+                        self.ctx
+                            .sql_with_options(
+                                &Statement::CreateView(bound_view).to_string(),
+                                options,
+                            )
+                            .await
                     }
                 }
             }

@@ -35,7 +35,7 @@ const MAX_FUNCTION_REFERENCES: usize = 1024;
 const MAX_EXPANDED_CALLS: usize = 1024;
 type FunctionReference = (String, Identifier);
 
-/// Bind persistent catalog dependencies in a temporary view's stored SQL to
+/// Bind persistent catalog dependencies in a view's stored SQL to
 /// the namespace used to create its logical plan. Keep CTEs, table functions,
 /// and native function calls in their original scopes.
 pub(crate) fn bind_view_query(

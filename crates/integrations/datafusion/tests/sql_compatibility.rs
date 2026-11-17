@@ -270,6 +270,55 @@ async fn show_create_view_supports_native_datafusion_views() {
 }
 
 #[tokio::test]
+async fn show_create_native_view_preserves_creation_namespace() {
+    let ctx = SQLContext::new();
+    ctx.ctx().sql("CREATE SCHEMA other").await.unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    for (name, id) in [
+        ("datafusion.public.source", 1),
+        ("datafusion.other.source", 2),
+    ] {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![id]))],
+        )
+        .unwrap();
+        ctx.ctx().register_batch(name, batch).unwrap();
+    }
+
+    // The destination schema can differ from the namespace that binds the query.
+    for destination in ["public", "other"] {
+        ctx.sql("SET datafusion.catalog.default_schema = 'public'")
+            .await
+            .unwrap();
+        let view = format!("datafusion.{destination}.bound_view");
+        ctx.sql(&format!("CREATE VIEW {view} AS SELECT id FROM source"))
+            .await
+            .unwrap();
+        ctx.sql("SET datafusion.catalog.default_schema = 'other'")
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&ctx, &format!("SELECT id FROM {view}")).await,
+            vec![vec!["1"]]
+        );
+
+        let shown = rows(&ctx, &format!("SHOW CREATE VIEW {view}")).await;
+        let definition = &shown[0][3];
+        assert!(
+            definition.contains("FROM \"datafusion\".\"public\".\"source\""),
+            "{definition}"
+        );
+        ctx.sql(&format!("DROP VIEW {view}")).await.unwrap();
+        ctx.sql(definition).await.unwrap();
+        assert_eq!(
+            rows(&ctx, &format!("SELECT id FROM {view}")).await,
+            vec![vec!["1"]]
+        );
+    }
+}
+
+#[tokio::test]
 async fn sort_by_limit_all_preserves_sort() {
     let ctx = SQLContext::new();
     assert_eq!(
