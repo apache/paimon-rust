@@ -170,6 +170,118 @@ fn current_audit_retains_deletes_and_owns_its_stream_and_schema() {
 }
 
 #[test]
+fn ordinary_and_audit_reads_preserve_variant_nulls() {
+    use arrow_array::BinaryArray;
+    use paimon::spec::VariantType;
+    use paimon::variant::GenericVariant;
+
+    let path = "memory:/audit_variant_nulls";
+    let io = memory_file_io();
+    setup_table_dirs(&io, path);
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("v", DataType::Variant(VariantType::new()))
+        .option("file.format", "parquet")
+        .option("row-tracking.enabled", "true")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        io,
+        Identifier::new("default", "audit_variant_nulls"),
+        path.into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    let encoded = GenericVariant::parse_json("null").unwrap();
+    let batch = RecordBatch::try_new(
+        paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            Arc::new(legacy_and_encoded_variant_nulls(&encoded)),
+        ],
+    )
+    .unwrap();
+    write_data_rust(&table, &[batch]);
+
+    unsafe {
+        let table = wrap_table(table);
+        let builder = paimon_table_new_read_builder(table);
+        assert!(builder.error.is_null());
+        let v = CString::new("v").unwrap();
+        let id = CString::new("id").unwrap();
+        let columns = [v.as_ptr(), id.as_ptr(), ptr::null()];
+        assert!(
+            paimon_read_builder_with_projection(builder.read_builder, columns.as_ptr()).is_null()
+        );
+        let plan = paimon_read_builder_plan_audit(builder.read_builder);
+        let read = paimon_read_builder_new_read(builder.read_builder);
+        assert!(plan.error.is_null() && read.error.is_null());
+        for audit in [false, true] {
+            let stream = if audit {
+                paimon_table_read_to_audit_log_arrow(read.read, plan.plan, 0, usize::MAX)
+            } else {
+                paimon_table_read_to_arrow(read.read, plan.plan, 0, usize::MAX)
+            };
+            assert!(stream.error.is_null());
+            let names: &[&str] = if audit {
+                &["rowkind", "v", "id"]
+            } else {
+                &["v", "id"]
+            };
+            let mut rows = Vec::new();
+            for batch in batches(stream.reader) {
+                assert_eq!(
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect::<Vec<_>>(),
+                    names
+                );
+                let variants = batch
+                    .column_by_name("v")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                for (row, id) in ids.values().iter().copied().enumerate() {
+                    rows.push((id, variants.is_valid(row)));
+                    if id == 1 {
+                        for (i, expected) in [encoded.value(), encoded.metadata()]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            assert_eq!(
+                                variants
+                                    .column(i)
+                                    .as_any()
+                                    .downcast_ref::<BinaryArray>()
+                                    .unwrap()
+                                    .value(row),
+                                expected
+                            );
+                        }
+                    }
+                }
+            }
+            rows.sort_unstable();
+            assert_eq!(rows, [(0, false), (1, true)]);
+        }
+        paimon_table_read_free(read.read);
+        paimon_plan_free(plan.plan);
+        paimon_read_builder_free(builder.read_builder);
+        unwrap_table(table);
+    }
+}
+
+#[test]
 fn current_audit_executes_imported_splits_and_system_only_projection() {
     unsafe {
         let table = wrap_table(audit_table(false));

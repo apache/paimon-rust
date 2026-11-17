@@ -46,6 +46,7 @@ pub use schema_evolution::cast_array_for_schema_evolution;
 pub(crate) mod shredding;
 mod variant;
 
+pub use nested_evolution::{visible_generic_list, visible_map};
 pub use read_budget::ReadBudget;
 pub use row_filter::{RowFilter, RowFilterContext, RowFilterFactory};
 pub use variant::{variant_get, variant_get_numeric_fields};
