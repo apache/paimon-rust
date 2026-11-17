@@ -609,6 +609,13 @@ async fn expand_statement_internal(
             crate::expression_compat::rewrite(&mut statement, state)?;
             crate::binary_cast::rewrite(&mut statement)?;
             crate::regex_operators::rewrite(&mut statement);
+            Box::pin(crate::partition_functions::rewrite(
+                &mut statement,
+                state,
+                current_catalog,
+                current_database,
+            ))
+            .await?;
             return Ok(statement);
         }
     }
@@ -707,6 +714,9 @@ fn function_reference(
     current_database: &str,
     state: &SessionState,
 ) -> Option<(String, Identifier)> {
+    if crate::partition_functions::is_max_pt(function, state) {
+        return None;
+    }
     let identifiers = function
         .name
         .0
@@ -810,6 +820,20 @@ fn expand_call(
     let mut body = crate::vector_type::parse_expr(parseable.as_ref()).map_err(|error| {
         DataFusionError::Plan(format!("Invalid SQL function definition: {error}"))
     })?;
+    let metadata_read = visit_expressions(&body, |expr| {
+        if let SqlExpr::Function(call) = expr {
+            if crate::partition_functions::is_max_pt(call, state) {
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    if metadata_read.is_break() {
+        return Err(DataFusionError::Plan(format!(
+            "REST SQL function '{}' cannot contain max_pt: table metadata reads are not immutable",
+            function.full_name()
+        )));
+    }
     let replacements: HashMap<String, SqlExpr> = input_params
         .iter()
         .zip(values)

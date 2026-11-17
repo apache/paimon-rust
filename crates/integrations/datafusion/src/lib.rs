@@ -36,6 +36,7 @@
 //! This version supports partition predicate pushdown by extracting
 //! translatable partition-only conjuncts from DataFusion filters.
 
+mod approx_percentile;
 mod binary_cast;
 mod blob_descriptor_functions;
 mod blob_reader;
@@ -64,6 +65,7 @@ mod memory;
 mod merge_condition;
 mod merge_into;
 mod partition_count_pushdown;
+mod partition_functions;
 mod physical_plan;
 mod primary_key_dml;
 mod procedures;

@@ -850,64 +850,34 @@ impl PaimonSchemaProvider {
     }
 }
 
-#[async_trait]
-impl SchemaProvider for PaimonSchemaProvider {
-    fn table_names(&self) -> Vec<String> {
-        let catalog = Arc::clone(&self.catalog);
-        let database = self.database.clone();
-        let (mut names, views) = block_on_with_runtime(
-            {
-                let db = database.clone();
-                async move {
-                    let names = match catalog.list_tables(&db).await {
-                        Ok(names) => names,
-                        Err(e) => {
-                            log::error!("failed to list tables in '{}': {e}", db);
-                            vec![]
-                        }
-                    };
-                    let views = match catalog.list_views(&db).await {
-                        Ok(views) => views,
-                        Err(paimon::Error::Unsupported { .. }) => vec![],
-                        Err(error) => {
-                            log::error!("failed to list views in '{}': {error}", db);
-                            vec![]
-                        }
-                    };
-                    (names, views)
-                }
-            },
-            "paimon catalog access thread panicked",
-        );
-
-        let mut catalog_table_types = HashMap::with_capacity(names.len() + views.len());
-        for name in &names {
-            catalog_table_types.insert(name.clone(), TableType::Base);
-        }
-        for view in views {
-            catalog_table_types
-                .entry(view.clone())
-                .or_insert(TableType::View);
-            names.push(view);
-        }
-        *self
-            .catalog_table_types
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = catalog_table_types;
-
-        if let Some(temp) = &self.temp_provider {
-            names.extend(temp.table_names());
-        }
-
-        let mut seen = std::collections::HashSet::new();
-        names.retain(|name| seen.insert(name.clone()));
-
-        names
+impl PaimonSchemaProvider {
+    /// Resolve a metadata function's source through normal table handling,
+    /// without planning persistent view definitions. Temporary shadows remain
+    /// visible so the caller can reject a shadowing view or memory table.
+    pub(crate) async fn table_without_view_fallback(
+        &self,
+        name: &str,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.table_with_views(name, false).await
     }
 
-    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+    async fn table_with_views(
+        &self,
+        name: &str,
+        allow_views: bool,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
         if let Some(temp) = &self.temp_provider {
             if let Some(table) = temp.table(name).await? {
+                if allow_views {
+                    if let Some(view) =
+                        table.downcast_ref::<crate::partition_functions::MetadataView>()
+                    {
+                        let state = self.session_state.as_ref().and_then(|provider| provider()).ok_or_else(|| {
+                            plan_datafusion_err!("DataFusion session is unavailable while planning temporary view '{name}'")
+                        })?;
+                        return Ok(Some(Arc::new(Box::pin(view.resolve(&state)).await?)));
+                    }
+                }
                 return Ok(Some(table));
             }
         }
@@ -1084,6 +1054,9 @@ impl SchemaProvider for PaimonSchemaProvider {
                     if branch.is_some() {
                         return Ok(None);
                     }
+                    if !allow_views {
+                        return Ok(None);
+                    }
                     // DataFusion preloads every relation name before planning, including
                     // registered table functions. Do not reinterpret a missing UDTF name as
                     // a REST view; the planner will resolve it through the UDTF registry.
@@ -1145,6 +1118,66 @@ impl SchemaProvider for PaimonSchemaProvider {
             }
         })
         .await
+    }
+}
+
+#[async_trait]
+impl SchemaProvider for PaimonSchemaProvider {
+    fn table_names(&self) -> Vec<String> {
+        let catalog = Arc::clone(&self.catalog);
+        let database = self.database.clone();
+        let (mut names, views) = block_on_with_runtime(
+            {
+                let db = database.clone();
+                async move {
+                    let names = match catalog.list_tables(&db).await {
+                        Ok(names) => names,
+                        Err(e) => {
+                            log::error!("failed to list tables in '{}': {e}", db);
+                            vec![]
+                        }
+                    };
+                    let views = match catalog.list_views(&db).await {
+                        Ok(views) => views,
+                        Err(paimon::Error::Unsupported { .. }) => vec![],
+                        Err(error) => {
+                            log::error!("failed to list views in '{}': {error}", db);
+                            vec![]
+                        }
+                    };
+                    (names, views)
+                }
+            },
+            "paimon catalog access thread panicked",
+        );
+
+        let mut catalog_table_types = HashMap::with_capacity(names.len() + views.len());
+        for name in &names {
+            catalog_table_types.insert(name.clone(), TableType::Base);
+        }
+        for view in views {
+            catalog_table_types
+                .entry(view.clone())
+                .or_insert(TableType::View);
+            names.push(view);
+        }
+        *self
+            .catalog_table_types
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = catalog_table_types;
+
+        if let Some(temp) = &self.temp_provider {
+            names.extend(temp.table_names());
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        names.retain(|name| seen.insert(name.clone()));
+
+        names
+    }
+
+    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.table_with_views(name, true).await
     }
 
     async fn table_type(&self, name: &str) -> DFResult<Option<TableType>> {

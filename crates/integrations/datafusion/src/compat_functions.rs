@@ -36,6 +36,7 @@ pub(crate) fn register_compat_functions(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(GroupConcatRow {
         signature: Signature::variadic(vec![DataType::Utf8], Volatility::Immutable),
     }));
+    crate::approx_percentile::register(ctx);
     for (name, alias) in [
         ("current_date", "curdate"),
         ("to_date", "date"),

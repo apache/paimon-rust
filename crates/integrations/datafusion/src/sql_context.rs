@@ -162,6 +162,7 @@ impl SQLContextBuilder {
             .with_config(crate::lateral_vector_search::session_config())
             .with_default_features()
             .with_spark_features()
+            .with_analyzer_rule(Arc::new(crate::approx_percentile::ValidateParameters))
             .with_type_planner(Arc::new(crate::vector_type::PaimonTypePlanner))
             .with_relation_planners(vec![
                 Arc::new(crate::lateral_views::ExplodeRelationPlanner),
@@ -520,7 +521,24 @@ impl SQLContext {
             let lateral_changed = crate::lateral_views::rewrite(&mut statements[0])?;
             let compat_changed =
                 crate::expression_compat::rewrite(&mut statements[0], &self.ctx.state())?;
-            binary_changed || regex_changed || lateral_changed || compat_changed
+            let state = self.ctx.state();
+            // Queries and temporary view bodies resolve after SQL function expansion below.
+            let max_pt_changed = if matches!(
+                statements[0],
+                Statement::Query(_) | Statement::Explain { .. }
+            ) || matches!(&statements[0], Statement::CreateView(view) if view.temporary)
+            {
+                false
+            } else {
+                Box::pin(crate::partition_functions::rewrite(
+                    &mut statements[0],
+                    &state,
+                    &self.current_catalog_name(),
+                    &state.config_options().catalog.default_schema,
+                ))
+                .await?
+            };
+            binary_changed || regex_changed || lateral_changed || compat_changed || max_pt_changed
         };
         let sql = if changed || vector_changed {
             rewritten = statements[0].to_string();
@@ -2369,31 +2387,45 @@ impl SQLContext {
                 create_view.name.clone(),
                 self.ctx.enable_ident_normalization(),
             )?;
+            let state = self.ctx.state();
             let query_sql = crate::sql_function::bind_view_query(
-                &self.ctx.state(),
+                &state,
                 &query_sql,
-                &self.current_catalog_name(),
-                &self.ctx.state().config_options().catalog.default_schema,
+                &state.config_options().catalog.default_catalog,
+                &state.config_options().catalog.default_schema,
             )?;
-            let expanded_query = crate::sql_function::expand_sql(
-                &self.ctx.state(),
-                &query_sql,
-                &self.catalogs,
-                &self.current_catalog_name(),
-                &self.ctx.state().config_options().catalog.default_schema,
-            )
-            .await?;
-            let df = self
-                .ctx
-                .sql_with_options(&expanded_query, sql_options)
+            let (df, reads_metadata) = crate::partition_functions::track_metadata_reads(async {
+                let expanded_query = crate::sql_function::expand_sql(
+                    &state,
+                    &query_sql,
+                    &self.catalogs,
+                    &state.config_options().catalog.default_catalog,
+                    &state.config_options().catalog.default_schema,
+                )
                 .await?;
+                self.ctx
+                    .sql_with_options(&expanded_query, sql_options)
+                    .await
+            })
+            .await?;
             let logical_plan = df.logical_plan().clone();
             if create_view.if_not_exists && self.temp_table_exist(table_ref.clone())? {
                 return ok_result(&self.ctx);
             }
-            // Create a ViewTable and register it as a temp table
-            let view_table = datafusion::datasource::ViewTable::new(logical_plan, Some(query_sql));
-            self.register_temp_table(table_ref, Arc::new(view_table))?;
+            let view_table: Arc<dyn TableProvider> = if reads_metadata {
+                Arc::new(crate::partition_functions::MetadataView::new(
+                    &logical_plan,
+                    query_sql,
+                    &state,
+                    self.catalogs.clone(),
+                ))
+            } else {
+                Arc::new(datafusion::datasource::ViewTable::new(
+                    logical_plan,
+                    Some(query_sql),
+                ))
+            };
+            self.register_temp_table(table_ref, view_table)?;
             ok_result(&self.ctx)
         } else {
             validate_persistent_create_view(create_view)?;
@@ -4733,6 +4765,8 @@ mod tests {
         functions: Mutex<HashMap<Identifier, paimon::catalog::Function>>,
         denied_functions: Mutex<std::collections::HashSet<String>>,
         function_lookups: Mutex<Vec<Identifier>>,
+        view_lookups: Mutex<Vec<Identifier>>,
+        max_view_lookups: usize,
         views: Mutex<HashMap<Identifier, paimon::catalog::View>>,
         drop_view_supported: bool,
     }
@@ -4745,6 +4779,8 @@ mod tests {
                 functions: Mutex::new(HashMap::new()),
                 denied_functions: Mutex::new(Default::default()),
                 function_lookups: Mutex::new(Vec::new()),
+                view_lookups: Mutex::new(Vec::new()),
+                max_view_lookups: usize::MAX,
                 views: Mutex::new(HashMap::new()),
                 drop_view_supported: true,
             }
@@ -4945,6 +4981,15 @@ mod tests {
         }
 
         async fn get_view(&self, identifier: &Identifier) -> paimon::Result<paimon::catalog::View> {
+            let mut lookups = self.view_lookups.lock().unwrap();
+            lookups.push(identifier.clone());
+            if lookups.len() > self.max_view_lookups {
+                return Err(paimon::Error::UnexpectedError {
+                    message: "view lookup recursion guard".into(),
+                    source: None,
+                });
+            }
+            drop(lookups);
             self.views
                 .lock()
                 .unwrap()
@@ -6187,6 +6232,80 @@ mod tests {
                 .and_then(paimon::catalog::FunctionDefinition::sql),
             Some("1")
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_rest_catalog_function_rejects_metadata_reads_before_folding() {
+        let (_tmp, source) = setup_fs_sql_context().await;
+        source
+            .sql("CREATE TABLE paimon.test_db.t (id INT, p INT) PARTITIONED BY (p)")
+            .await
+            .unwrap();
+        source
+            .sql("INSERT INTO paimon.test_db.t VALUES (1, 1)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let provider = source
+            .ctx()
+            .table_provider("paimon.test_db.t")
+            .await
+            .unwrap();
+        let catalog = Arc::new(MockCatalog::new());
+        *catalog.existing_table.lock().unwrap() = Some(
+            provider
+                .downcast_ref::<PaimonTableProvider>()
+                .unwrap()
+                .table()
+                .clone(),
+        );
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        for body in ["max_pt('t')", "sys.max_pt('t')", "paimon.sys.max_pt('t')"] {
+            let error = ctx
+                .sql(&format!(
+                    "CREATE FUNCTION latest() RETURNS STRING LANGUAGE SQL IMMUTABLE RETURN {body}"
+                ))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("cannot contain max_pt"),
+                "{error}"
+            );
+        }
+        assert!(!catalog
+            .functions
+            .lock()
+            .unwrap()
+            .contains_key(&Identifier::new("default", "latest")));
+        add_unary_sql_function(&catalog, "stored_latest", "max_pt('t')", true);
+        let error = ctx.sql("SELECT stored_latest(1)").await.unwrap_err();
+        assert!(
+            error.to_string().contains("cannot contain max_pt"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_pt_does_not_expand_stored_views_when_resolving_data_tables() {
+        let catalog = Arc::new(MockCatalog {
+            max_view_lookups: 2,
+            ..MockCatalog::new()
+        });
+        add_bigint_view(
+            &catalog,
+            "default",
+            "self_metadata",
+            "SELECT CAST(max_pt('self_metadata') AS BIGINT) AS answer",
+        );
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        let error = ctx.sql("SELECT max_pt('self_metadata')").await.unwrap_err();
+        assert!(error.to_string().contains("does not exist"), "{error}");
+        assert!(catalog.view_lookups.lock().unwrap().is_empty());
+        let error = ctx.sql("SELECT * FROM self_metadata").await.unwrap_err();
+        assert!(error.to_string().contains("does not exist"), "{error}");
+        assert_eq!(catalog.view_lookups.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
