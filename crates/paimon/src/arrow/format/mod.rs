@@ -49,6 +49,16 @@ use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+fn panic_payload_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 /// Predicates with the file-level field context needed for pushdown.
 /// Only used by formats that support predicate pushdown (e.g. Parquet).
 pub(crate) struct FilePredicates {
