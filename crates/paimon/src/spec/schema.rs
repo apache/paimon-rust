@@ -395,7 +395,7 @@ impl TableSchema {
         Ok(())
     }
 
-    /// Apply a list of schema changes and return a new schema with incremented ID.
+    /// Apply schema changes with an incremented ID and the current format version.
     ///
     /// Column-level changes operate on **top-level** columns only: a
     /// `field_names` path with more than one element (a nested struct field) is
@@ -440,6 +440,9 @@ impl TableSchema {
             .collect();
 
         let mut new_schema = self.clone();
+        // Keep resolved legacy options, but do not reapply old defaults after
+        // RESET when this new schema is persisted and loaded again.
+        new_schema.version = Self::CURRENT_VERSION;
         new_schema.id += 1;
         new_schema.time_millis = chrono::Utc::now().timestamp_millis();
 
@@ -2821,6 +2824,38 @@ mod tests {
             let mut json = schema_json_with_version(None);
             json["version"] = version;
             assert!(serde_json::from_value::<TableSchema>(json).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_schema_evolution_upgrades_version_and_preserves_resolved_defaults() {
+        for version in [None, Some(1), Some(2)] {
+            let schema: TableSchema =
+                serde_json::from_value(schema_json_with_version(version)).unwrap();
+            let evolved = schema
+                .apply_changes(vec![crate::spec::SchemaChange::update_comment(Some(
+                    "updated".into(),
+                ))])
+                .unwrap();
+            assert_eq!(evolved.version(), TableSchema::CURRENT_VERSION);
+            assert_eq!(evolved.id(), schema.id() + 1);
+            assert_eq!(evolved.options(), schema.options());
+            let restored: TableSchema =
+                serde_json::from_value(serde_json::to_value(&evolved).unwrap()).unwrap();
+            assert_eq!(restored, evolved);
+
+            // Reading or making a temporary options copy must not upgrade history.
+            assert_eq!(schema.version(), version.unwrap_or(1));
+            assert_eq!(
+                schema.copy_with_options(HashMap::new()).version(),
+                schema.version()
+            );
+            assert_eq!(
+                schema
+                    .copy_with_replaced_options(schema.options().clone())
+                    .version(),
+                schema.version()
+            );
         }
     }
 
