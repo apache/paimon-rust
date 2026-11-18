@@ -248,6 +248,7 @@ async fn read_all_manifest_entries(
     schema_fields: &[DataField],
     key_fields: &[String],
     bucket_selector: Option<&BucketSelector>,
+    selected_bucket: Option<i32>,
     row_range_index: Option<&RowRangeIndex>,
     manifest_sidecar_enabled: bool,
     manifest_parallelism: usize,
@@ -293,8 +294,11 @@ async fn read_all_manifest_entries(
     scan_stats.manifest_files_before_partition_pruning = manifest_files_before_partition_pruning;
     scan_stats.manifest_files_after_partition_pruning = manifest_files.len();
 
+    // Incremental validation must see DELETE entries before physical bucket selection.
+    let manifest_bucket = selected_bucket.filter(|_| !incremental);
     retain_manifest_buckets(
         &mut manifest_files,
+        manifest_bucket,
         has_primary_keys && !scan_all_files,
         bucket_predicate,
         bucket_key_fields,
@@ -342,7 +346,9 @@ async fn read_all_manifest_entries(
                     &mut |_kind, partition_bytes, bucket, total_buckets| {
                         counters.entries_read += 1;
                         // Bucket filter (negative bucket = unassigned)
-                        if has_primary_keys && !scan_all_files && bucket < 0 {
+                        if (has_primary_keys && !scan_all_files && bucket < 0)
+                            || manifest_bucket.is_some_and(|id| id != bucket)
+                        {
                             counters.pruned_by_bucket += 1;
                             return false;
                         }
@@ -413,7 +419,11 @@ async fn read_all_manifest_entries(
         .await?;
     let mut all_entries = if incremental {
         validate_incremental_entries(&all_entries)?;
-        all_entries
+        let mut entries = all_entries;
+        if let Some(bucket) = selected_bucket {
+            entries.retain(|entry| entry.bucket() == bucket);
+        }
+        entries
     } else {
         merge_manifest_entries(all_entries)
     };
@@ -462,6 +472,7 @@ fn retain_manifest_row_ranges(
 /// manifests are bucket-sorted.
 fn retain_manifest_buckets(
     manifests: &mut Vec<crate::spec::ManifestFileMeta>,
+    selected_bucket: Option<i32>,
     only_real_buckets: bool,
     bucket_predicate: Option<&Predicate>,
     bucket_key_fields: &[DataField],
@@ -475,6 +486,9 @@ fn retain_manifest_buckets(
         };
         if min_bucket > max_bucket {
             return true;
+        }
+        if selected_bucket.is_some_and(|bucket| !(min_bucket..=max_bucket).contains(&bucket)) {
+            return false;
         }
         if only_real_buckets && max_bucket < 0 {
             return false;
@@ -1113,6 +1127,13 @@ impl BucketFilter {
     }
 }
 
+fn bucket_shard_conflict() -> crate::Error {
+    crate::Error::DataInvalid {
+        message: "with_bucket and with_shard cannot be used together".into(),
+        source: None,
+    }
+}
+
 impl<'a> TableScan<'a> {
     pub(super) fn into_owned_paimon_scan(self) -> crate::Result<TableScan<'static>> {
         let TableScanKind::Paimon(scan) = self.0 else {
@@ -1366,6 +1387,7 @@ impl<'a> TableScan<'a> {
                     mode: Some(ScanSplitMode::ChunkShuffle(config)),
                     shard: scan.shard(),
                     bucket_filter: scan.bucket_filter().cloned(),
+                    selected_bucket: scan.selected_bucket(),
                     only_real_buckets: scan.only_real_buckets(),
                     snapshot_mode: scan.snapshot_mode(),
                     snapshot_levels: scan.snapshot_levels().cloned(),
@@ -1379,6 +1401,26 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// Restrict a scan to a physical Paimon bucket ID across the selected partitions.
+    /// Manifests whose bucket bounds exclude the ID can be skipped before opening them.
+    /// Cannot be combined with [`Self::with_shard`].
+    pub fn with_bucket(mut self, bucket: i32) -> crate::Result<Self> {
+        match &mut self.0 {
+            TableScanKind::Paimon(scan) => {
+                if scan.shard().is_some() {
+                    return Err(bucket_shard_conflict());
+                }
+                scan.split_selection
+                    .get_or_insert_with(Default::default)
+                    .selected_bucket = Some(bucket);
+                Ok(self)
+            }
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "format tables do not have Paimon buckets".into(),
+            }),
+        }
+    }
+
     /// Select one worker shard using Java `SnapshotReaderImpl.withShard` rules.
     ///
     /// Append tables and primary-key tables with deletion vectors or first-row
@@ -1386,6 +1428,7 @@ impl<'a> TableScan<'a> {
     /// `bucket % count`, keeping all versions of a key or row-id group together.
     /// Chunk shuffling instead distributes balanced ranges of shuffled chunks;
     /// callers may configure the shard before or after chunk shuffling.
+    /// Cannot be combined with [`Self::with_bucket`].
     pub fn with_shard(mut self, index: usize, count: usize) -> crate::Result<Self> {
         if count == 0 || index >= count {
             return Err(crate::Error::DataInvalid {
@@ -1395,6 +1438,9 @@ impl<'a> TableScan<'a> {
         }
         match &mut self.0 {
             TableScanKind::Paimon(scan) => {
+                if scan.selected_bucket().is_some() {
+                    return Err(bucket_shard_conflict());
+                }
                 if scan.row_position_selection().is_some() {
                     return Err(crate::Error::DataInvalid {
                         message:
@@ -1410,6 +1456,7 @@ impl<'a> TableScan<'a> {
                             mode: None,
                             shard: Some((index, count)),
                             bucket_filter: None,
+                            selected_bucket: None,
                             only_real_buckets: false,
                             snapshot_mode: None,
                             snapshot_levels: None,
@@ -1484,6 +1531,7 @@ impl<'a> TableScan<'a> {
                     mode: Some(ScanSplitMode::RowPosition(selection)),
                     shard: None,
                     bucket_filter: scan.bucket_filter().cloned(),
+                    selected_bucket: scan.selected_bucket(),
                     only_real_buckets: scan.only_real_buckets(),
                     snapshot_mode: scan.snapshot_mode(),
                     snapshot_levels: scan.snapshot_levels().cloned(),
@@ -1686,6 +1734,7 @@ struct ScanSplitSelection {
     mode: Option<ScanSplitMode>,
     shard: Option<(usize, usize)>,
     bucket_filter: Option<BucketFilter>,
+    selected_bucket: Option<i32>,
     only_real_buckets: bool,
     snapshot_mode: Option<SnapshotScanMode>,
     snapshot_levels: Option<std::ops::RangeInclusive<i32>>,
@@ -1781,7 +1830,11 @@ impl<'a> PaimonTableScan<'a> {
             return None;
         }
         let result = self.global_index_result()?;
-        let mut plan = Plan::new(result.splits().ok()?.to_vec());
+        let mut splits = result.splits().ok()?.to_vec();
+        if let Some(bucket) = self.selected_bucket() {
+            splits.retain(|split| split.bucket() == bucket);
+        }
+        let mut plan = Plan::new(splits);
         if let Some(id) = result.snapshot_id() {
             plan = plan.with_snapshot_id(id);
         }
@@ -1807,6 +1860,12 @@ impl<'a> PaimonTableScan<'a> {
         self.split_selection
             .as_deref()
             .is_some_and(|selection| selection.only_real_buckets)
+    }
+
+    fn selected_bucket(&self) -> Option<i32> {
+        self.split_selection
+            .as_deref()
+            .and_then(|s| s.selected_bucket)
     }
 
     fn bucket_filter(&self) -> Option<&BucketFilter> {
@@ -2443,6 +2502,7 @@ impl<'a> PaimonTableScan<'a> {
             self.table.schema().fields(),
             &key_fields,
             bucket_selector.as_ref(),
+            self.selected_bucket(),
             row_range_index,
             core_options.manifest_sidecar_enabled(),
             core_options.scan_manifest_parallelism()?,
@@ -3561,6 +3621,7 @@ mod tests {
 
         retain_manifest_buckets(
             &mut manifests,
+            None,
             true,
             Some(&predicate),
             &fields,
@@ -4070,6 +4131,39 @@ mod tests {
             .unwrap();
         assert!(empty.splits().is_empty());
         assert_eq!(empty.snapshot_id(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_physical_bucket_prunes_manifests_and_entries() {
+        let table = pk_stats_gate_table("memory:/physical_bucket")
+            .copy_with_options(HashMap::from([("bucket".into(), "4".into())]));
+        setup_scan_stats_dirs(&table).await;
+        let commit = TableCommit::new(table.clone(), "bucket".into());
+        for (version, buckets) in [[0, 1], [2, 3]].iter().enumerate() {
+            let messages = buckets
+                .iter()
+                .map(|&bucket| {
+                    CommitMessage::new(
+                        BinaryRowBuilder::new(0).build_serialized(),
+                        bucket,
+                        vec![pk_stats_file(
+                            &format!("v{version}-b{bucket}"),
+                            (1, 2),
+                            (1, 2),
+                        )],
+                    )
+                })
+                .collect();
+            commit.commit(messages).await.unwrap();
+        }
+        let scan = table.new_read_builder().new_scan();
+        let plan = scan.with_bucket(2).unwrap().plan().await.unwrap();
+        assert_eq!(plan.splits().len(), 1);
+        assert_eq!(plan.splits()[0].bucket(), 2);
+        assert_eq!(plan.splits()[0].data_files()[0].file_name, "v1-b2");
+        // The [0,1] manifest was never opened; [2,3] needed entry-level filtering.
+        assert_eq!(plan.stats().manifest_entries_read, 2);
+        assert_eq!(plan.stats().manifest_entries_pruned_by_bucket, 1);
     }
 
     #[tokio::test]
@@ -4852,6 +4946,10 @@ mod tests {
             .unwrap()
             .with_shard(0, 1)
             .is_ok());
+        let bucket = reader.new_scan().with_bucket(2).unwrap();
+        let shard = reader.new_scan().with_shard(0, 4).unwrap();
+        assert!(bucket.with_shard(0, 4).is_err());
+        assert!(shard.with_bucket(2).is_err());
         assert!(reader.new_scan().with_shard(0, 0).is_err());
         assert!(reader.new_scan().with_shard(1, 1).is_err());
     }

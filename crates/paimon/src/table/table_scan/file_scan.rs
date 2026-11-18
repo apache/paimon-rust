@@ -201,6 +201,7 @@ impl PaimonTableScan<'_> {
             self.table.schema().fields(),
             &self.table.schema().trimmed_primary_keys(),
             bucket_selector.as_ref(),
+            self.selected_bucket(),
             None,
             options.manifest_sidecar_enabled(),
             options.scan_manifest_parallelism()?,
