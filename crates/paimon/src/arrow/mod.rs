@@ -391,16 +391,12 @@ fn build_arrow_schema(fields: &[DataField], for_read: bool) -> crate::Result<Arc
 }
 
 pub(crate) const GEOARROW_WKB: &str = "geoarrow.wkb";
-const PAIMON_CRS_TEXT: &str = "paimon:crs";
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct GeoArrowMetadata {
-    // A PROJJSON object must stay an object in Arrow. Preserve its original text
-    // because Java also uses that text as the CRS in the Parquet logical type.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    crs: Option<Box<serde_json::value::RawValue>>,
+struct GeoArrowMetadata<C> {
     #[serde(skip_serializing_if = "Option::is_none")]
     edges: Option<String>,
+    crs: Option<C>,
 }
 
 fn geoarrow_metadata_error(error: serde_json::Error) -> crate::Error {
@@ -430,27 +426,12 @@ fn paimon_arrow_field(
         PaimonDataType::Geography(g) => (g.crs(), Some(g.algorithm().to_string())),
         _ => return Ok(field),
     };
-    let crs = match crs {
-        "srid:0" => None,
-        s if s.trim_start().starts_with('{') => Some(
-            match serde_json::from_str::<Box<serde_json::value::RawValue>>(s) {
-                Ok(object) => {
-                    // GeoArrow uses an object for PROJJSON. Java additionally
-                    // compares its exact spelling, including outer JSON whitespace.
-                    if object.get() != s {
-                        field
-                            .metadata_mut()
-                            .insert(PAIMON_CRS_TEXT.into(), s.into());
-                    }
-                    object
-                }
-                Err(_) => serde_json::value::to_raw_value(s).map_err(geoarrow_metadata_error)?,
-            },
-        ),
-        s => Some(serde_json::value::to_raw_value(s).map_err(geoarrow_metadata_error)?),
-    };
-    let metadata =
-        serde_json::to_string(&GeoArrowMetadata { crs, edges }).map_err(geoarrow_metadata_error)?;
+    // Java writes the original CRS as a string, including PROJJSON.
+    let metadata = serde_json::to_string(&GeoArrowMetadata {
+        edges,
+        crs: Some(crs),
+    })
+    .map_err(geoarrow_metadata_error)?;
     field
         .metadata_mut()
         .insert(EXTENSION_TYPE_NAME_KEY.into(), GEOARROW_WKB.into());
@@ -473,21 +454,16 @@ pub fn arrow_field_to_paimon_type(field: &ArrowField) -> crate::Result<PaimonDat
             message: format!("Invalid geoarrow.wkb storage type: {}", field.data_type()),
         });
     }
-    let md: GeoArrowMetadata =
+    let md: GeoArrowMetadata<&serde_json::value::RawValue> =
         serde_json::from_str(field.extension_type_metadata().unwrap_or("{}"))
             .map_err(geoarrow_metadata_error)?;
     // GeoArrow omits the CRS when unknown. Parquet represents an unknown CRS with srid:0.
-    let crs = match md.crs.as_deref().map(serde_json::value::RawValue::get) {
+    let crs = match md.crs.map(serde_json::value::RawValue::get) {
         None => "srid:0".into(),
         Some(s) if s.starts_with('"') => {
             serde_json::from_str(s).map_err(geoarrow_metadata_error)?
         }
-        Some(object) if object.starts_with('{') => field
-            .metadata()
-            .get(PAIMON_CRS_TEXT)
-            .filter(|original| original.trim_matches([' ', '\t', '\n', '\r']) == object)
-            .cloned()
-            .unwrap_or_else(|| object.to_owned()),
+        Some(object) if object.starts_with('{') => object.to_owned(),
         Some(value) => {
             return Err(crate::Error::DataTypeInvalid {
                 message: format!("Invalid geoarrow.wkb CRS: {value}"),
@@ -528,25 +504,34 @@ mod tests {
 
     #[test]
     fn geospatial_arrow_crs_preserves_identifiers_and_projjson() {
-        let projjson = r#"{ "type": "GeographicCRS", "name": "Example" }"#;
-        for crs in [
-            "OGC:CRS84",
-            "srid:0",
-            projjson,
-            " { \"name\": \"x\" } ",
-            "{custom",
-        ] {
+        let projjson = r#" { "type": "GeographicCRS", "name": "Example" } "#;
+        for crs in ["OGC:CRS84", "srid:0", projjson, "{custom"] {
             let ty = PaimonDataType::Geometry(crate::spec::GeometryType::new(crs).unwrap());
             let field = paimon_type_to_arrow_field("geometry", &ty).unwrap();
             assert_eq!(arrow_field_to_paimon_type(&field).unwrap(), ty);
             let metadata: serde_json::Value =
                 serde_json::from_str(field.extension_type_metadata().unwrap()).unwrap();
-            match crs {
-                "srid:0" => assert!(metadata.get("crs").is_none()),
-                s if s == projjson => assert_eq!(metadata["crs"]["name"], "Example"),
-                s if s.starts_with(' ') => assert_eq!(metadata["crs"]["name"], "x"),
-                identifier => assert_eq!(metadata["crs"], identifier),
-            }
+            assert_eq!(metadata, serde_json::json!({ "crs": crs }));
+            assert_eq!(field.metadata().len(), 2);
+        }
+
+        let mut field = ArrowField::new("geom", ArrowDataType::Binary, true);
+        field.metadata_mut().insert(
+            arrow_schema::extension::EXTENSION_TYPE_NAME_KEY.into(),
+            GEOARROW_WKB.into(),
+        );
+        for (metadata, expected) in [
+            (format!(r#"{{"crs":{projjson}}}"#), projjson.trim()),
+            ("{}".to_owned(), "srid:0"),
+        ] {
+            field.metadata_mut().insert(
+                arrow_schema::extension::EXTENSION_TYPE_METADATA_KEY.into(),
+                metadata,
+            );
+            assert_eq!(
+                arrow_field_to_paimon_type(&field).unwrap(),
+                PaimonDataType::Geometry(GeometryType::new(expected).unwrap())
+            );
         }
     }
 

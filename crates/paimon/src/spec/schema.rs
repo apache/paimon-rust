@@ -1780,23 +1780,6 @@ impl Schema {
                 reject("bucket key", bk, true)?;
             }
         }
-        if let Some(columns) = options
-            .get("clustering.columns")
-            .or_else(|| options.get("sink.clustering.by-columns"))
-        {
-            for name in columns.split(',').map(str::trim) {
-                if fields
-                    .iter()
-                    .any(|f| f.name() == name && f.data_type().contains_geospatial())
-                {
-                    return Err(crate::Error::ConfigInvalid {
-                        message: format!(
-                            "Geospatial column '{name}' cannot be a clustering column."
-                        ),
-                    });
-                }
-            }
-        }
         Ok(())
     }
 
@@ -2758,7 +2741,7 @@ mod tests {
     }
 
     #[test]
-    fn geospatial_columns_cannot_be_keys_or_ordering_fields() {
+    fn geospatial_key_and_clustering_options() {
         let geo = DataType::Geometry(crate::spec::GeometryType::default());
         let schema = || Schema::builder().column("g", geo.clone());
         assert_config_invalid(schema().primary_key(["g"]).build(), "primary key");
@@ -2768,13 +2751,14 @@ mod tests {
             schema().option("sequence.field", "g").build(),
             "sequence field",
         );
-        assert_config_invalid(
+        for option in ["clustering.columns", "sink.clustering.by-columns"] {
             Schema::builder()
-                .column("items", DataType::Array(ArrayType::new(geo)))
-                .option("clustering.columns", "items")
-                .build(),
-            "clustering column",
-        );
+                .column("g", geo.clone())
+                .column("items", DataType::Array(ArrayType::new(geo.clone())))
+                .option(option, "g,items")
+                .build()
+                .unwrap();
+        }
     }
 
     #[test]
