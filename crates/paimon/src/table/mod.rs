@@ -112,6 +112,7 @@ pub(crate) mod merge_tree_split_generator;
 #[cfg(test)]
 mod mosaic_table_write_tests;
 mod object_table;
+mod partition_fallback;
 mod partition_filter;
 mod partition_row_count;
 mod partition_spec;
@@ -1142,21 +1143,26 @@ impl Table {
             table.schema = table.schema.copy_with_replaced_options(options);
             return Ok(table);
         }
+        self.filesystem_branch(branch)
+            .await?
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("Branch '{branch_name}' does not exist."),
+                source: None,
+            })
+    }
+
+    async fn filesystem_branch(&self, branch: String) -> Result<Option<Self>> {
         let schema_manager = if branch == DEFAULT_MAIN_BRANCH {
             SchemaManager::new(self.file_io.clone(), self.location.clone())
         } else {
             SchemaManager::new(self.file_io.clone(), self.location.clone()).with_branch(&branch)
         };
-        let schema = schema_manager
-            .latest()
-            .await?
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!("Branch '{branch}' does not exist."),
-                source: None,
-            })?;
+        let Some(schema) = schema_manager.latest().await? else {
+            return Ok(None);
+        };
         let mut options = schema.options().clone();
         options.insert("branch".to_string(), branch.clone());
-        Ok(Self {
+        Ok(Some(Self {
             file_io: self.file_io.clone(),
             identifier: self.identifier.clone(),
             location: self.location.clone(),
@@ -1169,7 +1175,7 @@ impl Table {
             time_traveled: false,
             travel_snapshot: None,
             applied_dynamic_option_keys: HashSet::new(),
-        })
+        }))
     }
 
     /// Whether this copy has a time-traveled schema or an explicitly pinned

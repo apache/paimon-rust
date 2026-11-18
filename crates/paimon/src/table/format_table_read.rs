@@ -117,6 +117,11 @@ impl<'a> FormatTableRead<'a> {
         &self,
         data_splits: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
+        if data_splits.iter().any(DataSplit::is_fallback) {
+            return Err(crate::Error::Unsupported {
+                message: "Format tables do not support partition fallback splits".into(),
+            });
+        }
         let core_options = self.table.schema().core_options();
         core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
         // The marker carries the plan's decision.
