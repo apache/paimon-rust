@@ -570,14 +570,6 @@ impl TableProvider for PaimonTableProvider {
                 )));
             }
         };
-        if let Some(projection) =
-            input.downcast_ref::<datafusion::physical_plan::projection::ProjectionExec>()
-        {
-            let schema = projection.input().schema();
-            for (expr, target) in projection.expr().iter().zip(self.schema.fields()) {
-                crate::geospatial::check_wkb_assignment(&expr.expr, &schema, target)?;
-            }
-        }
         let sink = PaimonDataSink::new(self.table.clone(), self.schema.clone(), overwrite);
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }

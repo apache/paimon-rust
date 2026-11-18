@@ -1399,7 +1399,6 @@ fn enforce_view_schema(plan: LogicalPlan, view: &View) -> DFResult<LogicalPlan> 
             let target =
                 paimon::arrow::paimon_type_to_arrow_field(declared.name(), declared.data_type())
                     .map_err(to_datafusion_error)?;
-            paimon::arrow::validate_geoarrow_write(actual, &target).map_err(to_datafusion_error)?;
             let expr = if target.extension_type_name().is_some() {
                 Expr::Cast(datafusion::logical_expr::Cast::new_from_field(
                     Box::new(Expr::Column(column)),

@@ -450,8 +450,8 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 
 Supply WKB bytes in the column's declared CRS on insert. Direct projections
 return Arrow binary fields with the `geoarrow.wkb` extension, CRS, and geography
-edge algorithm. A direct assignment between geo columns requires matching types,
-CRSs, and edge algorithms. SQL casts follow DataFusion's binary conversions.
+edge algorithm. Assignments copy the WKB bytes. The target column supplies the
+CRS and edge algorithm, so reproject the coordinates before inserting if needed.
 Equality compares WKB bytes, even across different CRSs. Spatial functions
 such as `ST_Intersects` require a separate spatial function provider.
 Use Parquet when exchanging geospatial data with Java Paimon. The Rust Row

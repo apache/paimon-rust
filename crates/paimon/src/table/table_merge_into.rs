@@ -373,18 +373,15 @@ fn column_assignment(
     batches: &[RecordBatch],
     prefix: &str,
     name: &str,
-    target: &Field,
 ) -> crate::Result<UpdateAssignment> {
     Ok(UpdateAssignment::Array(
         batches
             .iter()
             .map(|batch| {
-                let schema = batch.schema();
-                let index = schema
-                    .index_of(&format!("{prefix}.{name}"))
-                    .map_err(|_| invalid(format!("Missing MERGE {prefix} column {name}")))?;
-                crate::arrow::validate_geoarrow_write(schema.field(index), target)?;
-                Ok(batch.column(index).clone())
+                batch
+                    .column_by_name(&format!("{prefix}.{name}"))
+                    .cloned()
+                    .ok_or_else(|| invalid(format!("Missing MERGE {prefix} column {name}")))
             })
             .collect::<crate::Result<_>>()?,
     ))
@@ -399,25 +396,19 @@ fn assigned(
 ) -> crate::Result<Vec<RecordBatch>> {
     let mut values = Vec::new();
     for name in columns {
-        let target = schema
-            .field_with_name(name)
-            .map_err(|e| invalid(e.to_string()))?;
         let value = assignments
             .iter()
             .find(|(column, _)| column == name)
             .map(|(_, value)| value);
         let assignment = match value {
             Some(MergeAssignment::Value(value)) => value.clone(),
-            Some(MergeAssignment::SourceColumn(column)) => {
-                column_assignment(batches, "s", column, target)?
-            }
-            Some(MergeAssignment::TargetColumn(column)) => {
-                column_assignment(batches, "t", column, target)?
-            }
-            None if insert => {
-                UpdateAssignment::Scalar(arrow_array::new_null_array(target.data_type(), 1))
-            }
-            None => column_assignment(batches, "t", name, target)?,
+            Some(MergeAssignment::SourceColumn(column)) => column_assignment(batches, "s", column)?,
+            Some(MergeAssignment::TargetColumn(column)) => column_assignment(batches, "t", column)?,
+            None if insert => UpdateAssignment::Scalar(arrow_array::new_null_array(
+                schema.field_with_name(name).unwrap().data_type(),
+                1,
+            )),
+            None => column_assignment(batches, "t", name)?,
         };
         values.push((name.clone(), assignment));
     }

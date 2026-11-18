@@ -38,25 +38,6 @@ pub fn normalize_write_array(array: &ArrayRef, expected: &DataType) -> Result<Ar
     normalize_visible_array(array, expected, None)
 }
 
-/// Validate the source field before replacing it with the declared append schema.
-pub(super) fn normalize_append_column(
-    batch: &arrow_array::RecordBatch,
-    index: usize,
-    expected: &Field,
-    dedicated_blob: bool,
-) -> Result<(Field, ArrayRef)> {
-    crate::arrow::validate_geoarrow_write(batch.schema_ref().field(index), expected)?;
-    let column = batch.column(index);
-    if dedicated_blob {
-        normalize_blob_write_field(column, expected)
-    } else {
-        Ok((
-            expected.clone(),
-            normalize_write_field(column, expected, None)?,
-        ))
-    }
-}
-
 pub(super) fn normalize_write_field(
     array: &ArrayRef,
     expected: &Field,
@@ -120,7 +101,10 @@ pub(super) fn blob_map_row_type(expected: &DataType) -> Option<DataType> {
     ))))
 }
 
-fn normalize_blob_write_field(array: &ArrayRef, expected: &Field) -> Result<(Field, ArrayRef)> {
+pub(super) fn normalize_blob_write_field(
+    array: &ArrayRef,
+    expected: &Field,
+) -> Result<(Field, ArrayRef)> {
     normalize_blob_field(array, expected, true)
 }
 

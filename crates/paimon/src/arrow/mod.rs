@@ -505,71 +505,6 @@ pub fn arrow_field_to_paimon_type(field: &ArrowField) -> crate::Result<PaimonDat
     }
 }
 
-/// Whether a field carries GeoArrow WKB, at its root or in a nested child.
-pub fn contains_geoarrow_wkb(field: &ArrowField) -> bool {
-    field.extension_type_name() == Some(GEOARROW_WKB)
-        || field.data_type().is_nested()
-            && ArrowSchema::new(vec![field.clone()])
-                .flattened_fields()
-                .iter()
-                .any(|child| child.extension_type_name() == Some(GEOARROW_WKB))
-}
-
-/// Comparing two typed WKB fields prevents relabeling bytes with another CRS.
-/// Unannotated input and physical layout conversions follow the usual Arrow write path.
-pub fn validate_geoarrow_write(actual: &ArrowField, expected: &ArrowField) -> crate::Result<()> {
-    use ArrowDataType::*;
-
-    if let Dictionary(_, values) = actual.data_type() {
-        return validate_geoarrow_write(&actual.clone().with_data_type(*values.clone()), expected);
-    }
-    if actual.extension_type_name() == Some(GEOARROW_WKB)
-        && expected.extension_type_name() == Some(GEOARROW_WKB)
-    {
-        let source = arrow_field_to_paimon_type(actual)?.copy_with_nullable(true)?;
-        let target = arrow_field_to_paimon_type(expected)?.copy_with_nullable(true)?;
-        if source != target {
-            return Err(crate::Error::DataTypeInvalid {
-                message: format!(
-                    "Cannot write {source} to field '{}' of type {target}",
-                    expected.name()
-                ),
-            });
-        }
-    }
-    if actual.data_type() == expected.data_type() {
-        return Ok(());
-    }
-    match (actual.data_type(), expected.data_type()) {
-        (Struct(source), Struct(target)) => {
-            let by_name = target.iter().all(|f| source.find(f.name()).is_some());
-            for (i, to) in target.iter().enumerate() {
-                if let Some((_, from)) = source.find(to.name()) {
-                    validate_geoarrow_write(from, to)?;
-                }
-                if !by_name {
-                    if let Some(from) = source.get(i) {
-                        validate_geoarrow_write(from, to)?;
-                    }
-                }
-            }
-        }
-        (Map(a, _), Map(b, _)) => {
-            if let (Struct(from), Struct(to)) = (a.data_type(), b.data_type()) {
-                for (from, to) in from.iter().zip(to) {
-                    validate_geoarrow_write(from, to)?;
-                }
-            }
-        }
-        (
-            List(a) | LargeList(a) | ListView(a) | LargeListView(a) | FixedSizeList(a, _),
-            List(b) | LargeList(b) | ListView(b) | LargeListView(b) | FixedSizeList(b, _),
-        ) => validate_geoarrow_write(a, b)?,
-        _ => {}
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,41 +569,6 @@ mod tests {
         assert_eq!(
             arrow_to_paimon_type(&row, true).unwrap(),
             PaimonDataType::Row(RowType::new(fields.to_vec()))
-        );
-    }
-
-    #[test]
-    fn geospatial_write_validates_named_struct_children_after_dictionary_decoding() {
-        let geo = |crs| {
-            paimon_type_to_arrow_field(
-                "g",
-                &PaimonDataType::Geometry(GeometryType::new(crs).unwrap()),
-            )
-            .unwrap()
-        };
-        let source = ArrowField::new(
-            "row",
-            ArrowDataType::Dictionary(
-                Box::new(ArrowDataType::Int32),
-                Box::new(ArrowDataType::Struct(
-                    vec![
-                        ArrowField::new("padding", ArrowDataType::Binary, true),
-                        geo("EPSG:3857"),
-                    ]
-                    .into(),
-                )),
-            ),
-            true,
-        );
-        let target =
-            |crs| ArrowField::new("row", ArrowDataType::Struct(vec![geo(crs)].into()), true);
-        assert!(validate_geoarrow_write(&source, &target("EPSG:3857")).is_ok());
-        let error = validate_geoarrow_write(&source, &target("EPSG:4326"))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("EPSG:3857") && error.contains("EPSG:4326"),
-            "{error}"
         );
     }
 

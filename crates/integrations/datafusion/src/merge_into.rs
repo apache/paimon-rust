@@ -531,7 +531,7 @@ impl PaimonMergeSink {
                                 &schema,
                                 &batch,
                                 value,
-                                table_schema.field(target_index),
+                                table_schema.field(target_index).data_type(),
                             )?);
                         }
                         updates.push((
@@ -548,7 +548,13 @@ impl PaimonMergeSink {
                                 .position(|c| c == field.name())
                                 .map(|i| values[i].clone())
                                 .unwrap_or_else(|| lit(datafusion::common::ScalarValue::Null));
-                            arrays.push(evaluate(&state, &schema, &batch, expr, field)?);
+                            arrays.push(evaluate(
+                                &state,
+                                &schema,
+                                &batch,
+                                expr,
+                                field.data_type(),
+                            )?);
                         }
                         inserts.push(RecordBatch::try_new(table_schema.clone(), arrays)?);
                     }
@@ -676,11 +682,10 @@ impl PaimonMergeSink {
             })
             .map(|index| {
                 let field = self.merge_schema.field(index);
-                let column = Expr::Column(Column::new_unqualified(field.name()));
-                Expr::Cast(datafusion::logical_expr::Cast::new_from_field(
-                    Box::new(column),
-                    field.clone(),
-                ))
+                datafusion::logical_expr::expr_fn::cast(
+                    Expr::Column(Column::new_unqualified(field.name())),
+                    field.data_type().clone(),
+                )
                 .alias(column_name(index, self.target_len))
             })
             .collect()
@@ -751,12 +756,13 @@ fn evaluate(
     schema: &DFSchema,
     batch: &RecordBatch,
     expr: Expr,
-    target: &Field,
+    target_type: &ArrowDataType,
 ) -> DFResult<ArrayRef> {
-    let expr = state.create_physical_expr(expr, schema)?;
-    crate::geospatial::check_wkb_assignment(&expr, batch.schema_ref(), target)?;
-    let value = expr.evaluate(batch)?.into_array(batch.num_rows())?;
-    cast(value.as_ref(), target.data_type()).map_err(Into::into)
+    let value = state
+        .create_physical_expr(expr, schema)?
+        .evaluate(batch)?
+        .into_array(batch.num_rows())?;
+    cast(value.as_ref(), target_type).map_err(Into::into)
 }
 
 fn memory_relation(
@@ -925,14 +931,11 @@ pub(crate) fn project_update_columns(
                 DataFusionError::Internal(format!("Column {prefixed} not found: {e}"))
             })?;
             columns.push(batch.column(idx).clone());
-            fields.push(
-                batch
-                    .schema()
-                    .field(idx)
-                    .clone()
-                    .with_name(col)
-                    .with_nullable(true),
-            );
+            fields.push(Field::new(
+                col,
+                batch.schema().field(idx).data_type().clone(),
+                true,
+            ));
         }
 
         let schema = Arc::new(Schema::new(fields));

@@ -45,7 +45,7 @@ use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
-use crate::table::write_batch_normalize::normalize_append_column;
+use crate::table::write_batch_normalize::{normalize_blob_write_field, normalize_write_field};
 use crate::table::{Snapshot, Table, TableScan};
 use crate::Result;
 use arrow_array::{Array, ArrayRef, Int8Array, RecordBatch};
@@ -1114,12 +1114,12 @@ impl TableWrite {
         let mut normalized_fields = Vec::with_capacity(actual_field_count);
         for (index, expected_field) in expected_schema.fields().iter().enumerate() {
             let actual_field = actual_schema.field(index);
-            let normalized = normalize_append_column(
-                batch,
-                index,
-                expected_field,
-                blob_maps.contains(expected_field.name().as_str()),
-            );
+            let normalized = if blob_maps.contains(expected_field.name().as_str()) {
+                normalize_blob_write_field(batch.column(index), expected_field)
+            } else {
+                normalize_write_field(batch.column(index), expected_field, None)
+                    .map(|column| (expected_field.as_ref().clone(), column))
+            };
             let (field, column) = normalized
                 .map_err(|error| crate::Error::DataInvalid {
                     message: format!(
@@ -2443,8 +2443,8 @@ pub(in crate::table) mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn geospatial_write_checks_annotated_crs_and_normalizes_wkb_layouts() {
+    #[test]
+    fn geospatial_write_normalizes_wkb_layouts() {
         use crate::spec::{ArrayType, GeometryType};
         use arrow_array::{BinaryViewArray, LargeBinaryArray, ListArray};
         use arrow_buffer::OffsetBuffer;
@@ -2461,7 +2461,7 @@ pub(in crate::table) mod tests {
             TableSchema::new(0, &schema),
             None,
         );
-        let mut writer = TableWrite::new(&table, "writer".into()).unwrap();
+        let writer = TableWrite::new(&table, "writer".into()).unwrap();
         let make_batch = |ty: &DataType, values: ArrayRef| {
             let child = crate::arrow::paimon_type_to_arrow_field("item", ty)
                 .unwrap()
@@ -2479,22 +2479,12 @@ pub(in crate::table) mod tests {
         ];
         let large = Arc::new(LargeBinaryArray::from(vec![Some(point), None])) as ArrayRef;
         let other = DataType::Geometry(GeometryType::new("EPSG:3857").unwrap());
-        let err = writer
-            .write_arrow_batch(&make_batch(&other, large.clone()))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("EPSG:4326") && err.contains("EPSG:3857"),
-            "{err}"
-        );
-
         for values in [
             large,
             Arc::new(BinaryViewArray::from_iter([Some(point), None])) as ArrayRef,
         ] {
             let batch = writer
-                .validate_write_batch_schema(&make_batch(&geom, values))
+                .validate_write_batch_schema(&make_batch(&other, values))
                 .unwrap();
             let list = batch
                 .column(0)

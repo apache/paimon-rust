@@ -3712,97 +3712,6 @@ async fn geospatial_sql_write_read_and_show_create() {
 }
 
 #[tokio::test]
-async fn geospatial_assignments_preserve_source_crs_and_edges() {
-    let (_tmp, catalog) = create_test_env();
-    let ctx = create_sql_context(catalog.clone()).await;
-    for ddl in [
-        "CREATE TABLE src (g GEOMETRY('EPSG:4326'), a ARRAY<GEOGRAPHY>)",
-        "CREATE TABLE dst (g GEOMETRY('EPSG:3857'), a ARRAY<GEOGRAPHY('OGC:CRS84', karney)>)",
-        "CREATE TABLE dst_partition (g GEOMETRY('EPSG:3857'), p INT) PARTITIONED BY (p)",
-    ] {
-        ctx.sql(ddl).await.unwrap();
-    }
-    ctx.sql("INSERT INTO src VALUES (NULL, NULL)")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-    for sql in [
-        "INSERT INTO dst (g) SELECT g FROM src",
-        "INSERT INTO dst (a) SELECT a FROM src",
-        "MERGE INTO dst USING src ON false WHEN NOT MATCHED THEN INSERT (a) VALUES (src.a)",
-        "INSERT OVERWRITE dst_partition PARTITION (p = 1) SELECT g FROM src",
-        "CREATE TEMPORARY TABLE swapped (g GEOMETRY('EPSG:3857')) AS SELECT g FROM src",
-    ] {
-        assert_sql_error_contains(&ctx, sql, "Cannot write").await;
-    }
-    for sql in [
-        "INSERT INTO dst (g) VALUES (CAST(CAST(NULL AS VARCHAR) AS BYTEA))",
-        "INSERT INTO dst (a, g) SELECT NULL, CAST(g AS BYTEA) FROM src",
-    ] {
-        ctx.sql(sql).await.unwrap().collect().await.unwrap();
-    }
-
-    let plain = datafusion::prelude::SessionContext::new();
-    for name in ["src", "dst"] {
-        let table = catalog
-            .get_table(&Identifier::new("default", name))
-            .await
-            .unwrap();
-        plain
-            .register_table(
-                name,
-                Arc::new(paimon_datafusion::PaimonTableProvider::try_new(table).unwrap()),
-            )
-            .unwrap();
-    }
-    let insert = plain
-        .sql("INSERT INTO dst (a) SELECT a FROM src")
-        .await
-        .unwrap();
-    let error = insert
-        .collect()
-        .await
-        .expect_err("incompatible nested CRS in plain DataFusion session");
-    assert!(error.to_string().contains("karney"), "{error}");
-
-    use datafusion::arrow::{
-        array::LargeBinaryArray, datatypes::DataType as ArrowType, record_batch::RecordBatch,
-    };
-    let source = plain.table("src").await.unwrap();
-    let field = source
-        .schema()
-        .field(0)
-        .as_ref()
-        .clone()
-        .with_data_type(ArrowType::LargeBinary);
-    let batch = RecordBatch::try_new(
-        Arc::new(datafusion::arrow::datatypes::Schema::new(vec![field])),
-        vec![Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>]))],
-    )
-    .unwrap();
-    plain.register_batch("wide", batch).unwrap();
-    let insert = plain
-        .sql("INSERT INTO dst (g) SELECT g FROM wide")
-        .await
-        .unwrap();
-    assert!(insert
-        .collect()
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("EPSG:3857"));
-    plain
-        .sql("INSERT INTO src (g) SELECT g FROM wide")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
 async fn geospatial_empty_temp_ctas_keeps_declared_type_and_name() {
     let (_tmp, catalog) = create_test_env();
     let ctx = create_sql_context(catalog).await;
@@ -3831,7 +3740,7 @@ async fn geospatial_empty_temp_ctas_keeps_declared_type_and_name() {
 }
 
 #[tokio::test]
-async fn geospatial_mutations_check_assignments_and_use_wkb_equality() {
+async fn geospatial_merge_compares_and_copies_wkb_across_crs() {
     let (_tmp, catalog) = create_test_env();
     let ctx = create_sql_context(catalog).await;
     let point = "decode('0101000000000000000000F03F0000000000000040', 'hex')";
@@ -3844,7 +3753,7 @@ async fn geospatial_mutations_check_assignments_and_use_wkb_equality() {
     ] {
         let ddl = format!(
             "CREATE TABLE {name} (id INT, a GEOMETRY('EPSG:4326'), \
-             b GEOMETRY('EPSG:3857'), bytes BYTEA, txt VARCHAR) {options}"
+             b GEOMETRY('EPSG:3857'), copied GEOMETRY('EPSG:4326')) {options}"
         );
         ctx.sql(&ddl).await.unwrap();
         ctx.sql(&format!(
@@ -3855,19 +3764,12 @@ async fn geospatial_mutations_check_assignments_and_use_wkb_equality() {
         .collect()
         .await
         .unwrap();
-        for sql in [
-            format!("UPDATE {name} SET a=b"),
-            format!("MERGE INTO {name} t USING {name} s ON t.id=s.id WHEN MATCHED THEN UPDATE SET a=s.b"),
-            format!("MERGE INTO {name} t USING {name} s ON t.id=s.id+1 WHEN NOT MATCHED THEN INSERT(id,a) VALUES(s.id+1,s.b)"),
-        ] {
-            assert_sql_error_contains(&ctx, &sql, "Cannot write GEOMETRY(EPSG:3857)").await;
-        }
         let merge = format!(
             "MERGE INTO {name} t USING {name} s ON t.a=s.b WHEN MATCHED \
-             THEN UPDATE SET bytes=CAST(s.a AS BYTEA), a=CAST(s.txt AS BYTEA)"
+             THEN UPDATE SET copied=s.b"
         );
         ctx.sql(&merge).await.unwrap().collect().await.unwrap();
-        let query = format!("SELECT id FROM {name} WHERE bytes={point} AND a IS NULL");
+        let query = format!("SELECT id FROM {name} WHERE copied={point}");
         let rows = ctx.sql(&query).await.unwrap().collect().await.unwrap();
         assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
     }
@@ -4054,6 +3956,8 @@ async fn test_vector_sql_rejects_invalid_types() {
         ("VECTOR<FLOAT, 4294967296>", "Vector length must be between"),
         ("VECTOR<FLOAT, 1.5>", "Invalid VECTOR type"),
         ("VECTOR<STRING, 2>", "Invalid element type for vector"),
+        ("VECTOR<GEOMETRY, 2>", "Invalid element type for vector"),
+        ("VECTOR<GEOGRAPHY, 2>", "Invalid element type for vector"),
         (
             "VECTOR<DECIMAL(10, 2), 2>",
             "Invalid element type for vector",

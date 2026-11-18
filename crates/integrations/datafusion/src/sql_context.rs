@@ -165,7 +165,7 @@ impl SQLContextBuilder {
             .with_spark_features()
             .with_analyzer_rule(Arc::new(crate::approx_percentile::ValidateParameters))
             .with_analyzer_rule(Arc::new(crate::geospatial::GeoListValues))
-            .with_type_planner(Arc::new(crate::vector_type::PaimonTypePlanner))
+            .with_type_planner(Arc::new(crate::geospatial::GeoTypePlanner))
             .with_relation_planners(vec![
                 Arc::new(crate::read_files::ReadFilesPlanner),
                 Arc::new(crate::lateral_views::ExplodeRelationPlanner),
@@ -1352,10 +1352,6 @@ impl SQLContext {
                         "CREATE TEMPORARY TABLE AS SELECT: declared {declared_col_count} column(s) \
                          but SELECT query returns only {select_col_count} column(s)"
                     )));
-                }
-                for (source, target) in schema.fields().iter().zip(target_fields) {
-                    paimon::arrow::validate_geoarrow_write(source, target)
-                        .map_err(to_datafusion_error)?;
                 }
                 Arc::new(Schema::new(
                     target_fields
@@ -3198,6 +3194,7 @@ fn parse_sql_statements(sql: &str) -> DFResult<(Vec<Statement>, bool)> {
     }
     let (mut statements, vector_changed) = crate::vector_type::parse_statements(tokens)
         .map_err(|error| DataFusionError::Plan(format!("SQL parse error: {error}")))?;
+    crate::geospatial::quote_cast_types(&mut statements);
     if create_function_if_not_exists {
         let Some(Statement::CreateFunction(create_function)) = statements.first_mut() else {
             return Err(DataFusionError::Plan(
@@ -4356,8 +4353,6 @@ fn append_partition_columns(
                 )));
             }
             let col = batch.column(source_col_idx).clone();
-            paimon::arrow::validate_geoarrow_write(batch.schema().field(source_col_idx), &target)
-                .map_err(to_datafusion_error)?;
             let target_type = target.data_type();
             let col = if col.data_type() != target_type {
                 cast(&col, target_type).map_err(|e| {

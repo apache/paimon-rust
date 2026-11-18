@@ -15,16 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Paimon's vector and geospatial SQL types.
+//! Paimon's VECTOR<element, length> SQL type.
 
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::FieldRef;
+use datafusion::arrow::datatypes::{Field, FieldRef};
 use datafusion::common::{plan_datafusion_err, Result};
 use datafusion::logical_expr::planner::TypePlanner;
-use datafusion::sql::sqlparser::ast::{
-    visit_expressions_mut, ArrayElemTypeDef, DataType, Expr, Statement,
-};
+use datafusion::sql::sqlparser::ast::{ArrayElemTypeDef, DataType, Expr, Statement};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::{Parser, ParserError};
@@ -40,9 +38,7 @@ impl TypePlanner for PaimonTypePlanner {
     fn plan_type_field(&self, sql_type: &DataType) -> Result<Option<FieldRef>> {
         let paimon_type = if let Some(vector) = sql_type_to_vector(sql_type, true)? {
             Some(PaimonDataType::Vector(vector))
-        } else if contains_sql_type(sql_type, is_geo_type)
-            || (matches!(sql_type, DataType::Map(_, _)) && contains_vector(sql_type))
-        {
+        } else if matches!(sql_type, DataType::Map(_, _)) && contains_vector(sql_type) {
             if contains_sql_type(sql_type, |ty| {
                 matches!(
                     ty,
@@ -50,7 +46,7 @@ impl TypePlanner for PaimonTypePlanner {
                 )
             }) {
                 return Err(datafusion::error::DataFusionError::NotImplemented(
-                    "Fixed-size SQL arrays inside vector MAP types or geospatial types are not supported; use ARRAY<T> for variable-length collections".to_string(),
+                    "Fixed-size SQL arrays inside vector MAP types are not supported; use ARRAY<T> for variable-length collections".to_string(),
                 ));
             }
             // DataFusion 55.2 cannot plan MAP itself, including a MAP reached
@@ -62,55 +58,15 @@ impl TypePlanner for PaimonTypePlanner {
             None
         };
         if let Some(paimon_type) = paimon_type {
-            let field = paimon::arrow::paimon_type_to_arrow_field("", &paimon_type)
-                .map_err(to_datafusion_error)?;
-            return Ok(Some(Arc::new(field)));
+            let arrow_type =
+                paimon::arrow::paimon_type_to_arrow(&paimon_type).map_err(to_datafusion_error)?;
+            return Ok(Some(Arc::new(Field::new(
+                "",
+                arrow_type,
+                paimon_type.is_nullable(),
+            ))));
         }
         crate::binary_cast::BinaryTypePlanner.plan_type_field(sql_type)
-    }
-}
-
-fn is_geo_type(ty: &DataType) -> bool {
-    let DataType::Custom(name, _) = ty else {
-        return false;
-    };
-    let [part] = name.0.as_slice() else {
-        return false;
-    };
-    part.as_ident().is_some_and(|ident| {
-        ident.quote_style.is_none()
-            && (ident.value.eq_ignore_ascii_case("GEOMETRY")
-                || ident.value.eq_ignore_ascii_case("GEOGRAPHY"))
-    })
-}
-
-// sqlparser represents custom type modifiers as bare strings and formats them
-// verbatim. Restore quoting in CASTs before storing or re-planning their SQL.
-fn quote_geo_cast_modifiers(ty: &mut DataType) {
-    if is_geo_type(ty) {
-        if let DataType::Custom(_, args) = ty {
-            for arg in args {
-                *arg = format!("'{}'", arg.replace('\'', "''"));
-            }
-        }
-        return;
-    }
-    match ty {
-        DataType::Array(
-            ArrayElemTypeDef::AngleBracket(t)
-            | ArrayElemTypeDef::Parenthesis(t)
-            | ArrayElemTypeDef::SquareBracket(t, _),
-        ) => quote_geo_cast_modifiers(t),
-        DataType::Map(k, v) => {
-            quote_geo_cast_modifiers(k);
-            quote_geo_cast_modifiers(v);
-        }
-        DataType::Struct(fields, _) => {
-            for f in fields {
-                quote_geo_cast_modifiers(&mut f.field_type);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -164,9 +120,7 @@ pub(crate) fn parse_expr(sql: &str) -> Result<Expr, ParserError> {
         .try_with_sql(sql)?
         .into_tokens();
     encode_explicit_types(&mut tokens);
-    let mut expr = parse_with_vectors(&mut tokens, |parser| parser.parse_expr(), true)?;
-    let _ = visit_expressions_mut(&mut expr, quote_geo_cast);
-    Ok(expr)
+    parse_with_vectors(&mut tokens, |parser| parser.parse_expr(), true)
 }
 
 pub(crate) fn parse_statements(
@@ -174,16 +128,8 @@ pub(crate) fn parse_statements(
 ) -> Result<(Vec<Statement>, bool), ParserError> {
     let original_len = tokens.len();
     encode_explicit_types(&mut tokens);
-    let mut statements = parse_with_vectors(&mut tokens, |parser| parser.parse_statements(), true)?;
-    let _ = visit_expressions_mut(&mut statements, quote_geo_cast);
+    let statements = parse_with_vectors(&mut tokens, |parser| parser.parse_statements(), true)?;
     Ok((statements, tokens.len() != original_len))
-}
-
-fn quote_geo_cast(expr: &mut Expr) -> std::ops::ControlFlow<()> {
-    if let Expr::Cast { data_type, .. } = expr {
-        quote_geo_cast_modifiers(data_type);
-    }
-    std::ops::ControlFlow::Continue(())
 }
 
 fn parse_with_vectors<T>(

@@ -26,7 +26,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, RecordBatch};
-use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::common::Column;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, ExprSchemable};
@@ -141,10 +141,7 @@ async fn execute_primary_key_update(
     let projection = target_schema
         .fields()
         .iter()
-        .enumerate()
-        .map(|(i, field)| {
-            paimon::arrow::validate_geoarrow_write(input.schema().field(i), field)
-                .map_err(to_datafusion_error)?;
+        .map(|field| {
             Expr::Column(Column::from_name(field.name()))
                 .cast_to(field.data_type(), input.schema())
                 .map(|expr| expr.alias(field.name()))
@@ -355,14 +352,11 @@ async fn execute_cow_update_inner(
             let idx = batch.schema().index_of(&prefixed).map_err(|e| {
                 DataFusionError::Internal(format!("Column {prefixed} not found: {e}"))
             })?;
-            upd_fields.push(
-                batch
-                    .schema()
-                    .field(idx)
-                    .clone()
-                    .with_name(col)
-                    .with_nullable(true),
-            );
+            upd_fields.push(Field::new(
+                col,
+                batch.schema().field(idx).data_type().clone(),
+                true,
+            ));
             upd_columns.push(batch.column(idx).clone());
         }
         let upd_schema = Arc::new(Schema::new(upd_fields));

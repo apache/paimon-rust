@@ -15,38 +15,118 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Preserve GeoArrow field metadata at DataFusion write boundaries.
+//! SQL type planning and GeoArrow metadata for Paimon geospatial fields.
 
 use crate::error::to_datafusion_error;
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{DataType as ArrowType, FieldRef};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::{DFSchema, Result};
 use datafusion::logical_expr::expr_rewriter::coerce_plan_expr_for_schema;
+use datafusion::logical_expr::planner::TypePlanner;
 use datafusion::logical_expr::{ExprSchemable, LogicalPlan, WriteOp};
 use datafusion::optimizer::analyzer::AnalyzerRule;
-use datafusion::physical_expr::{expressions::CastExpr, PhysicalExpr};
+use datafusion::sql::sqlparser::ast::{
+    visit_expressions_mut, ArrayElemTypeDef, DataType, Expr, VisitMut,
+};
 use std::sync::Arc;
 
-/// An implicit cast can change WKB offset widths or nested element fields.
-/// Check the input before that conversion strips its CRS.
-pub(crate) fn check_wkb_assignment(
-    expr: &Arc<dyn PhysicalExpr>,
-    schema: &Schema,
-    target: &Field,
-) -> Result<()> {
-    if !paimon::arrow::contains_geoarrow_wkb(target) {
-        return Ok(());
-    }
-    let field = match expr.downcast_ref::<CastExpr>() {
-        Some(cast)
-            if !cast.has_explicit_metadata()
-                && cast.expr().data_type(schema)? != *cast.cast_type() =>
-        {
-            cast.expr().return_field(schema)?
+#[derive(Debug)]
+pub(crate) struct GeoTypePlanner;
+
+impl TypePlanner for GeoTypePlanner {
+    fn plan_type_field(&self, sql_type: &DataType) -> Result<Option<FieldRef>> {
+        if !contains_sql_type(sql_type, is_geo_type) {
+            return crate::vector_type::PaimonTypePlanner.plan_type_field(sql_type);
         }
-        _ => expr.return_field(schema)?,
+        if contains_sql_type(sql_type, |ty| {
+            matches!(
+                ty,
+                DataType::Array(ArrayElemTypeDef::SquareBracket(_, Some(_)))
+            )
+        }) {
+            return Err(datafusion::error::DataFusionError::NotImplemented(
+                "Fixed-size SQL arrays in geospatial types are not supported; use ARRAY<T>".into(),
+            ));
+        }
+        let ty = crate::sql_context::sql_data_type_to_paimon_type(sql_type, true)?;
+        let field =
+            paimon::arrow::paimon_type_to_arrow_field("", &ty).map_err(to_datafusion_error)?;
+        Ok(Some(Arc::new(field)))
+    }
+}
+
+fn contains_sql_type(sql_type: &DataType, predicate: fn(&DataType) -> bool) -> bool {
+    if predicate(sql_type) {
+        return true;
+    }
+    match sql_type {
+        DataType::Array(
+            ArrayElemTypeDef::AngleBracket(element)
+            | ArrayElemTypeDef::SquareBracket(element, _)
+            | ArrayElemTypeDef::Parenthesis(element),
+        ) => contains_sql_type(element, predicate),
+        DataType::Map(key, value) => {
+            contains_sql_type(key, predicate) || contains_sql_type(value, predicate)
+        }
+        DataType::Struct(fields, _) => fields
+            .iter()
+            .any(|field| contains_sql_type(&field.field_type, predicate)),
+        _ => false,
+    }
+}
+
+fn is_geo_type(ty: &DataType) -> bool {
+    let DataType::Custom(name, _) = ty else {
+        return false;
     };
-    paimon::arrow::validate_geoarrow_write(&field, target).map_err(to_datafusion_error)
+    let [part] = name.0.as_slice() else {
+        return false;
+    };
+    part.as_ident().is_some_and(|ident| {
+        ident.quote_style.is_none()
+            && (ident.value.eq_ignore_ascii_case("GEOMETRY")
+                || ident.value.eq_ignore_ascii_case("GEOGRAPHY"))
+    })
+}
+
+// sqlparser represents custom type modifiers as bare strings and formats them
+// verbatim. Restore quoting in CASTs before storing or re-planning their SQL.
+fn quote_geo_cast_modifiers(ty: &mut DataType) {
+    if is_geo_type(ty) {
+        if let DataType::Custom(_, args) = ty {
+            for arg in args {
+                *arg = format!("'{}'", arg.replace('\'', "''"));
+            }
+        }
+        return;
+    }
+    match ty {
+        DataType::Array(
+            ArrayElemTypeDef::AngleBracket(t)
+            | ArrayElemTypeDef::Parenthesis(t)
+            | ArrayElemTypeDef::SquareBracket(t, _),
+        ) => quote_geo_cast_modifiers(t),
+        DataType::Map(k, v) => {
+            quote_geo_cast_modifiers(k);
+            quote_geo_cast_modifiers(v);
+        }
+        DataType::Struct(fields, _) => {
+            for f in fields {
+                quote_geo_cast_modifiers(&mut f.field_type);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Preserve CRS quoting when SQL ASTs are formatted for storage or reparsing.
+pub(crate) fn quote_cast_types(ast: &mut impl VisitMut) {
+    let _ = visit_expressions_mut(ast, |expr| {
+        if let Expr::Cast { data_type, .. } = expr {
+            quote_geo_cast_modifiers(data_type);
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
 }
 
 #[derive(Debug)]
@@ -79,7 +159,7 @@ impl AnalyzerRule for GeoListValues {
             .iter()
             .enumerate()
             .filter_map(|(i, field)| {
-                let DataType::List(child) = field.data_type() else {
+                let ArrowType::List(child) = field.data_type() else {
                     return None;
                 };
                 (child.extension_type_name() == Some("geoarrow.wkb")).then_some((i, child))
@@ -91,7 +171,7 @@ impl AnalyzerRule for GeoListValues {
         let mut values = values.clone();
         let mut fields = declared.fields().to_vec();
         for (i, child) in lists {
-            let storage = DataType::List(Arc::new(
+            let storage = ArrowType::List(Arc::new(
                 child.as_ref().clone().with_metadata(Default::default()),
             ));
             for row in &mut values.values {

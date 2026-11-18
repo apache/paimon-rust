@@ -35,7 +35,7 @@ use super::global_index_freshness::indexed_columns_unchanged;
 use super::key_normalization::canonical_partition_key;
 use super::update_input::unique_column_index;
 use super::upsert_key_matcher::UpsertKeyMatcher;
-use super::write_batch_normalize::{normalize_append_column, normalize_blob_update_field};
+use super::write_batch_normalize::{normalize_blob_write_field, normalize_write_field};
 use crate::spec::{
     batch_to_serialized_bytes, extract_datum_from_arrow, CoreOptions, Predicate, PredicateBuilder,
 };
@@ -214,33 +214,50 @@ impl TableUpsert {
             &self.update_columns,
         )?;
         let inline = CoreOptions::new(self.table.schema().options()).blob_inline_fields();
-        let input = batch.schema();
         let mut fields = Vec::new();
         let mut columns = Vec::new();
         for (index, field) in target.fields().iter().enumerate() {
-            let Ok(input_index) = input.index_of(field.name()) else {
+            let Some(column) = batch.column_by_name(field.name()) else {
                 // The row-ID updater diagnoses missing update columns. Absent
                 // append columns stay absent in the file's write_cols metadata.
                 continue;
             };
-            let column = batch.column(input_index);
-            let actual = input.field(input_index);
             let logical = &self.table.schema().fields()[index];
-            let dedicated_blob =
-                logical.data_type().is_blob_file_field() && !inline.contains(logical.name());
-            let normalized = if append {
-                normalize_append_column(&batch, input_index, field, dedicated_blob)
-            } else if dedicated_blob
-                && matches!(logical.data_type(), crate::spec::DataType::Map(_))
-                && update_fields
-                    .iter()
-                    .any(|updated| updated.name() == field.name())
+            let update_field = update_fields
+                .iter()
+                .find(|updated| updated.name() == field.name());
+            let normalized = if !append && update_field.is_none() {
+                Ok((
+                    batch
+                        .schema()
+                        .field_with_name(field.name())
+                        .unwrap()
+                        .clone(),
+                    column.clone(),
+                ))
+            } else if logical.data_type().is_blob_file_field()
+                && !inline.contains(logical.name())
+                && (append || matches!(logical.data_type(), crate::spec::DataType::Map(_)))
             {
                 // Named-row Blob maps carry nullable keys and decimal text in
                 // their dedicated physical layout. Keep that transport intact.
-                normalize_blob_update_field(column, field)
+                if append {
+                    normalize_blob_write_field(column, field)
+                } else {
+                    super::write_batch_normalize::normalize_blob_update_field(column, field)
+                }
+            } else if append {
+                normalize_write_field(column, field, None)
+                    .map(|column| (field.as_ref().clone(), column))
             } else {
-                Ok((actual.clone(), column.clone()))
+                Ok((
+                    batch
+                        .schema()
+                        .field_with_name(field.name())
+                        .unwrap()
+                        .clone(),
+                    column.clone(),
+                ))
             };
             let (field, column) = normalized.map_err(|error| {
                 invalid(format!("Invalid upsert column '{}': {error}", field.name()))
