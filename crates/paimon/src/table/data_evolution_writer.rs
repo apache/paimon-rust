@@ -918,21 +918,6 @@ fn matched_column(batch: &RecordBatch, col: &str) -> Result<ArrayRef> {
     Ok(batch.column(idx).clone())
 }
 
-/// Row-ID updates can use a different physical layout for historical files and Blob maps.
-fn cast_matched_column(
-    batch: &RecordBatch,
-    target: &arrow_schema::Field,
-    storage: &ArrowDataType,
-) -> Result<ArrayRef> {
-    let index = matched_column_index(batch, target.name())?;
-    crate::arrow::validate_geoarrow_write(batch.schema_ref().field(index), target)?;
-    super::update_input::cast_update_value(
-        batch.column(index),
-        storage,
-        super::update_input::CastMode::RowUpdate,
-    )
-}
-
 /// Apply matched values to one projected field. The projection may be a ROW
 /// containing only the leaves named in `update_columns`; its untouched sibling
 /// leaves remain available from the read batch but are absent from this file.
@@ -1023,8 +1008,14 @@ fn interleave_updated_leaf(
         let array_idx = if let Some(index) = batch_id_map.get(&batch_idx) {
             *index
         } else {
-            let value =
-                cast_matched_column(&matched_batches[batch_idx], target, original.data_type())?;
+            let batch = &matched_batches[batch_idx];
+            let index = matched_column_index(batch, path)?;
+            crate::arrow::validate_geoarrow_write(batch.schema_ref().field(index), target)?;
+            let value = super::update_input::cast_update_value(
+                batch.column(index),
+                original.data_type(),
+                super::update_input::CastMode::RowUpdate,
+            )?;
             let index = batch_arrays.len();
             batch_arrays.push(value);
             batch_id_map.insert(batch_idx, index);

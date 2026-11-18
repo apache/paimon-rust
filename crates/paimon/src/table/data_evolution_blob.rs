@@ -17,7 +17,7 @@
 
 //! Sparse Blob updates compatible with Java BlobFallbackRecordReader.
 
-use super::{cast_matched_column, matched_column, FileRowRange};
+use super::{matched_column, FileRowRange};
 use crate::spec::{CoreOptions, DataField, DataFileMeta};
 use crate::table::Table;
 use crate::Result;
@@ -146,11 +146,14 @@ pub(super) fn delta_batch(
     } else {
         row_count
     };
-    let schema = crate::arrow::build_target_arrow_schema(std::slice::from_ref(field))?;
-    let target = update_arrow_type(schema.field(0), batches)?;
+    let target = update_arrow_type(field, batches)?;
     let mut arrays = vec![arrow_array::new_null_array(&target, 1)];
     for batch in batches {
-        arrays.push(cast_matched_column(batch, schema.field(0), &target)?);
+        arrays.push(super::super::update_input::cast_update_value(
+            &matched_column(batch, field.name())?,
+            &target,
+            super::super::update_input::CastMode::RowUpdate,
+        )?);
     }
     let mut indices = vec![(0, 0); length];
     for &(offset, batch, row) in matches {
@@ -195,6 +198,7 @@ pub(super) fn delta_batch(
     })?;
     // Unchanged positions are NULL in Arrow and placeholders on disk, even
     // for a non-nullable logical Blob column.
+    let schema = crate::arrow::build_target_arrow_schema(std::slice::from_ref(field))?;
     let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
         vec![schema
             .field(0)
@@ -216,14 +220,11 @@ pub(super) fn delta_batch(
 
 /// Preserve Java's nullable map keys through a list of key/value structs.
 /// This representation is used only by the row-aware Blob update transport.
-fn update_arrow_type(
-    field: &arrow_schema::Field,
-    batches: &[RecordBatch],
-) -> Result<arrow_schema::DataType> {
+fn update_arrow_type(field: &DataField, batches: &[RecordBatch]) -> Result<arrow_schema::DataType> {
     use arrow_schema::DataType;
-    let target = field.data_type();
-    let DataType::Map(_, _) = target else {
-        return Ok(target.clone());
+    let target = crate::arrow::paimon_type_to_arrow(field.data_type())?;
+    let DataType::Map(_, _) = &target else {
+        return Ok(target);
     };
     let list_input = batches
         .iter()
@@ -235,10 +236,10 @@ fn update_arrow_type(
             if matches!(entry.data_type(), DataType::Struct(fields) if fields.len() == 2))
         });
     if !list_input {
-        return Ok(target.clone());
+        return Ok(target);
     }
     Ok(
-        super::super::write_batch_normalize::blob_map_row_type(target)
+        super::super::write_batch_normalize::blob_map_row_type(&target)
             .expect("logical Blob maps have key/value entries"),
     )
 }

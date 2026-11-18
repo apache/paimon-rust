@@ -515,25 +515,20 @@ pub fn contains_geoarrow_wkb(field: &ArrowField) -> bool {
                 .any(|child| child.extension_type_name() == Some(GEOARROW_WKB))
 }
 
-/// Validate GeoArrow annotations before assigning an input field to a declared field.
-/// Raw WKB and NULL can be assigned to a geospatial field. An annotated value
-/// must retain its logical type, coordinate reference system and edge algorithm.
-/// Physical layout and value nullability are validated by the caller.
+/// Comparing two typed WKB fields prevents relabeling bytes with another CRS.
+/// Unannotated input and physical layout conversions follow the usual Arrow write path.
 pub fn validate_geoarrow_write(actual: &ArrowField, expected: &ArrowField) -> crate::Result<()> {
     use ArrowDataType::*;
 
     if let Dictionary(_, values) = actual.data_type() {
-        let decoded = actual.clone().with_data_type(values.as_ref().clone());
-        return validate_geoarrow_write(&decoded, expected);
+        return validate_geoarrow_write(&actual.clone().with_data_type(*values.clone()), expected);
     }
-    let input_extension = actual.extension_type_name();
-    if input_extension == Some(GEOARROW_WKB) {
+    if actual.extension_type_name() == Some(GEOARROW_WKB)
+        && expected.extension_type_name() == Some(GEOARROW_WKB)
+    {
         let source = arrow_field_to_paimon_type(actual)?.copy_with_nullable(true)?;
-        if expected.extension_type_name() == Some(GEOARROW_WKB) {
-            let target = arrow_field_to_paimon_type(expected)?.copy_with_nullable(true)?;
-            if source == target {
-                return Ok(());
-            }
+        let target = arrow_field_to_paimon_type(expected)?.copy_with_nullable(true)?;
+        if source != target {
             return Err(crate::Error::DataTypeInvalid {
                 message: format!(
                     "Cannot write {source} to field '{}' of type {target}",
@@ -541,74 +536,36 @@ pub fn validate_geoarrow_write(actual: &ArrowField, expected: &ArrowField) -> cr
                 ),
             });
         }
-        return Err(crate::Error::DataTypeInvalid {
-            message: format!(
-                "Cannot write {source} to non-geospatial field '{}'",
-                expected.name()
-            ),
-        });
     }
-    if expected.extension_type_name() == Some(GEOARROW_WKB) {
-        if input_extension.is_none()
-            && (actual.data_type().is_binary() || actual.data_type() == &Null)
-        {
-            return Ok(());
-        }
-        return Err(crate::Error::DataTypeInvalid {
-            message: format!(
-                "Expected WKB for geospatial field '{}', got {actual}",
-                expected.name()
-            ),
-        });
-    }
-    if actual.data_type() == expected.data_type()
-        || actual.data_type() == &Null
-        || (!contains_geoarrow_wkb(actual) && !contains_geoarrow_wkb(expected))
-    {
+    if actual.data_type() == expected.data_type() {
         return Ok(());
     }
     match (actual.data_type(), expected.data_type()) {
         (Struct(source), Struct(target)) => {
-            // The native row updater selects named children. Arrow can also
-            // cast positionally when a target name is missing.
-            let named = target.iter().all(|f| source.find(f.name()).is_some());
-            for (index, to) in target.iter().enumerate() {
+            let by_name = target.iter().all(|f| source.find(f.name()).is_some());
+            for (i, to) in target.iter().enumerate() {
                 if let Some((_, from)) = source.find(to.name()) {
                     validate_geoarrow_write(from, to)?;
                 }
-                if !named {
-                    if let Some(from) = source.get(index) {
+                if !by_name {
+                    if let Some(from) = source.get(i) {
                         validate_geoarrow_write(from, to)?;
                     }
                 }
             }
         }
-        // Map key/value roles are positional, including the list of key/value
-        // structs used to transport a dedicated Blob map.
-        (Map(a, _) | List(a), Map(b, _)) | (Map(a, _), List(b)) => {
-            let (Struct(from), Struct(to)) = (a.data_type(), b.data_type()) else {
-                return Err(crate::Error::DataTypeInvalid {
-                    message: "Expected WKB map entries to contain key and value fields".into(),
-                });
-            };
-            for (from, to) in from.iter().zip(to) {
-                validate_geoarrow_write(from, to)?;
+        (Map(a, _), Map(b, _)) => {
+            if let (Struct(from), Struct(to)) = (a.data_type(), b.data_type()) {
+                for (from, to) in from.iter().zip(to) {
+                    validate_geoarrow_write(from, to)?;
+                }
             }
         }
         (
             List(a) | LargeList(a) | ListView(a) | LargeListView(a) | FixedSizeList(a, _),
             List(b) | LargeList(b) | ListView(b) | LargeListView(b) | FixedSizeList(b, _),
-        ) => {
-            validate_geoarrow_write(a, b)?;
-        }
-        _ => {
-            return Err(crate::Error::DataTypeInvalid {
-                message: format!(
-                    "Incompatible nested WKB layout for field '{}'",
-                    expected.name()
-                ),
-            });
-        }
+        ) => validate_geoarrow_write(a, b)?,
+        _ => {}
     }
     Ok(())
 }

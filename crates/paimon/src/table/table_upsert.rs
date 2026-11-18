@@ -238,7 +238,6 @@ impl TableUpsert {
             {
                 // Named-row Blob maps carry nullable keys and decimal text in
                 // their dedicated physical layout. Keep that transport intact.
-                crate::arrow::validate_geoarrow_write(actual, field)?;
                 normalize_blob_update_field(column, field)
             } else {
                 Ok((actual.clone(), column.clone()))

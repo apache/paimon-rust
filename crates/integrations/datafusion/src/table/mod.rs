@@ -570,24 +570,12 @@ impl TableProvider for PaimonTableProvider {
                 )));
             }
         };
-        // A plain SessionContext can register this provider without Paimon's
-        // SQL analyzer. Its implicit INSERT projection may already have cast
-        // a nested WKB field to the destination's CRS.
         if let Some(projection) =
             input.downcast_ref::<datafusion::physical_plan::projection::ProjectionExec>()
         {
-            let source_schema = projection.input().schema();
+            let schema = projection.input().schema();
             for (expr, target) in projection.expr().iter().zip(self.schema.fields()) {
-                if target.data_type().is_nested() && paimon::arrow::contains_geoarrow_wkb(target) {
-                    if let Some(cast) = expr
-                        .expr
-                        .downcast_ref::<datafusion::physical_expr::expressions::CastExpr>()
-                    {
-                        let actual = cast.expr().return_field(&source_schema)?;
-                        paimon::arrow::validate_geoarrow_write(&actual, target)
-                            .map_err(to_datafusion_error)?;
-                    }
-                }
+                crate::geospatial::check_wkb_assignment(&expr.expr, &schema, target)?;
             }
         }
         let sink = PaimonDataSink::new(self.table.clone(), self.schema.clone(), overwrite);

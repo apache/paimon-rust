@@ -63,7 +63,6 @@ use datafusion::execution::context::SQLOptions;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::session_state::SessionState;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::logical_expr::{ColumnarValue, Expr as LogicalExpr, LogicalPlan, Volatility};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::planner::{object_name_to_table_reference, IdentNormalizer};
@@ -165,7 +164,7 @@ impl SQLContextBuilder {
             .with_default_features()
             .with_spark_features()
             .with_analyzer_rule(Arc::new(crate::approx_percentile::ValidateParameters))
-            .with_analyzer_rule(Arc::new(crate::geospatial::GeoAssignments))
+            .with_analyzer_rule(Arc::new(crate::geospatial::GeoListValues))
             .with_type_planner(Arc::new(crate::vector_type::PaimonTypePlanner))
             .with_relation_planners(vec![
                 Arc::new(crate::read_files::ReadFilesPlanner),
@@ -184,10 +183,7 @@ impl SQLContextBuilder {
             .expr_planners()
             .get_or_insert_with(Vec::new)
             .insert(0, Arc::new(crate::spark_functions::FunctionPlanner));
-        let mut state = state_builder.build();
-        state
-            .register_function_rewrite(Arc::new(crate::geospatial::GeoAssignments))
-            .expect("SessionState supports expression rewrites");
+        let state = state_builder.build();
         let mut ctx = SessionContext::new_with_state(state);
         crate::spark_functions::apply_compatibility_fixes(&ctx);
         crate::compat_functions::register_compat_functions(&ctx);
@@ -1371,32 +1367,24 @@ impl SQLContext {
             } else {
                 schema
             };
-            let batches = df.collect().await?;
-            let batches = if declared_schema.is_some() {
-                batches
-                    .into_iter()
-                    .map(|batch| {
-                        let columns = batch
-                            .columns()
-                            .iter()
-                            .zip(output_schema.fields())
-                            .map(|(col, field)| {
-                                if col.data_type() != field.data_type() {
-                                    cast(col, field.data_type())
-                                        .map_err(|e| DataFusionError::External(e.into()))
-                                } else {
-                                    Ok(col.clone())
-                                }
-                            })
-                            .collect::<DFResult<Vec<_>>>()?;
-                        RecordBatch::try_new(output_schema.clone(), columns)
-                            .map_err(|e| DataFusionError::External(e.into()))
-                    })
-                    .collect::<DFResult<Vec<_>>>()?
-            } else {
-                batches
-            };
-
+            let mut batches = df.collect().await?;
+            if declared_schema.is_some() {
+                for batch in &mut batches {
+                    let columns = batch
+                        .columns()
+                        .iter()
+                        .zip(output_schema.fields())
+                        .map(|(col, field)| {
+                            if col.data_type() == field.data_type() {
+                                Ok(col.clone())
+                            } else {
+                                cast(col, field.data_type())
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    *batch = RecordBatch::try_new(output_schema.clone(), columns)?;
+                }
+            }
             let schema = batches
                 .first()
                 .map(|batch| batch.schema())

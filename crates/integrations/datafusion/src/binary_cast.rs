@@ -24,8 +24,8 @@ use datafusion::logical_expr::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{
-    visit_expressions_mut, BinaryLength, CastKind, DataType as SqlType, Expr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, SetExpr, Statement,
+    visit_expressions_mut, BinaryLength, DataType as SqlType, Expr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, Statement,
 };
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use std::ops::ControlFlow;
@@ -57,50 +57,21 @@ fn width(sql_type: &SqlType) -> Result<Option<(u64, bool)>> {
     Ok(value)
 }
 pub(crate) fn rewrite(statement: &mut Statement) -> Result<bool> {
-    // VALUES and MERGE put implicit storage casts directly on the
-    // supplied expression. Keep a user-requested binary conversion visible
-    // to the WKB assignment check until DataFusion simplifies arrow_cast.
-    let dml_values = matches!(statement, Statement::Merge(_))
-        || matches!(statement, Statement::Insert(i) if i.source.as_ref().is_some_and(|q| matches!(q.body.as_ref(), SetExpr::Values(_))));
     let mut changed = false;
     let flow = visit_expressions_mut(statement, |node| {
-        let Expr::Cast {
-            data_type,
-            expr,
-            kind,
-            format,
-            array,
-            ..
-        } = node
-        else {
+        let Expr::Cast { data_type, .. } = node else {
             return ControlFlow::Continue(());
         };
-        let (template, argument) = match width(data_type) {
-            Ok(Some((n, pad))) => {
-                let mut cast = node.clone();
-                if let Expr::Cast { data_type, .. } = &mut cast {
-                    *data_type = SqlType::Bytea;
-                }
-                (format!("__paimon_binary_width(NULL, {n}, {pad})"), cast)
-            }
-            Ok(None)
-                if dml_values
-                    && !*array
-                    && format.is_none()
-                    && matches!(kind, CastKind::Cast | CastKind::DoubleColon)
-                    && matches!(
-                        data_type,
-                        SqlType::Bytea | SqlType::Binary(_) | SqlType::Varbinary(_)
-                    ) =>
-            {
-                (
-                    "arrow_cast(NULL, 'Binary')".to_string(),
-                    expr.as_ref().clone(),
-                )
-            }
+        let (n, pad) = match width(data_type) {
+            Ok(Some(pair)) => pair,
             Ok(None) => return ControlFlow::Continue(()),
             Err(e) => return ControlFlow::Break(e),
         };
+        let mut cast = node.clone();
+        if let Expr::Cast { data_type, .. } = &mut cast {
+            *data_type = SqlType::Bytea;
+        }
+        let template = format!("__paimon_binary_width(NULL, {n}, {pad})");
         let call = Parser::new(&GenericDialect {})
             .try_with_sql(&template)
             .and_then(|mut p| p.parse_expr());
@@ -110,7 +81,7 @@ pub(crate) fn rewrite(statement: &mut Statement) -> Result<bool> {
         };
         if let Expr::Function(function) = &mut call {
             if let FunctionArguments::List(args) = &mut function.args {
-                args.args[0] = FunctionArg::Unnamed(FunctionArgExpr::Expr(argument));
+                args.args[0] = FunctionArg::Unnamed(FunctionArgExpr::Expr(cast));
             }
         }
         *node = call;

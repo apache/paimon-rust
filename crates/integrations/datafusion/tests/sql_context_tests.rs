@@ -388,11 +388,7 @@ async fn collect_string_column(sql_context: &SQLContext, sql: &str, column: &str
 
 async fn assert_sql_error_contains(sql_context: &SQLContext, sql: &str, expected: &str) {
     let err = match sql_context.sql(sql).await {
-        Ok(df) => df
-            .collect()
-            .await
-            .expect_err("SQL should fail but succeeded")
-            .to_string(),
+        Ok(df) => df.collect().await.expect_err(sql).to_string(),
         Err(err) => err.to_string(),
     };
     assert!(
@@ -3735,21 +3731,11 @@ async fn geospatial_assignments_preserve_source_crs_and_edges() {
     for sql in [
         "INSERT INTO dst (g) SELECT g FROM src",
         "INSERT INTO dst (a) SELECT a FROM src",
+        "MERGE INTO dst USING src ON false WHEN NOT MATCHED THEN INSERT (a) VALUES (src.a)",
         "INSERT OVERWRITE dst_partition PARTITION (p = 1) SELECT g FROM src",
-        "SELECT CAST(g AS GEOMETRY('EPSG:3857')) FROM src",
-        "SELECT CAST('POINT (1 2)' AS GEOMETRY)",
-        "INSERT INTO dst (g) SELECT 'POINT (1 2)'",
-        "INSERT INTO dst (g) VALUES ('POINT (1 2)')",
         "CREATE TEMPORARY TABLE swapped (g GEOMETRY('EPSG:3857')) AS SELECT g FROM src",
     ] {
-        let result = match ctx.sql(sql).await {
-            Ok(df) => df.collect().await.map(|_| ()),
-            Err(e) => Err(e),
-        };
-        assert!(
-            result.is_err(),
-            "incompatible geospatial assignment succeeded: {sql}"
-        );
+        assert_sql_error_contains(&ctx, sql, "Cannot write").await;
     }
     for sql in [
         "INSERT INTO dst (g) VALUES (CAST(CAST(NULL AS VARCHAR) AS BYTEA))",
@@ -3780,6 +3766,40 @@ async fn geospatial_assignments_preserve_source_crs_and_edges() {
         .await
         .expect_err("incompatible nested CRS in plain DataFusion session");
     assert!(error.to_string().contains("karney"), "{error}");
+
+    use datafusion::arrow::{
+        array::LargeBinaryArray, datatypes::DataType as ArrowType, record_batch::RecordBatch,
+    };
+    let source = plain.table("src").await.unwrap();
+    let field = source
+        .schema()
+        .field(0)
+        .as_ref()
+        .clone()
+        .with_data_type(ArrowType::LargeBinary);
+    let batch = RecordBatch::try_new(
+        Arc::new(datafusion::arrow::datatypes::Schema::new(vec![field])),
+        vec![Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>]))],
+    )
+    .unwrap();
+    plain.register_batch("wide", batch).unwrap();
+    let insert = plain
+        .sql("INSERT INTO dst (g) SELECT g FROM wide")
+        .await
+        .unwrap();
+    assert!(insert
+        .collect()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("EPSG:3857"));
+    plain
+        .sql("INSERT INTO src (g) SELECT g FROM wide")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -3840,15 +3860,7 @@ async fn geospatial_mutations_check_assignments_and_use_wkb_equality() {
             format!("MERGE INTO {name} t USING {name} s ON t.id=s.id WHEN MATCHED THEN UPDATE SET a=s.b"),
             format!("MERGE INTO {name} t USING {name} s ON t.id=s.id+1 WHEN NOT MATCHED THEN INSERT(id,a) VALUES(s.id+1,s.b)"),
         ] {
-            let result = match ctx.sql(&sql).await {
-                Ok(df) => df.collect().await.map(|_| ()),
-                Err(e) => Err(e),
-            };
-            let err = result.expect_err(&sql).to_string();
-            assert!(
-                err.contains("EPSG:4326") && err.contains("EPSG:3857"),
-                "{sql}: {err}"
-            );
+            assert_sql_error_contains(&ctx, &sql, "Cannot write GEOMETRY(EPSG:3857)").await;
         }
         let merge = format!(
             "MERGE INTO {name} t USING {name} s ON t.a=s.b WHEN MATCHED \

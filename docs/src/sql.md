@@ -448,12 +448,12 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `MAP(key, value)` | MapType | e.g. `MAP(STRING, INT)` |
 | `STRUCT<field TYPE, ...>` | RowType | e.g. `STRUCT<city STRING, zip INT>` |
 
-DataFusion accepts WKB bytes on insert and returns Arrow binary columns with
-the `geoarrow.wkb` extension on direct projection. The field metadata carries
-the CRS and, for geography, the edge algorithm. Assigning one geo column to
-another requires the same logical type, CRS, and edge algorithm. DataFusion
-compares WKB bytes for SQL equality, even across different CRSs. Spatial operations such as
-`ST_Intersects` require a separate spatial function provider.
+Supply WKB bytes in the column's declared CRS on insert. Direct projections
+return Arrow binary fields with the `geoarrow.wkb` extension, CRS, and geography
+edge algorithm. A direct assignment between geo columns requires matching types,
+CRSs, and edge algorithms. SQL casts follow DataFusion's binary conversions.
+Equality compares WKB bytes, even across different CRSs. Spatial functions
+such as `ST_Intersects` require a separate spatial function provider.
 Use Parquet when exchanging geospatial data with Java Paimon. The Rust Row
 format also accepts WKB, but the Java Row reader and writer do not handle these types.
 For an array of WKB literals, use `INSERT INTO shapes VALUES ([decode('0101000000000000000000F03F0000000000000040', 'hex')])`.

@@ -106,16 +106,20 @@ fn annotated_column(arrow: &FieldRef, physical: &DataField, logical: &DataField)
         }
         _ => return arrow.clone(),
     };
-    with_id(
-        &Arc::new(arrow.as_ref().clone().with_data_type(data_type)),
-        physical.id(),
-    )
+    with_id(arrow, data_type, physical.id())
 }
 
-fn with_id(field: &FieldRef, id: i32) -> FieldRef {
-    let mut metadata = field.metadata().clone();
-    metadata.insert(FIELD_ID_KEY.into(), id.to_string());
-    Arc::new(field.as_ref().clone().with_metadata(metadata))
+fn with_id(field: &FieldRef, data_type: ArrowDataType, id: i32) -> FieldRef {
+    let mut field = field.as_ref().clone().with_data_type(data_type);
+    field
+        .metadata_mut()
+        .insert(FIELD_ID_KEY.into(), id.to_string());
+    Arc::new(field)
+}
+
+fn annotated_field(arrow: &FieldRef, field: &DataField) -> FieldRef {
+    let ty = annotated_type(arrow.data_type(), field.data_type(), field.id(), 0);
+    with_id(arrow, ty, field.id())
 }
 
 /// Java's footer converter requires field IDs throughout a geospatial file.
@@ -131,11 +135,7 @@ pub(super) fn with_parquet_field_ids(schema: &Schema, fields: &[DataField]) -> S
             let Some(field) = by_name.get(arrow.name().as_str()) else {
                 return arrow.clone();
             };
-            let ty = annotated_type(arrow.data_type(), field.data_type(), field.id(), 0);
-            with_id(
-                &Arc::new(arrow.as_ref().clone().with_data_type(ty)),
-                field.id(),
-            )
+            annotated_field(arrow, field)
         })
         .collect::<Vec<_>>();
     Schema::new_with_metadata(arrow_fields, schema.metadata().clone())
@@ -154,7 +154,7 @@ fn annotated_type(
         let offset = field_id.wrapping_mul(1 << 10).wrapping_add(depth);
         let id = (i32::MAX / 4).wrapping_add(if key { offset.wrapping_neg() } else { offset });
         let ty = annotated_type(child.data_type(), ty, field_id, depth);
-        with_id(&Arc::new(child.as_ref().clone().with_data_type(ty)), id)
+        with_id(child, ty, id)
     };
     match (arrow, data_type) {
         (ArrowDataType::Struct(children), DataType::Row(row)) => ArrowDataType::Struct(
@@ -168,15 +168,7 @@ fn annotated_type(
                     else {
                         return child.clone();
                     };
-                    with_id(
-                        &Arc::new(child.as_ref().clone().with_data_type(annotated_type(
-                            child.data_type(),
-                            field.data_type(),
-                            field.id(),
-                            0,
-                        ))),
-                        field.id(),
-                    )
+                    annotated_field(child, field)
                 })
                 .collect::<Vec<_>>()
                 .into(),

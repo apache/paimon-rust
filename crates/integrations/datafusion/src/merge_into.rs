@@ -44,7 +44,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::dml::{MergeIntoAction, MergeIntoClause, MergeIntoClauseKind};
 use datafusion::logical_expr::execution_props::ExecutionProps;
-use datafusion::logical_expr::{col, expr::Case, lit, Expr, ExprSchemable, JoinType, Operator};
+use datafusion::logical_expr::{col, expr::Case, lit, Expr, JoinType, Operator};
 use datafusion::physical_expr::{expressions::Column as PhysicalColumn, PhysicalExpr};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan};
@@ -129,10 +129,6 @@ pub(crate) fn plan_merge(
         ));
     }
     let target_len = merge_schema.fields().len() - source.schema().fields().len();
-    let has_geo = merge_schema
-        .fields()
-        .iter()
-        .any(|f| paimon::arrow::contains_geoarrow_wkb(f));
     // DataFusion 55 retains every DML input field. Add a physical projection
     // before executing the source so scan pushdown can avoid unused payloads.
     let mut required = on.column_refs();
@@ -189,23 +185,6 @@ pub(crate) fn plan_merge(
     }
     let mut update_columns = Vec::new();
     let mut matched_count = 0;
-    let check_assignment = |name: &str, expr: &Expr| -> DFResult<()> {
-        if !has_geo {
-            return Ok(());
-        }
-        let (_, target) = merge_schema
-            .iter()
-            .take(target_len)
-            .find(|(_, f)| f.name() == name)
-            .ok_or_else(|| DataFusionError::Plan(format!("Unknown MERGE target column {name}")))?;
-        let source = if paimon::arrow::contains_geoarrow_wkb(target) {
-            crate::geospatial::before_coercion(expr)
-        } else {
-            expr
-        };
-        let (_, input) = source.to_field(&merge_schema)?;
-        paimon::arrow::validate_geoarrow_write(&input, target).map_err(to_datafusion_error)
-    };
     for clause in &mut clauses {
         match clause.kind {
             MergeIntoClauseKind::NotMatchedBySource => {
@@ -247,7 +226,6 @@ pub(crate) fn plan_merge(
                         .map_err(to_datafusion_error)?;
                 }
                 for (name, value) in assignments {
-                    check_assignment(name, value)?;
                     if !update_columns.contains(name) {
                         update_columns.push(name.clone());
                     }
@@ -264,8 +242,7 @@ pub(crate) fn plan_merge(
                         .collect();
                 }
                 validate_update_columns(columns, table.schema().fields())?;
-                for (name, value) in columns.iter().zip(values) {
-                    check_assignment(name, value)?;
+                for value in values {
                     *value = bind_expr(value.clone(), &merge_schema, target_len, true)?;
                 }
             }
@@ -554,7 +531,7 @@ impl PaimonMergeSink {
                                 &schema,
                                 &batch,
                                 value,
-                                table_schema.field(target_index).data_type(),
+                                table_schema.field(target_index),
                             )?);
                         }
                         updates.push((
@@ -571,13 +548,7 @@ impl PaimonMergeSink {
                                 .position(|c| c == field.name())
                                 .map(|i| values[i].clone())
                                 .unwrap_or_else(|| lit(datafusion::common::ScalarValue::Null));
-                            arrays.push(evaluate(
-                                &state,
-                                &schema,
-                                &batch,
-                                expr,
-                                field.data_type(),
-                            )?);
+                            arrays.push(evaluate(&state, &schema, &batch, expr, field)?);
                         }
                         inserts.push(RecordBatch::try_new(table_schema.clone(), arrays)?);
                     }
@@ -706,15 +677,11 @@ impl PaimonMergeSink {
             .map(|index| {
                 let field = self.merge_schema.field(index);
                 let column = Expr::Column(Column::new_unqualified(field.name()));
-                let expr = if field.extension_type_name() == Some("geoarrow.wkb") {
-                    Expr::Cast(datafusion::logical_expr::Cast::new_from_field(
-                        Box::new(column),
-                        field.clone(),
-                    ))
-                } else {
-                    datafusion::logical_expr::expr_fn::cast(column, field.data_type().clone())
-                };
-                expr.alias(column_name(index, self.target_len))
+                Expr::Cast(datafusion::logical_expr::Cast::new_from_field(
+                    Box::new(column),
+                    field.clone(),
+                ))
+                .alias(column_name(index, self.target_len))
             })
             .collect()
     }
@@ -784,13 +751,12 @@ fn evaluate(
     schema: &DFSchema,
     batch: &RecordBatch,
     expr: Expr,
-    target_type: &ArrowDataType,
+    target: &Field,
 ) -> DFResult<ArrayRef> {
-    let value = state
-        .create_physical_expr(expr, schema)?
-        .evaluate(batch)?
-        .into_array(batch.num_rows())?;
-    cast(value.as_ref(), target_type).map_err(Into::into)
+    let expr = state.create_physical_expr(expr, schema)?;
+    crate::geospatial::check_wkb_assignment(&expr, batch.schema_ref(), target)?;
+    let value = expr.evaluate(batch)?.into_array(batch.num_rows())?;
+    cast(value.as_ref(), target.data_type()).map_err(Into::into)
 }
 
 fn memory_relation(
