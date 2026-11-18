@@ -186,6 +186,9 @@ impl SQLContextBuilder {
         let state = state_builder.build();
         let mut ctx = SessionContext::new_with_state(state);
         crate::spark_functions::apply_compatibility_fixes(&ctx);
+        ctx.register_udf(datafusion::logical_expr::ScalarUDF::from(
+            crate::geospatial::BBoxIntersects::default(),
+        ));
         crate::compat_functions::register_compat_functions(&ctx);
         crate::binary_cast::register(&ctx);
         crate::lateral_views::register(&ctx);

@@ -143,6 +143,7 @@ mod postpone_fixed_bucket_write_builder;
 mod postpone_retract;
 mod prepared_files;
 mod query_auth;
+mod rtree_manifest;
 mod system_table;
 pub use system_table::SystemRead;
 

@@ -290,6 +290,7 @@ pub enum PredicateOperator {
     Like,
     Between,
     NotBetween,
+    BBoxIntersects,
 }
 
 impl PredicateOperator {
@@ -315,6 +316,7 @@ impl PredicateOperator {
             | Self::ArrayContains
             | Self::ArraysOverlap
             | Self::ArrayContainsAll
+            | Self::BBoxIntersects
             | Self::Like => return None,
         })
     }
@@ -351,6 +353,7 @@ impl fmt::Display for PredicateOperator {
             Self::ArrayContains => write!(f, "ARRAY_CONTAINS"),
             Self::ArraysOverlap => write!(f, "ARRAYS_OVERLAP"),
             Self::ArrayContainsAll => write!(f, "ARRAY_CONTAINS_ALL"),
+            Self::BBoxIntersects => write!(f, "BBOX_INTERSECTS"),
             Self::Like => write!(f, "LIKE"),
             Self::Between => write!(f, "BETWEEN"),
             Self::NotBetween => write!(f, "NOT BETWEEN"),
@@ -804,6 +807,7 @@ impl fmt::Display for Predicate {
                     PredicateOperator::In
                     | PredicateOperator::NotIn
                     | PredicateOperator::ArraysOverlap
+                    | PredicateOperator::BBoxIntersects
                     | PredicateOperator::ArrayContainsAll => {
                         write!(f, " (")?;
                         for (i, lit) in literals.iter().enumerate() {
@@ -973,6 +977,7 @@ fn rest_leaf_function(op: PredicateOperator) -> &'static str {
         PredicateOperator::Contains => "CONTAINS",
         PredicateOperator::ArrayContains => "ARRAY_CONTAINS",
         PredicateOperator::ArraysOverlap => "ARRAYS_OVERLAP",
+        PredicateOperator::BBoxIntersects => "BBOX_INTERSECTS",
         PredicateOperator::ArrayContainsAll => "ARRAY_CONTAINS_ALL",
         PredicateOperator::Like => "LIKE",
         PredicateOperator::Between => "BETWEEN",
@@ -1080,7 +1085,9 @@ fn parse_rest_leaf(
         .ok_or_else(|| rest_json_err(format!("unknown field `{field}`")))?;
 
     let function = str_prop(value, "function")?;
+    let double = DataType::Double(Default::default());
     let literal_data_type = match function {
+        "BBOX_INTERSECTS" => &double,
         "ARRAY_CONTAINS" | "ARRAYS_OVERLAP" | "ARRAY_CONTAINS_ALL" => match data_type {
             DataType::Array(array) => array.element_type(),
             other => {
@@ -1139,6 +1146,16 @@ fn parse_rest_leaf(
         "STARTS_WITH" => binary(one_literal()?, &|l| builder.starts_with(field, l)),
         "ENDS_WITH" => binary(one_literal()?, &|l| builder.ends_with(field, l)),
         "CONTAINS" => binary(one_literal()?, &|l| builder.contains(field, l)),
+        "BBOX_INTERSECTS" => {
+            let [Some(Datum::Double(a)), Some(Datum::Double(b)), Some(Datum::Double(c)), Some(Datum::Double(d))] =
+                literals.as_slice()
+            else {
+                return Err(rest_json_err(
+                    "BBOX_INTERSECTS expects four double coordinates",
+                ));
+            };
+            builder.bbox_intersects(field, *a, *b, *c, *d)
+        }
         "ARRAY_CONTAINS" => binary(one_literal()?, &|l| builder.array_contains(field, l)),
         "ARRAYS_OVERLAP" => {
             let datums = literals.iter().flatten().cloned().collect::<Vec<_>>();
@@ -1981,6 +1998,25 @@ impl PredicateBuilder {
         self.leaf(field, PredicateOperator::GtEq, vec![literal])
     }
 
+    /// Closed XY envelope intersection on a planar GEOMETRY field.
+    pub fn bbox_intersects<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+    ) -> Result<Predicate> {
+        self.leaf(
+            field,
+            PredicateOperator::BBoxIntersects,
+            [min_x, min_y, max_x, max_y]
+                .into_iter()
+                .map(Datum::Double)
+                .collect(),
+        )
+    }
+
     // -- null operators --
 
     pub fn is_null<'a>(&self, field: impl Into<PredicateField<'a>>) -> Result<Predicate> {
@@ -2240,6 +2276,19 @@ impl PredicateBuilder {
         literals: Vec<Datum>,
     ) -> Result<Predicate> {
         let data_type = field.data_type();
+        if op == PredicateOperator::BBoxIntersects {
+            if !matches!(data_type, DataType::Geometry(_)) {
+                return Err(Error::ConfigInvalid {
+                    message: format!("BBOX_INTERSECTS requires GEOMETRY, got {data_type:?}"),
+                });
+            }
+            crate::rtree::BoundingBox::from_literals(&literals).map_err(|e| {
+                Error::ConfigInvalid {
+                    message: e.to_string(),
+                }
+            })?;
+            return Ok(field.predicate(op, literals));
+        }
         let literal_type = if matches!(
             op,
             PredicateOperator::ArrayContains
@@ -2471,7 +2520,9 @@ pub(crate) fn extract_datum(
                 scale,
             }
         }
-        DataType::Binary(_) | DataType::VarBinary(_) => Datum::Bytes(row.get_binary(pos)?.to_vec()),
+        DataType::Binary(_) | DataType::VarBinary(_) | DataType::Geometry(_) => {
+            Datum::Bytes(row.get_binary(pos)?.to_vec())
+        }
         other => {
             return Err(Error::Unsupported {
                 message: format!("extract_datum: unsupported DataType {other:?}"),
@@ -2528,7 +2579,7 @@ pub(crate) fn eval_row(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
                 data_type = field.data_type();
             }
             let value = extract_datum(&current, position, data_type)?;
-            Ok(eval_leaf(*op, value.as_ref(), literals))
+            eval_row_leaf(*op, value.as_ref(), literals)
         }
         Predicate::AlwaysTrue => Ok(true),
         Predicate::AlwaysFalse => Ok(false),
@@ -2557,7 +2608,7 @@ pub(crate) fn eval_row(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
             ..
         } => {
             let datum = extract_datum(row, *index, data_type)?;
-            Ok(eval_leaf(*op, datum.as_ref(), literals))
+            eval_row_leaf(*op, datum.as_ref(), literals)
         }
     }
 }
@@ -2614,6 +2665,27 @@ pub(crate) fn java_cmp(lhs: &Datum, rhs: &Datum) -> Option<Ordering> {
 
 fn java_eq(lhs: &Datum, rhs: &Datum) -> bool {
     java_cmp(lhs, rhs) == Some(Ordering::Equal)
+}
+
+fn eval_row_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -> Result<bool> {
+    if op == PredicateOperator::BBoxIntersects {
+        let invalid = |error| Error::DataInvalid {
+            message: "Invalid bounding-box predicate or WKB geometry".into(),
+            source: Some(Box::new(error)),
+        };
+        let query = crate::rtree::BoundingBox::from_literals(literals).map_err(invalid)?;
+        return match datum {
+            None => Ok(false),
+            Some(Datum::Bytes(wkb)) => Ok(crate::rtree::BoundingBox::from_wkb(wkb)
+                .map_err(invalid)?
+                .intersects(&query)),
+            _ => Err(Error::DataInvalid {
+                message: "BBOX_INTERSECTS requires GEOMETRY".into(),
+                source: None,
+            }),
+        };
+    }
+    Ok(eval_leaf(op, datum, literals))
 }
 
 fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -> bool {
@@ -2677,6 +2749,7 @@ fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -
                         "LIKE must have Datum::String value and literal (validated by builder)"
                     ),
                 },
+                PredicateOperator::BBoxIntersects => unreachable!("evaluated on WKB in eval_row_leaf"),
                 PredicateOperator::Between => eval_between(val, literals),
                 PredicateOperator::NotBetween => !eval_between(val, literals),
                 PredicateOperator::ArrayContains
