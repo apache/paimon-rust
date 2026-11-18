@@ -215,6 +215,64 @@ async fn parquet_keeps_types_and_queries_as_a_relation() {
 }
 
 #[tokio::test]
+async fn parquet_infers_native_geography_without_arrow_metadata() {
+    use paimon::arrow::arrow_field_to_paimon_type;
+    use paimon::spec::{DataType as PaimonType, EdgeAlgorithm, GeographyType, GeometryType};
+
+    // Java Paimon wrote the native logical types and no ARROW:schema.
+    let native = include_bytes!("../testdata/native-geospatial.parquet");
+    let (ctx, store) = context(&[("geo/java.parquet", native)]).await;
+    let query = "SELECT g, geom, items FROM read_files('memory://files/geo/', format => 'parquet')";
+    let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
+    let batch = &batches[0];
+    let schema = batch.schema();
+    assert_eq!(
+        arrow_field_to_paimon_type(schema.field(0)).unwrap(),
+        PaimonType::Geography(GeographyType::new("EPSG:4326", EdgeAlgorithm::Karney).unwrap())
+    );
+    assert_eq!(
+        arrow_field_to_paimon_type(schema.field(1)).unwrap(),
+        PaimonType::Geometry(
+            GeometryType::new(r#" { "type": "GeographicCRS", "name": "WGS 84" } "#).unwrap()
+        )
+    );
+    let DataType::List(element) = schema.field(2).data_type() else {
+        panic!("expected a list")
+    };
+    assert_eq!(
+        arrow_field_to_paimon_type(element).unwrap(),
+        PaimonType::Geometry(GeometryType::new("123").unwrap())
+    );
+    let point = vec![
+        1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64,
+    ];
+    assert_eq!(
+        ScalarValue::try_from_array(batch.column(0), 0)
+            .unwrap()
+            .cast_to(&DataType::Binary)
+            .unwrap(),
+        ScalarValue::Binary(Some(point))
+    );
+
+    // An Arrow writer embeds its schema. Both files must infer the same geo fields.
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(Vec::new(), schema.clone(), None).unwrap();
+    writer.write(batch).unwrap();
+    store
+        .put(
+            &Path::from("geo/arrow.parquet"),
+            writer.into_inner().unwrap().into(),
+        )
+        .await
+        .unwrap();
+    let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    for batch in batches {
+        assert_eq!(batch.schema(), schema);
+    }
+}
+
+#[tokio::test]
 async fn json_lines_extensions_and_multiline_documents() {
     let (ctx, _) = context(&[
         ("allowed/events.ndjson", b"{\"id\":1}\n{\"id\":2}\n"),

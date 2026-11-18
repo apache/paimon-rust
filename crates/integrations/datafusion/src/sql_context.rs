@@ -164,7 +164,8 @@ impl SQLContextBuilder {
             .with_default_features()
             .with_spark_features()
             .with_analyzer_rule(Arc::new(crate::approx_percentile::ValidateParameters))
-            .with_type_planner(Arc::new(crate::vector_type::PaimonTypePlanner))
+            .with_analyzer_rule(Arc::new(crate::geospatial::GeoListValues))
+            .with_type_planner(Arc::new(crate::geospatial::GeoTypePlanner))
             .with_relation_planners(vec![
                 Arc::new(crate::read_files::ReadFilesPlanner),
                 Arc::new(crate::lateral_views::ExplodeRelationPlanner),
@@ -1326,13 +1327,8 @@ impl SQLContext {
                 .map(|col| {
                     let paimon_type =
                         sql_data_type_to_paimon_type(&col.data_type, column_def_nullable(col))?;
-                    let arrow_type = paimon::arrow::paimon_type_to_arrow(&paimon_type)
-                        .map_err(to_datafusion_error)?;
-                    Ok(Field::new(
-                        &col.name.value,
-                        arrow_type,
-                        column_def_nullable(col),
-                    ))
+                    paimon::arrow::paimon_type_to_arrow_field(&col.name.value, &paimon_type)
+                        .map_err(to_datafusion_error)
                 })
                 .collect::<DFResult<Vec<_>>>()?;
             Some(Arc::new(Schema::new(fields)))
@@ -1345,24 +1341,10 @@ impl SQLContext {
             let query_sql = query.to_string();
             let df = crate::read_files::sql(&self.ctx, &query_sql, sql_options).await?;
             let schema = df.schema().inner().clone();
-            let batches = df.collect().await?;
-
-            // If column types are specified, cast each column to the declared type
-            let batches = if ct.columns.is_empty() {
-                batches
-            } else {
-                let target_fields: Vec<(String, ArrowDataType)> = ct
-                    .columns
-                    .iter()
-                    .map(|col| {
-                        let paimon_type =
-                            sql_data_type_to_paimon_type(&col.data_type, column_def_nullable(col))?;
-                        let arrow_type = paimon::arrow::paimon_type_to_arrow(&paimon_type)
-                            .map_err(to_datafusion_error)?;
-                        Ok((col.name.value.clone(), arrow_type))
-                    })
-                    .collect::<DFResult<Vec<_>>>()?;
-
+            // Derive the result schema before execution so a query that returns
+            // no batches still exposes its declared names and logical types.
+            let output_schema = if let Some(declared) = &declared_schema {
+                let target_fields = declared.fields();
                 let select_col_count = schema.fields().len();
                 let declared_col_count = target_fields.len();
                 if select_col_count < declared_col_count {
@@ -1371,48 +1353,38 @@ impl SQLContext {
                          but SELECT query returns only {select_col_count} column(s)"
                     )));
                 }
-
-                batches
-                    .into_iter()
-                    .map(|batch| {
-                        let columns = batch
-                            .columns()
-                            .iter()
-                            .enumerate()
-                            .map(|(i, col)| {
-                                if i < target_fields.len() {
-                                    let target_dt = &target_fields[i].1;
-                                    if *col.data_type() != *target_dt {
-                                        cast(col, target_dt)
-                                            .map_err(|e| DataFusionError::External(e.into()))
-                                    } else {
-                                        Ok(col.clone())
-                                    }
-                                } else {
-                                    Ok(col.clone())
-                                }
-                            })
-                            .collect::<DFResult<Vec<_>>>()?;
-                        let new_fields = target_fields
-                            .iter()
-                            .zip(schema.fields().iter())
-                            .map(|((name, dt), _)| Field::new(name, dt.clone(), true))
-                            .chain(
-                                schema
-                                    .fields()
-                                    .iter()
-                                    .skip(target_fields.len())
-                                    .map(|f| f.as_ref().clone()),
-                            )
-                            .collect::<Vec<_>>();
-                        let new_schema = Schema::new(new_fields);
-                        RecordBatch::try_new(Arc::new(new_schema), columns)
-                            .map_err(|e| DataFusionError::External(e.into()))
-                    })
-                    .collect::<DFResult<Vec<_>>>()?
+                Arc::new(Schema::new(
+                    target_fields
+                        .iter()
+                        .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+                        .chain(schema.fields().iter().skip(declared_col_count).cloned())
+                        .collect::<Vec<_>>(),
+                ))
+            } else {
+                schema
             };
-
-            let schema = batches.first().map(|b| b.schema()).unwrap_or(schema);
+            let mut batches = df.collect().await?;
+            if declared_schema.is_some() {
+                for batch in &mut batches {
+                    let columns = batch
+                        .columns()
+                        .iter()
+                        .zip(output_schema.fields())
+                        .map(|(col, field)| {
+                            if col.data_type() == field.data_type() {
+                                Ok(col.clone())
+                            } else {
+                                cast(col, field.data_type())
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    *batch = RecordBatch::try_new(output_schema.clone(), columns)?;
+                }
+            }
+            let schema = batches
+                .first()
+                .map(|batch| batch.schema())
+                .unwrap_or(output_schema);
             let mem_table = MemTable::try_new(schema, vec![batches])?;
             self.register_temp_table(table_ref, Arc::new(mem_table))?;
         } else if let Some(schema) = declared_schema {
@@ -2948,9 +2920,14 @@ fn typed_view_query(view: &paimon::catalog::View) -> DFResult<String> {
         .iter()
         .zip(&columns)
         .map(|(field, column)| {
+            if field.data_type().contains_geospatial() {
+                let sql_type = crate::table::data_type_to_sql(field.data_type())?;
+                return Ok(format!("CAST({source}.{column} AS {sql_type}) AS {column}"));
+            }
             let arrow_type = paimon::arrow::paimon_type_to_arrow(field.data_type())
-                .map_err(to_datafusion_error)?;
-            let arrow_type = arrow_type.to_string().replace('\'', "''");
+                .map_err(to_datafusion_error)?
+                .to_string()
+                .replace('\'', "''");
             Ok(format!(
                 "arrow_cast({source}.{column}, '{arrow_type}') AS {column}"
             ))
@@ -3217,6 +3194,7 @@ fn parse_sql_statements(sql: &str) -> DFResult<(Vec<Statement>, bool)> {
     }
     let (mut statements, vector_changed) = crate::vector_type::parse_statements(tokens)
         .map_err(|error| DataFusionError::Plan(format!("SQL parse error: {error}")))?;
+    crate::geospatial::quote_cast_types(&mut statements);
     if create_function_if_not_exists {
         let Some(Statement::CreateFunction(create_function)) = statements.first_mut() else {
             return Err(DataFusionError::Plan(
@@ -3855,6 +3833,41 @@ pub(crate) fn sql_data_type_to_paimon_type(
                 .map_err(to_datafusion_error)?,
         )),
         SqlType::Blob(_) => Ok(PaimonDataType::Blob(BlobType::with_nullable(nullable))),
+        SqlType::Custom(name, args) if name.to_string().eq_ignore_ascii_case("GEOMETRY") => {
+            use paimon::spec::GeometryType;
+            let crs = match args.as_slice() {
+                [] => GeometryType::DEFAULT_CRS,
+                [crs] => crs,
+                _ => {
+                    return Err(DataFusionError::Plan(
+                        "GEOMETRY accepts one optional CRS".into(),
+                    ))
+                }
+            };
+            Ok(PaimonDataType::Geometry(
+                GeometryType::with_nullable(nullable, crs).map_err(to_datafusion_error)?,
+            ))
+        }
+        SqlType::Custom(name, args) if name.to_string().eq_ignore_ascii_case("GEOGRAPHY") => {
+            use paimon::spec::GeographyType;
+            let (crs, algorithm) = match args.as_slice() {
+                [] => (GeographyType::DEFAULT_CRS, GeographyType::DEFAULT_ALGORITHM),
+                [crs] => (crs.as_str(), GeographyType::DEFAULT_ALGORITHM),
+                [crs, algorithm] => (
+                    crs.as_str(),
+                    algorithm.parse().map_err(to_datafusion_error)?,
+                ),
+                _ => {
+                    return Err(DataFusionError::Plan(
+                        "GEOGRAPHY accepts a CRS and an optional edge algorithm".into(),
+                    ))
+                }
+            };
+            Ok(PaimonDataType::Geography(
+                GeographyType::with_nullable(nullable, crs, algorithm)
+                    .map_err(to_datafusion_error)?,
+            ))
+        }
         SqlType::Custom(name, modifiers)
             if name.to_string().eq_ignore_ascii_case("VARIANT") && modifiers.is_empty() =>
         {
@@ -4320,14 +4333,18 @@ fn append_partition_columns(
 ) -> DFResult<RecordBatch> {
     let num_rows = batch.num_rows();
 
-    let mut columns: Vec<(String, ArrayRef)> = Vec::with_capacity(all_fields.len());
+    let mut fields = Vec::with_capacity(all_fields.len());
+    let mut columns = Vec::with_capacity(all_fields.len());
 
     let mut source_col_idx = 0;
     for field in all_fields {
         let name = field.name().to_string();
+        let target = paimon::arrow::paimon_type_to_arrow_field(&name, field.data_type())
+            .map_err(to_datafusion_error)?
+            .with_nullable(true);
         if let Some(datum_opt) = partitions.get(&name) {
             let array = datum_to_constant_array(datum_opt, field.data_type(), num_rows)?;
-            columns.push((name, array));
+            columns.push(array);
         } else {
             if source_col_idx >= batch.num_columns() {
                 return Err(DataFusionError::Plan(format!(
@@ -4336,10 +4353,9 @@ fn append_partition_columns(
                 )));
             }
             let col = batch.column(source_col_idx).clone();
-            let target_type = paimon::arrow::paimon_type_to_arrow(field.data_type())
-                .map_err(to_datafusion_error)?;
-            let col = if col.data_type() != &target_type {
-                cast(&col, &target_type).map_err(|e| {
+            let target_type = target.data_type();
+            let col = if col.data_type() != target_type {
+                cast(&col, target_type).map_err(|e| {
                     DataFusionError::Plan(format!(
                         "Cannot cast column '{name}' from {:?} to {:?}: {e}",
                         col.data_type(),
@@ -4349,9 +4365,10 @@ fn append_partition_columns(
             } else {
                 col
             };
-            columns.push((name, col));
+            columns.push(col);
             source_col_idx += 1;
         }
+        fields.push(target);
     }
 
     if source_col_idx != batch.num_columns() || source_col_idx != expected_source_cols {
@@ -4362,13 +4379,9 @@ fn append_partition_columns(
         )));
     }
 
-    let fields: Vec<Field> = columns
-        .iter()
-        .map(|(name, arr)| Field::new(name, arr.data_type().clone(), true))
-        .collect();
     let schema = Arc::new(Schema::new(fields));
-    let arrays: Vec<ArrayRef> = columns.into_iter().map(|(_, arr)| arr).collect();
-    RecordBatch::try_new(schema, arrays).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 /// Create a constant Arrow array from a Datum value.
@@ -5388,6 +5401,33 @@ mod tests {
             .unwrap()
             .value(0)
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn geospatial_view_and_export_preserve_declared_type() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(catalog).await;
+        ctx.sql(r#"CREATE VIEW geo_v AS SELECT with_metadata(decode('0101000000000000000000F03F0000000000000040', 'hex'), 'ARROW:extension:name', 'geoarrow.wkb', 'ARROW:extension:metadata', '{"crs":"EPSG:3857","edges":"karney"}') AS g, CAST(NULL AS ARRAY<GEOMETRY('map''s CRS, v2')>) AS gs"#)
+            .await.unwrap();
+        for _ in 0..2 {
+            let df = ctx.sql("SELECT g, gs FROM geo_v").await.unwrap();
+            assert_eq!(
+                paimon::arrow::arrow_field_to_paimon_type(df.schema().field(0))
+                    .unwrap()
+                    .to_string(),
+                "GEOGRAPHY(EPSG:3857, karney)"
+            );
+            assert_eq!(
+                paimon::arrow::arrow_field_to_paimon_type(df.schema().field(1))
+                    .unwrap()
+                    .to_string(),
+                "ARRAY<GEOMETRY('map''s CRS, v2')>"
+            );
+            assert_eq!(df.collect().await.unwrap()[0].num_rows(), 1);
+            let ddl = shown_view_definition(&ctx, "geo_v").await;
+            ctx.sql("DROP VIEW geo_v").await.unwrap();
+            ctx.sql(&ddl).await.unwrap();
+        }
     }
 
     #[tokio::test]

@@ -1388,6 +1388,8 @@ pub(crate) fn literal_scalar_for_arrow_filter(
         | DataType::Multiset(_)
         | DataType::Row(_)
         | DataType::Variant(_)
+        | DataType::Geometry(_)
+        | DataType::Geography(_)
         | DataType::Vector(_) => {
             return Ok(None);
         }

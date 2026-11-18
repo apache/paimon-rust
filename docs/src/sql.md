@@ -437,6 +437,8 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `BINARY(n)` | BinaryType | Fixed-length; defaults to `BINARY(1)` when `n` is omitted |
 | `VARIANT` | VariantType | Semi-structured value encoded as value + metadata binary buffers |
 | `BLOB` | BlobType | Binary large object |
+| `GEOMETRY`, `GEOMETRY('crs')` | GeometryType | Planar WKB with a default CRS of `OGC:CRS84` |
+| `GEOGRAPHY`, `GEOGRAPHY('crs'[, algorithm])` | GeographyType | WKB with a default CRS of `OGC:CRS84`. Edge algorithms are `spherical` (default), `vincenty`, `thomas`, `andoyer`, and `karney`. |
 | `DATE` | DateType | |
 | `TIMESTAMP[(p)]` | TimestampType | Precision p: 0/3/6/9, default 3 |
 | `TIMESTAMP WITH TIME ZONE` | LocalZonedTimestampType | |
@@ -445,6 +447,16 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `VECTOR<element, n>` | VectorType | Fixed-size vector; `n` is between 1 and 2147483647 |
 | `MAP(key, value)` | MapType | e.g. `MAP(STRING, INT)` |
 | `STRUCT<field TYPE, ...>` | RowType | e.g. `STRUCT<city STRING, zip INT>` |
+
+Supply WKB bytes in the column's declared CRS on insert. Direct projections
+return Arrow binary fields with the `geoarrow.wkb` extension, CRS, and geography
+edge algorithm. Assignments copy the WKB bytes. The target column supplies the
+CRS and edge algorithm, so reproject the coordinates before inserting if needed.
+Equality compares WKB bytes, even across different CRSs. Spatial functions
+such as `ST_Intersects` require a separate spatial function provider.
+Use Parquet when exchanging geospatial data with Java Paimon. The Rust Row
+format also accepts WKB, but the Java Row reader and writer do not handle these types.
+For an array of WKB literals, use `INSERT INTO shapes VALUES ([decode('0101000000000000000000F03F0000000000000040', 'hex')])`.
 
 `VECTOR<element, n>` follows Paimon's logical vector type. Elements must be
 `BOOLEAN`, `TINYINT`, `SMALLINT`, `INT` / `INTEGER`, `BIGINT`, `FLOAT` / `REAL`,
