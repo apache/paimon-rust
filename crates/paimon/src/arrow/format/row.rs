@@ -23,8 +23,8 @@
 use super::metadata_cache::FileMetadataCache;
 use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::{
-    arrow_field_to_paimon_type, build_target_arrow_schema, is_variant_arrow_fields,
-    paimon_type_to_arrow, paimon_type_to_arrow_field, variant_arrow_type,
+    build_target_arrow_schema, convert_arrow_fields, is_variant_arrow_fields, paimon_type_to_arrow,
+    paimon_type_to_arrow_field, variant_arrow_type,
 };
 use crate::io::{FileFormatMetadataCacheContext, FileRead, FileWrite, OutputFile};
 use crate::spec::{CoreOptions, DataField, DataType, IntType, VarBinaryType, VariantType};
@@ -288,15 +288,7 @@ impl FormatFileWriter for RowFormatWriter {
 }
 
 pub(super) fn row_type_from_arrow_schema(schema: &SchemaRef) -> crate::Result<Vec<DataField>> {
-    schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(idx, field)| {
-            let data_type = arrow_field_to_paimon_type(field)?;
-            Ok(DataField::new(idx as i32, field.name().clone(), data_type))
-        })
-        .collect()
+    convert_arrow_fields(schema.fields())
 }
 
 #[async_trait]
@@ -2777,10 +2769,11 @@ mod tests {
         let fields = vec![
             DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
             DataField::new(
-                1,
+                7,
                 "name".to_string(),
                 DataType::VarChar(VarCharType::string_type()),
-            ),
+            )
+            .with_generation_expression(Some("CAST(id AS STRING)".into())),
             DataField::new(2, "flag".to_string(), DataType::Boolean(BooleanType::new())),
             DataField::new(
                 3,
@@ -2801,7 +2794,9 @@ mod tests {
             ),
         ];
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let mut writer = RowFormatWriter::new(&output, schema.clone(), fields.clone(), 1)
+        let inferred = row_type_from_arrow_schema(&schema).unwrap();
+        assert_eq!(inferred, fields);
+        let mut writer = RowFormatWriter::new(&output, schema.clone(), inferred, 1)
             .await
             .unwrap();
         let decimal = Decimal128Array::from(vec![Some(12345_i128), None, Some(-42_i128)])

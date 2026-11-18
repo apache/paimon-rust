@@ -840,19 +840,22 @@ async fn test_catalog_list_tables_empty() {
 #[tokio::test]
 async fn test_catalog_get_table() {
     let ctx = setup_catalog(vec!["default"]).await;
-
-    // Add a table with schema and path so get_table can build a Table object
-    let schema = test_schema();
+    let schema: Schema =
+        serde_json::from_str(include_str!("fixtures/generated_column_schema.json")).unwrap();
     ctx.server.add_table_with_schema(
         "default",
         "my_table",
-        schema,
+        schema.clone(),
         "file:///tmp/test_warehouse/default.db/my_table",
     );
 
     let identifier = Identifier::new("default", "my_table");
-    let table = ctx.catalog.get_table(&identifier).await;
-    assert!(table.is_ok(), "failed to get table: {table:?}");
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+    assert_eq!(table.schema().fields(), schema.fields());
+    assert_eq!(
+        table.schema().fields()[1].generation_expression(),
+        Some("YEAR(event_time)")
+    );
 }
 
 #[tokio::test]
@@ -1956,19 +1959,28 @@ async fn test_catalog_create_table_already_exists() {
 #[tokio::test]
 async fn test_catalog_create_table_ignore_if_exists() {
     let ctx = setup_catalog(vec!["default"]).await;
-
-    // Add a table first
+    let generated: Schema =
+        serde_json::from_str(include_str!("fixtures/generated_column_schema.json")).unwrap();
+    let id = Identifier::new("default", "existing_table");
+    for ignore_if_exists in [false, true] {
+        assert!(matches!(
+            ctx.catalog.create_table(&id, generated.clone(), ignore_if_exists).await,
+            Err(paimon::Error::Unsupported { message }) if message.contains("event_year")
+        ));
+    }
+    assert!(ctx.catalog.list_tables("default").await.unwrap().is_empty());
     ctx.server.add_table("default", "existing_table");
-
-    let schema = test_schema();
-    let identifier = Identifier::new("default", "existing_table");
-
-    // Create with ignore_if_exists=true should succeed
-    let result = ctx.catalog.create_table(&identifier, schema, true).await;
-    assert!(
-        result.is_ok(),
-        "creating duplicate table should succeed when ignore_if_exists=true"
-    );
+    for schema in [test_schema(), generated.clone()] {
+        ctx.catalog.create_table(&id, schema, true).await.unwrap();
+    }
+    ctx.server
+        .add_no_permission_table("default", "existing_table");
+    assert!(matches!(
+        ctx.catalog.create_table(&id, generated, true).await,
+        Err(paimon::Error::RestApi {
+            source: paimon::api::RestError::Forbidden { .. }
+        })
+    ));
 }
 
 #[tokio::test]

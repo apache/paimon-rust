@@ -374,12 +374,27 @@ impl RESTApi {
 
     /// Create a new table.
     pub async fn create_table(&self, identifier: &Identifier, schema: Schema) -> Result<()> {
-        let database = identifier.database();
-        let table = identifier.object();
-        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
-        let path = self.resource_paths.tables(Some(database));
-        let request = CreateTableRequest::new(identifier.clone(), schema);
-        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
+        let request = Self::prepare_create_table(identifier, schema)?;
+        self.send_create_table(&request).await
+    }
+
+    pub(crate) fn prepare_create_table(
+        identifier: &Identifier,
+        schema: Schema,
+    ) -> Result<CreateTableRequest> {
+        validate_non_empty_multi(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
+        ])?;
+        schema.validate_fields_for_create()?;
+        Ok(CreateTableRequest::new(identifier.clone(), schema))
+    }
+
+    pub(crate) async fn send_create_table(&self, request: &CreateTableRequest) -> Result<()> {
+        let path = self
+            .resource_paths
+            .tables(Some(request.identifier.database()));
+        let _resp: serde_json::Value = self.client.post(&path, request).await?;
         Ok(())
     }
 

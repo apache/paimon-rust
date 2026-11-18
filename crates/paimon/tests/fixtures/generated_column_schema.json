@@ -1,0 +1,15 @@
+{
+  "version": 3,
+  "id": 0,
+  "fields": [
+    {"id": 0, "name": "event_time", "type": "DATE"},
+    {"id": 3, "name": "event_year", "type": "INT", "generationExpression": "YEAR(event_time)"},
+    {"id": 4, "name": "note", "type": "INT", "generationExpression": null}
+  ],
+  "highestFieldId": 4,
+  "partitionKeys": [],
+  "primaryKeys": [],
+  "options": {"write-only": "true", "alter-column-null-to-not-null.disabled": "false"},
+  "comment": null,
+  "timeMillis": 1
+}

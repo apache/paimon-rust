@@ -198,9 +198,7 @@ fn ambiguous_nested_write_path(fields: &[DataField], path: &str) -> bool {
 }
 
 pub(super) fn field_with_type(field: &DataField, data_type: DataType) -> DataField {
-    DataField::new(field.id(), field.name().to_string(), data_type)
-        .with_description(field.description().map(str::to_string))
-        .with_default_value(field.default_value().map(str::to_string))
+    field.clone().with_data_type(data_type)
 }
 
 /// Field identities for row-id conflict detection. A whole ROW write covers
@@ -261,8 +259,13 @@ mod tests {
 
     #[test]
     fn projects_partial_row_in_path_order() {
+        let mut fields = fields();
+        fields[1] = fields[1]
+            .clone()
+            .with_description(Some("profile description".into()))
+            .with_generation_expression(Some("future_row(id)".into()));
         let projected = project_by_paths(
-            &fields(),
+            &fields,
             &["profile.age".into(), "id".into(), "profile.name".into()],
         )
         .unwrap();
@@ -270,6 +273,8 @@ mod tests {
             projected.iter().map(DataField::id).collect::<Vec<_>>(),
             vec![2, 1, 5]
         );
+        assert_eq!(projected[0].description(), Some("profile description"));
+        assert_eq!(projected[0].generation_expression(), Some("future_row(id)"));
         let DataType::Row(row) = projected[0].data_type() else {
             panic!("expected ROW")
         };

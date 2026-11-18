@@ -93,4 +93,36 @@ impl PyDataField {
     fn description(&self) -> Option<String> {
         self.inner.description().map(str::to_string)
     }
+
+    fn generation_expression(&self) -> Option<String> {
+        self.inner.generation_expression().map(str::to_string)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_column_metadata_is_exposed() -> PyResult<()> {
+        let schema = PyTableSchema::new(
+            serde_json::from_str(include_str!(
+                "../../../crates/paimon/tests/fixtures/generated_column_schema.json"
+            ))
+            .unwrap(),
+        );
+        Python::attach(|py| {
+            let fields = Bound::new(py, schema)?.call_method0("fields")?;
+            let expressions = fields
+                .try_iter()?
+                .map(|field| {
+                    field?
+                        .call_method0("generation_expression")?
+                        .extract::<Option<String>>()
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            assert_eq!(expressions, [None, Some("YEAR(event_time)".into()), None]);
+            Ok(())
+        })
+    }
 }

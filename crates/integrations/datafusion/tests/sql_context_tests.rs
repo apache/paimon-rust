@@ -17,10 +17,13 @@
 
 //! SQL context integration tests for paimon-datafusion.
 
+mod common;
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use common::{create_sql_context, create_test_env};
 use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::MemTable;
@@ -32,24 +35,9 @@ use paimon::spec::{
     VarCharType, VectorType,
 };
 use paimon::table::{BranchManager, SnapshotManager, TagManager};
-use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
+use paimon::{Catalog, FileSystemCatalog};
 use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
 use tempfile::TempDir;
-
-fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
-    let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let warehouse = format!("file://{}", temp_dir.path().display());
-    let mut options = Options::new();
-    options.set(CatalogOptions::WAREHOUSE, warehouse);
-    let catalog = FileSystemCatalog::new(options).expect("Failed to create catalog");
-    (temp_dir, Arc::new(catalog))
-}
-
-async fn create_sql_context(catalog: Arc<FileSystemCatalog>) -> SQLContext {
-    let mut ctx = SQLContext::new();
-    ctx.register_catalog("paimon", catalog).await.unwrap();
-    ctx
-}
 
 struct MetadataListingCatalog {
     get_table_calls: AtomicUsize,
@@ -3971,6 +3959,50 @@ async fn test_vector_sql_rejects_invalid_types() {
         assert!(err.to_string().contains(reason), "{sql}: {err}");
         assert!(catalog.list_tables("default").await.unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn generated_column_ddl_preserves_the_catalog_schema() {
+    let (tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog.clone()).await;
+    ctx.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
+    ctx.sql("CREATE TABLE test_db.events (event_time DATE, event_year INT)")
+        .await
+        .unwrap();
+    common::set_stored_generation_expression(
+        &tmp.path().join("test_db.db/events/schema/schema-0"),
+        "event_year",
+        "YEAR(event_time)",
+    );
+
+    for sql in [
+        "CREATE TABLE test_db.events_copy (source INT, label STRING GENERATED ALWAYS AS (source))",
+        "CREATE TEMPORARY TABLE temp_events (source INT, label STRING GENERATED ALWAYS AS (source))",
+        "ALTER TABLE test_db.events ADD COLUMN year2 INT GENERATED ALWAYS AS (YEAR(event_time))",
+        "SHOW CREATE TABLE test_db.events",
+    ] {
+        let error = ctx.sql(sql).await.unwrap_err();
+        assert!(
+            error.to_string().contains("generated column"),
+            "{sql}: {error}"
+        );
+    }
+    assert_eq!(catalog.list_tables("test_db").await.unwrap(), ["events"]);
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "events"))
+        .await
+        .unwrap();
+    assert_eq!(table.schema().id(), 0);
+    assert_eq!(
+        table.schema().fields()[1].generation_expression(),
+        Some("YEAR(event_time)")
+    );
+    ctx.sql("SELECT event_year FROM test_db.events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

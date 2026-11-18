@@ -540,6 +540,56 @@ let tables = catalog.list_tables("my_db").await?;
 let table = catalog.get_table(&identifier).await?;
 ```
 
+### Generated-column metadata
+
+A Java-created table stores each generated column's SQL expression in the
+optional `generationExpression` property of its schema JSON.
+
+```json
+{
+  "id": 3,
+  "name": "event_year",
+  "type": "INT",
+  "generationExpression": "YEAR(event_time)"
+}
+```
+
+Read the expression with `DataField::generation_expression()` in Rust or
+`field.generation_expression()` in Python. Field copies, schema builders and
+catalog round-trips preserve its text. Arrow fields use the metadata key
+`paimon:generationExpression`. An absent or null expression denotes an
+ordinary column and is omitted on serialization.
+
+Rust reads the physical values stored in the column. Writers must supply those
+values explicitly, including NULL where permitted. To define expressions or
+compute omitted values, use a generation-capable engine such as Spark with
+Paimon. Rust catalogs reject new generated definitions. DataFusion also rejects
+`GENERATED ALWAYS AS` in table DDL and `SHOW CREATE TABLE` for a table with
+generated columns. A persisted DataFusion view schema records projected
+generated values as ordinary view columns.
+
+When altering a table, Rust protects generated columns and their source columns
+by field ID. Their names and types (including nullability) and the generation
+expression must survive the change. If Rust cannot determine the dependencies,
+it rejects renames, drops and type changes to existing columns. You can still
+add ordinary columns, reorder columns and update comments or options that
+preserve the protected definitions. Generated columns must be top-level and
+cannot have a default value or serve as `rowkind.field`.
+
+### Column defaults
+
+The Rust filesystem catalog validates defaults with Java-compatible casts on
+`CREATE` and column value-type changes. The Rust REST client applies the same
+checks before submitting `CREATE`, and the catalog server handles `ALTER`
+validation. For example, changing `BIGINT DEFAULT 2147483648` to `INT` fails
+before a Rust catalog publishes a new schema. Java's collection literal syntax
+requires the contents inside the delimiters to fit on one line.
+
+For Format Tables, Rust also rejects defaults such as
+`TIME(3) DEFAULT '00:00:00.0005'` when Java and Rust writers interpret them
+differently. Rust Format Table writers preserve the original interpretation of
+persisted defaults, including timestamp literals with an explicit offset.
+
 ## Reading a Table
 
 Paimon Rust uses a scan-then-read pattern: first scan the table to produce splits, then read data from those splits as Arrow `RecordBatch` streams.

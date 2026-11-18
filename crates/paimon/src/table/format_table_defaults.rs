@@ -22,18 +22,44 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, Date32Array, Int16Array, Int32Array, Int64Array, Int8Array,
-    ListArray, MapArray, RecordBatch, StringArray, StructArray, Time32MillisecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
+    Array, ArrayRef, Int64Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
+    Time32MillisecondArray,
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{
     ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 
-use crate::spec::{DataField, DataType};
+use crate::arrow::CastExecutor;
+use crate::spec::{DataField, DataType, VarCharType};
 use crate::{Error, Result};
+
+#[derive(Clone, Copy)]
+enum DefaultParsing {
+    Stored,
+    NewDefinition,
+}
+
+impl DefaultParsing {
+    fn trim(self, text: &str) -> &str {
+        match self {
+            Self::Stored => text.trim(),
+            Self::NewDefinition => text.trim_matches(|ch| ch <= ' '),
+        }
+    }
+
+    fn is_token_whitespace(self, ch: char) -> bool {
+        match self {
+            Self::Stored => ch.is_whitespace(),
+            // Java TokenSplitter uses Character.isWhitespace, which preserves nonbreaking spaces.
+            Self::NewDefinition => {
+                matches!(ch, '\u{001c}'..='\u{001f}')
+                    || ch.is_whitespace()
+                        && !matches!(ch, '\u{0085}' | '\u{00a0}' | '\u{2007}' | '\u{202f}')
+            }
+        }
+    }
+}
 
 pub(super) struct FormatTableDefaults {
     values: Vec<Option<ArrayRef>>,
@@ -48,32 +74,7 @@ impl FormatTableDefaults {
                 field
                     .default_value()
                     .map(|text| {
-                        // Java DefaultValueUtils removes one pair of outer
-                        // single quotes before casting from VARCHAR.
-                        let text = text
-                            .strip_prefix('\'')
-                            .and_then(|text| text.strip_suffix('\''))
-                            .unwrap_or(text);
-                        let value = cast_default(field.data_type(), text, schema.field(index))
-                            .map_err(|source| Error::DataInvalid {
-                                message: format!(
-                                    "Unsupported default value '{}' for Format Table column '{}'",
-                                    field.default_value().unwrap_or_default(),
-                                    field.name()
-                                ),
-                                source: Some(Box::new(source)),
-                            })?;
-                        if value.is_null(0) {
-                            return Err(Error::DataInvalid {
-                                message: format!(
-                                    "Unsupported default value '{}' for Format Table column '{}'",
-                                    field.default_value().unwrap_or_default(),
-                                    field.name()
-                                ),
-                                source: None,
-                            });
-                        }
-                        Ok(value)
+                        parse_default(field, text, schema.field(index), DefaultParsing::Stored)
                     })
                     .transpose()
             })
@@ -128,179 +129,90 @@ impl FormatTableDefaults {
     }
 }
 
+pub(crate) fn validate_default_value(field: &DataField, is_format_table: bool) -> Result<()> {
+    let Some(text) = field.default_value() else {
+        return Ok(());
+    };
+    let arrow_field = crate::arrow::paimon_type_to_arrow_field(field.name(), field.data_type())?;
+    let java_value = parse_default(field, text, &arrow_field, DefaultParsing::NewDefinition)?;
+    if is_format_table {
+        let writer_value = parse_default(field, text, &arrow_field, DefaultParsing::Stored)?;
+        if java_value.to_data() != writer_value.to_data() {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Unsupported default value '{text}' for column '{}' of type {}: Java and Rust Format Table writers interpret it differently",
+                    field.name(),
+                    field.data_type()
+                ),
+                source: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn parse_default(
+    field: &DataField,
+    text: &str,
+    arrow_field: &ArrowField,
+    parsing: DefaultParsing,
+) -> Result<ArrayRef> {
+    let data_type = field.data_type();
+    let invalid = |source| Error::DataInvalid {
+        message: format!(
+            "Unsupported default value '{text}' for column '{}' of type {data_type}",
+            field.name()
+        ),
+        source,
+    };
+    if matches!(parsing, DefaultParsing::NewDefinition)
+        && (text == "'" || !supports_string_default(data_type))
+    {
+        return Err(invalid(None));
+    }
+    // Java's DefaultValueUtils strips one pair of outer single quotes before casting.
+    let text = text
+        .strip_prefix('\'')
+        .and_then(|text| text.strip_suffix('\''))
+        .unwrap_or(text);
+    let value = cast_default(data_type, text, arrow_field, parsing)
+        .map_err(|error| invalid(Some(Box::new(error))))?;
+    if value.is_null(0) {
+        return Err(invalid(None));
+    }
+    Ok(value)
+}
+
+fn supports_string_default(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Array(array) => supports_string_default(array.element_type()),
+        DataType::Map(map) => {
+            supports_string_default(map.key_type()) && supports_string_default(map.value_type())
+        }
+        DataType::Row(row) => row
+            .fields()
+            .iter()
+            .all(|field| supports_string_default(field.data_type())),
+        DataType::Time(_) => true,
+        _ => CastExecutor::supports(&DataType::VarChar(VarCharType::string_type()), data_type),
+    }
+}
+
 fn cast_default(
     data_type: &DataType,
     text: &str,
-    arrow_field: &arrow_schema::Field,
-) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
+    arrow_field: &ArrowField,
+    parsing: DefaultParsing,
+) -> std::result::Result<ArrayRef, ArrowError> {
     match data_type {
-        // Java's StringToStringCastRule counts characters, then pads CHAR with
-        // spaces or truncates VARCHAR to its declared length.
-        DataType::Char(typ) => {
-            let mut value = text.chars().take(typ.length()).collect::<String>();
-            value.extend(std::iter::repeat_n(
-                ' ',
-                typ.length().saturating_sub(value.chars().count()),
-            ));
-            Ok(Arc::new(StringArray::from(vec![value])))
-        }
-        DataType::VarChar(typ) => Ok(Arc::new(StringArray::from(vec![text
-            .chars()
-            .take(typ.length() as usize)
-            .collect::<String>()]))),
-        // Java's StringToBinaryCastRule uses UTF-8 bytes and pads only BINARY.
-        DataType::Binary(typ) => {
-            let mut value = text.as_bytes().to_vec();
-            value.resize(typ.length(), 0);
-            value.truncate(typ.length());
-            Ok(Arc::new(BinaryArray::from(vec![value.as_slice()])))
-        }
-        DataType::VarBinary(typ) => {
-            let bytes = text.as_bytes();
-            let bytes = &bytes[..bytes.len().min(typ.length() as usize)];
-            Ok(Arc::new(BinaryArray::from(vec![bytes])))
-        }
-        // Java BinaryStringUtils.toByte/toShort/toInt/toLong accept a decimal
-        // suffix, validate its digits and truncate it toward zero.
-        DataType::TinyInt(_) => Ok(Arc::new(Int8Array::from(vec![parse_java_integer(
-            text,
-            i64::from(i8::MIN),
-            i64::from(i8::MAX),
-        )? as i8]))),
-        DataType::SmallInt(_) => Ok(Arc::new(Int16Array::from(vec![parse_java_integer(
-            text,
-            i64::from(i16::MIN),
-            i64::from(i16::MAX),
-        )? as i16]))),
-        DataType::Int(_) => Ok(Arc::new(Int32Array::from(vec![parse_java_integer(
-            text,
-            i64::from(i32::MIN),
-            i64::from(i32::MAX),
-        )? as i32]))),
-        DataType::BigInt(_) => Ok(Arc::new(Int64Array::from(vec![parse_java_integer(
-            text,
-            i64::MIN,
-            i64::MAX,
-        )?]))),
-        // Java's BinaryStringUtils treats an all-digit DATE/TIME value as the
-        // internal day/millisecond count and a TIMESTAMP value as the count in
-        // the requested precision, rather than parsing it as a calendar string.
-        DataType::Date(_) if numeric_default(text) => Ok(Arc::new(Date32Array::from(vec![text
-            .parse::<i32>()
-            .map_err(|source| arrow_schema::ArrowError::CastError(source.to_string()))?]))),
-        DataType::Time(_) if numeric_default(text) => {
-            Ok(Arc::new(Time32MillisecondArray::from(vec![text
-                .parse::<i32>()
-                .map_err(|source| {
-                    arrow_schema::ArrowError::CastError(source.to_string())
-                })?])))
-        }
-        DataType::Timestamp(typ) if numeric_default(text) => {
-            let value = text
-                .parse::<i64>()
-                .map_err(|source| arrow_schema::ArrowError::CastError(source.to_string()))?;
-            match typ.precision() {
-                0 => Ok(Arc::new(TimestampSecondArray::from(vec![value]))),
-                3 => Ok(Arc::new(TimestampMillisecondArray::from(vec![value]))),
-                6 => Ok(Arc::new(TimestampMicrosecondArray::from(vec![value]))),
-                9 => Ok(Arc::new(TimestampNanosecondArray::from(vec![value]))),
-                precision => Err(arrow_schema::ArrowError::CastError(format!(
-                    "Java does not support a numeric TIMESTAMP default at precision {precision}"
-                ))),
-            }
-        }
-        DataType::Timestamp(typ) => {
-            // Arrow stores timestamps at 0, 3, 6 or 9 digits, while Java's
-            // DateTimeUtils.parseTimestampData truncates to the declared
-            // precision before creating the internal timestamp.
-            let value = arrow_cast::cast(&StringArray::from(vec![text]), arrow_field.data_type())?;
-            if value.is_null(0) {
-                return Ok(value);
-            }
-            let precision = typ.precision();
-            let stored_precision = match precision {
-                0 => 0,
-                1..=3 => 3,
-                4..=6 => 6,
-                7..=9 => 9,
-                _ => {
-                    return Err(arrow_schema::ArrowError::CastError(format!(
-                        "Unsupported timestamp precision {precision}"
-                    )))
-                }
-            };
-            let divisor = 10_i64.pow(stored_precision - precision);
-            if divisor == 1 {
-                return Ok(value);
-            }
-            let raw = match stored_precision {
-                3 => value
-                    .as_any()
-                    .downcast_ref::<TimestampMillisecondArray>()
-                    .unwrap()
-                    .value(0),
-                6 => value
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()
-                    .unwrap()
-                    .value(0),
-                9 => value
-                    .as_any()
-                    .downcast_ref::<TimestampNanosecondArray>()
-                    .unwrap()
-                    .value(0),
-                _ => unreachable!(),
-            };
-            let truncated = raw.div_euclid(divisor) * divisor;
-            match stored_precision {
-                3 => Ok(Arc::new(TimestampMillisecondArray::from(vec![truncated]))),
-                6 => Ok(Arc::new(TimestampMicrosecondArray::from(vec![truncated]))),
-                9 => Ok(Arc::new(TimestampNanosecondArray::from(vec![truncated]))),
-                _ => unreachable!(),
-            }
-        }
-        DataType::LocalZonedTimestamp(typ) => {
-            let datetime = arrow_cast::parse::string_to_datetime(&chrono::Local, text)?;
-            let precision = typ.precision();
-            let quantum = 10_u32.pow(9 - precision);
-            let nanos = datetime.timestamp_subsec_nanos() / quantum * quantum;
-            let (units_per_second, fraction) = match precision {
-                0 => (1_i128, 0_i128),
-                1..=3 => (1_000, i128::from(nanos / 1_000_000)),
-                4..=6 => (1_000_000, i128::from(nanos / 1_000)),
-                7..=9 => (1_000_000_000, i128::from(nanos)),
-                _ => {
-                    return Err(arrow_schema::ArrowError::CastError(format!(
-                        "Unsupported local timestamp precision {precision}"
-                    )))
-                }
-            };
-            let value =
-                i64::try_from(i128::from(datetime.timestamp()) * units_per_second + fraction)
-                    .map_err(|source| arrow_schema::ArrowError::CastError(source.to_string()))?;
-            match precision {
-                0 => Ok(Arc::new(
-                    TimestampSecondArray::from(vec![value]).with_timezone("UTC"),
-                )),
-                1..=3 => Ok(Arc::new(
-                    TimestampMillisecondArray::from(vec![value]).with_timezone("UTC"),
-                )),
-                4..=6 => Ok(Arc::new(
-                    TimestampMicrosecondArray::from(vec![value]).with_timezone("UTC"),
-                )),
-                _ => Ok(Arc::new(
-                    TimestampNanosecondArray::from(vec![value]).with_timezone("UTC"),
-                )),
-            }
-        }
         DataType::Array(typ) => {
             let ArrowDataType::List(element_field) = arrow_field.data_type() else {
                 return Err(cast_error("ARRAY default has a non-list Arrow field"));
             };
-            let content = literal_content(text, '[', ']', "ARRAY")?;
-            let elements = split_tokens(content)
+            let content = literal_content(text, '[', ']', "ARRAY", parsing)?;
+            let elements = split_tokens(content, parsing)
                 .iter()
-                .map(|token| cast_token(typ.element_type(), token, element_field))
+                .map(|token| cast_token(typ.element_type(), token, element_field, parsing))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             let values = concat_default_values(&elements, element_field.data_type())?;
             Ok(Arc::new(ListArray::try_new(
@@ -314,8 +226,8 @@ fn cast_default(
             let ArrowDataType::Struct(arrow_fields) = arrow_field.data_type() else {
                 return Err(cast_error("ROW default has a non-struct Arrow field"));
             };
-            let content = literal_content(text, '{', '}', "STRUCT")?;
-            let tokens = split_tokens(content);
+            let content = literal_content(text, '{', '}', "STRUCT", parsing)?;
+            let tokens = split_tokens(content, parsing);
             if !content.is_empty() && tokens.len() != typ.fields().len() {
                 return Err(cast_error(format!(
                     "ROW default has {} fields, expected {}",
@@ -328,7 +240,9 @@ fn cast_default(
                 .iter()
                 .enumerate()
                 .map(|(index, field)| match tokens.get(index) {
-                    Some(token) => cast_token(field.data_type(), token, &arrow_fields[index]),
+                    Some(token) => {
+                        cast_token(field.data_type(), token, &arrow_fields[index], parsing)
+                    }
                     None => Ok(arrow_array::new_null_array(
                         arrow_fields[index].data_type(),
                         1,
@@ -348,23 +262,24 @@ fn cast_default(
             let ArrowDataType::Struct(entry_fields) = entries_field.data_type() else {
                 return Err(cast_error("MAP default entries are not a struct"));
             };
-            let trimmed = text.trim();
-            let pairs: Vec<(DefaultToken, DefaultToken)> = if trimmed.starts_with('{') {
-                let content = literal_content(trimmed, '{', '}', "MAP")?;
-                split_raw(content, ",", 0)
+            let content = literal_content(text, '{', '}', "MAP", parsing)?;
+            let pairs: Vec<(DefaultToken, DefaultToken)> = if parsing.trim(text).starts_with('{') {
+                split_raw(content, ",", 0, parsing)
                     .into_iter()
                     .filter(|entry| !entry.is_empty())
                     .map(|entry| {
-                        let pair = split_raw(&entry, "->", 2);
+                        let pair = split_raw(&entry, "->", 2, parsing);
                         if pair.len() != 2 {
                             return Err(cast_error(format!("Invalid MAP entry: {entry}")));
                         }
-                        Ok((single_token(&pair[0])?, single_token(&pair[1])?))
+                        Ok((
+                            single_token(&pair[0], parsing)?,
+                            single_token(&pair[1], parsing)?,
+                        ))
                     })
                     .collect::<std::result::Result<Vec<_>, _>>()?
             } else {
-                let content = literal_content(trimmed, '{', '}', "MAP")?;
-                let tokens = split_tokens(content);
+                let tokens = split_tokens(content, parsing);
                 if !tokens.len().is_multiple_of(2) {
                     return Err(cast_error("MAP default has an odd number of tokens"));
                 }
@@ -378,8 +293,8 @@ fn cast_default(
             let mut keys: Vec<ArrayRef> = Vec::with_capacity(pairs.len());
             let mut values: Vec<ArrayRef> = Vec::with_capacity(pairs.len());
             for (key_token, value_token) in &pairs {
-                let key = cast_token(typ.key_type(), key_token, &entry_fields[0])?;
-                let value = cast_token(typ.value_type(), value_token, &entry_fields[1])?;
+                let key = cast_token(typ.key_type(), key_token, &entry_fields[0], parsing)?;
+                let value = cast_token(typ.value_type(), value_token, &entry_fields[1], parsing)?;
                 // Java builds a HashMap, so a later entry replaces an earlier
                 // value with the same cast key.
                 if let Some(index) = keys.iter().position(|old| old.to_data() == key.to_data()) {
@@ -406,29 +321,117 @@ fn cast_default(
                 *sorted,
             )?))
         }
-        DataType::Multiset(_) => Err(cast_error(
-            "Java does not support casting a string default to MULTISET",
-        )),
-        DataType::Vector(_) => Err(cast_error(
-            "Java does not support casting a string default to VECTOR",
-        )),
-        DataType::Variant(_) => Err(cast_error(
-            "Java does not support casting a string default to VARIANT",
-        )),
-        DataType::Blob(_) => Err(arrow_schema::ArrowError::CastError(
-            "Java does not support casting a string default to BLOB".into(),
-        )),
-        _ => arrow_cast::cast(&StringArray::from(vec![text]), arrow_field.data_type()),
+        _ => cast_scalar_default(data_type, text, arrow_field.data_type(), parsing),
     }
 }
 
-fn numeric_default(text: &str) -> bool {
+fn cast_scalar_default(
+    data_type: &DataType,
+    text: &str,
+    arrow_type: &ArrowDataType,
+    parsing: DefaultParsing,
+) -> std::result::Result<ArrayRef, ArrowError> {
+    if matches!(parsing, DefaultParsing::Stored) {
+        // Schema files carry no parser version. Preserve the original result
+        // when available and use the Java parser when legacy parsing fails.
+        let legacy = match data_type {
+            DataType::Timestamp(typ) => cast_legacy_timestamp(text, typ.precision(), arrow_type),
+            DataType::LocalZonedTimestamp(typ) => {
+                cast_legacy_local_zoned_timestamp(text, typ.precision(), arrow_type)
+            }
+            DataType::Date(_) | DataType::Time(_) if is_unsigned_integer(text) => {
+                return cast_java_scalar_default(data_type, text);
+            }
+            DataType::Boolean(_)
+            | DataType::Decimal(_)
+            | DataType::Float(_)
+            | DataType::Double(_)
+            | DataType::Date(_)
+            | DataType::Time(_)
+            | DataType::Geometry(_)
+            | DataType::Geography(_) => {
+                arrow_cast::cast(&StringArray::from(vec![text]), arrow_type)
+            }
+            _ => return cast_java_scalar_default(data_type, text),
+        };
+        if let Some(value) = legacy.ok().filter(|value| !value.is_null(0)) {
+            return Ok(value);
+        }
+    }
+    cast_java_scalar_default(data_type, text)
+}
+
+fn cast_legacy_timestamp(
+    text: &str,
+    precision: u32,
+    arrow_type: &ArrowDataType,
+) -> std::result::Result<ArrayRef, ArrowError> {
+    if is_unsigned_integer(text) {
+        if !precision.is_multiple_of(3) {
+            return Err(cast_error(format!(
+                "Invalid numeric TIMESTAMP({precision}) default"
+            )));
+        }
+        let ticks = text
+            .parse::<i64>()
+            .map_err(|error| cast_error(error.to_string()))?;
+        return arrow_cast::cast(&Int64Array::from(vec![ticks]), arrow_type);
+    }
+    let value = arrow_cast::cast(&StringArray::from(vec![text]), arrow_type)?;
+    let divisor = 10_i64.pow(precision.div_ceil(3) * 3 - precision);
+    if value.is_null(0) || divisor == 1 {
+        return Ok(value);
+    }
+    let ticks = arrow_cast::cast(value.as_ref(), &ArrowDataType::Int64)?;
+    let ticks = ticks
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let truncated = ticks
+        .div_euclid(divisor)
+        .checked_mul(divisor)
+        .ok_or_else(|| cast_error("TIMESTAMP default is outside the Arrow storage range"))?;
+    arrow_cast::cast(&Int64Array::from(vec![truncated]), arrow_type)
+}
+
+fn cast_legacy_local_zoned_timestamp(
+    text: &str,
+    precision: u32,
+    arrow_type: &ArrowDataType,
+) -> std::result::Result<ArrayRef, ArrowError> {
+    let datetime = arrow_cast::parse::string_to_datetime(&chrono::Local, text)?;
+    let stored_precision = precision.div_ceil(3) * 3;
+    let fraction = if precision == 0 {
+        0
+    } else {
+        datetime.timestamp_subsec_nanos() / 10_u32.pow(9 - precision)
+            * 10_u32.pow(stored_precision - precision)
+    };
+    let ticks =
+        i128::from(datetime.timestamp()) * 10_i128.pow(stored_precision) + i128::from(fraction);
+    let ticks = i64::try_from(ticks).map_err(|error| cast_error(error.to_string()))?;
+    arrow_cast::cast(&Int64Array::from(vec![ticks]), arrow_type)
+}
+
+fn is_unsigned_integer(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn parse_java_integer(text: &str, min: i64, max: i64) -> std::result::Result<i64, ArrowError> {
-    crate::common::number::parse_java_integer(text, min, max)
-        .map_err(|error| cast_error(error.to_string()))
+fn cast_java_scalar_default(
+    data_type: &DataType,
+    text: &str,
+) -> std::result::Result<ArrayRef, ArrowError> {
+    if matches!(data_type, DataType::Time(_)) {
+        let millis = crate::arrow::parse_java_time(text)
+            .map_err(|error| ArrowError::ExternalError(Box::new(error)))?;
+        return Ok(Arc::new(Time32MillisecondArray::from(vec![millis])));
+    }
+    let string = DataType::VarChar(VarCharType::string_type());
+    let input: ArrayRef = Arc::new(StringArray::from(vec![text]));
+    CastExecutor::new(string.clone(), string, data_type.clone())
+        .and_then(|cast| cast.cast(&input))
+        .map_err(|error| ArrowError::ExternalError(Box::new(error)))
 }
 
 #[derive(Clone)]
@@ -445,11 +448,12 @@ fn cast_token(
     data_type: &DataType,
     token: &DefaultToken,
     arrow_field: &ArrowField,
+    parsing: DefaultParsing,
 ) -> std::result::Result<ArrayRef, ArrowError> {
     if !token.literal && token.value == "null" {
         return Ok(arrow_array::new_null_array(arrow_field.data_type(), 1));
     }
-    let value = cast_default(data_type, &token.value, arrow_field)?;
+    let value = cast_default(data_type, &token.value, arrow_field, parsing)?;
     if value.is_null(0) {
         return Err(cast_error(format!(
             "Cannot cast '{}' to {data_type}",
@@ -485,23 +489,39 @@ fn literal_content<'a>(
     open: char,
     close: char,
     function: &str,
+    parsing: DefaultParsing,
 ) -> std::result::Result<&'a str, ArrowError> {
-    let text = text.trim();
-    if let Some(content) = text.strip_prefix(open).and_then(|v| v.strip_suffix(close)) {
-        return Ok(content.trim());
-    }
-    let prefix = text.get(..function.len());
-    if prefix.is_some_and(|prefix| prefix.eq_ignore_ascii_case(function)) {
-        let tail = text[function.len()..].trim_start();
-        if let Some(content) = tail.strip_prefix('(').and_then(|v| v.strip_suffix(')')) {
-            return Ok(content.trim());
-        }
-    }
-    Err(cast_error(format!("Invalid {function} default: {text}")))
+    let text = parsing.trim(text);
+    let content = text
+        .strip_prefix(open)
+        .and_then(|body| body.strip_suffix(close))
+        .or_else(|| {
+            let (name, tail) = text.split_at_checked(function.len())?;
+            if !name.eq_ignore_ascii_case(function) {
+                return None;
+            }
+            let tail = match parsing {
+                DefaultParsing::Stored => tail.trim_start(),
+                DefaultParsing::NewDefinition => {
+                    tail.trim_start_matches(|ch| matches!(ch, '\t'..='\r' | ' '))
+                }
+            };
+            tail.strip_prefix('(')?.strip_suffix(')')
+        })
+        // Java's collection cast rules match the body with a non-DOTALL regex.
+        .filter(|body| {
+            matches!(parsing, DefaultParsing::Stored)
+                || !body.contains(['\n', '\r', '\u{0085}', '\u{2028}', '\u{2029}'])
+        })
+        .ok_or_else(|| cast_error(format!("Invalid {function} default: {text}")))?;
+    Ok(parsing.trim(content))
 }
 
-fn single_token(text: &str) -> std::result::Result<DefaultToken, ArrowError> {
-    let tokens = split_tokens(text);
+fn single_token(
+    text: &str,
+    parsing: DefaultParsing,
+) -> std::result::Result<DefaultToken, ArrowError> {
+    let tokens = split_tokens(text, parsing);
     if tokens.len() != 1 {
         return Err(cast_error(format!("Invalid MAP entry token: {text}")));
     }
@@ -510,7 +530,7 @@ fn single_token(text: &str) -> std::result::Result<DefaultToken, ArrowError> {
 
 // Port of Java TokenSplitter.split. At the current level quotes and escapes
 // make a token literal; nested punctuation is retained for recursive casting.
-fn split_tokens(content: &str) -> Vec<DefaultToken> {
+fn split_tokens(content: &str, parsing: DefaultParsing) -> Vec<DefaultToken> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut brackets = Vec::new();
@@ -546,6 +566,7 @@ fn split_tokens(content: &str) -> Vec<DefaultToken> {
             }
             continue;
         }
+        let whitespace = parsing.is_token_whitespace(ch);
         if !in_quotes {
             if is_open_bracket(ch) {
                 brackets.push(ch);
@@ -557,12 +578,12 @@ fn split_tokens(content: &str) -> Vec<DefaultToken> {
                 end = 0;
                 literal = false;
                 continue;
-            } else if ch.is_whitespace() && end == 0 {
+            } else if whitespace && end == 0 {
                 continue;
             }
         }
         current.push(ch);
-        if in_quotes || !ch.is_whitespace() {
+        if in_quotes || !whitespace {
             end = current.len();
         }
     }
@@ -581,7 +602,7 @@ fn push_token(tokens: &mut Vec<DefaultToken>, current: &str, end: usize, literal
 
 // Java TokenSplitter.splitRaw leaves quotes and escapes in place for its
 // second pass, where a MAP entry is split on `->`.
-fn split_raw(content: &str, delimiter: &str, limit: usize) -> Vec<String> {
+fn split_raw(content: &str, delimiter: &str, limit: usize, parsing: DefaultParsing) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut brackets = Vec::new();
@@ -619,7 +640,7 @@ fn split_raw(content: &str, delimiter: &str, limit: usize) -> Vec<String> {
                     .collect::<String>()
                     == delimiter.chars().skip(1).collect::<String>()
             {
-                tokens.push(current.trim().to_string());
+                tokens.push(parsing.trim(&current).to_string());
                 current.clear();
                 splits += 1;
                 for _ in 1..delimiter.chars().count() {
@@ -630,7 +651,7 @@ fn split_raw(content: &str, delimiter: &str, limit: usize) -> Vec<String> {
         }
         current.push(ch);
     }
-    tokens.push(current.trim().to_string());
+    tokens.push(parsing.trim(&current).to_string());
     tokens
 }
 
@@ -647,7 +668,10 @@ mod tests {
     use super::*;
     use crate::arrow::build_target_arrow_schema;
     use crate::spec::{BigIntType, DataType, VarCharType};
-    use arrow_array::{Int64Array, StringArray};
+    use arrow_array::{
+        BinaryArray, Date32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    };
 
     fn fields() -> Vec<DataField> {
         vec![
@@ -834,8 +858,8 @@ mod tests {
     }
 
     #[test]
-    fn converts_java_quoted_dates_and_numeric_defaults() {
-        use crate::spec::{BooleanType, DateType, DecimalType};
+    fn converts_java_quoted_temporal_and_numeric_defaults() {
+        use crate::spec::{BooleanType, DateType, DecimalType, TimeType};
         use arrow_array::{BooleanArray, Date32Array, Decimal128Array};
         let fields = vec![
             DataField::new(0, "day".into(), DataType::Date(DateType::new()))
@@ -848,6 +872,8 @@ mod tests {
                 DataType::Decimal(DecimalType::new(10, 2).unwrap()),
             )
             .with_default_value(Some("12.34".into())),
+            DataField::new(3, "clock".into(), DataType::Time(TimeType::new(3).unwrap()))
+                .with_default_value(Some("'00:01:02.9995+01:30'".into())),
         ];
         let schema = build_target_arrow_schema(&fields).unwrap();
         let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
@@ -860,6 +886,7 @@ mod tests {
                 Arc::new(Date32Array::from(vec![None])),
                 Arc::new(BooleanArray::from(vec![None])),
                 Arc::new(amount),
+                Arc::new(Time32MillisecondArray::from(vec![None])),
             ],
         )
         .unwrap();
@@ -882,11 +909,49 @@ mod tests {
         assert_eq!(day.value(0), 20_090);
         assert!(enabled.value(0));
         assert_eq!(amount.value(0), 1234);
+        let clock = actual
+            .column(3)
+            .as_any()
+            .downcast_ref::<Time32MillisecondArray>()
+            .unwrap();
+        assert_eq!(clock.value(0), 5_463_000);
+        for (literal, stored_millis, java_millis) in [
+            ("'1:20 PM'", 48_000_000, None),
+            ("'00:00:00.0005'", 0, Some(1)),
+            ("'00:00:00.001'", 1, Some(1)),
+        ] {
+            let field = fields[3].clone().with_default_value(Some(literal.into()));
+            assert_eq!(
+                validate_default_value(&field, false).is_ok(),
+                java_millis.is_some(),
+                "{literal}"
+            );
+            assert_eq!(
+                validate_default_value(&field, true).is_ok(),
+                java_millis == Some(stored_millis),
+                "{literal}"
+            );
+            for (parsing, expected) in [
+                (DefaultParsing::Stored, Some(stored_millis)),
+                (DefaultParsing::NewDefinition, java_millis),
+            ] {
+                let millis = parse_default(&field, literal, input.schema_ref().field(3), parsing)
+                    .ok()
+                    .map(|value| {
+                        value
+                            .as_any()
+                            .downcast_ref::<Time32MillisecondArray>()
+                            .unwrap()
+                            .value(0)
+                    });
+                assert_eq!(millis, expected, "{literal}");
+            }
+        }
         assert_eq!(input.column(0).null_count(), 1);
     }
 
     #[test]
-    fn character_and_binary_defaults_follow_java_length_rules() {
+    fn character_and_binary_defaults_preserve_widths_and_quotes() {
         use crate::spec::{BinaryType, CharType, VarBinaryType};
         let fields = vec![
             DataField::new(
@@ -963,6 +1028,24 @@ mod tests {
                 .value(0),
             &[0xe7, 0x8c]
         );
+
+        let apostrophe = fields[1].clone().with_default_value(Some("'".into()));
+        assert!(validate_default_value(&apostrophe, true).is_err());
+        let stored = parse_default(
+            &apostrophe,
+            "'",
+            actual.schema().field(1),
+            DefaultParsing::Stored,
+        )
+        .unwrap();
+        assert_eq!(
+            stored
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "'"
+        );
     }
 
     #[test]
@@ -970,7 +1053,7 @@ mod tests {
         use crate::spec::{DateType, TimeType, TimestampType};
         let fields = vec![
             DataField::new(0, "day".into(), DataType::Date(DateType::new()))
-                .with_default_value(Some("42".into())),
+                .with_default_value(Some("-42".into())),
             DataField::new(1, "time".into(), DataType::Time(TimeType::new(3).unwrap()))
                 .with_default_value(Some("12345".into())),
             DataField::new(
@@ -984,7 +1067,7 @@ mod tests {
                 "micros".into(),
                 DataType::Timestamp(TimestampType::new(6).unwrap()),
             )
-            .with_default_value(Some("123456".into())),
+            .with_default_value(Some("-123456".into())),
         ];
         let schema = build_target_arrow_schema(&fields).unwrap();
         let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
@@ -1006,7 +1089,7 @@ mod tests {
                 .downcast_ref::<Date32Array>()
                 .unwrap()
                 .value(0),
-            42
+            -42
         );
         assert_eq!(
             actual
@@ -1033,19 +1116,41 @@ mod tests {
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap()
                 .value(0),
-            123456
+            -123456
         );
     }
 
     #[test]
-    fn rejects_blob_default_like_java() {
-        use crate::spec::BlobType;
-        let fields = vec![
-            DataField::new(0, "blob".into(), DataType::Blob(BlobType::new()))
-                .with_default_value(Some("'raw bytes'".into())),
-        ];
-        let schema = build_target_arrow_schema(&fields).unwrap();
-        assert!(FormatTableDefaults::new(&fields, &schema).is_err());
+    fn schema_validation_rejects_blob_and_geospatial_defaults() {
+        use crate::spec::{ArrayType, BlobType, GeographyType, GeometryType, MapType, RowType};
+        let geometry = DataType::Geometry(GeometryType::default());
+        let string = DataType::VarChar(VarCharType::string_type());
+        for (data_type, default) in [
+            (DataType::Blob(BlobType::new()), "'raw bytes'"),
+            (geometry.clone(), "'raw bytes'"),
+            (DataType::Geography(GeographyType::default()), "'raw bytes'"),
+            (DataType::Array(ArrayType::new(geometry.clone())), "'[]'"),
+            (
+                DataType::Map(MapType::new(geometry.clone(), string.clone())),
+                "'{}'",
+            ),
+            (
+                DataType::Map(MapType::new(string, geometry.clone())),
+                "'{a -> null}'",
+            ),
+            (
+                DataType::Row(RowType::new(vec![DataField::new(1, "g".into(), geometry)])),
+                "'STRUCT(null)'",
+            ),
+        ] {
+            let field = DataField::new(0, "value".into(), data_type)
+                .with_default_value(Some(default.into()));
+            assert!(
+                validate_default_value(&field, true).is_err(),
+                "{}",
+                field.data_type()
+            );
+        }
     }
 
     #[test]
@@ -1164,6 +1269,7 @@ mod tests {
                 field.data_type(),
                 "1970-01-01 00:00:00.123456789",
                 schema.field(0),
+                DefaultParsing::Stored,
             )
             .unwrap();
             let actual = match precision {
@@ -1346,8 +1452,13 @@ mod tests {
             vec![Some(1), Some(2)]
         );
 
-        let value =
-            cast_default(fields[0].data_type(), "MAP(a, 1, a, 2)", schema.field(0)).unwrap();
+        let value = cast_default(
+            fields[0].data_type(),
+            "MAP(a, 1, a, 2)",
+            schema.field(0),
+            DefaultParsing::NewDefinition,
+        )
+        .unwrap();
         let map = value.as_any().downcast_ref::<MapArray>().unwrap();
         assert_eq!(map.keys().len(), 1);
         assert_eq!(
@@ -1361,15 +1472,42 @@ mod tests {
     }
 
     #[test]
-    fn malformed_complex_default_fails_before_writing() {
-        use crate::spec::{ArrayType, IntType};
-        let fields = [DataField::new(
-            0,
-            "numbers".into(),
-            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
-        )
-        .with_default_value(Some("'[1, bad]'".into()))];
-        let schema = build_target_arrow_schema(&fields).unwrap();
-        assert!(FormatTableDefaults::new(&fields, &schema).is_err());
+    fn collection_defaults_validate_java_syntax_and_preserve_stored_values() {
+        use crate::spec::{ArrayType, IntType, MapType, RowType};
+
+        let int = DataType::Int(IntType::new());
+        let string = DataType::VarChar(VarCharType::string_type());
+        let numbers = DataType::Array(ArrayType::new(int.clone()));
+        let labels = DataType::Array(ArrayType::new(string.clone()));
+        let lookup = DataType::Map(MapType::new(string, int.clone()));
+        let row = DataType::Row(RowType::new(vec![DataField::new(1, "id".into(), int)]));
+        for (data_type, literal, writable, valid_in_java, valid_for_format_table) in [
+            (&numbers, "'[1, bad]'", false, false, false),
+            (&numbers, "'[1,\n2]'", true, false, false),
+            (&lookup, "'MAP(a,\n1)'", true, false, false),
+            (&row, "'STRUCT(\n1)'", true, false, false),
+            (&numbers, "'ARRAY\n(1, 2)'", true, true, true),
+            (&labels, "'[a, \u{00a0}b]'", true, true, false),
+            (&lookup, "'{a -> 1, \u{00a0}b -> 2}'", true, true, false),
+        ] {
+            let fields = [DataField::new(0, "value".into(), data_type.clone())
+                .with_default_value(Some(literal.into()))];
+            let schema = build_target_arrow_schema(&fields).unwrap();
+            assert_eq!(
+                FormatTableDefaults::new(&fields, &schema).is_ok(),
+                writable,
+                "{literal:?}"
+            );
+            assert_eq!(
+                validate_default_value(&fields[0], false).is_ok(),
+                valid_in_java,
+                "{literal:?}"
+            );
+            assert_eq!(
+                validate_default_value(&fields[0], true).is_ok(),
+                valid_for_format_table,
+                "{literal:?}"
+            );
+        }
     }
 }
