@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use crate::table::compact::{CompactBuckets, CompactPlan};
+use crate::table::compact::{CompactBuckets, CompactPlan, OverwriteL0Files};
 use sha2::{Digest, Sha256};
 
 impl TableCommit {
@@ -291,7 +291,7 @@ impl TableCommit {
             }
             compact.validate_auto_compaction_policy()?;
             let builder = compact.table.new_compact_builder();
-            let plan = match builder.new_planner()?.for_write(buckets).plan().await {
+            let mut plan = match builder.new_planner()?.for_write(buckets).plan().await {
                 Ok(plan) => plan,
                 // Some limitations depend on snapshot metadata, for example
                 // global indexes outside Data Evolution mode.
@@ -301,7 +301,14 @@ impl TableCommit {
             if plan.tasks().is_empty() {
                 return Ok(());
             }
+            let dv_snapshot = latest.as_ref().filter(|latest| {
+                overwrite
+                    && compact.deletion_vectors_enabled
+                    && !compact.data_evolution_enabled
+                    && latest.id() > written.id()
+            });
             if overwrite
+                && dv_snapshot.is_none()
                 && compact
                     .overwrite_inputs_replaced(
                         written,
@@ -312,7 +319,79 @@ impl TableCommit {
             {
                 return Ok(());
             }
-            let executor = builder.new_auto_executor()?;
+            let overwrite_l0 = if let Some(latest) = dv_snapshot {
+                let active = crate::table::snapshot_manifest::read_snapshot_entries(
+                    &compact.snapshot_manager,
+                    latest,
+                    None,
+                )
+                .await?;
+                let active = active
+                    .iter()
+                    .map(|entry| {
+                        let partition = if compact.table.schema().partition_keys().is_empty() {
+                            EMPTY_SERIALIZED_ROW.as_slice()
+                        } else {
+                            entry.partition()
+                        };
+                        (
+                            (
+                                partition,
+                                entry.bucket(),
+                                entry.total_buckets(),
+                                entry.file().file_name.as_str(),
+                            ),
+                            entry.file(),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                // Refresh DV masks and retained runs, suppressing changelogs only
+                // for original L0 inputs whose complete metadata is still active.
+                let mut files = OverwriteL0Files::new();
+                let mut buckets = CompactBuckets::new();
+                for task in plan.tasks() {
+                    for file in task.files().iter().filter(|file| file.level == 0) {
+                        if active
+                            .get(&(
+                                task.partition(),
+                                task.bucket(),
+                                task.total_buckets(),
+                                file.file_name.as_str(),
+                            ))
+                            .is_some_and(|current| *current == file)
+                        {
+                            files.insert((
+                                task.partition().to_vec(),
+                                task.bucket(),
+                                file.file_name.clone(),
+                            ));
+                            buckets.insert((
+                                task.partition().to_vec(),
+                                task.bucket(),
+                                task.total_buckets(),
+                            ));
+                        }
+                    }
+                }
+                if files.is_empty() {
+                    return Ok(());
+                }
+                compact.table = compact.table.copy_with_pinned_snapshot(Some(latest));
+                plan = compact
+                    .table
+                    .new_compact_builder()
+                    .new_planner()?
+                    .for_write(buckets)
+                    .plan_with_overwrite_l0(Some(&files))
+                    .await?;
+                if plan.tasks().is_empty() {
+                    return Ok(());
+                }
+                Some(files)
+            } else {
+                None
+            };
+            let executor = compact.table.new_compact_builder().new_auto_executor()?;
             let executor = if overwrite {
                 executor.without_changelog()
             } else {
@@ -330,6 +409,7 @@ impl TableCommit {
                 &plan,
                 &executor,
                 options.write_compaction_parallelism()?,
+                overwrite_l0.as_ref(),
             )
             .await
             {
@@ -349,6 +429,7 @@ impl TableCommit {
                         schema_id: prepared.schema_id,
                         read_snapshot: prepared.read_snapshot,
                         planned_snapshot_id: prepared.snapshot_id,
+                        overwrite_l0,
                     },
                     None,
                     written.id(),

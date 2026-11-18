@@ -57,8 +57,11 @@ schema even when the writer retains a historical schema, including schemas resol
 through a REST catalog. Primary-key writes honor normal sorted-run count and size
 triggers. Lookup, first-row and deletion-vector compaction, or an explicit
 `compaction.force-up-level-0=true`, can advance L0 files below those triggers.
-Overwrite compaction is pinned to its own committed data snapshot, so suppressing
-overwrite changelogs cannot consume a later append's pending lookup events.
+Overwrite compaction takes its eligible L0 files from the committed overwrite
+snapshot so later appends keep their pending lookup events. For primary-key
+deletion-vector tables, it reads current deletion vectors and retained runs when
+a newer snapshot exists. Recovery compacts the original L0 inputs that remain
+active with unchanged metadata, even when some other overwrite inputs were replaced.
 As in Java, overwriting partitions being consumed by streaming readers is unsupported;
 lookup changelogs do not describe the overwrite operation itself.
 Automatic tasks share one captured snapshot and bucket-grouped source/index
@@ -464,9 +467,13 @@ generation, so a DELETE may publish a changelog without a new data file.
 
 Commit atomically unions historical row deletions with the latest DV indexes and
 retires rewritten inputs' ranges, preserving unrelated ranges and HASH indexes.
-It rejects changed input masks, removed lookup targets and concurrently deleted
-hit positions; unrelated new DV bits can be merged. Uncommitted serialized DV results must
-retain their physical deletion metadata, including an empty list when appropriate.
+If another writer's `COMPACT` or `OVERWRITE` changes data or indexes in the same
+partition and bucket after planning, plan again from the latest snapshot.
+This applies to manual and automatic compaction, including `write-only=true`.
+Different buckets can compact independently. Concurrent `APPEND` snapshots still
+use the existing checks for selected input masks, lookup targets and deleted hit
+positions. Uncommitted serialized DV results must retain their physical deletion
+metadata, including an empty list when appropriate.
 Each output file is limited to 4,294,967,296 physical rows. Migrating files written
 without DV is unsupported, including enabling DV through temporary table options.
 

@@ -20,7 +20,7 @@ use std::future::Future;
 
 use futures::stream::{FuturesUnordered, StreamExt};
 
-use super::{prepare_results, CompactExecutor, CompactPlan, PreparedCompact};
+use super::{prepare_results, CompactExecutor, CompactPlan, OverwriteL0Files, PreparedCompact};
 use crate::table::{Table, TableCommit};
 use crate::{Error, Result};
 #[cfg(test)]
@@ -31,6 +31,7 @@ pub(in crate::table) async fn execute_auto_plan(
     plan: &CompactPlan,
     executor: &CompactExecutor,
     parallelism: usize,
+    overwrite_l0: Option<&OverwriteL0Files>,
 ) -> Result<PreparedCompact> {
     // Total-bucket metadata can change, but tasks writing one physical bucket
     // still run in order. Append/DE may produce several tasks for that bucket.
@@ -46,7 +47,11 @@ pub(in crate::table) async fn execute_auto_plan(
         None => None,
     };
     let (results, error) = run_buckets(buckets.into_values(), parallelism, |task| {
-        executor.execute_captured(task, inputs.as_ref().expect("nonempty task plan"))
+        executor.execute_captured(
+            task,
+            inputs.as_ref().expect("nonempty task plan"),
+            overwrite_l0,
+        )
     })
     .await;
     let prepared = match error {

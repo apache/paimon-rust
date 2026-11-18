@@ -18,6 +18,7 @@
 mod pk_dv_retry {
     use super::*;
     use arrow_array::{Int32Array, RecordBatch};
+    use futures::TryStreamExt;
     use indexmap::IndexMap;
     use roaring::RoaringBitmap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -102,6 +103,184 @@ mod pk_dv_retry {
             .unwrap();
     }
 
+    async fn rows(table: &Table) -> Vec<(i32, i32)> {
+        let read = table.new_read_builder();
+        let plan = read.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = read
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        batch_rows(batches)
+    }
+
+    fn batch_rows(batches: Vec<RecordBatch>) -> Vec<(i32, i32)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+            let values = batch["value"]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            rows.extend(
+                ids.values()
+                    .iter()
+                    .copied()
+                    .zip(values.values().iter().copied()),
+            );
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    struct InterruptOverwriteOnce(std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl CommitCallback for InterruptOverwriteOnce {
+        async fn call(&self, context: &CommitCallbackContext) -> Result<()> {
+            if context.snapshot.commit_kind() == &CommitKind::OVERWRITE
+                && !self.0.swap(true, Ordering::SeqCst)
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: "interrupt overwrite maintenance".into(),
+                    source: None,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn overwrite_recovery_refreshes_dv_on_its_inputs() {
+        overwrite_recovery_after_dv_update(true).await;
+    }
+
+    #[tokio::test]
+    async fn overwrite_recovery_refreshes_history_and_leaves_later_append_pending() {
+        overwrite_recovery_after_dv_update(false).await;
+    }
+
+    async fn overwrite_recovery_after_dv_update(mask_overwrite_input: bool) {
+        let (write_only, _, _) = fixture().await;
+        let table =
+            write_only.copy_with_options(HashMap::from([("write-only".into(), "false".into())]));
+        let builder = table
+            .new_write_builder()
+            .with_commit_user("overwrite-recovery")
+            .unwrap()
+            .with_overwrite();
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+            ),
+            (
+                "value",
+                Arc::new(Int32Array::from(vec![10, 20])) as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut writer = builder.new_write().unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        let input = messages[0].new_files[0].file_name.clone();
+        let mut commit = builder.new_commit();
+        commit
+            .add_commit_callback(Arc::new(InterruptOverwriteOnce(false.into())))
+            .unwrap();
+        let error = commit
+            .overwrite_with_identifier(messages.clone(), None, 7)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("interrupt overwrite maintenance"),
+            "{error}"
+        );
+
+        let manager = table.snapshot_manager();
+        let original = manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(original.commit_kind(), &CommitKind::OVERWRITE);
+        let (_, pending) = write(&write_only, vec![3, 4], 0).await;
+        let masked_file = if mask_overwrite_input {
+            &input
+        } else {
+            &pending.file_name
+        };
+        replace_vectors(&write_only, &[(masked_file, &[0])]).await;
+        let modified = manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(modified.commit_kind(), &CommitKind::OVERWRITE);
+        assert!(modified.index_manifest().is_some());
+
+        let first = commit
+            .overwrite_with_identifier(messages.clone(), None, 7)
+            .await;
+        let second = commit.overwrite_with_identifier(messages, None, 7).await;
+        assert!(
+            first.is_ok() && second.is_ok(),
+            "first: {first:?}, retry: {second:?}"
+        );
+        let recovered = manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(recovered.id(), modified.id() + 1);
+        assert_eq!(recovered.commit_kind(), &CommitKind::COMPACT);
+        assert_eq!(recovered.changelog_record_count().unwrap_or_default(), 0);
+        let active =
+            crate::table::snapshot_manifest::read_snapshot_entries(&manager, &recovered, None)
+                .await
+                .unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|entry| entry.file() == &pending));
+        assert!(active.iter().all(|entry| entry.file().file_name != input));
+        assert_eq!(
+            active
+                .iter()
+                .filter(|entry| entry.file().level > 0)
+                .map(|entry| entry.file().row_count)
+                .sum::<i64>(),
+            if mask_overwrite_input { 1 } else { 2 }
+        );
+        assert_eq!(
+            rows(&table).await,
+            if mask_overwrite_input {
+                vec![(2, 20)]
+            } else {
+                vec![(1, 10), (2, 20)]
+            }
+        );
+
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        let result = builder
+            .new_executor()
+            .unwrap()
+            .execute(&plan.tasks()[0])
+            .await
+            .unwrap();
+        builder
+            .new_commit()
+            .unwrap()
+            .commit_compact(vec![result])
+            .await
+            .unwrap();
+        let completed = manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(
+            completed.changelog_record_count(),
+            Some(if mask_overwrite_input { 2 } else { 1 })
+        );
+        assert_eq!(
+            rows(&table).await,
+            if mask_overwrite_input {
+                vec![(2, 20), (3, 300), (4, 400)]
+            } else {
+                vec![(1, 10), (2, 20), (4, 400)]
+            }
+        );
+    }
+
     async fn fixture() -> (Table, String, String) {
         let path = format!("memory:/pk-dv-retry/{}", uuid::Uuid::new_v4());
         let mut options = crate::Options::new();
@@ -176,6 +355,241 @@ mod pk_dv_retry {
         calls: AtomicUsize,
         publish_first: bool,
         paths: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    struct OverwriteCasRace {
+        table: Table,
+        compact_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SnapshotCommit for OverwriteCasRace {
+        async fn commit(
+            &self,
+            _: Option<&str>,
+            snapshot: &Snapshot,
+            _: &str,
+            _: &[PartitionStatistics],
+        ) -> Result<bool> {
+            if snapshot.commit_kind() == &CommitKind::COMPACT
+                && self.compact_calls.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                let (_, pending) = write(&self.table, vec![3, 4], 0).await;
+                replace_vectors(&self.table, &[(&pending.file_name, &[0])]).await;
+                return Ok(false);
+            }
+            self.table
+                .snapshot_manager()
+                .commit_snapshot(snapshot)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn overwrite_recovery_after_cas_loss_refreshes_dv_and_preserves_append_changelog() {
+        let (write_only, _, _) = fixture().await;
+        let table =
+            write_only.copy_with_options(HashMap::from([("write-only".into(), "false".into())]));
+        let builder = table
+            .new_write_builder()
+            .with_commit_user("overwrite-cas-recovery")
+            .unwrap()
+            .with_overwrite();
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2])) as arrow_array::ArrayRef,
+            ),
+            (
+                "value",
+                Arc::new(Int32Array::from(vec![10, 20])) as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut writer = builder.new_write().unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        let publisher = Arc::new(OverwriteCasRace {
+            table: write_only,
+            compact_calls: AtomicUsize::new(0),
+        });
+        let mut commit = builder.new_commit();
+        commit.snapshot_commit = publisher.clone();
+        let error = commit
+            .overwrite_with_identifier(messages.clone(), None, 7)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Concurrent PK deletion-vector compaction"),
+            "{error}"
+        );
+        assert_eq!(publisher.compact_calls.load(Ordering::SeqCst), 1);
+        let manager = table.snapshot_manager();
+        let raced = manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(raced.commit_kind(), &CommitKind::OVERWRITE);
+
+        commit
+            .overwrite_with_identifier(messages.clone(), None, 7)
+            .await
+            .unwrap();
+        let recovered = manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(recovered.id(), raced.id() + 1);
+        assert_eq!(recovered.commit_kind(), &CommitKind::COMPACT);
+        assert_eq!(recovered.changelog_record_count().unwrap_or_default(), 0);
+        assert_eq!(rows(&table).await, vec![(1, 10), (2, 20)]);
+        commit
+            .overwrite_with_identifier(messages, None, 7)
+            .await
+            .unwrap();
+        assert_eq!(publisher.compact_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            manager.get_latest_snapshot_id().await.unwrap(),
+            Some(recovered.id())
+        );
+
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+        assert!(plan.tasks()[0].files().iter().any(|file| file.level == 0));
+        let result = builder
+            .new_executor()
+            .unwrap()
+            .execute(&plan.tasks()[0])
+            .await
+            .unwrap();
+        builder
+            .new_commit()
+            .unwrap()
+            .commit_compact(vec![result])
+            .await
+            .unwrap();
+        let completed = manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(rows(&table).await, vec![(1, 10), (2, 20), (4, 400)]);
+        assert_eq!(completed.changelog_record_count(), Some(1));
+        let read = table.new_read_builder();
+        let changes = read
+            .new_incremental_scan(
+                crate::table::IncrementalScanMode::Changelog,
+                recovered.id(),
+                completed.id(),
+            )
+            .plan_combined()
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = read
+            .new_read()
+            .unwrap()
+            .to_arrow(changes.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batch_rows(batches), vec![(4, 400)]);
+    }
+
+    struct CompetingCompactCommit {
+        table: Table,
+        commit: TableCommit,
+        result: std::sync::Mutex<Option<crate::table::CompactResult>>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SnapshotCommit for CompetingCompactCommit {
+        async fn commit(
+            &self,
+            _: Option<&str>,
+            snapshot: &Snapshot,
+            _: &str,
+            _: &[PartitionStatistics],
+        ) -> Result<bool> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let competing = self.result.lock().unwrap().take();
+            if let Some(result) = competing {
+                self.commit.commit_compact(vec![result]).await?;
+                return Ok(false);
+            }
+            self.table
+                .snapshot_manager()
+                .commit_snapshot(snapshot)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_cas_retry_rechecks_same_bucket_history() {
+        let (table, _, _) = fixture().await;
+        write(&table, (3000..3100).collect(), 0).await;
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        let result = builder
+            .new_executor()
+            .unwrap()
+            .execute(&plan.tasks()[0])
+            .await
+            .unwrap();
+        builder
+            .new_commit()
+            .unwrap()
+            .commit_compact(vec![result])
+            .await
+            .unwrap();
+
+        let competing_table = table.copy_with_options(HashMap::from([
+            ("num-sorted-run.compaction-trigger".into(), "2".into()),
+            (
+                "compaction.max-size-amplification-percent".into(),
+                "0".into(),
+            ),
+        ]));
+        let competing = competing_table.new_compact_builder();
+        let plan = competing.new_planner().unwrap().plan().await.unwrap();
+        assert!(plan.tasks()[0].files().iter().all(|file| file.level > 0));
+        let result = competing
+            .new_executor()
+            .unwrap()
+            .execute(&plan.tasks()[0])
+            .await
+            .unwrap();
+        let publisher = Arc::new(CompetingCompactCommit {
+            table: table.clone(),
+            commit: competing.new_commit().unwrap(),
+            result: std::sync::Mutex::new(Some(result)),
+            calls: AtomicUsize::new(0),
+        });
+
+        write(&table, vec![4000], 0).await;
+        let builder = table.new_compact_builder();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        assert!(plan.tasks()[0].files().iter().all(|file| file.level == 0));
+        let result = builder
+            .new_executor()
+            .unwrap()
+            .execute(&plan.tasks()[0])
+            .await
+            .unwrap();
+        let mut commit = builder.new_commit().unwrap();
+        commit.snapshot_commit = publisher.clone();
+        commit.commit_min_retry_wait_ms = 0;
+        commit.commit_max_retry_wait_ms = 0;
+        let error = commit.commit_compact(vec![result]).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Concurrent PK deletion-vector compaction"),
+            "{error}"
+        );
+        assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap(),
+            Some(plan.snapshot_id().unwrap() + 1)
+        );
     }
 
     #[async_trait::async_trait]
@@ -290,7 +704,7 @@ mod pk_dv_retry {
     }
 
     #[tokio::test]
-    async fn selected_dv_container_repacking_compares_masks_and_rebases_unrelated_rows() {
+    async fn selected_dv_container_repacking_in_an_overwrite_invalidates_compaction() {
         for selected_changed in [false, true] {
             let (table, anchor, unrelated) = fixture().await;
             let (_, selected) = write(&table, vec![42, 43], 0).await;
@@ -343,26 +757,21 @@ mod pk_dv_retry {
                 .unwrap()
                 .commit_compact(vec![result])
                 .await;
-            if selected_changed {
-                assert!(published
-                    .unwrap_err()
-                    .to_string()
-                    .contains("input deletion vectors changed"));
-                assert_eq!(
-                    table
-                        .snapshot_manager()
-                        .get_latest_snapshot_id()
-                        .await
-                        .unwrap(),
-                    Some(latest.id())
-                );
+            let reason = if selected_changed {
+                "input deletion vectors changed"
             } else {
-                published.unwrap();
-                let masks = vectors(&table).await.0;
-                assert_eq!(masks[&anchor], [43, 500, 501].into_iter().collect());
-                assert_eq!(masks[&unrelated], [0].into_iter().collect());
-                assert!(!masks.contains_key(&selected.file_name));
-            }
+                "Concurrent PK deletion-vector compaction"
+            };
+            let error = published.unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+            assert_eq!(
+                table
+                    .snapshot_manager()
+                    .get_latest_snapshot_id()
+                    .await
+                    .unwrap(),
+                Some(latest.id())
+            );
             for path in old_paths {
                 assert!(table.file_io().exists(&path).await.unwrap());
             }

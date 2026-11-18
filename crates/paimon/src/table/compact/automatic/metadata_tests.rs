@@ -89,7 +89,7 @@ async fn automatic_tasks_read_captured_metadata_once_and_keep_bucket_indexes() {
         let snapshot_path = table.snapshot_manager().snapshot_path(snapshot.id());
         watched.push(snapshot_path.clone());
         counter.watch(watched);
-        let prepared = execute_auto_plan(&table, &plan, &executor, 2)
+        let prepared = execute_auto_plan(&table, &plan, &executor, 2, None)
             .await
             .unwrap();
         let counts = counter.counts();
@@ -139,7 +139,7 @@ async fn automatic_tasks_read_captured_metadata_once_and_keep_bucket_indexes() {
             error.to_string().contains("snapshot was replaced"),
             "{error}"
         );
-        let error = execute_auto_plan(&table, &plan, &executor, 2)
+        let error = execute_auto_plan(&table, &plan, &executor, 2, None)
             .await
             .err()
             .unwrap();
