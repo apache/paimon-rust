@@ -19,11 +19,10 @@
 
 use crate::error::to_datafusion_error;
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::tree_node::Transformed;
 use datafusion::common::{DFSchema, Result};
-use datafusion::dataframe::DataFrame;
 use datafusion::logical_expr::expr_rewriter::FunctionRewrite;
-use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, Operator, WriteOp};
+use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, WriteOp};
 use datafusion::optimizer::analyzer::AnalyzerRule;
 
 #[derive(Debug)]
@@ -114,70 +113,6 @@ pub(crate) fn before_coercion(expr: &Expr) -> &Expr {
         Expr::Cast(c) if c.field.extension_type_name().is_none() => &c.expr,
         expr => expr,
     }
-}
-
-/// Arrow compares WKB bytes. Typed comparisons in a write predicate must
-/// agree on their CRS and edge algorithm before matching any rows.
-pub(crate) fn validate_comparisons(condition: &Expr, schema: &DFSchema) -> Result<()> {
-    let validate = |left: &Expr, right: &Expr| -> Result<()> {
-        let (_, left) = left.to_field(schema)?;
-        let (_, right) = right.to_field(schema)?;
-        if paimon::arrow::contains_geoarrow_wkb(&left) {
-            paimon::arrow::validate_geoarrow_write(&right, &left).map_err(to_datafusion_error)?;
-        } else if paimon::arrow::contains_geoarrow_wkb(&right) {
-            paimon::arrow::validate_geoarrow_write(&left, &right).map_err(to_datafusion_error)?;
-        }
-        Ok(())
-    };
-    condition.apply(|expr| {
-        match expr {
-            Expr::BinaryExpr(b)
-                if matches!(
-                    b.op,
-                    Operator::Eq
-                        | Operator::NotEq
-                        | Operator::Lt
-                        | Operator::LtEq
-                        | Operator::Gt
-                        | Operator::GtEq
-                        | Operator::IsDistinctFrom
-                        | Operator::IsNotDistinctFrom
-                ) =>
-            {
-                validate(&b.left, &b.right)?
-            }
-            Expr::InList(list) => {
-                for value in &list.list {
-                    validate(&list.expr, value)?;
-                }
-            }
-            Expr::Between(range) => {
-                validate(&range.expr, &range.low)?;
-                validate(&range.expr, &range.high)?;
-            }
-            _ => {}
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    Ok(())
-}
-
-/// UPDATE and DELETE build a SELECT to find the rows they will modify.
-pub(crate) fn validate_dml_filters(df: DataFrame) -> Result<DataFrame> {
-    df.logical_plan().apply(|plan| {
-        if let LogicalPlan::Filter(filter) = plan {
-            let schema = filter.input.schema();
-            if schema
-                .fields()
-                .iter()
-                .any(|field| paimon::arrow::contains_geoarrow_wkb(field))
-            {
-                validate_comparisons(&filter.predicate, schema)?;
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    Ok(df)
 }
 
 /// DataFusion 55.2 scalarizes each VALUES cell and drops metadata on list

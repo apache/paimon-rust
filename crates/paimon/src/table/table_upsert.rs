@@ -35,7 +35,7 @@ use super::global_index_freshness::indexed_columns_unchanged;
 use super::key_normalization::canonical_partition_key;
 use super::update_input::unique_column_index;
 use super::upsert_key_matcher::UpsertKeyMatcher;
-use super::write_batch_normalize::{normalize_blob_write_field, normalize_write_field};
+use super::write_batch_normalize::{normalize_append_column, normalize_blob_update_field};
 use crate::spec::{
     batch_to_serialized_bytes, extract_datum_from_arrow, CoreOptions, Predicate, PredicateBuilder,
 };
@@ -226,29 +226,20 @@ impl TableUpsert {
             let column = batch.column(input_index);
             let actual = input.field(input_index);
             let logical = &self.table.schema().fields()[index];
-            let update_field = update_fields
-                .iter()
-                .find(|updated| updated.name() == field.name());
-            if append {
-                crate::arrow::validate_geoarrow_write(actual, field)?;
-            }
-            let normalized = if !append && update_field.is_none() {
-                Ok((actual.clone(), column.clone()))
-            } else if logical.data_type().is_blob_file_field()
-                && !inline.contains(logical.name())
-                && (append || matches!(logical.data_type(), crate::spec::DataType::Map(_)))
+            let dedicated_blob =
+                logical.data_type().is_blob_file_field() && !inline.contains(logical.name());
+            let normalized = if append {
+                normalize_append_column(&batch, input_index, field, dedicated_blob)
+            } else if dedicated_blob
+                && matches!(logical.data_type(), crate::spec::DataType::Map(_))
+                && update_fields
+                    .iter()
+                    .any(|updated| updated.name() == field.name())
             {
                 // Named-row Blob maps carry nullable keys and decimal text in
                 // their dedicated physical layout. Keep that transport intact.
-                if append {
-                    normalize_blob_write_field(column, field)
-                } else {
-                    crate::arrow::validate_geoarrow_write(actual, field)?;
-                    super::write_batch_normalize::normalize_blob_update_field(column, field)
-                }
-            } else if append {
-                normalize_write_field(column, field, None)
-                    .map(|column| (field.as_ref().clone(), column))
+                crate::arrow::validate_geoarrow_write(actual, field)?;
+                normalize_blob_update_field(column, field)
             } else {
                 Ok((actual.clone(), column.clone()))
             };
@@ -277,15 +268,12 @@ impl TableUpsert {
             .source
             .iter()
             .map(|batch| {
-                let input = batch.schema();
                 let columns = key_schema
                     .fields()
                     .iter()
                     .map(|field| {
-                        let index = unique_column_index(&input, field.name())?;
-                        crate::arrow::validate_geoarrow_write(input.field(index), field)?;
                         super::key_normalization::normalize_match_key(
-                            batch.column(index),
+                            batch.column_by_name(field.name()).unwrap(),
                             field.data_type(),
                         )
                         .map_err(|error| {
@@ -428,8 +416,7 @@ impl TableUpsert {
                 .iter()
                 .find(|field| field.name() == key)
                 .unwrap();
-            // BLOB and geospatial keys match by bytes. Their typed domains
-            // do not support pruning with binary equality/IN predicates.
+            // BLOB and WKB keys use byte matching without a scalar index predicate.
             if field.data_type().is_blob_type() || field.data_type().is_geospatial() {
                 continue;
             }
@@ -1419,11 +1406,30 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_blob_keys_fall_back_to_byte_matching() {
-        use crate::spec::BlobType;
-        use arrow_array::LargeBinaryArray;
+        let keys = arrow_array::LargeBinaryArray::from_vec(vec![b"blob-key"]);
+        assert_upsert_matches_bytes(
+            PaimonType::Blob(crate::spec::BlobType::new()),
+            Arc::new(keys),
+        )
+        .await;
+    }
 
+    #[tokio::test]
+    async fn upsert_geospatial_keys_fall_back_to_byte_matching() {
+        let point = [
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64,
+        ];
+        let keys = arrow_array::BinaryArray::from_vec(vec![point.as_slice()]);
+        assert_upsert_matches_bytes(
+            PaimonType::Geometry(crate::spec::GeometryType::default()),
+            Arc::new(keys),
+        )
+        .await;
+    }
+
+    async fn assert_upsert_matches_bytes(key_type: PaimonType, key: ArrayRef) {
         let schema = PaimonSchema::builder()
-            .column("key", PaimonType::Blob(BlobType::new()))
+            .column("key", key_type)
             .column("value", PaimonType::Int(IntType::new()))
             .option("data-evolution.enabled", "true")
             .option("row-tracking.enabled", "true")
@@ -1438,10 +1444,7 @@ mod tests {
         );
         for value in [41, 42] {
             let source = RecordBatch::try_from_iter([
-                (
-                    "key",
-                    Arc::new(LargeBinaryArray::from_vec(vec![b"blob-key"])) as ArrayRef,
-                ),
+                ("key", key.clone()),
                 ("value", Arc::new(Int32Array::from(vec![value])) as ArrayRef),
             ])
             .unwrap();

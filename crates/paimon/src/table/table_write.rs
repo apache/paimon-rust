@@ -45,7 +45,7 @@ use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
-use crate::table::write_batch_normalize::{normalize_blob_write_field, normalize_write_field};
+use crate::table::write_batch_normalize::normalize_append_column;
 use crate::table::{Snapshot, Table, TableScan};
 use crate::Result;
 use arrow_array::{Array, ArrayRef, Int8Array, RecordBatch};
@@ -1114,13 +1114,12 @@ impl TableWrite {
         let mut normalized_fields = Vec::with_capacity(actual_field_count);
         for (index, expected_field) in expected_schema.fields().iter().enumerate() {
             let actual_field = actual_schema.field(index);
-            crate::arrow::validate_geoarrow_write(actual_field, expected_field)?;
-            let normalized = if blob_maps.contains(expected_field.name().as_str()) {
-                normalize_blob_write_field(batch.column(index), expected_field)
-            } else {
-                normalize_write_field(batch.column(index), expected_field, None)
-                    .map(|column| (expected_field.as_ref().clone(), column))
-            };
+            let normalized = normalize_append_column(
+                batch,
+                index,
+                expected_field,
+                blob_maps.contains(expected_field.name().as_str()),
+            );
             let (field, column) = normalized
                 .map_err(|error| crate::Error::DataInvalid {
                     message: format!(

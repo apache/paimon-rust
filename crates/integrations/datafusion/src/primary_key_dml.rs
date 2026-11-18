@@ -146,7 +146,6 @@ pub(crate) async fn plan_input(
             "SELECT {projection} FROM {table_ref}{where_clause}"
         ))
         .await?;
-    let matched = crate::geospatial::validate_dml_filters(matched)?;
     let is_live_target = |provider: &PaimonTableProvider| {
         let source = provider.table();
         source.identifier() == table.identifier()

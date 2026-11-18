@@ -209,10 +209,7 @@ async fn execute_update_once(
     let query_sql = format!(
         "SELECT {select_clause} FROM (SELECT * FROM {table_ref}{selection_clause}) AS {alias}"
     );
-    let df = ctx.ctx().sql(&query_sql).await?;
-    let batches = crate::geospatial::validate_dml_filters(df)?
-        .collect()
-        .await?;
+    let batches = ctx.ctx().sql(&query_sql).await?.collect().await?;
 
     // 4. Project update columns (rename __upd_X → X)
     let total_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -338,10 +335,7 @@ async fn execute_cow_update_inner(
         "SELECT {select_clause} FROM \
          (SELECT * FROM {cow_table_name} AS {alias}{selection_clause}) AS {alias}"
     );
-    let df = ctx.sql(&query_sql).await?;
-    let join_result = crate::geospatial::validate_dml_filters(df)?
-        .collect()
-        .await?;
+    let join_result = ctx.sql(&query_sql).await?.collect().await?;
 
     let mut update_value_batches: Vec<RecordBatch> = Vec::new();
     let mut batch_counter: usize = 0;

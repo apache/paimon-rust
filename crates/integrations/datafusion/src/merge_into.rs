@@ -133,15 +133,6 @@ pub(crate) fn plan_merge(
         .fields()
         .iter()
         .any(|f| paimon::arrow::contains_geoarrow_wkb(f));
-    if has_geo {
-        for condition in std::iter::once(&on).chain(
-            clauses
-                .iter()
-                .filter_map(|clause| clause.predicate.as_ref()),
-        ) {
-            crate::geospatial::validate_comparisons(condition, &merge_schema)?;
-        }
-    }
     // DataFusion 55 retains every DML input field. Add a physical projection
     // before executing the source so scan pushdown can avoid unused payloads.
     let mut required = on.column_refs();

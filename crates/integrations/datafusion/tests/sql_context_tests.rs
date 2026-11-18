@@ -3811,7 +3811,7 @@ async fn geospatial_empty_temp_ctas_keeps_declared_type_and_name() {
 }
 
 #[tokio::test]
-async fn geospatial_mutations_reject_mismatched_coordinate_systems() {
+async fn geospatial_mutations_check_assignments_and_use_wkb_equality() {
     let (_tmp, catalog) = create_test_env();
     let ctx = create_sql_context(catalog).await;
     let point = "decode('0101000000000000000000F03F0000000000000040', 'hex')";
@@ -3837,12 +3837,6 @@ async fn geospatial_mutations_reject_mismatched_coordinate_systems() {
         .unwrap();
         for sql in [
             format!("UPDATE {name} SET a=b"),
-            format!("UPDATE {name} SET id=2 WHERE a=b"),
-            format!("DELETE FROM {name} WHERE a=b"),
-            format!("UPDATE {name} SET id=2 WHERE a IN (a,b)"),
-            format!("DELETE FROM {name} WHERE a BETWEEN a AND b"),
-            format!("MERGE INTO {name} t USING {name} s ON t.a=s.b WHEN MATCHED THEN UPDATE SET id=2"),
-            format!("MERGE INTO {name} t USING {name} s ON t.id=s.id WHEN MATCHED AND t.a=s.b THEN UPDATE SET id=2"),
             format!("MERGE INTO {name} t USING {name} s ON t.id=s.id WHEN MATCHED THEN UPDATE SET a=s.b"),
             format!("MERGE INTO {name} t USING {name} s ON t.id=s.id+1 WHEN NOT MATCHED THEN INSERT(id,a) VALUES(s.id+1,s.b)"),
         ] {
@@ -3857,7 +3851,7 @@ async fn geospatial_mutations_reject_mismatched_coordinate_systems() {
             );
         }
         let merge = format!(
-            "MERGE INTO {name} t USING {name} s ON t.id=s.id WHEN MATCHED \
+            "MERGE INTO {name} t USING {name} s ON t.a=s.b WHEN MATCHED \
              THEN UPDATE SET bytes=CAST(s.a AS BYTEA), a=CAST(s.txt AS BYTEA)"
         );
         ctx.sql(&merge).await.unwrap().collect().await.unwrap();

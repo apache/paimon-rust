@@ -17,7 +17,7 @@
 
 //! Sparse Blob updates compatible with Java BlobFallbackRecordReader.
 
-use super::{matched_column, matched_column_index, FileRowRange};
+use super::{cast_matched_column, matched_column, FileRowRange};
 use crate::spec::{CoreOptions, DataField, DataFileMeta};
 use crate::table::Table;
 use crate::Result;
@@ -150,13 +150,7 @@ pub(super) fn delta_batch(
     let target = update_arrow_type(schema.field(0), batches)?;
     let mut arrays = vec![arrow_array::new_null_array(&target, 1)];
     for batch in batches {
-        let index = matched_column_index(batch, field.name())?;
-        crate::arrow::validate_geoarrow_write(batch.schema().field(index), schema.field(0))?;
-        arrays.push(super::super::update_input::cast_update_value(
-            batch.column(index),
-            &target,
-            super::super::update_input::CastMode::RowUpdate,
-        )?);
+        arrays.push(cast_matched_column(batch, schema.field(0), &target)?);
     }
     let mut indices = vec![(0, 0); length];
     for &(offset, batch, row) in matches {

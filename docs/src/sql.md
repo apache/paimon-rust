@@ -450,7 +450,9 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 
 DataFusion accepts WKB bytes on insert and returns Arrow binary columns with
 the `geoarrow.wkb` extension on direct projection. The field metadata carries
-the CRS and, for geography, the edge algorithm. Spatial operations such as
+the CRS and, for geography, the edge algorithm. Assigning one geo column to
+another requires the same logical type, CRS, and edge algorithm. DataFusion
+compares WKB bytes for SQL equality, even across different CRSs. Spatial operations such as
 `ST_Intersects` require a separate spatial function provider.
 Use Parquet when exchanging geospatial data with Java Paimon. The Rust Row
 format also accepts WKB, but the Java Row reader and writer do not handle these types.
