@@ -396,7 +396,7 @@ fn update_inferred_variant_schema(
             }
             _ => field.data_type().clone(),
         };
-        fields.push(data_field_with_type(field, data_type));
+        fields.push(field.clone().with_data_type(data_type));
     }
     Ok(RowType::new(fields))
 }
@@ -418,14 +418,9 @@ fn physical_fields_for_configured_shredding(
                     .unwrap_or_else(|| field.data_type().clone()),
                 _ => field.data_type().clone(),
             };
-            Ok(data_field_with_type(field, physical_type))
+            Ok(field.clone().with_data_type(physical_type))
         })
         .collect()
-}
-
-fn data_field_with_type(field: &DataField, data_type: DataType) -> DataField {
-    DataField::new(field.id(), field.name().to_string(), data_type)
-        .with_description(field.description().map(ToString::to_string))
 }
 
 /// Java's VariantShreddingWritePlanFactory: configuration and adaptive evidence
@@ -2343,7 +2338,8 @@ mod tests {
     fn configured_schema_transforms_and_reassembles_variant_batch() {
         let logical_fields = vec![
             DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
-            DataField::new(1, "v".to_string(), DataType::Variant(VariantType::new())),
+            DataField::new(1, "v".to_string(), DataType::Variant(VariantType::new()))
+                .with_generation_expression(Some("future_variant(id)".into())),
         ];
         let options = HashMap::from([(
             "parquet.variant.shreddingSchema".to_string(),
@@ -2360,6 +2356,10 @@ mod tests {
             .unwrap()
             .expect("shredding fields");
         assert_ne!(logical_fields, physical_fields);
+        assert_eq!(
+            physical_fields[1].generation_expression(),
+            Some("future_variant(id)")
+        );
 
         let variants = vec![
             GenericVariant::parse_json(
@@ -3097,7 +3097,8 @@ mod tests {
     fn inferred_schema_transforms_and_reassembles_variant_batch() {
         let logical_fields = vec![
             DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
-            DataField::new(1, "v".to_string(), DataType::Variant(VariantType::new())),
+            DataField::new(1, "v".to_string(), DataType::Variant(VariantType::new()))
+                .with_generation_expression(Some("future_variant(id)".into())),
         ];
         let variants = vec![
             GenericVariant::parse_json(r#"{"age":30,"name":"Alice"}"#).unwrap(),
@@ -3121,6 +3122,10 @@ mod tests {
             infer_variant_shredding_fields(&logical_fields, std::slice::from_ref(&batch), &options)
                 .unwrap()
                 .expect("inferred shredding fields");
+        assert_eq!(
+            physical_fields[1].generation_expression(),
+            Some("future_variant(id)")
+        );
         let DataType::Row(variant_row) = physical_fields[1].data_type() else {
             panic!("expected inferred variant field to become ROW");
         };

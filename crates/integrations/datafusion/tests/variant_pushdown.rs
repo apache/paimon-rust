@@ -19,25 +19,35 @@ mod common;
 
 use datafusion::arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
 use datafusion::physical_plan::displayable;
+use paimon::catalog::Identifier;
+use paimon::spec::{DataField, DataType, IntType, Schema, VariantType};
+use paimon::Catalog;
 use paimon_datafusion::SQLContext;
 
 async fn setup_shredded_variant_table() -> (tempfile::TempDir, SQLContext) {
-    let (tmp, sql_context) = common::setup_sql_context().await;
-    common::exec(
-        &sql_context,
-        r#"
-        CREATE TABLE paimon.test_db.t (
-            id INT,
-            payload VARIANT
-        ) WITH (
-            'file.format' = 'parquet',
-            'variant.shreddingSchema' =
-                '{"type":"ROW","fields":[{"name":"payload","type":{"type":"ROW","fields":[{"name":"age","type":"INT"},{"name":"city","type":"STRING"}]}}]}'
+    let (tmp, catalog) = common::create_test_env();
+    catalog
+        .create_database("test_db", false, Default::default())
+        .await
+        .unwrap();
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .field(
+            DataField::new(1, "payload".into(), DataType::Variant(VariantType::new()))
+                .with_generation_expression(Some("future_variant(id)".into())),
         )
-        "#,
-    )
-    .await;
-    (tmp, sql_context)
+        .option("file.format", "parquet")
+        .option(
+            "variant.shreddingSchema",
+            r#"{"type":"ROW","fields":[{"name":"payload","type":{"type":"ROW","fields":[{"name":"age","type":"INT"},{"name":"city","type":"STRING"}]}}]}"#,
+        )
+        .build()
+        .unwrap();
+    catalog
+        .create_table(&Identifier::new("test_db", "t"), schema, false)
+        .await
+        .unwrap();
+    (tmp, common::create_sql_context(catalog).await)
 }
 
 async fn setup_shredded_variant_table_with_rows() -> (tempfile::TempDir, SQLContext) {
@@ -104,6 +114,23 @@ async fn variant_get_projection_pushes_extractions_into_scan() {
     assert!(
         plan_text.contains("PushedVariants=[payload=[$.age,$.city]]"),
         "plan should push variant extractions, got:\n{plan_text}"
+    );
+    let mut nodes = vec![&plan];
+    let scan = loop {
+        let node = nodes.pop().expect("Paimon scan in the physical plan");
+        if node.name() == "PaimonTableScan" {
+            break node;
+        }
+        nodes.extend(node.children());
+    };
+    assert_eq!(
+        scan.schema()
+            .field_with_name("payload")
+            .unwrap()
+            .metadata()
+            .get("paimon:generationExpression")
+            .map(String::as_str),
+        Some("future_variant(id)")
     );
 
     let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();

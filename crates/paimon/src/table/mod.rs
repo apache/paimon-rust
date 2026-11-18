@@ -233,6 +233,7 @@ pub use format_partition::{
 };
 pub use format_partition_stats::FormatTablePartitionStatsCollector;
 pub use format_partition_truncate::FormatTableTruncator;
+pub(crate) use format_table_defaults::validate_default_value;
 pub use full_text_search_builder::{
     FullTextRead, FullTextScan, FullTextScanPlan, FullTextSearchBuilder,
 };

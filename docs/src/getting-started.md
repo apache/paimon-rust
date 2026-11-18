@@ -540,6 +540,51 @@ let tables = catalog.list_tables("my_db").await?;
 let table = catalog.get_table(&identifier).await?;
 ```
 
+### Generated-column metadata
+
+Paimon Rust preserves Java's optional `generationExpression` field in schema
+JSON, including through catalog loading and schema changes. For example:
+
+```json
+{
+  "id": 3,
+  "name": "event_year",
+  "type": "INT",
+  "generationExpression": "YEAR(event_time)"
+}
+```
+
+Missing or null expressions describe ordinary columns and are omitted when
+serialized. `DataField::generation_expression()` exposes the stored expression;
+`with_generation_expression(...)` sets it. Field copies and
+`SchemaBuilder::field(...)` preserve it, with the builder assigning new field
+IDs. Arrow schema conversions retain it in field metadata under
+`paimon:generationExpression`. The Python `DataField` wrapper also provides
+`generation_expression()`.
+
+Schema evolution rejects renaming, dropping or changing the type (including
+nullability) or expression of a generated column. It also rejects renaming,
+dropping or changing the type or nullability of a referenced column before
+publishing a new schema. Validation compares the final field definitions by
+stable field ID, after options have been applied and nullability normalized.
+Unrelated column changes, comments, options and column reordering remain
+available when they preserve these definitions. Dependency analysis follows
+Java's top-level field references, scalar calls and `CAST` syntax. If an
+expression uses unknown syntax, renaming, dropping or changing the type of
+existing columns is rejected conservatively. Adding ordinary columns, updating
+comments or options, and reordering columns remain possible under the same
+rules. Top-level generated columns can only be defined when creating a table.
+CREATE and ALTER reject generated columns nested inside ROW, ARRAY, MULTISET
+or MAP types. Generated columns cannot have a default value or serve as
+`rowkind.field`. Type changes also validate any existing default against the
+new type before publishing the schema.
+
+This support preserves metadata and reads existing stored generated values.
+Rust does not evaluate generation expressions or support SQL
+`GENERATED ALWAYS AS` authoring. Writers must explicitly supply the generated
+values they want to store; omitting a column does not compute its expression.
+Supplied values, including NULL where the schema permits it, are not recomputed.
+
 ## Reading a Table
 
 Paimon Rust uses a scan-then-read pattern: first scan the table to produce splits, then read data from those splits as Arrow `RecordBatch` streams.

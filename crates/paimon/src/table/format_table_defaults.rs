@@ -48,32 +48,16 @@ impl FormatTableDefaults {
                 field
                     .default_value()
                     .map(|text| {
-                        // Java DefaultValueUtils removes one pair of outer
-                        // single quotes before casting from VARCHAR.
-                        let text = text
-                            .strip_prefix('\'')
-                            .and_then(|text| text.strip_suffix('\''))
-                            .unwrap_or(text);
-                        let value = cast_default(field.data_type(), text, schema.field(index))
-                            .map_err(|source| Error::DataInvalid {
+                        parse_default(field.data_type(), text, schema.field(index)).map_err(
+                            |source| Error::DataInvalid {
                                 message: format!(
                                     "Unsupported default value '{}' for Format Table column '{}'",
-                                    field.default_value().unwrap_or_default(),
+                                    text,
                                     field.name()
                                 ),
                                 source: Some(Box::new(source)),
-                            })?;
-                        if value.is_null(0) {
-                            return Err(Error::DataInvalid {
-                                message: format!(
-                                    "Unsupported default value '{}' for Format Table column '{}'",
-                                    field.default_value().unwrap_or_default(),
-                                    field.name()
-                                ),
-                                source: None,
-                            });
-                        }
-                        Ok(value)
+                            },
+                        )
                     })
                     .transpose()
             })
@@ -126,6 +110,41 @@ impl FormatTableDefaults {
             }
         })
     }
+}
+
+pub(crate) fn validate_default_value(data_type: &DataType, text: Option<&str>) -> Result<()> {
+    let Some(text) = text else {
+        return Ok(());
+    };
+    let field = ArrowField::new(
+        "",
+        crate::arrow::paimon_type_to_arrow(data_type)?,
+        data_type.is_nullable(),
+    );
+    parse_default(data_type, text, &field)
+        .map(|_| ())
+        .map_err(|source| Error::DataInvalid {
+            message: format!("Unsupported default value '{text}' for type {data_type:?}"),
+            source: Some(Box::new(source)),
+        })
+}
+
+fn parse_default(
+    data_type: &DataType,
+    text: &str,
+    arrow_field: &ArrowField,
+) -> std::result::Result<ArrayRef, ArrowError> {
+    let text = text
+        .strip_prefix('\'')
+        .and_then(|text| text.strip_suffix('\''))
+        .unwrap_or(text);
+    let value = cast_default(data_type, text, arrow_field)?;
+    if value.is_null(0) {
+        return Err(ArrowError::CastError(format!(
+            "Cannot cast default value '{text}' to {data_type:?}"
+        )));
+    }
+    Ok(value)
 }
 
 fn cast_default(
