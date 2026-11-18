@@ -44,7 +44,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::dml::{MergeIntoAction, MergeIntoClause, MergeIntoClauseKind};
 use datafusion::logical_expr::execution_props::ExecutionProps;
-use datafusion::logical_expr::{col, expr::Case, lit, Expr, JoinType, Operator};
+use datafusion::logical_expr::{col, expr::Case, lit, Expr, ExprSchemable, JoinType, Operator};
 use datafusion::physical_expr::{expressions::Column as PhysicalColumn, PhysicalExpr};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan};
@@ -129,6 +129,19 @@ pub(crate) fn plan_merge(
         ));
     }
     let target_len = merge_schema.fields().len() - source.schema().fields().len();
+    let has_geo = merge_schema
+        .fields()
+        .iter()
+        .any(|f| paimon::arrow::contains_geoarrow_wkb(f));
+    if has_geo {
+        for condition in std::iter::once(&on).chain(
+            clauses
+                .iter()
+                .filter_map(|clause| clause.predicate.as_ref()),
+        ) {
+            crate::geospatial::validate_comparisons(condition, &merge_schema)?;
+        }
+    }
     // DataFusion 55 retains every DML input field. Add a physical projection
     // before executing the source so scan pushdown can avoid unused payloads.
     let mut required = on.column_refs();
@@ -185,6 +198,23 @@ pub(crate) fn plan_merge(
     }
     let mut update_columns = Vec::new();
     let mut matched_count = 0;
+    let check_assignment = |name: &str, expr: &Expr| -> DFResult<()> {
+        if !has_geo {
+            return Ok(());
+        }
+        let (_, target) = merge_schema
+            .iter()
+            .take(target_len)
+            .find(|(_, f)| f.name() == name)
+            .ok_or_else(|| DataFusionError::Plan(format!("Unknown MERGE target column {name}")))?;
+        let source = if paimon::arrow::contains_geoarrow_wkb(target) {
+            crate::geospatial::before_coercion(expr)
+        } else {
+            expr
+        };
+        let (_, input) = source.to_field(&merge_schema)?;
+        paimon::arrow::validate_geoarrow_write(&input, target).map_err(to_datafusion_error)
+    };
     for clause in &mut clauses {
         match clause.kind {
             MergeIntoClauseKind::NotMatchedBySource => {
@@ -226,6 +256,7 @@ pub(crate) fn plan_merge(
                         .map_err(to_datafusion_error)?;
                 }
                 for (name, value) in assignments {
+                    check_assignment(name, value)?;
                     if !update_columns.contains(name) {
                         update_columns.push(name.clone());
                     }
@@ -242,7 +273,8 @@ pub(crate) fn plan_merge(
                         .collect();
                 }
                 validate_update_columns(columns, table.schema().fields())?;
-                for value in values {
+                for (name, value) in columns.iter().zip(values) {
+                    check_assignment(name, value)?;
                     *value = bind_expr(value.clone(), &merge_schema, target_len, true)?;
                 }
             }
@@ -682,11 +714,16 @@ impl PaimonMergeSink {
             })
             .map(|index| {
                 let field = self.merge_schema.field(index);
-                datafusion::logical_expr::expr_fn::cast(
-                    Expr::Column(Column::new_unqualified(field.name())),
-                    field.data_type().clone(),
-                )
-                .alias(column_name(index, self.target_len))
+                let column = Expr::Column(Column::new_unqualified(field.name()));
+                let expr = if field.extension_type_name() == Some("geoarrow.wkb") {
+                    Expr::Cast(datafusion::logical_expr::Cast::new_from_field(
+                        Box::new(column),
+                        field.clone(),
+                    ))
+                } else {
+                    datafusion::logical_expr::expr_fn::cast(column, field.data_type().clone())
+                };
+                expr.alias(column_name(index, self.target_len))
             })
             .collect()
     }
@@ -931,11 +968,14 @@ pub(crate) fn project_update_columns(
                 DataFusionError::Internal(format!("Column {prefixed} not found: {e}"))
             })?;
             columns.push(batch.column(idx).clone());
-            fields.push(Field::new(
-                col,
-                batch.schema().field(idx).data_type().clone(),
-                true,
-            ));
+            fields.push(
+                batch
+                    .schema()
+                    .field(idx)
+                    .clone()
+                    .with_name(col)
+                    .with_nullable(true),
+            );
         }
 
         let schema = Arc::new(Schema::new(fields));

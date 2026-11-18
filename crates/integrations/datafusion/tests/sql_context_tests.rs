@@ -3669,6 +3669,264 @@ async fn test_vector_sql_cast_preserves_nested_nullability() {
 }
 
 #[tokio::test]
+async fn geospatial_sql_write_read_and_show_create() {
+    use datafusion::arrow::array::BinaryArray;
+    use paimon::arrow::arrow_field_to_paimon_type;
+
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    ctx.sql("CREATE TABLE shapes (id INT, geom GEOMETRY('EPSG:4326'), geog GEOGRAPHY('OGC:CRS84', karney))")
+        .await.unwrap();
+    let ddl = collect_definition(&ctx, "shapes").await;
+    assert!(ddl.contains("GEOMETRY('EPSG:4326')"), "{ddl}");
+    assert!(ddl.contains("GEOGRAPHY('OGC:CRS84', karney)"), "{ddl}");
+
+    // Little-endian WKB POINT (1 2), also used by Java GeospatialTypeTableTest.
+    let point = "0101000000000000000000F03F0000000000000040";
+    ctx.sql(&format!("INSERT INTO shapes VALUES (1, decode('{point}', 'hex'), NULL), (2, NULL, decode('{point}', 'hex'))"))
+        .await.unwrap().collect().await.unwrap();
+    let batches = ctx
+        .sql("SELECT geom, geog FROM shapes ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let batch = datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    let expected = [
+        1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64,
+    ];
+    for (i, ty) in ["GEOMETRY(EPSG:4326)", "GEOGRAPHY(OGC:CRS84, karney)"]
+        .iter()
+        .enumerate()
+    {
+        let schema = batch.schema();
+        let field = schema.field(i);
+        assert_eq!(field.extension_type_name(), Some("geoarrow.wkb"));
+        assert_eq!(arrow_field_to_paimon_type(field).unwrap().to_string(), *ty);
+        let values = batch
+            .column(i)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(i), expected);
+        assert!(values.is_null(1 - i));
+    }
+}
+
+#[tokio::test]
+async fn geospatial_assignments_preserve_source_crs_and_edges() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog.clone()).await;
+    for ddl in [
+        "CREATE TABLE src (g GEOMETRY('EPSG:4326'), a ARRAY<GEOGRAPHY>)",
+        "CREATE TABLE dst (g GEOMETRY('EPSG:3857'), a ARRAY<GEOGRAPHY('OGC:CRS84', karney)>)",
+        "CREATE TABLE dst_partition (g GEOMETRY('EPSG:3857'), p INT) PARTITIONED BY (p)",
+    ] {
+        ctx.sql(ddl).await.unwrap();
+    }
+    ctx.sql("INSERT INTO src VALUES (NULL, NULL)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    for sql in [
+        "INSERT INTO dst (g) SELECT g FROM src",
+        "INSERT INTO dst (a) SELECT a FROM src",
+        "INSERT OVERWRITE dst_partition PARTITION (p = 1) SELECT g FROM src",
+        "SELECT CAST(g AS GEOMETRY('EPSG:3857')) FROM src",
+        "SELECT CAST('POINT (1 2)' AS GEOMETRY)",
+        "INSERT INTO dst (g) SELECT 'POINT (1 2)'",
+        "INSERT INTO dst (g) VALUES ('POINT (1 2)')",
+        "CREATE TEMPORARY TABLE swapped (g GEOMETRY('EPSG:3857')) AS SELECT g FROM src",
+    ] {
+        let result = match ctx.sql(sql).await {
+            Ok(df) => df.collect().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        assert!(
+            result.is_err(),
+            "incompatible geospatial assignment succeeded: {sql}"
+        );
+    }
+    for sql in [
+        "INSERT INTO dst (g) VALUES (CAST(CAST(NULL AS VARCHAR) AS BYTEA))",
+        "INSERT INTO dst (a, g) SELECT NULL, CAST(g AS BYTEA) FROM src",
+    ] {
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    }
+
+    let plain = datafusion::prelude::SessionContext::new();
+    for name in ["src", "dst"] {
+        let table = catalog
+            .get_table(&Identifier::new("default", name))
+            .await
+            .unwrap();
+        plain
+            .register_table(
+                name,
+                Arc::new(paimon_datafusion::PaimonTableProvider::try_new(table).unwrap()),
+            )
+            .unwrap();
+    }
+    let insert = plain
+        .sql("INSERT INTO dst (a) SELECT a FROM src")
+        .await
+        .unwrap();
+    let error = insert
+        .collect()
+        .await
+        .expect_err("incompatible nested CRS in plain DataFusion session");
+    assert!(error.to_string().contains("karney"), "{error}");
+}
+
+#[tokio::test]
+async fn geospatial_empty_temp_ctas_keeps_declared_type_and_name() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    ctx.sql("CREATE TEMPORARY TABLE no_rows (bytes BYTEA)")
+        .await
+        .unwrap();
+    assert!(ctx
+        .sql("SELECT bytes FROM no_rows")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .is_empty());
+    ctx.sql("CREATE TEMPORARY TABLE tmp (g GEOGRAPHY) AS SELECT bytes FROM no_rows")
+        .await
+        .unwrap();
+    let df = ctx.sql("SELECT g FROM tmp").await.unwrap();
+    let field = df.schema().field(0);
+    assert_eq!(
+        paimon::arrow::arrow_field_to_paimon_type(field)
+            .unwrap()
+            .to_string(),
+        "GEOGRAPHY(OGC:CRS84, spherical)"
+    );
+}
+
+#[tokio::test]
+async fn geospatial_mutations_reject_mismatched_coordinate_systems() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    let point = "decode('0101000000000000000000F03F0000000000000040', 'hex')";
+    for (name, options) in [
+        ("cow", ""),
+        (
+            "de",
+            "WITH ('row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true', 'deletion-vectors.enabled' = 'true')",
+        ),
+    ] {
+        let ddl = format!(
+            "CREATE TABLE {name} (id INT, a GEOMETRY('EPSG:4326'), \
+             b GEOMETRY('EPSG:3857'), bytes BYTEA, txt VARCHAR) {options}"
+        );
+        ctx.sql(&ddl).await.unwrap();
+        ctx.sql(&format!(
+            "INSERT INTO {name} (id,a,b) VALUES (1,{point},{point})"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        for sql in [
+            format!("UPDATE {name} SET a=b"),
+            format!("UPDATE {name} SET id=2 WHERE a=b"),
+            format!("DELETE FROM {name} WHERE a=b"),
+            format!("UPDATE {name} SET id=2 WHERE a IN (a,b)"),
+            format!("DELETE FROM {name} WHERE a BETWEEN a AND b"),
+            format!("MERGE INTO {name} t USING {name} s ON t.a=s.b WHEN MATCHED THEN UPDATE SET id=2"),
+            format!("MERGE INTO {name} t USING {name} s ON t.id=s.id WHEN MATCHED AND t.a=s.b THEN UPDATE SET id=2"),
+            format!("MERGE INTO {name} t USING {name} s ON t.id=s.id WHEN MATCHED THEN UPDATE SET a=s.b"),
+            format!("MERGE INTO {name} t USING {name} s ON t.id=s.id+1 WHEN NOT MATCHED THEN INSERT(id,a) VALUES(s.id+1,s.b)"),
+        ] {
+            let result = match ctx.sql(&sql).await {
+                Ok(df) => df.collect().await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            let err = result.expect_err(&sql).to_string();
+            assert!(
+                err.contains("EPSG:4326") && err.contains("EPSG:3857"),
+                "{sql}: {err}"
+            );
+        }
+        let merge = format!(
+            "MERGE INTO {name} t USING {name} s ON t.id=s.id WHEN MATCHED \
+             THEN UPDATE SET bytes=CAST(s.a AS BYTEA), a=CAST(s.txt AS BYTEA)"
+        );
+        ctx.sql(&merge).await.unwrap().collect().await.unwrap();
+        let query = format!("SELECT id FROM {name} WHERE bytes={point} AND a IS NULL");
+        let rows = ctx.sql(&query).await.unwrap().collect().await.unwrap();
+        assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
+    }
+}
+
+#[tokio::test]
+async fn geospatial_nested_wkb_read_write() {
+    use datafusion::arrow::array::{BinaryArray, ListArray};
+    use paimon::arrow::arrow_field_to_paimon_type;
+
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    for format in ["row", "parquet"] {
+        let name = format!("shapes_{format}");
+        ctx.sql(&format!(
+            "CREATE TABLE {name} (items ARRAY<GEOGRAPHY>) WITH ('file.format' = '{format}')"
+        ))
+        .await
+        .unwrap();
+        let point = "0101000000000000000000F03F0000000000000040";
+        ctx.sql(&format!(
+            "INSERT INTO {name} VALUES ([decode('{point}', 'hex'), CAST(NULL AS BYTEA)]), (NULL)"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        let batches = ctx
+            .sql(&format!("SELECT items FROM {name} ORDER BY items IS NULL"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let batch =
+            datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(
+            arrow_field_to_paimon_type(batch.schema().field(0))
+                .unwrap()
+                .to_string(),
+            "ARRAY<GEOGRAPHY(OGC:CRS84, spherical)>"
+        );
+        let list = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.value_offsets(), &[0, 2, 2]);
+        assert!(list.is_null(1));
+        let values = list
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(
+            values.value(0),
+            &[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64]
+        );
+        assert!(values.is_null(1));
+    }
+}
+
+#[tokio::test]
 async fn test_vector_sql_cast_and_write() {
     use datafusion::arrow::array::{BooleanArray, FixedSizeListArray, Float32Array, ListArray};
 

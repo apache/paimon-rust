@@ -930,12 +930,12 @@ fn apply_field_updates(
     matches: &[(usize, usize, usize)],
 ) -> Result<ArrayRef> {
     if update_columns.iter().any(|column| column == path) {
-        let updated = interleave_updated_leaf(path, original, matched_batches, matches)?;
+        let target = crate::arrow::paimon_type_to_arrow_field(path, write_field.data_type())?;
+        let updated = interleave_updated_leaf(&target, original, matched_batches, matches)?;
         // Readers allow runtime NULLs and relax nested field nullability.
         // Restore the declared write layout, validating only visible children,
         // before constructing a partial-column file with the table schema.
-        let target = crate::arrow::paimon_type_to_arrow(write_field.data_type())?;
-        return super::write_batch_normalize::normalize_write_array(&updated, &target);
+        return super::write_batch_normalize::normalize_write_field(&updated, &target, None);
     }
 
     let DataType::Row(row) = write_field.data_type() else {
@@ -995,11 +995,12 @@ fn apply_field_updates(
 /// the file's physical row positions. Casts follow the existing top-level
 /// MERGE update behavior.
 fn interleave_updated_leaf(
-    path: &str,
+    target: &arrow_schema::Field,
     original: &ArrayRef,
     matched_batches: &[RecordBatch],
     matches: &[(usize, usize, usize)],
 ) -> Result<ArrayRef> {
+    let path = target.name();
     let mut batch_arrays = Vec::<ArrayRef>::new();
     let mut batch_id_map = HashMap::<usize, usize>::new();
     let mut gather = Vec::with_capacity(matches.len());
@@ -1007,9 +1008,11 @@ fn interleave_updated_leaf(
         let array_idx = if let Some(index) = batch_id_map.get(&batch_idx) {
             *index
         } else {
-            let value = matched_column(&matched_batches[batch_idx], path)?;
+            let batch = &matched_batches[batch_idx];
+            let index = matched_column_index(batch, path)?;
+            crate::arrow::validate_geoarrow_write(batch.schema().field(index), target)?;
             let value = super::update_input::cast_update_value(
-                &value,
+                batch.column(index),
                 original.data_type(),
                 super::update_input::CastMode::RowUpdate,
             )?;

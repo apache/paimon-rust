@@ -35,7 +35,7 @@ use super::global_index_freshness::indexed_columns_unchanged;
 use super::key_normalization::canonical_partition_key;
 use super::update_input::unique_column_index;
 use super::upsert_key_matcher::UpsertKeyMatcher;
-use super::write_batch_normalize::{normalize_blob_write_field, normalize_write_array};
+use super::write_batch_normalize::{normalize_blob_write_field, normalize_write_field};
 use crate::spec::{
     batch_to_serialized_bytes, extract_datum_from_arrow, CoreOptions, Predicate, PredicateBuilder,
 };
@@ -214,27 +214,26 @@ impl TableUpsert {
             &self.update_columns,
         )?;
         let inline = CoreOptions::new(self.table.schema().options()).blob_inline_fields();
+        let input = batch.schema();
         let mut fields = Vec::new();
         let mut columns = Vec::new();
         for (index, field) in target.fields().iter().enumerate() {
-            let Some(column) = batch.column_by_name(field.name()) else {
+            let Ok(input_index) = input.index_of(field.name()) else {
                 // The row-ID updater diagnoses missing update columns. Absent
                 // append columns stay absent in the file's write_cols metadata.
                 continue;
             };
+            let column = batch.column(input_index);
+            let actual = input.field(input_index);
             let logical = &self.table.schema().fields()[index];
             let update_field = update_fields
                 .iter()
                 .find(|updated| updated.name() == field.name());
+            if append {
+                crate::arrow::validate_geoarrow_write(actual, field)?;
+            }
             let normalized = if !append && update_field.is_none() {
-                Ok((
-                    batch
-                        .schema()
-                        .field_with_name(field.name())
-                        .unwrap()
-                        .clone(),
-                    column.clone(),
-                ))
+                Ok((actual.clone(), column.clone()))
             } else if logical.data_type().is_blob_file_field()
                 && !inline.contains(logical.name())
                 && (append || matches!(logical.data_type(), crate::spec::DataType::Map(_)))
@@ -244,20 +243,14 @@ impl TableUpsert {
                 if append {
                     normalize_blob_write_field(column, field)
                 } else {
+                    crate::arrow::validate_geoarrow_write(actual, field)?;
                     super::write_batch_normalize::normalize_blob_update_field(column, field)
                 }
             } else if append {
-                normalize_write_array(column, field.data_type())
+                normalize_write_field(column, field, None)
                     .map(|column| (field.as_ref().clone(), column))
             } else {
-                Ok((
-                    batch
-                        .schema()
-                        .field_with_name(field.name())
-                        .unwrap()
-                        .clone(),
-                    column.clone(),
-                ))
+                Ok((actual.clone(), column.clone()))
             };
             let (field, column) = normalized.map_err(|error| {
                 invalid(format!("Invalid upsert column '{}': {error}", field.name()))
@@ -284,12 +277,15 @@ impl TableUpsert {
             .source
             .iter()
             .map(|batch| {
+                let input = batch.schema();
                 let columns = key_schema
                     .fields()
                     .iter()
                     .map(|field| {
+                        let index = unique_column_index(&input, field.name())?;
+                        crate::arrow::validate_geoarrow_write(input.field(index), field)?;
                         super::key_normalization::normalize_match_key(
-                            batch.column_by_name(field.name()).unwrap(),
+                            batch.column(index),
                             field.data_type(),
                         )
                         .map_err(|error| {
@@ -432,8 +428,9 @@ impl TableUpsert {
                 .iter()
                 .find(|field| field.name() == key)
                 .unwrap();
-            // BLOB keys can be matched as Arrow bytes but have no scalar Datum.
-            if field.data_type().is_blob_type() {
+            // BLOB and geospatial keys match by bytes. Their typed domains
+            // do not support pruning with binary equality/IN predicates.
+            if field.data_type().is_blob_type() || field.data_type().is_geospatial() {
                 continue;
             }
             let mut seen = HashSet::new();

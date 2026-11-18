@@ -1744,6 +1744,8 @@ impl Schema {
                 return Ok(());
             };
             let unsupported = match field.data_type() {
+                DataType::Geometry(_) => Some("GEOMETRY"),
+                DataType::Geography(_) => Some("GEOGRAPHY"),
                 DataType::Map(_) => Some("MAP"),
                 DataType::Array(_) => Some("ARRAY"),
                 DataType::Multiset(_) => Some("MULTISET"),
@@ -1776,6 +1778,23 @@ impl Schema {
         if let Some(bucket_keys) = CoreOptions::new(options).bucket_key() {
             for bk in &bucket_keys {
                 reject("bucket key", bk, true)?;
+            }
+        }
+        if let Some(columns) = options
+            .get("clustering.columns")
+            .or_else(|| options.get("sink.clustering.by-columns"))
+        {
+            for name in columns.split(',').map(str::trim) {
+                if fields
+                    .iter()
+                    .any(|f| f.name() == name && f.data_type().contains_geospatial())
+                {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Geospatial column '{name}' cannot be a clustering column."
+                        ),
+                    });
+                }
             }
         }
         Ok(())
@@ -2259,9 +2278,14 @@ impl Schema {
 
         let mut seen: HashSet<&str> = HashSet::new();
         for name in &sequence_fields {
-            if fields.iter().all(|f| f.name() != *name) {
+            let Some(field) = fields.iter().find(|f| f.name() == *name) else {
                 return Err(crate::Error::ConfigInvalid {
                     message: format!("Sequence field '{name}' can not be found in table schema."),
+                });
+            };
+            if field.data_type().is_geospatial() {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!("Geospatial column '{name}' cannot be a sequence field."),
                 });
             }
             if !seen.insert(name) {
@@ -2731,6 +2755,73 @@ mod tests {
                 if message.contains(expected_message)),
             "expected ConfigInvalid containing '{expected_message}', got {error:?}"
         );
+    }
+
+    #[test]
+    fn geospatial_columns_cannot_be_keys_or_ordering_fields() {
+        let geo = DataType::Geometry(crate::spec::GeometryType::default());
+        let schema = || Schema::builder().column("g", geo.clone());
+        assert_config_invalid(schema().primary_key(["g"]).build(), "primary key");
+        assert_config_invalid(schema().partition_keys(["g"]).build(), "partition key");
+        assert_config_invalid(schema().option("bucket-key", "g").build(), "bucket key");
+        assert_config_invalid(
+            schema().option("sequence.field", "g").build(),
+            "sequence field",
+        );
+        assert_config_invalid(
+            Schema::builder()
+                .column("items", DataType::Array(ArrayType::new(geo)))
+                .option("clustering.columns", "items")
+                .build(),
+            "clustering column",
+        );
+    }
+
+    #[test]
+    fn alter_geospatial_children_preserves_the_interpretation_of_existing_wkb() {
+        use crate::spec::{EdgeAlgorithm, GeographyType, GeometryType, SchemaChange};
+
+        let geometry = |crs| DataType::Geometry(GeometryType::new(crs).unwrap());
+        let geography =
+            |algorithm| DataType::Geography(GeographyType::new("OGC:CRS84", algorithm).unwrap());
+        let nested = |element| {
+            DataType::Map(MapType::new(
+                DataType::Int(IntType::new()),
+                DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                    DataField::new(1, "shape".into(), element),
+                ])))),
+            ))
+        };
+        let binary = DataType::VarBinary(crate::spec::VarBinaryType::new(128).unwrap());
+        for (source, target) in [
+            (geometry("EPSG:4326"), geometry("EPSG:3857")),
+            (geometry("OGC:CRS84"), geography(EdgeAlgorithm::Spherical)),
+            (
+                geography(EdgeAlgorithm::Karney),
+                geography(EdgeAlgorithm::Thomas),
+            ),
+            (geometry("EPSG:4326"), binary.clone()),
+            (binary, geometry("EPSG:4326")),
+        ] {
+            let schema = Schema::builder()
+                .column("shapes", nested(source))
+                .build()
+                .unwrap();
+            let change = SchemaChange::update_column_type("shapes".into(), nested(target));
+            assert!(matches!(
+                TableSchema::new(0, &schema).apply_changes(vec![change]),
+                Err(crate::Error::Unsupported { message }) if message.contains("cannot be converted")
+            ));
+        }
+        let schema = Schema::builder()
+            .column("shapes", nested(geometry("EPSG:4326")))
+            .build()
+            .unwrap();
+        let change =
+            SchemaChange::update_column_type("shapes".into(), nested(geometry("epsg:4326")));
+        TableSchema::new(0, &schema)
+            .apply_changes(vec![change])
+            .unwrap();
     }
 
     fn build_vector_index_test_schema(

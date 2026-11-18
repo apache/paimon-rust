@@ -32,9 +32,13 @@ fn table() -> Table {
 }
 
 fn table_at(name: &str) -> Table {
+    table_with_id_type(name, DataType::Int(IntType::new()))
+}
+
+fn table_with_id_type(name: &str, id_type: DataType) -> Table {
     let schema = Schema::builder()
         .option("write-only", "true")
-        .column("id", DataType::Int(IntType::new()))
+        .column("id", id_type)
         .column("value", DataType::Int(IntType::new()))
         .option("data-evolution.enabled", "true")
         .option("row-tracking.enabled", "true")
@@ -105,6 +109,88 @@ fn update(condition: Option<MergeCondition>) -> WhenMatched {
             "value".into(),
             MergeAssignment::SourceColumn("value".into()),
         )],
+    }
+}
+
+#[tokio::test]
+async fn geospatial_merge_and_upsert_keys_preserve_the_crs() {
+    use crate::arrow::paimon_type_to_arrow_field;
+    use crate::spec::GeometryType;
+    use arrow_array::BinaryArray;
+    use arrow_schema::{Field, Schema as ArrowSchema};
+
+    let geometry = |crs| DataType::Geometry(GeometryType::new(crs).unwrap());
+    let target = table_with_id_type("geo_match", geometry("EPSG:4326"));
+    let point = [
+        1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64,
+    ];
+    let input = |crs, value| {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                paimon_type_to_arrow_field("id", &geometry(crs)).unwrap(),
+                Field::new("value", arrow_schema::DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(BinaryArray::from(vec![point.as_slice()])),
+                Arc::new(Int32Array::from(vec![value])),
+            ],
+        )
+        .unwrap()
+    };
+    seed(&target, &input("EPSG:4326", 0)).await;
+    for (upsert, new_value) in [(false, 42), (true, 43)] {
+        let mut writer = target.new_write_builder().new_update().unwrap();
+        writer.with_update_type(vec!["value".into()]).unwrap();
+        for crs in ["EPSG:3857", "EPSG:4326"] {
+            let source = vec![input(crs, new_value)];
+            let result = if upsert {
+                writer
+                    .upsert_by_arrow_with_key(source, vec!["id".into()])
+                    .await
+            } else {
+                writer
+                    .merge_into(
+                        MergeSource::Batches(source),
+                        vec![("id".into(), "id".into())],
+                        vec![update(None)],
+                        vec![],
+                    )
+                    .await
+            };
+            if crs == "EPSG:3857" {
+                let error = result.expect_err("identical WKB in different CRSs must not match");
+                assert!(error.to_string().contains("EPSG:3857"), "{error}");
+            } else {
+                TableCommit::new(target.clone(), "geo-match".into())
+                    .commit(result.unwrap())
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut reader = target.new_read_builder();
+        reader.with_projection(&["value"]).unwrap();
+        let plan = reader.new_scan().plan().await.unwrap();
+        let batches: Vec<_> = reader
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .iter()
+                })
+                .collect::<Vec<_>>(),
+            [Some(new_value)]
+        );
     }
 }
 

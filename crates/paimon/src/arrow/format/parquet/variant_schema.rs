@@ -118,12 +118,44 @@ fn with_id(field: &FieldRef, id: i32) -> FieldRef {
     Arc::new(field.as_ref().clone().with_metadata(metadata))
 }
 
+/// Java's footer converter requires field IDs throughout a geospatial file.
+/// Keep these IDs in the Parquet descriptor. Adding them to the embedded Arrow
+/// schema could change an ordinary ROW(value, metadata) into a VARIANT.
+pub(super) fn with_parquet_field_ids(schema: &Schema, fields: &[DataField]) -> Schema {
+    let by_name: std::collections::HashMap<_, _> =
+        fields.iter().map(|field| (field.name(), field)).collect();
+    let arrow_fields = schema
+        .fields()
+        .iter()
+        .map(|arrow| {
+            let Some(field) = by_name.get(arrow.name().as_str()) else {
+                return arrow.clone();
+            };
+            let ty = annotated_type(arrow.data_type(), field.data_type(), field.id(), 0);
+            with_id(
+                &Arc::new(arrow.as_ref().clone().with_data_type(ty)),
+                field.id(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Schema::new_with_metadata(arrow_fields, schema.metadata().clone())
+}
+
 fn annotated_type(
     arrow: &ArrowDataType,
     data_type: &DataType,
     field_id: i32,
     depth: i32,
 ) -> ArrowDataType {
+    let collection_child = |child: &FieldRef, ty: &DataType, key: bool| {
+        // Java SpecialFields derives collection child IDs from the enclosing
+        // field and nesting depth. Map keys use the negative offset.
+        let depth = depth + 1;
+        let offset = field_id.wrapping_mul(1 << 10).wrapping_add(depth);
+        let id = (i32::MAX / 4).wrapping_add(if key { offset.wrapping_neg() } else { offset });
+        let ty = annotated_type(child.data_type(), ty, field_id, depth);
+        with_id(&Arc::new(child.as_ref().clone().with_data_type(ty)), id)
+    };
     match (arrow, data_type) {
         (ArrowDataType::Struct(children), DataType::Row(row)) => ArrowDataType::Struct(
             children
@@ -150,19 +182,33 @@ fn annotated_type(
                 .into(),
         ),
         (ArrowDataType::List(element), DataType::Array(array)) => {
-            // Java SpecialFields.getArrayElementFieldId. Nested ROW children
-            // reset depth; consecutive ARRAY levels retain the parent field ID.
-            let next_depth = depth + 1;
-            let id = (i32::MAX / 4)
-                .wrapping_add(field_id.wrapping_mul(1 << 10))
-                .wrapping_add(next_depth);
-            let element = Arc::new(element.as_ref().clone().with_data_type(annotated_type(
-                element.data_type(),
-                array.element_type(),
-                field_id,
-                next_depth,
-            )));
-            ArrowDataType::List(with_id(&element, id))
+            ArrowDataType::List(collection_child(element, array.element_type(), false))
+        }
+        (ArrowDataType::FixedSizeList(element, size), DataType::Vector(vector)) => {
+            ArrowDataType::FixedSizeList(
+                collection_child(element, vector.element_type(), false),
+                *size,
+            )
+        }
+        (ArrowDataType::Map(entries, sorted), DataType::Map(_) | DataType::Multiset(_)) => {
+            let ArrowDataType::Struct(children) = entries.data_type() else {
+                return arrow.clone();
+            };
+            let count_type = DataType::Int(crate::spec::IntType::new());
+            let (key, value) = match data_type {
+                DataType::Map(m) => (m.key_type(), m.value_type()),
+                DataType::Multiset(m) => (m.element_type(), &count_type),
+                _ => unreachable!(),
+            };
+            let children = vec![
+                collection_child(&children[0], key, true),
+                collection_child(&children[1], value, false),
+            ];
+            let entries = entries
+                .as_ref()
+                .clone()
+                .with_data_type(ArrowDataType::Struct(children.into()));
+            ArrowDataType::Map(Arc::new(entries), *sorted)
         }
         _ => arrow.clone(),
     }

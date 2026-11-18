@@ -26,7 +26,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, RecordBatch};
-use datafusion::arrow::datatypes::{Field, Schema};
+use datafusion::arrow::datatypes::Schema;
 use datafusion::common::Column;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, ExprSchemable};
@@ -141,7 +141,10 @@ async fn execute_primary_key_update(
     let projection = target_schema
         .fields()
         .iter()
-        .map(|field| {
+        .enumerate()
+        .map(|(i, field)| {
+            paimon::arrow::validate_geoarrow_write(input.schema().field(i), field)
+                .map_err(to_datafusion_error)?;
             Expr::Column(Column::from_name(field.name()))
                 .cast_to(field.data_type(), input.schema())
                 .map(|expr| expr.alias(field.name()))
@@ -206,7 +209,10 @@ async fn execute_update_once(
     let query_sql = format!(
         "SELECT {select_clause} FROM (SELECT * FROM {table_ref}{selection_clause}) AS {alias}"
     );
-    let batches = ctx.ctx().sql(&query_sql).await?.collect().await?;
+    let df = ctx.ctx().sql(&query_sql).await?;
+    let batches = crate::geospatial::validate_dml_filters(df)?
+        .collect()
+        .await?;
 
     // 4. Project update columns (rename __upd_X → X)
     let total_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -332,7 +338,10 @@ async fn execute_cow_update_inner(
         "SELECT {select_clause} FROM \
          (SELECT * FROM {cow_table_name} AS {alias}{selection_clause}) AS {alias}"
     );
-    let join_result = ctx.sql(&query_sql).await?.collect().await?;
+    let df = ctx.sql(&query_sql).await?;
+    let join_result = crate::geospatial::validate_dml_filters(df)?
+        .collect()
+        .await?;
 
     let mut update_value_batches: Vec<RecordBatch> = Vec::new();
     let mut batch_counter: usize = 0;
@@ -352,11 +361,14 @@ async fn execute_cow_update_inner(
             let idx = batch.schema().index_of(&prefixed).map_err(|e| {
                 DataFusionError::Internal(format!("Column {prefixed} not found: {e}"))
             })?;
-            upd_fields.push(Field::new(
-                col,
-                batch.schema().field(idx).data_type().clone(),
-                true,
-            ));
+            upd_fields.push(
+                batch
+                    .schema()
+                    .field(idx)
+                    .clone()
+                    .with_name(col)
+                    .with_nullable(true),
+            );
             upd_columns.push(batch.column(idx).clone());
         }
         let upd_schema = Arc::new(Schema::new(upd_fields));

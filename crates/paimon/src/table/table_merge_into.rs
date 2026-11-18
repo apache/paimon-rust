@@ -373,15 +373,18 @@ fn column_assignment(
     batches: &[RecordBatch],
     prefix: &str,
     name: &str,
+    target: &Field,
 ) -> crate::Result<UpdateAssignment> {
     Ok(UpdateAssignment::Array(
         batches
             .iter()
             .map(|batch| {
-                batch
-                    .column_by_name(&format!("{prefix}.{name}"))
-                    .cloned()
-                    .ok_or_else(|| invalid(format!("Missing MERGE {prefix} column {name}")))
+                let schema = batch.schema();
+                let index = schema
+                    .index_of(&format!("{prefix}.{name}"))
+                    .map_err(|_| invalid(format!("Missing MERGE {prefix} column {name}")))?;
+                crate::arrow::validate_geoarrow_write(schema.field(index), target)?;
+                Ok(batch.column(index).clone())
             })
             .collect::<crate::Result<_>>()?,
     ))
@@ -396,19 +399,25 @@ fn assigned(
 ) -> crate::Result<Vec<RecordBatch>> {
     let mut values = Vec::new();
     for name in columns {
+        let target = schema
+            .field_with_name(name)
+            .map_err(|e| invalid(e.to_string()))?;
         let value = assignments
             .iter()
             .find(|(column, _)| column == name)
             .map(|(_, value)| value);
         let assignment = match value {
             Some(MergeAssignment::Value(value)) => value.clone(),
-            Some(MergeAssignment::SourceColumn(column)) => column_assignment(batches, "s", column)?,
-            Some(MergeAssignment::TargetColumn(column)) => column_assignment(batches, "t", column)?,
-            None if insert => UpdateAssignment::Scalar(arrow_array::new_null_array(
-                schema.field_with_name(name).unwrap().data_type(),
-                1,
-            )),
-            None => column_assignment(batches, "t", name)?,
+            Some(MergeAssignment::SourceColumn(column)) => {
+                column_assignment(batches, "s", column, target)?
+            }
+            Some(MergeAssignment::TargetColumn(column)) => {
+                column_assignment(batches, "t", column, target)?
+            }
+            None if insert => {
+                UpdateAssignment::Scalar(arrow_array::new_null_array(target.data_type(), 1))
+            }
+            None => column_assignment(batches, "t", name, target)?,
         };
         values.push((name.clone(), assignment));
     }
@@ -621,23 +630,24 @@ pub(super) async fn merge_into(
     let mut source_keys = HashMap::<Vec<u8>, Vec<usize>>::new();
     let mut seen_source = vec![false; source.as_ref().map_or(0, |source| source.row_count)];
     if let Some(source) = &source {
+        let row_id = Field::new(ROW_ID, DataType::Int64, false);
         let fields = on
             .iter()
             .map(|(target, source_name)| {
-                let source_type = source
+                let source_field = source
                     .schema
                     .field_with_name(source_name)
-                    .map_err(|error| invalid(error.to_string()))?
-                    .data_type();
-                let target_type = if target == ROW_ID {
-                    &DataType::Int64
+                    .map_err(|error| invalid(error.to_string()))?;
+                let target_field = if target == ROW_ID {
+                    &row_id
                 } else {
                     schema
                         .field_with_name(target)
                         .map_err(|error| invalid(error.to_string()))?
-                        .data_type()
                 };
-                let mut logical_source_type = source_type;
+                crate::arrow::validate_geoarrow_write(source_field, target_field)?;
+                let target_type = target_field.data_type();
+                let mut logical_source_type = source_field.data_type();
                 while let DataType::Dictionary(_, value) = logical_source_type {
                     logical_source_type = value;
                 }

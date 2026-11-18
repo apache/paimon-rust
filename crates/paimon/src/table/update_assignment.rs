@@ -120,7 +120,11 @@ pub(super) fn assigned_batches(
         let chunks = chunks
             .iter()
             .filter(|chunk| !chunk.is_empty())
-            .map(|chunk| cast_update_value(chunk, field.data_type(), CastMode::Assignment))
+            .map(|chunk| {
+                let source = arrow_schema::Field::new(&name, chunk.data_type().clone(), true);
+                crate::arrow::validate_geoarrow_write(&source, field)?;
+                cast_update_value(chunk, field.data_type(), CastMode::Assignment)
+            })
             .collect::<crate::Result<Vec<_>>>()?;
         values.push(Values {
             scalar,

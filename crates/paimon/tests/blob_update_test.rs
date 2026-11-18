@@ -390,6 +390,71 @@ fn collection_values(map: bool, values: &[Option<Vec<Option<&[u8]>>>]) -> ArrayR
     }
 }
 
+#[tokio::test]
+async fn geospatial_values_cannot_be_relabelled_by_dedicated_blob_updates() {
+    let table = typed_table(
+        DataType::Map(MapType::new(
+            DataType::VarChar(VarCharType::string_type()),
+            DataType::Blob(BlobType::new()),
+        )),
+        &[],
+    )
+    .await;
+    let builder = table.new_write_builder();
+    let ids = Arc::new(Int32Array::from(vec![0])) as ArrayRef;
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(
+            &RecordBatch::try_from_iter([
+                ("id", ids.clone()),
+                (
+                    "payload",
+                    collection_values(true, &[Some(vec![Some(b"before")])]),
+                ),
+                ("value", ids.clone()),
+            ])
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    builder
+        .new_commit()
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    let geometry = paimon::arrow::paimon_type_to_arrow_field(
+        "value",
+        &DataType::Geometry(paimon::spec::GeometryType::default()),
+    )
+    .unwrap()
+    .with_data_type(arrow_schema::DataType::LargeBinary);
+    let mut map = MapBuilder::new(None, StringBuilder::new(), LargeBinaryBuilder::new())
+        .with_values_field(geometry);
+    let mut point = [0; 21];
+    point[..2].copy_from_slice(&[1, 1]); // Little-endian POINT (0 0).
+    map.keys().append_value("0");
+    map.values().append_value(point);
+    map.append(true).unwrap();
+    let payload = Arc::new(map.finish()) as ArrayRef;
+    let mut update = builder.new_update().unwrap();
+    update.with_update_type(vec!["payload".into()]).unwrap();
+    for (name, id) in [
+        ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+        ("id", ids),
+    ] {
+        let input = RecordBatch::try_from_iter([(name, id), ("payload", payload.clone())]).unwrap();
+        let result = if name == "_ROW_ID" {
+            update.update_by_arrow_with_row_id(vec![input]).await
+        } else {
+            update
+                .upsert_by_arrow_with_key(vec![input], vec!["id".into()])
+                .await
+        };
+        let error = result.expect_err("annotated WKB must not be written to a BLOB");
+        assert!(error.to_string().contains("GEOMETRY"), "{error}");
+    }
+}
+
 async fn seed(table: &Table) {
     seed_chunks(table, 5).await;
 }

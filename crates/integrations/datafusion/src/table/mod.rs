@@ -319,6 +319,12 @@ pub(crate) fn data_type_to_sql(data_type: &DataType) -> DFResult<String> {
         DataType::Binary(t) => Ok(format!("BINARY({})", t.length())),
         DataType::VarBinary(t) => Ok(format!("VARBINARY({})", t.length())),
         DataType::Blob(_) => Ok("BLOB".to_string()),
+        DataType::Geometry(t) => Ok(format!("GEOMETRY('{}')", t.crs().replace('\'', "''"))),
+        DataType::Geography(t) => Ok(format!(
+            "GEOGRAPHY('{}', {})",
+            t.crs().replace('\'', "''"),
+            t.algorithm()
+        )),
         DataType::Char(t) => Ok(format!("CHAR({})", t.length())),
         DataType::VarChar(t) => Ok(format!("VARCHAR({})", t.length())),
         DataType::Date(_) => Ok("DATE".to_string()),
@@ -564,6 +570,26 @@ impl TableProvider for PaimonTableProvider {
                 )));
             }
         };
+        // A plain SessionContext can register this provider without Paimon's
+        // SQL analyzer. Its implicit INSERT projection may already have cast
+        // a nested WKB field to the destination's CRS.
+        if let Some(projection) =
+            input.downcast_ref::<datafusion::physical_plan::projection::ProjectionExec>()
+        {
+            let source_schema = projection.input().schema();
+            for (expr, target) in projection.expr().iter().zip(self.schema.fields()) {
+                if target.data_type().is_nested() && paimon::arrow::contains_geoarrow_wkb(target) {
+                    if let Some(cast) = expr
+                        .expr
+                        .downcast_ref::<datafusion::physical_expr::expressions::CastExpr>()
+                    {
+                        let actual = cast.expr().return_field(&source_schema)?;
+                        paimon::arrow::validate_geoarrow_write(&actual, target)
+                            .map_err(to_datafusion_error)?;
+                    }
+                }
+            }
+        }
         let sink = PaimonDataSink::new(self.table.clone(), self.schema.clone(), overwrite);
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }

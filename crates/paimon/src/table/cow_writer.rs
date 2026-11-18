@@ -532,7 +532,12 @@ fn apply_operations(
                         let source_idx = match batch_source_map.get(&batch_idx) {
                             Some(&idx) => idx,
                             None => {
-                                let src_col = update_batches[batch_idx].column(upd_idx);
+                                let batch = &update_batches[batch_idx];
+                                crate::arrow::validate_geoarrow_write(
+                                    batch.schema().field(upd_idx),
+                                    schema.field(col_idx),
+                                )?;
+                                let src_col = batch.column(upd_idx);
                                 let casted = if src_col.data_type() != original_col.data_type() {
                                     arrow_cast::cast(src_col, original_col.data_type()).map_err(
                                         |e| crate::Error::DataInvalid {
