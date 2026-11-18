@@ -104,7 +104,8 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     /// Attach a caller-managed row-ID allow-list.
     ///
     /// This low-level API does not bind the allow-list to a table snapshot.
-    /// Prefer [`Self::with_prepared_filter`] for scalar pre-filters.
+    /// Use [`Self::with_filter`] to let the planner choose a filtering strategy,
+    /// or [`Self::with_prepared_filter`] to reuse an explicitly resolved set.
     pub fn with_include_row_ids(&mut self, include_row_ids: RoaringTreemap) -> &mut Self {
         self.include_row_ids = Some(Arc::new(include_row_ids));
         self.filter = None;

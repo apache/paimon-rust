@@ -112,7 +112,7 @@ pub(super) fn unindexed_ranges_for_coverage(
     source::exclude_row_ranges(&data_ranges, &indexed_ranges)
 }
 
-pub(super) fn unindexed_ranges_for_indexed_coverage(
+pub(crate) fn unindexed_ranges_for_indexed_coverage(
     indexed_ranges: &[RowRange],
     search_mode: GlobalIndexSearchMode,
     next_row_id: Option<i64>,

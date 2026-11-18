@@ -54,7 +54,7 @@ use std::fmt;
 /// e.g. `Decimal(10, scale=1)` == `Decimal(100, scale=2)`
 /// because both represent `1.0`.
 ///
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Datum {
     Bool(bool),
     TinyInt(i8),
@@ -269,7 +269,7 @@ fn java_bytes_cmp(a: &[u8], b: &[u8]) -> Ordering {
 // ---------------------------------------------------------------------------
 
 /// Predicate operators for leaf predicates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PredicateOperator {
     IsNull,
     IsNotNull,
@@ -368,7 +368,7 @@ impl fmt::Display for PredicateOperator {
 /// - `And` / `Or`: N-ary logical connectives (auto-flattened)
 /// - `Not`: logical negation
 /// - `AlwaysTrue` / `AlwaysFalse`: constant predicates
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Predicate {
     /// Leaf: column op literal(s).
     Leaf {

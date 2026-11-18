@@ -2865,8 +2865,7 @@ score. If no matching index is found, an empty result is returned.
 
 ### Scalar Pre-Filters
 
-Add a `WHERE` clause to restrict the rows considered by vector Top-K. The
-predicate is evaluated before the vector index selects its nearest neighbors:
+Add a `WHERE` clause to restrict the rows returned by vector Top-K:
 
 ```sql
 SELECT id, event_time
@@ -2879,11 +2878,28 @@ FROM vector_search(
 WHERE event_time >= TIMESTAMP '2026-08-01 00:00:00';
 ```
 
-On data-evolution tables, Paimon resolves the predicate to matching global row
-IDs using a snapshot-pinned table read. Scalar global indexes such as BTree can
-narrow this read. The matching global row IDs are intersected with each vector
-index shard and passed to the vector backend as its row filter, so an excluded
-nearest neighbor does not consume one of the requested Top-K positions.
+On data-evolution tables, exact scalar global-index answers are passed to each
+vector shard as a row-ID filter. When no scalar index can evaluate the
+predicate, each shard retrieves ANN candidates once and checks their scalar
+values against the same pinned snapshot before returning results. Batch queries
+share a candidate row-ID union for each filtering read.
+
+`vector-index.post-filter.candidates-factor` defaults to `10`. Each query's
+candidate count is `max(original Top-K * factor, required candidate limit)`,
+capped by shard size and the backend limit (`2147483647`). The required limit
+includes reranking/deletion slack; neither that slack nor batch size multiplies
+the factor. For example, Top-K 10 requests 100 candidates with the default
+factor unless a larger required allowance applies.
+
+Every returned row satisfies the predicate, but filtering may leave fewer than
+Top-K rows, including no rows even when matches exist outside the candidates.
+There is no retry or automatic raw scoring of indexed ranges to fill results.
+Increase the factor to check more candidates, at additional query and scalar
+read cost. Post-filtering retains ANN's approximate recall. Raw work outside
+vector-index coverage still follows `fast`, `full`, and `detail` search modes;
+explicitly supplied Raw sources retain their exact scoring.
+When a scalar index can evaluate the predicate but covers only part of the row
+range, scalar `full` and `detail` modes still plan Raw work for its coverage gaps.
 
 Only predicates that can be translated completely to Paimon predicates are
 pushed into vector search. DataFusion keeps its residual filter for ordinary
@@ -3980,6 +3996,7 @@ optimization may be disabled. Full-text builds reject deletion-vector tables.
 | `btree-index.fallback-scan-max-size` | `256mb` | Maximum total size of BTree global-index files requiring fallback scans for range/between and suffix/contains/complex LIKE predicates; files proven to match completely by metadata need no scan and are excluded. `0` disables BTree fallback index scans. |
 | `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected bitmap global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
 | `global-index.search-mode` | `fast` | Global index coverage mode for reads: `fast`, `full`, or `detail`. |
+| `vector-index.post-filter.candidates-factor` | `10` | Multiplier of each query's original Top-K for one ANN query followed by exact scalar post-filtering. At least the required reranking/deletion allowance, capped by shard size and the backend limit. Positive integer no greater than `2147483647`. Short results are returned without retry. |
 | `global-index.thread-num` | `32` | Number of concurrent global-index search tasks; must be greater than 0 and must not exceed the runtime's task limit. This does not limit Vindex file range reads. |
 | `global-index.vindex.read-thread-num` | `64` | Maximum number of concurrent Vindex file range reads shared by one search operation; must be greater than 0 and must not exceed the runtime semaphore limit. |
 | `global-index.column-update-action` | `THROW_ERROR` | What a commit does when it updates an indexed column: `THROW_ERROR` rejects the commit, `DROP_PARTITION_INDEX` drops the affected partition index instead. |
