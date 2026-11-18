@@ -23,6 +23,7 @@
 pub(in crate::table) mod extraction;
 pub(in crate::table) mod fields;
 pub(in crate::table) mod full_text;
+pub(in crate::table) mod rtree;
 pub(in crate::table) mod scalar;
 pub(in crate::table) mod sort;
 pub(in crate::table) mod vector;

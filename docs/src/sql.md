@@ -1903,6 +1903,14 @@ CALL sys.create_global_index(
 );
 
 CALL sys.create_global_index(
+  table => 'paimon.my_db.places',
+  index_column => 'shape',
+  index_type => 'rtree'
+);
+
+SELECT id FROM paimon.my_db.places WHERE bbox_intersects(shape, 10, 20, 30, 40);
+
+CALL sys.create_global_index(
   table => 'paimon.my_db.my_table',
   index_column => 'message',
   index_type => 'fm',
@@ -2025,6 +2033,17 @@ Build options are
 `fm-index.locate-cost-ratio`. When locating a dense result would cost more than
 the configured ratio, the FM index safely declines evaluation and the normal
 source scan applies the predicate.
+
+An R-tree indexes one planar `GEOMETRY` column. The arguments to
+`bbox_intersects(shape, min_x, min_y, max_x, max_y)` define a closed rectangle in
+the column's coordinate system. Touching envelopes match. Empty geometries have
+no envelope but still match `IS NOT NULL`. SQL returns null for a null argument.
+The reader and writer use the [Apache Paimon R-tree V1 file format](https://github.com/apache/paimon/blob/79b8ec4788e2cd8ed87b1745d5ca54aa8db0e293/docs/docs/multimodal-table/global-index/rtree.mdx#file-format-version-1). Exact shape intersection
+requires a separate geometry predicate.
+
+A bbox lookup in `fast` mode returns matches from indexed ranges. In `full` and
+`detail`, the scan also checks original geometries in uncovered ranges. A covered
+range with zero matches needs no additional scan.
 
 Full-text global indexes support character-string columns and serve the
 [`full_text_search`](#full-text-search) function. The build splits the table's
@@ -2201,7 +2220,7 @@ CALL sys.drop_global_index(
 ```
 
 `index_type` accepts every type the create procedures build: `btree`, `bitmap`,
-`multivalue`, `fm`, `full-text`, and the vindex types
+`multivalue`, `fm`, `rtree`, `full-text`, and the vindex types
 `ivf-flat`, `ivf-pq`, `ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is
 case-insensitive and surrounding whitespace is ignored.
 
@@ -3980,12 +3999,12 @@ optimization may be disabled. Full-text builds reject deletion-vector tables.
 | `row-tracking.enabled` | `false` | Enables stable row ids required by global index files. |
 | `data-evolution.enabled` | `false` | Enables row-id-aware table evolution and partial-column writes. |
 | `global-index.enabled` | `true` | Enables global index metadata and global-index-aware reads. |
-| `global-index.<family>.index-columns` | unset | Comma-separated columns maintained automatically with `write-only=false`. Families: `btree`, `bitmap`, `multivalue`, `fm`, `full-text`, `vector`. Each column owns one index. |
+| `global-index.<family>.index-columns` | unset | Comma-separated columns maintained automatically with `write-only=false`. Families: `btree`, `bitmap`, `multivalue`, `fm`, `rtree`, `full-text`, `vector`. Each column owns one index. |
 | `fields.<column>.global-index.<family>.index-options` | unset | Per-column JSON object of native writer options, following primary-key index option resolution. |
 | `fields.<column>.global-index.vector.index-type` | required for declared vector columns | Vector algorithm, such as `diskann` or `ivf-flat`. Changes replace incompatible payloads atomically during maintenance. |
 | `fields.<column>.global-index.vector.distance-metric` | `inner_product` | Vector distance metric for builds and FULL/DETAIL raw fallback: `inner_product`, `cosine`, or `l2`. Changes replace incompatible payloads atomically during maintenance. |
 | `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
-| `sorted-index.records-per-range` | `100000` | Maximum row count per BTree, bitmap, multivalue, or FM global-index file range; falls back to legacy `btree-index.records-per-range`. |
+| `sorted-index.records-per-range` | `100000` | Maximum row count per BTree, bitmap, multivalue, FM, or R-tree global-index shard; falls back to legacy `btree-index.records-per-range`. |
 | `btree-index.block-size` | `64kb` | Target BTree data-block size. |
 | `btree-index.file-version` | `1` | BTree file version to write: `1` or `2`. V2 uses adaptive postings and requires V2-capable readers. |
 | `btree-index.bloom-filter.enabled` | `false` | Writes a Bloom filter used to avoid BTree data-block reads for missing equality and `IN` keys. |
@@ -3997,6 +4016,11 @@ optimization may be disabled. Full-text builds reject deletion-vector tables.
 | `multivalue-index.dictionary-block-size` | `16kb` | Target multivalue dictionary-block size. |
 | `multivalue-index.compression` | `none` | Multivalue dictionary/index block compression: `none`, `zstd`, `lz4`, or `lzo`. |
 | `multivalue-index.compression-level` | `1` | Multivalue compression level (used by codecs that support levels). |
+| `rtree-index.page-size` | `256` | Entries per packed page (2 to 4096). |
+| `rtree-index.partition-row-count` | `65536` | Source rows per physical R-tree file (1 to 1048576). |
+| `rtree-index.read-cache-size` | `8 MiB` | Shared page-cache budget. Zero disables caching. |
+| `rtree-index.read-batch-size` | `1 MiB` | Maximum bytes per coalesced read (4 KiB to 16 MiB, with at least one page per read). |
+| `rtree-index.read-file-concurrency` | `4` | Maximum concurrent file traversals sharing an index read context. |
 | `fm-index.partition-size` | `16mb` | Maximum encoded symbol count targeted by each FM partition. A single encoded value must be smaller than this limit. |
 | `fm-index.partition-row-count` | `100000` | Maximum row count per FM partition. |
 | `fm-index.sa-sample-rate` | `32` | Power-of-two suffix-array sampling rate used by FM locate operations. |

@@ -101,6 +101,10 @@ impl BitmapGlobalIndexReader {
             return self.is_not_null().await;
         }
         match op {
+            PredicateOperator::BBoxIntersects => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Bitmap index does not support bounding-box intersection",
+            )),
             PredicateOperator::ArrayContains => {
                 let key = serialize_bitmap_datum(&literals[0], data_type);
                 self.equal(&key, data_type).await

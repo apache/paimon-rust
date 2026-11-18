@@ -17,6 +17,9 @@
 
 //! SQL type planning and GeoArrow metadata for Paimon geospatial fields.
 
+mod bbox_intersects;
+pub(crate) use bbox_intersects::BBoxIntersects;
+
 use crate::error::to_datafusion_error;
 use datafusion::arrow::datatypes::{DataType as ArrowType, FieldRef};
 use datafusion::common::config::ConfigOptions;

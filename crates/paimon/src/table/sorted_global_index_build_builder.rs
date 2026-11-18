@@ -45,6 +45,11 @@ use crate::table::{CommitMessage, RowRange, Table, TableCommit};
 use crate::{Error, Result};
 use std::collections::HashMap;
 
+enum ShardWriteOptions {
+    Scalar(ScalarIndexOptions),
+    RTree(crate::rtree::RTreeIndexOptions),
+}
+
 pub(super) struct SortedGlobalIndexBuildBuilder<'a> {
     table: &'a Table,
     index_column: Option<IndexColumns>,
@@ -115,7 +120,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         let index_type = normalize_queryable_global_index_type(&self.index_type).ok_or_else(|| {
             Error::Unsupported {
                 message: format!(
-                    "Scalar global index build only supports index_type => 'btree', 'bitmap', 'multivalue', or 'fm', got '{}'",
+                    "Scalar global index build only supports index_type => 'btree', 'bitmap', 'multivalue', 'fm', or 'rtree', got '{}'",
                     self.index_type
                 ),
             }
@@ -133,7 +138,16 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         let core_options = CoreOptions::new(&resolved_options);
         super::global_index_build_common::validate_build_table(self.table)?;
         let records_per_range = core_options.sorted_index_records_per_range()?;
-        let write_options = ScalarIndexOptions::from_options(index_type, &resolved_options)?;
+        let write_options = if index_type == super::global_index_types::RTREE_GLOBAL_INDEX_TYPE {
+            ShardWriteOptions::RTree(crate::rtree::RTreeIndexOptions::from_options(
+                &resolved_options,
+            )?)
+        } else {
+            ShardWriteOptions::Scalar(ScalarIndexOptions::from_options(
+                index_type,
+                &resolved_options,
+            )?)
+        };
 
         let index_fields = super::global_index_build_common::resolve_index_fields(
             self.table,
@@ -199,8 +213,8 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         let shard_count = shards.len();
         let mut messages = Vec::with_capacity(shard_count);
         for shard in shards {
-            let index_file = match self
-                .build_index_file(&shard, &index_fields, &write_options)
+            let index_files = match self
+                .build_index_files(&shard, &index_fields, &write_options)
                 .await
             {
                 Ok(index_file) => index_file,
@@ -213,7 +227,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             };
             let mut message =
                 CommitMessage::new(shard.partition_bytes.clone(), shard.source_bucket, vec![]);
-            message.new_index_files = vec![index_file];
+            message.new_index_files = index_files;
             messages.push(message);
         }
 

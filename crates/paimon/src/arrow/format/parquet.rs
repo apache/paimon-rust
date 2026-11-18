@@ -2056,6 +2056,7 @@ fn parquet_row_filter_literals_supported(
     file_data_type: &DataType,
 ) -> crate::Result<bool> {
     match op {
+        PredicateOperator::BBoxIntersects => Ok(false),
         PredicateOperator::IsNull | PredicateOperator::IsNotNull => Ok(true),
         PredicateOperator::Eq
         | PredicateOperator::NotEq

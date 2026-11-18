@@ -687,6 +687,7 @@ fn build_orc_leaf_predicate(
         | PredicateOperator::NotBetween
         | PredicateOperator::ArrayContains
         | PredicateOperator::ArraysOverlap
+        | PredicateOperator::BBoxIntersects
         | PredicateOperator::ArrayContainsAll => None,
     }
 }

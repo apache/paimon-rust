@@ -2321,7 +2321,7 @@ impl Schema {
         let declared = core.global_index_types().iter().any(|kind| {
             !matches!(
                 kind.as_str(),
-                "vector" | "btree" | "bitmap" | "multivalue" | "fm" | "full-text"
+                "vector" | "btree" | "bitmap" | "multivalue" | "fm" | "rtree" | "full-text"
             ) && core.global_index_columns(kind).contains(&column)
         });
         let legacy_type = options
