@@ -438,7 +438,8 @@ pub(crate) fn create_format_reader_with_budget(
     } else if lower.ends_with(".blob") {
         Box::new(
             blob::BlobFormatReader::new(path.to_string(), blob_as_descriptor)
-                .with_blob_parallelism(blob_parallelism),
+                .with_blob_parallelism(blob_parallelism)
+                .with_crc_verification(blob::crc_verification_enabled(table_options)?),
         )
     } else if lower.ends_with(".video") {
         Box::new(video::VideoFormatReader::new(path.to_string()))

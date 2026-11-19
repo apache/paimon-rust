@@ -68,6 +68,7 @@ impl LazyBlobFile {
         file_io: &FileIO,
         blob_as_descriptor: bool,
         blob_parallelism: usize,
+        verify_crc: bool,
         field_kind: &BlobFieldKind,
     ) -> crate::Result<Vec<BlobReadValue>> {
         if self.reader.is_none() {
@@ -99,7 +100,8 @@ impl LazyBlobFile {
                         blob_as_descriptor,
                         blob_parallelism,
                     )
-                    .await?,
+                    .await?
+                    .with_crc_verification(verify_crc),
                 )
             };
             let indexed_rows =
@@ -154,6 +156,7 @@ pub(super) fn read(
     file_io: FileIO,
     blob_as_descriptor: bool,
     blob_parallelism: usize,
+    verify_crc: bool,
     anchor_deletion_vector: Option<DeletionVectorContext>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     if read_fields.len() != 1 || !read_fields[0].data_type().is_blob_file_field() {
@@ -219,6 +222,7 @@ pub(super) fn read(
                 &file_io,
                 blob_as_descriptor,
                 blob_parallelism,
+                verify_crc,
                 &field_kind,
             ).await?;
         }
@@ -226,6 +230,7 @@ pub(super) fn read(
     .boxed())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_batch(
     sequence_groups: &mut [VecDeque<LazyBlobFile>],
     row_ids: &[i64],
@@ -233,6 +238,7 @@ async fn resolve_batch(
     file_io: &FileIO,
     blob_as_descriptor: bool,
     blob_parallelism: usize,
+    verify_crc: bool,
     field_kind: &BlobFieldKind,
 ) -> crate::Result<RecordBatch> {
     let mut resolved = (0..row_ids.len())
@@ -286,6 +292,7 @@ async fn resolve_batch(
                         file_io,
                         blob_as_descriptor,
                         blob_parallelism,
+                        verify_crc,
                         field_kind,
                     )
                     .await?;
@@ -438,6 +445,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_lazy_blob_file_crc_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.blob");
+        let mut bytes = blob_test_utils::build_blob_file_bytes(&[Some(b"hello".as_slice())]);
+        bytes[4] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
+        for verify_crc in [true, false] {
+            let mut file = LazyBlobFile {
+                range: RowRange::new(0, 0),
+                file_name: "data.blob".to_string(),
+                path: path.to_str().unwrap().to_string(),
+                file_size: bytes.len() as i64,
+                row_count: 1,
+                reader: None,
+            };
+            let result = file
+                .read_positions(&[0], &file_io, false, 1, verify_crc, &BlobFieldKind::Scalar)
+                .await;
+            if verify_crc {
+                assert!(
+                    matches!(result, Err(Error::DataInvalid { message, .. }) if message.contains("CRC32 mismatch"))
+                );
+            } else {
+                let values = result.unwrap();
+                assert!(
+                    matches!(&values[0], BlobReadValue::Value(value) if value.as_ref() == &bytes[4..9])
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_resolve_batch_skips_payloads_for_resolved_rows() {
         use BlobFixtureValue::{Null, Placeholder, Value};
 
@@ -485,6 +525,7 @@ mod tests {
             &file_io,
             false,
             crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM,
+            true,
             &BlobFieldKind::Scalar,
         )
         .await
