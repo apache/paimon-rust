@@ -19,7 +19,7 @@
 
 use super::{
     read_all_manifest_entries, BucketSelector, CoreOptions, ManifestEntry, ManifestListSource,
-    PaimonTableScan, ScanStats, TableScan, TableScanKind,
+    PaimonTableScan, ScanSplitSelection, ScanStats, TableScan, TableScanKind,
 };
 use crate::table::incremental_scan::timestamp_snapshot_range;
 use crate::table::{IncrementalScan, IncrementalScanMode};
@@ -93,7 +93,13 @@ impl TableScan<'_> {
         });
         scan.projected_read_field_ids = None;
         scan.row_ranges = None;
-        scan.split_selection = None;
+        // File plans ignore split distribution, but a physical bucket restricts the file set.
+        scan.split_selection = scan.selected_bucket().map(|bucket| {
+            Box::new(ScanSplitSelection {
+                selected_bucket: Some(bucket),
+                ..Default::default()
+            })
+        });
         // Preserve the effective raw-file policy for the shared merge-safe stats
         // rules. Raw defaults include L0 even when ordinary first-row reads do not.
         scan.file_scan_options = Some(filters);

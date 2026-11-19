@@ -421,7 +421,9 @@ async fn read_all_manifest_entries(
         validate_incremental_entries(&all_entries)?;
         let mut entries = all_entries;
         if let Some(bucket) = selected_bucket {
+            let before = entries.len();
             entries.retain(|entry| entry.bucket() == bucket);
+            counters.pruned_by_bucket += before - entries.len();
         }
         entries
     } else {
@@ -4163,6 +4165,65 @@ mod tests {
         assert_eq!(plan.splits()[0].data_files()[0].file_name, "v1-b2");
         // The [0,1] manifest was never opened; [2,3] needed entry-level filtering.
         assert_eq!(plan.stats().manifest_entries_read, 2);
+        assert_eq!(plan.stats().manifest_entries_pruned_by_bucket, 1);
+    }
+
+    #[tokio::test]
+    async fn test_physical_bucket_in_file_and_incremental_plans() {
+        let table = scan_stats_test_table("memory:/incremental_bucket")
+            .copy_with_options(HashMap::from([("bucket".into(), "4".into())]));
+        setup_scan_stats_dirs(&table).await;
+        let messages = [1, 3]
+            .into_iter()
+            .map(|bucket| {
+                CommitMessage::new(
+                    BinaryRowBuilder::new(0).build_serialized(),
+                    bucket,
+                    vec![stats_test_file(&format!("b{bucket}.parquet"), 1, 2)],
+                )
+            })
+            .collect();
+        TableCommit::new(table.clone(), "bucket".into())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let files = table
+            .new_read_builder()
+            .new_scan()
+            .with_bucket(3)
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap();
+        assert_eq!(
+            files
+                .files()
+                .iter()
+                .map(|entry| entry.bucket())
+                .collect::<Vec<_>>(),
+            [3]
+        );
+
+        let table = table.copy_with_options(HashMap::from([(
+            "incremental-between-timestamp".into(),
+            format!("0,{}", i64::MAX),
+        )]));
+        let plan = table
+            .new_read_builder()
+            .new_scan()
+            .with_bucket(3)
+            .unwrap()
+            .plan()
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.splits()
+                .iter()
+                .map(|split| split.bucket())
+                .collect::<Vec<_>>(),
+            [3]
+        );
         assert_eq!(plan.stats().manifest_entries_pruned_by_bucket, 1);
     }
 
