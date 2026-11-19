@@ -180,6 +180,7 @@ pub(super) fn read_blob_compaction(
         file_io,
         true,
         DEFAULT_BLOB_READ_PARALLELISM,
+        true,
         None,
     )
 }
@@ -1971,6 +1972,7 @@ fn open_source_stream(
                     file_io,
                     blob_as_descriptor,
                     blob_parallelism,
+                    crate::arrow::format::blob::crc_verification_enabled(&table_options)?,
                     anchor_deletion_vector.cloned(),
                 );
             }
@@ -1987,6 +1989,7 @@ fn open_source_stream(
                 file_io,
                 blob_as_descriptor,
                 blob_parallelism,
+                crate::arrow::format::blob::crc_verification_enabled(&table_options)?,
                 anchor_deletion_vector.cloned(),
             );
         }
