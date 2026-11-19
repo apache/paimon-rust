@@ -189,6 +189,71 @@ async fn test_compat_drop_partition_validates_all_specs_before_committing() {
 }
 
 #[tokio::test]
+async fn test_compat_drop_partition_preserves_positional_spec_boundaries() {
+    let (_tmp, ctx) = setup_sql_context().await;
+    exec(
+        &ctx,
+        "CREATE TABLE test_db.call_parts (id INT, pt STRING) PARTITIONED BY (pt)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "INSERT INTO test_db.call_parts VALUES (1, 'a;pt=b'), (2, 'a'), (3, 'b'), (4, 'c')",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CALL sys.drop_partition('test_db.call_parts', 'pt=a;pt=b', 'pt=c')",
+    )
+    .await;
+    assert_eq!(row_count(&ctx, "SELECT * FROM test_db.call_parts").await, 2);
+    assert_eq!(
+        row_count(&ctx, "SELECT * FROM test_db.call_parts WHERE id IN (2, 3)").await,
+        2
+    );
+    exec(
+        &ctx,
+        "CALL sys.drop_partition(table => 'test_db.call_parts', partitions => 'pt=a;pt=b')",
+    )
+    .await;
+    assert_eq!(row_count(&ctx, "SELECT * FROM test_db.call_parts").await, 0);
+}
+
+#[tokio::test]
+async fn test_compat_procedure_name_uses_sql_identifier_case_rules() {
+    let (_tmp, ctx) = setup_sql_context().await;
+    assert_sql_error(
+        &ctx,
+        "CALL PAIMON.sys.VeCtOr_SeArCh()",
+        "Missing required argument: 'table'",
+    )
+    .await;
+    assert_sql_error(
+        &ctx,
+        r#"CALL sys."VECTOR_SEARCH"()"#,
+        "Unknown procedure: VECTOR_SEARCH",
+    )
+    .await;
+    exec(
+        &ctx,
+        "SET datafusion.sql_parser.enable_ident_normalization = false",
+    )
+    .await;
+    assert_sql_error(
+        &ctx,
+        "CALL sys.VECTOR_SEARCH()",
+        "Unknown procedure: VECTOR_SEARCH",
+    )
+    .await;
+    assert_sql_error(
+        &ctx,
+        "CALL paimon.sys.vector_search()",
+        "Missing required argument: 'table'",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_create_tag() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
 

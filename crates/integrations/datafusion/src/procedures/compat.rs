@@ -25,10 +25,18 @@ use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::lit;
 use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::sql::planner::object_name_to_table_reference;
 use datafusion::sql::sqlparser::ast::{Ident, ObjectName};
+use datafusion::sql::sqlparser::{
+    dialect::GenericDialect,
+    parser::Parser,
+    tokenizer::{Token, Tokenizer, Whitespace},
+};
+use paimon::api::RestError;
 use paimon::catalog::{Catalog, Function, Identifier};
 use paimon::spec::DataField;
-use paimon::table::Instant;
+use paimon::table::{Instant, RESTEnv, Table};
+use serde_json::Value;
 
 use super::{
     parse_key_value_options, parse_partition_specs, require_arg, resolve_rollback_target,
@@ -93,17 +101,19 @@ pub(super) async fn rollback(
         .map_err(to_datafusion_error)?
         .ok_or_else(|| DataFusionError::Plan("Cannot roll back a table without a snapshot".into()))?
         .id();
-    let current = if table.rest_env().is_some() {
-        let id = match &target {
-            Instant::Snapshot { snapshot_id } => *snapshot_id,
-            Instant::Tag { .. } => resolve_rollback_target(&table, &target).await?.id(),
-        };
-        rollback_table(&table, &target, Some(previous)).await?;
-        id
-    } else {
-        let snapshot = resolve_rollback_target(&table, &target).await?;
-        rollback_to_snapshot(&snapshots, &table.tag_manager(), &snapshot).await?;
-        snapshot.id()
+    let current = match (table.rest_env(), &target) {
+        (Some(rest), Instant::Tag { .. }) => {
+            rollback_rest_tag(&table, rest, &target, previous).await?
+        }
+        (Some(_), Instant::Snapshot { snapshot_id }) => {
+            rollback_table(&table, &target, Some(previous)).await?;
+            *snapshot_id
+        }
+        (None, _) => {
+            let snapshot = resolve_rollback_target(&table, &target).await?;
+            rollback_to_snapshot(&snapshots, &table.tag_manager(), &snapshot).await?;
+            snapshot.id()
+        }
     };
 
     let schema = Arc::new(Schema::new(vec![
@@ -117,6 +127,55 @@ pub(super) async fn rollback(
             Arc::new(Int64Array::from(vec![current])),
         ],
     )?)
+}
+
+async fn rollback_rest_tag(
+    table: &Table,
+    rest: &RESTEnv,
+    tag: &Instant,
+    previous: i64,
+) -> DFResult<i64> {
+    let expected = resolve_rollback_target(table, tag).await?;
+    let apply = |instant: Instant| async move {
+        rest.api()
+            .rollback_to(
+                rest.identifier(),
+                &instant,
+                Some(previous),
+                Some(rest.uuid()),
+            )
+            .await
+    };
+    match apply(Instant::snapshot(expected.id())).await {
+        Ok(()) => return Ok(expected.id()),
+        Err(paimon::Error::RestApi {
+            source: RestError::NoSuchResource { resource_type, .. },
+        }) if resource_type.as_deref() == Some("SNAPSHOT") => {}
+        Err(error) => return Err(to_datafusion_error(error)),
+    }
+
+    // Some catalogs can restore a tag-retained snapshot only by name. The
+    // REST protocol has no tag-target guard, so verify the outcome as well.
+    if resolve_rollback_target(table, tag).await? != expected {
+        return Err(DataFusionError::Execution(
+            "Rollback tag changed after resolution. No rollback was applied.".into(),
+        ));
+    }
+    apply(tag.clone()).await.map_err(to_datafusion_error)?;
+    let latest = table.snapshot_manager().get_latest_snapshot().await.map_err(|error| {
+        DataFusionError::Context(
+            "REST rollback was accepted but its result could not be verified. Inspect the table head before retrying.".into(),
+            Box::new(to_datafusion_error(error)),
+        )
+    })?;
+    if latest.as_ref() != Some(&expected) {
+        return Err(DataFusionError::Execution(format!(
+            "REST rollback was accepted but could not verify expected snapshot {} (observed head {:?}). Inspect the table head before retrying.",
+            expected.id(),
+            latest.as_ref().map(|snapshot| snapshot.id()),
+        )));
+    }
+    Ok(expected.id())
 }
 
 fn parse_snapshot_id(value: &str) -> DFResult<i64> {
@@ -136,26 +195,33 @@ pub(super) async fn drop_partition(
     catalog: &Arc<dyn Catalog>,
     catalog_name: &str,
     args: &HashMap<String, String>,
+    positional_partitions: &[String],
     sql_ctx: Option<&SQLContext>,
 ) -> DFResult<DataFrame> {
     let identifier = resolve_table_identifier(require_arg(args, "table")?, catalog_name)?;
-    let partitions = require_arg(args, "partitions")?;
+    let named_partitions = positional_partitions
+        .is_empty()
+        .then(|| require_arg(args, "partitions"))
+        .transpose()?;
     validate_write_target(sql_ctx, catalog_name, &identifier, "CALL drop_partition").await?;
     let table = crate::table_loader::get_paimon_table(catalog, &identifier).await?;
-    let specs = parse_partition_specs(&table, partitions)?
-        .into_iter()
-        .map(|spec| {
-            if spec.len() != table.schema().partition_keys().len() {
-                return Err(DataFusionError::Plan(
-                    "Incomplete partition spec. All partition columns must be specified.".into(),
-                ));
-            }
-            Ok(spec
-                .into_iter()
-                .map(|(key, datum)| (key.to_string(), datum))
-                .collect())
-        })
-        .collect::<DFResult<Vec<_>>>()?;
+    let specs = match named_partitions {
+        Some(specs) => parse_partition_specs(&table, specs.split(';')),
+        None => parse_partition_specs(&table, positional_partitions.iter().map(String::as_str)),
+    }?
+    .into_iter()
+    .map(|spec| {
+        if spec.len() != table.schema().partition_keys().len() {
+            return Err(DataFusionError::Plan(
+                "Incomplete partition spec. All partition columns must be specified.".into(),
+            ));
+        }
+        Ok(spec
+            .into_iter()
+            .map(|(key, datum)| (key.to_string(), datum))
+            .collect())
+    })
+    .collect::<DFResult<Vec<_>>>()?;
     table
         .new_write_builder()
         .try_new_commit()
@@ -172,21 +238,49 @@ fn function_identifier(
     args: &HashMap<String, String>,
 ) -> DFResult<Identifier> {
     let name = require_arg(args, "function")?;
-    let default_schema = ctx.state().config_options().catalog.default_schema.clone();
-    match name.split('.').collect::<Vec<_>>().as_slice() {
-        [function] if !function.is_empty() => Ok(Identifier::new(default_schema, *function)),
-        [db, function] if !db.is_empty() && !function.is_empty() => {
-            Ok(Identifier::new(*db, *function))
+    let object_name = if name.contains(['"', '`']) {
+        let dialect = GenericDialect {};
+        let tokens = Tokenizer::new(&dialect, name).tokenize().map_err(|error| {
+            DataFusionError::Plan(format!("Invalid function identifier: {error}"))
+        })?;
+        if tokens.iter().any(|token| {
+            matches!(
+                token,
+                Token::Whitespace(
+                    Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)
+                )
+            )
+        }) {
+            return Err(DataFusionError::Plan(
+                "Comments are not allowed in a quoted function identifier".into(),
+            ));
         }
-        [catalog, db, function]
-            if *catalog == catalog_name && !db.is_empty() && !function.is_empty() =>
-        {
-            Ok(Identifier::new(*db, *function))
-        }
-        _ => Err(DataFusionError::Plan(format!(
+        let mut parser = Parser::new(&dialect).with_tokens(tokens);
+        let object_name = parser.parse_object_name(false)?;
+        parser.expect_token(&Token::EOF)?;
+        object_name
+    } else {
+        // Keep exact literal names accepted before the quoted-name syntax.
+        ObjectName::from(name.split('.').map(Ident::new).collect::<Vec<_>>())
+    };
+    let state = ctx.state();
+    let options = state.config_options();
+    // The argument is a string containing exact catalog names, as in the
+    // other procedures. Quoting delimits a component without changing its case.
+    let reference = object_name_to_table_reference(object_name, false)?;
+    let resolved = reference.resolve(catalog_name, options.catalog.default_schema.as_str());
+    if resolved.catalog.as_ref() != catalog_name
+        || resolved.schema.is_empty()
+        || resolved.table.is_empty()
+    {
+        return Err(DataFusionError::Plan(format!(
             "Invalid function identifier '{name}' for catalog '{catalog_name}'"
-        ))),
+        )));
     }
+    Ok(Identifier::new(
+        resolved.schema.as_ref(),
+        resolved.table.as_ref(),
+    ))
 }
 
 pub(super) async fn create_function(
@@ -231,20 +325,18 @@ pub(super) async fn create_function(
 
 fn parse_function_parameters(json: &str, name: &str) -> DFResult<Vec<DataField>> {
     let invalid = |error| DataFusionError::Plan(format!("Invalid {name} fields: {error}"));
-    let mut fields = serde_json::from_str::<Vec<serde_json::Value>>(json).map_err(invalid)?;
-    let assign_ids = fields.iter().all(|field| field.get("id").is_none());
+    let mut fields = serde_json::from_str::<Vec<Value>>(json).map_err(invalid)?;
+    let assign_ids = fields
+        .first()
+        .is_some_and(|field| field.get("id").is_none());
+    let mut next_id = 0;
+    normalize_parameter_ids(&mut fields, assign_ids, &mut next_id, name)?;
     let mut ids = HashSet::new();
     let mut names = HashSet::new();
     fields
-        .iter_mut()
-        .enumerate()
-        .map(|(index, field)| {
-            if assign_ids {
-                if let Some(object) = field.as_object_mut() {
-                    object.insert("id".to_string(), index.into());
-                }
-            }
-            let field: DataField = serde_json::from_value(field.take()).map_err(invalid)?;
+        .into_iter()
+        .map(|field| {
+            let field: DataField = serde_json::from_value(field).map_err(invalid)?;
             if !ids.insert(field.id()) || !names.insert(field.name().to_string()) {
                 return Err(DataFusionError::Plan(format!(
                     "Duplicate field ID or name in {name}"
@@ -253,6 +345,49 @@ fn parse_function_parameters(json: &str, name: &str) -> DFResult<Vec<DataField>>
             Ok(field)
         })
         .collect()
+}
+
+fn normalize_parameter_ids(
+    fields: &mut [Value],
+    assign_ids: bool,
+    next_id: &mut usize,
+    name: &str,
+) -> DFResult<()> {
+    for field in fields.iter_mut().filter_map(Value::as_object_mut) {
+        if field.contains_key("id") == assign_ids {
+            return Err(DataFusionError::Plan(format!(
+                "{name} cannot mix explicit field IDs and omitted field IDs"
+            )));
+        }
+        if assign_ids {
+            field.insert("id".into(), (*next_id).into());
+            *next_id += 1;
+        }
+        if let Some(data_type) = field.get_mut("type") {
+            normalize_parameter_type_ids(data_type, assign_ids, next_id, name)?;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_parameter_type_ids(
+    data_type: &mut Value,
+    assign_ids: bool,
+    next_id: &mut usize,
+    name: &str,
+) -> DFResult<()> {
+    let Some(data_type) = data_type.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(fields) = data_type.get_mut("fields").and_then(Value::as_array_mut) {
+        normalize_parameter_ids(fields, assign_ids, next_id, name)?;
+    }
+    for key in ["element", "key", "value"] {
+        if let Some(child) = data_type.get_mut(key) {
+            normalize_parameter_type_ids(child, assign_ids, next_id, name)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn drop_function(

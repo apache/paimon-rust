@@ -73,9 +73,10 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
     Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArgOperator,
-    FunctionArguments, ObjectName, Value as SqlValue,
+    FunctionArguments, Ident, ObjectName, Value as SqlValue,
 };
 use paimon::api::{
     ColumnMask, DataPolicy, ListPermissionsRequest, ListPoliciesRequest, PermissionAssignment,
@@ -346,15 +347,22 @@ pub(crate) async fn execute_call(
     current_catalog: &str,
     func: &Function,
 ) -> DFResult<DataFrame> {
-    let (explicit_catalog, proc_name) = extract_procedure_name(&func.name)?;
-    let catalog_name = explicit_catalog.as_deref().unwrap_or(current_catalog);
+    let normalizer = IdentNormalizer::new(sql_ctx.ctx().enable_ident_normalization());
+    let (explicit_catalog, proc_name) = extract_procedure_name(&func.name, &normalizer)?;
+    // Catalog registrations are exact keys. Preserve an exact match before
+    // applying SQL case folding to an unquoted qualifier.
+    let catalog_name = match explicit_catalog {
+        Some(catalog) if catalogs.contains_key(&catalog.value) => catalog.value,
+        Some(catalog) => normalizer.normalize(catalog),
+        None => current_catalog.to_string(),
+    };
     let catalog = catalogs
-        .get(catalog_name)
+        .get(&catalog_name)
         .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'")))?;
     execute_procedure_with_context(
         sql_ctx.ctx(),
         catalog,
-        catalog_name,
+        &catalog_name,
         &proc_name,
         &func.args,
         Some(sql_ctx),
@@ -380,7 +388,7 @@ async fn execute_procedure_with_context(
     arguments: &FunctionArguments,
     sql_ctx: Option<&SQLContext>,
 ) -> DFResult<DataFrame> {
-    let args = extract_args(ctx, proc_name, arguments)?;
+    let (args, positional_partitions) = extract_args(ctx, proc_name, arguments)?;
     reject_unknown_args(proc_name, &args)?;
 
     match proc_name {
@@ -393,7 +401,15 @@ async fn execute_procedure_with_context(
         "clear_consumers" => proc_clear_consumers(ctx, catalog, catalog_name, &args).await,
         "rollback" => compat::rollback(ctx, catalog, catalog_name, &args, sql_ctx).await,
         "drop_partition" => {
-            compat::drop_partition(ctx, catalog, catalog_name, &args, sql_ctx).await
+            compat::drop_partition(
+                ctx,
+                catalog,
+                catalog_name,
+                &args,
+                &positional_partitions,
+                sql_ctx,
+            )
+            .await
         }
         "create_function" => compat::create_function(ctx, catalog, catalog_name, &args).await,
         "drop_function" => compat::drop_function(ctx, catalog, catalog_name, &args).await,
@@ -429,16 +445,19 @@ async fn execute_procedure_with_context(
 }
 
 /// Returns (optional_catalog_name, procedure_name).
-fn extract_procedure_name(name: &ObjectName) -> DFResult<(Option<String>, String)> {
-    let parts: Vec<String> = name
+fn extract_procedure_name(
+    name: &ObjectName,
+    normalizer: &IdentNormalizer,
+) -> DFResult<(Option<Ident>, String)> {
+    let parts = name
         .0
         .iter()
-        .filter_map(|p| p.as_ident().map(|id| id.value.clone()))
-        .collect();
-    match parts.len() {
-        1 => Ok((None, parts[0].clone())),
-        2 => Ok((None, parts[1].clone())),
-        3 => Ok((Some(parts[0].clone()), parts[2].clone())),
+        .map(|part| part.as_ident())
+        .collect::<Option<Vec<_>>>();
+    let normalize = |id: &Ident| normalizer.normalize(id.clone());
+    match parts.as_deref() {
+        Some([procedure] | [_, procedure]) => Ok((None, normalize(procedure))),
+        Some([catalog, _, procedure]) => Ok((Some((*catalog).clone()), normalize(procedure))),
         _ => Err(DataFusionError::Plan(format!(
             "Invalid procedure name: {name}. Expected procedure_name, sys.procedure_name, or catalog.sys.procedure_name"
         ))),
@@ -449,10 +468,10 @@ fn extract_args(
     ctx: &SessionContext,
     proc_name: &str,
     args: &FunctionArguments,
-) -> DFResult<HashMap<String, String>> {
+) -> DFResult<(HashMap<String, String>, Vec<String>)> {
     let arg_list = match args {
         FunctionArguments::List(list) => &list.args,
-        FunctionArguments::None => return Ok(HashMap::new()),
+        FunctionArguments::None => return Ok((HashMap::new(), Vec::new())),
         _ => {
             return Err(DataFusionError::Plan(
                 "Unsupported argument format for CALL".to_string(),
@@ -473,6 +492,7 @@ fn extract_args(
         compatibility_call && matches!(arg_list.first(), Some(FunctionArg::Unnamed(_)));
     let mut map = HashMap::<String, String>::new();
     let mut seen = std::collections::HashSet::new();
+    let mut positional_partitions = Vec::new();
     for (index, arg) in arg_list.iter().enumerate() {
         let (name, expr) = match arg {
             FunctionArg::Named {
@@ -507,7 +527,7 @@ fn extract_args(
             )),
         };
         // Positional DROP PARTITION repeats the partition argument for each specification.
-        let variadic_partition = positional && proc_name == "drop_partition" && index > 1;
+        let variadic_partition = positional && proc_name == "drop_partition" && index > 0;
         if !variadic_partition && !seen.insert(name.clone()) {
             return Err(DataFusionError::Plan(format!(
                 "Procedure argument {name} is duplicated."
@@ -530,14 +550,12 @@ fn extract_args(
             Err(_) => constant_argument(ctx, expr)?,
         };
         if variadic_partition {
-            let specs = map.entry(name).or_default();
-            specs.push(';');
-            specs.push_str(&value);
+            positional_partitions.push(value);
         } else {
             map.insert(name, value);
         }
     }
-    Ok(map)
+    Ok((map, positional_partitions))
 }
 
 fn expr_to_string(expr: &SqlExpr) -> DFResult<String> {
@@ -1497,7 +1515,7 @@ async fn proc_compact(
 /// Semicolon-separated alternatives, each containing comma-separated key=value constraints.
 fn parse_partitions(table: &Table, partitions: &str) -> DFResult<Predicate> {
     let pb = PredicateBuilder::new(table.schema().fields());
-    let alternatives = parse_partition_specs(table, partitions)?
+    let alternatives = parse_partition_specs(table, partitions.split(';'))?
         .into_iter()
         .map(|spec| {
             spec.into_iter()
@@ -1517,7 +1535,7 @@ type PartitionSpec<'a> = Vec<(&'a str, Option<Datum>)>;
 
 fn parse_partition_specs<'a>(
     table: &Table,
-    partitions: &'a str,
+    partitions: impl IntoIterator<Item = &'a str>,
 ) -> DFResult<Vec<PartitionSpec<'a>>> {
     let partition_fields = table.schema().partition_fields();
     if partition_fields.is_empty() {
@@ -1527,7 +1545,7 @@ fn parse_partition_specs<'a>(
     }
     let options = CoreOptions::new(table.schema().options());
     let mut alternatives = Vec::new();
-    for partition in partitions.split(';') {
+    for partition in partitions {
         let mut constraints = Vec::new();
         let mut keys = std::collections::HashSet::new();
         for entry in partition.split(',') {

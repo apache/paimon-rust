@@ -602,7 +602,7 @@ impl RESTApi {
     /// Create a persistent function.
     pub async fn create_function(&self, function: &Function) -> Result<()> {
         let database = function.identifier().database();
-        validate_non_empty_multi(&[
+        validate_resource_path(&[
             (database, "database name"),
             (function.name(), "function name"),
         ])?;

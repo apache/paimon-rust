@@ -1507,6 +1507,9 @@ Use `CALL` to invoke built-in procedures. All procedures are under the `sys` nam
 
 These procedures accept named arguments and positional
 arguments in the order shown. Other procedures continue to use named arguments.
+Unquoted procedure names follow the session's identifier normalization setting.
+An explicit catalog qualifier checks the exact registered name first, then
+applies that setting if the name is unquoted and no exact match exists.
 
 | Procedure | Arguments in positional order | Result |
 |---|---|---|
@@ -1519,10 +1522,15 @@ arguments in the order shown. Other procedures continue to use named arguments.
 
 `rollback` takes exactly one of `version`, `snapshot`, or `tag`. A version
 containing only digits means a snapshot ID. Use `tag` for a numeric tag name.
+For a REST catalog, `rollback` first tries the resolved snapshot ID. A catalog
+that only supports restoring an expired snapshot by tag receives a tag rollback
+after the client checks the tag still points to that snapshot. The client verifies
+the resulting head before reporting success. A failed verification can follow an
+applied rollback, so inspect the table state before retrying.
 For `drop_partition`, specify every partition key in each `key=value` list.
-Use one positional argument per partition or separate specifications with
-semicolons in the named `partitions` argument. The procedure operates on Paimon
-FileStore tables.
+Each positional argument represents one partition and can contain a semicolon
+in a partition value. Use semicolons to separate specifications in the named
+`partitions` argument. The procedure operates on Paimon FileStore tables.
 
 ```sql
 CALL sys.rollback('my_db.events', 'release_1');
@@ -1531,7 +1539,9 @@ CALL sys.drop_partition('my_db.events', 'dt=2026-10-01', 'dt=2026-10-02');
 
 `create_function` registers Catalog metadata on catalogs that support
 persistent functions. Both parameter lists are JSON arrays of Paimon data
-fields. A list with no explicit IDs assigns IDs starting at zero. The optional
+fields. Omit IDs from an entire list to assign distinct IDs starting at zero,
+including nested fields. Function names inside string arguments preserve case.
+Quote a name component to include a dot. The optional
 `deterministic` argument defaults to true and `options` takes comma-separated
 `key=value` pairs. Use [CREATE FUNCTION](#rest-catalog-views-and-sql-functions)
 to register an executable SQL definition.

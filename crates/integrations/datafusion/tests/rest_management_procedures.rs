@@ -24,9 +24,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, Int64Array, RecordBatch};
 use paimon::api::{ConfigResponse, CreateTagRequest};
-use paimon::catalog::RESTCatalog;
+use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::spec::{DataType, IntType, Schema};
 use paimon::{CatalogOptions, Options};
 use paimon_datafusion::SQLContext;
@@ -141,6 +141,128 @@ async fn create_row_filter(context: &SQLContext, principal: &str, predicate: &st
              policy_type => 'ROW_FILTER', principal => '{principal}', \
              predicate_json => '{predicate}')"
         ),
+    )
+    .await;
+}
+
+async fn setup_rest_tag_rollback() -> (tempfile::TempDir, RESTServer, Arc<RESTCatalog>, SQLContext)
+{
+    let tmp = tempfile::tempdir().unwrap();
+    let server = start_server(tmp.path()).await;
+    let location = tmp.path().join("orders");
+    server.add_table_with_schema(
+        DATABASE,
+        TABLE,
+        Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap(),
+        location.to_str().unwrap(),
+    );
+    server.add_tag(DATABASE, TABLE, "release");
+    let (catalog, context) = connect(&server).await;
+    let identifier = Identifier::new(DATABASE, TABLE);
+    let mut latest = serde_json::to_value(
+        catalog
+            .get_tag(&identifier, "release")
+            .await
+            .unwrap()
+            .snapshot,
+    )
+    .unwrap();
+    latest["id"] = serde_json::json!(3);
+    server.set_catalog_snapshot(DATABASE, TABLE, serde_json::from_value(latest).unwrap());
+    (tmp, server, catalog, context)
+}
+
+#[tokio::test]
+async fn test_compat_rollback_pins_the_resolved_rest_tag_snapshot() {
+    let (_tmp, server, catalog, context) = setup_rest_tag_rollback().await;
+    let identifier = Identifier::new(DATABASE, TABLE);
+    let target = catalog
+        .get_tag(&identifier, "release")
+        .await
+        .unwrap()
+        .snapshot;
+    server.add_rollback_snapshot(DATABASE, TABLE, target);
+    server.replace_tag_after_reads(DATABASE, TABLE, "release", 1, 2);
+
+    let result = call(
+        &context,
+        "CALL sys.rollback(table => 'sales.orders', tag => 'release')",
+    )
+    .await;
+    for (column, id) in [("previous_snapshot_id", 3), ("current_snapshot_id", 1)] {
+        assert_eq!(
+            result[0]
+                .column_by_name(column)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            id
+        );
+    }
+    assert_eq!(rollback_head(&catalog).await, 1);
+}
+
+async fn rollback_head(catalog: &RESTCatalog) -> i64 {
+    catalog
+        .load_snapshot(&Identifier::new(DATABASE, TABLE))
+        .await
+        .unwrap()
+        .unwrap()
+        .snapshot
+        .id()
+}
+
+#[tokio::test]
+async fn test_compat_rollback_restores_a_snapshot_retained_only_by_tag() {
+    let (_tmp, _server, catalog, context) = setup_rest_tag_rollback().await;
+    let result = call(
+        &context,
+        "CALL sys.rollback(table => 'sales.orders', tag => 'release')",
+    )
+    .await;
+    assert_eq!(
+        result[0]
+            .column_by_name("current_snapshot_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+    assert_eq!(rollback_head(&catalog).await, 1);
+}
+
+#[tokio::test]
+async fn test_compat_expired_tag_rollback_rejects_a_rebound_target() {
+    for (reads, expected_error, head) in [
+        (1, "No rollback was applied", 3),
+        (2, "could not verify expected snapshot 1", 2),
+    ] {
+        let (_tmp, server, catalog, context) = setup_rest_tag_rollback().await;
+        server.replace_tag_after_reads(DATABASE, TABLE, "release", reads, 2);
+        common::assert_sql_error(
+            &context,
+            "CALL sys.rollback(table => 'sales.orders', tag => 'release')",
+            expected_error,
+        )
+        .await;
+        assert_eq!(rollback_head(&catalog).await, head);
+    }
+}
+
+#[tokio::test]
+async fn test_compat_create_function_rejects_dot_path_segments() {
+    let (_tmp, _server, context) = setup().await;
+    common::assert_sql_error(
+        &context,
+        r#"CALL sys.create_function('"..".f', '[]', '[]')"#,
+        "database name must not be a dot path segment",
     )
     .await;
 }
