@@ -97,7 +97,7 @@ fn is_raw_convertible(files: &[DataFileMeta]) -> bool {
 /// vector) file must lie inside that range. Only such a group is merged
 /// column-wise; any other group holds files that were not written as slices of
 /// each other.
-fn is_data_evolution_column_slice_group(files: &[DataFileMeta]) -> bool {
+pub(super) fn is_data_evolution_column_slice_group(files: &[DataFileMeta]) -> bool {
     let mut normal_files = files
         .iter()
         .filter(|file| is_data_evolution_normal_file(file));

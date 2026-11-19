@@ -20,7 +20,7 @@ mod common;
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
-use paimon::spec::{DataType, IntType, Schema, TableSchema};
+use paimon::spec::{DataType, Datum, IntType, PredicateBuilder, Schema, TableSchema};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -167,4 +167,89 @@ async fn window_reads_files_that_are_not_column_slices_as_stored() {
             (Some(4), Some(4)),
         ]
     );
+}
+
+/// Projection pruning must not drop an update-only file from a physical-event
+/// group: its absent projected fields are read as NULL like the other columns.
+#[tokio::test]
+async fn window_reads_physical_events_with_projection() {
+    let path = "memory:/data_evolution_window/projection";
+    let (io, table) = data_evolution_table(path);
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    write_batch(&table, &make_batch(vec![1, 2], vec![1, 2])).await;
+    write_batch(&table, &make_batch(vec![3, 4], vec![3, 4])).await;
+    compact(&table).await;
+    update_values(&table, vec![50; 4]).await;
+
+    let options = HashMap::from([(
+        "incremental-between-timestamp".to_string(),
+        "0,9999999999999".to_string(),
+    )]);
+    let table = table.copy_with_time_travel(options).await.unwrap();
+    let mut builder = table.new_read_builder();
+    builder.with_projection(&["id"]).unwrap();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let batches = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let mut ids = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![None, None, None, None, Some(1), Some(2), Some(3), Some(4),]
+    );
+}
+
+/// Merged latest-row statistics must not prune physical events whose stored
+/// values satisfy the predicate.
+#[tokio::test]
+async fn window_filters_physical_events_by_stored_values() {
+    let path = "memory:/data_evolution_window/filter";
+    let (io, table) = data_evolution_table(path);
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    write_batch(&table, &make_batch(vec![1, 2], vec![1, 2])).await;
+    write_batch(&table, &make_batch(vec![3, 4], vec![3, 4])).await;
+    compact(&table).await;
+    update_values(&table, vec![50; 4]).await;
+
+    let options = HashMap::from([(
+        "incremental-between-timestamp".to_string(),
+        "0,9999999999999".to_string(),
+    )]);
+    let table = table.copy_with_time_travel(options).await.unwrap();
+    let mut builder = table.new_read_builder();
+    builder.with_filter(
+        PredicateBuilder::new(table.schema().fields())
+            .equal("value", Datum::Int(1))
+            .unwrap(),
+    );
+    let plan = builder.new_scan().plan().await.unwrap();
+    let batches = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(rows(&batches), vec![(Some(1), Some(1))]);
 }

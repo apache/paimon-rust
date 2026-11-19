@@ -22,6 +22,7 @@
 
 use super::bucket_filter::{compute_target_buckets, BucketSelector};
 use super::chunk_shuffle::{chunk_shuffle_splits, ChunkShuffle};
+use super::data_evolution_reader::is_data_evolution_column_slice_group;
 use super::format_table_scan::FormatTableScan;
 use super::global_index_result::GlobalIndexResult;
 use super::global_index_scanner::RowRangeIndex;
@@ -3151,20 +3152,28 @@ impl<'a> PaimonTableScan<'a> {
                 scan_stats.data_evolution_groups_pruned_by_row_ranges +=
                     groups_pruned_by_row_ranges;
 
-                // Filter groups by merged stats before splitting.
+                // An incremental group that is not made of column slices holds
+                // independent physical events. Merged-row statistics and
+                // projection can discard events before the reader classifies it.
+                let physical_event_group = |group: &[DataFileMeta]| {
+                    self.is_streaming() && !is_data_evolution_column_slice_group(group)
+                };
+
+                // Filter mergeable groups by merged stats before splitting.
                 let row_id_groups: Vec<Vec<DataFileMeta>> = if self.data_predicates.is_empty() {
                     row_id_groups
                 } else {
                     let before = row_id_groups.len();
                     let mut groups = Vec::with_capacity(before);
                     for group in row_id_groups {
-                        if data_evolution_group_matches_predicates_for_table(
-                            &self.table,
-                            &group,
-                            &self.data_predicates,
-                            &mut stats_schema_cache,
-                        )
-                        .await
+                        if physical_event_group(&group)
+                            || data_evolution_group_matches_predicates_for_table(
+                                &self.table,
+                                &group,
+                                &self.data_predicates,
+                                &mut stats_schema_cache,
+                            )
+                            .await
                         {
                             groups.push(group);
                         }
@@ -3179,18 +3188,22 @@ impl<'a> PaimonTableScan<'a> {
                     } else {
                         let mut pruned = Vec::with_capacity(row_id_groups.len());
                         for group in row_id_groups {
-                            pruned.push(
-                                prune_data_evolution_group_by_read_fields(
-                                    group,
-                                    read_field_ids,
-                                    deletion_vectors_enabled,
-                                    table_schema_id,
-                                    table_fields,
-                                    schema_manager,
-                                    &mut data_file_field_ids_cache,
-                                )
-                                .await?,
-                            );
+                            if physical_event_group(&group) {
+                                pruned.push(group);
+                            } else {
+                                pruned.push(
+                                    prune_data_evolution_group_by_read_fields(
+                                        group,
+                                        read_field_ids,
+                                        deletion_vectors_enabled,
+                                        table_schema_id,
+                                        table_fields,
+                                        schema_manager,
+                                        &mut data_file_field_ids_cache,
+                                    )
+                                    .await?,
+                                );
+                            }
                         }
                         pruned
                     }
