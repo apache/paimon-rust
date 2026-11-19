@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 use std::sync::Arc;
 
 use paimon::catalog::Identifier;
+use paimon::spec::Schema;
 use paimon::{Catalog, CatalogFactory, Options};
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
@@ -98,6 +100,97 @@ pub unsafe extern "C" fn paimon_catalog_free(catalog: *mut paimon_catalog) {
         if !c.inner.is_null() {
             drop(Box::from_raw(c.inner as *mut Arc<dyn Catalog>));
         }
+    }
+}
+
+/// Create a database. Returns null on success, or an error to free with
+/// `paimon_error_free`. A null `properties_json` or JSON null means no properties.
+///
+/// # Safety
+/// `catalog` must be a valid catalog handle from a previous paimon C call.
+/// `name` and any non-null `properties_json` must be valid null-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_catalog_create_database(
+    catalog: *const paimon_catalog,
+    name: *const c_char,
+    properties_json: *const c_char,
+    ignore_if_exists: bool,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(catalog, "catalog") {
+        return error;
+    }
+    let name = match validate_cstr(name, "name") {
+        Ok(name) => name,
+        Err(error) => return error,
+    };
+    let properties = if properties_json.is_null() {
+        HashMap::new()
+    } else {
+        let json = match validate_cstr(properties_json, "properties_json") {
+            Ok(json) => json,
+            Err(error) => return error,
+        };
+        match serde_json::from_str::<Option<HashMap<String, String>>>(&json) {
+            Ok(properties) => properties.unwrap_or_default(),
+            Err(error) => {
+                return paimon_error::new(
+                    PaimonErrorCode::InvalidInput,
+                    format!("Failed to parse database properties JSON: {error}"),
+                );
+            }
+        }
+    };
+
+    let catalog = &*((*catalog).inner as *const Arc<dyn Catalog>);
+    match runtime().block_on(catalog.create_database(&name, ignore_if_exists, properties)) {
+        Ok(()) => std::ptr::null_mut(),
+        Err(error) => paimon_error::from_paimon(error),
+    }
+}
+
+/// Create a table from Paimon's DDL Schema JSON. Returns null on success, or
+/// an error to free with `paimon_error_free`.
+///
+/// # Safety
+/// `catalog` and `identifier` must be valid handles from previous paimon C calls.
+/// `schema_json` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_catalog_create_table(
+    catalog: *const paimon_catalog,
+    identifier: *const paimon_identifier,
+    schema_json: *const c_char,
+    ignore_if_exists: bool,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(catalog, "catalog") {
+        return error;
+    }
+    if let Err(error) = check_non_null(identifier, "identifier") {
+        return error;
+    }
+    let json = match validate_cstr(schema_json, "schema_json") {
+        Ok(json) => json,
+        Err(error) => return error,
+    };
+    let schema = match serde_json::from_str::<Schema>(&json) {
+        Ok(schema) => schema,
+        Err(error) => {
+            return paimon_error::new(
+                PaimonErrorCode::InvalidInput,
+                format!("Failed to parse table schema JSON: {error}"),
+            );
+        }
+    };
+    // Deserialization does not run Schema's normalization and validation.
+    let schema = match schema.copy(schema.row_type()) {
+        Ok(schema) => schema,
+        Err(error) => return paimon_error::from_paimon(error),
+    };
+
+    let catalog = &*((*catalog).inner as *const Arc<dyn Catalog>);
+    let identifier = &*((*identifier).inner as *const Identifier);
+    match runtime().block_on(catalog.create_table(identifier, schema, ignore_if_exists)) {
+        Ok(()) => std::ptr::null_mut(),
+        Err(error) => paimon_error::from_paimon(error),
     }
 }
 

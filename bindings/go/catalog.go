@@ -21,6 +21,7 @@ package paimon
 
 import (
 	"context"
+	"encoding/json"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -66,6 +67,30 @@ func (c *Catalog) Close() {
 		c.inner = nil
 		c.lib.release()
 	})
+}
+
+// CreateDatabase creates a database with optional properties. When ignoreIfExists
+// is true, an existing database is accepted.
+func (c *Catalog) CreateDatabase(name string, properties map[string]string, ignoreIfExists bool) error {
+	if c.inner == nil {
+		return ErrClosed
+	}
+	return ffiCatalogCreateDatabase.symbol(c.ctx)(c.inner, name, properties, ignoreIfExists)
+}
+
+// CreateTable creates a table from the Paimon schema JSON used by the REST
+// catalog's CreateTableRequest.schema. The database must already exist.
+// When ignoreIfExists is true, an existing table is accepted.
+func (c *Catalog) CreateTable(id Identifier, schemaJSON []byte, ignoreIfExists bool) error {
+	if c.inner == nil {
+		return ErrClosed
+	}
+	cID, err := c.newIdentifier(id)
+	if err != nil {
+		return err
+	}
+	defer ffiIdentifierFree.symbol(c.ctx)(cID)
+	return ffiCatalogCreateTable.symbol(c.ctx)(c.inner, cID, schemaJSON, ignoreIfExists)
 }
 
 // GetTable retrieves a table from the catalog using the given identifier.
@@ -201,6 +226,69 @@ var ffiIdentifierFree = newFFI(ffiOpts{
 			nil,
 			unsafe.Pointer(&id),
 		)
+	}
+})
+
+var ffiCatalogCreateDatabase = newFFI(ffiOpts{
+	sym:    "paimon_catalog_create_database",
+	rType:  &ffi.TypePointer,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer, &ffi.TypePointer, &ffi.TypeUint8},
+}, func(ctx context.Context, ffiCall ffiCall) func(*paimonCatalog, string, map[string]string, bool) error {
+	return func(catalog *paimonCatalog, name string, properties map[string]string, ignoreIfExists bool) error {
+		namePtr, err := bytePtrFromString(name)
+		if err != nil {
+			return err
+		}
+		propertiesJSON, err := json.Marshal(properties)
+		if err != nil {
+			return err
+		}
+		propertiesPtr, err := bytePtrFromString(string(propertiesJSON))
+		if err != nil {
+			return err
+		}
+		ignore := uint8(0)
+		if ignoreIfExists {
+			ignore = 1
+		}
+		var ffiError *paimonError
+		ffiCall(
+			unsafe.Pointer(&ffiError),
+			unsafe.Pointer(&catalog),
+			unsafe.Pointer(&namePtr),
+			unsafe.Pointer(&propertiesPtr),
+			unsafe.Pointer(&ignore),
+		)
+		runtime.KeepAlive(namePtr)
+		runtime.KeepAlive(propertiesPtr)
+		return parseError(ctx, ffiError)
+	}
+})
+
+var ffiCatalogCreateTable = newFFI(ffiOpts{
+	sym:    "paimon_catalog_create_table",
+	rType:  &ffi.TypePointer,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer, &ffi.TypePointer, &ffi.TypeUint8},
+}, func(ctx context.Context, ffiCall ffiCall) func(*paimonCatalog, *paimonIdentifier, []byte, bool) error {
+	return func(catalog *paimonCatalog, id *paimonIdentifier, schemaJSON []byte, ignoreIfExists bool) error {
+		schemaPtr, err := bytePtrFromString(string(schemaJSON))
+		if err != nil {
+			return err
+		}
+		ignore := uint8(0)
+		if ignoreIfExists {
+			ignore = 1
+		}
+		var ffiError *paimonError
+		ffiCall(
+			unsafe.Pointer(&ffiError),
+			unsafe.Pointer(&catalog),
+			unsafe.Pointer(&id),
+			unsafe.Pointer(&schemaPtr),
+			unsafe.Pointer(&ignore),
+		)
+		runtime.KeepAlive(schemaPtr)
+		return parseError(ctx, ffiError)
 	}
 })
 
