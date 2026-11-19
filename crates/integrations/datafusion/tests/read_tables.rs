@@ -1938,6 +1938,33 @@ mod vector_search_tests {
         assert!(ids.contains(&0), "exact match [1,0,0,0] should be in top 3");
     }
 
+    #[tokio::test]
+    async fn test_compat_call_vector_search_returns_ranked_projected_rows() {
+        let (ctx, _catalog, _tmp) = create_java_vindex_vector_search_context().await;
+        super::common::assert_sql_error(
+            &ctx,
+            "CALL sys.vector_search(table => 'default.test_java_vindex_vector', \
+             vector_column => 'embedding', query_vector => '1, 0, 0, 0', top_k => 3, \
+             \"where\" => 'id = 5')",
+            "Argument where is unknown",
+        )
+        .await;
+        let batches = ctx
+            .sql(
+                "CALL paimon.sys.vector_search(\
+                 'default.test_java_vindex_vector', 'embedding', '1, 0, 0, 0', 3, 'id')",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let ids = extract_ids(&batches);
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], 0);
+        assert!(batches.iter().all(|batch| batch.num_columns() == 1));
+    }
+
     /// `vector_search` must return rows in relevance order, not file order. Querying
     /// id 2's vector ranks `[2, 5, 1]` by L2 distance, which differs from the
     /// ascending-id file order `[1, 2, 5]` the pre-fix scan produced.

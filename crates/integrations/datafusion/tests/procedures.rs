@@ -100,6 +100,95 @@ fn read_tag(tmp: &Path, name: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn test_compat_rollback_reports_and_applies_snapshot_and_tag() {
+    let (_tmp, ctx) = setup_table_with_snapshots().await;
+    exec(
+        &ctx,
+        "CALL sys.create_tag(table => 'test_db.t1', tag => 'first', snapshot_id => 1)",
+    )
+    .await;
+    assert_sql_error(
+        &ctx,
+        "CALL sys.rollback(table => 'test_db.t1', version => '1', snapshot => 2)",
+        "requires exactly one",
+    )
+    .await;
+    assert_eq!(row_count(&ctx, "SELECT * FROM test_db.t1").await, 3);
+
+    for (sql, previous, current) in [
+        ("CALL sys.rollback('test_db.t1', '2')", 3, 2),
+        (
+            "CALL paimon.sys.rollback(table => 'test_db.t1', tag => 'first')",
+            2,
+            1,
+        ),
+    ] {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        for (name, expected) in [
+            ("previous_snapshot_id", previous),
+            ("current_snapshot_id", current),
+        ] {
+            assert_eq!(
+                batch
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                expected,
+            );
+        }
+        assert_eq!(
+            row_count(&ctx, "SELECT * FROM test_db.t1").await,
+            current as usize
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_compat_drop_partition_validates_all_specs_before_committing() {
+    let (_tmp, ctx) = setup_sql_context().await;
+    exec(
+        &ctx,
+        "CREATE TABLE test_db.call_parts (id INT, dt STRING, region INT) PARTITIONED BY (dt, region)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "INSERT INTO test_db.call_parts VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 1)",
+    )
+    .await;
+    assert_sql_error(
+        &ctx,
+        "CALL sys.drop_partition('test_db.call_parts', 'dt=a,region=1', 'dt=b')",
+        "Incomplete partition spec",
+    )
+    .await;
+    assert_eq!(row_count(&ctx, "SELECT * FROM test_db.call_parts").await, 3);
+    exec(&ctx, "SET 'paimon.scan.version' = '1'").await;
+    assert_sql_error(
+        &ctx,
+        "CALL sys.drop_partition('test_db.call_parts', 'dt=a,region=1')",
+        "while time-travel option 'scan.version' is set",
+    )
+    .await;
+    exec(&ctx, "RESET 'paimon.scan.version'").await;
+    exec(
+        &ctx,
+        "CALL sys.drop_partition('test_db.call_parts', 'dt=a,region=1', 'dt=b,region=1')",
+    )
+    .await;
+    assert_eq!(row_count(&ctx, "SELECT * FROM test_db.call_parts").await, 1);
+    assert_eq!(
+        row_count(&ctx, "SELECT * FROM test_db.call_parts WHERE id = 2").await,
+        1
+    );
+}
+
+#[tokio::test]
 async fn test_create_tag() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
 
@@ -1308,6 +1397,18 @@ async fn test_create_and_drop_full_text_global_index() {
         vec![
             (1, "apache paimon lake".to_string()),
             (4, "paimon rust reader".to_string())
+        ]
+    );
+    assert_eq!(
+        collect_id_name(
+            &sql_context,
+            "CALL sys.full_text_search(table => 'test_db.ft_build', column => 'name', \
+             query => 'paimon', top_k => 10, projection => 'id, name')",
+        )
+        .await,
+        vec![
+            (1, "apache paimon lake".to_string()),
+            (4, "paimon rust reader".to_string()),
         ]
     );
 

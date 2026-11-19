@@ -927,12 +927,13 @@ impl SQLContext {
                 }
             }
             Statement::Call(func) => {
-                crate::procedures::execute_call(
-                    &self.ctx,
+                // Keep procedure futures out of the shared SQL executor's stack frame.
+                Box::pin(crate::procedures::execute_call(
+                    self,
                     &self.catalogs,
                     &self.current_catalog_name(),
                     func,
-                )
+                ))
                 .await
             }
             Statement::Query(_) | Statement::Explain { .. } => {
@@ -1965,7 +1966,7 @@ impl SQLContext {
     /// resolve the selected snapshot schema. Silently ignoring the selector
     /// here would be inconsistent. Ordinary INSERT uses the resolved provider
     /// and its selected schema, so it does not need this guard.
-    fn ensure_no_time_travel_for_write(&self, operation: &str) -> DFResult<()> {
+    pub(crate) fn ensure_no_time_travel_for_write(&self, operation: &str) -> DFResult<()> {
         use paimon::spec::{
             SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION,
             SCAN_TIMESTAMP_OPTION, SCAN_VERSION_OPTION, SCAN_WATERMARK_OPTION,
@@ -5972,6 +5973,62 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn call_create_and_drop_catalog_function_metadata() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        let identifier = Identifier::new("default", "registered");
+        let created = ctx
+            .sql(
+                r#"CALL sys.create_function(
+                    'default.registered', '[{"name":"x","type":"BIGINT"},{"name":"y","type":"STRING"}]',
+                    '[{"id":7,"name":"result","type":"BIGINT"}]',
+                    NULL, 'Catalog function', 'owner=sql'
+                )"#,
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let result = created[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(result.value(0));
+        let stored = catalog.get_function(&identifier).await.unwrap();
+        assert_eq!(
+            stored
+                .input_params()
+                .unwrap()
+                .iter()
+                .map(PaimonDataField::id)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(stored.return_params().unwrap()[0].id(), 7);
+        assert!(stored.definitions().is_empty());
+        assert!(stored.is_deterministic());
+        assert_eq!(stored.comment(), Some("Catalog function"));
+        assert_eq!(
+            stored.options().get("owner").map(String::as_str),
+            Some("sql")
+        );
+        assert!(ctx
+            .sql("CALL sys.drop_function(function => 'another.default.registered')")
+            .await
+            .is_err());
+        assert!(catalog.get_function(&identifier).await.is_ok());
+        ctx.sql("CALL sys.drop_function(function => 'default.registered')")
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.get_function(&identifier).await,
+            Err(paimon::Error::FunctionNotExist { .. })
+        ));
     }
 
     #[tokio::test]
