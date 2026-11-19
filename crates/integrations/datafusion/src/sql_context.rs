@@ -927,12 +927,13 @@ impl SQLContext {
                 }
             }
             Statement::Call(func) => {
-                crate::procedures::execute_call(
-                    &self.ctx,
+                // Keep procedure futures out of the shared SQL executor's stack frame.
+                Box::pin(crate::procedures::execute_call(
+                    self,
                     &self.catalogs,
                     &self.current_catalog_name(),
                     func,
-                )
+                ))
                 .await
             }
             Statement::Query(_) | Statement::Explain { .. } => {
@@ -1965,7 +1966,7 @@ impl SQLContext {
     /// resolve the selected snapshot schema. Silently ignoring the selector
     /// here would be inconsistent. Ordinary INSERT uses the resolved provider
     /// and its selected schema, so it does not need this guard.
-    fn ensure_no_time_travel_for_write(&self, operation: &str) -> DFResult<()> {
+    pub(crate) fn ensure_no_time_travel_for_write(&self, operation: &str) -> DFResult<()> {
         use paimon::spec::{
             SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION,
             SCAN_TIMESTAMP_OPTION, SCAN_VERSION_OPTION, SCAN_WATERMARK_OPTION,
@@ -5972,6 +5973,218 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(answers.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn call_create_and_drop_catalog_function_metadata() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        let identifier = Identifier::new("default", "registered");
+        let created = ctx
+            .sql(
+                r#"CALL sys.create_function(
+                    'default.registered', '[{"name":"x","type":"BIGINT"},{"name":"y","type":"STRING"}]',
+                    '[{"id":7,"name":"result","type":"BIGINT"}]',
+                    NULL, 'Catalog function', 'owner=sql'
+                )"#,
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let result = created[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(result.value(0));
+        let stored = catalog.get_function(&identifier).await.unwrap();
+        assert_eq!(
+            stored
+                .input_params()
+                .unwrap()
+                .iter()
+                .map(PaimonDataField::id)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(stored.return_params().unwrap()[0].id(), 7);
+        assert!(stored.definitions().is_empty());
+        assert!(stored.is_deterministic());
+        assert_eq!(stored.comment(), Some("Catalog function"));
+        assert_eq!(
+            stored.options().get("owner").map(String::as_str),
+            Some("sql")
+        );
+        assert!(ctx
+            .sql("CALL sys.drop_function(function => 'another.default.registered')")
+            .await
+            .is_err());
+        assert!(catalog.get_function(&identifier).await.is_ok());
+        ctx.sql("CALL sys.drop_function(function => 'default.registered')")
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.get_function(&identifier).await,
+            Err(paimon::Error::FunctionNotExist { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn call_create_function_assigns_ids_across_nested_fields() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.sql(
+            r#"CALL sys.create_function(
+                'default.composite',
+                '[{"name":"payload","type":{"type":"ARRAY","element":{"type":"ROW","fields":[
+                    {"name":"k","type":"STRING"},
+                    {"name":"v","type":{"type":"MAP","key":"STRING","value":{"type":"ROW","fields":[
+                        {"name":"count","type":"BIGINT"}
+                    ]}}}
+                ]}}},{"name":"limit","type":"INT"}]',
+                '[]'
+            )"#,
+        )
+        .await
+        .unwrap();
+        let stored = catalog
+            .get_function(&Identifier::new("default", "composite"))
+            .await
+            .unwrap();
+        let params = serde_json::to_value(stored.input_params().unwrap()).unwrap();
+        assert_eq!(params[0]["id"], 0);
+        let row = &params[0]["type"]["element"]["fields"];
+        assert_eq!(row[0]["id"], 1);
+        assert_eq!(row[1]["id"], 2);
+        assert_eq!(row[1]["type"]["value"]["fields"][0]["id"], 3);
+        assert_eq!(params[1]["id"], 4);
+
+        let mixed = ctx
+            .sql(r#"CALL sys.create_function(
+                'default.mixed',
+                '[{"name":"payload","type":{"type":"ROW","fields":[{"id":5,"name":"x","type":"INT"}]}}]',
+                '[]'
+            )"#)
+            .await
+            .unwrap_err();
+        assert!(mixed.to_string().contains("explicit field IDs"));
+        assert!(matches!(
+            catalog
+                .get_function(&Identifier::new("default", "mixed"))
+                .await,
+            Err(paimon::Error::FunctionNotExist { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn call_catalog_functions_resolve_quoted_identifiers() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.sql(r#"CALL sys.create_function('paimon.default."Risk.Score"', '[]', '[]')"#)
+            .await
+            .unwrap();
+        let identifier = Identifier::new("default", "Risk.Score");
+        assert!(catalog.get_function(&identifier).await.is_ok());
+        ctx.sql("CALL paimon.sys.drop_function('default.`Risk.Score`')")
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.get_function(&identifier).await,
+            Err(paimon::Error::FunctionNotExist { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn call_drop_function_keeps_case_inside_identifier_strings() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        let mixed_case = Identifier::new("default", "Risk");
+        let lowercase = Identifier::new("default", "risk");
+        ctx.sql(r#"CREATE FUNCTION "Risk"() RETURNS BIGINT RETURN 1"#)
+            .await
+            .unwrap();
+        ctx.sql("CREATE FUNCTION risk() RETURNS BIGINT RETURN 2")
+            .await
+            .unwrap();
+        ctx.sql("CALL sys.drop_function('default.Risk')")
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.get_function(&mixed_case).await,
+            Err(paimon::Error::FunctionNotExist { .. })
+        ));
+        assert!(catalog.get_function(&lowercase).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn call_drop_function_does_not_strip_comment_shaped_name_suffix() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+        let literal_name = Identifier::new("default", "billing--v1");
+        let shorter_name = Identifier::new("default", "billing");
+        ctx.sql(r#"CREATE FUNCTION "billing--v1"() RETURNS BIGINT RETURN 1"#)
+            .await
+            .unwrap();
+        ctx.sql("CREATE FUNCTION billing() RETURNS BIGINT RETURN 2")
+            .await
+            .unwrap();
+
+        let error = ctx
+            .sql(r#"CALL sys.drop_function('default."billing"--v1')"#)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Comments are not allowed"));
+        ctx.sql("CALL sys.drop_function('default.billing--v1')")
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.get_function(&literal_name).await,
+            Err(paimon::Error::FunctionNotExist { .. })
+        ));
+        assert!(catalog.get_function(&shorter_name).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn call_qualified_catalog_preserves_exact_registered_name() {
+        let exact = Arc::new(MockCatalog::new());
+        let lowercase = Arc::new(MockCatalog::new());
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog("Prod", exact.clone()).await.unwrap();
+        ctx.register_catalog("prod", lowercase.clone())
+            .await
+            .unwrap();
+        for qualifier in [r#""Prod""#, "prod"] {
+            ctx.sql(&format!(
+                "CALL {qualifier}.sys.create_function('default.target', '[]', '[]')"
+            ))
+            .await
+            .unwrap();
+        }
+
+        ctx.sql("CALL Prod.sys.drop_function('default.target')")
+            .await
+            .unwrap();
+        let identifier = Identifier::new("default", "target");
+        assert!(matches!(
+            exact.get_function(&identifier).await,
+            Err(paimon::Error::FunctionNotExist { .. })
+        ));
+        assert!(lowercase.get_function(&identifier).await.is_ok());
+
+        let quoted = ctx
+            .sql(r#"CALL "PROD".sys.drop_function('default.target')"#)
+            .await
+            .unwrap_err();
+        assert!(quoted.to_string().contains("Unknown catalog 'PROD'"));
+        ctx.sql("CALL PROD.sys.drop_function('default.target')")
+            .await
+            .unwrap();
+        assert!(matches!(
+            lowercase.get_function(&identifier).await,
+            Err(paimon::Error::FunctionNotExist { .. })
+        ));
     }
 
     #[tokio::test]

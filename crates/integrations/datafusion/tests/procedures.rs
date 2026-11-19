@@ -100,6 +100,225 @@ fn read_tag(tmp: &Path, name: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn test_compat_rollback_reports_and_applies_snapshot_and_tag() {
+    let (_tmp, ctx) = setup_table_with_snapshots().await;
+    exec(
+        &ctx,
+        "CALL sys.create_tag(table => 'test_db.t1', tag => 'first', snapshot_id => 1)",
+    )
+    .await;
+    assert_sql_error(
+        &ctx,
+        "CALL sys.rollback(table => 'test_db.t1', version => '1', snapshot => 2)",
+        "requires exactly one",
+    )
+    .await;
+    assert_eq!(row_count(&ctx, "SELECT * FROM test_db.t1").await, 3);
+
+    for (sql, previous, current) in [
+        ("CALL sys.rollback('test_db.t1', '2')", 3, 2),
+        (
+            "CALL paimon.sys.rollback(table => 'test_db.t1', tag => 'first')",
+            2,
+            1,
+        ),
+    ] {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        for (name, expected) in [
+            ("previous_snapshot_id", previous),
+            ("current_snapshot_id", current),
+        ] {
+            assert_eq!(
+                batch
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                expected,
+            );
+        }
+        assert_eq!(
+            row_count(&ctx, "SELECT * FROM test_db.t1").await,
+            current as usize
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_compat_drop_partition_validates_all_specs_before_committing() {
+    let (_tmp, ctx) = setup_sql_context().await;
+    exec(
+        &ctx,
+        "CREATE TABLE test_db.call_parts (id INT, dt STRING, region INT) PARTITIONED BY (dt, region)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "INSERT INTO test_db.call_parts VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 1)",
+    )
+    .await;
+    assert_sql_error(
+        &ctx,
+        "CALL sys.drop_partition('test_db.call_parts', 'dt=a,region=1', 'dt=b')",
+        "Incomplete partition spec",
+    )
+    .await;
+    assert_eq!(row_count(&ctx, "SELECT * FROM test_db.call_parts").await, 3);
+    exec(&ctx, "SET 'paimon.scan.version' = '1'").await;
+    assert_sql_error(
+        &ctx,
+        "CALL sys.drop_partition('test_db.call_parts', 'dt=a,region=1')",
+        "while time-travel option 'scan.version' is set",
+    )
+    .await;
+    exec(&ctx, "RESET 'paimon.scan.version'").await;
+    exec(
+        &ctx,
+        "CALL sys.drop_partition('test_db.call_parts', 'dt=a,region=1', 'dt=b,region=1')",
+    )
+    .await;
+    assert_eq!(row_count(&ctx, "SELECT * FROM test_db.call_parts").await, 1);
+    assert_eq!(
+        row_count(&ctx, "SELECT * FROM test_db.call_parts WHERE id = 2").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_compat_drop_partition_preserves_positional_spec_boundaries() {
+    let (_tmp, ctx) = setup_sql_context().await;
+    exec(
+        &ctx,
+        "CREATE TABLE test_db.call_parts (id INT, pt STRING) PARTITIONED BY (pt)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "INSERT INTO test_db.call_parts VALUES (1, 'a;pt=b'), (2, 'a'), (3, 'b'), (4, 'c')",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CALL sys.drop_partition('test_db.call_parts', 'pt=a;pt=b', 'pt=c')",
+    )
+    .await;
+    assert_eq!(row_count(&ctx, "SELECT * FROM test_db.call_parts").await, 2);
+    assert_eq!(
+        row_count(&ctx, "SELECT * FROM test_db.call_parts WHERE id IN (2, 3)").await,
+        2
+    );
+    exec(
+        &ctx,
+        "CALL sys.drop_partition(table => 'test_db.call_parts', partitions => 'pt=a;pt=b')",
+    )
+    .await;
+    assert_eq!(row_count(&ctx, "SELECT * FROM test_db.call_parts").await, 0);
+}
+
+#[tokio::test]
+async fn test_compat_drop_partition_preserves_whitespace_in_string_values() {
+    let (_tmp, ctx) = setup_sql_context().await;
+    exec(
+        &ctx,
+        "CREATE TABLE test_db.call_parts (id INT, pt STRING) PARTITIONED BY (pt)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "INSERT INTO test_db.call_parts VALUES (1, 'a'), (2, ' a'), (3, '  a')",
+    )
+    .await;
+    exec(
+        &ctx,
+        "CALL sys.drop_partition('test_db.call_parts', 'pt= a')",
+    )
+    .await;
+    assert_eq!(row_count(&ctx, "SELECT * FROM test_db.call_parts").await, 2);
+    assert_eq!(
+        row_count(&ctx, "SELECT * FROM test_db.call_parts WHERE id IN (1, 3)").await,
+        2
+    );
+    exec(
+        &ctx,
+        "CALL sys.drop_partition(table => 'test_db.call_parts', partitions => 'pt=  a')",
+    )
+    .await;
+    assert_eq!(row_count(&ctx, "SELECT * FROM test_db.call_parts").await, 1);
+    assert_eq!(
+        row_count(&ctx, "SELECT * FROM test_db.call_parts WHERE id = 1").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_compat_drop_partition_rejects_an_incorrect_procedure_namespace() {
+    let (_tmp, ctx) = setup_sql_context().await;
+    exec(
+        &ctx,
+        "CREATE TABLE test_db.call_parts (id INT, pt STRING) PARTITIONED BY (pt)",
+    )
+    .await;
+    exec(&ctx, "INSERT INTO test_db.call_parts VALUES (1, 'a')").await;
+    for procedure in [
+        "archive.drop_partition",
+        "paimon.archive.drop_partition",
+        r#"paimon."SYS".drop_partition"#,
+    ] {
+        assert_sql_error(
+            &ctx,
+            &format!("CALL {procedure}('test_db.call_parts', 'pt=a')"),
+            "requires the sys procedure namespace",
+        )
+        .await;
+        assert_eq!(row_count(&ctx, "SELECT * FROM test_db.call_parts").await, 1);
+    }
+    exec(
+        &ctx,
+        "CALL paimon.SYS.drop_partition('test_db.call_parts', 'pt=a')",
+    )
+    .await;
+    assert_eq!(row_count(&ctx, "SELECT * FROM test_db.call_parts").await, 0);
+}
+
+#[tokio::test]
+async fn test_compat_procedure_name_uses_sql_identifier_case_rules() {
+    let (_tmp, ctx) = setup_sql_context().await;
+    assert_sql_error(
+        &ctx,
+        "CALL PAIMON.sys.VeCtOr_SeArCh()",
+        "Missing required argument: 'table'",
+    )
+    .await;
+    assert_sql_error(
+        &ctx,
+        r#"CALL sys."VECTOR_SEARCH"()"#,
+        "Unknown procedure: VECTOR_SEARCH",
+    )
+    .await;
+    exec(
+        &ctx,
+        "SET datafusion.sql_parser.enable_ident_normalization = false",
+    )
+    .await;
+    assert_sql_error(
+        &ctx,
+        "CALL sys.VECTOR_SEARCH()",
+        "Unknown procedure: VECTOR_SEARCH",
+    )
+    .await;
+    assert_sql_error(
+        &ctx,
+        "CALL paimon.sys.vector_search()",
+        "Missing required argument: 'table'",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_create_tag() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
 
@@ -1280,6 +1499,12 @@ async fn test_create_and_drop_full_text_global_index() {
     .await;
     let search =
         "SELECT id, name FROM full_text_search('paimon.test_db.ft_build', 'name', 'paimon', 10)";
+    let call_search = "CALL sys.full_text_search(table => 'test_db.ft_build', column => 'name', \
+                       query => 'paimon', top_k => 10, projection => 'id, name')";
+    let expected_hits = vec![
+        (1, "apache paimon lake".to_string()),
+        (4, "paimon rust reader".to_string()),
+    ];
 
     // Without an index, the default `fast` search mode finds nothing.
     assert!(collect_id_name(&sql_context, search).await.is_empty());
@@ -1303,12 +1528,10 @@ async fn test_create_and_drop_full_text_global_index() {
         .await,
         3
     );
+    assert_eq!(collect_id_name(&sql_context, search).await, expected_hits);
     assert_eq!(
-        collect_id_name(&sql_context, search).await,
-        vec![
-            (1, "apache paimon lake".to_string()),
-            (4, "paimon rust reader".to_string())
-        ]
+        collect_id_name(&sql_context, call_search).await,
+        expected_hits
     );
 
     // Rebuilding with no new rows is a no-op.
@@ -1328,6 +1551,11 @@ async fn test_create_and_drop_full_text_global_index() {
 
     exec(
         &sql_context,
+        "CALL sys.create_tag(table => 'test_db.ft_build', tag => 'indexed')",
+    )
+    .await;
+    exec(
+        &sql_context,
         "CALL sys.drop_global_index(table => 'test_db.ft_build', index_column => 'name', index_type => 'full-text')",
     )
     .await;
@@ -1340,6 +1568,12 @@ async fn test_create_and_drop_full_text_global_index() {
         0
     );
     assert!(collect_id_name(&sql_context, search).await.is_empty());
+    assert!(collect_id_name(&sql_context, call_search).await.is_empty());
+    exec(&sql_context, "SET 'paimon.scan.version' = 'indexed'").await;
+    assert_eq!(
+        collect_id_name(&sql_context, call_search).await,
+        expected_hits
+    );
     drop(tmp);
 }
 

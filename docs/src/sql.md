@@ -1503,6 +1503,73 @@ anything is deleted.
 
 Use `CALL` to invoke built-in procedures. All procedures are under the `sys` namespace.
 
+### Compatibility procedures
+
+These procedures accept named arguments and positional
+arguments in the order shown. Other procedures continue to use named arguments.
+When qualifying one of these procedures, use `sys` or `catalog.sys`.
+Unquoted procedure names follow the session's identifier normalization setting.
+An explicit catalog qualifier checks the exact registered name first, then
+applies that setting if the name is unquoted and no exact match exists.
+
+| Procedure | Arguments in positional order | Result |
+|---|---|---|
+| `rollback` | `table, version, snapshot, tag` | `previous_snapshot_id` and `current_snapshot_id` as BIGINT |
+| `drop_partition` | `table, partitions...` | `OK` after committing the partition drop |
+| `create_function` | `function, inputParams, returnParams, deterministic, comment, options` | Boolean `result` |
+| `drop_function` | `function` | Boolean `result` |
+| `vector_search` | `table, vector_column, query_vector, top_k, projection` | Rows from the existing vector search table function |
+| `full_text_search` | `table, column, query, top_k, projection` | Rows from the existing full-text search table function |
+
+`rollback` takes exactly one of `version`, `snapshot`, or `tag`. A version
+containing only digits means a snapshot ID. Use `tag` for a numeric tag name.
+For a REST catalog, `rollback` first tries the resolved snapshot ID. A catalog
+that only supports restoring an expired snapshot by tag receives a tag rollback
+after the client checks the tag still points to that snapshot. The client verifies
+the resulting head before reporting success. A failed verification can follow an
+applied rollback, so inspect the table state before retrying.
+For a filesystem catalog, stop concurrent writes before calling `rollback`.
+For `drop_partition`, specify every partition key in each `key=value` list.
+Each positional argument represents one partition and can contain a semicolon
+in a partition value. Use semicolons to separate specifications in the named
+`partitions` argument. Whitespace after `=` is significant for string and binary
+values. Use `ALTER TABLE ... DROP PARTITION` for values containing commas.
+The procedure operates on Paimon FileStore tables.
+
+```sql
+CALL sys.rollback('my_db.events', 'release_1');
+CALL sys.drop_partition('my_db.events', 'dt=2026-10-01', 'dt=2026-10-02');
+```
+
+`create_function` registers Catalog metadata on catalogs that support
+persistent functions. Both parameter lists are JSON arrays of Paimon data
+fields. Omit IDs from an entire list to assign distinct IDs starting at zero,
+including nested fields. Function names inside string arguments preserve case.
+Quote a name component to include a dot. The optional
+`deterministic` argument defaults to true and `options` takes comma-separated
+`key=value` pairs. Use [CREATE FUNCTION](#rest-catalog-views-and-sql-functions)
+to register an executable SQL definition.
+
+```sql
+CALL sys.create_function(
+    'my_db.f',
+    '[{"name":"x","type":"BIGINT"}]',
+    '[{"name":"result","type":"BIGINT"}]'
+);
+CALL sys.drop_function('my_db.f');
+```
+
+The search procedures accept `top_k` between 1 and 10000 and an optional
+comma-separated `projection`. `vector_search` accepts a JSON array or a
+comma-separated vector. Both return typed table rows and honor session time-travel
+options such as `paimon.scan.version`. Per-call search options,
+filters and Flink's JSON score output are unsupported by these adapters.
+
+```sql
+CALL sys.vector_search('my_db.items', 'embedding', '1.0, 0.0', 10, 'id');
+CALL sys.full_text_search('my_db.docs', 'content', 'paimon', 10, 'id, title');
+```
+
 ### reset_consumer
 
 Create or overwrite a consumer's next snapshot to consume:
@@ -2403,7 +2470,7 @@ CALL sys.list_policies(database => 'sales', table => 'orders');
 
 ### Constant procedure arguments
 
-CALL arguments still use named `name => expression` syntax. In addition to
+All CALL procedures accept named `name => expression` syntax. In addition to
 literals, SQLContext accepts immutable scalar constant expressions such as
 casts, arithmetic, string functions, CASE and boolean predicates.
 

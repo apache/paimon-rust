@@ -33,7 +33,7 @@ use datafusion::catalog::Session;
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::common::project_schema;
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
@@ -47,6 +47,7 @@ use crate::table_function_args::{
     extract_int_literal, extract_string_literal, parse_table_identifier,
 };
 use crate::table_loader::load_data_table_for_read;
+use crate::DynamicOptions;
 
 const FUNCTION_NAME: &str = "full_text_search";
 
@@ -68,6 +69,7 @@ pub fn register_full_text_search(
 pub struct FullTextSearchFunction {
     catalog: Arc<dyn Catalog>,
     default_database: String,
+    dynamic_options: DynamicOptions,
 }
 
 impl Debug for FullTextSearchFunction {
@@ -80,9 +82,18 @@ impl Debug for FullTextSearchFunction {
 
 impl FullTextSearchFunction {
     pub fn new(catalog: Arc<dyn Catalog>, default_database: &str) -> Self {
+        Self::new_with_dynamic_options(catalog, default_database, Default::default())
+    }
+
+    pub(crate) fn new_with_dynamic_options(
+        catalog: Arc<dyn Catalog>,
+        default_database: &str,
+        dynamic_options: DynamicOptions,
+    ) -> Self {
         Self {
             catalog,
             default_database: default_database.to_string(),
+            dynamic_options,
         }
     }
 }
@@ -110,8 +121,19 @@ impl TableFunctionImpl for FullTextSearchFunction {
             parse_table_identifier(FUNCTION_NAME, &table_name, &self.default_database)?;
 
         let catalog = Arc::clone(&self.catalog);
+        let dynamic_options = self.dynamic_options.read().unwrap().clone();
         let table = block_on_with_runtime(
-            async move { load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await },
+            async move {
+                let table = load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await?;
+                if dynamic_options.is_empty() {
+                    Ok(table)
+                } else {
+                    table
+                        .copy_with_time_travel(dynamic_options)
+                        .await
+                        .map_err(to_datafusion_error)
+                }
+            },
             "full_text_search: catalog access thread panicked",
         )?;
 
@@ -153,29 +175,29 @@ impl TableProvider for FullTextSearchTableProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let table = self.inner.table();
-
-        // Use FullTextSearchBuilder to execute the search.
-        let row_ranges = await_with_runtime(async {
-            let mut builder = table.new_full_text_search_builder();
+        let result = await_with_runtime(async {
+            let mut builder = self.inner.table().new_full_text_search_builder();
             builder
                 .with_text_column(&self.column_name)
                 .with_query_text(&self.query_text)
                 .with_limit(self.limit);
-            builder
-                .execute()
-                .await
-                .and_then(|result| result.row_ids()?.to_row_ranges())
-                .map_err(to_datafusion_error)
+            builder.execute().await.map_err(to_datafusion_error)
         })
         .await?;
+        let row_ranges = result
+            .row_ids()
+            .and_then(|hits| hits.to_row_ranges())
+            .map_err(to_datafusion_error)?;
 
         if row_ranges.is_empty() {
             let schema = project_schema(&self.schema(), projection)?;
             return Ok(Arc::new(EmptyExec::new(schema)));
         }
 
-        // Convert search results to row ranges and inject into the scan.
+        // Read matching row IDs from the same snapshot that supplied the hits.
+        let table = result.table().ok_or_else(|| {
+            DataFusionError::Internal("Full-text search result has no source table".into())
+        })?;
         let mut read_builder = table.new_read_builder();
         if let Some(limit) = limit {
             read_builder.with_limit(limit);
