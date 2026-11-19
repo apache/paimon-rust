@@ -205,9 +205,14 @@ pub(super) async fn drop_partition(
         .transpose()?;
     validate_write_target(sql_ctx, catalog_name, &identifier, "CALL drop_partition").await?;
     let table = crate::table_loader::get_paimon_table(catalog, &identifier).await?;
+    // Preserve literal whitespace so dropping a partition cannot target its trimmed value.
     let specs = match named_partitions {
-        Some(specs) => parse_partition_specs(&table, specs.split(';')),
-        None => parse_partition_specs(&table, positional_partitions.iter().map(String::as_str)),
+        Some(specs) => parse_partition_specs(&table, specs.split(';'), true),
+        None => parse_partition_specs(
+            &table,
+            positional_partitions.iter().map(String::as_str),
+            true,
+        ),
     }?
     .into_iter()
     .map(|spec| {
@@ -455,17 +460,23 @@ pub(super) fn search(
     let parameters = [lit(table), lit(column), lit(query), lit(top_k)];
     let state = ctx.state();
     let call = TableFunctionArgs::new(&parameters, &state);
+    let dynamic_options = sql_ctx
+        .map(|context| context.dynamic_options().clone())
+        .unwrap_or_default();
     let provider = if procedure == "vector_search" {
         VectorSearchFunction::new_with_dynamic_options(
             Arc::clone(catalog),
             &default_schema,
-            sql_ctx
-                .map(|context| context.dynamic_options().clone())
-                .unwrap_or_default(),
+            dynamic_options,
         )
         .call_with_args(call)?
     } else {
-        FullTextSearchFunction::new(Arc::clone(catalog), &default_schema).call_with_args(call)?
+        FullTextSearchFunction::new_with_dynamic_options(
+            Arc::clone(catalog),
+            &default_schema,
+            dynamic_options,
+        )
+        .call_with_args(call)?
     };
     let df = ctx.read_table(provider)?;
     match args.get("projection").map(|value| value.trim()) {

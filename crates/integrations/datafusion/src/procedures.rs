@@ -454,14 +454,37 @@ fn extract_procedure_name(
         .iter()
         .map(|part| part.as_ident())
         .collect::<Option<Vec<_>>>();
-    let normalize = |id: &Ident| normalizer.normalize(id.clone());
-    match parts.as_deref() {
-        Some([procedure] | [_, procedure]) => Ok((None, normalize(procedure))),
-        Some([catalog, _, procedure]) => Ok((Some((*catalog).clone()), normalize(procedure))),
-        _ => Err(DataFusionError::Plan(format!(
+    let (catalog, namespace, procedure) = match parts.as_deref() {
+        Some([procedure]) => (None, None, *procedure),
+        Some([namespace, procedure]) => (None, Some(*namespace), *procedure),
+        Some([catalog, namespace, procedure]) => {
+            (Some((*catalog).clone()), Some(*namespace), *procedure)
+        }
+        _ => return Err(DataFusionError::Plan(format!(
             "Invalid procedure name: {name}. Expected procedure_name, sys.procedure_name, or catalog.sys.procedure_name"
         ))),
+    };
+    let procedure = normalizer.normalize(procedure.clone());
+    if is_compatibility_procedure(&procedure)
+        && namespace.is_some_and(|namespace| normalizer.normalize(namespace.clone()) != "sys")
+    {
+        return Err(DataFusionError::Plan(format!(
+            "Procedure '{procedure}' requires the sys procedure namespace"
+        )));
     }
+    Ok((catalog, procedure))
+}
+
+fn is_compatibility_procedure(name: &str) -> bool {
+    matches!(
+        name,
+        "rollback"
+            | "drop_partition"
+            | "create_function"
+            | "drop_function"
+            | "vector_search"
+            | "full_text_search"
+    )
 }
 
 fn extract_args(
@@ -479,15 +502,7 @@ fn extract_args(
         }
     };
 
-    let compatibility_call = matches!(
-        proc_name,
-        "rollback"
-            | "drop_partition"
-            | "create_function"
-            | "drop_function"
-            | "vector_search"
-            | "full_text_search"
-    );
+    let compatibility_call = is_compatibility_procedure(proc_name);
     let positional =
         compatibility_call && matches!(arg_list.first(), Some(FunctionArg::Unnamed(_)));
     let mut map = HashMap::<String, String>::new();
@@ -1515,7 +1530,7 @@ async fn proc_compact(
 /// Semicolon-separated alternatives, each containing comma-separated key=value constraints.
 fn parse_partitions(table: &Table, partitions: &str) -> DFResult<Predicate> {
     let pb = PredicateBuilder::new(table.schema().fields());
-    let alternatives = parse_partition_specs(table, partitions.split(';'))?
+    let alternatives = parse_partition_specs(table, partitions.split(';'), false)?
         .into_iter()
         .map(|spec| {
             spec.into_iter()
@@ -1536,6 +1551,7 @@ type PartitionSpec<'a> = Vec<(&'a str, Option<Datum>)>;
 fn parse_partition_specs<'a>(
     table: &Table,
     partitions: impl IntoIterator<Item = &'a str>,
+    preserve_literal_whitespace: bool,
 ) -> DFResult<Vec<PartitionSpec<'a>>> {
     let partition_fields = table.schema().partition_fields();
     if partition_fields.is_empty() {
@@ -1556,13 +1572,24 @@ fn parse_partition_specs<'a>(
             })?;
             // Java ParameterUtils uses String.trim(), not Unicode whitespace trimming.
             let key = key.trim_matches(|ch| ch <= ' ');
-            let value = value.trim_matches(|ch| ch <= ' ');
             let field = partition_fields
                 .iter()
                 .find(|field| field.name() == key)
                 .ok_or_else(|| {
                     DataFusionError::Plan(format!("Column '{key}' is not a partition column"))
                 })?;
+            let value = if preserve_literal_whitespace
+                && matches!(
+                    field.data_type(),
+                    DataType::Char(_)
+                        | DataType::VarChar(_)
+                        | DataType::Binary(_)
+                        | DataType::VarBinary(_)
+                ) {
+                value
+            } else {
+                value.trim_matches(|ch| ch <= ' ')
+            };
             if !keys.insert(key) {
                 return Err(DataFusionError::Plan(format!(
                     "Duplicate partition column '{key}'"

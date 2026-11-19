@@ -1507,6 +1507,7 @@ Use `CALL` to invoke built-in procedures. All procedures are under the `sys` nam
 
 These procedures accept named arguments and positional
 arguments in the order shown. Other procedures continue to use named arguments.
+When qualifying one of these procedures, use `sys` or `catalog.sys`.
 Unquoted procedure names follow the session's identifier normalization setting.
 An explicit catalog qualifier checks the exact registered name first, then
 applies that setting if the name is unquoted and no exact match exists.
@@ -1527,10 +1528,13 @@ that only supports restoring an expired snapshot by tag receives a tag rollback
 after the client checks the tag still points to that snapshot. The client verifies
 the resulting head before reporting success. A failed verification can follow an
 applied rollback, so inspect the table state before retrying.
+For a filesystem catalog, stop concurrent writes before calling `rollback`.
 For `drop_partition`, specify every partition key in each `key=value` list.
 Each positional argument represents one partition and can contain a semicolon
 in a partition value. Use semicolons to separate specifications in the named
-`partitions` argument. The procedure operates on Paimon FileStore tables.
+`partitions` argument. Whitespace after `=` is significant for string and binary
+values. Use `ALTER TABLE ... DROP PARTITION` for values containing commas.
+The procedure operates on Paimon FileStore tables.
 
 ```sql
 CALL sys.rollback('my_db.events', 'release_1');
@@ -1557,7 +1561,8 @@ CALL sys.drop_function('my_db.f');
 
 The search procedures accept `top_k` between 1 and 10000 and an optional
 comma-separated `projection`. `vector_search` accepts a JSON array or a
-comma-separated vector. Both return typed table rows. Per-call search options,
+comma-separated vector. Both return typed table rows and honor session time-travel
+options such as `paimon.scan.version`. Per-call search options,
 filters and Flink's JSON score output are unsupported by these adapters.
 
 ```sql
