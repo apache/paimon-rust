@@ -608,15 +608,11 @@ fn build_physical_fields(
                 .and_then(|field| {
                     // The table remains logically NOT NULL, but Java's KV
                     // value type makes non-key DELETE payloads nullable.
-                    Ok(DataField::new(
-                        field.id(),
-                        field.name().into(),
+                    Ok(field.clone().with_data_type(
                         field
                             .data_type()
                             .copy_with_nullable(arrow_field.is_nullable())?,
-                    )
-                    .with_description(field.description().map(str::to_owned))
-                    .with_default_value(field.default_value().map(str::to_owned)))
+                    ))
                 }),
         })
         .collect()
@@ -628,6 +624,41 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::IntType;
     use arrow_array::Int32Array;
+
+    #[test]
+    fn physical_fields_preserve_generated_metadata_for_nullable_delete_values() {
+        let value_fields = vec![
+            DataField::new(7, "id".into(), DataType::Int(IntType::with_nullable(false))),
+            DataField::new(
+                11,
+                "value".into(),
+                DataType::Int(IntType::with_nullable(false)),
+            )
+            .with_description(Some("stored value".into()))
+            .with_generation_expression(Some("CAST(id AS INT)".into())),
+        ];
+        let physical_schema = ArrowSchema::new(vec![
+            ArrowField::new(SEQUENCE_NUMBER_FIELD_NAME, ArrowDataType::Int64, false),
+            ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]);
+        let physical_fields = build_physical_fields(&physical_schema, &value_fields).unwrap();
+        assert_eq!(physical_fields[0].id(), SEQUENCE_NUMBER_FIELD_ID);
+        assert_eq!(physical_fields[1].id(), VALUE_KIND_FIELD_ID);
+        assert_eq!(physical_fields[2], value_fields[0]);
+        assert_eq!(physical_fields[3].id(), 11);
+        assert_eq!(
+            physical_fields[3].data_type(),
+            &DataType::Int(IntType::new())
+        );
+        assert_eq!(physical_fields[3].description(), Some("stored value"));
+        assert_eq!(
+            physical_fields[3].generation_expression(),
+            Some("CAST(id AS INT)")
+        );
+        assert!(!value_fields[1].data_type().is_nullable());
+    }
 
     async fn write_with_budget(
         format: &str,

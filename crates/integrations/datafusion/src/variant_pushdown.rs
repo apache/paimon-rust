@@ -356,14 +356,7 @@ fn build_projection_rewrite(
                 }),
             )
             .map_err(to_datafusion_error)?;
-            read_type.push(
-                DataField::new(
-                    field.id(),
-                    field.name().to_string(),
-                    DataType::Row(extraction_row),
-                )
-                .with_description(field.description().map(ToString::to_string)),
-            );
+            read_type.push(field.with_data_type(DataType::Row(extraction_row)));
         } else {
             read_type.push(field);
         }

@@ -60,6 +60,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
+const PAIMON_GENERATION_EXPRESSION_META_KEY: &str = "paimon:generationExpression";
 
 /// Converts a Paimon [`DataType`](PaimonDataType) to an Arrow [`DataType`](ArrowDataType).
 pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType> {
@@ -135,7 +136,12 @@ fn paimon_arrow_type(dt: &PaimonDataType, for_read: bool) -> crate::Result<Arrow
             let fields: Vec<ArrowField> = r
                 .fields()
                 .iter()
-                .map(|f| field(f.name(), f.data_type()))
+                .map(|f| {
+                    Ok(with_generation_expression(
+                        field(f.name(), f.data_type())?,
+                        f,
+                    ))
+                })
                 .collect::<crate::Result<Vec<_>>>()?;
             ArrowDataType::Struct(fields.into())
         }
@@ -343,7 +349,21 @@ fn arrow_field_with_paimon_id(
     ArrowField::new(name, data_type, nullable).with_metadata(metadata)
 }
 
-/// Convert Arrow fields to Paimon [`DataField`]s, preserving explicit field IDs.
+fn with_generation_expression(arrow_field: ArrowField, field: &DataField) -> ArrowField {
+    if let Some(expression) = field.generation_expression() {
+        let mut metadata = arrow_field.metadata().clone();
+        metadata.insert(
+            PAIMON_GENERATION_EXPRESSION_META_KEY.to_string(),
+            expression.to_string(),
+        );
+        arrow_field.with_metadata(metadata)
+    } else {
+        arrow_field
+    }
+}
+
+/// Convert Arrow fields to Paimon [`DataField`]s, preserving explicit field IDs
+/// and generation expressions stored under `paimon:generationExpression`.
 /// Fields without IDs receive positional IDs starting from 0.
 pub fn arrow_fields_to_paimon(fields: &[ArrowField]) -> crate::Result<Vec<DataField>> {
     fields
@@ -355,6 +375,11 @@ pub fn arrow_fields_to_paimon(fields: &[ArrowField]) -> crate::Result<Vec<DataFi
                 arrow_field_id(f).unwrap_or(i as i32),
                 f.name().clone(),
                 paimon_type,
+            )
+            .with_generation_expression(
+                f.metadata()
+                    .get(PAIMON_GENERATION_EXPRESSION_META_KEY)
+                    .cloned(),
             ))
         })
         .collect()
@@ -384,7 +409,7 @@ fn build_arrow_schema(fields: &[DataField], for_read: bool) -> crate::Result<Arc
             field
                 .metadata_mut()
                 .insert(PARQUET_FIELD_ID_META_KEY.into(), f.id().to_string());
-            Ok(field)
+            Ok(with_generation_expression(field, f))
         })
         .collect::<crate::Result<Vec<_>>>()?;
     Ok(Arc::new(ArrowSchema::new(fields)))
@@ -890,16 +915,95 @@ mod tests {
     #[test]
     fn test_row_roundtrip() {
         let row = PaimonDataType::Row(RowType::new(vec![
-            DataField::new(0, "a".to_string(), PaimonDataType::Int(IntType::new())),
+            DataField::new(0, "a".to_string(), PaimonDataType::Int(IntType::new()))
+                .with_generation_expression(Some("LENGTH(b)".into())),
             DataField::new(
                 1,
                 "b".to_string(),
                 PaimonDataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
             ),
+            DataField::new(
+                2,
+                "geometry".into(),
+                PaimonDataType::Geometry(GeometryType::new("EPSG:3857").unwrap()),
+            )
+            .with_generation_expression(Some("future_geometry(b)".into())),
+            DataField::new(
+                3,
+                "geography".into(),
+                PaimonDataType::Geography(
+                    GeographyType::new("OGC:CRS84", EdgeAlgorithm::Karney).unwrap(),
+                ),
+            )
+            .with_generation_expression(Some("future_geography(b)".into())),
         ]));
         let arrow = paimon_type_to_arrow(&row).unwrap();
         let back = arrow_to_paimon_type(&arrow, true).unwrap();
-        assert!(matches!(back, PaimonDataType::Row(_)));
+        assert_eq!(back, row);
+        let read = paimon_type_to_arrow_for_read(&row).unwrap();
+        assert_eq!(arrow_to_paimon_type(&read, true).unwrap(), row);
+    }
+
+    #[test]
+    fn generated_column_arrow_schema_roundtrip() {
+        let fields = vec![
+            DataField::new(
+                7,
+                "source".into(),
+                PaimonDataType::Int(IntType::with_nullable(false)),
+            ),
+            DataField::new(
+                11,
+                "generated".into(),
+                PaimonDataType::Int(IntType::with_nullable(false)),
+            )
+            .with_generation_expression(Some("CAST(source AS INT)".into())),
+            DataField::new(
+                15,
+                "geometry".into(),
+                PaimonDataType::Geometry(GeometryType::with_nullable(false, "EPSG:3857").unwrap()),
+            )
+            .with_generation_expression(Some("future_geometry(source)".into())),
+            DataField::new(
+                19,
+                "geography".into(),
+                PaimonDataType::Geography(
+                    GeographyType::with_nullable(false, "OGC:CRS84", EdgeAlgorithm::Karney)
+                        .unwrap(),
+                ),
+            )
+            .with_generation_expression(Some("future_geography(source)".into())),
+        ];
+        for (schema, nullable) in [
+            (build_target_arrow_schema(&fields).unwrap(), false),
+            (build_read_arrow_schema(&fields).unwrap(), true),
+        ] {
+            for (index, field) in fields.iter().enumerate() {
+                assert_eq!(
+                    schema
+                        .field(index)
+                        .metadata()
+                        .get("paimon:generationExpression")
+                        .map(String::as_str),
+                    field.generation_expression()
+                );
+            }
+            let arrow_fields: Vec<_> = schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect();
+            let restored = arrow_fields_to_paimon(&arrow_fields).unwrap();
+            let expected: Vec<_> = fields
+                .iter()
+                .cloned()
+                .map(|field| {
+                    let data_type = field.data_type().copy_with_nullable(nullable).unwrap();
+                    field.with_data_type(data_type)
+                })
+                .collect();
+            assert_eq!(restored, expected);
+        }
     }
 
     #[test]

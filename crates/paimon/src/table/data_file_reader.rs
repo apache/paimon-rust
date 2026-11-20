@@ -1286,10 +1286,10 @@ fn projected_source_fields(decoded: &[DataField], projected: &[DataField]) -> Ve
         .iter()
         .filter_map(|source| {
             let projected = projected.iter().find(|field| field.id() == source.id())?;
-            Some(data_field_with_type(
-                source,
-                projected_source_type(source.data_type(), projected.data_type()),
-            ))
+            Some(source.clone().with_data_type(projected_source_type(
+                source.data_type(),
+                projected.data_type(),
+            )))
         })
         .collect()
 }
@@ -1340,7 +1340,7 @@ fn read_data_fields(
                 data_field.data_type(),
                 nested_field_enabled,
             )? {
-                let mut field = data_field_with_type(data_field, pruned_type);
+                let mut field = data_field.clone().with_data_type(pruned_type);
                 if crate::spec::is_map_selected_keys_field(expected) {
                     field = field.with_description(expected.description().map(str::to_string));
                 }
@@ -1444,12 +1444,6 @@ fn prune_data_type(
         }
         _ => Ok(Some(data_type.clone())),
     }
-}
-
-fn data_field_with_type(field: &DataField, data_type: DataType) -> DataField {
-    DataField::new(field.id(), field.name().to_string(), data_type)
-        .with_description(field.description().map(ToString::to_string))
-        .with_default_value(field.default_value().map(ToString::to_string))
 }
 
 fn data_schema_fields_for_file(
@@ -1937,7 +1931,9 @@ mod row_tests {
             DataType::Int(IntType::new()),
         )]));
         let physical_type = variant_shredding_type(&configured).unwrap();
-        let data_field = field(1, "v", physical_type);
+        let data_field = field(1, "v", physical_type)
+            .with_description(Some("stored variant".into()))
+            .with_generation_expression(Some("future_variant(id)".into()));
         let extraction_type = DataType::Row(
             variant_extraction_row(
                 true,
@@ -1957,6 +1953,11 @@ mod row_tests {
         assert_eq!(read_fields.len(), 1);
         assert!(is_variant_extraction_row_type(read_fields[0].data_type()));
         assert_eq!(read_fields[0].data_type(), &extraction_type);
+        assert_eq!(read_fields[0].description(), Some("stored variant"));
+        assert_eq!(
+            read_fields[0].generation_expression(),
+            Some("future_variant(id)")
+        );
     }
 
     #[test]
@@ -1988,7 +1989,8 @@ mod row_tests {
                 old_sub.clone(),
                 field(4, "other", DataType::Int(IntType::new())),
             ])),
-        );
+        )
+        .with_generation_expression(Some("future_row(id)".into()));
         let read_profile = field(
             1,
             "profile",
@@ -2003,7 +2005,10 @@ mod row_tests {
             )])),
         );
 
-        let pruned = read_data_fields(&[file_profile], &[read_profile], true).unwrap();
+        let pruned =
+            read_data_fields(std::slice::from_ref(&file_profile), &[read_profile], true).unwrap();
+        assert_eq!(pruned[0].generation_expression(), Some("future_row(id)"));
+        assert_eq!(projected_source_fields(&[file_profile], &pruned), pruned);
         let DataType::Row(profile) = pruned[0].data_type() else {
             panic!("profile should remain a ROW")
         };

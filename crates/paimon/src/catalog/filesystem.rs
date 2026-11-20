@@ -2268,6 +2268,315 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn format_table_type_changes_validate_existing_defaults_before_publication() {
+        use crate::spec::BigIntType;
+
+        for (default, valid) in [
+            ("2147483648", false),
+            ("-2147483649", false),
+            ("'2147483648'", false),
+            ("2147483647", true),
+            ("'2147483647'", true),
+            ("'42.9'", true),
+        ] {
+            let catalog = create_memory_catalog();
+            let schema = Schema::builder()
+                .field(
+                    DataField::new(0, "value".into(), DataType::BigInt(BigIntType::new()))
+                        .with_default_value(Some(default.into())),
+                )
+                .option("type", "format-table")
+                .option("file.format", "parquet")
+                .build()
+                .unwrap();
+            let id = setup_table(&catalog, schema).await;
+            let original = catalog.get_table(&id).await.unwrap();
+            original.new_write_builder().new_write().unwrap();
+            let manager = SchemaManager::new(catalog.file_io.clone(), catalog.table_path(&id));
+            let result = catalog
+                .alter_table(
+                    &id,
+                    vec![SchemaChange::update_column_type(
+                        "value".into(),
+                        DataType::Int(IntType::new()),
+                    )],
+                    false,
+                )
+                .await;
+            let current = catalog.get_table(&id).await.unwrap();
+            if valid {
+                result.unwrap();
+                assert_eq!(manager.list_all_ids().await.unwrap(), vec![0, 1]);
+                assert_eq!(current.schema().id(), 1);
+                assert_eq!(
+                    current.schema().fields()[0].data_type(),
+                    &DataType::Int(IntType::new())
+                );
+                assert_eq!(current.schema().fields()[0].default_value(), Some(default));
+            } else {
+                assert!(
+                    matches!(result, Err(Error::DataInvalid { message, .. }) if message.contains("Unsupported default value")),
+                    "default {default} must be rejected before schema publication"
+                );
+                assert_eq!(manager.list_all_ids().await.unwrap(), vec![0]);
+                assert_eq!(current.schema(), original.schema());
+            }
+            current.new_write_builder().new_write().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_generated_column_changes_do_not_publish_schema() {
+        let ordinary = Schema::builder()
+            .column("source", DataType::VarChar(VarCharType::string_type()))
+            .build()
+            .unwrap();
+        let generated = DataField::new(
+            1,
+            "generated".into(),
+            DataType::VarChar(VarCharType::string_type()),
+        )
+        .with_generation_expression(Some("UPPER(source)".into()));
+        let with_generated = Schema::builder()
+            .field(ordinary.fields()[0].clone())
+            .field(generated.clone())
+            .build()
+            .unwrap();
+        for (schema, change, message) in [
+            (
+                ordinary,
+                SchemaChange::add_column(
+                    "nested".into(),
+                    DataType::Row(RowType::new(vec![generated])),
+                ),
+                "Generated columns must be top-level columns",
+            ),
+            (
+                with_generated,
+                SchemaChange::set_option("rowkind.field".into(), "generated".into()),
+                "cannot be used as rowkind.field",
+            ),
+        ] {
+            let catalog = create_memory_catalog();
+            let id = setup_table(&catalog, schema).await;
+            let original = catalog.get_table(&id).await.unwrap();
+            let manager = SchemaManager::new(catalog.file_io.clone(), catalog.table_path(&id));
+            let error = catalog
+                .alter_table(
+                    &id,
+                    vec![
+                        SchemaChange::set_option("test.option".into(), "uncommitted".into()),
+                        change,
+                    ],
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, Error::ConfigInvalid { message: actual } if actual.contains(message)),
+                "{error:?}"
+            );
+            assert_eq!(manager.list_all_ids().await.unwrap(), vec![0]);
+            assert_eq!(
+                catalog.get_table(&id).await.unwrap().schema(),
+                original.schema()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_columns_survive_catalog_evolution_and_reads() {
+        use arrow_array::{Date32Array, Int32Array, RecordBatch};
+        use futures::TryStreamExt;
+
+        let catalog = create_memory_catalog();
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+        let id = Identifier::new("db", "generated");
+        let table_path = catalog.table_path(&id);
+        catalog
+            .file_io
+            .mkdirs(&catalog.schema_dir_path(&table_path))
+            .await
+            .unwrap();
+        catalog
+            .file_io
+            .new_output(&catalog.schema_file_path(&table_path, 0))
+            .unwrap()
+            .write(Bytes::from_static(include_bytes!(
+                "../../tests/fixtures/generated_column_schema.json"
+            )))
+            .await
+            .unwrap();
+        let original = catalog.get_table(&id).await.unwrap();
+        let manager = SchemaManager::new(catalog.file_io.clone(), table_path);
+        assert_eq!(
+            original.schema().fields()[1].generation_expression(),
+            Some("YEAR(event_time)")
+        );
+
+        let mut builder = Schema::builder().options(original.schema().options().clone());
+        for field in original.schema().fields() {
+            builder = builder.field(field.clone());
+        }
+        let creation = builder.build().unwrap();
+        let created_id = Identifier::new("db", "created_generated");
+        catalog
+            .create_table(&created_id, creation.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .get_table(&created_id)
+                .await
+                .unwrap()
+                .schema()
+                .fields(),
+            creation.fields()
+        );
+
+        for name in ["event_year", "event_time"] {
+            for changes in [
+                vec![SchemaChange::rename_column(name.into(), "renamed".into())],
+                vec![SchemaChange::drop_column(name.into())],
+                vec![SchemaChange::update_column_type(
+                    name.into(),
+                    DataType::VarChar(VarCharType::string_type()),
+                )],
+                vec![SchemaChange::update_column_nullability(name.into(), false)],
+                vec![
+                    SchemaChange::drop_column(name.into()),
+                    SchemaChange::add_column(name.into(), DataType::Int(IntType::new())),
+                ],
+            ] {
+                let mut changes_with_option = vec![SchemaChange::set_option(
+                    "test.option".into(),
+                    "unpublished".into(),
+                )];
+                changes_with_option.extend(changes.clone());
+                let error = catalog
+                    .alter_table(&id, changes_with_option, false)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, Error::Unsupported { ref message } if message.contains("generated column")),
+                    "{changes:?}: {error}"
+                );
+                assert_eq!(manager.list_all_ids().await.unwrap(), vec![0]);
+                assert_eq!(
+                    catalog.get_table(&id).await.unwrap().schema(),
+                    original.schema()
+                );
+            }
+        }
+
+        let batch = RecordBatch::try_new(
+            crate::arrow::build_target_arrow_schema(original.schema().fields()).unwrap(),
+            vec![
+                Arc::new(Date32Array::from(vec![0, 1])),
+                Arc::new(Int32Array::from(vec![Some(1900), None])),
+                Arc::new(Int32Array::from(vec![7, 8])),
+            ],
+        )
+        .unwrap();
+        let builder = original.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        builder.new_commit().commit(messages).await.unwrap();
+        writer.close().await;
+
+        catalog
+            .alter_table(
+                &id,
+                vec![
+                    SchemaChange::set_option("test.option".into(), "retained".into()),
+                    SchemaChange::set_option("temporary.option".into(), "removed".into()),
+                    SchemaChange::remove_option("temporary.option".into()),
+                    SchemaChange::update_comment(Some("updated table".into())),
+                    SchemaChange::update_column_comment("event_year".into(), "stored year".into()),
+                    SchemaChange::update_column_position(ColumnMove::move_first(
+                        "event_year".into(),
+                    )),
+                    SchemaChange::rename_column("event_time".into(), "temporary".into()),
+                    SchemaChange::rename_column("temporary".into(), "event_time".into()),
+                    SchemaChange::update_column_type(
+                        "event_year".into(),
+                        DataType::Int(IntType::new()),
+                    ),
+                    SchemaChange::update_column_nullability("event_year".into(), true),
+                    SchemaChange::rename_column("note".into(), "renamed_note".into()),
+                    SchemaChange::update_column_type(
+                        "renamed_note".into(),
+                        DataType::BigInt(crate::spec::BigIntType::new()),
+                    ),
+                    SchemaChange::drop_column("renamed_note".into()),
+                    SchemaChange::add_column("note".into(), DataType::Int(IntType::new())),
+                ],
+                false,
+            )
+            .await
+            .unwrap();
+
+        let table = catalog.get_table(&id).await.unwrap();
+        assert_eq!(manager.list_all_ids().await.unwrap(), vec![0, 1]);
+        assert_eq!(
+            table.schema().fields()[0].generation_expression(),
+            Some("YEAR(event_time)")
+        );
+        assert_eq!(
+            table.schema().fields()[0].description(),
+            Some("stored year")
+        );
+        assert_eq!(table.schema().comment(), Some("updated table"));
+        assert_eq!(table.schema().options()["test.option"], "retained");
+        assert!(!table.schema().options().contains_key("temporary.option"));
+        let json: serde_json::Value = serde_json::from_slice(
+            &catalog
+                .file_io
+                .new_input(&manager.schema_path(1))
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            json["fields"][0]["generationExpression"],
+            "YEAR(event_time)"
+        );
+        assert!(json["fields"][1].get("generationExpression").is_none());
+        assert!(json["fields"][2].get("generationExpression").is_none());
+
+        let mut reader = table.new_read_builder();
+        reader.with_projection(&["event_year"]).unwrap();
+        let plan = reader.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = reader
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut years: Vec<Option<i32>> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+            })
+            .collect();
+        years.sort_unstable();
+        assert_eq!(years, vec![None, Some(1900)]);
+    }
+
+    #[tokio::test]
     async fn test_alter_table_column_changes() {
         let (_tmp, catalog) = create_test_catalog();
         let id = setup_table(&catalog, two_column_schema()).await;

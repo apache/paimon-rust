@@ -823,10 +823,7 @@ impl MapShreddingWritePlan {
                     })
                 }
             };
-            physical_fields.push(
-                DataField::new(field.id(), field.name().to_string(), physical_type)
-                    .with_description(field.description().map(ToString::to_string)),
-            );
+            physical_fields.push(field.clone().with_data_type(physical_type));
             contexts.insert(
                 index,
                 MapWriteContext {
@@ -1158,10 +1155,7 @@ impl MapShreddingReadPlan {
                         !field_meta.overflow_set.is_empty(),
                     )?
                     .copy_with_nullable(field.data_type().is_nullable())?;
-                    physical_fields.push(
-                        DataField::new(field.id(), field.name().to_string(), physical_type)
-                            .with_description(field.description().map(ToString::to_string)),
-                    );
+                    physical_fields.push(field.clone().with_data_type(physical_type));
                     let selected_names = selected_map_keys(field)?;
                     let mut selected_columns = BTreeSet::new();
                     let mut include_overflow = true;
@@ -1230,18 +1224,20 @@ impl MapShreddingReadPlan {
         let DataType::Row(row) = physical.data_type() else {
             return None;
         };
-        Some(DataField::new(
-            physical.id(),
-            physical.name().into(),
-            DataType::Row(RowType::with_nullable(
-                physical.data_type().is_nullable(),
-                row.fields()
-                    .iter()
-                    .filter(|child| children.contains(child.name()))
-                    .cloned()
-                    .collect(),
-            )),
-        ))
+        let projected_type = DataType::Row(RowType::with_nullable(
+            physical.data_type().is_nullable(),
+            row.fields()
+                .iter()
+                .filter(|child| children.contains(child.name()))
+                .cloned()
+                .collect(),
+        ));
+        Some(
+            physical
+                .clone()
+                .with_data_type(projected_type)
+                .with_description(None),
+        )
     }
 }
 
@@ -3038,7 +3034,8 @@ mod tests {
     fn test_write_read_roundtrip() {
         let logical_fields = vec![
             DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
-            map_field(1, "tags", bigint_type()),
+            map_field(1, "tags", bigint_type())
+                .with_generation_expression(Some("future_map(id)".into())),
         ];
         let configs = vec![MapShreddingFieldConfig {
             field_index: 1,
@@ -3055,6 +3052,10 @@ mod tests {
         let mut plan =
             MapShreddingWritePlan::new(&logical_fields, &configs, &MapShreddingContext::default())
                 .unwrap();
+        assert_eq!(
+            plan.physical_fields()[1].generation_expression(),
+            Some("future_map(id)")
+        );
         let batch = logical_batch(
             &logical_fields,
             vec![
@@ -3139,6 +3140,10 @@ mod tests {
         let read_plan = MapShreddingReadPlan::create(&logical_fields, &file_schema)
             .unwrap()
             .expect("read plan expected");
+        assert_eq!(
+            read_plan.physical_fields()[1].generation_expression(),
+            Some("future_map(id)")
+        );
         let assembled = read_plan.assemble_batch(&physical).unwrap();
 
         assert_eq!(
@@ -3170,5 +3175,24 @@ mod tests {
             })
             .collect();
         assert_eq!(assembled_rows, expected_rows);
+
+        let selected = logical_fields[1]
+            .clone()
+            .with_description(Some(format!("{SELECTED_KEYS_PREFIX}a")));
+        let selected_plan =
+            MapShreddingReadPlan::create(std::slice::from_ref(&selected), &file_schema)
+                .unwrap()
+                .expect("selected-key read plan expected");
+        let projected = selected_plan.projected_physical_field("tags").unwrap();
+        assert_eq!(projected.generation_expression(), Some("future_map(id)"));
+        assert_eq!(projected.description(), None);
+        let DataType::Row(row) = projected.data_type() else {
+            panic!("expected physical ROW")
+        };
+        assert_eq!(row.fields().len(), 3);
+        assert!(row
+            .fields()
+            .iter()
+            .all(|field| field.name() != OVERFLOW_NAME));
     }
 }

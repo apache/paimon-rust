@@ -93,4 +93,33 @@ impl PyDataField {
     fn description(&self) -> Option<String> {
         self.inner.description().map(str::to_string)
     }
+
+    fn generation_expression(&self) -> Option<String> {
+        self.inner.generation_expression().map(str::to_string)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_column_metadata_is_exposed() {
+        let schema = PyTableSchema::new(
+            serde_json::from_str(include_str!(
+                "../../../crates/paimon/tests/fixtures/generated_column_schema.json"
+            ))
+            .unwrap(),
+        );
+        let fields = schema.fields();
+        assert_eq!(fields[0].generation_expression(), None);
+        assert_eq!(fields[1].id(), 3);
+        assert_eq!(fields[1].name(), "event_year");
+        assert_eq!(fields[1].field_type(), "INT");
+        assert_eq!(
+            fields[1].generation_expression().as_deref(),
+            Some("YEAR(event_time)")
+        );
+        assert_eq!(fields[2].generation_expression(), None);
+    }
 }
