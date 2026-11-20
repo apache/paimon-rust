@@ -297,6 +297,34 @@ catalog, err := paimon.NewCatalog(map[string]string{
 })
 ```
 
+## Creating a Database and Table
+
+Use `CreateDatabase` and `CreateTable` to provision tables from Go. Pass the
+schema JSON used by the Paimon REST create-table request's `schema` field.
+The last argument controls whether an existing database or table is accepted.
+
+```go
+if err := catalog.CreateDatabase("demo", nil, true); err != nil {
+    log.Fatal(err)
+}
+
+schemaJSON := []byte(`{
+    "fields": [
+        {"id": 0, "name": "id", "type": "INT NOT NULL"},
+        {"id": 1, "name": "name", "type": "STRING"}
+    ],
+    "partitionKeys": [],
+    "primaryKeys": ["id"],
+    "options": {"bucket": "1", "merge-engine": "partial-update"}
+}`)
+id := paimon.NewIdentifier("demo", "users")
+if err := catalog.CreateTable(id, schemaJSON, true); err != nil {
+    log.Fatal(err)
+}
+```
+
+Open the new table with `catalog.GetTable(id)`.
+
 ## Managing Tags
 
 Catalog tags pin table snapshots. Pass `nil` to tag the latest snapshot, then
