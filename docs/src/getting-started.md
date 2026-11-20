@@ -163,6 +163,46 @@ Parquet Page Index pruning is enabled by default. Set
 this may reduce request count while increasing bytes read. The option does not
 change Page Index generation.
 
+### Merged Data Evolution reads
+
+On row-tracked Data Evolution append tables with `bucket=-1`, ordinary
+Parquet files that share a complete row-ID range support merged-read pruning
+by default. The reader splits filters at `AND` and uses a file's statistics
+only when that file supplies every field in the condition. Field IDs and file
+versions identify the current provider across column renames and updates.
+
+The reader intersects candidate row IDs from row-group and page statistics
+with requested ranges and file-index hits. It excludes deleted rows, reads
+the same positions from each file, and applies the full filter to the
+reconstructed rows before `LIMIT`.
+
+The reader uses row-group statistics when page indexes are unavailable or
+describe invalid page spans. It ignores statistics when their null counts
+conflict with the Parquet schema or available definition-level histograms.
+Page statistics require independent page row counts for the indexed predicate
+column. When statistics produce candidate ranges, the reader also checks those
+counts for the projected columns in selected row groups, even if the candidate
+intersection leaves the requested rows unchanged. If a projected column in a
+selected row group lacks those counts, the reader decodes whole column chunks
+from that file.
+If a candidate-selected row group fails to decode with its page index, the
+reader resumes that selection from whole column chunks using the cached footer.
+When every row group and page may match, the reader can use a valid offset
+index for the caller's requested ranges. Full merged reads decode from
+column chunks using the cached footer. Predicate-free row-ID selections load
+only the offset index. When the requested rows lie within one row group, the
+reader checks its footer statistics first. If the footer shows that every row
+matches or that none can match, the reader skips the column index. Any decoded
+rows still go through the residual filter.
+If a provider's row count disagrees with the manifest, the merge uses the
+original selection.
+Dedicated BLOB and vector groups, nested-field evolution and ROW sidecar reads
+follow their usual read paths.
+
+Set `data-evolution.merged-read.stats-pushdown.enabled=false` to disable this
+optimization. For selective and full-range scan results, see the
+[merged Parquet read benchmark](benchmark.md#data-evolution-merged-parquet-reads).
+
 ## Mosaic File Format
 
 Mosaic data file reads and writes are available for ordinary Paimon tables. Set

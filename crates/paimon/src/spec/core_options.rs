@@ -879,16 +879,23 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
+    /// Use the winning column providers' Parquet statistics to restrict merged reads.
+    pub fn data_evolution_merged_read_stats_pushdown_enabled(&self) -> crate::Result<bool> {
+        self.boolean_option("data-evolution.merged-read.stats-pushdown.enabled", true)
+    }
+
     /// Whether normal Data Evolution files also write an aligned ROW sidecar.
     pub fn data_evolution_row_sidecar_enabled(&self) -> crate::Result<bool> {
-        match self.options.get("data-evolution.row-sidecar.enabled") {
-            None => Ok(false),
+        self.boolean_option("data-evolution.row-sidecar.enabled", false)
+    }
+
+    fn boolean_option(&self, key: &str, default: bool) -> crate::Result<bool> {
+        match self.options.get(key) {
+            None => Ok(default),
             Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
             Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
             Some(value) => Err(crate::Error::ConfigInvalid {
-                message: format!(
-                    "data-evolution.row-sidecar.enabled must be true or false, got {value}"
-                ),
+                message: format!("{key} must be true or false, got {value}"),
             }),
         }
     }
