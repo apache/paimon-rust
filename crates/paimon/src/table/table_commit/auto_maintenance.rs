@@ -404,7 +404,7 @@ impl TableCommit {
                     crate::spec::MergeEngine::PartialUpdate | crate::spec::MergeEngine::Aggregation
                 )
                 && options.try_changelog_producer()? != crate::spec::ChangelogProducer::Lookup;
-            let prepared = match crate::table::compact::execute_auto_plan(
+            let (prepared, private_outputs) = match crate::table::compact::execute_auto_plan(
                 &compact.table,
                 &plan,
                 &executor,
@@ -430,6 +430,7 @@ impl TableCommit {
                         read_snapshot: prepared.read_snapshot,
                         planned_snapshot_id: prepared.snapshot_id,
                         overwrite_l0,
+                        private_outputs: Some(private_outputs),
                     },
                     None,
                     written.id(),

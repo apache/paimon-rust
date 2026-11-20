@@ -360,6 +360,7 @@ mod pk_dv_retry {
     struct OverwriteCasRace {
         table: Table,
         compact_calls: AtomicUsize,
+        rejected_paths: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -374,6 +375,21 @@ mod pk_dv_retry {
             if snapshot.commit_kind() == &CommitKind::COMPACT
                 && self.compact_calls.fetch_add(1, Ordering::SeqCst) == 0
             {
+                let commit = self.table.new_write_builder().new_commit();
+                let paths = commit
+                    .read_delta_entries(None, snapshot)
+                    .await?
+                    .into_iter()
+                    .filter(|entry| *entry.kind() == FileKind::Add)
+                    .map(|entry| {
+                        let bucket = commit.bucket_path(entry.partition(), entry.bucket())?;
+                        Ok(entry.file().collect_files(&bucket))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                *self.rejected_paths.lock().unwrap() = paths;
                 let (_, pending) = write(&self.table, vec![3, 4], 0).await;
                 replace_vectors(&self.table, &[(&pending.file_name, &[0])]).await;
                 return Ok(false);
@@ -412,6 +428,7 @@ mod pk_dv_retry {
         let publisher = Arc::new(OverwriteCasRace {
             table: write_only,
             compact_calls: AtomicUsize::new(0),
+            rejected_paths: Default::default(),
         });
         let mut commit = builder.new_commit();
         commit.snapshot_commit = publisher.clone();
@@ -426,6 +443,11 @@ mod pk_dv_retry {
             "{error}"
         );
         assert_eq!(publisher.compact_calls.load(Ordering::SeqCst), 1);
+        let rejected_paths = publisher.rejected_paths.lock().unwrap().clone();
+        assert!(!rejected_paths.is_empty());
+        for path in rejected_paths {
+            assert!(!table.file_io().exists(&path).await.unwrap(), "{path}");
+        }
         let manager = table.snapshot_manager();
         let raced = manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(raced.commit_kind(), &CommitKind::OVERWRITE);
@@ -487,6 +509,100 @@ mod pk_dv_retry {
             .await
             .unwrap();
         assert_eq!(batch_rows(batches), vec![(4, 400)]);
+    }
+
+    struct LostAutomaticCompactResponse {
+        table: Table,
+        replayed: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SnapshotCommit for LostAutomaticCompactResponse {
+        async fn commit(
+            &self,
+            _: Option<&str>,
+            snapshot: &Snapshot,
+            _: &str,
+            _: &[PartitionStatistics],
+        ) -> Result<bool> {
+            let published = self
+                .table
+                .snapshot_manager()
+                .commit_snapshot(snapshot)
+                .await?;
+            if snapshot.commit_kind() != &CommitKind::COMPACT {
+                return Ok(published);
+            }
+            assert!(published);
+            if self.replayed {
+                // A replay of a successful conditional write sees an existing snapshot.
+                Ok(false)
+            } else {
+                Err(crate::Error::IoUnsupported {
+                    message: "lost automatic compaction response".into(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_retains_published_outputs_after_lost_response() {
+        for replayed in [false, true] {
+            let (table, anchor, _) = fixture().await;
+            let table = table.copy_with_options(HashMap::from([
+                ("write-only".into(), "false".into()),
+                ("commit.max-retries".into(), "0".into()),
+            ]));
+            let builder = table.new_write_builder();
+            let mut writer = builder.new_write().unwrap();
+            let batch = RecordBatch::try_from_iter([
+                (
+                    "id",
+                    Arc::new(Int32Array::from(vec![42])) as arrow_array::ArrayRef,
+                ),
+                (
+                    "value",
+                    Arc::new(Int32Array::from(vec![4200])) as arrow_array::ArrayRef,
+                ),
+            ])
+            .unwrap();
+            writer.write_arrow_batch(&batch).await.unwrap();
+            let messages = writer.prepare_commit().await.unwrap();
+            let mut commit = builder.new_commit();
+            commit.snapshot_commit = Arc::new(LostAutomaticCompactResponse {
+                table: table.clone(),
+                replayed,
+            });
+            let error = commit
+                .commit_with_identifier(messages.clone(), 7)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("outcome may be unknown"),
+                "{error}"
+            );
+            let manager = table.snapshot_manager();
+            let published = manager.get_latest_snapshot().await.unwrap().unwrap();
+            assert_eq!(published.commit_kind(), &CommitKind::COMPACT);
+            commit
+                .filter_and_commit_with_identifier(messages, 7)
+                .await
+                .unwrap();
+            assert_eq!(
+                manager.get_latest_snapshot_id().await.unwrap(),
+                Some(published.id())
+            );
+            assert_eq!(
+                vectors(&table).await.0[&anchor],
+                [42, 500].into_iter().collect()
+            );
+            let matching: Vec<_> = rows(&table)
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id == 42)
+                .collect();
+            assert_eq!(matching, vec![(42, 4200)]);
+        }
     }
 
     struct CompetingCompactCommit {

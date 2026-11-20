@@ -472,6 +472,7 @@ impl TableCommit {
                     read_snapshot: prepared.read_snapshot,
                     planned_snapshot_id: prepared.snapshot_id,
                     overwrite_l0: None,
+                    private_outputs: None,
                 },
                 None,
                 BATCH_COMMIT_IDENTIFIER,
@@ -1208,6 +1209,13 @@ impl TableCommit {
         let check_append_files = filter_committed;
         let mut filter_committed = filter_committed;
 
+        let private_outputs = match &mut plan {
+            CommitEntriesPlan::Compact {
+                private_outputs, ..
+            } => private_outputs.take(),
+            _ => None,
+        };
+        let mut automatic_outputs_published = false;
         let mut publication_uncertain = false;
         let mut last_publication_error = None;
         let result = async {
@@ -1272,7 +1280,14 @@ impl TableCommit {
                 }
 
                 let result = self
-                    .try_commit_once(resolved, &latest_snapshot, commit_identifier)
+                    .try_commit_once(
+                        resolved,
+                        &latest_snapshot,
+                        commit_identifier,
+                        private_outputs
+                            .as_ref()
+                            .map(|_| &mut automatic_outputs_published),
+                    )
                     .await?;
 
                 match result {
@@ -1311,6 +1326,11 @@ impl TableCommit {
             Ok(outcome)
         }
         .await;
+        if !automatic_outputs_published && !publication_uncertain {
+            if let Some(outputs) = private_outputs {
+                let _ = self.delete_new_files(&outputs).await;
+            }
+        }
         match result {
             Err(error) if publication_uncertain => Err(crate::Error::UnexpectedError {
                 message: "Commit outcome may be unknown; retain prepared files and retry with the same commit identifier".into(),
@@ -1402,6 +1422,7 @@ impl TableCommit {
         mut resolved: ResolvedCommit,
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
+        automatic_outputs_published: Option<&mut bool>,
     ) -> Result<CommitAttemptResult> {
         let mut created_files = Vec::new();
         let prepared = self
@@ -1424,7 +1445,7 @@ impl TableCommit {
         // Once publication starts its outcome may be unknown. These files must
         // remain available even if the response is lost or a later retry fails.
         let base_snapshot_uuid = latest_snapshot.as_ref().and_then(Snapshot::uuid);
-        let publication_error = match self
+        let publication = self
             .snapshot_commit
             .commit(
                 base_snapshot_uuid,
@@ -1432,9 +1453,40 @@ impl TableCommit {
                 self.table.branch(),
                 &statistics,
             )
-            .await
-        {
+            .await;
+        // A file-store rejection may be a replay of a successful conditional
+        // write. Only a different snapshot can prove that cleanup is safe.
+        // REST mutations are not replayed and return a definite rejection.
+        let publication = match publication {
+            Ok(false) if automatic_outputs_published.is_some() && self.table.rest_env.is_none() => {
+                match self
+                    .snapshot_manager
+                    .get_snapshot_uncached(snapshot.id())
+                    .await
+                {
+                    Ok(current)
+                        if current.uuid() != snapshot.uuid()
+                            && current.delta_manifest_list() != snapshot.delta_manifest_list() =>
+                    {
+                        Ok(false)
+                    }
+                    Ok(_) => Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Cannot confirm rejection of automatic compaction snapshot {}",
+                            snapshot.id()
+                        ),
+                        source: None,
+                    }),
+                    Err(error) => Err(error),
+                }
+            }
+            result => result,
+        };
+        let publication_error = match publication {
             Ok(true) => {
+                if let Some(published) = automatic_outputs_published {
+                    *published = true;
+                }
                 if !self.commit_callbacks.is_empty() {
                     self.notify_commit_callbacks(snapshot.clone(), resolved.entries)
                         .await?;
@@ -2063,6 +2115,7 @@ impl TableCommit {
                 read_snapshot,
                 planned_snapshot_id,
                 overwrite_l0,
+                ..
             } => {
                 if latest_snapshot
                     .as_ref()
@@ -4005,6 +4058,7 @@ enum CommitEntriesPlan {
         read_snapshot: Option<Box<Snapshot>>,
         planned_snapshot_id: i64,
         overwrite_l0: Option<super::compact::OverwriteL0Files>,
+        private_outputs: Option<Vec<CommitMessage>>,
     },
     /// Caller-provided entries. May contain `FileKind::Delete` entries from CoW
     /// rewrites, in which case `resolve_commit` auto-promotes to `CommitKind::OVERWRITE`.
