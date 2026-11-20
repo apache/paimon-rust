@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, Array, ArrayRef, Int8Array, MapArray, RecordBatch, UInt64Array};
+use arrow_array::{cast::AsArray, Array, ArrayRef, Int8Array, MapArray, RecordBatch};
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::{DataType as ArrowType, SchemaRef};
 
@@ -108,17 +108,14 @@ fn source_row(
     columns: &[usize],
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
-    let indices = UInt64Array::from(vec![row_idx as u64]);
+    // A zero-copy slice: the reader concatenates changelog rows into batches.
     let values = (0..schema.fields().len())
         .map(|index| {
-            arrow_select::take::take(
-                batches[batch_idx].column_for_output(index, columns),
-                &indices,
-                None,
-            )
-            .map_err(|error| invalid(format!("Failed to materialize lookup value: {error}")))
+            batches[batch_idx]
+                .column_for_output(index, columns)
+                .slice(row_idx, 1)
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     RecordBatch::try_new(schema.clone(), values)
         .map_err(|error| invalid(format!("Invalid lookup value: {error}")))
 }
@@ -359,13 +356,13 @@ impl MergeFunction for LookupChangelogMergeFunction {
             }
             _ => {}
         }
-        let changelog = if changes.is_empty() {
-            None
-        } else {
-            Some(
+        let changelog = match changes.len() {
+            0 => None,
+            1 => changes.pop(),
+            _ => Some(
                 arrow_select::concat::concat_batches(schema, &changes)
                     .map_err(|error| invalid(error.to_string()))?,
-            )
+            ),
         };
         Ok((result, changelog))
     }
