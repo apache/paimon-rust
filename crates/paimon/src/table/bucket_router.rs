@@ -36,37 +36,86 @@ use std::collections::{HashMap, HashSet};
 ///
 /// This is the same bucket computation used by fixed-bucket writers and by
 /// Java's `FixedBucketRowKeyExtractor` and `PostponeBucketRouter`. Inputs can
-/// omit payload fields and reorder columns, but must contain each partition
-/// and bucket key exactly once. Output positions retain the input row order.
+/// omit payload fields and reorder columns. Fixed-bucket routing requires only
+/// each bucket key exactly once; postpone-bucket routing requires each
+/// partition and bucket key exactly once. Output positions retain the input row
+/// order.
 #[derive(Debug, Clone)]
 pub struct BucketRouter {
+    inner: BucketRouterInner,
+}
+
+#[derive(Debug, Clone)]
+enum BucketRouterInner {
+    Fixed(FixedBucketRouter),
+    Postpone(PostponeBucketRouter),
+}
+
+#[derive(Debug, Clone)]
+struct FixedBucketRouter {
+    bucket_fields: Vec<DataField>,
+    bucket_indices: Vec<usize>,
+    arrow_schema: SchemaRef,
+    bucket_function: BucketFunctionType,
+    total_buckets: i32,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PostponeBucketRouter {
     fields: Vec<DataField>,
     arrow_schema: SchemaRef,
     partition_indices: Vec<usize>,
     bucket_indices: Vec<usize>,
     bucket_function: BucketFunctionType,
-    total_buckets: i32,
     plan: PostponeBucketPlan,
 }
 
-impl BucketRouter {
-    /// Construct an owned router for a fixed-bucket or postpone-bucket schema.
-    ///
-    /// Postpone routing uses the configured default until an explicit plan is
-    /// supplied. Without either, routing an unknown input partition fails.
-    pub fn new(schema: &TableSchema) -> Result<Self> {
-        let options = CoreOptions::new(schema.options());
-        let total_buckets = options.bucket();
-        if options.is_format_table() || (total_buckets <= 0 && total_buckets != POSTPONE_BUCKET) {
-            return Err(crate::Error::Unsupported {
-                message: "Bucket routing requires a Paimon fixed-bucket or postpone-bucket table"
-                    .into(),
-            });
-        }
-        if total_buckets == POSTPONE_BUCKET {
-            validate_postpone_fixed_bucket_schema(schema)?;
-        }
+impl FixedBucketRouter {
+    fn new(schema: &TableSchema, total_buckets: i32) -> Result<Self> {
+        let bucket_keys = schema.bucket_keys();
+        let bucket_fields = bucket_keys
+            .iter()
+            .map(|name| {
+                schema
+                    .fields()
+                    .iter()
+                    .find(|field| field.name() == name)
+                    .cloned()
+                    .ok_or_else(|| data_invalid(format!("Unknown routing column '{name}'")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let bucket_function = CoreOptions::new(schema.options()).bucket_function_type()?;
+        validate_bucket_function(bucket_function, &bucket_fields)?;
+        Ok(Self {
+            arrow_schema: crate::arrow::build_target_arrow_schema(&bucket_fields)?,
+            bucket_indices: (0..bucket_fields.len()).collect(),
+            bucket_fields,
+            bucket_function,
+            total_buckets,
+        })
+    }
 
+    fn route(&self, batch: &RecordBatch) -> Result<Int32Array> {
+        let input = project_routing_input(batch, &self.bucket_fields, &self.arrow_schema)?;
+        let buckets = if self.total_buckets == 1 {
+            vec![0; input.num_rows()]
+        } else {
+            batch_bucket_ids(
+                &input,
+                &self.bucket_indices,
+                &self.bucket_fields,
+                self.bucket_function,
+                self.total_buckets,
+            )?
+        };
+        Ok(Int32Array::from(buckets))
+    }
+}
+
+impl PostponeBucketRouter {
+    pub(super) fn new(schema: &TableSchema) -> Result<Self> {
+        validate_postpone_fixed_bucket_schema(schema)?;
+        let options = CoreOptions::new(schema.options());
         let bucket_keys = schema.bucket_keys();
         let required = schema
             .partition_keys()
@@ -99,39 +148,23 @@ impl BucketRouter {
             .map(|&index| fields[index].clone())
             .collect::<Vec<_>>();
         validate_bucket_function(bucket_function, &bucket_fields)?;
-        let plan = if total_buckets == POSTPONE_BUCKET {
-            options
-                .postpone_default_bucket_num()?
-                .map(PostponeBucketPlan::with_default_bucket_num)
-                .unwrap_or_default()
-        } else {
-            PostponeBucketPlan::default()
-        };
+        let plan = options
+            .postpone_default_bucket_num()?
+            .map(PostponeBucketPlan::with_default_bucket_num)
+            .unwrap_or_default();
         Ok(Self {
             arrow_schema: crate::arrow::build_target_arrow_schema(&fields)?,
             fields,
             partition_indices,
             bucket_indices,
             bucket_function,
-            total_buckets,
             plan,
         })
     }
 
-    /// Replace postpone routing metadata, including any configured default.
-    pub fn with_bucket_plan(mut self, plan: PostponeBucketPlan) -> Result<Self> {
-        if self.total_buckets != POSTPONE_BUCKET {
-            return Err(data_invalid(
-                "A bucket plan requires a postpone-bucket schema",
-            ));
-        }
+    pub(super) fn with_bucket_plan(mut self, plan: PostponeBucketPlan) -> Self {
         self.plan = plan;
-        Ok(self)
-    }
-
-    /// Return non-null Int32 bucket IDs in input row order.
-    pub fn route(&self, batch: &RecordBatch) -> Result<Int32Array> {
-        Ok(self.route_with_partitions(batch)?.1)
+        self
     }
 
     pub(super) fn plan(&self) -> &PostponeBucketPlan {
@@ -142,17 +175,16 @@ impl BucketRouter {
         &mut self.plan
     }
 
+    fn route(&self, batch: &RecordBatch) -> Result<Int32Array> {
+        Ok(self.route_with_partitions(batch)?.1)
+    }
+
     pub(super) fn route_with_partitions(
         &self,
         batch: &RecordBatch,
     ) -> Result<(Vec<Vec<u8>>, Int32Array)> {
         let input = project_routing_input(batch, &self.fields, &self.arrow_schema)?;
         let partitions = batch_to_serialized_bytes(&input, &self.partition_indices, &self.fields)?;
-        if self.total_buckets > 0 {
-            let buckets = self.route_count(&input, self.total_buckets)?;
-            return Ok((partitions, Int32Array::from(buckets)));
-        }
-
         let mut groups: HashMap<i32, Vec<usize>> = HashMap::new();
         for (row, partition) in partitions.iter().enumerate() {
             let count = self.plan.total_buckets(partition).ok_or_else(|| {
@@ -175,7 +207,7 @@ impl BucketRouter {
     }
 
     fn route_count(&self, batch: &RecordBatch, count: i32) -> Result<Vec<i32>> {
-        if count == 1 || (self.total_buckets == POSTPONE_BUCKET && self.bucket_indices.is_empty()) {
+        if count == 1 || self.bucket_indices.is_empty() {
             return Ok(vec![0; batch.num_rows()]);
         }
         batch_bucket_ids(
@@ -185,6 +217,51 @@ impl BucketRouter {
             self.bucket_function,
             count,
         )
+    }
+}
+
+impl BucketRouter {
+    /// Construct an owned router for a fixed-bucket or postpone-bucket schema.
+    ///
+    /// Postpone routing uses the configured default until an explicit plan is
+    /// supplied. Without either, routing an unknown input partition fails.
+    pub fn new(schema: &TableSchema) -> Result<Self> {
+        let options = CoreOptions::new(schema.options());
+        let total_buckets = options.bucket();
+        let inner = match total_buckets {
+            n if n > 0 && !options.is_format_table() => {
+                BucketRouterInner::Fixed(FixedBucketRouter::new(schema, n)?)
+            }
+            POSTPONE_BUCKET => BucketRouterInner::Postpone(PostponeBucketRouter::new(schema)?),
+            _ => {
+                return Err(crate::Error::Unsupported {
+                    message:
+                        "Bucket routing requires a Paimon fixed-bucket or postpone-bucket table"
+                            .into(),
+                })
+            }
+        };
+        Ok(Self { inner })
+    }
+
+    /// Replace postpone routing metadata, including any configured default.
+    pub fn with_bucket_plan(self, plan: PostponeBucketPlan) -> Result<Self> {
+        match self.inner {
+            BucketRouterInner::Postpone(router) => Ok(Self {
+                inner: BucketRouterInner::Postpone(router.with_bucket_plan(plan)),
+            }),
+            BucketRouterInner::Fixed(_) => Err(data_invalid(
+                "A bucket plan requires a postpone-bucket schema",
+            )),
+        }
+    }
+
+    /// Return non-null Int32 bucket IDs in input row order.
+    pub fn route(&self, batch: &RecordBatch) -> Result<Int32Array> {
+        match &self.inner {
+            BucketRouterInner::Fixed(router) => router.route(batch),
+            BucketRouterInner::Postpone(router) => router.route(batch),
+        }
     }
 }
 
@@ -284,7 +361,9 @@ mod tests {
             ("payload", nested),
             ("b", Arc::new(Int32Array::from(vec![6]))),
             ("a", Arc::new(Int32Array::from(vec![5]))),
+            ("pt", Arc::new(StringArray::from(vec!["p1"]))),
         ]);
+        let without_partition = input.project(&[0, 1, 2, 3]).unwrap();
         for (keys, expected) in [("a", 96), ("a,b", 27), ("a,b,c", 40)] {
             let schema = TableSchema::new(
                 0,
@@ -292,13 +371,17 @@ mod tests {
                     .column("a", DataType::Int(IntType::new()))
                     .column("b", DataType::Int(IntType::new()))
                     .column("c", DataType::Int(IntType::new()))
+                    .column("pt", DataType::VarChar(VarCharType::string_type()))
+                    .partition_keys(["pt"])
                     .option("bucket", "100")
                     .option("bucket-key", keys)
                     .build()
                     .unwrap(),
             );
             let router = BucketRouter::new(&schema).unwrap();
-            assert_eq!(router.route(&input).unwrap().values(), &[expected]);
+            let buckets = router.route(&input).unwrap();
+            assert_eq!(buckets.values(), &[expected]);
+            assert_eq!(router.route(&without_partition).unwrap(), buckets);
             if keys == "a" {
                 assert_eq!(
                     router
