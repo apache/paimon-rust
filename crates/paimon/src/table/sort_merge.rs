@@ -206,8 +206,8 @@ pub(crate) trait MergeFunction: Send + Sync {
     ) -> crate::Result<MergeResult>;
 
     /// Emit at most one key's changelog alongside its merged state. The reader
-    /// drains it before advancing to the next key, keeping memory bounded even
-    /// when all data rows are deleted.
+    /// hands changelog on in batches of up to its batch size, keeping memory
+    /// bounded even when all data rows are deleted.
     fn merge_with_changelog(
         &self,
         rows: &[MergeRow],
@@ -1797,6 +1797,14 @@ fn sort_merge_stream(
         let mut output_indices: Vec<(usize, usize)> = Vec::with_capacity(batch_size);
         // Output rows at `(PICKED_ROW, i)` are `picked_rows[i]`.
         let mut picked_rows: Vec<PickedRow> = Vec::new();
+        // Changelog rows not yet handed on, and the schema that marks them.
+        let mut pending_changelog: Vec<RecordBatch> = Vec::new();
+        let mut changelog_rows = 0;
+        let changelog_schema = {
+            let mut metadata = output_schema.metadata().clone();
+            metadata.insert(CHANGELOG_BATCH_METADATA_KEY.into(), "true".into());
+            Arc::new(output_schema.as_ref().clone().with_metadata(metadata))
+        };
         // Reused for every key, so grouping allocates nothing per key.
         let mut winner_key: Vec<u8> = Vec::new();
         let mut same_key_rows: Vec<MergeRow> = Vec::new();
@@ -1942,14 +1950,21 @@ fn sort_merge_stream(
             }
 
             if let Some(changelog) = changelog {
-                if changelog.schema().as_ref() != output_schema.as_ref() {
+                if !Arc::ptr_eq(&changelog.schema(), &output_schema)
+                    && changelog.schema().as_ref() != output_schema.as_ref()
+                {
                     Err(Error::UnexpectedError { message: "Changelog merge result schema does not match merge output schema".into(), source: None })?;
                 }
-                let mut metadata = output_schema.metadata().clone();
-                metadata.insert(CHANGELOG_BATCH_METADATA_KEY.into(), "true".into());
-                yield RecordBatch::try_new(
-                    Arc::new(output_schema.as_ref().clone().with_metadata(metadata)), changelog.columns().to_vec(),
-                ).map_err(|error| Error::DataInvalid { message: format!("Invalid changelog batch: {error}"), source: Some(Box::new(error)) })?;
+                changelog_rows += changelog.num_rows();
+                pending_changelog.push(changelog);
+                // Changelog comes one key at a time; hand it on in batches so the
+                // writer does not handle a one-row batch per key. The buffer stays
+                // bounded by the batch size even when every data row is deleted.
+                if changelog_rows >= batch_size {
+                    yield changelog_batch(&changelog_schema, &pending_changelog)?;
+                    pending_changelog.clear();
+                    changelog_rows = 0;
+                }
             }
             if output_indices.is_empty() {
                 compact_batch_buffer(&mut batch_buffer, &mut stream_batch_idx, &cursors);
@@ -1979,6 +1994,10 @@ fn sort_merge_stream(
             }
         }
 
+        if !pending_changelog.is_empty() {
+            yield changelog_batch(&changelog_schema, &pending_changelog)?;
+        }
+
         // Yield remaining rows.
         if !output_indices.is_empty() {
             let batch = build_output(
@@ -1992,6 +2011,14 @@ fn sort_merge_stream(
         }
     }
     .boxed())
+}
+
+/// Concatenates per-key changelog batches into one changelog batch.
+fn changelog_batch(schema: &SchemaRef, batches: &[RecordBatch]) -> crate::Result<RecordBatch> {
+    arrow_select::concat::concat_batches(schema, batches).map_err(|error| Error::DataInvalid {
+        message: format!("Invalid changelog batch: {error}"),
+        source: Some(Box::new(error)),
+    })
 }
 
 /// Batch index marking an output row as a [`PickedRow`].
@@ -3285,6 +3312,111 @@ mod tests {
                 None,
                 Some("c6")
             ]) as &dyn arrow_array::Array
+        );
+    }
+
+    /// Changelog from consecutive keys is handed on in key order, in batches of up
+    /// to the batch size rather than one batch per key.
+    #[tokio::test]
+    async fn test_changelog_is_emitted_in_batches() {
+        struct EveryKeyChangelog;
+        impl MergeFunction for EveryKeyChangelog {
+            fn merge(
+                &self,
+                rows: &[MergeRow],
+                batch_buffer: &[BufferedBatch],
+                source_output_col_indices: &[usize],
+                output_schema: &SchemaRef,
+            ) -> crate::Result<MergeResult> {
+                DeduplicateMergeFunction.merge(
+                    rows,
+                    batch_buffer,
+                    source_output_col_indices,
+                    output_schema,
+                )
+            }
+
+            fn merge_with_changelog(
+                &self,
+                rows: &[MergeRow],
+                batches: &[BufferedBatch],
+                columns: &[usize],
+                schema: &SchemaRef,
+            ) -> crate::Result<(MergeResult, Option<RecordBatch>)> {
+                let last = rows.last().unwrap();
+                let changelog = build_output_interleave(
+                    schema,
+                    batches,
+                    columns,
+                    &[(last.batch_idx, last.row_idx)],
+                )?;
+                Ok((self.merge(rows, batches, columns, schema)?, Some(changelog)))
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let stream = |pk: Vec<i32>, seq: i64| {
+            let n = pk.len();
+            stream_from_batches(vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(pk.clone())),
+                    Arc::new(Int64Array::from(vec![seq; n])),
+                    Arc::new(Int8Array::from(vec![0; n])),
+                    Arc::new(Int32Array::from_iter_values(pk.iter().map(|k| k * 10))),
+                ],
+            )
+            .unwrap()])
+        };
+        let batches = SortMergeReaderBuilder::new(
+            vec![stream(vec![1, 2, 4], 1), stream(vec![2, 3, 5], 2)],
+            schema.clone(),
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema.clone(),
+            Box::new(EveryKeyChangelog),
+        )
+        .with_batch_size(2)
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let pks = |batch: &RecordBatch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        let (changelog, data): (Vec<_>, Vec<_>) = batches.iter().partition(|batch| {
+            batch
+                .schema()
+                .metadata()
+                .contains_key(CHANGELOG_BATCH_METADATA_KEY)
+        });
+        assert_eq!(
+            changelog.iter().map(|batch| pks(batch)).collect::<Vec<_>>(),
+            vec![vec![1, 2], vec![3, 4], vec![5]]
+        );
+        assert_eq!(
+            data.iter().flat_map(|batch| pks(batch)).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
         );
     }
 
