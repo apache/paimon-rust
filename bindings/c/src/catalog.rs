@@ -236,6 +236,32 @@ pub unsafe extern "C" fn paimon_catalog_get_table(
     }
 }
 
+/// Drop a table. Returns null on success, or an error to free with
+/// `paimon_error_free`. If `ignore_if_not_exists` is true, a missing table is accepted.
+///
+/// # Safety
+/// `catalog` and `identifier` must be valid handles from previous paimon C calls.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_catalog_drop_table(
+    catalog: *const paimon_catalog,
+    identifier: *const paimon_identifier,
+    ignore_if_not_exists: bool,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(catalog, "catalog") {
+        return error;
+    }
+    if let Err(error) = check_non_null(identifier, "identifier") {
+        return error;
+    }
+
+    let catalog = &*((*catalog).inner as *const Arc<dyn Catalog>);
+    let identifier = &*((*identifier).inner as *const Identifier);
+    match runtime().block_on(catalog.drop_table(identifier, ignore_if_not_exists)) {
+        Ok(()) => std::ptr::null_mut(),
+        Err(error) => paimon_error::from_paimon(error),
+    }
+}
+
 /// List the databases in a catalog.
 ///
 /// On success `error` is null and `string_list` owns the database names; free it
