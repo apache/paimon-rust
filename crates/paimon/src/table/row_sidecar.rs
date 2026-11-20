@@ -184,7 +184,7 @@ pub(super) fn propagate_blob_data(schema: &SchemaRef, batch: &RecordBatch) -> Sc
 
 /// Exactly one ROW extra file is required, as in Java. Do not guess between
 /// multiple sidecars or enable one merely because deletion vectors prune rows.
-fn selected_sidecar<'a>(
+pub(super) fn selected_sidecar<'a>(
     file: &'a DataFileMeta,
     local_ranges: Option<&[RowRange]>,
     options: &CoreOptions<'_>,

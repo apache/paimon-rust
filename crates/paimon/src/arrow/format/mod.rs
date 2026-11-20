@@ -484,7 +484,7 @@ pub(crate) fn create_format_reader_with_budget(
     Ok(configure_format_reader(reader, fields))
 }
 
-fn configure_format_reader(
+pub(crate) fn configure_format_reader(
     reader: Box<dyn FormatFileReader>,
     fields: FormatReadFields<'_>,
 ) -> ConfiguredFormatReader {

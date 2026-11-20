@@ -358,7 +358,8 @@ pub(super) async fn execute(
         first,
         last,
         resources.clone(),
-    )?;
+    )
+    .await?;
     let mut writer = DataFileWriter::new(
         table.file_io().clone(),
         table.location().into(),

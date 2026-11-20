@@ -30,6 +30,7 @@ use crate::io::{FileIO, FileRead};
 use crate::spec::{
     is_variant_extraction_row_type, DataField, DataFileMeta, DataType, Predicate, ROW_ID_FIELD_NAME,
 };
+use crate::table::row_id_predicate::intersect_sorted_ranges;
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
 use crate::table::RowRange;
@@ -38,6 +39,7 @@ use arrow_array::{Array, Int64Array, RecordBatch};
 
 use async_stream::try_stream;
 use futures::StreamExt;
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -56,6 +58,10 @@ pub(crate) struct DataFileReadTiming {
     file_schema_open_nanos: AtomicU64,
     first_batch_wait_nanos: AtomicU64,
     remaining_batch_wait_nanos: AtomicU64,
+    #[cfg(test)]
+    pub(super) read_ranges: std::sync::Mutex<HashMap<Arc<str>, Vec<Range<u64>>>>,
+    #[cfg(test)]
+    pub(super) source_rows: AtomicU64,
 }
 
 impl DataFileReadTiming {
@@ -102,6 +108,30 @@ impl DataFileReadTiming {
 struct TimedFileRead {
     inner: Box<dyn FileRead>,
     timing: Arc<DataFileReadTiming>,
+    #[cfg(test)]
+    path: Arc<str>,
+}
+
+pub(super) async fn open_file_reader(
+    file_io: &FileIO,
+    path: &str,
+    size: u64,
+    timing: Option<&Arc<DataFileReadTiming>>,
+) -> crate::Result<Box<dyn FileRead>> {
+    let input = file_io.new_input(path)?;
+    let start = timing.map(|_| Instant::now());
+    let reader = input.reader_with_size(size).await?;
+    if let (Some(timing), Some(start)) = (timing, start) {
+        timing.add_file_read(start.elapsed());
+        Ok(Box::new(TimedFileRead {
+            inner: Box::new(reader),
+            timing: Arc::clone(timing),
+            #[cfg(test)]
+            path: path.into(),
+        }))
+    } else {
+        Ok(Box::new(reader))
+    }
 }
 
 #[async_trait::async_trait]
@@ -114,6 +144,14 @@ impl FileRead for TimedFileRead {
     }
 
     async fn read(&self, range: Range<u64>) -> crate::Result<bytes::Bytes> {
+        #[cfg(test)]
+        self.timing
+            .read_ranges
+            .lock()
+            .unwrap()
+            .entry(self.path.clone())
+            .or_default()
+            .push(range.clone());
         let start = Instant::now();
         let result = self.inner.read(range).await;
         self.timing.add_file_read(start.elapsed());
@@ -134,6 +172,23 @@ impl FileRead for TimedFileRead {
 }
 
 type DataFieldsExtractor = dyn Fn(&[DataField]) -> crate::Result<Vec<DataField>> + Send + Sync;
+
+pub(super) struct FileReadSelection {
+    pub(super) rows: Option<Vec<RowRange>>,
+    /// Caller ranges or live bitmap hits used to choose a ROW sidecar before Parquet pruning or LIMIT.
+    pub(super) sidecar_rows: Option<Vec<RowRange>>,
+    pub(super) parquet_metadata: Option<ArrowReaderMetadata>,
+}
+
+impl FileReadSelection {
+    pub(super) fn new(rows: Option<Vec<RowRange>>, sidecar_rows: Option<Vec<RowRange>>) -> Self {
+        Self {
+            rows,
+            sidecar_rows,
+            parquet_metadata: None,
+        }
+    }
+}
 
 /// Reads data files through their format-specific readers.
 #[derive(Clone)]
@@ -410,13 +465,12 @@ impl DataFileReader {
                         selected_ranges
                     };
 
-                    let mut stream = reader.read_single_file_stream_with_selection(
+                    let mut stream = reader.read_single_file_stream_with_local_selection(
                         &split,
                         file_meta,
                         data_fields,
                         None,
-                        row_selection,
-                        sidecar_ranges,
+                        FileReadSelection::new(row_selection, sidecar_ranges),
                     )?;
                     while let Some(batch) = stream.next().await {
                         yield batch?;
@@ -494,50 +548,44 @@ impl DataFileReader {
         dv: Option<Arc<DeletionVector>>,
         row_ranges: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        self.read_single_file_stream_with_requested_ranges(
+        self.read_single_file_stream_with_row_id_ranges(
             split,
             file_meta,
             data_fields,
             dv,
-            row_ranges.clone(),
-            row_ranges,
+            FileReadSelection::new(row_ranges.clone(), row_ranges),
         )
     }
 
-    /// The caller supplies sidecar candidates separately from physical ranges:
-    /// a selective bitmap includes DV filtering, while LIMIT never affects it.
-    pub(super) fn read_single_file_stream_with_requested_ranges(
+    pub(super) fn read_single_file_stream_with_row_id_ranges(
         &self,
         split: &DataSplit,
         file_meta: DataFileMeta,
         data_fields: Option<Vec<DataField>>,
         dv: Option<Arc<DeletionVector>>,
-        row_ranges: Option<Vec<RowRange>>,
-        requested_ranges: Option<Vec<RowRange>>,
+        selection: FileReadSelection,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        let local_ranges = row_ranges.as_ref().map(|ranges| {
+        let to_local = |ranges: &[RowRange]| {
             to_local_row_ranges(
                 ranges,
                 file_meta.first_row_id.unwrap_or(0),
                 file_meta.row_count,
             )
-        });
+        };
+        let local_ranges = selection.rows.as_deref().map(to_local);
         let row_selection =
             merge_row_selection(file_meta.row_count, dv.as_deref(), local_ranges.as_deref());
-        let sidecar_ranges = requested_ranges.as_ref().map(|ranges| {
-            to_local_row_ranges(
-                ranges,
-                file_meta.first_row_id.unwrap_or(0),
-                file_meta.row_count,
-            )
-        });
-        self.read_single_file_stream_with_selection(
+        let sidecar_ranges = selection.sidecar_rows.as_deref().map(to_local);
+        self.read_single_file_stream_with_local_selection(
             split,
             file_meta,
             data_fields,
             None,
-            row_selection,
-            sidecar_ranges,
+            FileReadSelection {
+                rows: row_selection,
+                sidecar_rows: sidecar_ranges,
+                ..selection
+            },
         )
     }
 
@@ -558,25 +606,28 @@ impl DataFileReader {
             dv.as_deref(),
             local_row_ranges.as_deref(),
         );
-        self.read_single_file_stream_with_selection(
+        self.read_single_file_stream_with_local_selection(
             split,
             file_meta,
             data_fields,
             Some(data_schema_fields),
-            row_selection,
-            local_row_ranges,
+            FileReadSelection::new(row_selection, local_row_ranges),
         )
     }
 
-    fn read_single_file_stream_with_selection(
+    fn read_single_file_stream_with_local_selection(
         &self,
         split: &DataSplit,
         file_meta: DataFileMeta,
         data_fields: Option<Vec<DataField>>,
         data_schema_fields: Option<Vec<DataField>>,
-        row_selection: Option<Vec<RowRange>>,
-        sidecar_ranges: Option<Vec<RowRange>>,
+        selection: FileReadSelection,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        let FileReadSelection {
+            rows: row_selection,
+            sidecar_rows: sidecar_ranges,
+            parquet_metadata,
+        } = selection;
         if row_selection.as_ref().is_some_and(Vec::is_empty) {
             return Ok(futures::stream::empty().boxed());
         }
@@ -708,18 +759,29 @@ impl DataFileReader {
         let projected_read_fields =
             read_data_fields(&data_schema_fields, &read_type, self.nested_field_enabled)?;
         let path_to_read = split.data_file_path(&file_meta);
-        let configured_reader = create_format_reader_with_budget(
-            &path_to_read,
-            blob_as_descriptor,
-            FormatReadFields {
-                data_schema: &data_schema_fields,
-                projected: &projected_read_fields,
-            },
-            &table_options,
-            parquet_read_budget,
-            blob_parallelism,
-            mosaic_prefetch,
-        )?;
+        let fields = FormatReadFields {
+            data_schema: &data_schema_fields,
+            projected: &projected_read_fields,
+        };
+        let configured_reader = match parquet_metadata {
+            Some(metadata) => {
+                let reader = crate::arrow::format::parquet::ParquetFormatReader::with_options(
+                    &table_options,
+                    parquet_read_budget,
+                )?
+                .with_metadata(metadata);
+                crate::arrow::format::configure_format_reader(Box::new(reader), fields)
+            }
+            None => create_format_reader_with_budget(
+                &path_to_read,
+                blob_as_descriptor,
+                fields,
+                &table_options,
+                parquet_read_budget,
+                blob_parallelism,
+                mosaic_prefetch,
+            )?,
+        };
         // Remap predicates from table-level to file-level indices.
         let file_predicates = if post_read_filter {
             None
@@ -767,19 +829,7 @@ impl DataFileReader {
             let index_mapping = create_index_mapping(&read_type, &source_fields);
             let source_fields = Some(source_fields);
 
-            let input_file = file_io.new_input(&read_path)?;
-            let open_start = read_timing.as_ref().map(|_| Instant::now());
-            let file_reader = input_file.reader_with_size(read_size).await?;
-            if let (Some(timing), Some(start)) = (read_timing.as_ref(), open_start) {
-                timing.add_file_read(start.elapsed());
-            }
-            let file_reader: Box<dyn FileRead> = match read_timing.as_ref() {
-                Some(timing) => Box::new(TimedFileRead {
-                    inner: Box::new(file_reader),
-                    timing: Arc::clone(timing),
-                }),
-                None => Box::new(file_reader),
-            };
+            let file_reader = open_file_reader(&file_io, &read_path, read_size, read_timing.as_ref()).await?;
             let is_parquet = read_path.to_ascii_lowercase().ends_with(".parquet");
             let target_schema = if read_path != path_to_read && read_path.ends_with(".row") {
                 let names = read_type.iter().filter(|field| matches!(field.data_type(), DataType::Blob(_)))
@@ -788,13 +838,11 @@ impl DataFileReader {
             } else {
                 target_schema
             };
-            let selected_row_ids = selected_row_ids_for_read(
+            let mut row_ids = selected_row_ids_for_read(
                 projects_row_id,
                 file_meta.first_row_id,
                 row_selection.as_deref(),
             );
-            let mut row_id_cursor = file_meta.first_row_id.unwrap_or(0);
-            let mut row_id_offset = 0usize;
 
             let mut batch_stream = format_reader.read_batch_stream(
                 file_reader,
@@ -833,19 +881,17 @@ impl DataFileReader {
                 first_batch = false;
                 let batch = batch?;
                 let num_rows = batch.num_rows();
+                #[cfg(test)]
+                if let Some(timing) = read_timing.as_ref() {
+                    timing.source_rows.fetch_add(num_rows as u64, Ordering::Relaxed);
+                }
                 let batch_schema = batch.schema();
 
                 // Build output columns using index mapping (field-ID-based) or by name.
                 let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(target_schema.fields().len());
                 for (i, target_field) in target_schema.fields().iter().enumerate() {
                     if target_field.name() == ROW_ID_FIELD_NAME {
-                        columns.push(row_id_column_for_batch(
-                            file_meta.first_row_id,
-                            num_rows,
-                            &mut row_id_cursor,
-                            selected_row_ids.as_deref(),
-                            &mut row_id_offset,
-                        )?);
+                        columns.push(row_id_column_for_batch(row_ids.as_mut(), num_rows)?);
                         continue;
                     }
 
@@ -1471,22 +1517,24 @@ fn data_schema_fields_for_file(
 /// `first_row_id` is the coordinate base selected by the table's read path:
 /// stable row ID for row-tracked tables, or cumulative split-local physical
 /// offset for raw tables without row tracking.
-fn to_local_row_ranges(
+pub(super) fn to_local_row_ranges(
     row_ranges: &[RowRange],
     first_row_id: i64,
     row_count: i64,
 ) -> Vec<RowRange> {
-    let file_end = first_row_id + row_count - 1;
+    if row_count <= 0 {
+        return Vec::new();
+    }
+    let file_end = first_row_id.saturating_add(row_count - 1);
     crate::table::merge_row_ranges(
         row_ranges
             .iter()
             .filter_map(|r| {
-                if r.to() < first_row_id || r.from() > file_end {
-                    return None;
-                }
-                let local_from = (r.from() - first_row_id).max(0);
-                let local_to = (r.to() - first_row_id).min(row_count - 1);
-                Some(RowRange::new(local_from, local_to))
+                let overlap = r.intersect_inclusive(first_row_id, file_end)?;
+                Some(RowRange::new(
+                    overlap.from() - first_row_id,
+                    overlap.to() - first_row_id,
+                ))
             })
             .collect(),
     )
@@ -1595,7 +1643,7 @@ fn ranges_cover_all_rows(ranges: &[RowRange], row_count: i64) -> bool {
 }
 
 /// Convert a DeletionVector into sorted non-deleted inclusive RowRanges.
-fn dv_to_non_deleted_ranges(dv: &DeletionVector, row_count: i64) -> Vec<RowRange> {
+pub(super) fn dv_to_non_deleted_ranges(dv: &DeletionVector, row_count: i64) -> Vec<RowRange> {
     let mut result = Vec::new();
     let mut cursor: i64 = 0;
     for (start, end) in dv.deleted_ranges() {
@@ -1614,134 +1662,43 @@ fn dv_to_non_deleted_ranges(dv: &DeletionVector, row_count: i64) -> Vec<RowRange
     result
 }
 
-/// Intersect two sorted lists of inclusive RowRanges using a merge-style scan.
-fn intersect_sorted_ranges(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
-    let mut result = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        let from = a[i].from().max(b[j].from());
-        let to = a[i].to().min(b[j].to());
-        if from <= to {
-            result.push(RowRange::new(from, to));
-        }
-        if a[i].to() < b[j].to() {
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    result
-}
-
-/// Expand row_ranges into a flat sequence of selected row IDs for a file.
-/// Intended for per-batch _ROW_ID attachment — callers should not pass
-/// whole-file ranges with millions of rows, as this allocates a Vec<i64>
-/// proportional to the selected range size.
-pub(super) fn expand_selected_row_ids(
+pub(super) fn row_ids_from_ranges(
     first_row_id: i64,
-    row_count: i64,
-    row_ranges: &[RowRange],
-) -> Vec<i64> {
-    if row_count == 0 {
-        return Vec::new();
-    }
-    let file_end = first_row_id + row_count - 1;
-    let mut ids = Vec::new();
-    for r in row_ranges {
-        let from = r.from().max(first_row_id);
-        let to = r.to().min(file_end);
-        for id in from..=to {
-            ids.push(id);
-        }
-    }
-    ids
-}
-
-fn expand_local_selected_row_ids(first_row_id: i64, local_ranges: &[RowRange]) -> Vec<i64> {
-    let mut ids = Vec::new();
-    for range in local_ranges {
-        for local_id in range.from()..=range.to() {
-            ids.push(first_row_id + local_id);
-        }
-    }
-    ids
+    ranges: Option<Vec<RowRange>>,
+) -> impl Iterator<Item = i64> {
+    let contiguous = ranges.is_none().then_some(first_row_id..=i64::MAX);
+    let selected = ranges.into_iter().flatten().map(|r| r.from()..=r.to());
+    selected.chain(contiguous).flatten()
 }
 
 fn selected_row_ids_for_read(
     projects_row_id: bool,
     first_row_id: Option<i64>,
-    row_selection: Option<&[RowRange]>,
-) -> Option<Vec<i64>> {
-    if !projects_row_id {
-        return None;
-    }
-    match (first_row_id, row_selection) {
-        (Some(first_row_id), Some(ranges)) => {
-            Some(expand_local_selected_row_ids(first_row_id, ranges))
-        }
-        _ => None,
-    }
+    local_ranges: Option<&[RowRange]>,
+) -> Option<impl Iterator<Item = i64>> {
+    let first = first_row_id.filter(|_| projects_row_id)?;
+    let positions = row_ids_from_ranges(0, local_ranges.map(|ranges| ranges.to_vec()));
+    Some(positions.map_while(move |position| first.checked_add(position)))
 }
 
-fn row_id_column_for_batch(
-    first_row_id: Option<i64>,
+pub(super) fn row_id_column_for_batch(
+    row_ids: Option<&mut impl Iterator<Item = i64>>,
     num_rows: usize,
-    row_id_cursor: &mut i64,
-    selected_row_ids: Option<&[i64]>,
-    row_id_offset: &mut usize,
 ) -> crate::Result<Arc<dyn arrow_array::Array>> {
-    let Some(_) = first_row_id else {
+    let Some(row_ids) = row_ids else {
         return Ok(Arc::new(Int64Array::new_null(num_rows)));
     };
-
-    if let Some(selected_row_ids) = selected_row_ids {
-        let end = *row_id_offset + num_rows;
-        if end > selected_row_ids.len() {
-            return Err(Error::UnexpectedError {
-                message: format!(
-                    "Row ID offset out of bounds: need {}..{} but selected_row_ids has {} entries",
-                    *row_id_offset,
-                    end,
-                    selected_row_ids.len()
-                ),
-                source: None,
-            });
-        }
-        let batch_ids = &selected_row_ids[*row_id_offset..end];
-        *row_id_offset = end;
-        return Ok(Arc::new(Int64Array::from(batch_ids.to_vec())));
-    }
-
-    let start = *row_id_cursor;
-    let end = start + num_rows as i64;
-    *row_id_cursor = end;
-    Ok(Arc::new(Int64Array::from((start..end).collect::<Vec<_>>())))
-}
-
-pub(super) fn attach_row_id(
-    batch: RecordBatch,
-    row_id_index: usize,
-    selected_row_ids: &[i64],
-    row_id_offset: &mut usize,
-    output_schema: &Arc<arrow_schema::Schema>,
-) -> crate::Result<RecordBatch> {
-    let num_rows = batch.num_rows();
-    let end = *row_id_offset + num_rows;
-    if end > selected_row_ids.len() {
-        return Err(Error::UnexpectedError {
+    let ids = Int64Array::from_iter_values(row_ids.take(num_rows));
+    if ids.len() != num_rows {
+        return Err(Error::DataInvalid {
             message: format!(
-                "Row ID offset out of bounds: need {}..{} but selected_row_ids has {} entries",
-                *row_id_offset,
-                end,
-                selected_row_ids.len()
+                "Batch has {num_rows} rows but only {} selected row IDs remain",
+                ids.len()
             ),
             source: None,
         });
     }
-    let batch_ids = &selected_row_ids[*row_id_offset..end];
-    *row_id_offset = end;
-    let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(batch_ids.to_vec()));
-    insert_column_at(batch, array, row_id_index, output_schema)
+    Ok(Arc::new(ids))
 }
 
 pub(super) fn insert_column_at(
@@ -1765,16 +1722,6 @@ pub(super) fn insert_column_at(
         message: format!("Failed to insert column into RecordBatch: {e}"),
         source: Some(Box::new(e)),
     })
-}
-
-/// Append a null `_ROW_ID` column for files without `first_row_id`.
-pub(super) fn append_null_row_id_column(
-    batch: RecordBatch,
-    insert_index: usize,
-    output_schema: &Arc<arrow_schema::Schema>,
-) -> crate::Result<RecordBatch> {
-    let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::new_null(batch.num_rows()));
-    insert_column_at(batch, array, insert_index, output_schema)
 }
 
 #[cfg(test)]
@@ -2799,6 +2746,12 @@ mod tests {
             to_local_row_ranges(&[RowRange::new(103, 104)], 100, 6),
             vec![RowRange::new(3, 4)]
         );
+        let all_ids = [RowRange::new(i64::MIN, i64::MAX)];
+        assert_eq!(
+            to_local_row_ranges(&all_ids, i64::MAX - 5, 6),
+            vec![RowRange::new(0, 5)]
+        );
+        assert!(to_local_row_ranges(&all_ids, 100, 0).is_empty());
     }
 
     #[test]
@@ -2830,6 +2783,7 @@ mod tests {
         let timed = TimedFileRead {
             inner: Box::new(reader),
             timing: Arc::new(DataFileReadTiming::default()),
+            path: "memory:/timed-file".into(),
         };
 
         assert!(std::ptr::eq(
@@ -2924,20 +2878,29 @@ mod tests {
     }
 
     #[test]
-    fn selected_row_ids_are_built_only_when_projected() {
+    fn projected_row_ids_follow_the_selection_one_batch_at_a_time() {
         let huge_selection = [RowRange::new(0, i64::from(i32::MAX))];
+        assert!(selected_row_ids_for_read(false, Some(10), Some(&huge_selection)).is_none());
         assert_eq!(
-            selected_row_ids_for_read(false, Some(10), Some(&huge_selection)),
-            None
+            selected_row_ids_for_read(true, Some(10), Some(&huge_selection))
+                .unwrap()
+                .take(3)
+                .collect::<Vec<_>>(),
+            [10, 11, 12]
         );
         assert_eq!(
             selected_row_ids_for_read(
                 true,
                 Some(10),
                 Some(&[RowRange::new(1, 2), RowRange::new(4, 4)]),
-            ),
-            Some(vec![11, 12, 14])
+            )
+            .unwrap()
+            .collect::<Vec<_>>(),
+            [11, 12, 14]
         );
+        let mut ids = selected_row_ids_for_read(true, Some(i64::MAX), None).unwrap();
+        assert_eq!(row_id_column_for_batch(Some(&mut ids), 1).unwrap().len(), 1);
+        assert!(row_id_column_for_batch(Some(&mut ids), 1).is_err());
     }
 
     #[test]

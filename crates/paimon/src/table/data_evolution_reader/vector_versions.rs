@@ -24,11 +24,12 @@ use async_stream::try_stream;
 use futures::StreamExt;
 
 use super::{
-    intersect_local_ranges, is_vector_store_file_name, vector_file_row_range, vector_format_suffix,
-    PreparedMergeGroup, ResolvedFileInfo,
+    is_vector_store_file_name, vector_file_row_range, vector_format_suffix, PreparedMergeGroup,
+    ResolvedFileInfo,
 };
 use crate::spec::{DataField, DataFileMeta};
 use crate::table::data_file_reader::DataFileReader;
+use crate::table::row_id_predicate::intersect_sorted_ranges;
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::{DataSplit, Error};
 
@@ -198,7 +199,7 @@ pub(super) fn read(
         previous_version = Some((file.max_sequence_number, range.to()));
         let winning =
             crate::table::source::exclude_row_ranges(std::slice::from_ref(&range), &covered);
-        let ranges = intersect_local_ranges(&winning, &selected);
+        let ranges = intersect_sorted_ranges(&winning, &selected);
         if !ranges.is_empty() {
             let index = file_reads.len();
             reads.extend(ranges.iter().map(|range| (range.clone(), Some(index))));
