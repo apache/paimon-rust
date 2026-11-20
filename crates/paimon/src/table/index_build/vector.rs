@@ -276,7 +276,7 @@ pub(in crate::table) async fn serialize_writer(
     mut writer: VectorIndexWriter,
     output: OutputFile,
 ) -> Result<()> {
-    let mut output = SyncIoBridge::new(output.async_writer().await?);
+    let mut output = SyncIoBridge::new(output.async_writer_with_concurrency(8).await?);
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         writer.write(&mut PosWriter::new(&mut output))?;
         output.shutdown()
