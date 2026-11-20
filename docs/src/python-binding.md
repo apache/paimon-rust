@@ -371,6 +371,27 @@ schema recorded in that snapshot. An update to a dropped field is rejected even
 if its name is reused or DDL has not published a new data snapshot. This check
 includes fields nested inside written ROW, ARRAY, MAP, and MULTISET columns.
 
+## BLOB CRC verification
+
+Rust verifies CRC32 when materializing managed `.blob` entries. It accepts both
+standard checksums and historical Python checksums written before
+[apache/paimon#9426](https://github.com/apache/paimon/pull/9426), which excluded
+the trailing length. Both checksums share one payload scan.
+
+The read option `blob.read.verify-crc` defaults to `true`. To skip CRC calculation:
+
+```python
+rb = table.new_read_builder({"blob.read.verify-crc": "false"})
+# Continue with scan-then-read using this builder.
+```
+
+This option applies to scalar, array, and map BLOB materialization, including
+Data Evolution reads. Magic, entry length, and range checks remain enabled;
+payload corruption detectable only by CRC is no longer rejected when disabled.
+Writers continue producing standard checksums. Descriptor-only reads do not
+materialize the full entry and do not verify its CRC; this option does not add
+verification to external objects or Python-side descriptor fetching.
+
 ## Column Projection
 
 Use `with_projection` to select specific columns. Only the requested columns are read, reducing I/O.
