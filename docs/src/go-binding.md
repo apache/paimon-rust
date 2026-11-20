@@ -384,6 +384,12 @@ log.Printf("retained for %s", *tag.TagTimeRetained)
 Pass `nil` for `timeRetained` to create a tag without retention metadata, the
 same as `CreateTag`.
 
+## Dropping a Table
+
+Call `catalog.DropTable(id, ignoreIfNotExists)` to drop a table. Pass `true`
+for `DROP TABLE IF EXISTS` behavior. With `false`, a missing table returns
+a Paimon error with code `CodeNotFound`.
+
 ## Writing a Table
 
 Use `NewWriteBuilder` for ordinary and fixed-bucket tables. The `arrow.Record`

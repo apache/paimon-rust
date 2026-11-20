@@ -113,6 +113,19 @@ func (c *Catalog) GetTable(id Identifier) (*Table, error) {
 	return &Table{ctx: c.ctx, lib: c.lib, inner: inner}, nil
 }
 
+// DropTable drops a table. When ignoreIfNotExists is true, a missing table is accepted.
+func (c *Catalog) DropTable(id Identifier, ignoreIfNotExists bool) error {
+	if c.inner == nil {
+		return ErrClosed
+	}
+	cID, err := c.newIdentifier(id)
+	if err != nil {
+		return err
+	}
+	defer ffiIdentifierFree.symbol(c.ctx)(cID)
+	return ffiCatalogDropTable.symbol(c.ctx)(c.inner, cID, ignoreIfNotExists)
+}
+
 func (c *Catalog) newIdentifier(id Identifier) (*paimonIdentifier, error) {
 	return ffiIdentifierNew.symbol(c.ctx)(id.database, id.object)
 }
@@ -308,6 +321,22 @@ var ffiCatalogGetTable = newFFI(ffiOpts{
 			return nil, parseError(ctx, result.error)
 		}
 		return result.table, nil
+	}
+})
+
+var ffiCatalogDropTable = newFFI(ffiOpts{
+	sym:    "paimon_catalog_drop_table",
+	rType:  &ffi.TypePointer,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer, &ffi.TypeUint8},
+}, func(ctx context.Context, ffiCall ffiCall) func(*paimonCatalog, *paimonIdentifier, bool) error {
+	return func(catalog *paimonCatalog, id *paimonIdentifier, ignoreIfNotExists bool) error {
+		var ignore uint8
+		if ignoreIfNotExists {
+			ignore = 1
+		}
+		var ffiError *paimonError
+		ffiCall(unsafe.Pointer(&ffiError), unsafe.Pointer(&catalog), unsafe.Pointer(&id), unsafe.Pointer(&ignore))
+		return parseError(ctx, ffiError)
 	}
 })
 
