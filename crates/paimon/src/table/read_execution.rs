@@ -22,7 +22,7 @@ use crate::DataSplit;
 use arrow_array::RecordBatch;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
@@ -113,7 +113,15 @@ pub(super) fn execute(
     limit: Option<usize>,
     read: SplitReader,
 ) -> ArrowRecordBatchStream {
-    let streams = split_groups(splits, parallelism)
+    // Ordered output needs a sliding window of individual splits. Grouping
+    // several splits into one stream leaves the later splits in each group
+    // unopened until every earlier split in that group has been emitted.
+    let groups = if ordered && parallelism > 1 {
+        splits.into_iter().map(|split| vec![split]).collect()
+    } else {
+        split_groups(splits, parallelism)
+    };
+    let streams = groups
         .into_iter()
         .map(|group| {
             let read = Arc::clone(&read);
@@ -133,7 +141,11 @@ pub(super) fn execute(
             }) as ArrowRecordBatchStream
         })
         .collect();
-    merge_streams(streams, ordered, limit)
+    if ordered && parallelism > 1 {
+        merge_streams_bounded(streams, ordered, limit, parallelism)
+    } else {
+        merge_streams(streams, ordered, limit)
+    }
 }
 
 fn next_batch(index: usize, mut stream: ArrowRecordBatchStream) -> BoxFuture<'static, NextBatch> {
@@ -148,9 +160,19 @@ fn next_batch(index: usize, mut stream: ArrowRecordBatchStream) -> BoxFuture<'st
 /// on owned runtime tasks so synchronous decoder work can use separate CPUs.
 /// Dropping the output aborts every task through JoinSet's drop implementation.
 fn merge_streams(
+    streams: Vec<ArrowRecordBatchStream>,
+    ordered: bool,
+    limit: Option<usize>,
+) -> ArrowRecordBatchStream {
+    let parallelism = streams.len();
+    merge_streams_bounded(streams, ordered, limit, parallelism)
+}
+
+fn merge_streams_bounded(
     mut streams: Vec<ArrowRecordBatchStream>,
     ordered: bool,
     limit: Option<usize>,
+    parallelism: usize,
 ) -> ArrowRecordBatchStream {
     if limit == Some(0) {
         return Box::pin(futures::stream::empty());
@@ -178,9 +200,12 @@ fn merge_streams(
             }
         };
         let count = streams.len();
+        let mut unscheduled = streams.into_iter().enumerate().collect::<VecDeque<_>>();
         let mut pending = JoinSet::new();
-        for (index, stream) in streams.into_iter().enumerate() {
-            pending.spawn_on(next_batch(index, stream), &handle);
+        for _ in 0..parallelism.min(count) {
+            if let Some((index, stream)) = unscheduled.pop_front() {
+                pending.spawn_on(next_batch(index, stream), &handle);
+            }
         }
         let mut ready = BTreeMap::new();
         let mut current = 0;
@@ -209,6 +234,7 @@ fn merge_streams(
                 Ok(None) => break,
                 Err(error) => {
                     drop(ready);
+                    unscheduled.clear();
                     pending.shutdown().await;
                     Err(error)?;
                     break;
@@ -220,6 +246,7 @@ fn merge_streams(
                     // worker first, even if the caller retains the errored stream.
                     drop(stream);
                     drop(ready);
+                    unscheduled.clear();
                     pending.shutdown().await;
                     Err(error)?;
                     break;
@@ -232,6 +259,7 @@ fn merge_streams(
                             // final batch is handed to the caller.
                             drop(stream);
                             drop(ready);
+                            unscheduled.clear();
                             pending.shutdown().await;
                             yield batch;
                             break;
@@ -241,7 +269,12 @@ fn merge_streams(
                     // Schedule another decode only after the caller resumes.
                     pending.spawn_on(next_batch(index, stream), &handle);
                 }
-                None if ordered => current += 1,
+                None if ordered => {
+                    current += 1;
+                    if let Some((index, stream)) = unscheduled.pop_front() {
+                        pending.spawn_on(next_batch(index, stream), &handle);
+                    }
+                }
                 None => {},
             }
         }
@@ -383,6 +416,64 @@ mod tests {
         assert_eq!(rest, vec![2, 3, 4]);
         assert_eq!(reads.load(Ordering::SeqCst), 2);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn ordered_split_window_opens_later_splits_as_earlier_ones_finish() {
+        let (release, wait) = oneshot::channel();
+        let reads = (0..4)
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect::<Vec<_>>();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut first = Some(wait);
+        let streams = reads
+            .iter()
+            .enumerate()
+            .map(|(index, reads)| {
+                controlled_stream(
+                    vec![index as i32],
+                    if index == 0 { first.take() } else { None },
+                    reads.clone(),
+                    drops.clone(),
+                )
+            })
+            .collect();
+        let mut output = merge_streams_bounded(streams, true, None, 2);
+        assert!(output.next().now_or_never().is_none());
+        wait_for_count(&reads[1], 1).await;
+        assert_eq!(reads[2].load(Ordering::SeqCst), 0);
+        assert_eq!(reads[3].load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        let values = output
+            .map_ok(|batch| value(&batch))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(values, vec![0, 1, 2, 3]);
+        assert!(reads.iter().all(|count| count.load(Ordering::SeqCst) == 1));
+        assert_eq!(drops.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn ordered_limit_discards_unscheduled_splits() {
+        let reads = (0..4)
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect::<Vec<_>>();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let streams = reads
+            .iter()
+            .enumerate()
+            .map(|(index, reads)| {
+                controlled_stream(vec![index as i32], None, reads.clone(), drops.clone())
+            })
+            .collect();
+        let mut output = merge_streams_bounded(streams, true, Some(1), 2);
+        assert_eq!(value(&output.next().await.unwrap().unwrap()), 0);
+        assert!(output.next().await.is_none());
+        assert!(reads[2..]
+            .iter()
+            .all(|count| count.load(Ordering::SeqCst) == 0));
+        assert_eq!(drops.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
