@@ -139,7 +139,7 @@ arrow-select = { workspace = true }
 arrow-string = { workspace = true }
 futures = "0.3"
 crossbeam-channel = "0.5"
-tokio-util = { workspace = true, features = ["compat", "io-util"] }
+tokio-util = { workspace = true, features = ["compat", "io-util", "rt"] }
 parquet = { workspace = true, features = ["async", "zstd", "lz4", "snap"] }
 orc-rust = "0.9.0"
 async-stream = "0.3.6"

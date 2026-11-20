@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{timestamp_millis_schema, FilePredicates, FormatFileReader};
+use super::{panic_payload_message, timestamp_millis_schema, FilePredicates, FormatFileReader};
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::filtering::{
     predicates_may_match_with_schema, remap_predicates_to_file, StatsAccessor,
@@ -512,16 +512,6 @@ fn read_planned_row_group(
         .map_err(mosaic_read_error)?;
     let batch = row_group_reader.read_columns().map_err(mosaic_read_error)?;
     take_row_slices(batch, plan.selected_slices.as_deref(), read_schema)
-}
-
-fn panic_payload_message(panic: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = panic.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = panic.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic payload".to_string()
-    }
 }
 
 fn apply_mosaic_residual(
