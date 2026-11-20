@@ -22,7 +22,7 @@ use crate::DataSplit;
 use arrow_array::RecordBatch;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
@@ -202,26 +202,43 @@ fn merge_streams_bounded(
         let count = streams.len();
         let mut unscheduled = streams.into_iter().enumerate().collect::<VecDeque<_>>();
         let mut pending = JoinSet::new();
+        // A worker panic has no returned stream index. Keep its task ID so a
+        // finite ordered read can defer the failure until that split is needed.
+        let mut task_indices = HashMap::new();
         for _ in 0..parallelism.min(count) {
             if let Some((index, stream)) = unscheduled.pop_front() {
-                pending.spawn_on(next_batch(index, stream), &handle);
+                let task = pending.spawn_on(next_batch(index, stream), &handle);
+                if ordered && limit.is_some() {
+                    task_indices.insert(task.id(), index);
+                }
             }
         }
         let mut ready = BTreeMap::new();
+        let mut ready_errors = BTreeMap::new();
         let mut current = 0;
         let mut remaining = limit;
         while remaining != Some(0) && current < count {
             let next = if ordered {
                 loop {
+                    if let Some(error) = ready_errors.remove(&current) { break Err(error); }
                     if let Some(next) = ready.remove(&current) { break Ok(Some(next)); }
-                    let next = match pending.join_next().await {
-                        Some(Ok(next)) => next,
+                    let next = match pending.join_next_with_id().await {
+                        Some(Ok((id, next))) => {
+                            task_indices.remove(&id);
+                            next
+                        }
+                        Some(Err(error)) if limit.is_some() => {
+                            let index = task_indices.remove(&error.id())
+                                .expect("ordered worker must have a split index");
+                            ready_errors.insert(index, worker_error(error));
+                            continue;
+                        }
                         Some(Err(error)) => break Err(worker_error(error)),
                         None => break Ok(None),
                     };
-                    // Surface a failed worker even while an earlier group is
-                    // blocked; cleanup happens before exposing the error.
-                    if next.0 == current || next.1.as_ref().is_some_and(Result::is_err) {
+                    // A finite ordered LIMIT may finish before a later split
+                    // is needed, so defer speculative failures in that case.
+                    if next.0 == current || (limit.is_none() && next.1.as_ref().is_some_and(Result::is_err)) {
                         break Ok(Some(next));
                     }
                     ready.insert(next.0, next);
@@ -267,12 +284,18 @@ fn merge_streams_bounded(
                         yield batch;
                     }
                     // Schedule another decode only after the caller resumes.
-                    pending.spawn_on(next_batch(index, stream), &handle);
+                    let task = pending.spawn_on(next_batch(index, stream), &handle);
+                    if ordered && limit.is_some() {
+                        task_indices.insert(task.id(), index);
+                    }
                 }
                 None if ordered => {
                     current += 1;
                     if let Some((index, stream)) = unscheduled.pop_front() {
-                        pending.spawn_on(next_batch(index, stream), &handle);
+                        let task = pending.spawn_on(next_batch(index, stream), &handle);
+                        if limit.is_some() {
+                            task_indices.insert(task.id(), index);
+                        }
                     }
                 }
                 None => {},
@@ -320,6 +343,8 @@ fn limit_single_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::BinaryRow;
+    use crate::table::DataSplitBuilder;
     use arrow_array::Int32Array;
     use futures::channel::oneshot;
     use futures::TryStreamExt;
@@ -474,6 +499,106 @@ mod tests {
             .iter()
             .all(|count| count.load(Ordering::SeqCst) == 0));
         assert_eq!(drops.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn ordered_limit_ignores_only_speculative_split_errors() {
+        for first_has_row in [true, false] {
+            let splits = (0..4)
+                .map(|index| {
+                    DataSplitBuilder::new()
+                        .with_snapshot(1)
+                        .with_partition(BinaryRow::new(0))
+                        .with_bucket(index)
+                        .with_bucket_path(format!("memory:/split-{index}"))
+                        .with_data_files(Vec::new())
+                        .build()
+                        .unwrap()
+                })
+                .collect();
+            let (release, wait) = oneshot::channel();
+            let first_wait = std::sync::Mutex::new(Some(wait));
+            let failed = Arc::new(AtomicUsize::new(0));
+            let failed_read = failed.clone();
+            let read: SplitReader = Arc::new(move |splits, _| match splits[0].bucket() {
+                0 => {
+                    let wait = first_wait.lock().unwrap().take().unwrap();
+                    Ok(Box::pin(async_stream::try_stream! {
+                        let _ = wait.await;
+                        if first_has_row { yield batch(1); }
+                    }))
+                }
+                1 => {
+                    failed_read.fetch_add(1, Ordering::SeqCst);
+                    Err(crate::Error::DataInvalid {
+                        message: "speculative split failed".into(),
+                        source: None,
+                    })
+                }
+                _ => Ok(Box::pin(futures::stream::empty())),
+            });
+            let mut output = execute(splits, 2, true, Some(1), read);
+            assert!(output.next().now_or_never().is_none());
+            wait_for_count(&failed, 1).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), output.next())
+                    .await
+                    .is_err()
+            );
+            release.send(()).unwrap();
+            if first_has_row {
+                assert_eq!(value(&output.next().await.unwrap().unwrap()), 1);
+                assert!(output.next().await.is_none());
+            } else {
+                assert!(output
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("speculative split failed"));
+                assert!(output.next().await.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordered_limit_defers_speculative_worker_panics() {
+        for first_has_row in [true, false] {
+            let (release, wait) = oneshot::channel();
+            let first = controlled_stream(
+                if first_has_row { vec![1] } else { vec![] },
+                Some(wait),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            );
+            let entered = Arc::new(AtomicUsize::new(0));
+            let entered_worker = entered.clone();
+            let panicking = Box::pin(futures::stream::once(async move {
+                entered_worker.fetch_add(1, Ordering::SeqCst);
+                panic!("speculative decoder panic");
+                #[allow(unreachable_code)]
+                Ok(batch(2))
+            })) as ArrowRecordBatchStream;
+            let mut output = merge_streams_bounded(vec![first, panicking], true, Some(1), 2);
+            assert!(output.next().now_or_never().is_none());
+            wait_for_count(&entered, 1).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), output.next())
+                    .await
+                    .is_err()
+            );
+            release.send(()).unwrap();
+            if first_has_row {
+                assert_eq!(value(&output.next().await.unwrap().unwrap()), 1);
+            } else {
+                assert!(matches!(
+                    output.next().await.unwrap().unwrap_err(),
+                    crate::Error::UnexpectedError { .. }
+                ));
+            }
+            assert!(output.next().await.is_none());
+        }
     }
 
     #[tokio::test]
