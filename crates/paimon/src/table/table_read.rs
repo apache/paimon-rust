@@ -39,7 +39,7 @@ use arrow_array::{
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat as arrow_concat;
 use arrow_select::take::take;
-use futures::{stream, StreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -85,6 +85,16 @@ pub(crate) fn configured_mosaic_prefetch(table: &Table) -> crate::Result<MosaicP
 }
 
 impl<'a> TableRead<'a> {
+    pub(super) fn with_partition_fallback(
+        mut self,
+        fallback: Option<Arc<super::partition_fallback::PartitionFallback>>,
+    ) -> Self {
+        if let TableReadKind::Paimon(read) = &mut self.kind {
+            read.partition_fallback = fallback;
+        }
+        self
+    }
+
     /// Internal mutation readers need stable row IDs to match and preserve
     /// original rows. This does not authorize a read: every split must still
     /// carry a whole-table unrestricted grant issued to this exact handle.
@@ -497,6 +507,7 @@ impl<'a> TableRead<'a> {
 
 #[derive(Debug, Clone)]
 struct PaimonTableRead<'a> {
+    partition_fallback: Option<Arc<super::partition_fallback::PartitionFallback>>,
     table: &'a Table,
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
@@ -536,6 +547,7 @@ impl<'a> PaimonTableRead<'a> {
         data_predicates: Vec<Predicate>,
     ) -> Self {
         Self {
+            partition_fallback: None,
             table,
             read_type,
             data_predicates,
@@ -558,6 +570,13 @@ impl<'a> PaimonTableRead<'a> {
         include_row_kind: bool,
     ) -> crate::Result<ArrowRecordBatchStream> {
         let options = self.table.schema().core_options();
+        if splits.iter().any(DataSplit::is_fallback)
+            && (self.partition_fallback.is_none() || self.update_read)
+        {
+            return Err(crate::Error::Unsupported {
+                message: "Fallback splits require a partition fallback batch reader".into(),
+            });
+        }
         // Validate the complete grant set before splitting the work. Per-worker
         // validation alone could accept incompatible restricted policies.
         let grant = self.ensure_authorized_by_splits(&options, splits)?;
@@ -646,9 +665,16 @@ impl<'a> PaimonTableRead<'a> {
         let row_filter_factory = self.row_filter_factory.clone();
         let data_file_read_timing = self.data_file_read_timing.clone();
         let update_read = self.update_read;
-        Arc::new(move |splits, limit| {
+        // A worker may receive wire splits from a different planner. Resolve its
+        // source once for this execution; a subsequent scan must observe new DDL.
+        let fallback = self
+            .partition_fallback
+            .clone()
+            .map(|branch| (branch, Arc::new(tokio::sync::OnceCell::<Table>::new())));
+        let read_branch = move |table: &Table, splits: &[DataSplit], limit| {
             let read = PaimonTableRead {
-                table: &table,
+                partition_fallback: None,
+                table,
                 read_type: read_type.clone(),
                 data_predicates: data_predicates.clone(),
                 partition_predicate: partition_predicate.clone(),
@@ -666,6 +692,38 @@ impl<'a> PaimonTableRead<'a> {
             } else {
                 read.to_arrow(splits)
             }
+        };
+        Arc::new(move |splits, limit| {
+            // read_execution supplies one split at a time and enforces one global limit.
+            if !splits[0].is_fallback() {
+                return read_branch(&table, splits, limit);
+            }
+            let (fallback, source) =
+                fallback.as_ref().ok_or_else(|| crate::Error::Unsupported {
+                    message: "Fallback splits require a partition fallback batch reader".into(),
+                })?;
+            if let Some(branch) = source.get() {
+                return read_branch(branch, splits, limit);
+            }
+            let (fallback, source) = (Arc::clone(fallback), Arc::clone(source));
+            let table = table.clone();
+            let split = splits[0].clone();
+            let read_branch = read_branch.clone();
+            let stream = stream::once(async move {
+                let branch = source
+                    .get_or_try_init(|| async {
+                        fallback
+                            .branch(&table, super::partition_fallback::BranchSchema::Planned)
+                            .await?
+                            .ok_or_else(|| crate::Error::DataInvalid {
+                                message: "The configured fallback branch does not exist".into(),
+                                source: None,
+                            })
+                    })
+                    .await?;
+                read_branch(branch, std::slice::from_ref(&split), limit)
+            });
+            Ok(Box::pin(stream.try_flatten()))
         })
     }
 
@@ -920,6 +978,7 @@ impl<'a> PaimonTableRead<'a> {
             for group in [materialized, streaming] {
                 if remaining == Some(0) { break; }
                 let read = PaimonTableRead {
+                    partition_fallback: None,
                     table: &table,
                     read_type: read_type.clone(),
                     data_predicates: data_predicates.clone(),

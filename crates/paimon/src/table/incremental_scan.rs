@@ -122,6 +122,16 @@ impl IncrementalPlan {
                 source: None,
             });
         }
+        if self.splits.iter().any(|split| match split {
+            IncrementalSplit::Data(data) => data.is_fallback(),
+            IncrementalSplit::DiffPair { before, after } => {
+                before.iter().chain(after).any(DataSplit::is_fallback)
+            }
+        }) {
+            return Err(crate::Error::Unsupported {
+                message: "Incremental reads do not support partition fallback splits".into(),
+            });
+        }
         if self.mode == IncrementalScanMode::Diff {
             let mut before_snapshot_id = None;
             let mut after_snapshot_id = None;

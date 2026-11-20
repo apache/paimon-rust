@@ -27,6 +27,7 @@ use super::global_index_result::GlobalIndexResult;
 use super::global_index_scanner::RowRangeIndex;
 use super::global_index_types::normalize_queryable_global_index_type;
 use super::kv_file_reader::retain_primary_key_conjuncts;
+use super::partition_fallback::{BranchSchema, PartitionFallback};
 use super::partition_filter::PartitionFilter;
 use super::row_position_selection::RowPositionSelection;
 use super::stats_filter::{
@@ -1114,6 +1115,19 @@ impl BucketFilter {
 }
 
 impl<'a> TableScan<'a> {
+    pub(super) fn with_partition_fallback(
+        mut self,
+        fallback: Option<Arc<PartitionFallback>>,
+    ) -> Self {
+        if let (TableScanKind::Paimon(scan), Some(fallback)) = (&mut self.0, fallback) {
+            scan.table = ScanTable::WithFallback(Arc::new(FallbackScanTable {
+                current: (*scan.table).clone(),
+                fallback,
+            }));
+        }
+        self
+    }
+
     pub(super) fn into_owned_paimon_scan(self) -> crate::Result<TableScan<'static>> {
         let TableScanKind::Paimon(scan) = self.0 else {
             return Err(crate::Error::Unsupported {
@@ -1698,6 +1712,13 @@ struct ScanSplitSelection {
 enum ScanTable<'a> {
     Borrowed(&'a Table),
     Owned(std::sync::Arc<Table>),
+    WithFallback(Arc<FallbackScanTable>),
+}
+
+#[derive(Debug)]
+struct FallbackScanTable {
+    current: Table,
+    fallback: Arc<PartitionFallback>,
 }
 
 impl std::ops::Deref for ScanTable<'_> {
@@ -1707,6 +1728,7 @@ impl std::ops::Deref for ScanTable<'_> {
         match self {
             Self::Borrowed(table) => table,
             Self::Owned(table) => table,
+            Self::WithFallback(source) => &source.current,
         }
     }
 }
@@ -1949,6 +1971,17 @@ impl<'a> PaimonTableScan<'a> {
     async fn plan_selection(&self, stats: &mut ScanStats) -> crate::Result<Plan> {
         let scan = self.authorized_scan().await?;
         stats.limit = scan.limit;
+        if let ScanTable::WithFallback(source) = &scan.table {
+            if !scan.scan_all_files {
+                if let Some(other) = source
+                    .fallback
+                    .branch(&source.current, BranchSchema::Latest)
+                    .await?
+                {
+                    return scan.plan_partition_fallback(other, stats).await;
+                }
+            }
+        }
         if let Some(plan) = scan.supplied_split_plan() {
             stats.record_split_planning(plan.splits().len(), false);
             return Ok(plan);
@@ -1970,6 +2003,97 @@ impl<'a> PaimonTableScan<'a> {
             None => Plan::new(Vec::new()),
         };
         scan.finish_plan(plan).await
+    }
+
+    async fn plan_partition_fallback(
+        &self,
+        other: Table,
+        stats: &mut ScanStats,
+    ) -> crate::Result<Plan> {
+        if self.split_selection.is_some()
+            || self.file_scan_options.is_some()
+            || self.row_ranges.is_some()
+        {
+            return Err(crate::Error::Unsupported {
+                message: "Partition fallback only supports ordinary batch split selection".into(),
+            });
+        }
+        let (current, backup) = futures::try_join!(
+            self.table.resolve_read_snapshot(),
+            other.resolve_read_snapshot()
+        )?;
+        let snapshot_id = current.as_ref().map(Snapshot::id);
+        if self.limit == Some(0) {
+            return Ok(Plan::from_splits(snapshot_id, Vec::new()));
+        }
+
+        let mut splits = Vec::new();
+        let mut remaining = self.limit.filter(|_| self.can_push_down_limit_hint(None));
+        let mut owned = HashSet::new();
+        if let Some(snapshot) = current {
+            let mut main_stats = ScanStats::default();
+            splits = self
+                .plan_snapshot_from_lists(
+                    &snapshot,
+                    ManifestListSource::Snapshot(&snapshot),
+                    None,
+                    None,
+                    &mut main_stats,
+                )
+                .await?
+                .into_splits();
+            stats.accumulate_planning(&main_stats);
+            if let Some(limit) = &mut remaining {
+                for rows in splits.iter().filter_map(DataSplit::merged_row_count) {
+                    *limit =
+                        limit.saturating_sub(usize::try_from(rows.max(0)).unwrap_or(usize::MAX));
+                }
+            }
+            if backup.is_some() && remaining != Some(0) {
+                // File pruning and LIMIT cannot transfer ownership of a partition.
+                let listing = PaimonTableScan::new(
+                    &self.table,
+                    self.partition_filter.clone(),
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                );
+                let mut listing_stats = ScanStats::default();
+                let entries = listing
+                    .read_filtered_manifest_entries(
+                        ManifestListSource::Snapshot(&snapshot),
+                        None,
+                        &mut listing_stats,
+                    )
+                    .await?;
+                owned.extend(entries.into_iter().map(|e| e.partition().to_vec()));
+                stats.accumulate_planning(&listing_stats);
+            }
+        }
+        if let Some(snapshot) = backup.filter(|_| remaining != Some(0)) {
+            let mut scan = self.clone();
+            scan.table = ScanTable::Owned(Arc::new(other));
+            scan.limit = remaining;
+            let mut backup_stats = ScanStats::default();
+            let plan = scan
+                .plan_snapshot_from_lists(
+                    &snapshot,
+                    ManifestListSource::Snapshot(&snapshot),
+                    None,
+                    (!owned.is_empty()).then_some(&owned),
+                    &mut backup_stats,
+                )
+                .await?;
+            stats.accumulate_planning(&backup_stats);
+            splits.extend(
+                plan.into_splits()
+                    .into_iter()
+                    .map(|split| split.with_fallback(true)),
+            );
+        }
+        self.finish_plan(Plan::from_splits(snapshot_id, splits))
+            .await
     }
 
     /// Keep pruning off masked columns and apply limits after row filtering.
@@ -2722,6 +2846,7 @@ impl<'a> PaimonTableScan<'a> {
             end_snapshot,
             ManifestListSource::IncrementalLists(manifest_lists),
             data_evolution_read_field_ids.as_ref(),
+            None,
             scan_stats,
         )
         .await
@@ -2764,6 +2889,7 @@ impl<'a> PaimonTableScan<'a> {
             snapshot,
             ManifestListSource::IncrementalList(manifest_list_name),
             data_evolution_read_field_ids,
+            None,
             scan_stats,
         )
         .await
@@ -2890,6 +3016,7 @@ impl<'a> PaimonTableScan<'a> {
             &snapshot,
             ManifestListSource::Snapshot(&snapshot),
             data_evolution_read_field_ids,
+            None,
             scan_stats,
         )
         .await
@@ -2900,6 +3027,7 @@ impl<'a> PaimonTableScan<'a> {
         snapshot: &Snapshot,
         source: ManifestListSource<'_>,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
+        excluded_partitions: Option<&HashSet<Vec<u8>>>,
         scan_stats: &mut ScanStats,
     ) -> crate::Result<Plan> {
         scan_stats.limit = self.limit;
@@ -2934,9 +3062,13 @@ impl<'a> PaimonTableScan<'a> {
         } else {
             None
         };
-        let entries = self
+        let mut entries = self
             .read_filtered_manifest_entries(source, row_range_index.as_ref(), scan_stats)
             .await?;
+        // Remove shadowed backup entries before split packing spends the LIMIT hint.
+        if let Some(excluded) = excluded_partitions {
+            entries.retain(|entry| !excluded.contains(entry.partition()));
+        }
         let effective_row_ranges = self
             .effective_row_ranges(
                 snapshot,

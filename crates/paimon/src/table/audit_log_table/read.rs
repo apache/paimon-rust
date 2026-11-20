@@ -96,7 +96,12 @@ impl<'a> AuditLogRead<'a> {
             ));
         }
 
-        let physical_stream = if has_primary_keys {
+        let physical_stream = if data_splits.iter().any(DataSplit::is_fallback) {
+            // Keep audit projection below and use the batch reader's source routing.
+            let mut read = self.read.clone();
+            read.read_type = read_type;
+            read.execute_splits(data_splits, 1, true, false)?
+        } else if has_primary_keys {
             let core_options = self.read.table.schema().core_options();
             let merge_engine = core_options.merge_engine()?;
             let (raw_splits, merge_splits): (Vec<_>, Vec<_>) = data_splits

@@ -124,6 +124,7 @@ fn normalize_filter(table: &Table, filter: Predicate) -> NormalizedFilter {
 pub struct ReadBuilder<'a> {
     kind: ReadBuilderKind<'a>,
     resources: Option<ResourceContext>,
+    partition_fallback: Option<Arc<super::partition_fallback::PartitionFallback>>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,7 +143,23 @@ impl<'a> ReadBuilder<'a> {
         Self {
             kind,
             resources: None,
+            partition_fallback: None,
         }
+    }
+
+    /// For this batch read, fill partitions absent from the current branch using
+    /// the table's `scan.fallback-branch` option. A missing branch, blank option
+    /// or reference to the current branch leaves the ordinary scan in place.
+    /// Both branches must be partitioned filesystem append tables with matching
+    /// fields and partition keys. Use the same builder for planning and reading.
+    /// Streaming, incremental, and physical all-files scans stay branch-local.
+    pub fn with_partition_fallback(&mut self) -> Result<&mut Self> {
+        let table = match &self.kind {
+            ReadBuilderKind::Paimon(builder) => builder.table,
+            ReadBuilderKind::Format(builder) => builder.table(),
+        };
+        self.partition_fallback = super::partition_fallback::PartitionFallback::configured(table)?;
+        Ok(self)
     }
 
     /// Share Parquet working-memory reservations across reads.
@@ -335,7 +352,9 @@ impl<'a> ReadBuilder<'a> {
     /// Create a table scan. Call [TableScan::plan] to get splits.
     pub fn new_scan(&self) -> TableScan<'a> {
         match &self.kind {
-            ReadBuilderKind::Paimon(builder) => builder.new_scan(),
+            ReadBuilderKind::Paimon(builder) => builder
+                .new_scan()
+                .with_partition_fallback(self.partition_fallback.clone()),
             ReadBuilderKind::Format(builder) => builder.new_scan(),
         }
     }
@@ -379,6 +398,7 @@ impl<'a> ReadBuilder<'a> {
             ReadBuilderKind::Paimon(builder) => builder.new_read(),
             ReadBuilderKind::Format(builder) => builder.new_read(),
         }?;
+        let read = read.with_partition_fallback(self.partition_fallback.clone());
         Ok(match &self.resources {
             Some(resources) => read.with_resources(resources.clone()),
             None => read,
