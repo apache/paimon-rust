@@ -1375,7 +1375,7 @@ fn ranked_row_ids(result: &ScoredRowIds) -> Vec<(u64, f32)> {
         best_scores
             .entry(row_id)
             .and_modify(|old: &mut f32| {
-                if score > *old {
+                if score.total_cmp(old).is_gt() {
                     *old = score;
                 }
             })
@@ -1385,8 +1385,7 @@ fn ranked_row_ids(result: &ScoredRowIds) -> Vec<(u64, f32)> {
     let mut ranked: Vec<_> = best_scores.into_iter().collect();
     ranked.sort_by(|(left_id, left_score), (right_id, right_score)| {
         right_score
-            .partial_cmp(left_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(left_score)
             .then_with(|| left_id.cmp(right_id))
     });
     ranked
@@ -1407,8 +1406,7 @@ fn top_k(scores: HashMap<u64, f32>, limit: usize) -> ScoredRowIds {
     let mut entries: Vec<_> = scores.into_iter().collect();
     entries.sort_by(|(left_id, left_score), (right_id, right_score)| {
         right_score
-            .partial_cmp(left_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(left_score)
             .then_with(|| left_id.cmp(right_id))
     });
     entries.truncate(limit);
@@ -1440,6 +1438,18 @@ mod tests {
         );
 
         assert_eq!(ranked.row_ids, vec![2]);
+    }
+
+    #[test]
+    fn rank_based_fusion_preserves_vector_top_k_score_order() {
+        let route = route_result(vec![1, 2, 3], vec![-0.0, 0.0, 0.0], 1.0);
+        let expected = route.result.top_k(1).row_ids;
+        assert_eq!(expected, vec![2]);
+
+        for ranker in [HybridSearchRanker::Rrf, HybridSearchRanker::Mrr] {
+            let ranked = rank_results(ranker, std::slice::from_ref(&route), 1);
+            assert_eq!(ranked.row_ids, expected);
+        }
     }
 
     #[test]
