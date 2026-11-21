@@ -612,7 +612,7 @@ fn reject_unsafe_nested_update_overwrite_on_equal(
             continue;
         }
         // Sequence / PK columns never run nested_update under AggregateMergeFunction.
-        if sequence_fields.iter().any(|name| *name == field_name)
+        if sequence_fields.contains(&field_name)
             || primary_keys.iter().any(|name| name == field_name)
         {
             continue;
