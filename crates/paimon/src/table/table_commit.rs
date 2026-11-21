@@ -7666,6 +7666,13 @@ mod tests {
                 max.get_double(0).unwrap().to_bits(),
             )
         };
+        for v in [-0.0f64, 0.0, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(bounds(&[v]), (v.to_bits(), v.to_bits()));
+        }
+        assert_eq!(
+            bounds(&[0.0, -0.0]),
+            ((-0.0f64).to_bits(), 0.0f64.to_bits())
+        );
         let expected = ((-0.0f64).to_bits(), f64::NAN.to_bits());
         for values in [
             [0.0, -0.0, f64::NAN, 1.0],

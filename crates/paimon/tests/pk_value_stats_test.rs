@@ -121,3 +121,119 @@ async fn nested_leaf_nulls_do_not_prune_non_null_parent_columns() {
         );
     }
 }
+
+#[tokio::test]
+async fn floating_file_bounds_follow_java_order() {
+    use arrow_array::{Float32Array, Float64Array};
+    use paimon::spec::{BinaryRow, DoubleType, FloatType};
+    for (values, low, high) in [
+        (vec![0.0], 0.0, 0.0),
+        (vec![-0.0], -0.0, -0.0),
+        (vec![0.0, -0.0], -0.0, 0.0),
+        (vec![-0.0, 0.0], -0.0, 0.0),
+        (vec![5.0, f64::NAN], 5.0, f64::NAN),
+        (vec![f64::NAN, 5.0], 5.0, f64::NAN),
+        (vec![-f64::NAN, 5.0], 5.0, f64::NAN),
+        (
+            vec![f64::NEG_INFINITY, f64::INFINITY, f64::NAN],
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ),
+    ] {
+        let path = "memory:/pk_value_stats/floating";
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("k", DataType::Double(DoubleType::new()))
+            .column("f", DataType::Float(FloatType::new()))
+            .primary_key(["k", "id"])
+            .option("bucket", "1")
+            .option("metadata.stats-mode", "full")
+            .build()
+            .unwrap();
+        let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+        setup_dirs(&io, path).await;
+        persist_table_schema(&io, path, table.schema()).await;
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        for (id, &v) in values.iter().enumerate() {
+            let batch = RecordBatch::try_from_iter([
+                (
+                    "id",
+                    Arc::new(Int32Array::from(vec![id as i32])) as ArrayRef,
+                ),
+                ("k", Arc::new(Float64Array::from(vec![v]))),
+                ("f", Arc::new(Float32Array::from(vec![v as f32]))),
+            ])
+            .unwrap();
+            writer.write_arrow_batch(&batch).await.unwrap();
+        }
+        let msgs = writer.prepare_commit().await.unwrap();
+        builder.new_commit().commit(msgs).await.unwrap();
+        let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+        let files = plan.splits()[0].data_files();
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        let bytes = io
+            .new_input(&format!("{path}/bucket-0/{}", file.file_name))
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let mut physical =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+                .unwrap()
+                .build()
+                .unwrap();
+        let batch = physical.next().unwrap().unwrap();
+        let keys = batch
+            .column_by_name("k")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for (key_stats, value_stats, key, expected, row) in [
+            (
+                file.key_stats.min_values(),
+                file.value_stats.min_values(),
+                &file.min_key,
+                low,
+                0,
+            ),
+            (
+                file.key_stats.max_values(),
+                file.value_stats.max_values(),
+                &file.max_key,
+                high,
+                batch.num_rows() - 1,
+            ),
+        ] {
+            let ks = BinaryRow::from_serialized_bytes(key_stats).unwrap();
+            let vs = BinaryRow::from_serialized_bytes(value_stats).unwrap();
+            for actual in [
+                ks.get_double(0).unwrap(),
+                vs.get_double(1).unwrap(),
+                f64::from(vs.get_float(2).unwrap()),
+            ] {
+                if expected.is_nan() {
+                    assert!(actual.is_nan());
+                } else {
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+            }
+            // The composite endpoints refer to the physical run, even when its Arrow
+            // ordering of a negative NaN differs from scalar Java statistics order.
+            let endpoint = BinaryRow::from_serialized_bytes(key).unwrap();
+            assert_eq!(
+                endpoint.get_double(0).unwrap().to_bits(),
+                keys.value(row).to_bits()
+            );
+            assert_eq!(endpoint.get_int(1).unwrap(), ids.value(row));
+        }
+    }
+}

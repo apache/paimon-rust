@@ -2651,16 +2651,15 @@ fn eval_row_negated(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
 /// `+Inf` and `-0.0` is below `0.0`.
 pub(crate) fn java_cmp(lhs: &Datum, rhs: &Datum) -> Option<Ordering> {
     match (lhs, rhs) {
-        (Datum::Float(a), Datum::Float(b)) => {
-            let canonical = |v: f32| if v.is_nan() { f32::NAN } else { v };
-            Some(canonical(*a).total_cmp(&canonical(*b)))
-        }
-        (Datum::Double(a), Datum::Double(b)) => {
-            let canonical = |v: f64| if v.is_nan() { f64::NAN } else { v };
-            Some(canonical(*a).total_cmp(&canonical(*b)))
-        }
+        (Datum::Float(a), Datum::Float(b)) => Some(java_floating_cmp((*a).into(), (*b).into())),
+        (Datum::Double(a), Datum::Double(b)) => Some(java_floating_cmp(*a, *b)),
         _ => datum_cmp(lhs, rhs),
     }
+}
+
+pub(super) fn java_floating_cmp(a: f64, b: f64) -> Ordering {
+    let canonical = |v: f64| if v.is_nan() { f64::NAN } else { v };
+    canonical(a).total_cmp(&canonical(b))
 }
 
 fn java_eq(lhs: &Datum, rhs: &Datum) -> bool {

@@ -27,7 +27,7 @@ use crate::arrow::shredding::map::MapShreddingReadPlan;
 use crate::arrow::shredding::ShreddingReadPlan;
 use crate::arrow::{ReadBudget, RowFilter, RowFilterContext};
 use crate::io::{FileRead, OutputFile};
-use crate::spec::stats::BinaryTableStats;
+use crate::spec::stats::{BinaryTableStats, ColumnStats};
 use crate::spec::{
     is_row_tracking_column, BinaryRowBuilder, CoreOptions, DataField, DataType, Datum,
     MetadataStatsMode, Predicate, PredicateOperator,
@@ -289,6 +289,9 @@ pub(crate) struct ParquetFormatWriter {
     schema: arrow_schema::SchemaRef,
     write_fields: Option<Vec<DataField>>,
     stats_modes: Option<Vec<MetadataStatsMode>>,
+    // Parquet footer bounds can exclude NaNs and normalize signed zeros.
+    // Stats field index -> (physical batch column index, aggregate over input rows).
+    floating_stats: HashMap<usize, (usize, ColumnStats)>,
     stats_dense_store: bool,
     max_row_group_bytes: Option<usize>,
 }
@@ -412,12 +415,34 @@ impl ParquetFormatWriter {
         let stats_modes = stats_fields
             .map(|fields| core_options.metadata_stats_modes(fields.iter().map(DataField::name)))
             .transpose()?;
+        let mut floating_stats = HashMap::new();
+        if let (Some(fields), Some(modes)) = (stats_fields, &stats_modes) {
+            for (pos, (field, mode)) in fields.iter().zip(modes).enumerate() {
+                if !matches!(
+                    mode,
+                    MetadataStatsMode::Full | MetadataStatsMode::Truncate(_)
+                ) {
+                    continue;
+                }
+                let Ok(index) = input_schema.index_of(field.name()) else {
+                    continue;
+                };
+                if matches!(
+                    (field.data_type(), input_schema.field(index).data_type()),
+                    (DataType::Float(_), arrow_schema::DataType::Float32)
+                        | (DataType::Double(_), arrow_schema::DataType::Float64)
+                ) {
+                    floating_stats.insert(pos, (index, ColumnStats::default()));
+                }
+            }
+        }
         Ok(Self {
             inner,
             input_schema,
             schema,
             write_fields: stats_fields.map(|fields| fields.to_vec()),
             stats_modes,
+            floating_stats,
             stats_dense_store: core_options.metadata_stats_dense_store(),
             max_row_group_bytes,
         })
@@ -758,6 +783,11 @@ impl FormatFileWriter for ParquetFormatWriter {
                 source: None,
             });
         }
+        if let Some(fields) = &self.write_fields {
+            for (&pos, (index, stats)) in &mut self.floating_stats {
+                stats.collect(batch, *index, fields[pos].data_type())?;
+            }
+        }
         let physical_batch;
         let batch = if self.input_schema.as_ref() == self.schema.as_ref() {
             batch
@@ -858,8 +888,13 @@ impl FormatFileWriter for ParquetFormatWriter {
             })?;
         let file_size = self.inner.bytes_written() as u64;
         if let (Some(write_fields), Some(stats_modes)) = (&self.write_fields, &self.stats_modes) {
-            let (value_stats, value_stats_cols) =
-                extract_value_stats(&metadata, write_fields, stats_modes, self.stats_dense_store);
+            let (value_stats, value_stats_cols) = extract_value_stats(
+                &metadata,
+                write_fields,
+                stats_modes,
+                self.stats_dense_store,
+                &self.floating_stats,
+            );
             Ok(FormatWriteResult::with_value_stats(
                 file_size,
                 value_stats,
@@ -2264,6 +2299,7 @@ fn extract_value_stats(
     write_fields: &[DataField],
     stats_modes: &[MetadataStatsMode],
     stats_dense_store: bool,
+    floating_stats: &HashMap<usize, (usize, ColumnStats)>,
 ) -> (BinaryTableStats, Option<Vec<String>>) {
     debug_assert_eq!(write_fields.len(), stats_modes.len());
     let row_groups = metadata.row_groups();
@@ -2282,7 +2318,9 @@ fn extract_value_stats(
             .get(field_idx)
             .copied()
             .unwrap_or(MetadataStatsMode::None);
-        let column_stats = if mode == MetadataStatsMode::None {
+        let column_stats = if let Some((_, stats)) = floating_stats.get(&field_idx) {
+            Some((stats.min.clone(), stats.max.clone(), Some(stats.null_count)))
+        } else if mode == MetadataStatsMode::None {
             None
         } else {
             column_indices
@@ -2338,7 +2376,7 @@ fn extract_column_value_stats(
     let collect_min_max = matches!(
         mode,
         MetadataStatsMode::Full | MetadataStatsMode::Truncate(_)
-    ) && supports_manifest_min_max(data_type);
+    ) && supports_footer_min_max(data_type);
     let mut min_datum: Option<Datum> = None;
     let mut max_datum: Option<Datum> = None;
     let mut min_complete = true;
@@ -2420,7 +2458,7 @@ fn extract_column_value_stats(
     }
 }
 
-fn supports_manifest_min_max(data_type: &DataType) -> bool {
+fn supports_footer_min_max(data_type: &DataType) -> bool {
     matches!(
         data_type,
         DataType::Boolean(_)
@@ -2433,8 +2471,6 @@ fn supports_manifest_min_max(data_type: &DataType) -> bool {
             | DataType::Binary(_)
             | DataType::VarBinary(_)
             | DataType::Decimal(_)
-            | DataType::Double(_)
-            | DataType::Float(_)
             | DataType::Date(_)
             | DataType::Time(_)
             | DataType::LocalZonedTimestamp(_)
@@ -4247,6 +4283,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn floating_value_bounds_span_row_groups_and_respect_column_modes() {
+        use crate::spec::{BinaryRow, DoubleType};
+        use arrow_array::Float64Array;
+        let ty = DataType::Double(DoubleType::new());
+        let fields = ["omitted", "bounded", "counted"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| DataField::new(i as i32, (*name).to_string(), ty.clone()))
+            .collect::<Vec<_>>();
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let options = std::collections::HashMap::from([
+            ("metadata.stats-mode".into(), "none".into()),
+            ("fields.bounded.stats-mode".into(), "truncate(16)".into()),
+            ("fields.counted.stats-mode".into(), "counts".into()),
+        ]);
+        let output = io.new_output("memory:/floating.parquet").unwrap();
+        let mut writer =
+            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1, Some(&fields), &options)
+                .await
+                .unwrap();
+        for values in [
+            vec![None, None],
+            vec![Some(-f64::NAN), None],
+            vec![Some(0.0), Some(-0.0)],
+        ] {
+            let col: arrow_array::ArrayRef = Arc::new(Float64Array::from(values));
+            writer
+                .write(
+                    &RecordBatch::try_new(schema.clone(), vec![col.clone(), col.clone(), col])
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+        }
+        let result = Box::new(writer).close().await.unwrap().value_stats.unwrap();
+        assert_eq!(result.columns.unwrap(), ["bounded", "counted"]);
+        assert_eq!(result.stats.null_counts(), &[Some(3), Some(3)]);
+        let lo = BinaryRow::from_serialized_bytes(result.stats.min_values()).unwrap();
+        let hi = BinaryRow::from_serialized_bytes(result.stats.max_values()).unwrap();
+        assert_eq!(lo.get_double(0).unwrap().to_bits(), (-0.0f64).to_bits());
+        assert!(hi.get_double(0).unwrap().is_nan());
+        assert!(lo.is_null_at(1) && hi.is_null_at(1));
+    }
+
+    #[tokio::test]
     async fn parquet_read_paths_preserve_fork_safety_error() {
         let fields = vec![DataField::new(
             0,
@@ -4740,6 +4823,7 @@ mod tests {
                 schema,
                 write_fields: None,
                 stats_modes: None,
+                floating_stats: HashMap::new(),
                 stats_dense_store: false,
                 max_row_group_bytes: None,
             }),

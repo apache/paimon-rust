@@ -152,75 +152,88 @@ impl Display for BinaryTableStats {
 /// Incremental full column statistics without retaining the input batches.
 pub(crate) struct ColumnStatsCollector<'a> {
     types: &'a [DataType],
-    min_datums: Vec<Option<Datum>>,
-    max_datums: Vec<Option<Datum>>,
-    null_counts: Vec<Option<i64>>,
+    columns: Vec<ColumnStats>,
 }
 
-impl<'a> ColumnStatsCollector<'a> {
-    pub(crate) fn new(types: &'a [DataType]) -> Self {
-        Self {
-            types,
-            min_datums: vec![None; types.len()],
-            max_datums: vec![None; types.len()],
-            null_counts: vec![Some(0); types.len()],
-        }
-    }
+#[derive(Default, Clone)]
+pub(crate) struct ColumnStats {
+    pub(crate) min: Option<Datum>,
+    pub(crate) max: Option<Datum>,
+    pub(crate) null_count: i64,
+}
 
-    pub(crate) fn collect(&mut self, batch: &RecordBatch, indices: &[usize]) -> crate::Result<()> {
-        for (pos, (&col_idx, data_type)) in indices.iter().zip(self.types.iter()).enumerate() {
-            if data_type.is_geospatial() {
-                *self.null_counts[pos].as_mut().unwrap() +=
-                    batch.column(col_idx).null_count() as i64;
-                continue;
+impl ColumnStats {
+    pub(crate) fn collect(
+        &mut self,
+        batch: &RecordBatch,
+        index: usize,
+        ty: &DataType,
+    ) -> crate::Result<()> {
+        let column = batch.column(index);
+        self.null_count += column.null_count() as i64;
+        if ty.is_geospatial() {
+            return Ok(());
+        }
+        match bound_rows(column.as_ref(), ty) {
+            Some(Some((min, max))) => {
+                self.update(extract_datum_from_arrow(batch, min, index, ty)?);
+                self.update(extract_datum_from_arrow(batch, max, index, ty)?);
             }
-            match bound_rows(batch.column(col_idx).as_ref(), data_type) {
-                Some(bounds) => {
-                    *self.null_counts[pos].as_mut().unwrap() +=
-                        batch.column(col_idx).null_count() as i64;
-                    if let Some((min_row, max_row)) = bounds {
-                        let min = extract_datum_from_arrow(batch, min_row, col_idx, data_type)?;
-                        let max = extract_datum_from_arrow(batch, max_row, col_idx, data_type)?;
-                        self.update(pos, min);
-                        self.update(pos, max);
-                    }
-                }
-                None => {
-                    for row_idx in 0..batch.num_rows() {
-                        let datum = extract_datum_from_arrow(batch, row_idx, col_idx, data_type)?;
-                        self.update(pos, datum);
-                    }
+            Some(None) => {}
+            None => {
+                for row in 0..batch.num_rows() {
+                    self.update(extract_datum_from_arrow(batch, row, index, ty)?);
                 }
             }
         }
         Ok(())
     }
 
-    fn update(&mut self, pos: usize, datum: Option<Datum>) {
-        match datum {
-            Some(d) => {
-                if self.min_datums[pos].as_ref().is_none_or(|m| d < *m) {
-                    self.min_datums[pos] = Some(d.clone());
-                }
-                if self.max_datums[pos].as_ref().is_none_or(|m| d > *m) {
-                    self.max_datums[pos] = Some(d);
-                }
-            }
-            None => {
-                *self.null_counts[pos].as_mut().unwrap() += 1;
-            }
+    fn update(&mut self, value: Option<Datum>) {
+        let Some(value) = value else {
+            return;
+        };
+        if self
+            .min
+            .as_ref()
+            .is_none_or(|m| super::java_cmp(&value, m).is_some_and(|o| o.is_lt()))
+        {
+            self.min = Some(value.clone());
         }
+        if self
+            .max
+            .as_ref()
+            .is_none_or(|m| super::java_cmp(&value, m).is_some_and(|o| o.is_gt()))
+        {
+            self.max = Some(value);
+        }
+    }
+}
+
+impl<'a> ColumnStatsCollector<'a> {
+    pub(crate) fn new(types: &'a [DataType]) -> Self {
+        Self {
+            types,
+            columns: vec![ColumnStats::default(); types.len()],
+        }
+    }
+
+    pub(crate) fn collect(&mut self, batch: &RecordBatch, indices: &[usize]) -> crate::Result<()> {
+        for ((column, &idx), ty) in self.columns.iter_mut().zip(indices).zip(self.types) {
+            column.collect(batch, idx, ty)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn finish(&self) -> BinaryTableStats {
         let mut min_builder = BinaryRowBuilder::new(self.types.len() as i32);
         let mut max_builder = BinaryRowBuilder::new(self.types.len() as i32);
         for (pos, data_type) in self.types.iter().enumerate() {
-            match &self.min_datums[pos] {
+            match &self.columns[pos].min {
                 Some(d) => min_builder.write_datum(pos, d, data_type),
                 None => min_builder.set_null_at(pos),
             }
-            match &self.max_datums[pos] {
+            match &self.columns[pos].max {
                 Some(d) => max_builder.write_datum(pos, d, data_type),
                 None => max_builder.set_null_at(pos),
             }
@@ -229,7 +242,7 @@ impl<'a> ColumnStatsCollector<'a> {
         BinaryTableStats::new(
             min_builder.build_serialized(),
             max_builder.build_serialized(),
-            self.null_counts.clone(),
+            self.columns.iter().map(|c| Some(c.null_count)).collect(),
         )
     }
 }
@@ -242,6 +255,22 @@ fn bound_rows(col: &dyn Array, data_type: &DataType) -> Option<Option<(usize, us
         Date32Type, Int16Type, Int32Type, Int64Type, Int8Type, Time32MillisecondType,
     };
     match data_type {
+        DataType::Float(_) => col
+            .as_any()
+            .downcast_ref::<arrow_array::Float32Array>()
+            .map(|array| {
+                arg_bounds_by(array.iter(), |a, b| {
+                    super::predicate::java_floating_cmp(f64::from(a), f64::from(b)).is_lt()
+                })
+            }),
+        DataType::Double(_) => col
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .map(|array| {
+                arg_bounds_by(array.iter(), |a, b| {
+                    super::predicate::java_floating_cmp(a, b).is_lt()
+                })
+            }),
         DataType::TinyInt(_) => primitive_bound_rows::<Int8Type>(col),
         DataType::SmallInt(_) => primitive_bound_rows::<Int16Type>(col),
         DataType::Int(_) => primitive_bound_rows::<Int32Type>(col),
@@ -274,16 +303,23 @@ where
 
 /// First row of the minimum and of the maximum, skipping nulls.
 fn arg_bounds<V: Ord + Copy>(values: impl Iterator<Item = Option<V>>) -> Option<(usize, usize)> {
+    arg_bounds_by(values, |a, b| a < b)
+}
+
+fn arg_bounds_by<V: Copy>(
+    values: impl Iterator<Item = Option<V>>,
+    less: impl Fn(V, V) -> bool,
+) -> Option<(usize, usize)> {
     let mut bounds: Option<((usize, V), (usize, V))> = None;
     for (row, value) in values.enumerate() {
         let Some(value) = value else { continue };
         match &mut bounds {
             None => bounds = Some(((row, value), (row, value))),
             Some((min, max)) => {
-                if value < min.1 {
+                if less(value, min.1) {
                     *min = (row, value);
                 }
-                if value > max.1 {
+                if less(max.1, value) {
                     *max = (row, value);
                 }
             }
