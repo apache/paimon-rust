@@ -3635,6 +3635,50 @@ async fn test_or_reuses_one_btree_reader_for_same_file() {
 }
 
 #[tokio::test]
+async fn test_or_batches_btree_equalities_with_unindexed_residuals() {
+    let (io, path, name, _tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
+    let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+    let entries = vec![make_global_index_entry(&name, 1, 0, 99, &meta)];
+    let mut fields = int_schema_fields();
+    fields.push(DataField::new(
+        2,
+        "residual".into(),
+        fields[0].data_type().clone(),
+    ));
+    let mut scanner =
+        GlobalIndexScanner::create(&io, &path, 4, i64::MAX, i64::MAX, &entries, &fields)
+            .unwrap()
+            .unwrap();
+    let probe = Arc::new(QueryIoProbe::default());
+    scanner.query_io_probe = Some(Arc::clone(&probe));
+    let predicate = Predicate::or(
+        [10, 20, 30, 40, 20]
+            .map(|value| Predicate::and(vec![int_eq("id", 0, value), int_eq("residual", 1, value)]))
+            .to_vec(),
+    );
+
+    let result = scanner.evaluate(&predicate).await.unwrap().unwrap();
+    assert_eq!(
+        result.row_ranges,
+        [5, 10, 15, 20].map(|row| RowRange::new(row, row)).to_vec()
+    );
+    assert_eq!(result.indexed_coverage, vec![RowRange::new(0, 99)]);
+    assert_eq!(result.evaluated_field_ids, HashSet::from([1]));
+    assert!(!result.fully_evaluated);
+    assert!(result.candidate_ranges.is_empty());
+    assert_eq!(probe.predicate_queries.load(TestOrdering::SeqCst), 1);
+    assert!(
+        !scanner
+            .matching_ranges_with_exactness(&predicate)
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
+        "unindexed conjuncts must stay in the residual filter"
+    );
+}
+
+#[tokio::test]
 async fn test_wide_or_fallback_creates_only_bounded_child_futures() {
     let (io, path, name, _tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
     let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
