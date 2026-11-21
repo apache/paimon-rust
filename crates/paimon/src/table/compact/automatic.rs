@@ -20,8 +20,8 @@ use std::future::Future;
 
 use futures::stream::{FuturesUnordered, StreamExt};
 
-use super::{prepare_results, CompactExecutor, CompactPlan, PreparedCompact};
-use crate::table::{Table, TableCommit};
+use super::{prepare_results, CompactExecutor, CompactPlan, OverwriteL0Files, PreparedCompact};
+use crate::table::{CommitMessage, Table, TableCommit};
 use crate::{Error, Result};
 #[cfg(test)]
 mod metadata_tests;
@@ -31,7 +31,8 @@ pub(in crate::table) async fn execute_auto_plan(
     plan: &CompactPlan,
     executor: &CompactExecutor,
     parallelism: usize,
-) -> Result<PreparedCompact> {
+    overwrite_l0: Option<&OverwriteL0Files>,
+) -> Result<(PreparedCompact, Vec<CommitMessage>)> {
     // Total-bucket metadata can change, but tasks writing one physical bucket
     // still run in order. Append/DE may produce several tasks for that bucket.
     let mut buckets = BTreeMap::<_, Vec<_>>::new();
@@ -46,21 +47,33 @@ pub(in crate::table) async fn execute_auto_plan(
         None => None,
     };
     let (results, error) = run_buckets(buckets.into_values(), parallelism, |task| {
-        executor.execute_captured(task, inputs.as_ref().expect("nonempty task plan"))
+        executor.execute_captured(
+            task,
+            inputs.as_ref().expect("nonempty task plan"),
+            overwrite_l0,
+        )
     })
     .await;
     let prepared = match error {
         Some(error) => Err(error),
         None => prepare_results(table, &results),
     };
-    if prepared.is_err() {
-        // All started tasks have finished. Clean every successful output by
-        // its own task, regardless of completion order. No publication began.
-        let _ = TableCommit::new(table.clone(), "auto-compact-cleanup".into())
-            .abort_compact(&results)
-            .await;
+    match prepared {
+        Ok(prepared) => Ok((
+            prepared,
+            results
+                .iter()
+                .map(super::CompactResult::abort_message)
+                .collect(),
+        )),
+        Err(error) => {
+            // All started tasks have finished and no publication began.
+            let _ = TableCommit::new(table.clone(), "auto-compact-cleanup".into())
+                .abort_compact(&results)
+                .await;
+            Err(error)
+        }
     }
-    prepared
 }
 
 async fn run_buckets<T, R, F, Fut>(

@@ -215,6 +215,19 @@ pub struct CompactPlanner {
 }
 
 pub(super) type CompactBuckets = HashSet<(Vec<u8>, i32, i32)>;
+pub(super) type OverwriteL0Files = HashSet<(Vec<u8>, i32, String)>;
+
+pub(super) fn within_overwrite_l0_scope(
+    overwrite_l0: Option<&OverwriteL0Files>,
+    partition: &[u8],
+    bucket: i32,
+    file: &DataFileMeta,
+) -> bool {
+    file.level != 0
+        || overwrite_l0.is_none_or(|files| {
+            files.contains(&(partition.to_vec(), bucket, file.file_name.clone()))
+        })
+}
 
 enum CompactPlannerKind {
     Append(append::AppendCompactPlanner),
@@ -326,6 +339,13 @@ impl CompactPlanner {
 
     /// Capture a snapshot without writing data or publishing metadata.
     pub async fn plan(&self) -> Result<CompactPlan> {
+        self.plan_with_overwrite_l0(None).await
+    }
+
+    pub(super) async fn plan_with_overwrite_l0(
+        &self,
+        overwrite_l0: Option<&OverwriteL0Files>,
+    ) -> Result<CompactPlan> {
         ensure_supported(&self.table)?;
         let mut reader = self.table.new_read_builder();
         if let Some(filter) = &self.partition_filter {
@@ -390,7 +410,9 @@ impl CompactPlanner {
         };
         let tasks = match &self.kind {
             CompactPlannerKind::Append(planner) => planner.plan_tasks(&source, &context)?,
-            CompactPlannerKind::PrimaryKey(planner) => planner.plan_tasks(&source, &context)?,
+            CompactPlannerKind::PrimaryKey(planner) => {
+                planner.plan_tasks(&source, &context, overwrite_l0)?
+            }
             CompactPlannerKind::DataEvolution(planner) => {
                 planner
                     .plan_tasks(&self.table, &scan, &context, self.buckets.as_ref())
@@ -511,7 +533,7 @@ impl CompactExecutor {
 
     pub async fn execute(&self, task: &CompactTask) -> Result<CompactResult> {
         let inputs = self.capture_inputs(task).await?;
-        self.execute_captured(task, &inputs).await
+        self.execute_captured(task, &inputs, None).await
     }
 
     async fn capture_inputs(&self, task: &CompactTask) -> Result<CompactInputs> {
@@ -558,6 +580,7 @@ impl CompactExecutor {
         &self,
         task: &CompactTask,
         inputs: &CompactInputs,
+        overwrite_l0: Option<&OverwriteL0Files>,
     ) -> Result<CompactResult> {
         task.validate_target(&self.table)?;
         let snapshot = &inputs.snapshot;
@@ -571,7 +594,8 @@ impl CompactExecutor {
             .get(&key)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        task.validate_inputs(&self.table, active).await?;
+        task.validate_inputs(&self.table, active, overwrite_l0)
+            .await?;
         // validate_target proved the complete schema and branch are identical.
         // Preserve already resolved catalog schemas in the shared manager;
         // rebuilding it here would require REST-only schemas to exist on disk.
@@ -794,7 +818,12 @@ impl CompactTask {
         }
     }
 
-    async fn validate_inputs(&self, table: &Table, active: &[ManifestEntry]) -> Result<()> {
+    async fn validate_inputs(
+        &self,
+        table: &Table,
+        active: &[ManifestEntry],
+        overwrite_l0: Option<&OverwriteL0Files>,
+    ) -> Result<()> {
         if self.is_data_evolution() {
             data_evolution::validate_inputs(
                 table,
@@ -811,6 +840,12 @@ impl CompactTask {
                 entry.partition() == self.partition
                     && entry.bucket() == self.bucket
                     && entry.total_buckets() == self.total_buckets
+                    && within_overwrite_l0_scope(
+                        overwrite_l0,
+                        entry.partition(),
+                        entry.bucket(),
+                        entry.file(),
+                    )
             })
             .map(|entry| (entry.file().file_name.as_str(), entry))
             .collect::<HashMap<_, _>>();
@@ -903,11 +938,11 @@ impl CompactTask {
 }
 
 /// Validate published PK file changes without depending on executor task metadata.
-pub(super) fn validate_primary_key_changes(
+pub(super) fn validate_primary_key_changes<'a>(
     schema: &TableSchema,
     changes: &[ManifestEntry],
     changelog: &[ManifestEntry],
-    captured: &[ManifestEntry],
+    captured: impl IntoIterator<Item = &'a ManifestEntry>,
 ) -> Result<()> {
     fn group(entry: &ManifestEntry) -> (&[u8], i32, i32) {
         (entry.partition(), entry.bucket(), entry.total_buckets())

@@ -19,7 +19,7 @@
 //!
 //! Reference:[org.apache.paimon.utils.SnapshotManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java).
 use crate::catalog::DEFAULT_MAIN_BRANCH;
-use crate::io::FileIO;
+use crate::io::{FileIO, InputFile};
 use crate::spec::Snapshot;
 use futures::future::try_join_all;
 use std::str;
@@ -225,8 +225,16 @@ impl SnapshotManager {
 
     /// Get a snapshot by id.
     pub async fn get_snapshot(&self, snapshot_id: i64) -> crate::Result<Snapshot> {
-        let snapshot_path = self.snapshot_path(snapshot_id);
-        let snap_input = self.file_io.new_input(&snapshot_path)?;
+        let input = self.file_io.new_input(&self.snapshot_path(snapshot_id))?;
+        Self::read_snapshot(snapshot_id, input).await
+    }
+
+    pub(super) async fn get_snapshot_uncached(&self, snapshot_id: i64) -> crate::Result<Snapshot> {
+        let input = self.file_io.new_input(&self.snapshot_path(snapshot_id))?;
+        Self::read_snapshot(snapshot_id, input.without_cache()).await
+    }
+
+    async fn read_snapshot(snapshot_id: i64, snap_input: InputFile) -> crate::Result<Snapshot> {
         if !snap_input.exists().await? {
             return Err(crate::Error::SnapshotNotExist { snapshot_id });
         }

@@ -23,14 +23,22 @@ use std::sync::Arc;
 
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use common::incremental_helpers::{
-    make_batch, persist_table_schema, pk_schema, setup_dirs, write_batch,
+    make_batch, make_partitioned_batch, persist_table_schema, pk_schema, setup_dirs, write_batch,
 };
 use futures::TryStreamExt;
 use paimon::catalog::{FileSystemCatalog, Identifier};
-use paimon::spec::CommitKind;
+use paimon::spec::{CommitKind, DataType, IntType, Schema, TableSchema, VarCharType};
 use paimon::table::{CommitCallback, CommitCallbackContext, IncrementalScanMode, Table};
 
 async fn table() -> Table {
+    table_with_schema(pk_schema(&[
+        ("write-only", "false"),
+        ("changelog-producer", "lookup"),
+    ]))
+    .await
+}
+
+async fn table_with_schema(schema: TableSchema) -> Table {
     let path = format!(
         "memory:/write_compact_overwrite_recovery/{}",
         uuid::Uuid::new_v4()
@@ -43,7 +51,7 @@ async fn table() -> Table {
         io.clone(),
         Identifier::new("default", "write_compact_overwrite_recovery"),
         path.clone(),
-        pk_schema(&[("write-only", "false"), ("changelog-producer", "lookup")]),
+        schema,
         None,
     );
     setup_dirs(&io, &path).await;
@@ -69,7 +77,13 @@ impl CommitCallback for FailOverwriteOnce {
 }
 
 async fn files(table: &Table) -> Vec<(String, i32)> {
-    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .unwrap();
     let mut files = plan
         .splits()
         .iter()
@@ -330,4 +344,130 @@ async fn overwrite_recovery_does_not_resurrect_inputs_replaced_by_a_later_overwr
     );
     assert_eq!(files(&table).await, replacement_files);
     assert_eq!(rows(&table).await, vec![(2, 20)]);
+}
+
+#[tokio::test]
+async fn dv_overwrite_recovery_compacts_surviving_partitions() {
+    dv_overwrite_recovery_after_replacement(true).await;
+}
+
+#[tokio::test]
+async fn dv_overwrite_recovery_skips_fully_replaced_inputs() {
+    dv_overwrite_recovery_after_replacement(false).await;
+}
+
+async fn dv_overwrite_recovery_after_replacement(partial: bool) {
+    let schema = Schema::builder()
+        .column("pt", DataType::VarChar(VarCharType::string_type()))
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .primary_key(["pt", "id"])
+        .partition_keys(["pt"])
+        .option("bucket", "1")
+        .option("write-only", "false")
+        .option("deletion-vectors.enabled", "true")
+        .option("deletion-vectors.merge-on-read", "false")
+        .option("changelog-producer", "lookup")
+        .build()
+        .unwrap();
+    let table = table_with_schema(TableSchema::new(0, &schema)).await;
+    let builder = table
+        .new_write_builder()
+        .with_commit_user("partitioned-overwrite-recovery")
+        .unwrap()
+        .with_overwrite();
+    let batch = if partial {
+        make_partitioned_batch(vec!["p", "q"], vec![1, 2], vec![10, 20])
+    } else {
+        make_partitioned_batch(vec!["p"], vec![1], vec![10])
+    };
+    let mut writer = builder.new_write().unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    let mut commit = builder.new_commit();
+    commit
+        .add_commit_callback(Arc::new(FailOverwriteOnce(AtomicBool::new(false))))
+        .unwrap();
+    let error = commit
+        .overwrite_with_identifier(messages.clone(), None, 7)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected overwrite callback failure"),
+        "{error}"
+    );
+    let manager = table.snapshot_manager();
+    let original = manager.get_latest_snapshot().await.unwrap().unwrap();
+    assert_eq!(original.commit_kind(), &CommitKind::OVERWRITE);
+    let original_files = files(&table).await;
+
+    let write_only = table.copy_with_options(HashMap::from([("write-only".into(), "true".into())]));
+    let replacement = write_only.new_write_builder().with_overwrite();
+    let mut writer = replacement.new_write().unwrap();
+    writer
+        .write_arrow_batch(&make_partitioned_batch(vec!["p"], vec![3], vec![30]))
+        .await
+        .unwrap();
+    replacement
+        .new_commit()
+        .overwrite_with_identifier(writer.prepare_commit().await.unwrap(), None, 8)
+        .await
+        .unwrap();
+    if partial {
+        write_batch(
+            &write_only,
+            &make_partitioned_batch(vec!["q"], vec![4], vec![40]),
+        )
+        .await;
+    }
+    let pending: Vec<_> = files(&table)
+        .await
+        .into_iter()
+        .filter(|file| !original_files.contains(file))
+        .collect();
+    assert_eq!(pending.len(), if partial { 2 } else { 1 });
+    let before = manager.get_latest_snapshot().await.unwrap().unwrap();
+    commit
+        .overwrite_with_identifier(messages.clone(), None, 7)
+        .await
+        .unwrap();
+    let recovered = manager.get_latest_snapshot().await.unwrap().unwrap();
+    let active = files(&table).await;
+    for pending in &pending {
+        assert!(active.contains(pending));
+    }
+    commit
+        .overwrite_with_identifier(messages, None, 7)
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.get_latest_snapshot_id().await.unwrap(),
+        Some(recovered.id())
+    );
+
+    let builder = table.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let executor = builder.new_executor().unwrap();
+    let mut results = Vec::new();
+    for task in plan.tasks() {
+        results.push(executor.execute(task).await.unwrap());
+    }
+    builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap();
+    let end = manager.get_latest_snapshot_id().await.unwrap().unwrap();
+    let mut expected_events = vec![("+I".to_string(), 3, 30)];
+    let mut expected_rows = vec![(3, 30)];
+    if partial {
+        expected_events.push(("+I".to_string(), 4, 40));
+        expected_rows = vec![(2, 20), (3, 30), (4, 40)];
+    }
+    assert_eq!(events(&table, original.id(), end).await, expected_events);
+    assert_eq!(rows(&table).await, expected_rows);
+    assert_eq!(recovered.id(), before.id() + i64::from(partial));
 }

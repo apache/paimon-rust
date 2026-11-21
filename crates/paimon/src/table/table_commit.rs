@@ -471,6 +471,8 @@ impl TableCommit {
                     schema_id: prepared.schema_id,
                     read_snapshot: prepared.read_snapshot,
                     planned_snapshot_id: prepared.snapshot_id,
+                    overwrite_l0: None,
+                    private_outputs: None,
                 },
                 None,
                 BATCH_COMMIT_IDENTIFIER,
@@ -1207,6 +1209,13 @@ impl TableCommit {
         let check_append_files = filter_committed;
         let mut filter_committed = filter_committed;
 
+        let private_outputs = match &mut plan {
+            CommitEntriesPlan::Compact {
+                private_outputs, ..
+            } => private_outputs.take(),
+            _ => None,
+        };
+        let mut automatic_outputs_published = false;
         let mut publication_uncertain = false;
         let mut last_publication_error = None;
         let result = async {
@@ -1271,7 +1280,14 @@ impl TableCommit {
                 }
 
                 let result = self
-                    .try_commit_once(resolved, &latest_snapshot, commit_identifier)
+                    .try_commit_once(
+                        resolved,
+                        &latest_snapshot,
+                        commit_identifier,
+                        private_outputs
+                            .as_ref()
+                            .map(|_| &mut automatic_outputs_published),
+                    )
                     .await?;
 
                 match result {
@@ -1310,6 +1326,11 @@ impl TableCommit {
             Ok(outcome)
         }
         .await;
+        if !automatic_outputs_published && !publication_uncertain {
+            if let Some(outputs) = private_outputs {
+                let _ = self.delete_new_files(&outputs).await;
+            }
+        }
         match result {
             Err(error) if publication_uncertain => Err(crate::Error::UnexpectedError {
                 message: "Commit outcome may be unknown; retain prepared files and retry with the same commit identifier".into(),
@@ -1401,6 +1422,7 @@ impl TableCommit {
         mut resolved: ResolvedCommit,
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
+        automatic_outputs_published: Option<&mut bool>,
     ) -> Result<CommitAttemptResult> {
         let mut created_files = Vec::new();
         let prepared = self
@@ -1423,7 +1445,7 @@ impl TableCommit {
         // Once publication starts its outcome may be unknown. These files must
         // remain available even if the response is lost or a later retry fails.
         let base_snapshot_uuid = latest_snapshot.as_ref().and_then(Snapshot::uuid);
-        let publication_error = match self
+        let publication = self
             .snapshot_commit
             .commit(
                 base_snapshot_uuid,
@@ -1431,9 +1453,40 @@ impl TableCommit {
                 self.table.branch(),
                 &statistics,
             )
-            .await
-        {
+            .await;
+        // A file-store rejection may be a replay of a successful conditional
+        // write. Only a different snapshot can prove that cleanup is safe.
+        // REST mutations are not replayed and return a definite rejection.
+        let publication = match publication {
+            Ok(false) if automatic_outputs_published.is_some() && self.table.rest_env.is_none() => {
+                match self
+                    .snapshot_manager
+                    .get_snapshot_uncached(snapshot.id())
+                    .await
+                {
+                    Ok(current)
+                        if current.uuid() != snapshot.uuid()
+                            && current.delta_manifest_list() != snapshot.delta_manifest_list() =>
+                    {
+                        Ok(false)
+                    }
+                    Ok(_) => Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Cannot confirm rejection of automatic compaction snapshot {}",
+                            snapshot.id()
+                        ),
+                        source: None,
+                    }),
+                    Err(error) => Err(error),
+                }
+            }
+            result => result,
+        };
+        let publication_error = match publication {
             Ok(true) => {
+                if let Some(published) = automatic_outputs_published {
+                    *published = true;
+                }
                 if !self.commit_callbacks.is_empty() {
                     self.notify_commit_callbacks(snapshot.clone(), resolved.entries)
                         .await?;
@@ -2061,6 +2114,8 @@ impl TableCommit {
                 schema_id,
                 read_snapshot,
                 planned_snapshot_id,
+                overwrite_l0,
+                ..
             } => {
                 if latest_snapshot
                     .as_ref()
@@ -2126,7 +2181,14 @@ impl TableCommit {
                             self.table.schema(),
                             entries,
                             changelog_entries,
-                            &captured_files,
+                            captured_files.iter().filter(|entry| {
+                                super::compact::within_overwrite_l0_scope(
+                                    overwrite_l0.as_ref(),
+                                    entry.partition(),
+                                    entry.bucket(),
+                                    entry.file(),
+                                )
+                            }),
                         )?;
                     }
                     let deleted_ids = deletes
@@ -2222,7 +2284,8 @@ impl TableCommit {
                     base_data_files.as_deref().unwrap_or_default(),
                     entries,
                 )?;
-                if !self.data_evolution_enabled && self.deletion_vectors_enabled {
+                let dv_snapshots = if !self.data_evolution_enabled && self.deletion_vectors_enabled
+                {
                     let captured =
                         read_snapshot
                             .as_deref()
@@ -2232,15 +2295,19 @@ impl TableCommit {
                                         .into(),
                                 source: None,
                             })?;
+                    let latest = latest_snapshot.as_ref().expect("validated latest snapshot");
                     super::compact::primary_key::deletion_vectors::validate_dependencies(
                         &self.table,
                         captured,
-                        latest_snapshot.as_ref().expect("validated latest snapshot"),
+                        latest,
                         entries,
                         deletion_vector_updates,
                     )
                     .await?;
-                }
+                    Some((captured, latest))
+                } else {
+                    None
+                };
                 let indexes = self
                     .resolve_indexes(
                         latest_snapshot,
@@ -2252,6 +2319,10 @@ impl TableCommit {
                         },
                     )
                     .await?;
+                if let Some((captured, latest)) = dv_snapshots {
+                    self.check_dv_compaction_history(captured, latest, entries)
+                        .await?;
+                }
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
                     changelog_entries: changelog_entries.clone(),
@@ -2698,6 +2769,101 @@ impl TableCommit {
             );
         }
         Ok(Some(entries))
+    }
+
+    async fn check_dv_compaction_history(
+        &self,
+        captured: &Snapshot,
+        latest: &Snapshot,
+        entries: &[ManifestEntry],
+    ) -> Result<()> {
+        if captured.id() == latest.id() || entries.is_empty() {
+            return Ok(());
+        }
+
+        fn bucket_key(partition: &[u8], bucket: i32) -> (&[u8], i32) {
+            let partition = if is_empty_partition(partition) {
+                &[]
+            } else {
+                partition
+            };
+            (partition, bucket)
+        }
+
+        let buckets: HashSet<_> = entries
+            .iter()
+            .map(|entry| bucket_key(entry.partition(), entry.bucket()))
+            .collect();
+        let partition_filter =
+            self.build_entries_partition_filter(&entries.iter().collect::<Vec<_>>())?;
+        let manifest_dir = self.snapshot_manager.manifest_dir();
+        let read_indexes = async |name: Option<&str>| -> Result<_> {
+            let Some(name) = name else {
+                return Ok(HashMap::new());
+            };
+            let indexes = IndexManifest::read(
+                self.snapshot_manager.file_io(),
+                &format!("{manifest_dir}/{name}"),
+            )
+            .await?;
+            Ok(indexes
+                .into_iter()
+                .filter_map(|entry| {
+                    let key = bucket_key(&entry.partition, entry.bucket);
+                    buckets.contains(&key).then(|| {
+                        let identity = (
+                            key.0.to_vec(),
+                            key.1,
+                            entry.kind == FileKind::Add,
+                            entry.index_file.index_type.clone(),
+                            entry.index_file.file_name.clone(),
+                        );
+                        (identity, entry.index_file)
+                    })
+                })
+                .collect::<HashMap<_, _>>())
+        };
+
+        let mut previous = captured.clone();
+        for id in captured.id() + 1..=latest.id() {
+            let snapshot = if id == latest.id() {
+                latest.clone()
+            } else {
+                self.snapshot_manager.get_snapshot(id).await?
+            };
+            if snapshot.commit_user() != self.commit_user
+                && matches!(
+                    snapshot.commit_kind(),
+                    CommitKind::COMPACT | CommitKind::OVERWRITE
+                )
+            {
+                let changes_data = self
+                    .read_delta_entries(partition_filter.as_ref(), &snapshot)
+                    .await?
+                    .iter()
+                    .any(|entry| buckets.contains(&bucket_key(entry.partition(), entry.bucket())));
+                // Index manifests contain the full index state. Compare to the
+                // immediate predecessor to detect both additions and removals.
+                let before = previous.index_manifest();
+                let after = snapshot.index_manifest();
+                if changes_data
+                    || (before != after
+                        && read_indexes(before).await? != read_indexes(after).await?)
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Concurrent PK deletion-vector compaction conflict: {:?} snapshot {id} by '{}' modified the same partition and bucket after snapshot {}; create a new plan",
+                            snapshot.commit_kind(),
+                            snapshot.commit_user(),
+                            captured.id(),
+                        ),
+                        source: None,
+                    });
+                }
+            }
+            previous = snapshot;
+        }
+        Ok(())
     }
 
     async fn detect_commit_conflicts(
@@ -3891,6 +4057,8 @@ enum CommitEntriesPlan {
         schema_id: i64,
         read_snapshot: Option<Box<Snapshot>>,
         planned_snapshot_id: i64,
+        overwrite_l0: Option<super::compact::OverwriteL0Files>,
+        private_outputs: Option<Vec<CommitMessage>>,
     },
     /// Caller-provided entries. May contain `FileKind::Delete` entries from CoW
     /// rewrites, in which case `resolve_commit` auto-promotes to `CommitKind::OVERWRITE`.
