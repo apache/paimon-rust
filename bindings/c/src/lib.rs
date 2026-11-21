@@ -21,6 +21,7 @@
 
 mod audit_read;
 mod blob_reader;
+mod bucket_router;
 mod bucket_vector_search_split;
 mod catalog;
 mod error;
