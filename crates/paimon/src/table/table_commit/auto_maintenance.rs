@@ -349,6 +349,8 @@ impl TableCommit {
                         schema_id: prepared.schema_id,
                         read_snapshot: prepared.read_snapshot,
                         planned_snapshot_id: prepared.snapshot_id,
+                        pk_force_level_zero: prepared.pk_force_level_zero,
+                        pk_expire_now_secs: prepared.pk_expire_now_secs,
                     },
                     None,
                     written.id(),

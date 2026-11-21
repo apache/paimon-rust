@@ -61,6 +61,8 @@ impl AppendCompactPlanner {
                     total_buckets,
                     files,
                     output_level: None,
+                    force_level_zero: true,
+                    expire_now_secs: None,
                     blob_field_id: None,
                     vector_field_ids: None,
                 });

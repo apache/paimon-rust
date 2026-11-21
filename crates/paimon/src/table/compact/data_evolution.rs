@@ -274,6 +274,8 @@ impl DataEvolutionCompactPlanner {
                     total_buckets,
                     files,
                     output_level: None,
+                    force_level_zero: true,
+                    expire_now_secs: None,
                     blob_field_id: None,
                     vector_field_ids: None,
                 });
@@ -287,6 +289,8 @@ impl DataEvolutionCompactPlanner {
                     total_buckets,
                     files,
                     output_level: None,
+                    force_level_zero: true,
+                    expire_now_secs: None,
                     blob_field_id: Some(field_id),
                     vector_field_ids: None,
                 });
@@ -300,6 +304,8 @@ impl DataEvolutionCompactPlanner {
                     total_buckets,
                     files,
                     output_level: None,
+                    force_level_zero: true,
+                    expire_now_secs: None,
                     blob_field_id: None,
                     vector_field_ids: Some(field_ids),
                 });

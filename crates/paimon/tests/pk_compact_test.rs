@@ -41,6 +41,9 @@ mod dynamic_tests;
 #[path = "pk_compact/deletion_vectors.rs"]
 mod deletion_vector_tests;
 
+#[path = "pk_compact/record_level_expire.rs"]
+mod record_level_expire_tests;
+
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use common::incremental_helpers::{
     make_batch, make_batch_with_kinds, make_partitioned_batch, persist_table_schema, pk_schema,
@@ -582,10 +585,20 @@ async fn pk_compaction_refuses_partial_buckets_and_unsupported_layouts() {
         vec![
             ("record-level.expire-time", "1 d"),
             ("record-level.time-field", "value"),
+            ("pk-clustering-override", "true"),
+            ("clustering.columns", "value"),
+        ],
+        vec![("record-level.expire-time", "1 d")],
+        vec![
+            ("record-level.expire-time", "1 d"),
+            ("record-level.time-field", "missing"),
         ],
     ] {
         let table = table(&options).await;
-        assert!(table.new_compact_builder().new_planner().is_err());
+        assert!(
+            table.new_compact_builder().new_planner().is_err(),
+            "{options:?}"
+        );
     }
     let table = table(&[]).await;
     write_batch(&table, &make_batch(vec![1], vec![10])).await;

@@ -141,11 +141,25 @@ fn mergeable_field(schema: &TableSchema, field: &DataField, function: &str) -> b
     }
 }
 
-pub(in crate::table::compact) fn select(
+#[cfg(test)]
+fn select(
     files: Vec<DataFileMeta>,
     properties: &std::collections::HashMap<String, String>,
 ) -> Result<Option<(Vec<DataFileMeta>, i32)>> {
     select_with_force_level_zero(files, properties, true)
+}
+
+/// Same force-L0 policy used by [`super::PrimaryKeyCompactPlanner`].
+pub(in crate::table::compact) fn force_level_zero(
+    schema: &TableSchema,
+    automatic: bool,
+) -> Result<bool> {
+    let options = schema.core_options();
+    Ok(!automatic
+        || options.compaction_force_up_level0()?
+        || options.try_changelog_producer()? == ChangelogProducer::Lookup
+        || options.merge_engine()? == MergeEngine::FirstRow
+        || options.deletion_vectors_enabled())
 }
 
 /// Automatic writes honor Java's normal triggers; explicit compaction can
@@ -227,10 +241,71 @@ pub(in crate::table::compact) fn select_with_force_level_zero(
     Ok(Some((selected, output_level)))
 }
 
+/// Incremental run selection used by execute/commit validation.
+///
+/// Matches planning: prefer UniversalCompaction with the same force-L0 policy,
+/// then fall back to an expire-only max-level rewrite when value stats prove
+/// every record expired at `expire_now_secs` (or the current clock when unset).
+pub(in crate::table::compact) fn select_or_expire(
+    files: Vec<DataFileMeta>,
+    schema: &TableSchema,
+    force_level_zero: bool,
+    expire_now_secs: Option<i64>,
+) -> Result<Option<(Vec<DataFileMeta>, i32)>> {
+    if let Some(selected) =
+        select_with_force_level_zero(files.clone(), schema.options(), force_level_zero)?
+    {
+        return Ok(Some(selected));
+    }
+    let now = expire_now_secs.unwrap_or_else(crate::table::record_level_expire::current_epoch_secs);
+    select_expired_max_level(&files, schema, now)
+}
+
+/// When UniversalCompaction picks nothing, rewrite max-level files whose value
+/// stats prove every record is already past `record-level.expire-time`.
+///
+/// Unknown / incomplete stats never force a rewrite. `now_secs` must match the
+/// value frozen on the compaction task so selection does not drift.
+pub(in crate::table::compact) fn select_expired_max_level(
+    files: &[DataFileMeta],
+    schema: &TableSchema,
+    now_secs: i64,
+) -> Result<Option<(Vec<DataFileMeta>, i32)>> {
+    let Some(expire) = crate::table::record_level_expire::RecordLevelExpire::create(schema)? else {
+        return Ok(None);
+    };
+    let properties = schema.options();
+    let strategy = UniversalCompaction::from_options(properties, "")?;
+    let configured_levels = integer_option(
+        properties,
+        "num-levels",
+        strategy.trigger.saturating_add(1),
+        2,
+    )?;
+    let levels = configured_levels.max(
+        files
+            .iter()
+            .map(|file| file.level.saturating_add(1))
+            .max()
+            .unwrap_or(2),
+    );
+    let max_level = levels - 1;
+    let expired = files
+        .iter()
+        .filter(|file| file.level == max_level && expire.is_expire_file(file, schema, now_secs))
+        .cloned()
+        .collect::<Vec<_>>();
+    if expired.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((expired, max_level)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spec::stats::BinaryTableStats;
+    use crate::spec::{BinaryRowBuilder, IntType, Schema};
     use crate::Error;
     use std::collections::HashMap;
     fn file(name: &str, level: i32, size: i64) -> DataFileMeta {
@@ -257,6 +332,184 @@ mod tests {
             write_cols: None,
             column_max_sequence_numbers: None,
         }
+    }
+
+    fn expire_schema() -> TableSchema {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("ts", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("record-level.expire-time", "1 s")
+            .option("record-level.time-field", "ts")
+            .option("num-levels", "3")
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
+    fn expired_max_level_file(name: &str) -> DataFileMeta {
+        let mut min = BinaryRowBuilder::new(2);
+        min.write_int(0, 1);
+        min.write_int(1, 1);
+        let mut max = BinaryRowBuilder::new(2);
+        max.write_int(0, 1);
+        max.write_int(1, 1);
+        DataFileMeta {
+            file_name: name.into(),
+            file_size: 10,
+            row_count: 1,
+            min_key: vec![],
+            max_key: vec![],
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::new(
+                min.build().to_serialized_bytes(),
+                max.build().to_serialized_bytes(),
+                vec![Some(0), Some(0)],
+            ),
+            min_sequence_number: 0,
+            max_sequence_number: 1,
+            schema_id: 0,
+            level: 2,
+            extra_files: vec![],
+            creation_time: None,
+            delete_row_count: Some(0),
+            embedded_index: None,
+            file_source: Some(0),
+            value_stats_cols: Some(vec!["id".into(), "ts".into()]),
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+            column_max_sequence_numbers: None,
+        }
+    }
+
+    #[test]
+    fn expired_max_level_files_are_rewritten_when_universal_picks_nothing() {
+        let schema = expire_schema();
+        let file = expired_max_level_file("expired.parquet");
+        assert!(select(vec![file.clone()], schema.options())
+            .unwrap()
+            .is_none());
+        let now = crate::table::record_level_expire::current_epoch_secs();
+        let (selected, output_level) =
+            select_expired_max_level(std::slice::from_ref(&file), &schema, now)
+                .unwrap()
+                .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].file_name, "expired.parquet");
+        assert_eq!(output_level, 2);
+        let (selected, output_level) = select_or_expire(vec![file], &schema, true, Some(now))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].file_name, "expired.parquet");
+        assert_eq!(output_level, 2);
+    }
+
+    #[test]
+    fn unknown_stats_do_not_trigger_expire_rewrite() {
+        let schema = expire_schema();
+        let mut file = expired_max_level_file("unknown.parquet");
+        file.value_stats = BinaryTableStats::empty();
+        let now = crate::table::record_level_expire::current_epoch_secs();
+        assert!(select_expired_max_level(&[file], &schema, now)
+            .unwrap()
+            .is_none());
+    }
+
+    fn max_level_file_with_ts(name: &str, ts: i32) -> DataFileMeta {
+        let mut file = expired_max_level_file(name);
+        let mut min = BinaryRowBuilder::new(2);
+        min.write_int(0, 1);
+        min.write_int(1, ts);
+        let mut max = BinaryRowBuilder::new(2);
+        max.write_int(0, 1);
+        max.write_int(1, ts);
+        file.value_stats = BinaryTableStats::new(
+            min.build().to_serialized_bytes(),
+            max.build().to_serialized_bytes(),
+            vec![Some(0), Some(0)],
+        );
+        file.value_stats_cols = Some(vec!["id".into(), "ts".into()]);
+        file
+    }
+
+    #[test]
+    fn automatic_expire_only_ignores_sub_trigger_l0_like_planning() {
+        // Planning with force_level_zero=false skips a lone L0 below the
+        // compaction trigger, then falls back to expire-only max-level rewrite.
+        // Validation must use the same force policy or the task is rejected.
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("ts", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("record-level.expire-time", "1 s")
+            .option("record-level.time-field", "ts")
+            .option("num-levels", "3")
+            .option("num-sorted-run.compaction-trigger", "2")
+            .build()
+            .unwrap();
+        let schema = TableSchema::new(0, &schema);
+        let expired = max_level_file_with_ts("expired.parquet", 1);
+        let l0 = file("new-l0.parquet", 0, 1);
+        let files = vec![l0.clone(), expired.clone()];
+
+        assert!(
+            !force_level_zero(&schema, true).unwrap(),
+            "plain automatic deduplicate must not force L0"
+        );
+        assert!(
+            select_with_force_level_zero(files.clone(), schema.options(), false)
+                .unwrap()
+                .is_none()
+        );
+        let now = crate::table::record_level_expire::current_epoch_secs();
+        let (selected, output_level) = select_or_expire(files.clone(), &schema, false, Some(now))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].file_name, "expired.parquet");
+        assert_eq!(output_level, 2);
+
+        // Legacy force=true validation would prefer L0 and reject expire-only.
+        let forced = select_or_expire(files, &schema, true, Some(now))
+            .unwrap()
+            .unwrap();
+        assert_eq!(forced.0[0].file_name, "new-l0.parquet");
+    }
+
+    #[test]
+    fn expire_selection_stays_stable_when_wall_clock_advances() {
+        let schema = expire_schema();
+        let file_a = max_level_file_with_ts("a.parquet", 1);
+        let file_b = max_level_file_with_ts("b.parquet", 50);
+        let files = vec![file_a.clone(), file_b.clone()];
+
+        let _clock = crate::table::record_level_expire::TestClockGuard::set(20);
+        // now=20, expire=1s → watermark 19; A(min=1) expired, B(min=50) live.
+        let planned_now = crate::table::record_level_expire::current_epoch_secs();
+        let (selected, output_level) = select_expired_max_level(&files, &schema, planned_now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].file_name, "a.parquet");
+        assert_eq!(output_level, 2);
+
+        drop(_clock);
+        let _later = crate::table::record_level_expire::TestClockGuard::set(100);
+        // Wall clock advanced so B is also expired, but the original task must
+        // still validate against the frozen planning instant.
+        let (still, _) = select_or_expire(files.clone(), &schema, true, Some(planned_now))
+            .unwrap()
+            .unwrap();
+        assert_eq!(still.len(), 1);
+        assert_eq!(still[0].file_name, "a.parquet");
+        let (expanded, _) = select_or_expire(files, &schema, true, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(expanded.len(), 2, "current clock would expand selection");
     }
     #[test]
     fn java_force_l0_stops_before_a_large_higher_level_and_outputs_below_it() {
