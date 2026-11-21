@@ -274,7 +274,7 @@ fn build_bounds_from_partition_bytes(
 
 /// Build min/max bounds for a single field from its candidate values.
 ///
-/// A closed interval covers all finite candidates. Include NULL separately if requested.
+/// A closed interval covers all non-NaN candidates. Include NULL separately if requested.
 fn build_field_bounds(
     pb: &PredicateBuilder,
     field_name: &str,
@@ -291,8 +291,7 @@ fn build_field_bounds(
     // Legacy floating bounds may omit NaN; a set containing it cannot be
     // summarized by the interval of its other values.
     if non_null.iter().any(|d| {
-        matches!(d, Datum::Float(v) if !v.is_finite())
-            || matches!(d, Datum::Double(v) if !v.is_finite())
+        matches!(d, Datum::Float(v) if v.is_nan()) || matches!(d, Datum::Double(v) if v.is_nan())
     }) {
         return Some(Predicate::AlwaysTrue);
     }
@@ -446,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn finite_float_partitions_prune_disjoint_manifests() {
+    fn float_partition_sets_prune_disjoint_manifests() {
         use crate::spec::{stats::BinaryTableStats, DoubleType};
         let fields = vec![DataField::new(
             0,
@@ -467,6 +466,11 @@ mod tests {
         );
         for (predicate, expected) in [
             (pb.equal("p", Datum::Double(5.)).unwrap(), false),
+            (pb.equal("p", Datum::Double(f64::INFINITY)).unwrap(), false),
+            (
+                pb.equal("p", Datum::Double(f64::NEG_INFINITY)).unwrap(),
+                false,
+            ),
             (
                 pb.is_in("p", vec![Datum::Double(1.), Datum::Double(5.)])
                     .unwrap(),
@@ -497,6 +501,7 @@ mod tests {
             PartitionFilter::from_partition_set(partitions, &fields).unwrap()
         };
         assert!(!from_values(&[1.0, 5.0]).matches_manifest(&meta, &fields));
+        assert!(from_values(&[f64::NEG_INFINITY, f64::INFINITY]).matches_manifest(&meta, &fields));
         assert!(from_values(&[5.0, f64::NAN]).matches_manifest(&meta, &fields));
     }
 
