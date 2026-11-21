@@ -310,23 +310,6 @@ impl GlobalIndexScanner {
                 meta: parsed_meta,
             };
 
-            #[cfg(test)]
-            let row_range = RowRange::new(global_meta.row_range_start, global_meta.row_range_end);
-            #[cfg(test)]
-            coverage_by_field
-                .entry(global_meta.index_field_id)
-                .or_default()
-                .push(row_range.clone());
-            #[cfg(test)]
-            if let Some(extra_field_ids) = global_meta.extra_field_ids.as_ref() {
-                for extra_field_id in extra_field_ids {
-                    coverage_by_field
-                        .entry(*extra_field_id)
-                        .or_default()
-                        .push(row_range.clone());
-                }
-            }
-
             if kind == GlobalIndexFileKind::BTree
                 && global_meta
                     .extra_field_ids
@@ -337,6 +320,14 @@ impl GlobalIndexScanner {
                 ids.extend(global_meta.extra_field_ids.as_ref().unwrap());
                 composite_entries.entry(ids).or_default().push(resolved);
             } else {
+                #[cfg(test)]
+                coverage_by_field
+                    .entry(global_meta.index_field_id)
+                    .or_default()
+                    .push(RowRange::new(
+                        global_meta.row_range_start,
+                        global_meta.row_range_end,
+                    ));
                 entries_by_field
                     .entry(global_meta.index_field_id)
                     .or_default()
