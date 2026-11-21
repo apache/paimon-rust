@@ -404,7 +404,7 @@ fn validate_batch_schema(
     Ok(())
 }
 
-unsafe fn import_record_batch(
+pub(crate) unsafe fn import_record_batch(
     array: *mut c_void,
     schema: *mut c_void,
 ) -> Result<RecordBatch, *mut paimon_error> {
@@ -647,6 +647,31 @@ pub unsafe extern "C" fn paimon_table_write_write_arrow_batch(
     array: *mut c_void,
     schema: *mut c_void,
 ) -> *mut paimon_error {
+    write_arrow_batch(tw, array, schema, None)
+}
+
+/// Write a batch whose rows all belong to the supplied bucket and a single partition.
+/// The caller is responsible for routing the rows to the correct bucket.
+/// Ownership of `array` and `schema` is transferred once Arrow import starts.
+///
+/// # Safety
+/// `tw` must be a live writer. `array` and `schema` must point to valid Arrow C Data structures.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_write_write_arrow_batch_with_bucket(
+    tw: *mut paimon_table_write,
+    array: *mut c_void,
+    schema: *mut c_void,
+    bucket: i32,
+) -> *mut paimon_error {
+    write_arrow_batch(tw, array, schema, Some(bucket))
+}
+
+unsafe fn write_arrow_batch(
+    tw: *mut paimon_table_write,
+    array: *mut c_void,
+    schema: *mut c_void,
+    bucket: Option<i32>,
+) -> *mut paimon_error {
     if let Err(error) = check_non_null(tw, "tw") {
         return error;
     }
@@ -655,7 +680,11 @@ pub unsafe extern "C" fn paimon_table_write_write_arrow_batch(
         Ok(batch) => batch,
         Err(error) => return error,
     };
-    match runtime().block_on(table_write.write.write_arrow_batch(&batch)) {
+    match runtime().block_on(
+        table_write
+            .write
+            .write_arrow(std::slice::from_ref(&batch), bucket),
+    ) {
         Ok(()) => ptr::null_mut(),
         Err(error) => paimon_error::from_paimon(error),
     }
@@ -1636,6 +1665,12 @@ const _: unsafe extern "C" fn(
     *mut c_void,
     *mut c_void,
 ) -> *mut paimon_error = paimon_table_write_write_arrow_batch;
+const _: unsafe extern "C" fn(
+    *mut paimon_table_write,
+    *mut c_void,
+    *mut c_void,
+    i32,
+) -> *mut paimon_error = paimon_table_write_write_arrow_batch_with_bucket;
 const _: unsafe extern "C" fn(
     *mut paimon_postpone_fixed_bucket_table_write,
     *mut c_void,

@@ -2060,6 +2060,69 @@ fn test_write_commit_read_roundtrip() {
 }
 
 #[test]
+fn route_and_write_with_precomputed_bucket() {
+    use crate::bucket_router::*;
+
+    let schema = TableSchema::new(
+        0,
+        &Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "100")
+            .build()
+            .unwrap(),
+    );
+    let json = CString::new(serde_json::to_string(&schema).unwrap()).unwrap();
+    let path = "memory:/routed_write";
+    let io = memory_file_io();
+    setup_table_dirs(&io, path);
+    let table = Table::new(io, Identifier::new("db", "test"), path.into(), schema, None);
+    let batch = make_batch(vec![5], vec!["a"]);
+    unsafe {
+        let router = paimon_bucket_router_new_from_schema_json(json.as_ptr());
+        assert!(router.error.is_null());
+        let (mut array, mut schema) = export_batch_to_ffi(batch.project(&[0]).unwrap());
+        let mut bucket = -1;
+        assert!(paimon_bucket_router_route_arrow(
+            router.router,
+            (&mut **array as *mut FFI_ArrowArray).cast(),
+            (&mut **schema as *mut FFI_ArrowSchema).cast(),
+            &mut bucket,
+            1
+        )
+        .is_null());
+        assert_eq!(bucket, 96);
+        paimon_bucket_router_free(router.router);
+
+        let handle = wrap_table(table);
+        let builder = paimon_table_new_write_builder(handle);
+        assert!(builder.error.is_null());
+        let writer = paimon_write_builder_new_write(builder.write_builder);
+        assert!(writer.error.is_null());
+        let (mut array, mut schema) = export_batch_to_ffi(batch);
+        assert!(paimon_table_write_write_arrow_batch_with_bucket(
+            writer.write,
+            (&mut **array as *mut FFI_ArrowArray).cast(),
+            (&mut **schema as *mut FFI_ArrowSchema).cast(),
+            bucket
+        )
+        .is_null());
+        let prepared = paimon_table_write_prepare_commit(writer.write);
+        assert!(prepared.error.is_null());
+        let commit = paimon_write_builder_new_commit(builder.write_builder);
+        assert!(commit.error.is_null());
+        assert!(paimon_table_commit_commit(commit.commit, prepared.messages).is_null());
+        assert_eq!(read_rows_ffi(handle), vec![(5, "a".into())]);
+        paimon_commit_messages_free(prepared.messages);
+        paimon_table_commit_free(commit.commit);
+        paimon_table_write_free(writer.write);
+        paimon_write_builder_free(builder.write_builder);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
 fn test_write_arrow_batch_moves_ffi_structs() {
     let path = "memory:/test_write_arrow_batch_moves_ffi_structs";
     let file_io = memory_file_io();

@@ -223,3 +223,9 @@ pub struct paimon_result_postpone_fixed_bucket_prepare_commit {
     pub messages: *mut paimon_postpone_fixed_bucket_commit_messages,
     pub error: *mut paimon_error,
 }
+
+#[repr(C)]
+pub struct paimon_result_bucket_router {
+    pub router: *mut paimon_bucket_router,
+    pub error: *mut paimon_error,
+}
