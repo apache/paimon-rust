@@ -317,7 +317,6 @@ impl DataFileWriter {
             .new_file_name(&self.data_file_prefix, &self.file_format);
         let location = self.paths.new_path(&file_name)?;
         let bucket_dir = location.parent();
-        self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
 
         let file_path = location.path.clone();
         self.created_paths.push(file_path.clone());
