@@ -64,7 +64,7 @@ impl PostponeRetractValidator {
             }
             MergeEngine::Aggregation => {
                 AggregationConfig::new(&config.table_options)
-                    .validate_runtime_mode(true, &config.table_name)?;
+                    .validate_runtime_mode(&config.primary_keys, &config.table_name)?;
                 let sequences = options
                     .sequence_fields()
                     .iter()

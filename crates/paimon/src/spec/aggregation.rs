@@ -102,6 +102,7 @@ impl<'a> AggregationConfig<'a> {
         };
         if mode.is_some() {
             self.validate_field_scoped_options(fields, primary_keys)?;
+            reject_unsafe_nested_update_overwrite_on_equal(self.options, primary_keys)?;
         }
         Ok(mode)
     }
@@ -109,11 +110,16 @@ impl<'a> AggregationConfig<'a> {
     /// Validate options at read/write runtime.
     pub(crate) fn validate_runtime_mode(
         &self,
-        has_primary_keys: bool,
+        primary_keys: &[String],
         table_name: &str,
     ) -> crate::Result<Option<AggregationMode>> {
-        match self.validated_mode(has_primary_keys) {
-            Ok(mode) => Ok(mode),
+        match self.validated_mode(!primary_keys.is_empty()) {
+            Ok(mode) => {
+                if mode.is_some() {
+                    reject_unsafe_nested_update_overwrite_on_equal(self.options, primary_keys)?;
+                }
+                Ok(mode)
+            }
             Err(unsupported_options) => Err(crate::Error::Unsupported {
                 message: format!(
                     "Table '{table_name}' uses merge-engine=aggregation options not supported by this build: {}",
@@ -304,11 +310,12 @@ fn parse_field_scoped_option_key(key: &str) -> Option<(&str, FieldScopedOptionKi
 /// `SchemaManager.applyRenameColumnsToOptions` (Java's case-2 list; the
 /// aggregation/partial-update engines do not accept every entry at create
 /// time, but the keys can still arrive in Java-written metadata).
-const FIELD_SCOPED_RENAMEABLE_SUFFIXES: [&str; 7] = [
+const FIELD_SCOPED_RENAMEABLE_SUFFIXES: [&str; 8] = [
     AGG_FUNCTION_SUFFIX,
     IGNORE_RETRACT_SUFFIX,
     DISTINCT_SUFFIX,
     LIST_AGG_DELIMITER_SUFFIX,
+    NESTED_SEQUENCE_OVERWRITE_ON_EQUAL_SUFFIX,
     MAP_STORAGE_LAYOUT_SUFFIX,
     MAP_SHARED_SHREDDING_MAX_COLUMNS_SUFFIX,
     MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY_SUFFIX,
@@ -570,11 +577,85 @@ fn is_fields_option_with_suffix(key: &str, suffix: &str) -> bool {
     key.starts_with(FIELDS_PREFIX) && key.ends_with(suffix)
 }
 
+/// Reject nested_update equal-sequence retention under global `sequence.field`.
+///
+/// Aggregation with `sequence.field` stably keeps input order for equal
+/// sequences, so flush/commit grouping can change which equal nested ROW is
+/// retained when overwrite-on-equal is false. Refuse the combination instead
+/// of silently accepting grouping-dependent results.
+///
+/// Field resolution mirrors `AggregateMergeFunction`: sequence fields force
+/// `last_value`, primary keys skip aggregators, per-field aggregate-function
+/// overrides the table default.
+fn reject_unsafe_nested_update_overwrite_on_equal(
+    options: &HashMap<String, String>,
+    primary_keys: &[String],
+) -> crate::Result<()> {
+    let sequence_fields = CoreOptions::new(options).sequence_fields();
+    if sequence_fields.is_empty() {
+        return Ok(());
+    }
+
+    let default_is_nested_update = options
+        .get(FIELDS_DEFAULT_AGG_FUNCTION_OPTION)
+        .is_some_and(|value| canonical_aggregator_name(value) == "nested_update");
+
+    for (key, value) in options {
+        let Some(field_name) = key
+            .strip_prefix(FIELDS_PREFIX)
+            .and_then(|rest| rest.strip_suffix(NESTED_SEQUENCE_OVERWRITE_ON_EQUAL_SUFFIX))
+        else {
+            continue;
+        };
+        if field_name.is_empty() || !value.eq_ignore_ascii_case("false") {
+            continue;
+        }
+        // Sequence / PK columns never run nested_update under AggregateMergeFunction.
+        if sequence_fields.iter().any(|name| *name == field_name)
+            || primary_keys.iter().any(|name| name == field_name)
+        {
+            continue;
+        }
+
+        let agg_key = format!("{FIELDS_PREFIX}{field_name}{AGG_FUNCTION_SUFFIX}");
+        let uses_nested_update = match options.get(&agg_key).map(String::as_str) {
+            Some(name) => canonical_aggregator_name(name) == "nested_update",
+            None => default_is_nested_update,
+        };
+        if !uses_nested_update {
+            continue;
+        }
+
+        return Err(crate::Error::ConfigInvalid {
+            message: format!(
+                "Option 'fields.{field_name}.nested-sequence-overwrite-on-equal=false' is not \
+                 supported for nested_update fields when 'sequence.field' is configured, \
+                 because equal-sequence retention can depend on flush/commit grouping under \
+                 sequence-ordered aggregation."
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{IntType, VarCharType};
+    use crate::spec::{ArrayType, IntType, RowType, VarCharType};
     use crate::table::aggregator::new_aggregator;
+
+    fn nested_items_fields() -> Vec<DataField> {
+        let mut fields = sample_fields();
+        fields.push(DataField::new(
+            6,
+            "items".into(),
+            DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                DataField::new(7, "item_id".into(), DataType::Int(IntType::new())),
+                DataField::new(8, "qty".into(), DataType::Int(IntType::new())),
+            ])))),
+        ));
+        fields
+    }
 
     fn aggregation_options(extra: &[(&str, &str)]) -> HashMap<String, String> {
         let mut options = HashMap::from([(
@@ -651,7 +732,7 @@ mod tests {
                     "{key}={value}"
                 );
                 assert_eq!(
-                    config.validate_runtime_mode(true, "default.t").unwrap(),
+                    config.validate_runtime_mode(&pk(), "default.t").unwrap(),
                     Some(AggregationMode::Basic),
                     "{key}={value}"
                 );
@@ -706,7 +787,9 @@ mod tests {
     fn test_validate_runtime_mode_rejects_unsupported_options() {
         let options = aggregation_options(&[("fields.price.sequence-group", "true")]);
         let config = AggregationConfig::new(&options);
-        let err = config.validate_runtime_mode(true, "default.t").unwrap_err();
+        let err = config
+            .validate_runtime_mode(&pk(), "default.t")
+            .unwrap_err();
 
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("fields.price.sequence-group")),
@@ -1021,6 +1104,7 @@ mod tests {
             ("fields.a.ignore-retract", "true"),
             ("fields.a.distinct", "true"),
             ("fields.a.list-agg-delimiter", ";"),
+            ("fields.a.nested-sequence-overwrite-on-equal", "false"),
             ("fields.a.map.storage-layout", "shared-shredding"),
             ("fields.a.map.shared-shredding.max-columns", "64"),
             (
@@ -1041,6 +1125,7 @@ mod tests {
             ("ignore-retract", "true"),
             ("distinct", "true"),
             ("list-agg-delimiter", ";"),
+            ("nested-sequence-overwrite-on-equal", "false"),
             ("map.storage-layout", "shared-shredding"),
             ("map.shared-shredding.max-columns", "64"),
             ("map.shared-shredding.column-placement-policy", "even"),
@@ -1062,6 +1147,145 @@ mod tests {
                 .get("fields.ab.aggregate-function")
                 .map(String::as_str),
             Some("max")
+        );
+    }
+
+    #[test]
+    fn test_remove_field_scoped_options_clears_overwrite_on_equal() {
+        let mut options: HashMap<String, String> = [
+            ("fields.items.nested-sequence-overwrite-on-equal", "false"),
+            ("fields.other.nested-sequence-overwrite-on-equal", "true"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+
+        remove_field_scoped_options(&mut options, "items");
+
+        assert!(!options.contains_key("fields.items.nested-sequence-overwrite-on-equal"));
+        assert_eq!(
+            options
+                .get("fields.other.nested-sequence-overwrite-on-equal")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn test_rejects_nested_update_overwrite_on_equal_false_with_sequence_field() {
+        let options = aggregation_options(&[
+            ("sequence.field", "price"),
+            ("fields.items.aggregate-function", "nested_update"),
+            ("fields.items.nested-key", "item_id"),
+            ("fields.items.nested-sequence-field", "item_id"),
+            ("fields.items.nested-sequence-overwrite-on-equal", "false"),
+        ]);
+        let config = AggregationConfig::new(&options);
+        let err = config
+            .validate_create_mode(&pk(), &nested_items_fields())
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("nested-sequence-overwrite-on-equal=false")
+                    && message.contains("sequence.field")),
+            "expected unsafe nested_update overwrite rejection, got {err:?}"
+        );
+
+        let runtime_err = config
+            .validate_runtime_mode(&pk(), "default.t")
+            .unwrap_err();
+        assert!(
+            matches!(runtime_err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("nested-sequence-overwrite-on-equal=false")
+                    && message.contains("sequence.field")),
+            "runtime validation must reject the same combination, got {runtime_err:?}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_default_nested_update_overwrite_on_equal_false_with_sequence_field() {
+        let options = aggregation_options(&[
+            ("sequence.field", "price"),
+            ("fields.default-aggregate-function", "nested_update"),
+            ("fields.items.nested-sequence-overwrite-on-equal", "false"),
+        ]);
+        let err = AggregationConfig::new(&options)
+            .validate_create_mode(&pk(), &nested_items_fields())
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("fields.items.nested-sequence-overwrite-on-equal=false")
+                    && message.contains("sequence.field")),
+            "default nested_update must also reject overwrite-on-equal=false, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_accepts_nested_update_overwrite_on_equal_true_or_default_with_sequence_field() {
+        for overwrite in [None, Some("true")] {
+            let mut extra = vec![
+                ("sequence.field", "price"),
+                ("fields.items.aggregate-function", "nested_update"),
+                ("fields.items.nested-key", "item_id"),
+                ("fields.items.nested-sequence-field", "item_id"),
+            ];
+            if let Some(value) = overwrite {
+                extra.push(("fields.items.nested-sequence-overwrite-on-equal", value));
+            }
+            let options = aggregation_options(&extra);
+            assert_eq!(
+                AggregationConfig::new(&options)
+                    .validate_create_mode(&pk(), &nested_items_fields())
+                    .unwrap(),
+                Some(AggregationMode::Basic),
+                "overwrite={overwrite:?}"
+            );
+            assert_eq!(
+                AggregationConfig::new(&options)
+                    .validate_runtime_mode(&pk(), "default.t")
+                    .unwrap(),
+                Some(AggregationMode::Basic),
+                "overwrite={overwrite:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_accepts_non_nested_update_overwrite_on_equal_false_with_sequence_field() {
+        let options = aggregation_options(&[
+            ("sequence.field", "price"),
+            ("fields.payload.aggregate-function", "last_non_null_value"),
+            ("fields.payload.nested-sequence-overwrite-on-equal", "false"),
+        ]);
+        assert_eq!(
+            AggregationConfig::new(&options)
+                .validate_create_mode(&pk(), &sample_fields())
+                .unwrap(),
+            Some(AggregationMode::Basic)
+        );
+    }
+
+    #[test]
+    fn test_skips_overwrite_on_equal_false_on_pk_or_sequence_fields() {
+        // AggregateMergeFunction forces sequence fields to last_value and skips
+        // primary keys, so overwrite-on-equal=false there is not nested_update.
+        let options = aggregation_options(&[
+            ("sequence.field", "price"),
+            ("fields.default-aggregate-function", "nested_update"),
+            ("fields.id.nested-sequence-overwrite-on-equal", "false"),
+            ("fields.price.nested-sequence-overwrite-on-equal", "false"),
+        ]);
+        assert_eq!(
+            AggregationConfig::new(&options)
+                .validate_create_mode(&pk(), &nested_items_fields())
+                .unwrap(),
+            Some(AggregationMode::Basic)
+        );
+        assert_eq!(
+            AggregationConfig::new(&options)
+                .validate_runtime_mode(&pk(), "default.t")
+                .unwrap(),
+            Some(AggregationMode::Basic)
         );
     }
 

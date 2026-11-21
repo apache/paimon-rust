@@ -6915,6 +6915,102 @@ mod tests {
     }
 
     #[test]
+    fn test_rename_column_rewrites_nested_sequence_overwrite_on_equal() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("items", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("fields.items.aggregate-function", "sum")
+                .option("fields.items.nested-sequence-overwrite-on-equal", "false")
+                .build()
+                .unwrap(),
+        );
+
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::rename_column(
+                "items".to_string(),
+                "lines".to_string(),
+            )])
+            .unwrap();
+
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.lines.nested-sequence-overwrite-on-equal")
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.lines.aggregate-function")
+                .map(String::as_str),
+            Some("sum")
+        );
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.items.nested-sequence-overwrite-on-equal"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_drop_and_readd_column_clears_nested_sequence_overwrite_on_equal() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("items", DataType::Int(IntType::new()))
+                .column("keep", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("fields.items.aggregate-function", "sum")
+                .option("fields.items.nested-sequence-overwrite-on-equal", "false")
+                .option("fields.keep.aggregate-function", "sum")
+                .build()
+                .unwrap(),
+        );
+
+        let after_drop = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "items".to_string(),
+            )])
+            .unwrap();
+        assert_eq!(
+            after_drop
+                .options()
+                .get("fields.items.nested-sequence-overwrite-on-equal"),
+            None
+        );
+        assert_eq!(
+            after_drop
+                .options()
+                .get("fields.keep.aggregate-function")
+                .map(String::as_str),
+            Some("sum")
+        );
+
+        let after_readd = after_drop
+            .apply_changes(vec![crate::spec::SchemaChange::add_column(
+                "items".to_string(),
+                DataType::Int(IntType::new()),
+            )])
+            .unwrap();
+        assert_eq!(
+            after_readd
+                .options()
+                .get("fields.items.nested-sequence-overwrite-on-equal"),
+            None,
+            "re-adding the column must not revive the dropped field-scoped option"
+        );
+        assert!(after_readd.fields().iter().any(|f| f.name() == "items"));
+    }
+
+    #[test]
     fn test_schema_builder_column_row_type() {
         let row_type = RowType::new(vec![DataField::new(
             0,

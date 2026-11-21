@@ -1174,7 +1174,7 @@ impl AggregateMergeFunction {
         sequence_fields: &[String],
     ) -> crate::Result<Self> {
         let config = AggregationConfig::new(table_options);
-        config.validate_runtime_mode(true, table_name)?;
+        config.validate_runtime_mode(primary_keys, table_name)?;
 
         let pk_set: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
         let seq_set: HashSet<&str> = sequence_fields.iter().map(String::as_str).collect();
@@ -5094,6 +5094,45 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, Error::Unsupported { message } if message.contains("sequence-group"))
+        );
+    }
+
+    #[test]
+    fn test_aggregate_merge_function_rejects_nested_update_overwrite_on_equal_false_with_sequence_field(
+    ) {
+        use crate::spec::{ArrayType, RowType};
+        let fields = vec![
+            DataField::new(0, "pk".into(), PaimonDataType::Int(IntType::new())),
+            DataField::new(1, "version".into(), PaimonDataType::Int(IntType::new())),
+            DataField::new(
+                2,
+                "items".into(),
+                PaimonDataType::Array(ArrayType::new(PaimonDataType::Row(RowType::new(vec![
+                    DataField::new(3, "item_id".into(), PaimonDataType::Int(IntType::new())),
+                    DataField::new(4, "amount".into(), PaimonDataType::Int(IntType::new())),
+                ])))),
+            ),
+        ];
+        let options = agg_options(&[
+            ("sequence.field", "version"),
+            ("fields.items.aggregate-function", "nested_update"),
+            ("fields.items.nested-key", "item_id"),
+            ("fields.items.nested-sequence-field", "item_id"),
+            ("fields.items.nested-sequence-overwrite-on-equal", "false"),
+        ]);
+        let err = AggregateMergeFunction::new(
+            &options,
+            "test_table",
+            &fields,
+            &["pk".to_string()],
+            &["version".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::ConfigInvalid { ref message }
+                if message.contains("nested-sequence-overwrite-on-equal=false")
+                    && message.contains("sequence.field")),
+            "AggregateMergeFunction::new must reject the unsafe combination, got {err:?}"
         );
     }
 }
