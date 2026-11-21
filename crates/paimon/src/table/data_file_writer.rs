@@ -573,7 +573,9 @@ impl DataFileWriter {
         while self.in_flight_closes.join_next().await.is_some() {}
         for path in self.created_paths.drain(..) {
             if self.delete_file_upon_abort {
-                let _ = self.file_io.delete_file(&path).await;
+                if let Err(error) = self.file_io.delete_file(&path).await {
+                    log::warn!("Failed to discard uncommitted file '{path}': {error}");
+                }
             }
         }
         self.written_files.clear();
@@ -585,7 +587,9 @@ impl DataFileWriter {
         }
         for file in files {
             for path in file.collect_files(self.bucket_dir()) {
-                let _ = self.file_io.delete_file(&path).await;
+                if let Err(error) = self.file_io.delete_file(&path).await {
+                    log::warn!("Failed to discard uncommitted file '{path}': {error}");
+                }
             }
         }
     }

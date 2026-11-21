@@ -58,7 +58,7 @@ async fn validate_write_target(
         Ident::with_quote('"', identifier.database()),
         Ident::with_quote('"', identifier.object()),
     ]);
-    SQLContext::ensure_partition_command_target(&name, operation)?;
+    SQLContext::ensure_main_branch_base_table(&name, operation)?;
     if let Some(sql_ctx) = sql_ctx {
         sql_ctx.ensure_no_time_travel_for_write(operation)?;
         sql_ctx

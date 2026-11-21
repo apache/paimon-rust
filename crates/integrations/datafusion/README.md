@@ -149,4 +149,21 @@ let view = ctx.sql("SELECT * FROM analytics_view").await?;
 let function = ctx.sql("SELECT plus_one(score) FROM scores").await?;
 ```
 
+## Persistent CREATE TABLE AS SELECT
+
+Use `CREATE TABLE AS SELECT` to materialize a query as a native Paimon table.
+The query determines the destination schema. In this example, `scores` resolves
+in the session's current catalog and database.
+
+```sql
+CREATE TABLE paimon.reporting.results
+WITH ('bucket' = '-1')
+AS SELECT id, score FROM scores WHERE score > 10;
+```
+
+`IF NOT EXISTS` skips an existing target. If population fails after creation,
+the destination remains in the catalog. For supported types, concurrent DDL,
+cancellation and recovery after a commit error, see the
+[SQL reference](../../../docs/src/sql.md#create-table-as-select).
+
 See the [documentation](https://paimon.apache.org/docs/rust/datafusion/) for getting started guide and more details.

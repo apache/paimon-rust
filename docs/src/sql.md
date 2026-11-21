@@ -43,7 +43,7 @@ SQL support has two layers:
 - DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
 - Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, `CREATE FUNCTION`, and `DROP FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `MSCK REPAIR TABLE`, `ANALYZE TABLE`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`. `MERGE INTO` uses DataFusion's native planner and the Paimon table provider for execution.
 
-Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. Persistent `CREATE FUNCTION` is supported only for the REST Catalog SQL scalar form documented below. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
+Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, and `CREATE OR REPLACE TABLE ... AS SELECT` are rejected or not implemented. Persistent `CREATE FUNCTION` is supported only for the REST Catalog SQL scalar form documented below. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
 
 For the exact delegated SQL grammar, see the [DataFusion SQL Reference](https://datafusion.apache.org/user-guide/sql/index.html).
 
@@ -913,7 +913,62 @@ mixed-case or uppercase field when normalization is enabled.
 Unsupported syntax (will return an error):
 - `CREATE EXTERNAL TABLE`
 - `LOCATION`
-- `CREATE TABLE AS SELECT`
+
+### CREATE TABLE AS SELECT
+
+Use a read-only query to create and populate a persistent Paimon table of the
+default type (`'type' = 'table'`).
+
+```sql
+CREATE TABLE paimon.my_db.query_result
+PARTITIONED BY (region)
+WITH ('bucket' = '-1')
+AS SELECT id, region FROM source WHERE id > 10;
+```
+
+Column names, types and nullability come from the analyzed query, even when it
+returns zero rows. Use aliases and casts to choose output names and types.
+Geospatial outputs preserve their geometry or geography type, CRS and edge algorithm.
+Table options, comments and partition keys use the same validation as
+`CREATE TABLE`. Place `PARTITIONED BY` before `AS` and list unqualified output
+column names. Quote a name containing a dot, as in `PARTITIONED BY ("event.day")`.
+CTAS rejects explicit column declarations and `OR REPLACE`. The read-only
+requirement also applies inside CTEs and set operations. Use one table-options
+clause (`WITH`, `TBLPROPERTIES` or `OPTIONS`); multiple clauses and unsupported
+modifiers such as `AUTO_INCREMENT` are rejected.
+
+Paimon stores `TIME` values with millisecond precision. CTAS accepts Arrow
+second and millisecond time outputs, but rejects microsecond and nanosecond time
+outputs before creating a table, including nested and dictionary-encoded outputs.
+This also applies to empty results. DataFusion's `CAST(... AS TIME)` produces a
+nanosecond time type. Cast it to `VARCHAR` to retain finer precision as text.
+
+Unqualified source tables and REST catalog SQL functions resolve in the
+**current session catalog and database**, even for a destination in another
+namespace. The same query plan supplies the schema and the rows. Source and
+destination names follow the session's identifier normalization setting.
+Quoted names retain their spelling. Use `VERSION AS OF` with a snapshot ID or
+tag, or `TIMESTAMP AS OF` with a timestamp, to select a source version.
+Tables in a join can read different snapshots.
+
+`IF NOT EXISTS` on an existing target skips source planning and execution, even
+when that target uses an external table engine. Authorization and transport errors
+are propagated. If another client creates the target first, CTAS returns a
+table-already-exists error. With `IF NOT EXISTS` it succeeds without writing.
+The filesystem catalog requires storage that can publish the initial schema
+atomically without replacing an existing file, for both regular creation and
+CTAS. After creation, CTAS loads the table and uses its normal write and commit
+APIs. As with an ordinary INSERT, coordinate DROP, RENAME and table replacement
+with active writers; CTAS does not isolate population from concurrent DDL.
+
+**A population failure retains the created table.** Other clients can write to
+it as soon as creation succeeds. Before commit, a reported failure or caller
+cancellation discards the writer's outstanding files. Cancellation allows an
+in-progress write to finish before cleanup. Once commit starts, it finishes
+even if the caller cancels, so the table may contain committed rows. If commit
+returns an error, prepared files remain because a published snapshot may
+reference them. Process termination can interrupt this cleanup. Inspect the
+table and its snapshots before retrying. `IF NOT EXISTS` skips a retained table.
 
 ### Partitioned Tables
 

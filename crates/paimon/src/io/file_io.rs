@@ -997,7 +997,9 @@ impl FileIO {
         } else {
             return Err(Error::IoUnsupported {
                 message: format!(
-                    "Storage '{}' cannot atomically publish a complete snapshot without overwriting '{path}'; use a catalog SnapshotCommit with concurrency control",
+                    "Storage '{}' cannot atomically publish '{path}' without overwriting it. \
+                     Use storage or a FileIOProvider with atomic publication support. \
+                     For snapshots, a catalog SnapshotCommit can also coordinate publication.",
                     info.scheme()
                 ),
             });
@@ -1028,14 +1030,14 @@ impl FileIO {
     ) -> Result<bool> {
         // OpenDAL's filesystem conditional write exposes the target before
         // its contents are complete. Stage locally, then publish without
-        // replacing another process's snapshot.
+        // replacing a file published by another process.
         let relative = normalize_path(relative_path);
         if std::path::Path::new(&relative)
             .components()
             .any(|component| matches!(component, std::path::Component::ParentDir))
         {
             return Err(Error::IoUnsupported {
-                message: format!("Cannot publish a snapshot through a parent path: '{path}'"),
+                message: format!("Cannot atomically publish '{path}' through a parent path"),
             });
         }
         let target = std::path::Path::new(&op.info().root()).join(relative);
