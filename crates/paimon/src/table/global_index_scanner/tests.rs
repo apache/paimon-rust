@@ -1846,10 +1846,10 @@ fn test_unindexed_ranges_missing_field_coverage_reads_all_data_ranges() {
 }
 
 #[test]
-fn test_unindexed_ranges_counts_extra_field_coverage() {
+fn test_unindexed_ranges_excludes_composite_fields_from_scalar_coverage() {
     let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
     let meta = BTreeIndexMeta::new(None, None, false);
-    let mut entry = make_global_index_entry("idx_id_value", 1, 0, 99, &meta);
+    let mut entry = make_global_index_entry("idx_id_value", 1, 50, 99, &meta);
     entry
         .index_file
         .global_index_meta
@@ -1863,7 +1863,7 @@ fn test_unindexed_ranges_counts_extra_field_coverage() {
         32,
         i64::MAX,
         i64::MAX,
-        &[entry],
+        &[make_global_index_entry("idx_value", 2, 0, 49, &meta), entry],
         &fields,
     )
     .expect("create scanner")
@@ -1877,7 +1877,40 @@ fn test_unindexed_ranges_counts_extra_field_coverage() {
             &[],
         )
         .unwrap();
-    assert!(ranges.is_empty());
+    assert_eq!(ranges, vec![RowRange::new(50, 99)]);
+    let leading_field = scanner
+        .unindexed_ranges(
+            &int_eq("id", 0, 8),
+            GlobalIndexSearchMode::Full,
+            Some(100),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(leading_field, vec![RowRange::new(0, 99)]);
+}
+
+#[test]
+fn test_entry_coverage_uses_only_the_primary_field() {
+    let meta = BTreeIndexMeta::new(None, None, false);
+    let mut entry = make_global_index_entry("idx_id_value", 1, 50, 99, &meta);
+    entry
+        .index_file
+        .global_index_meta
+        .as_mut()
+        .unwrap()
+        .extra_field_ids = Some(vec![2]);
+    let entries = [make_global_index_entry("idx_value", 2, 0, 49, &meta), entry];
+    assert_eq!(
+        unindexed_ranges_for_global_index_entries(
+            &entries,
+            &HashSet::from([2]),
+            GlobalIndexSearchMode::Full,
+            Some(100),
+            &[],
+            |_| true,
+        ),
+        vec![RowRange::new(50, 99)],
+    );
 }
 
 #[tokio::test]

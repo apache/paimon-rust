@@ -647,11 +647,7 @@ fn retain_index_manifest_entry_for_scan(
         // Keep malformed entries so the scanner can preserve fail-loud validation.
         return Ok(true);
     };
-    Ok(predicate_field_ids.contains(&global_index.index_field_id)
-        || global_index.extra_field_ids.as_ref().is_some_and(|ids| {
-            ids.iter()
-                .any(|field_id| predicate_field_ids.contains(field_id))
-        }))
+    Ok(predicate_field_ids.contains(&global_index.index_field_id))
 }
 
 /// A deletion-vector entry whose on-disk path is not resolved yet.
@@ -7351,7 +7347,8 @@ mod tests {
         };
 
         assert!(retained(&entry(2, None)));
-        assert!(retained(&entry(1, Some(vec![2]))));
+        assert!(retained(&entry(2, Some(vec![3]))));
+        assert!(!retained(&entry(1, Some(vec![2]))));
         assert!(!retained(&entry(1, Some(vec![3]))));
 
         let mut missing_meta = entry(2, None);
