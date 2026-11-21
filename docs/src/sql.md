@@ -4099,7 +4099,7 @@ optimization may be disabled. Full-text builds reject deletion-vector tables.
 | `btree-index.fallback-scan-max-size` | `256mb` | Maximum total size of BTree global-index files requiring fallback scans for range/between and suffix/contains/complex LIKE predicates; files proven to match completely by metadata need no scan and are excluded. `0` disables BTree fallback index scans. |
 | `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected bitmap global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
 | `global-index.search-mode` | unset | Legacy fallback for the scalar, vector, and full-text search modes. |
-| `scalar-index.search-mode` | `full` for Data Evolution batch scans, `fast` for search filters | Coverage mode for scalar indexes. `full` and `detail` scan uncovered data. `fast` may omit matches outside index coverage. |
+| `scalar-index.search-mode` | `full` for ordinary Data Evolution batch scans, `fast` for scalar prefilters in vector and full-text search | Coverage mode for scalar indexes. `full` and `detail` scan uncovered data. `fast` may omit matches outside index coverage. |
 | `vector-index.search-mode` | `fast` | Coverage mode for vector search. |
 | `full-text-index.search-mode` | `fast` | Coverage mode for full-text search. |
 | `vector-index.post-filter.candidates-factor` | `10` | Multiplier of each query's original Top-K for one ANN query followed by exact scalar post-filtering. At least the required reranking/deletion allowance, capped by shard size and the backend limit. Positive integer no greater than `2147483647`. Short results are returned without retry. |
