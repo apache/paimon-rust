@@ -546,6 +546,8 @@ pub(crate) mod test_support {
     use super::*;
     use std::collections::BTreeSet;
 
+    /// Used by `java_rust_compat` Rust → Java fixture emission (`jvm-compat`).
+    #[cfg(feature = "jvm-compat")]
     pub fn encode_values(values: impl IntoIterator<Item = u64>) -> crate::Result<Vec<u8>> {
         let mut grouped: BTreeMap<[u8; 6], Vec<(u16, u16)>> = BTreeMap::new();
         for value in values {

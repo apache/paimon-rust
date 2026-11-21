@@ -20,7 +20,7 @@
   Standalone classpath for Generate*/Verify* sketch-bitmap compat tools.
   Versions match paimon-common (RoaringBitmap ${roaringbitmap.version}=1.2.1,
   datasketches-java 4.2.0). Not part of the Rust crate publish; used only by
-  the `--features jvm-compat` Rust→Java round trip (CI / local).
+  the Cargo feature jvm-compat Rust-to-Java round trip (CI / local).
 -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
