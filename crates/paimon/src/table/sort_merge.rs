@@ -157,8 +157,9 @@ pub(crate) struct PickedRow {
     /// `_SEQUENCE_NUMBER` / `_VALUE_KIND` columns.
     columns: Vec<Option<(usize, usize)>>,
     sequence_number: i64,
-    /// One-row results of field aggregators, by output column.
-    values: Vec<(usize, ArrayRef)>,
+    /// One-row results of field aggregators, indexed by output column. Empty when
+    /// no column is aggregated.
+    values: Vec<Option<ArrayRef>>,
 }
 
 /// What [`MergeFunction::merge_picked`] returns.
@@ -1246,7 +1247,7 @@ impl AggregateMergeFunction {
             false,
         )? {
             PickedMerge::Result(MergeResult::MaterializedRow(batch)) => Ok((batch, false)),
-            PickedMerge::Result(MergeResult::MaterializedDeleteRow(batch)) => Ok((batch, true)),
+            PickedMerge::Result(MergeResult::MaterializedRetractRow(batch, _)) => Ok((batch, true)),
             _ => unreachable!("aggregation materializes every row unless picks are requested"),
         }
     }
@@ -1332,7 +1333,7 @@ impl AggregateMergeFunction {
 
         if pick && !current_delete_row {
             let mut columns = vec![None; output_schema.fields().len()];
-            let mut values = Vec::new();
+            let mut values = vec![None; output_schema.fields().len()];
             for (col_idx, field) in output_schema.fields().iter().enumerate() {
                 if is_merged_metadata_field(field) {
                     continue;
@@ -1341,7 +1342,7 @@ impl AggregateMergeFunction {
                     Some(agg) => {
                         let value = agg.result()?;
                         let is_null = value.is_null(0);
-                        values.push((col_idx, value));
+                        values[col_idx] = Some(value);
                         is_null
                     }
                     None => {
@@ -1410,7 +1411,7 @@ impl AggregateMergeFunction {
         })?;
 
         Ok(PickedMerge::Result(if current_delete_row {
-            MergeResult::MaterializedDeleteRow(batch)
+            MergeResult::MaterializedRetractRow(batch, RowKind::Delete)
         } else {
             MergeResult::MaterializedRow(batch)
         }))
@@ -2139,20 +2140,16 @@ fn build_output(
                         picked_rows.len()
                     ]))
                 }
-                _ if picked_rows.iter().any(|row| {
-                    row.values
-                        .iter()
-                        .any(|(col_idx, _)| *col_idx == output_col_idx)
-                }) =>
+                _ if picked_rows
+                    .iter()
+                    .any(|row| matches!(row.values.get(output_col_idx), Some(Some(_)))) =>
                 {
                     let nulls = new_null_array(field.data_type(), 1);
                     let parts: Vec<&dyn arrow_array::Array> = picked_rows
                         .iter()
-                        .map(|row| {
-                            row.values
-                                .iter()
-                                .find(|(col_idx, _)| *col_idx == output_col_idx)
-                                .map_or(nulls.as_ref(), |(_, value)| value.as_ref())
+                        .map(|row| match row.values.get(output_col_idx) {
+                            Some(Some(value)) => value.as_ref(),
+                            _ => nulls.as_ref(),
                         })
                         .collect();
                     arrow_select::concat::concat(&parts).map_err(|e| Error::UnexpectedError {
