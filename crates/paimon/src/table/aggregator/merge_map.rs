@@ -18,8 +18,9 @@
 //! Java `FieldMergeMapAgg` / `FieldMergeMapWithKeyTimeAgg`: merge maps by key.
 //!
 //! `merge_map_with_keytime` keeps the ROW with the newer timestamp per key.
-//! Character timestamps follow Java `String.compareTo` (UTF-16 code units).
-//! FLOAT/DOUBLE follow Python `>` / `==` (NaN never updates; ±0.0 are equal).
+//! Character timestamps use unsigned UTF-8 byte lexicographical order (Java
+//! `BinaryString.compareTo`). FLOAT/DOUBLE keep ordinary numeric ordering with
+//! `+0.0 == -0.0`; NaN key-times are rejected and never enter aggregation.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -167,8 +168,24 @@ impl MergeMapAgg {
         Ok(match cmp {
             KeytimeCmp::Greater => true,
             KeytimeCmp::Equal => self.overwrite_on_equal_ts,
-            KeytimeCmp::Less | KeytimeCmp::Unordered => false,
+            KeytimeCmp::Less => false,
         })
+    }
+
+    /// Reject NaN FLOAT/DOUBLE key-times before they can enter aggregator state.
+    fn reject_nan_keytime(&self, value: &dyn Array) -> crate::Result<()> {
+        let Some(ts) = self.timestamp_column(value)? else {
+            return Ok(());
+        };
+        let kind = self.keytime_kind.as_ref().expect("timestamp mode");
+        reject_nan_keytime_value(kind, ts, &self.field_name)
+    }
+
+    fn reject_nan_in_entries(&self, entries: &[(ArrayRef, ArrayRef)]) -> crate::Result<()> {
+        for (_, value) in entries {
+            self.reject_nan_keytime(value.as_ref())?;
+        }
+        Ok(())
     }
 
     fn apply_keytime_entry(&mut self, key: ArrayRef, value: ArrayRef) -> crate::Result<()> {
@@ -180,6 +197,7 @@ impl MergeMapAgg {
             }
             return Ok(());
         }
+        self.reject_nan_keytime(value.as_ref())?;
         let Some(new_ts) = self.timestamp_column(value.as_ref())? else {
             return Ok(());
         };
@@ -188,6 +206,13 @@ impl MergeMapAgg {
             Some(index) => match self.timestamp_column(self.entries[index].1.as_ref())? {
                 None => self.entries[index].1 = value,
                 Some(old_ts) => {
+                    // Existing state should already be NaN-free; re-check so a
+                    // corrupt accumulator cannot reintroduce unordered compares.
+                    reject_nan_keytime_value(
+                        self.keytime_kind.as_ref().expect("timestamp mode"),
+                        old_ts,
+                        &self.field_name,
+                    )?;
                     if self.should_replace_by_timestamp(new_ts, old_ts)? {
                         self.entries[index].1 = value;
                     }
@@ -235,7 +260,11 @@ impl MergeMapAgg {
             .collect();
         if !self.seen_input {
             // Java returns the first non-null map unchanged, including its
-            // entry order and any duplicate keys.
+            // entry order and any duplicate keys. Still reject NaN key-times
+            // so they never become accumulator state.
+            if self.timestamp_index.is_some() {
+                self.reject_nan_in_entries(&incoming)?;
+            }
             self.entries = incoming;
             self.seen_input = true;
             return Ok(());
@@ -251,6 +280,7 @@ impl MergeMapAgg {
                 // start with this input map, then apply the current accumulator
                 // so equal timestamps keep the input when overwrite-on-equal-ts
                 // is false; when true, the accumulator (applied second) wins.
+                self.reject_nan_in_entries(&incoming)?;
                 let current = std::mem::replace(&mut self.entries, incoming);
                 self.normalized = false;
                 self.normalize();
@@ -502,9 +532,39 @@ enum KeytimeCmp {
     Less,
     Equal,
     Greater,
-    /// Python float ordering: any comparison involving NaN is unordered, so
-    /// the incoming value must not replace the existing one.
-    Unordered,
+}
+
+fn reject_nan_keytime_value(
+    kind: &KeytimeKind,
+    ts: &dyn Array,
+    field_name: &str,
+) -> crate::Result<()> {
+    match kind {
+        KeytimeKind::Float32 => {
+            let value = downcast::<Float32Array>(ts, field_name)?.value(0);
+            if value.is_nan() {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "merge_map_with_keytime field '{field_name}' rejects NaN FLOAT key-time values"
+                    ),
+                    source: None,
+                });
+            }
+        }
+        KeytimeKind::Float64 => {
+            let value = downcast::<Float64Array>(ts, field_name)?.value(0);
+            if value.is_nan() {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "merge_map_with_keytime field '{field_name}' rejects NaN DOUBLE key-time values"
+                    ),
+                    source: None,
+                });
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn compare_keytime(
@@ -517,7 +577,8 @@ fn compare_keytime(
         KeytimeKind::Utf8 => {
             let new_v = downcast::<StringArray>(new_ts, field_name)?.value(0);
             let old_v = downcast::<StringArray>(old_ts, field_name)?.value(0);
-            Ok(ordering_to_cmp(utf16_code_unit_cmp(new_v, old_v)))
+            // BinaryString / unsigned UTF-8 byte lexicographical order.
+            Ok(ordering_to_cmp(new_v.as_bytes().cmp(old_v.as_bytes())))
         }
         KeytimeKind::Int8 => cmp_ord(
             downcast::<Int8Array>(new_ts, field_name)?.value(0),
@@ -535,11 +596,11 @@ fn compare_keytime(
             downcast::<Int64Array>(new_ts, field_name)?.value(0),
             downcast::<Int64Array>(old_ts, field_name)?.value(0),
         ),
-        KeytimeKind::Float32 => Ok(python_float_cmp(
+        KeytimeKind::Float32 => Ok(finite_float_cmp(
             downcast::<Float32Array>(new_ts, field_name)?.value(0),
             downcast::<Float32Array>(old_ts, field_name)?.value(0),
         )),
-        KeytimeKind::Float64 => Ok(python_float_cmp(
+        KeytimeKind::Float64 => Ok(finite_float_cmp(
             downcast::<Float64Array>(new_ts, field_name)?.value(0),
             downcast::<Float64Array>(old_ts, field_name)?.value(0),
         )),
@@ -575,22 +636,15 @@ fn ordering_to_cmp(ordering: Ordering) -> KeytimeCmp {
     }
 }
 
-/// Python `>` / `==` for keytime floats: NaN never updates; ±0.0 compare equal.
-fn python_float_cmp<T: Copy + PartialEq + PartialOrd>(new_v: T, old_v: T) -> KeytimeCmp {
+/// Finite FLOAT/DOUBLE key-time compare: `+0.0 == -0.0`. Callers must reject NaN first.
+fn finite_float_cmp<T: Copy + PartialEq + PartialOrd>(new_v: T, old_v: T) -> KeytimeCmp {
     if new_v > old_v {
         KeytimeCmp::Greater
     } else if new_v == old_v {
         KeytimeCmp::Equal
-    } else if new_v < old_v {
-        KeytimeCmp::Less
     } else {
-        KeytimeCmp::Unordered
+        KeytimeCmp::Less
     }
-}
-
-/// Java `String.compareTo` / Python `_utf16_code_unit_greater` order.
-fn utf16_code_unit_cmp(left: &str, right: &str) -> Ordering {
-    left.encode_utf16().cmp(right.encode_utf16())
 }
 
 fn timestamp_value(array: &dyn Array, unit: TimeUnit, field_name: &str) -> crate::Result<i64> {
@@ -911,33 +965,33 @@ mod tests {
     }
 
     #[test]
-    fn keytime_string_utf16_prefers_bmp_over_supplementary() {
-        // U+10000 encodes as UTF-16 surrogates D800 DC00 (< U+E000).
-        // UTF-8 byte order is the opposite; UTF-16 must keep the BMP value.
-        let low = "\u{10000}";
-        let high = "\u{E000}";
+    fn keytime_string_utf8_prefers_supplementary_over_private_use() {
+        // U+E000 is EE 80 80; U+10000 is F0 90 80 80. Unsigned UTF-8 bytes
+        // (BinaryString) keep the supplementary-plane value as newer.
+        let older = "\u{E000}";
+        let newer = "\u{10000}";
         let ts = DataType::VarChar(VarCharType::string_type());
         assert_eq!(
             merge_two(
                 ts.clone(),
-                1,
-                Arc::new(StringArray::from(vec![high])),
-                2,
-                Arc::new(StringArray::from(vec![low])),
+                11,
+                Arc::new(StringArray::from(vec![older])),
+                22,
+                Arc::new(StringArray::from(vec![newer])),
                 HashMap::new(),
             ),
-            1
+            22
         );
         assert_eq!(
             merge_two(
                 ts,
-                1,
-                Arc::new(StringArray::from(vec![low])),
-                2,
-                Arc::new(StringArray::from(vec![high])),
+                11,
+                Arc::new(StringArray::from(vec![newer])),
+                22,
+                Arc::new(StringArray::from(vec![older])),
                 HashMap::new(),
             ),
-            2
+            11
         );
     }
 
@@ -981,36 +1035,36 @@ mod tests {
     }
 
     #[test]
-    fn keytime_char_utf16_matches_varchar() {
+    fn keytime_char_utf8_matches_varchar() {
         let ts = DataType::Char(CharType::new(8).unwrap());
-        let low = "\u{10000}";
-        let high = "\u{E000}";
+        let older = "\u{E000}";
+        let newer = "\u{10000}";
         assert_eq!(
             merge_two(
                 ts.clone(),
-                1,
-                Arc::new(StringArray::from(vec![high])),
-                2,
-                Arc::new(StringArray::from(vec![low])),
+                11,
+                Arc::new(StringArray::from(vec![older])),
+                22,
+                Arc::new(StringArray::from(vec![newer])),
                 HashMap::new(),
             ),
-            1
+            22
         );
         assert_eq!(
             merge_two(
                 ts,
-                1,
-                Arc::new(StringArray::from(vec![low])),
-                2,
-                Arc::new(StringArray::from(vec![high])),
+                11,
+                Arc::new(StringArray::from(vec![newer])),
+                22,
+                Arc::new(StringArray::from(vec![older])),
                 HashMap::new(),
             ),
-            2
+            11
         );
     }
 
     #[test]
-    fn keytime_float_python_semantics() {
+    fn keytime_float_finite_and_signed_zero_semantics() {
         let ts = DataType::Float(FloatType::new());
         assert_eq!(
             merge_two(
@@ -1026,7 +1080,7 @@ mod tests {
         // Equal ±0.0 keeps first when overwrite is false.
         assert_eq!(
             merge_two(
-                ts.clone(),
+                ts,
                 1,
                 Arc::new(Float32Array::from(vec![-0.0f32])),
                 2,
@@ -1035,35 +1089,11 @@ mod tests {
             ),
             1
         );
-        // Incoming NaN must not replace.
-        assert_eq!(
-            merge_two(
-                ts.clone(),
-                1,
-                Arc::new(Float32Array::from(vec![1.0f32])),
-                2,
-                Arc::new(Float32Array::from(vec![f32::NAN])),
-                HashMap::new(),
-            ),
-            1
-        );
-        // Existing NaN is not replaced by a finite value under Python `>`.
-        assert_eq!(
-            merge_two(
-                ts,
-                1,
-                Arc::new(Float32Array::from(vec![f32::NAN])),
-                2,
-                Arc::new(Float32Array::from(vec![1.0f32])),
-                HashMap::new(),
-            ),
-            1
-        );
 
         let ts = DataType::Double(DoubleType::new());
         assert_eq!(
             merge_two(
-                ts,
+                ts.clone(),
                 1,
                 Arc::new(Float64Array::from(vec![9.5f64])),
                 2,
@@ -1071,6 +1101,104 @@ mod tests {
                 HashMap::new(),
             ),
             2
+        );
+        assert_eq!(
+            merge_two(
+                ts,
+                1,
+                Arc::new(Float64Array::from(vec![-0.0f64])),
+                2,
+                Arc::new(Float64Array::from(vec![0.0f64])),
+                HashMap::new(),
+            ),
+            1
+        );
+    }
+
+    fn assert_nan_rejected(ts_type: DataType, nan_ts: ArrayRef, finite_ts: ArrayRef) {
+        let data_type = keytime_map_type(ts_type.clone());
+        let options = HashMap::new();
+
+        // First input already carries NaN: must fail before state is accepted.
+        let first_nan = keytime_map(&ts_type, vec![22], nan_ts.slice(0, 1));
+        let mut agg = MergeMapAgg::new_with_keytime("m", &data_type, &options).unwrap();
+        let err = agg.agg(&first_nan, 0).unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { ref message, .. } if message.contains("rejects NaN")),
+            "first-input NaN must be rejected, got {err:?}"
+        );
+
+        // Reviewer rows (11, 0), (22, NaN), (33, 1) under different flush groups.
+        let all = keytime_map(
+            &ts_type,
+            vec![11, 22, 33],
+            concat(&[
+                finite_ts.slice(0, 1).as_ref(),
+                nan_ts.slice(0, 1).as_ref(),
+                finite_ts.slice(1, 1).as_ref(),
+            ])
+            .unwrap(),
+        );
+        // One flush streaming all three rows: NaN row must fail (not yield 11 or 33).
+        let mut agg = MergeMapAgg::new_with_keytime("m", &data_type, &options).unwrap();
+        agg.agg(&all, 0).unwrap();
+        let err = agg.agg(&all, 1).unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { ref message, .. } if message.contains("rejects NaN")),
+            "single-flush NaN must be rejected, got {err:?}"
+        );
+
+        // Separate flushes: commit (11,0), then (22,NaN) must fail.
+        let mut agg = MergeMapAgg::new_with_keytime("m", &data_type, &options).unwrap();
+        let first = keytime_map(&ts_type, vec![11], finite_ts.slice(0, 1));
+        agg.agg(&first, 0).unwrap();
+        let second = keytime_map(&ts_type, vec![22], nan_ts.slice(0, 1));
+        let err = agg.agg(&second, 0).unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { ref message, .. } if message.contains("rejects NaN")),
+            "NaN flush must be rejected, got {err:?}"
+        );
+
+        // Finite-only flush groups stay associative: (11,0)+(33,1) == 33 either order.
+        assert_eq!(
+            merge_two(
+                ts_type.clone(),
+                11,
+                finite_ts.slice(0, 1),
+                33,
+                finite_ts.slice(1, 1),
+                options.clone(),
+            ),
+            33
+        );
+        assert_eq!(
+            merge_two(
+                ts_type,
+                33,
+                finite_ts.slice(1, 1),
+                11,
+                finite_ts.slice(0, 1),
+                options,
+            ),
+            33
+        );
+    }
+
+    #[test]
+    fn keytime_float_rejects_nan_across_flush_groups() {
+        assert_nan_rejected(
+            DataType::Float(FloatType::new()),
+            Arc::new(Float32Array::from(vec![f32::NAN])),
+            Arc::new(Float32Array::from(vec![0.0f32, 1.0f32])),
+        );
+    }
+
+    #[test]
+    fn keytime_double_rejects_nan_across_flush_groups() {
+        assert_nan_rejected(
+            DataType::Double(DoubleType::new()),
+            Arc::new(Float64Array::from(vec![f64::NAN])),
+            Arc::new(Float64Array::from(vec![0.0f64, 1.0f64])),
         );
     }
 
@@ -1568,12 +1696,11 @@ mod tests {
     }
 
     #[test]
-    fn utf16_code_unit_cmp_matches_java_order() {
-        assert_eq!(utf16_code_unit_cmp("a", "b"), Ordering::Less);
-        assert_eq!(utf16_code_unit_cmp("\u{10000}", "\u{E000}"), Ordering::Less);
-        assert_eq!(
-            utf16_code_unit_cmp("\u{E000}", "\u{10000}"),
-            Ordering::Greater
-        );
+    fn utf8_byte_cmp_matches_binary_string_order() {
+        assert!("a".as_bytes() < "b".as_bytes());
+        // U+E000 (EE 80 80) < U+10000 (F0 90 80 80) in unsigned UTF-8 bytes;
+        // UTF-16 code units reverse this pair.
+        assert!("\u{E000}".as_bytes() < "\u{10000}".as_bytes());
+        assert!("\u{E000}".encode_utf16().cmp("\u{10000}".encode_utf16()) == Ordering::Greater);
     }
 }

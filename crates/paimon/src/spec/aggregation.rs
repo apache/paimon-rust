@@ -36,6 +36,7 @@ const NESTED_KEY_SUFFIX: &str = ".nested-key";
 const NESTED_SEQUENCE_FIELD_SUFFIX: &str = ".nested-sequence-field";
 const NESTED_KEY_NULL_STRATEGY_SUFFIX: &str = ".nested-key-null-strategy";
 const COUNT_LIMIT_SUFFIX: &str = ".count-limit";
+const OVERWRITE_ON_EQUAL_TS_SUFFIX: &str = ".overwrite-on-equal-ts";
 const MAP_STORAGE_LAYOUT_SUFFIX: &str = ".map.storage-layout";
 const MAP_SHARED_SHREDDING_MAX_COLUMNS_SUFFIX: &str = ".map.shared-shredding.max-columns";
 const MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY_SUFFIX: &str =
@@ -250,6 +251,7 @@ enum FieldScopedOptionKind {
     NestedKeyNullStrategy,
     CountLimit,
     IgnoreRetract,
+    OverwriteOnEqualTs,
 }
 
 /// Parse the `<col>` segment and option kind out of a
@@ -278,6 +280,10 @@ fn parse_field_scoped_option_key(key: &str) -> Option<(&str, FieldScopedOptionKi
         ),
         (COUNT_LIMIT_SUFFIX, FieldScopedOptionKind::CountLimit),
         (IGNORE_RETRACT_SUFFIX, FieldScopedOptionKind::IgnoreRetract),
+        (
+            OVERWRITE_ON_EQUAL_TS_SUFFIX,
+            FieldScopedOptionKind::OverwriteOnEqualTs,
+        ),
     ] {
         if let Some(col) = inner.strip_suffix(suffix) {
             if col.is_empty() {
@@ -298,11 +304,12 @@ fn parse_field_scoped_option_key(key: &str) -> Option<(&str, FieldScopedOptionKi
 /// `SchemaManager.applyRenameColumnsToOptions` (Java's case-2 list; the
 /// aggregation/partial-update engines do not accept every entry at create
 /// time, but the keys can still arrive in Java-written metadata).
-const FIELD_SCOPED_RENAMEABLE_SUFFIXES: [&str; 7] = [
+const FIELD_SCOPED_RENAMEABLE_SUFFIXES: [&str; 8] = [
     AGG_FUNCTION_SUFFIX,
     IGNORE_RETRACT_SUFFIX,
     DISTINCT_SUFFIX,
     LIST_AGG_DELIMITER_SUFFIX,
+    OVERWRITE_ON_EQUAL_TS_SUFFIX,
     MAP_STORAGE_LAYOUT_SUFFIX,
     MAP_SHARED_SHREDDING_MAX_COLUMNS_SUFFIX,
     MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY_SUFFIX,
@@ -1145,6 +1152,7 @@ mod tests {
             ("fields.a.ignore-retract", "true"),
             ("fields.a.distinct", "true"),
             ("fields.a.list-agg-delimiter", ";"),
+            ("fields.a.overwrite-on-equal-ts", "true"),
             ("fields.a.map.storage-layout", "shared-shredding"),
             ("fields.a.map.shared-shredding.max-columns", "64"),
             (
@@ -1165,6 +1173,7 @@ mod tests {
             ("ignore-retract", "true"),
             ("distinct", "true"),
             ("list-agg-delimiter", ";"),
+            ("overwrite-on-equal-ts", "true"),
             ("map.storage-layout", "shared-shredding"),
             ("map.shared-shredding.max-columns", "64"),
             ("map.shared-shredding.column-placement-policy", "even"),

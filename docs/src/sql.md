@@ -3567,9 +3567,10 @@ Field-scoped options used by these functions:
   `nested-key`.
 
 For `merge_map_with_keytime`, a newer key-time replaces the existing ROW for
-that map key. `CHAR`/`VARCHAR` key-times compare as Java `String.compareTo`
-(UTF-16 code units). `FLOAT`/`DOUBLE` follow Python `>` / `==` (NaN never
-updates; `+0.0` and `-0.0` are equal). `TIMESTAMP` / `TIMESTAMP_LTZ` compare
+that map key. `CHAR`/`VARCHAR` key-times use unsigned UTF-8 byte
+lexicographical order (Java `BinaryString.compareTo`). `FLOAT`/`DOUBLE`
+compare as ordinary numbers with `+0.0` equal to `-0.0`; NaN key-times are
+rejected and never enter aggregation. `TIMESTAMP` / `TIMESTAMP_LTZ` compare
 by ticks under a unified time semantics (timezone metadata does not affect
 ordering). A NULL key-time ignores the incoming update and leaves any
 existing key unchanged. A NULL ROW value removes that key. Rust Native

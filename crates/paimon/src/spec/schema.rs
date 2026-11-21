@@ -5182,6 +5182,164 @@ mod tests {
     }
 
     #[test]
+    fn test_overwrite_on_equal_ts_schema_evolution_rename_drop_recreate() {
+        use crate::arrow::paimon_type_to_arrow;
+        use crate::table::aggregator::{FieldAggregator, MergeMapAgg};
+        use arrow_array::{Array, Int32Array, MapArray, StringArray, StructArray};
+        use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow_schema::DataType as ArrowDataType;
+        use std::sync::Arc;
+
+        let updates_type = DataType::Map(MapType::new(
+            DataType::VarChar(VarCharType::string_type()),
+            DataType::Row(RowType::new(vec![
+                DataField::new(3, "payload".into(), DataType::Int(IntType::new())),
+                DataField::new(4, "ts".into(), DataType::Int(IntType::new())),
+            ])),
+        ));
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("updates", updates_type.clone())
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option(
+                    "fields.updates.aggregate-function",
+                    "merge_map_with_keytime",
+                )
+                .option("fields.updates.overwrite-on-equal-ts", "true")
+                .build()
+                .unwrap(),
+        );
+
+        // 1) rename keeps the option and its value.
+        let renamed = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::rename_column(
+                "updates".to_string(),
+                "events".to_string(),
+            )])
+            .unwrap();
+        assert_eq!(
+            renamed
+                .options()
+                .get("fields.events.overwrite-on-equal-ts")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            renamed
+                .options()
+                .get("fields.events.aggregate-function")
+                .map(String::as_str),
+            Some("merge_map_with_keytime")
+        );
+        assert!(renamed
+            .options()
+            .get("fields.updates.overwrite-on-equal-ts")
+            .is_none());
+
+        // 4) equal timestamp aggregation follows the migrated config.
+        let events_type = renamed
+            .fields()
+            .iter()
+            .find(|f| f.name() == "events")
+            .unwrap()
+            .data_type()
+            .clone();
+        let ArrowDataType::Map(entries_field, ordered) =
+            paimon_type_to_arrow(&events_type).unwrap()
+        else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(entry_fields) = entries_field.data_type() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(value_fields) = entry_fields[1].data_type() else {
+            unreachable!()
+        };
+        let values = StructArray::try_new(
+            value_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 10])),
+            ],
+            None,
+        )
+        .unwrap();
+        let entries = StructArray::try_new(
+            entry_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["k", "k"])),
+                Arc::new(values),
+            ],
+            None,
+        )
+        .unwrap();
+        let input = MapArray::try_new(
+            entries_field,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2])),
+            entries,
+            None,
+            ordered,
+        )
+        .unwrap();
+        let mut agg =
+            MergeMapAgg::new_with_keytime("events", &events_type, renamed.options()).unwrap();
+        agg.agg(&input, 0).unwrap();
+        agg.agg(&input, 1).unwrap();
+        let result = agg.result().unwrap();
+        let map = result.as_any().downcast_ref::<MapArray>().unwrap();
+        let entries = map.value(0);
+        let row = entries.as_any().downcast_ref::<StructArray>().unwrap();
+        let payloads = row
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            payloads.value(0),
+            2,
+            "overwrite-on-equal-ts=true after rename must keep the newer equal-ts payload"
+        );
+
+        // 2) drop clears the option.
+        let dropped = renamed
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "events".to_string(),
+            )])
+            .unwrap();
+        assert!(dropped
+            .options()
+            .get("fields.events.overwrite-on-equal-ts")
+            .is_none());
+        assert!(dropped
+            .options()
+            .get("fields.events.aggregate-function")
+            .is_none());
+
+        // 3) recreating the same column name must not revive the old option.
+        let recreated = dropped
+            .apply_changes(vec![crate::spec::SchemaChange::add_column(
+                "events".to_string(),
+                updates_type,
+            )])
+            .unwrap();
+        assert!(recreated
+            .options()
+            .get("fields.events.overwrite-on-equal-ts")
+            .is_none());
+        assert!(recreated
+            .options()
+            .get("fields.events.aggregate-function")
+            .is_none());
+    }
+
+    #[test]
     fn test_rename_column_rewrites_sequence_group_options() {
         let table_schema = TableSchema::new(
             0,
