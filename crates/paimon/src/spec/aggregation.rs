@@ -591,7 +591,8 @@ fn reject_unsafe_nested_update_overwrite_on_equal(
     options: &HashMap<String, String>,
     primary_keys: &[String],
 ) -> crate::Result<()> {
-    let sequence_fields = CoreOptions::new(options).sequence_fields();
+    let core_options = CoreOptions::new(options);
+    let sequence_fields = core_options.sequence_fields();
     if sequence_fields.is_empty() {
         return Ok(());
     }
