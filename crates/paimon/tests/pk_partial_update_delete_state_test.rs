@@ -274,7 +274,10 @@ async fn delete_state_survives_subsequent_retractions() {
 }
 
 #[tokio::test]
-async fn whole_row_delete_ignores_update_before_payload() {
+async fn whole_row_delete_keeps_update_before_payload() {
+    // Java PR 11178: after a DELETE, an UPDATE_BEFORE keeps the row removed
+    // and still applies its non-null fields, so they are the baseline of the
+    // restored row.
     let before = event(
         RowKind::UpdateBefore,
         (Some(9), Some(99)),
@@ -286,7 +289,72 @@ async fn whole_row_delete_ignores_update_before_payload() {
         &[("partial-update.remove-record-on-delete", "true")],
         &[INITIAL, DELETED, before],
         restored,
-        [Some(1), Some(2), Some(10), Some(3), Some(30), Some(1)],
+        [Some(1), Some(9), Some(99), Some(3), Some(30), Some(9)],
+    )
+    .await;
+}
+
+// Java PR 11178 handles an UPDATE_BEFORE under remove-record-on-delete as a
+// retraction: it marks the row removed without re-initializing it and applies
+// its own non-null fields, and a merge result removed only by UPDATE_BEFORE
+// stays UPDATE_BEFORE. Every split of the events into commits, each flushed
+// through the writer's pre-merge, must read the same row. One writer owns
+// left_value, another writer owns right_value.
+const OTHER_WRITER: Event = Event {
+    values: [Some(1), None, None, None, Some(20), None],
+    kind: RowKind::Insert,
+};
+
+fn left(kind: RowKind, value: i32) -> Event {
+    event(kind, (None, Some(value)), (None, None), None)
+}
+
+#[tokio::test]
+async fn update_before_pair_keeps_other_writer_fields() {
+    // The +U brings the row back on top of the kept right_value = 20.
+    assert_all_layouts(
+        &[("partial-update.remove-record-on-delete", "true")],
+        &[
+            OTHER_WRITER,
+            left(RowKind::Insert, 10),
+            left(RowKind::UpdateBefore, 10),
+            left(RowKind::UpdateAfter, 11),
+        ],
+        [Some(1), None, Some(11), None, Some(20), None],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn lone_update_before_removes_row_until_restored() {
+    // A key that ends with a lone -U reads no row. When the other writer
+    // restores it, the kept left_value = 10 comes back, as after a DELETE.
+    assert_deleted_then_restored(
+        &[("partial-update.remove-record-on-delete", "true")],
+        &[
+            OTHER_WRITER,
+            left(RowKind::Insert, 10),
+            left(RowKind::UpdateBefore, 10),
+        ],
+        event(RowKind::Insert, (None, None), (None, Some(30)), None),
+        [Some(1), None, Some(10), None, Some(30), None],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn update_before_only_merge_keeps_older_fields() {
+    // Two -U merged without an add stay UPDATE_BEFORE rather than DELETE, so a
+    // later merge does not re-initialize the row and drop right_value = 20.
+    assert_deleted_then_restored(
+        &[("partial-update.remove-record-on-delete", "true")],
+        &[
+            OTHER_WRITER,
+            left(RowKind::UpdateBefore, 10),
+            left(RowKind::UpdateBefore, 11),
+        ],
+        left(RowKind::Insert, 12),
+        [Some(1), None, Some(12), None, Some(20), None],
     )
     .await;
 }

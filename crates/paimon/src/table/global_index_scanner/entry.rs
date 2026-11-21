@@ -49,12 +49,13 @@ impl GlobalIndexEntry {
 pub(super) fn sorted_entry_meta(entry: &GlobalIndexEntry) -> &BTreeIndexMeta {
     match &entry.meta {
         GlobalIndexEntryMeta::Sorted(meta) => meta,
-        GlobalIndexEntryMeta::FM { .. } => unreachable!("FM entries do not have sorted metadata"),
+        _ => unreachable!("expected sorted index metadata"),
     }
 }
 
 pub(super) enum GlobalIndexEntryMeta {
     Sorted(BTreeIndexMeta),
+    RTree(crate::rtree::RTreeFileMeta, crate::rtree::Metadata),
     FM {
         bytes: Vec<u8>,
         first_row_id: u64,
@@ -156,6 +157,7 @@ pub(super) enum GlobalIndexFileKind {
     Bitmap,
     Multivalue,
     FM,
+    RTree,
 }
 
 pub(super) fn is_floating_point(data_type: &DataType) -> bool {
@@ -219,6 +221,7 @@ impl GlobalIndexFileKind {
             Self::Bitmap => "bitmap",
             Self::Multivalue => "multivalue",
             Self::FM => "FM",
+            Self::RTree => "rtree",
         }
     }
 }

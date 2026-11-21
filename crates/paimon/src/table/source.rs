@@ -148,9 +148,19 @@ pub fn merge_row_ranges(mut ranges: Vec<RowRange>) -> Vec<RowRange> {
 /// merged; the result is normalized (sorted, merged-adjacent, non-empty ranges).
 pub(crate) fn exclude_row_ranges(base: &[RowRange], subtract: &[RowRange]) -> Vec<RowRange> {
     let base = merge_row_ranges(base.to_vec());
+    if base.is_empty() || subtract.is_empty() {
+        return base;
+    }
     let subtract = merge_row_ranges(subtract.to_vec());
     let mut result = Vec::new();
+    // Both lists are sorted and disjoint, so a cut that ends before one
+    // segment ends before every later one too. Skipping those once keeps this
+    // linear instead of rescanning every cut for each segment.
+    let mut first_cut = 0;
     for seg in base {
+        while first_cut < subtract.len() && subtract[first_cut].to() < seg.from() {
+            first_cut += 1;
+        }
         // Current uncovered cursor within [seg.from, seg.to].
         let mut cursor = seg.from();
         // Set once a cut covers through seg.to(); the trailing suffix must then
@@ -158,9 +168,9 @@ pub(crate) fn exclude_row_ranges(base: &[RowRange], subtract: &[RowRange]) -> Ve
         // keeps the i64::MAX edge correct: at i64::MAX, `saturating_add(1)`
         // cannot push the cursor past seg.to(), so we rely on this flag instead.
         let mut exhausted = false;
-        for cut in &subtract {
-            if cut.to() < cursor || cut.from() > seg.to() {
-                continue; // cut entirely before the cursor or beyond this segment
+        for cut in &subtract[first_cut..] {
+            if cut.from() > seg.to() {
+                break; // this and every later cut start beyond this segment
             }
             if cut.from() > cursor {
                 // Emit the gap before this cut.

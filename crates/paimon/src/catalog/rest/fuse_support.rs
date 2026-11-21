@@ -79,9 +79,7 @@ impl FusePathResolver {
             let mut builder = FileIO::from_path(local.as_ref())?
                 .with_props(self.options.to_map())
                 .with_cache_context(file_io_cache);
-            if let Some(cache) = local_cache {
-                builder = builder.with_local_cache(cache);
-            }
+            builder = builder.with_local_cache(local_cache);
             Ok(Some(builder.build()?.with_fuse(original, &local)?))
         }
         #[cfg(not(feature = "storage-fs"))]

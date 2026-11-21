@@ -19,10 +19,10 @@ under the License.
 
 # Table Compaction
 
-Rust supports small-file compaction for ordinary append tables, normal-file
-compaction for Data Evolution tables, and sorted-run compaction for primary-key
-tables with fixed or dynamic buckets. `CompactBuilder` creates
-a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
+Rust supports small-file compaction for ordinary append tables, normal-file and
+opt-in dedicated BLOB/Vector compaction for Data Evolution tables, and sorted-run
+compaction for primary-key tables with fixed or dynamic buckets. `CompactBuilder`
+creates a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
 execution do not publish snapshots; `commit_compact` atomically publishes the
 selected results in a `COMPACT` snapshot. DataFusion SQL runs this flow through
 [`CALL sys.compact`](sql.md#compact), and Python through
@@ -134,6 +134,9 @@ let options = std::collections::HashMap::from([
     ),
 ]);
 ```
+
+Append and Data Evolution tables also support `global-index.rtree.index-columns`
+for planar `GEOMETRY` columns.
 
 Maintenance reuses the global-index builders and their table, column-type,
 and native writer restrictions. Tables must have row tracking enabled, no
@@ -522,6 +525,9 @@ legitimately ignored, compaction can remove the selected files without
 creating an output file. Key bounds, sequence bounds, delete counts and file
 indexes are regenerated, using metadata statistics options for the output level.
 Compound `partial-update` DELETE states with field aggregators are rejected.
+Compound UPDATE_BEFORE states, which `partial-update.remove-record-on-delete`
+produces when only UPDATE_BEFORE records removed the row, are compacted
+because a later merge only replays their non-null fields.
 For both reducer engines, compound groups containing retracts are also rejected
 when they use `first_value`, `first_non_null_value`, `collect`, `listagg`,
 `nested_update` or `nested_partial_update`. These states may carry initialization
@@ -688,15 +694,138 @@ Changing storage options does not migrate values in existing files. If selected
 normal files still provide a field that the current schema stores in dedicated
 files, compaction is rejected before writing or publishing output. Migrate those
 historical inline values first; otherwise omitting the field would lose data.
-With deletion vectors enabled, one output file is limited to 4,294,967,296
+With deletion vectors enabled, one normal output file is limited to 4,294,967,296
 physical row slots so every local position remains deletable by the current
 Rust writer. Wider rewrites are rejected before execution; 64-bit deletion-vector
 writing is not yet supported.
 
-Dedicated Blob/Vector compaction, splitting large normal files, and materializing
-deletions into reassigned row IDs are not provided. Setting
+Splitting large normal files and materializing deletions into reassigned row IDs
+are not provided. Setting
 `data-evolution.compaction.split-large-files=true` or
 `data-evolution.compaction.rewrite-row-ids=true` is rejected.
+
+### Dedicated BLOB files
+
+Enable payload compaction explicitly on the Rust builder:
+
+```rust
+let builder = table.new_compact_builder().with_blob_compaction(true);
+let plan = builder.new_planner()?.plan().await?;
+let executor = builder.new_executor()?;
+let mut results = Vec::new();
+for task in plan.tasks() {
+    results.push(executor.execute(task).await?);
+}
+builder.new_commit()?.commit_compact(results).await?;
+```
+
+The default planner and automatic compaction continue to select normal files.
+The BLOB option applies to Data Evolution append tables with row tracking,
+`bucket=-1`, and no primary key. It supports dedicated `BLOB`, `ARRAY<BLOB>`,
+and `MAP<K, BLOB>` files, following Java's `DataEvolutionBlobCompactTask`.
+Video-frame fields and historical `.video` sources are rejected even if the
+current schema no longer configures video storage. BLOB field-type conversion
+and migration from inline storage are unsupported.
+The BLOB switch is currently exposed through the Rust builder; SQL and language
+bindings continue to use normal-file compaction.
+
+Planning resolves historical schemas by field ID, preserving renamed field
+identity and separating dropped/recreated fields with reused names. Each task
+contains at least two files of one field. Overlapping versions stay together;
+adjacent groups are packed by `blob.target-file-size`, while gaps and standalone
+files at or above that size end a bin. A task streams effective values, resolving
+sparse-update placeholders through older versions, into one new `.blob` file.
+The target guides input selection; write-time size and row limits do not roll
+the output. NULL, empty payloads, collection nulls, row IDs, sequence bounds,
+and column sequence metadata are preserved. Deleted physical slots remain;
+BLOB-only tasks retain the existing normal anchors and deletion vectors.
+For example, a five-row baseline with two sparse updates goes from three BLOB
+files to one while keeping the normal anchor and all five physical row slots.
+
+When a BLOB output spans several normal groups, commit it with its planned
+normal merge, or commit that normal merge first. Other task subsets can be
+committed independently. The committer checks the final row-range layout on
+each attempt and rejects omitted or concurrently added overlapping versions
+of the same BLOB field. Historical field IDs, types and supported task options
+are checked again at publication, including for serialized worker results.
+BLOB-only tasks can coexist with updates to other fields or disjoint row-ID
+ranges, disjoint appends and logical deletions. Retained snapshots keep their
+original files.
+Failed execution cleans its partial outputs; use `abort_compact`
+for earlier results that were never submitted. After a failed or uncertain commit,
+retain the submitted outputs and retry with the same `commit_user` and results.
+In a mixed plan, `rows_written` sums the physical slots of normal and BLOB
+outputs, so it can count the same logical row in more than one task.
+
+This operation copies dedicated BLOB payloads. Primary-key managed BLOB
+compaction below merges descriptors and rebuilds reference sidecars instead.
+
+### Dedicated Vector files
+
+Enable Vector storage compaction with the Rust builder:
+
+```rust
+let builder = table.new_compact_builder().with_vector_compaction(true);
+let plan = builder.new_planner()?.plan().await?;
+let executor = builder.new_executor()?;
+let mut results = Vec::new();
+for task in plan.tasks() {
+    results.push(executor.execute(task).await?);
+}
+builder.new_commit()?.commit_compact(results).await?;
+```
+
+This follows Java's `DataEvolutionVectorCompactTask` for Data Evolution append
+tables with row tracking, no primary key, `bucket=-1`, and `vector.file.format`
+configured. `vector.target-file-size` must be positive. The switch can be combined
+with `with_blob_compaction(true)`. Default and automatic compaction, SQL, and
+language bindings continue to select normal files.
+
+A Vector task contains every overlapping Vector version in its selected range,
+including shadowed files and independent column projections. It requires at
+least two files and respects `compaction.min.file-num`. Adjacent normal groups
+can share a task only when normal compaction selects them for the same merge.
+If a combined range is unsafe, planning tries the original normal groups.
+Gaps and partial field coverage are not filled: every current Vector field
+represented by the inputs must cover the entire task range, or that range is
+skipped. Fields are resolved by stable IDs in each file's historical schema.
+Dropped fields are ignored, renamed fields keep their identity, and newly added
+fields absent from all inputs remain absent. Reads return NULL for missing
+nullable fields after a normal merge; Vector compaction still requires complete
+field coverage. Field-type and inline-storage migrations are unsupported.
+
+Execution streams effective column values in row-ID order into the configured
+`*.vector.<format>` files, rolling by `vector.target-file-size`. As with other
+Rust writers, a batch stays intact even when it crosses the size target. Outputs
+have consecutive first-row IDs and exactly the input union's physical row count,
+including deleted slots. Sequence bounds and per-column freshness metadata are
+preserved, including `global-index.column-update-action=ignore`. Vector tasks
+replace only their selected Vector inputs and preserve valid global indexes.
+A simultaneous normal task remaps the latest deletion vectors. Historical
+snapshots keep their original inputs.
+
+For example, a six-row baseline plus two overlapping partial-column updates can
+be consolidated from three Vector files into one, without changing any row ID
+or the winner of a later update. Disjoint rolled outputs from one completed
+Vector task are not selected again solely because compression puts them below
+the target size. New inputs and outputs from independent tasks can be combined
+when at least two files are below the target. Overlapping versions still require
+a rewrite.
+
+A cross-group output requires its normal merge in the same or an earlier commit.
+Other serialized task subsets can commit independently. Execution rejects inputs
+that omit overlapping Vector versions from the captured snapshot. Commit also
+rejects concurrently added overlapping Vector versions. Disjoint appends,
+normal-column updates that preserve the layout, and deletion-vector changes
+can coexist. Commit rechecks output fields, format, row ranges and
+sequence metadata against the captured inputs and latest snapshot. Failed
+execution removes partial outputs; `abort_compact` cleans unsubmitted results.
+After an uncertain commit, retain submitted outputs and retry with the same
+`commit_user` and results. In a mixed plan, `rows_written` counts the physical
+slots written by each normal, BLOB and Vector task separately.
+
+This operation consolidates row-aligned Vector storage. It does not build ANN
+indexes or compact primary-key vector indexes.
 
 ## Primary-key managed BLOB compaction
 

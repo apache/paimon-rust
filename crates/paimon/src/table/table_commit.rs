@@ -2141,9 +2141,11 @@ impl TableCommit {
                         .collect::<HashSet<_>>();
                     if self.data_evolution_enabled {
                         super::compact::data_evolution::validate_replacement_inputs(
+                            &self.table,
                             entries,
                             &captured_files,
-                        )?;
+                        )
+                        .await?;
                         super::compact::data_evolution::validate_storage_layout(
                             &self.table,
                             &deletes
@@ -2216,9 +2218,11 @@ impl TableCommit {
                 }
                 if self.data_evolution_enabled {
                     super::compact::data_evolution::validate_replacement_inputs(
+                        &self.table,
                         entries,
                         base_data_files.as_deref().unwrap_or_default(),
-                    )?;
+                    )
+                    .await?;
                 }
                 self.check_compact_lsm_conflicts(
                     base_data_files.as_deref().unwrap_or_default(),
@@ -3503,10 +3507,15 @@ impl TableCommit {
         // Build index: (partition, bucket, first_row_id, row_count)
         let existing_index: HashSet<(&[u8], i32, i64, i64)> = existing_entries
             .iter()
+            // Dedicated column files may cover only a prefix of an anchor.
+            // They must never serve as anchors for another partial update.
+            .filter(|entry| {
+                !self.data_evolution_enabled || !is_dedicated_storage_file(entry.file())
+            })
             .filter_map(|e| {
                 e.file()
-                    .first_row_id
-                    .map(|fid| (e.partition(), e.bucket(), fid, e.file().row_count))
+                    .row_id_range()
+                    .map(|(fid, _)| (e.partition(), e.bucket(), fid, e.file().row_count))
             })
             .collect();
 
@@ -3518,7 +3527,19 @@ impl TableCommit {
                 fid,
                 entry.file().row_count,
             );
-            if !existing_index.contains(&key) {
+            let covered_dedicated = self.data_evolution_enabled
+                && is_dedicated_storage_file(entry.file())
+                && entry.file().row_id_range().is_some_and(|(first, last)| {
+                    existing_index
+                        .iter()
+                        .any(|&(partition, bucket, start, count)| {
+                            partition == entry.partition()
+                                && bucket == entry.bucket()
+                                && start <= first
+                                && start.checked_add(count - 1).is_some_and(|end| last <= end)
+                        })
+                });
+            if !existing_index.contains(&key) && !covered_dedicated {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
                         "Row ID conflict: file '{}' references first_row_id={}, row_count={} \
@@ -3528,8 +3549,8 @@ impl TableCommit {
                         entry.file().file_name,
                         fid,
                         entry.file().row_count,
+                        self.partition_to_string(entry.partition()),
                         entry.bucket(),
-                        entry.file().row_count,
                     ),
                     source: None,
                 });

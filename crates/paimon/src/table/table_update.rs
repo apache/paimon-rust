@@ -71,7 +71,7 @@ impl TableUpdate {
         }
     }
 
-    /// Reuse a captured `plan_all` result for row-ID updates and deletes.
+    /// Reuse a captured `plan_all` result for row-ID updates, deletes and shards.
     ///
     /// Each split must contain complete logical file groups, including their
     /// partial-column files and deletion vectors. Splits may be distributed
@@ -82,7 +82,9 @@ impl TableUpdate {
     /// still read the captured index manifest to preserve all deletion vectors
     /// when replacing a bucket's shared index file. Assign all deletes for one
     /// partition/bucket to the same worker.
-    /// Predicate, key-based, MERGE and shard operations reject this setting;
+    /// Shard operations balance only the supplied groups. Use shard 0 of 1
+    /// when the coordinator has already assigned this worker's complete groups.
+    /// Predicate, key-based and MERGE operations reject this setting;
     /// use a separately configured updater for those operations.
     pub fn with_plan(&mut self, plan: super::Plan) -> crate::Result<&mut Self> {
         super::RowIdPlan::from_plan(plan.clone())?;
@@ -93,7 +95,8 @@ impl TableUpdate {
     fn ensure_unplanned(&self) -> crate::Result<()> {
         if self.plan.is_some() {
             return Err(crate::Error::Unsupported {
-                message: "with_plan supports only row-ID update and delete operations".into(),
+                message: "with_plan supports only row-ID update, delete and shard operations"
+                    .into(),
             });
         }
         Ok(())
@@ -144,13 +147,16 @@ impl TableUpdate {
     /// like [`ReadBuilder::with_read_type`](super::ReadBuilder::with_read_type).
     /// `None` reads all table fields; `Some(vec![])` returns zero-column batches
     /// with their row counts preserved. Row IDs are tracked internally.
+    /// With [`with_plan`](Self::with_plan), reuse its captured snapshot and
+    /// balance only its complete file groups without replanning manifests.
+    /// Use `(0, 1)` for groups already assigned to this worker. Empty plans
+    /// remain empty even if the table has advanced since planning.
     pub async fn new_shard_updater(
         &self,
         shard: usize,
         shard_count: usize,
         read_type: Option<Vec<DataField>>,
     ) -> crate::Result<super::ShardTableUpdater> {
-        self.ensure_unplanned()?;
         let mut updater = super::ShardTableUpdater::new(
             &self.table,
             read_type,
@@ -159,6 +165,7 @@ impl TableUpdate {
                 .unwrap_or_else(|| self.all_fields()),
             shard,
             shard_count,
+            self.plan.as_ref(),
         )
         .await?;
         updater.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone());

@@ -141,9 +141,7 @@ impl RESTTokenFileIO {
         let merged_props = RESTUtil::merge(Some(self.catalog_options.to_map()), Some(&token.token));
         let mut builder = FileIO::from_path(&self.path)?.with_props(merged_props);
         builder = builder.with_cache_context(self.file_io_cache.clone());
-        if let Some(local_cache) = &self.local_cache {
-            builder = builder.with_local_cache(local_cache.clone());
-        }
+        builder = builder.with_local_cache(self.local_cache.clone());
         builder.build()
     }
 

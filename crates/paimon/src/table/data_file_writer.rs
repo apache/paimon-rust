@@ -116,6 +116,7 @@ impl DataFileWriter {
         let row_sidecar_enabled = options.data_evolution_enabled()
             && options.data_evolution_row_sidecar_enabled()?
             && !file_format.eq_ignore_ascii_case("blob")
+            && !file_format.eq_ignore_ascii_case("video")
             && !file_format.starts_with("vector.");
         Ok(Self {
             row_sidecar_enabled,
@@ -169,6 +170,22 @@ impl DataFileWriter {
         uri_reader_factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
     ) -> Result<()> {
         debug_assert!(self.current_writer.is_none());
+        if self.file_format.eq_ignore_ascii_case("video") {
+            if consumer.is_some() {
+                return Err(crate::Error::Unsupported {
+                    message: "BlobConsumer is not supported for video frame fields".into(),
+                });
+            }
+            self.format_writer_factory = Some(Arc::new(
+                crate::arrow::format::video::VideoWriterFactory::new(
+                    Some(self.file_io.clone()),
+                    Some(&self.write_fields),
+                    Some(&self.format_options),
+                )?
+                .with_uri_reader_factory(uri_reader_factory),
+            ));
+            return Ok(());
+        }
         let mut factory = self.blob_writer_factory()?;
         // Java BlobFormatWriter relinquishes deletion rights whenever a
         // consumer can expose a descriptor, even if a later callback fails.

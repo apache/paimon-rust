@@ -59,6 +59,11 @@ pub(in crate::table) async fn rewrite_indexes(
         ),
     >::new();
     for entry in delta {
+        // Dedicated files never anchor deletion vectors. In a mixed commit,
+        // remap positions only between the replaced normal files.
+        if data_evolution && !crate::table::source::is_data_evolution_normal_file(entry.file()) {
+            continue;
+        }
         let bucket = buckets
             .entry((entry.partition().to_vec(), entry.bucket()))
             .or_default();

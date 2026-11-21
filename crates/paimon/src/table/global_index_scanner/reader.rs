@@ -37,6 +37,7 @@ pub(super) enum OpenedGlobalIndexReader {
     BTree(BTreeIndexReader<BoxedCmp>),
     Bitmap(BitmapGlobalIndexReader),
     FM(FMGlobalIndexReader),
+    RTree(crate::rtree::RTreeIndexReader),
 }
 
 impl OpenedGlobalIndexReader {
@@ -49,6 +50,15 @@ impl OpenedGlobalIndexReader {
         match self {
             Self::BTree(reader) => reader.query(op, literals, data_type).await.map(Some),
             Self::Bitmap(reader) => reader.query(op, literals, data_type).await.map(Some),
+            Self::RTree(reader) => match op {
+                PredicateOperator::BBoxIntersects => reader
+                    .query(crate::rtree::BoundingBox::from_literals(literals)?)
+                    .await
+                    .map(Some),
+                PredicateOperator::IsNull => reader.query_nulls(true).await.map(Some),
+                PredicateOperator::IsNotNull => reader.query_nulls(false).await.map(Some),
+                _ => Ok(None),
+            },
             Self::FM(reader) => match op {
                 PredicateOperator::Contains => {
                     let literal = literals.first().ok_or_else(|| {
@@ -87,7 +97,7 @@ impl OpenedGlobalIndexReader {
                     .range_query(from, to, data_type, from_inclusive, to_inclusive)
                     .await
             }
-            Self::FM(_) => Err(std::io::Error::new(
+            Self::FM(_) | Self::RTree(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "FM index does not support ordered range queries",
             )),
@@ -126,7 +136,9 @@ impl GlobalIndexScanner {
                 GlobalIndexFileKind::Bitmap | GlobalIndexFileKind::Multivalue => {
                     serialize_bitmap_datum
                 }
-                GlobalIndexFileKind::FM => unreachable!("FM range query was rejected in planning"),
+                GlobalIndexFileKind::FM | GlobalIndexFileKind::RTree => {
+                    unreachable!("unsupported ordered range query")
+                }
             };
             let from_key = serialize_key(between.from, between.data_type);
             let to_key = serialize_key(between.to, between.data_type);
@@ -312,6 +324,28 @@ impl GlobalIndexScanner {
                     ),
                     source: Some(Box::new(e)),
                 }),
+            GlobalIndexFileKind::RTree => {
+                let GlobalIndexEntryMeta::RTree(meta, _) = &entry.meta else {
+                    unreachable!("R-tree metadata")
+                };
+                let mut meta = meta.clone();
+                meta.name = entry.resolved_path(&self.table_path);
+                let input = self.file_io.new_input(&meta.name)?;
+                let reader = Arc::new(input.reader_with_size(meta.file_size).await?);
+                let context = self
+                    .field_options(entry)
+                    .and_then(|opts| opts.rtree.as_ref())
+                    .unwrap_or(&self.rtree);
+                let reader = crate::rtree::RTreeIndexReader::new(
+                    vec![crate::rtree::RTreeFileSource { meta, reader }],
+                    (entry.row_range_end - entry.row_range_start + 1) as u64,
+                    context.cache.clone(),
+                    context.batch_bytes,
+                )
+                .map_err(|e| Self::query_error(entry, e))?
+                .with_permits(context.permits.clone());
+                Ok(OpenedGlobalIndexReader::RTree(reader))
+            }
             GlobalIndexFileKind::FM => self
                 .open_fm_reader(entry)
                 .await
@@ -423,7 +457,7 @@ impl GlobalIndexScanner {
                     plan.selected_bitmap += 1;
                     bitmap_valid &= add_file_size(&mut bitmap_total, entry.file_size);
                 }
-                GlobalIndexFileKind::FM => {}
+                GlobalIndexFileKind::FM | GlobalIndexFileKind::RTree => {}
             }
         }
 

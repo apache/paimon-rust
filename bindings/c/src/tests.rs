@@ -26,7 +26,9 @@
 //! must NOT wrap C FFI calls inside another `block_on`. Use the global
 //! runtime only for Rust-API setup (write_data_rust, setup_table_dirs).
 
+mod audit_read;
 mod commit_messages;
+mod read_type;
 mod table_arrow_schema;
 
 use std::collections::HashMap;
@@ -700,6 +702,35 @@ fn test_file_io_external_cache_short_hit_fails_open_to_storage() {
             .unwrap();
         assert_eq!(actual.as_ref(), b"source");
         paimon_file_io_free(result.file_io);
+    }
+}
+
+#[test]
+fn test_table_from_schema_json_accepts_legacy_defaults() {
+    let path = CString::new("memory:/test_legacy_schema").unwrap();
+    let database = CString::new("default").unwrap();
+    let table_name = CString::new("test").unwrap();
+    let mut json = serde_json::to_value(simple_table_schema()).unwrap();
+    json.as_object_mut().unwrap().remove("version");
+    let schema_json = CString::new(serde_json::to_string(&json).unwrap()).unwrap();
+
+    unsafe {
+        let result = paimon_table_from_schema_json(
+            path.as_ptr(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+        );
+        assert!(result.error.is_null());
+        assert!(!result.table.is_null());
+        let schema = table_ref(result.table).schema();
+        assert_eq!(schema.version(), 1);
+        assert_eq!(schema.core_options().bucket(), 1);
+        assert_eq!(schema.core_options().file_format(), "orc");
+        paimon_table_free(result.table);
     }
 }
 

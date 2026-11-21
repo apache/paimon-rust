@@ -144,6 +144,7 @@ mod postpone_retract;
 mod prepared_files;
 mod query_auth;
 pub(crate) mod record_level_expire;
+mod rtree_manifest;
 mod system_table;
 pub use system_table::SystemRead;
 

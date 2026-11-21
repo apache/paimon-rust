@@ -23,8 +23,8 @@
 use super::metadata_cache::FileMetadataCache;
 use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::{
-    arrow_to_paimon_type, build_target_arrow_schema, is_variant_arrow_fields, paimon_type_to_arrow,
-    variant_arrow_type,
+    arrow_field_to_paimon_type, build_target_arrow_schema, is_variant_arrow_fields,
+    paimon_type_to_arrow, paimon_type_to_arrow_field, variant_arrow_type,
 };
 use crate::io::{FileFormatMetadataCacheContext, FileRead, FileWrite, OutputFile};
 use crate::spec::{CoreOptions, DataField, DataType, IntType, VarBinaryType, VariantType};
@@ -293,7 +293,7 @@ pub(super) fn row_type_from_arrow_schema(schema: &SchemaRef) -> crate::Result<Ve
         .iter()
         .enumerate()
         .map(|(idx, field)| {
-            let data_type = arrow_to_paimon_type(field.data_type(), field.is_nullable())?;
+            let data_type = arrow_field_to_paimon_type(field)?;
             Ok(DataField::new(idx as i32, field.name().clone(), data_type))
         })
         .collect()
@@ -519,7 +519,13 @@ fn validate_arrow_type_for_row_field(
         | (ArrowDataType::Float32, DataType::Float(_))
         | (ArrowDataType::Float64, DataType::Double(_))
         | (ArrowDataType::Utf8, DataType::Char(_) | DataType::VarChar(_))
-        | (ArrowDataType::Binary, DataType::Binary(_) | DataType::VarBinary(_))
+        | (
+            ArrowDataType::Binary,
+            DataType::Binary(_)
+            | DataType::VarBinary(_)
+            | DataType::Geometry(_)
+            | DataType::Geography(_),
+        )
         | (ArrowDataType::LargeBinary, DataType::Blob(_))
         | (ArrowDataType::Date32, DataType::Date(_))
         | (ArrowDataType::Time32(TimeUnit::Millisecond), DataType::Time(_)) => true,
@@ -646,6 +652,8 @@ fn validate_supported_type(data_type: &DataType) -> crate::Result<()> {
         | DataType::VarChar(_)
         | DataType::Binary(_)
         | DataType::VarBinary(_)
+        | DataType::Geometry(_)
+        | DataType::Geography(_)
         | DataType::Variant(_)
         | DataType::Blob(_)
         | DataType::Date(_)
@@ -780,7 +788,10 @@ fn write_field_value(
                 .value(row_idx)
                 .as_bytes(),
         ),
-        DataType::Binary(_) | DataType::VarBinary(_) => write_bytes(
+        DataType::Binary(_)
+        | DataType::VarBinary(_)
+        | DataType::Geometry(_)
+        | DataType::Geography(_) => write_bytes(
             out,
             downcast::<BinaryArray>(array, data_type)?.value(row_idx),
         ),
@@ -1348,7 +1359,10 @@ impl ColumnBuilder {
             DataType::Float(_) => Self::F32(Float32Builder::with_capacity(capacity)),
             DataType::Double(_) => Self::F64(Float64Builder::with_capacity(capacity)),
             DataType::Char(_) | DataType::VarChar(_) => Self::String(StringBuilder::new()),
-            DataType::Binary(_) | DataType::VarBinary(_) => Self::Binary(BinaryBuilder::new()),
+            DataType::Binary(_)
+            | DataType::VarBinary(_)
+            | DataType::Geometry(_)
+            | DataType::Geography(_) => Self::Binary(BinaryBuilder::new()),
             DataType::Blob(_) => Self::LargeBinary(LargeBinaryBuilder::new()),
             DataType::Variant(_) => Self::Row {
                 fields: variant_arrow_fields(),
@@ -1381,11 +1395,7 @@ impl ColumnBuilder {
                     })?,
             ),
             DataType::Array(a) => Self::Array {
-                field: Arc::new(Field::new(
-                    "element",
-                    paimon_type_to_arrow(a.element_type())?,
-                    a.element_type().is_nullable(),
-                )),
+                field: Arc::new(paimon_type_to_arrow_field("element", a.element_type())?),
                 offsets: vec![0],
                 validities: Vec::with_capacity(capacity),
                 values: Box::new(ColumnBuilder::new(a.element_type(), capacity)?),
@@ -1516,7 +1526,13 @@ impl ColumnBuilder {
                 })?;
                 b.append_value(value);
             }
-            (Self::Binary(b), DataType::Binary(_) | DataType::VarBinary(_)) => {
+            (
+                Self::Binary(b),
+                DataType::Binary(_)
+                | DataType::VarBinary(_)
+                | DataType::Geometry(_)
+                | DataType::Geography(_),
+            ) => {
                 b.append_value(input.read_bytes()?);
             }
             (Self::LargeBinary(b), DataType::Blob(_)) => b.append_value(input.read_bytes()?),
@@ -1891,13 +1907,7 @@ fn append_binary_value(
 fn arrow_fields_for_row(fields: &[DataField]) -> crate::Result<Fields> {
     let fields = fields
         .iter()
-        .map(|field| {
-            Ok(Arc::new(Field::new(
-                field.name(),
-                paimon_type_to_arrow(field.data_type())?,
-                field.data_type().is_nullable(),
-            )))
-        })
+        .map(|field| paimon_type_to_arrow_field(field.name(), field.data_type()).map(Arc::new))
         .collect::<crate::Result<Vec<_>>>()?;
     Ok(fields.into())
 }
@@ -1923,16 +1933,8 @@ fn map_entries_field(
     value_nullable: bool,
 ) -> crate::Result<Arc<Field>> {
     let fields: Fields = vec![
-        Arc::new(Field::new(
-            "key",
-            paimon_type_to_arrow(key_type)?,
-            key_nullable,
-        )),
-        Arc::new(Field::new(
-            "value",
-            paimon_type_to_arrow(value_type)?,
-            value_nullable,
-        )),
+        Arc::new(paimon_type_to_arrow_field("key", key_type)?.with_nullable(key_nullable)),
+        Arc::new(paimon_type_to_arrow_field("value", value_type)?.with_nullable(value_nullable)),
     ]
     .into();
     Ok(Arc::new(Field::new(

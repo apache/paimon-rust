@@ -320,7 +320,7 @@ async fn compact_moves_latest_deletion_vectors_and_keeps_physical_slots() {
 }
 
 #[tokio::test]
-async fn compact_retains_dedicated_blob_and_vector_files() {
+async fn compact_keeps_vector_files_and_only_rewrites_blobs_when_enabled() {
     use arrow_array::{types::Float32Type, FixedSizeListArray, LargeBinaryArray};
     use paimon::spec::{BlobType, FloatType, VectorType};
 
@@ -375,14 +375,14 @@ async fn compact_retains_dedicated_blob_and_vector_files() {
     read.with_projection(&["id", "payload", "embedding"])
         .unwrap();
     let original = read.new_scan().plan().await.unwrap();
-    let blobs = original
+    let dedicated_files = original
         .splits()
         .iter()
         .flat_map(|split| split.data_files())
         .filter(|file| file.file_name.ends_with(".blob") || file.file_name.contains(".vector."))
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(blobs.len(), 4);
+    assert_eq!(dedicated_files.len(), 4);
     let (_, results) = execute(&table).await;
     assert_eq!(
         results[0].files()[0].write_cols,
@@ -396,12 +396,40 @@ async fn compact_retains_dedicated_blob_and_vector_files() {
         .await
         .unwrap();
     let latest = read.new_scan().plan().await.unwrap();
-    for blob in blobs {
+    for file in &dedicated_files {
         assert!(latest
             .splits()
             .iter()
             .flat_map(|split| split.data_files())
-            .any(|file| file == &blob));
+            .any(|active| active == file));
+    }
+    let builder = table.new_compact_builder().with_blob_compaction(true);
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    assert_eq!(plan.tasks().len(), 1);
+    let result = builder
+        .new_executor()
+        .unwrap()
+        .execute(&plan.tasks()[0])
+        .await
+        .unwrap();
+    assert_eq!(result.files().len(), 1);
+    assert!(result.files()[0].file_name.ends_with(".blob"));
+    builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(vec![result])
+        .await
+        .unwrap();
+    let latest = read.new_scan().plan().await.unwrap();
+    for vector in dedicated_files
+        .iter()
+        .filter(|file| file.file_name.contains(".vector."))
+    {
+        assert!(latest
+            .splits()
+            .iter()
+            .flat_map(|split| split.data_files())
+            .any(|file| file == vector));
     }
     let batches: Vec<RecordBatch> = read
         .new_read()

@@ -17,10 +17,11 @@
 
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::SessionState;
+use datafusion::logical_expr::Volatility;
 use datafusion::sql::sqlparser::ast::{
-    DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause,
-    FunctionArguments, Ident, NullTreatment, ObjectName, Select, SelectItem, Statement, Value,
-    VisitMut, VisitorMut,
+    visit_expressions, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArgumentClause, FunctionArguments, Ident, NullTreatment, ObjectName, Select,
+    SelectItem, Statement, Value, VisitMut, VisitorMut,
 };
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use std::ops::ControlFlow;
@@ -37,6 +38,7 @@ pub(crate) fn is_aggregate(name: &str) -> bool {
             | "min_by"
             | "arg_max"
             | "listagg"
+            | "group_concat"
     )
 }
 fn error(message: impl Into<String>) -> DataFusionError {
@@ -73,7 +75,10 @@ fn set_args(call: &mut Function, args: Vec<Expr>) {
             .collect();
     }
 }
-fn lower_aggregate(call: &Function, name: &str) -> Result<Expr> {
+fn lower_aggregate(call: &Function, name: &str, state: &SessionState) -> Result<Expr> {
+    if name == "group_concat" {
+        return lower_group_concat(call, state);
+    }
     let args = arguments(call)?;
     let mut lowered = call.clone();
     if !call.within_group.is_empty() && name != "listagg" {
@@ -208,6 +213,127 @@ fn lower_aggregate(call: &Function, name: &str) -> Result<Expr> {
     Ok(Expr::Function(lowered))
 }
 
+fn contains_volatile_function(expr: &Expr, state: &SessionState) -> bool {
+    matches!(
+        visit_expressions(expr, |expr| {
+            if let Expr::Function(call) = expr {
+                let name = if call.name.0.len() == 1 {
+                    let Some(ident) = call.name.0[0].as_ident() else {
+                        return ControlFlow::Continue(());
+                    };
+                    if ident.quote_style.is_some() {
+                        ident.value.clone()
+                    } else {
+                        ident.value.to_ascii_lowercase()
+                    }
+                } else {
+                    call.name.to_string()
+                };
+                let volatile = state.scalar_functions().get(&name).is_some_and(|function| {
+                    function.signature().volatility == Volatility::Volatile
+                }) || state.higher_order_functions().get(&name).is_some_and(
+                    |function| function.signature().volatility == Volatility::Volatile,
+                ) || state.aggregate_functions().get(&name).is_some_and(
+                    |function| function.signature().volatility == Volatility::Volatile,
+                ) || state.window_functions().get(&name).is_some_and(|function| {
+                    function.signature().volatility == Volatility::Volatile
+                });
+                if volatile {
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        }),
+        ControlFlow::Break(())
+    )
+}
+
+fn lower_group_concat(call: &Function, state: &SessionState) -> Result<Expr> {
+    let args = arguments(call)?;
+    if args.is_empty() || !call.within_group.is_empty() || call.null_treatment.is_some() {
+        return Err(error(
+            "GROUP_CONCAT requires expressions and does not accept WITHIN GROUP or NULL modifiers",
+        ));
+    }
+    let mut aggregate = call.clone();
+    aggregate.name = ObjectName::from(vec![Ident::new("array_agg")]);
+    aggregate.null_treatment = Some(NullTreatment::IgnoreNulls);
+    let FunctionArguments::List(list) = &mut aggregate.args else {
+        unreachable!()
+    };
+    if args.len() > 1 && list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+        return Err(error("GROUP_CONCAT DISTINCT supports one expression"));
+    }
+    let mut separator = None;
+    let mut clauses = Vec::new();
+    for clause in &list.clauses {
+        match clause {
+            FunctionArgumentClause::Separator(value) => {
+                if separator.is_some() || !matches!(value.value, Value::SingleQuotedString(_)) {
+                    return Err(error("GROUP_CONCAT SEPARATOR must be one string literal"));
+                }
+                separator = Some(Expr::Value(value.clone()));
+            }
+            FunctionArgumentClause::OrderBy(ordering) => {
+                let mut ordering = ordering.clone();
+                for key in &mut ordering {
+                    if let Expr::Value(value) = &key.expr {
+                        if let Value::Number(number, _) = &value.value {
+                            if number.chars().all(|ch| ch.is_ascii_digit()) {
+                                let index = number
+                                    .parse::<usize>()
+                                    .ok()
+                                    .and_then(|index| index.checked_sub(1))
+                                    .filter(|index| *index < args.len())
+                                    .ok_or_else(|| {
+                                        error(format!(
+                                        "GROUP_CONCAT ORDER BY position must be between 1 and {}",
+                                        args.len()
+                                    ))
+                                    })?;
+                                if contains_volatile_function(&args[index], state) {
+                                    return Err(error("GROUP_CONCAT ORDER BY position cannot reference a volatile expression; compute the expression in a subquery first"));
+                                }
+                                key.expr = Expr::Nested(Box::new(args[index].clone()));
+                            } else {
+                                // DataFusion treats a bare numeric aggregate sort key
+                                // as an input-column index. Non-integer literals here
+                                // are ordinary constants, not argument positions.
+                                key.expr = Expr::Nested(Box::new(key.expr.clone()));
+                            }
+                        }
+                    }
+                }
+                clauses.push(FunctionArgumentClause::OrderBy(ordering));
+            }
+            _ => return Err(error("Unsupported GROUP_CONCAT argument modifier")),
+        }
+    }
+    list.clauses = clauses;
+    let value = if args.len() == 1 {
+        args[0].clone()
+    } else {
+        // Evaluate every input once. A CASE-based NULL guard would evaluate
+        // volatile arguments again when concatenating the non-NULL row.
+        let strings = args
+            .iter()
+            .map(|arg| format!("CAST(({arg}) AS STRING)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        expression(&format!("__paimon_group_concat_row({strings})"))?
+    };
+    set_args(&mut aggregate, vec![value]);
+    let separator = separator.unwrap_or(expression("','")?);
+    // Aggregate before converting to text so DISTINCT and numeric ORDER BY
+    // retain their original types. Empty/all-NULL groups return NULL, but a
+    // group containing an empty string still returns an empty string. Convert
+    // elements with Arrow's STRING cast after aggregation so all argument
+    // counts share the same formatting, including integral floating values.
+    expression(&format!(
+        "CASE WHEN cardinality({aggregate}) > 0 THEN array_to_string(arrow_cast({aggregate}, 'List(Utf8)'), {separator}) ELSE CAST(NULL AS STRING) END"
+    ))
+}
+
 struct Rewriter<'a> {
     state: &'a SessionState,
     changed: bool,
@@ -257,7 +383,7 @@ impl VisitorMut for Rewriter<'_> {
                             || self.state.window_functions().contains_key(&name)
                             || self.state.higher_order_functions().contains_key(&name);
                         if is_aggregate(&name) && !registered {
-                            return lower_aggregate(call, &name).map(Some);
+                            return lower_aggregate(call, &name, self.state).map(Some);
                         }
                     }
                 }

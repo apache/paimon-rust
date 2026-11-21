@@ -378,31 +378,22 @@ impl VectorSearchExec {
     }
 
     async fn compute_batch(&self) -> DFResult<RecordBatch> {
-        let prepared_filter = match &self.filter {
-            Some(filter) => Some(
-                self.table
-                    .prepare_vector_search_filter(filter.clone())
-                    .await
-                    .map_err(to_datafusion_error)?,
-            ),
-            None => None,
-        };
-        let search_table = prepared_filter
-            .as_ref()
-            .map(|prepared| prepared.table())
-            .unwrap_or(&self.table);
+        let snapshot = await_with_runtime(self.table.resolve_read_snapshot())
+            .await
+            .map_err(to_datafusion_error)?;
+        let search_table = self.table.copy_with_pinned_snapshot(snapshot.as_ref());
 
         // Best-first row-ids from the index, searched at the full top-k so the ANN
         // recall is unchanged (data-evolution / global-index path; PK-vector tables are
         // unsupported here, as before).
         let mut search_result = await_with_runtime(async {
-            let mut builder = self.table.new_batch_vector_search_builder();
+            let mut builder = search_table.new_batch_vector_search_builder();
             builder
                 .with_vector_column(&self.column_name)
                 .with_query_vectors(vec![self.query_vector.clone()])
                 .with_limit(self.search_limit);
-            if let Some(prepared) = &prepared_filter {
-                builder.with_prepared_filter(prepared.clone());
+            if let Some(filter) = &self.filter {
+                builder.with_filter(filter.clone());
             }
             let mut results = builder.execute().await.map_err(to_datafusion_error)?;
             results
@@ -428,7 +419,7 @@ impl VectorSearchExec {
 
         // Read the projected columns (+ internal `_ROW_ID`); the row-range scan yields
         // file order, realigned to relevance rank below.
-        let read_fields = projected_read_fields(search_table, self.projection.as_ref())?;
+        let read_fields = projected_read_fields(&search_table, self.projection.as_ref())?;
         let row_ranges = search_result.to_row_ranges().map_err(to_datafusion_error)?;
         let batches = await_with_runtime(async {
             let mut read_builder = search_table.new_read_builder();
@@ -655,6 +646,37 @@ mod tests {
 
     use super::*;
     use crate::SQLContext;
+
+    #[test]
+    fn unfiltered_snapshot_io_uses_runtime_bridge_when_polled_without_tokio() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table = crate::runtime::runtime().block_on(async {
+            let mut options = Options::new();
+            options.set(CatalogOptions::WAREHOUSE, format!("file://{}", temp_dir.path().display()));
+            let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+            let mut context = SQLContext::new();
+            context.register_catalog("paimon", catalog.clone()).await.unwrap();
+            context.sql("CREATE TABLE paimon.default.no_runtime_vectors (id INT, embedding ARRAY<FLOAT>) \
+                WITH ('data-evolution.enabled' = 'true', 'row-tracking.enabled' = 'true')")
+                .await.unwrap();
+            context.sql("INSERT INTO paimon.default.no_runtime_vectors (id) VALUES (1)")
+                .await.unwrap().collect().await.unwrap();
+            catalog.get_table(&paimon::catalog::Identifier::new("default", "no_runtime_vectors"))
+                .await.unwrap()
+        });
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let exec = VectorSearchExec::new(
+            table,
+            "embedding".into(),
+            vec![1.0],
+            1,
+            None,
+            None,
+            Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+        );
+        let batch = futures::executor::block_on(exec.compute_batch()).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+    }
 
     #[tokio::test]
     async fn test_vector_search_applies_supported_session_dynamic_options() {

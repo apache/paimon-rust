@@ -268,6 +268,7 @@ pub(crate) struct ReadBuilderState {
     pub table: Table,
     pub resources: Option<ResourceContext>,
     pub projected_columns: Option<Vec<String>>,
+    pub read_type: Option<Vec<DataField>>,
     pub filter: Option<Predicate>,
     pub case_sensitive: bool,
     pub limit: Option<usize>,
@@ -276,6 +277,7 @@ pub(crate) struct ReadBuilderState {
 /// Internal state for TableScan that stores table and filter.
 pub(crate) struct TableScanState {
     pub table: Table,
+    pub read_type: Option<Vec<DataField>>,
     pub filter: Option<Predicate>,
     pub limit: Option<usize>,
 }

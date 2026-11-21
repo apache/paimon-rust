@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{timestamp_millis_schema, FilePredicates, FormatFileReader};
+use super::{panic_payload_message, timestamp_millis_schema, FilePredicates, FormatFileReader};
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::filtering::{
     predicates_may_match_with_schema, remap_predicates_to_file, StatsAccessor,
@@ -512,16 +512,6 @@ fn read_planned_row_group(
         .map_err(mosaic_read_error)?;
     let batch = row_group_reader.read_columns().map_err(mosaic_read_error)?;
     take_row_slices(batch, plan.selected_slices.as_deref(), read_schema)
-}
-
-fn panic_payload_message(panic: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = panic.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = panic.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic payload".to_string()
-    }
 }
 
 fn apply_mosaic_residual(
@@ -2029,6 +2019,58 @@ mod tests {
             .unwrap();
 
         assert_eq!(collect_i32_column(&batches, 0), vec![1, 2, 10, 11, 20, 21]);
+    }
+
+    #[tokio::test]
+    async fn test_read_predicate_missing_column_under_not_stays_null() {
+        // The file omits `new_name`, so it is NULL in every row. A NOT over a
+        // leaf on it is still NULL and keeps no row; null checks still flip.
+        let mut fields = data_fields();
+        let missing_field = field(
+            3,
+            "new_name",
+            DataType::VarChar(VarCharType::with_nullable(true, 20).unwrap()),
+        );
+        fields.push(missing_field.clone());
+        let pb = PredicateBuilder::new(&fields);
+        let starts = pb
+            .starts_with("new_name", Datum::String("a".to_string()))
+            .unwrap();
+        let id_is_1 = pb.equal("id", Datum::Int(1)).unwrap();
+        let all = vec![1, 2, 10, 11, 20, 21];
+        for (predicate, expected) in [
+            (crate::spec::Predicate::negate(starts.clone()), vec![]),
+            (
+                crate::spec::Predicate::negate(crate::spec::Predicate::and(vec![
+                    starts.clone(),
+                    id_is_1.clone(),
+                ])),
+                vec![2, 10, 11, 20, 21],
+            ),
+            (
+                crate::spec::Predicate::negate(crate::spec::Predicate::or(vec![
+                    starts.clone(),
+                    id_is_1,
+                ])),
+                vec![],
+            ),
+            (
+                crate::spec::Predicate::negate(pb.is_null("new_name").unwrap()),
+                vec![],
+            ),
+            (
+                crate::spec::Predicate::negate(pb.is_not_null("new_name").unwrap()),
+                all,
+            ),
+        ] {
+            let predicates = predicate_file_predicates(fields.clone(), vec![predicate.clone()]);
+            let projected = vec![fields[0].clone(), missing_field.clone()];
+            let data = multi_row_group_mosaic(vec!["id".to_string()]);
+            let batches = read_batches_with_predicates(data, &projected, Some(&predicates), None)
+                .await
+                .unwrap();
+            assert_eq!(collect_i32_column(&batches, 0), expected, "{predicate:?}");
+        }
     }
 
     #[tokio::test]

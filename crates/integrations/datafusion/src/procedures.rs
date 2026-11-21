@@ -73,9 +73,10 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
     Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArgOperator,
-    FunctionArguments, ObjectName, Value as SqlValue,
+    FunctionArguments, Ident, ObjectName, Value as SqlValue,
 };
 use paimon::api::{
     ColumnMask, DataPolicy, ListPermissionsRequest, ListPoliciesRequest, PermissionAssignment,
@@ -84,12 +85,15 @@ use paimon::api::{
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::spec::{CoreOptions, DataType, Datum, Predicate, PredicateBuilder, Snapshot};
 use paimon::table::{
-    normalize_global_index_type, BranchManager, CompactMetrics, ConsumerManager, SnapshotManager,
-    Table, TagManager, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
+    normalize_global_index_type, BranchManager, CompactMetrics, ConsumerManager, Instant,
+    SnapshotManager, Table, TagManager, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
 
 use crate::error::to_datafusion_error;
 use crate::memory::compact_resources;
+use crate::SQLContext;
+
+mod compat;
 
 /// Default `index_type` for the global index procedures when the argument is
 /// omitted, matching Java's `CreateGlobalIndexProcedure`.
@@ -220,13 +224,38 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
         "reset_consumer" => &["table", "consumer_id", "next_snapshot_id"],
         "clear_consumers" => &["table", "including_consumers", "excluding_consumers"],
         "rollback_to" => &["table", "snapshot_id", "tag"],
+        "rollback" => &["table", "version", "snapshot", "tag"],
+        "drop_partition" => &["table", "partitions"],
+        "create_function" => &[
+            "function",
+            "inputparams",
+            "returnparams",
+            "deterministic",
+            "comment",
+            "options",
+        ],
+        "drop_function" => &["function"],
+        "vector_search" => &[
+            "table",
+            "vector_column",
+            "query_vector",
+            "top_k",
+            "projection",
+        ],
+        "full_text_search" => &["table", "column", "query", "top_k", "projection"],
         "rollback_to_timestamp" => &["table", "timestamp"],
         "create_tag_from_timestamp" => &["table", "tag", "timestamp"],
         "create_tag_from_watermark" => &["table", "tag", "watermark", "time_retained"],
         "rename_branch" => &["table", "from_branch", "to_branch"],
         "delete_branch" => &["table", "branch"],
         "fast_forward" => &["table", "branch"],
-        "create_global_index" => &["table", "index_column", "index_type", "options"],
+        "create_global_index" => &[
+            "table",
+            "index_column",
+            "index_type",
+            "partitions",
+            "options",
+        ],
         "drop_global_index" => &[
             "table",
             "index_column",
@@ -312,18 +341,33 @@ fn reject_unknown_args(proc_name: &str, args: &HashMap<String, String>) -> DFRes
     Ok(())
 }
 
-pub async fn execute_call(
-    ctx: &SessionContext,
+pub(crate) async fn execute_call(
+    sql_ctx: &SQLContext,
     catalogs: &HashMap<String, Arc<dyn Catalog>>,
     current_catalog: &str,
     func: &Function,
 ) -> DFResult<DataFrame> {
-    let (explicit_catalog, proc_name) = extract_procedure_name(&func.name)?;
-    let catalog_name = explicit_catalog.as_deref().unwrap_or(current_catalog);
+    let normalizer = IdentNormalizer::new(sql_ctx.ctx().enable_ident_normalization());
+    let (explicit_catalog, proc_name) = extract_procedure_name(&func.name, &normalizer)?;
+    // Catalog registrations are exact keys. Preserve an exact match before
+    // applying SQL case folding to an unquoted qualifier.
+    let catalog_name = match explicit_catalog {
+        Some(catalog) if catalogs.contains_key(&catalog.value) => catalog.value,
+        Some(catalog) => normalizer.normalize(catalog),
+        None => current_catalog.to_string(),
+    };
     let catalog = catalogs
-        .get(catalog_name)
+        .get(&catalog_name)
         .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'")))?;
-    execute_procedure(ctx, catalog, catalog_name, &proc_name, &func.args).await
+    execute_procedure_with_context(
+        sql_ctx.ctx(),
+        catalog,
+        &catalog_name,
+        &proc_name,
+        &func.args,
+        Some(sql_ctx),
+    )
+    .await
 }
 
 pub async fn execute_procedure(
@@ -333,7 +377,18 @@ pub async fn execute_procedure(
     proc_name: &str,
     arguments: &FunctionArguments,
 ) -> DFResult<DataFrame> {
-    let args = extract_named_args(ctx, arguments)?;
+    execute_procedure_with_context(ctx, catalog, catalog_name, proc_name, arguments, None).await
+}
+
+async fn execute_procedure_with_context(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    proc_name: &str,
+    arguments: &FunctionArguments,
+    sql_ctx: Option<&SQLContext>,
+) -> DFResult<DataFrame> {
+    let (args, positional_partitions) = extract_args(ctx, proc_name, arguments)?;
     reject_unknown_args(proc_name, &args)?;
 
     match proc_name {
@@ -344,6 +399,23 @@ pub async fn execute_procedure(
         "rename_tag" => proc_rename_tag(ctx, catalog, catalog_name, &args).await,
         "reset_consumer" => proc_reset_consumer(ctx, catalog, catalog_name, &args).await,
         "clear_consumers" => proc_clear_consumers(ctx, catalog, catalog_name, &args).await,
+        "rollback" => compat::rollback(ctx, catalog, catalog_name, &args, sql_ctx).await,
+        "drop_partition" => {
+            compat::drop_partition(
+                ctx,
+                catalog,
+                catalog_name,
+                &args,
+                &positional_partitions,
+                sql_ctx,
+            )
+            .await
+        }
+        "create_function" => compat::create_function(ctx, catalog, catalog_name, &args).await,
+        "drop_function" => compat::drop_function(ctx, catalog, catalog_name, &args).await,
+        "vector_search" | "full_text_search" => {
+            compat::search(ctx, catalog, catalog_name, proc_name, &args, sql_ctx)
+        }
         "rollback_to" => proc_rollback_to(ctx, catalog, catalog_name, &args).await,
         "rollback_to_timestamp" => {
             proc_rollback_to_timestamp(ctx, catalog, catalog_name, &args).await
@@ -373,29 +445,56 @@ pub async fn execute_procedure(
 }
 
 /// Returns (optional_catalog_name, procedure_name).
-fn extract_procedure_name(name: &ObjectName) -> DFResult<(Option<String>, String)> {
-    let parts: Vec<String> = name
+fn extract_procedure_name(
+    name: &ObjectName,
+    normalizer: &IdentNormalizer,
+) -> DFResult<(Option<Ident>, String)> {
+    let parts = name
         .0
         .iter()
-        .filter_map(|p| p.as_ident().map(|id| id.value.clone()))
-        .collect();
-    match parts.len() {
-        1 => Ok((None, parts[0].clone())),
-        2 => Ok((None, parts[1].clone())),
-        3 => Ok((Some(parts[0].clone()), parts[2].clone())),
-        _ => Err(DataFusionError::Plan(format!(
+        .map(|part| part.as_ident())
+        .collect::<Option<Vec<_>>>();
+    let (catalog, namespace, procedure) = match parts.as_deref() {
+        Some([procedure]) => (None, None, *procedure),
+        Some([namespace, procedure]) => (None, Some(*namespace), *procedure),
+        Some([catalog, namespace, procedure]) => {
+            (Some((*catalog).clone()), Some(*namespace), *procedure)
+        }
+        _ => return Err(DataFusionError::Plan(format!(
             "Invalid procedure name: {name}. Expected procedure_name, sys.procedure_name, or catalog.sys.procedure_name"
         ))),
+    };
+    let procedure = normalizer.normalize(procedure.clone());
+    if is_compatibility_procedure(&procedure)
+        && namespace.is_some_and(|namespace| normalizer.normalize(namespace.clone()) != "sys")
+    {
+        return Err(DataFusionError::Plan(format!(
+            "Procedure '{procedure}' requires the sys procedure namespace"
+        )));
     }
+    Ok((catalog, procedure))
 }
 
-fn extract_named_args(
+fn is_compatibility_procedure(name: &str) -> bool {
+    matches!(
+        name,
+        "rollback"
+            | "drop_partition"
+            | "create_function"
+            | "drop_function"
+            | "vector_search"
+            | "full_text_search"
+    )
+}
+
+fn extract_args(
     ctx: &SessionContext,
+    proc_name: &str,
     args: &FunctionArguments,
-) -> DFResult<HashMap<String, String>> {
+) -> DFResult<(HashMap<String, String>, Vec<String>)> {
     let arg_list = match args {
         FunctionArguments::List(list) => &list.args,
-        FunctionArguments::None => return Ok(HashMap::new()),
+        FunctionArguments::None => return Ok((HashMap::new(), Vec::new())),
         _ => {
             return Err(DataFusionError::Plan(
                 "Unsupported argument format for CALL".to_string(),
@@ -403,35 +502,75 @@ fn extract_named_args(
         }
     };
 
-    let mut map = HashMap::new();
-    for arg in arg_list {
-        match arg {
+    let compatibility_call = is_compatibility_procedure(proc_name);
+    let positional =
+        compatibility_call && matches!(arg_list.first(), Some(FunctionArg::Unnamed(_)));
+    let mut map = HashMap::<String, String>::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut positional_partitions = Vec::new();
+    for (index, arg) in arg_list.iter().enumerate() {
+        let (name, expr) = match arg {
             FunctionArg::Named {
                 name,
                 arg: FunctionArgExpr::Expr(expr),
                 operator: FunctionArgOperator::RightArrow,
-            } => {
-                let value = match expr_to_string(expr) {
-                    Ok(value) => value,
-                    Err(error) if matches!(expr, SqlExpr::Value(_)) => return Err(error),
-                    Err(_) => constant_argument(ctx, expr)?,
+            } if !positional => (name.value.to_lowercase(), expr),
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) if positional => {
+                let parameters = declared_parameters(proc_name).unwrap_or_default();
+                let parameter_index = if proc_name == "drop_partition" {
+                    index.min(1)
+                } else {
+                    index
                 };
-                let name = name.value.to_lowercase();
-                // Java `PaimonProcedureResolver.buildNameToArgumentMap` rejects a repeat
-                // rather than letting the last one win.
-                if map.insert(name.clone(), value).is_some() {
-                    return Err(DataFusionError::Plan(format!(
-                        "Procedure argument {name} is duplicated."
-                    )));
-                }
+                let name = parameters.get(parameter_index).ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "{proc_name} accepts at most {} positional arguments",
+                        parameters.len()
+                    ))
+                })?;
+                (name.to_string(), expr)
+            }
+            _ if compatibility_call => {
+                return Err(DataFusionError::Plan(
+                    "CALL arguments must be either all positional or all named with '=>' syntax"
+                        .to_string(),
+                ))
             }
             _ => return Err(DataFusionError::Plan(
                 "CALL procedures require named arguments with '=>' syntax, e.g. table => 'db.t'"
                     .to_string(),
             )),
+        };
+        // Positional DROP PARTITION repeats the partition argument for each specification.
+        let variadic_partition = positional && proc_name == "drop_partition" && index > 0;
+        if !variadic_partition && !seen.insert(name.clone()) {
+            return Err(DataFusionError::Plan(format!(
+                "Procedure argument {name} is duplicated."
+            )));
+        }
+        if compatibility_call
+            && proc_name != "drop_partition"
+            && matches!(expr, SqlExpr::Value(value) if value.value == SqlValue::Null)
+        {
+            if !declared_parameters(proc_name).is_some_and(|names| names.contains(&name.as_str())) {
+                return Err(DataFusionError::Plan(format!(
+                    "Argument {name} is unknown."
+                )));
+            }
+            continue;
+        }
+        let value = match expr_to_string(expr) {
+            Ok(value) => value,
+            Err(error) if matches!(expr, SqlExpr::Value(_)) => return Err(error),
+            Err(_) => constant_argument(ctx, expr)?,
+        };
+        if variadic_partition {
+            positional_partitions.push(value);
+        } else {
+            map.insert(name, value);
         }
     }
-    Ok(map)
+    Ok((map, positional_partitions))
 }
 
 fn expr_to_string(expr: &SqlExpr) -> DFResult<String> {
@@ -1085,61 +1224,53 @@ async fn proc_rollback_to(
     args: &HashMap<String, String>,
 ) -> DFResult<DataFrame> {
     let table = get_table(catalog, catalog_name, args).await?;
-
-    if let Some(rest_env) = table.rest_env() {
-        if let Some(id_str) = args.get("snapshot_id") {
-            let id: i64 = id_str
-                .parse()
-                .map_err(|_| DataFusionError::Plan(format!("Invalid snapshot_id: '{id_str}'")))?;
-            rest_env
-                .api()
-                .rollback_to(
-                    rest_env.identifier(),
-                    &paimon::table::Instant::snapshot(id),
-                    None,
-                    Some(rest_env.uuid()),
-                )
-                .await
-                .map_err(to_datafusion_error)?;
-        } else if let Some(tag_name) = args.get("tag") {
-            rest_env
-                .api()
-                .rollback_to(
-                    rest_env.identifier(),
-                    &paimon::table::Instant::tag(tag_name),
-                    None,
-                    Some(rest_env.uuid()),
-                )
-                .await
-                .map_err(to_datafusion_error)?;
-        } else {
-            return Err(DataFusionError::Plan(
-                "rollback_to requires either 'snapshot_id' or 'tag' argument".to_string(),
-            ));
-        }
+    let target = if let Some(id_str) = args.get("snapshot_id") {
+        let id = id_str
+            .parse()
+            .map_err(|_| DataFusionError::Plan(format!("Invalid snapshot_id: '{id_str}'")))?;
+        Instant::snapshot(id)
+    } else if let Some(tag_name) = args.get("tag") {
+        Instant::tag(tag_name)
     } else {
-        let (sm, tm) = managers(&table);
-        if let Some(id_str) = args.get("snapshot_id") {
-            let id: i64 = id_str
-                .parse()
-                .map_err(|_| DataFusionError::Plan(format!("Invalid snapshot_id: '{id_str}'")))?;
-            let snapshot = resolve_snapshot_by_id(&sm, &tm, id).await?;
-            rollback_to_snapshot(&sm, &tm, &snapshot).await?;
-        } else if let Some(tag_name) = args.get("tag") {
-            let snapshot = tm
-                .get(tag_name)
-                .await
-                .map_err(to_datafusion_error)?
-                .ok_or_else(|| DataFusionError::Plan(format!("Tag '{tag_name}' does not exist")))?;
-            rollback_to_snapshot(&sm, &tm, &snapshot).await?;
-        } else {
-            return Err(DataFusionError::Plan(
-                "rollback_to requires either 'snapshot_id' or 'tag' argument".to_string(),
-            ));
-        }
-    }
-
+        return Err(DataFusionError::Plan(
+            "rollback_to requires either 'snapshot_id' or 'tag' argument".to_string(),
+        ));
+    };
+    rollback_table(&table, &target, None).await?;
     ok_result(ctx)
+}
+
+async fn resolve_rollback_target(table: &Table, target: &Instant) -> DFResult<Snapshot> {
+    let (sm, tm) = (table.snapshot_manager(), table.tag_manager());
+    match target {
+        Instant::Snapshot { snapshot_id } => resolve_snapshot_by_id(&sm, &tm, *snapshot_id).await,
+        Instant::Tag { tag_name } => tm
+            .get(tag_name)
+            .await
+            .map_err(to_datafusion_error)?
+            .ok_or_else(|| DataFusionError::Plan(format!("Tag '{tag_name}' does not exist"))),
+    }
+}
+
+async fn rollback_table(
+    table: &Table,
+    target: &Instant,
+    previous_snapshot: Option<i64>,
+) -> DFResult<()> {
+    if let Some(rest_env) = table.rest_env() {
+        return rest_env
+            .api()
+            .rollback_to(
+                rest_env.identifier(),
+                target,
+                previous_snapshot,
+                Some(rest_env.uuid()),
+            )
+            .await
+            .map_err(to_datafusion_error);
+    }
+    let snapshot = resolve_rollback_target(table, target).await?;
+    rollback_to_snapshot(&table.snapshot_manager(), &table.tag_manager(), &snapshot).await
 }
 
 async fn proc_rollback_to_timestamp(
@@ -1271,6 +1402,11 @@ async fn proc_create_global_index(
     if let Some(options) = args.get("options") {
         builder.with_options(parse_key_value_options(options)?);
     }
+    if let Some(partitions) = args.get("partitions") {
+        builder
+            .with_partition_filter(parse_partitions(&table, partitions)?)
+            .map_err(to_datafusion_error)?;
+    }
     builder.execute().await.map_err(to_datafusion_error)?;
     ok_result(ctx)
 }
@@ -1393,16 +1529,39 @@ async fn proc_compact(
 
 /// Semicolon-separated alternatives, each containing comma-separated key=value constraints.
 fn parse_partitions(table: &Table, partitions: &str) -> DFResult<Predicate> {
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let alternatives = parse_partition_specs(table, partitions.split(';'), false)?
+        .into_iter()
+        .map(|spec| {
+            spec.into_iter()
+                .map(|(key, value)| match value {
+                    Some(value) => pb.equal(key, value),
+                    None => pb.is_null(key),
+                })
+                .collect::<paimon::Result<Vec<_>>>()
+                .map(Predicate::and)
+                .map_err(to_datafusion_error)
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+    Ok(Predicate::or(alternatives))
+}
+
+type PartitionSpec<'a> = Vec<(&'a str, Option<Datum>)>;
+
+fn parse_partition_specs<'a>(
+    table: &Table,
+    partitions: impl IntoIterator<Item = &'a str>,
+    preserve_literal_whitespace: bool,
+) -> DFResult<Vec<PartitionSpec<'a>>> {
     let partition_fields = table.schema().partition_fields();
     if partition_fields.is_empty() {
         return Err(DataFusionError::Plan(
             "Cannot filter partitions on an unpartitioned table".to_string(),
         ));
     }
-    let pb = PredicateBuilder::new(table.schema().fields());
     let options = CoreOptions::new(table.schema().options());
     let mut alternatives = Vec::new();
-    for partition in partitions.split(';') {
+    for partition in partitions {
         let mut constraints = Vec::new();
         let mut keys = std::collections::HashSet::new();
         for entry in partition.split(',') {
@@ -1413,13 +1572,24 @@ fn parse_partitions(table: &Table, partitions: &str) -> DFResult<Predicate> {
             })?;
             // Java ParameterUtils uses String.trim(), not Unicode whitespace trimming.
             let key = key.trim_matches(|ch| ch <= ' ');
-            let value = value.trim_matches(|ch| ch <= ' ');
             let field = partition_fields
                 .iter()
                 .find(|field| field.name() == key)
                 .ok_or_else(|| {
                     DataFusionError::Plan(format!("Column '{key}' is not a partition column"))
                 })?;
+            let value = if preserve_literal_whitespace
+                && matches!(
+                    field.data_type(),
+                    DataType::Char(_)
+                        | DataType::VarChar(_)
+                        | DataType::Binary(_)
+                        | DataType::VarBinary(_)
+                ) {
+                value
+            } else {
+                value.trim_matches(|ch| ch <= ' ')
+            };
             if !keys.insert(key) {
                 return Err(DataFusionError::Plan(format!(
                     "Duplicate partition column '{key}'"
@@ -1430,8 +1600,8 @@ fn parse_partitions(table: &Table, partitions: &str) -> DFResult<Predicate> {
                     "Empty partitions value for column '{key}'"
                 )));
             }
-            let predicate = if value == options.partition_default_name() {
-                pb.is_null(key)
+            let datum = if value == options.partition_default_name() {
+                None
             } else {
                 let datum = parse_partition_value(
                     value,
@@ -1444,13 +1614,13 @@ fn parse_partitions(table: &Table, partitions: &str) -> DFResult<Predicate> {
                         field.data_type()
                     ))
                 })?;
-                pb.equal(key, datum)
+                Some(datum)
             };
-            constraints.push(predicate.map_err(to_datafusion_error)?);
+            constraints.push((key, datum));
         }
-        alternatives.push(Predicate::and(constraints));
+        alternatives.push(constraints);
     }
-    Ok(Predicate::or(alternatives))
+    Ok(alternatives)
 }
 
 fn parse_partition_value(

@@ -333,6 +333,7 @@ impl TableCommit {
     pub(super) fn validate_added_global_index_overlap(
         added_entries: &[IndexManifestEntry],
     ) -> Result<()> {
+        let added_entries = crate::table::rtree_manifest::logical_additions(added_entries)?;
         for (left_index, left) in added_entries.iter().enumerate() {
             if left.kind == FileKind::Delete {
                 continue;

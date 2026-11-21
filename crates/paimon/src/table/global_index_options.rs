@@ -68,7 +68,15 @@ fn declarations_impl(options: &HashMap<String, String>, strict: bool) -> Result<
     }
     let mut result = Vec::new();
     let mut owners = HashSet::new();
-    for family in ["btree", "bitmap", "multivalue", "fm", "full-text", "vector"] {
+    for family in [
+        "btree",
+        "bitmap",
+        "multivalue",
+        "fm",
+        "rtree",
+        "full-text",
+        "vector",
+    ] {
         let columns = if family == "vector" {
             core.vector_index_columns()
         } else {

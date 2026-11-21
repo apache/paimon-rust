@@ -94,6 +94,8 @@ impl PrimaryKeyCompactPlanner {
                         output_level: Some(output_level),
                         force_level_zero,
                         expire_now_secs,
+                        blob_field_id: None,
+                        vector_field_ids: None,
                     });
                 } else if let Some((files, output_level)) = planner::select_expired_max_level(
                     &bucket_files,
@@ -113,6 +115,8 @@ impl PrimaryKeyCompactPlanner {
                         output_level: Some(output_level),
                         force_level_zero,
                         expire_now_secs,
+                        blob_field_id: None,
+                        vector_field_ids: None,
                     });
                 }
                 continue;
@@ -147,6 +151,8 @@ impl PrimaryKeyCompactPlanner {
                     output_level: None,
                     force_level_zero,
                     expire_now_secs,
+                    blob_field_id: None,
+                    vector_field_ids: None,
                 });
             }
         }
@@ -218,19 +224,24 @@ impl MergeFunction for CompactReducer {
             });
         }
         Ok(match self.inner.merge(rows, batches, columns, schema)? {
-            MergeResult::MaterializedDeleteRow(_) if self.reject_delete_state && rows.len() > 1 => {
+            MergeResult::MaterializedRetractRow(_, RowKind::Delete)
+                if self.reject_delete_state && rows.len() > 1 =>
+            {
                 // A partial-update reducer initializes from the first retract
                 // and then retracts its payload. Replaying an accumulated
                 // DELETE can cancel its own state. First-value aggregators
                 // also carry an initialized flag that DELETE payloads do not
-                // serialize. Keep the sources until replay is safe.
+                // serialize. Keep the sources until replay is safe. An
+                // UPDATE_BEFORE state only comes from remove-record-on-delete
+                // without sequence groups, where a replayed UPDATE_BEFORE
+                // writes its non-null fields like an INSERT.
                 return Err(crate::Error::Unsupported {
                     message:
                         "Compaction cannot preserve DELETE aggregate state for this merge engine"
                             .into(),
                 });
             }
-            MergeResult::MaterializedDeleteRow(batch) => MergeResult::MaterializedRow(batch),
+            MergeResult::MaterializedRetractRow(batch, _) => MergeResult::MaterializedRow(batch),
             result => result,
         })
     }
