@@ -15,24 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Bidirectional Java ↔ Rust compatibility tests for sketch/bitmap aggregators.
+//! Java ↔ Rust compatibility checks for sketch/bitmap aggregators.
 //!
-//! - **Java → Rust**: production Rust aggregators consume Java golden bytes.
-//! - **Rust → Java**: Rust writes payloads to a temp directory, then
-//!   `VerifyRustSketchBitmapCompat.java` deserializes them with the same
-//!   production library call patterns as Paimon `HllSketchUtil` / `ThetaSketch`
-//!   / `RoaringBitmap32` / `RoaringBitmap64` (DataSketches 4.2.0, Roaring 1.2.1).
+//! - **Java → Rust** (default `cargo test -p paimon --lib`): production Rust
+//!   aggregators consume committed Java `compat_*.bin` goldens. Rust and Cargo
+//!   only — no JDK/Maven.
+//! - **Rust → Java** (`--features jvm-compat`): emits deterministic Rust
+//!   payloads and runs `VerifyRustSketchBitmapCompat.java`. Requires JDK 17+
+//!   and Maven. Gated out of the default unit suite; CI runs it only from the
+//!   `integration (jvm-compat)` job and never skips when tools are missing.
 //!
-//! JVM classpath comes from `goldens/pom.xml` via Maven (`dependency:build-classpath`),
-//! matching `paimon-common` versions. Do not commit jars under `goldens/lib/`.
+//! Current Rust → Java checks cover sparse/SET HLL and exact-mode Theta (plus
+//! Roaring 32/64). They are not an exhaustive dense-HLL or Theta sampling
+//! compatibility proof.
 //!
 //! Fixtures: `GenerateSketchBitmapCompat.java` (deterministic, non-random).
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{Array, BinaryArray};
 use roaring::RoaringBitmap;
@@ -45,20 +44,6 @@ use crate::spec::{DataType, VarBinaryType};
 
 fn varbinary() -> DataType {
     DataType::VarBinary(VarBinaryType::new(65535).unwrap())
-}
-
-fn goldens_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/table/goldens")
-}
-
-fn rust_written_dir() -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("paimon-rust-sketch-bitmap-compat-{nanos}-{n}"))
 }
 
 fn merge_rows(agg: &mut dyn FieldAggregator, rows: &[&[u8]]) {
@@ -82,169 +67,8 @@ fn rbm32_values(bytes: &[u8]) -> BTreeSet<u32> {
         .collect()
 }
 
-fn serialize_rbm32(values: &[u32]) -> Vec<u8> {
-    let mut bitmap = RoaringBitmap::new();
-    for value in values {
-        bitmap.insert(*value);
-    }
-    bitmap.optimize();
-    let mut bytes = Vec::new();
-    bitmap.serialize_into(&mut bytes).unwrap();
-    bytes
-}
-
-fn write_bytes(path: &Path, bytes: &[u8]) {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(path, bytes).unwrap();
-}
-
-/// Emit Rust-written payloads for the JVM verifier (deterministic inputs).
-fn emit_rust_written_fixtures() -> PathBuf {
-    let out = rust_written_dir();
-    std::fs::create_dir_all(&out).unwrap();
-
-    let rust_a = serialize_rbm32(&[1, 2, 3, 100]);
-    let rust_b = serialize_rbm32(&[3, 4, 5, 100]);
-    write_bytes(&out.join("rust_rbm32_a.bin"), &rust_a);
-    write_bytes(&out.join("rust_rbm32_b.bin"), &rust_b);
-    let mut rbm32 = Roaring32Agg::new("bm", &varbinary()).unwrap();
-    merge_rows(&mut rbm32, &[&rust_a, &rust_b]);
-    write_bytes(&out.join("rust_rbm32_union.bin"), &result_bytes(&rbm32));
-
-    let values_a = [1u64, 2, 3, (1 << 32) + 5];
-    let values_b = [3u64, 4, (1 << 32) + 5, 1 << 40];
-    let rust64_a = bitmap64::test_support::encode_values(values_a).unwrap();
-    let rust64_b = bitmap64::test_support::encode_values(values_b).unwrap();
-    write_bytes(&out.join("rust_rbm64_a.bin"), &rust64_a);
-    write_bytes(&out.join("rust_rbm64_b.bin"), &rust64_b);
-    let mut rbm64 = Roaring64Agg::new("bm", &varbinary()).unwrap();
-    merge_rows(&mut rbm64, &[&rust64_a, &rust64_b]);
-    write_bytes(&out.join("rust_rbm64_union.bin"), &result_bytes(&rbm64));
-
-    let hll_a = include_bytes!("../goldens/compat_hll_a.bin");
-    let hll_b = include_bytes!("../goldens/compat_hll_b.bin");
-    let mut hll = HllSketchAgg::new("s", &varbinary()).unwrap();
-    merge_rows(&mut hll, &[hll_a, hll_b]);
-    write_bytes(&out.join("rust_hll_union.bin"), &result_bytes(&hll));
-
-    let theta_a = include_bytes!("../goldens/compat_theta_a.bin");
-    let theta_b = include_bytes!("../goldens/compat_theta_b.bin");
-    let mut theta = ThetaSketchAgg::new("s", &varbinary()).unwrap();
-    merge_rows(&mut theta, &[theta_a, theta_b]);
-    write_bytes(&out.join("rust_theta_union.bin"), &result_bytes(&theta));
-
-    out
-}
-
-fn maven_command() -> Command {
-    // On Windows, `Command::new("mvn")` does not automatically resolve `mvn.cmd`.
-    let candidates = if cfg!(windows) {
-        ["mvn.cmd", "mvn"].as_slice()
-    } else {
-        ["mvn"].as_slice()
-    };
-    for name in candidates {
-        if Command::new(name)
-            .arg("-v")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return Command::new(name);
-        }
-    }
-    panic!(
-        "mvn not found on PATH (tried {:?}); install Maven to resolve goldens/pom.xml deps",
-        candidates
-    );
-}
-
-/// Resolve RoaringBitmap 1.2.1 + datasketches-java 4.2.0 via `goldens/pom.xml`.
-fn maven_classpath() -> String {
-    let goldens = goldens_dir();
-    let cp_file =
-        std::env::temp_dir().join(format!("paimon-rust-compat-cp-{}.txt", std::process::id()));
-    let output = maven_command()
-        .current_dir(&goldens)
-        .args([
-            "-q",
-            "dependency:build-classpath",
-            &format!("-Dmdep.outputFile={}", cp_file.display()),
-        ])
-        .output()
-        .expect("failed to execute mvn dependency:build-classpath");
-    assert!(
-        output.status.success(),
-        "mvn dependency:build-classpath failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let cp = std::fs::read_to_string(&cp_file).unwrap_or_else(|e| {
-        panic!(
-            "failed to read Maven classpath file {}: {e}",
-            cp_file.display()
-        )
-    });
-    let _ = std::fs::remove_file(&cp_file);
-    let cp = cp.trim().to_string();
-    assert!(
-        !cp.is_empty(),
-        "Maven classpath for goldens/pom.xml was empty"
-    );
-    cp
-}
-
-/// Compile and run `VerifyRustSketchBitmapCompat.java` against goldens + rust temp dir.
-fn run_jvm_verifier(rust_out: &Path) {
-    let goldens = goldens_dir();
-    let cp = maven_classpath();
-
-    let verify_src = goldens.join("VerifyRustSketchBitmapCompat.java");
-    let status = Command::new("javac")
-        .current_dir(&goldens)
-        .args([
-            "-cp",
-            &cp,
-            verify_src.file_name().unwrap().to_str().unwrap(),
-        ])
-        .status()
-        .expect("javac must be available for JVM compatibility verification");
-    assert!(
-        status.success(),
-        "javac VerifyRustSketchBitmapCompat failed"
-    );
-
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    let run_cp = format!(".{sep}{cp}");
-    let output = Command::new("java")
-        .current_dir(&goldens)
-        .args([
-            "-cp",
-            &run_cp,
-            "VerifyRustSketchBitmapCompat",
-            ".",
-            rust_out.to_str().unwrap(),
-        ])
-        .output()
-        .expect("java must be available for JVM compatibility verification");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "JVM verifier failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(
-        stdout.contains("OK all JVM compatibility checks passed"),
-        "unexpected JVM verifier output:\n{stdout}\n{stderr}"
-    );
-}
-
 // ---------------------------------------------------------------------------
-// Java → Rust (production Rust aggregators)
+// Java → Rust (production Rust aggregators) — default unit suite
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -385,9 +209,200 @@ fn theta_empty_and_multi_merge() {
 }
 
 // ---------------------------------------------------------------------------
-// Rust → Java via real JVM (production DataSketches / Roaring deserializers)
+// Rust → Java via real JVM — only with `--features jvm-compat`
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "jvm-compat")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "jvm-compat")]
+use std::process::Command;
+#[cfg(feature = "jvm-compat")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "jvm-compat")]
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(feature = "jvm-compat")]
+fn goldens_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/table/goldens")
+}
+
+#[cfg(feature = "jvm-compat")]
+fn serialize_rbm32(values: &[u32]) -> Vec<u8> {
+    let mut bitmap = RoaringBitmap::new();
+    for value in values {
+        bitmap.insert(*value);
+    }
+    bitmap.optimize();
+    let mut bytes = Vec::new();
+    bitmap.serialize_into(&mut bytes).unwrap();
+    bytes
+}
+
+#[cfg(feature = "jvm-compat")]
+fn rust_written_temp_dir() -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("paimon-rust-sketch-bitmap-compat-{nanos}-{n}"))
+}
+
+#[cfg(feature = "jvm-compat")]
+fn write_bytes(path: &Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Emit Rust-written payloads for the JVM verifier (deterministic inputs).
+#[cfg(feature = "jvm-compat")]
+fn emit_rust_written_fixtures() -> PathBuf {
+    let out = rust_written_temp_dir();
+    std::fs::create_dir_all(&out).unwrap();
+
+    let rust_a = serialize_rbm32(&[1, 2, 3, 100]);
+    let rust_b = serialize_rbm32(&[3, 4, 5, 100]);
+    write_bytes(&out.join("rust_rbm32_a.bin"), &rust_a);
+    write_bytes(&out.join("rust_rbm32_b.bin"), &rust_b);
+    let mut rbm32 = Roaring32Agg::new("bm", &varbinary()).unwrap();
+    merge_rows(&mut rbm32, &[&rust_a, &rust_b]);
+    write_bytes(&out.join("rust_rbm32_union.bin"), &result_bytes(&rbm32));
+
+    let values_a = [1u64, 2, 3, (1 << 32) + 5];
+    let values_b = [3u64, 4, (1 << 32) + 5, 1 << 40];
+    let rust64_a = bitmap64::test_support::encode_values(values_a).unwrap();
+    let rust64_b = bitmap64::test_support::encode_values(values_b).unwrap();
+    write_bytes(&out.join("rust_rbm64_a.bin"), &rust64_a);
+    write_bytes(&out.join("rust_rbm64_b.bin"), &rust64_b);
+    let mut rbm64 = Roaring64Agg::new("bm", &varbinary()).unwrap();
+    merge_rows(&mut rbm64, &[&rust64_a, &rust64_b]);
+    write_bytes(&out.join("rust_rbm64_union.bin"), &result_bytes(&rbm64));
+
+    let hll_a = include_bytes!("../goldens/compat_hll_a.bin");
+    let hll_b = include_bytes!("../goldens/compat_hll_b.bin");
+    let mut hll = HllSketchAgg::new("s", &varbinary()).unwrap();
+    merge_rows(&mut hll, &[hll_a, hll_b]);
+    write_bytes(&out.join("rust_hll_union.bin"), &result_bytes(&hll));
+
+    let theta_a = include_bytes!("../goldens/compat_theta_a.bin");
+    let theta_b = include_bytes!("../goldens/compat_theta_b.bin");
+    let mut theta = ThetaSketchAgg::new("s", &varbinary()).unwrap();
+    merge_rows(&mut theta, &[theta_a, theta_b]);
+    write_bytes(&out.join("rust_theta_union.bin"), &result_bytes(&theta));
+
+    out
+}
+
+#[cfg(feature = "jvm-compat")]
+fn maven_command() -> Command {
+    // On Windows, `Command::new("mvn")` does not automatically resolve `mvn.cmd`.
+    let candidates = if cfg!(windows) {
+        ["mvn.cmd", "mvn"].as_slice()
+    } else {
+        ["mvn"].as_slice()
+    };
+    for name in candidates {
+        if Command::new(name)
+            .arg("-v")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return Command::new(name);
+        }
+    }
+    panic!(
+        "mvn not found on PATH (tried {:?}); install Maven to resolve goldens/pom.xml deps",
+        candidates
+    );
+}
+
+#[cfg(feature = "jvm-compat")]
+fn maven_classpath() -> String {
+    let goldens = goldens_dir();
+    let cp_file =
+        std::env::temp_dir().join(format!("paimon-rust-compat-cp-{}.txt", std::process::id()));
+    let output = maven_command()
+        .current_dir(&goldens)
+        .args([
+            "-q",
+            "dependency:build-classpath",
+            &format!("-Dmdep.outputFile={}", cp_file.display()),
+        ])
+        .output()
+        .expect("failed to execute mvn dependency:build-classpath");
+    assert!(
+        output.status.success(),
+        "mvn dependency:build-classpath failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cp = std::fs::read_to_string(&cp_file).unwrap_or_else(|e| {
+        panic!(
+            "failed to read Maven classpath file {}: {e}",
+            cp_file.display()
+        )
+    });
+    let _ = std::fs::remove_file(&cp_file);
+    let cp = cp.trim().to_string();
+    assert!(
+        !cp.is_empty(),
+        "Maven classpath for goldens/pom.xml was empty"
+    );
+    cp
+}
+
+#[cfg(feature = "jvm-compat")]
+fn run_jvm_verifier(rust_out: &Path) {
+    let goldens = goldens_dir();
+    let cp = maven_classpath();
+
+    let verify_src = goldens.join("VerifyRustSketchBitmapCompat.java");
+    let status = Command::new("javac")
+        .current_dir(&goldens)
+        .args([
+            "-cp",
+            &cp,
+            verify_src.file_name().unwrap().to_str().unwrap(),
+        ])
+        .status()
+        .expect("javac must be available for JVM compatibility verification");
+    assert!(
+        status.success(),
+        "javac VerifyRustSketchBitmapCompat failed"
+    );
+
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let run_cp = format!(".{sep}{cp}");
+    let output = Command::new("java")
+        .current_dir(&goldens)
+        .args([
+            "-cp",
+            &run_cp,
+            "VerifyRustSketchBitmapCompat",
+            ".",
+            rust_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("java must be available for JVM compatibility verification");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "JVM verifier failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("OK all JVM compatibility checks passed"),
+        "unexpected JVM verifier output:\n{stdout}\n{stderr}"
+    );
+}
+
+#[cfg(feature = "jvm-compat")]
 #[test]
 fn rust_written_bytes_pass_jvm_production_reader_and_merge() {
     let rust_out = emit_rust_written_fixtures();

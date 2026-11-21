@@ -47,6 +47,9 @@ storage-all = [
 # Unstable bridge used by the repository's language bindings. It is not part
 # of the public table API or the default crate surface.
 internal-api = []
+# Gates the sketch/bitmap Rust→Java JVM round-trip test. Not enabled by default
+# so ordinary `cargo test -p paimon --lib` stays Rust/Cargo-only.
+jvm-compat = []
 vortex = ["dep:vortex"]
 
 storage-memory = ["opendal/services-memory"]

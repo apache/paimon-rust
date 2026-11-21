@@ -19,11 +19,31 @@ under the License.
 
 # Sketch / Bitmap Java ↔ Rust fixtures
 
-Deterministic payloads for `table/aggregator/java_rust_compat.rs`.
+Deterministic payloads for Java ↔ Rust sketch/bitmap aggregator compatibility.
+
+## What runs where
+
+| Suite | Command | Needs JDK / Maven? | What it covers |
+|---|---|---|---|
+| Default Rust unit tests | `cargo test -p paimon --lib` | No — Rust and Cargo only | Java `compat_*.bin` goldens → Rust aggregators |
+| JVM compatibility (CI / local) | see below | Yes — **JDK 17+** and **Maven** | Rust → Java: emit Rust payloads, then `VerifyRustSketchBitmapCompat` deserializes and merge/unions with production DataSketches / Roaring |
+
+- Default Rust unit tests need only Rust and Cargo.
+- Java → Rust golden-byte checks run in that default suite.
+- Rust → Java JVM compatibility runs only when `--features jvm-compat` is set
+  (CI job `integration (jvm-compat)`). The three-OS `unit` matrix does **not**
+  enable this feature and never invokes Maven/`javac`/`java`.
+- Missing JDK/Maven or a failed verifier fails the job; nothing is skipped.
 
 Committed `compat_*.bin` goldens follow the same pattern as existing
 `hll_java_*.bin` / `roaring64_java_*.bin` fixtures: generated once by Java,
 checked in, and loaded via `include_bytes!`.
+
+### Coverage note
+
+The Rust → Java round trip exercises **sparse/SET HLL** and **exact-mode Theta**
+(plus RoaringBitmap 32/64). It is **not** an exhaustive proof of dense-HLL or
+Theta sampling cross-language compatibility.
 
 ## Dependencies (do not commit jars)
 
@@ -53,10 +73,24 @@ javac -cp "$CP" GenerateSketchBitmapCompat.java
 java -cp ".:$CP" GenerateSketchBitmapCompat .
 ```
 
-## JVM verification of Rust-written bytes
+## Run the JVM compatibility test locally
 
-Rust tests write payloads under the process temp directory (not under
-`goldens/`), then compile/run:
+Requires **JDK 17+** (the verifier uses `Path.of`) and **Maven** on `PATH`.
+
+```bash
+cargo test -p paimon --lib --features jvm-compat \
+  table::aggregator::java_rust_compat::rust_written_bytes_pass_jvm_production_reader_and_merge \
+  -- --exact
+```
+
+A unique substring filter also works:
+
+```bash
+cargo test -p paimon --lib --features jvm-compat \
+  rust_written_bytes_pass_jvm_production_reader_and_merge
+```
+
+Equivalent manual steps (after writing Rust payloads to a temp directory):
 
 ```bash
 CP=$(mvn -q dependency:build-classpath -Dmdep.outputFile=/dev/stdout)
