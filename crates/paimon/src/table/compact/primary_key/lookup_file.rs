@@ -556,7 +556,15 @@ impl LookupFileCache {
                 if stream.next().is_some() {
                     return Err(invalid("Lookup IPC payload contains multiple batches"));
                 }
-                if batch.get_array_memory_size() > self.limit {
+                // Decoded columns are views into one IPC body. Counting each
+                // column's backing buffer would charge that body once per column.
+                let decoded_size = batch
+                    .columns()
+                    .iter()
+                    .map(|column| column.to_data().get_slice_memory_size())
+                    .sum::<std::result::Result<usize, _>>()
+                    .map_err(invalid)?;
+                if decoded_size > self.limit {
                     return Err(exhausted("Decoded Lookup IPC exceeds the memory budget"));
                 }
                 *self.payload.lock().unwrap() = Some(Payload {
@@ -1241,6 +1249,61 @@ mod tests {
                 .await
                 .unwrap(),
             Some(batch().slice(1, 1))
+        );
+    }
+
+    /// A wide payload within the budget can be read back: its decoded columns
+    /// share one IPC body, which must be charged once, not once per column.
+    #[tokio::test]
+    async fn wide_payload_within_the_budget_is_read_back() {
+        const ROWS: i32 = 256;
+        let options = HashMap::from([
+            ("lookup.cache-max-memory-size".into(), "2mb".into()),
+            ("lookup.cache-spill-compression".into(), "none".into()),
+        ]);
+        let cache = LookupFileCache::new(local(None, false, "16mb"), &options).unwrap();
+        let input = || -> Result<ArrowRecordBatchStream> {
+            let ids: Vec<i32> = (1..=ROWS).collect();
+            let mut columns = vec![
+                (
+                    "_SEQUENCE_NUMBER".to_string(),
+                    Arc::new(Int64Array::from_iter_values(
+                        ids.iter().map(|&id| id as i64),
+                    )) as ArrayRef,
+                ),
+                (
+                    "_VALUE_KIND".to_string(),
+                    Arc::new(Int8Array::from(vec![0; ids.len()])) as ArrayRef,
+                ),
+                (
+                    "id".to_string(),
+                    Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
+                ),
+            ];
+            for column in 0..60 {
+                columns.push((
+                    format!("v{column}"),
+                    Arc::new(Int64Array::from_iter_values(
+                        ids.iter().map(|&id| id as i64 * 100 + column),
+                    )) as ArrayRef,
+                ));
+            }
+            let batch = RecordBatch::try_from_iter(columns).unwrap();
+            Ok(stream::once(async { Ok(batch) }).boxed())
+        };
+        let row = cache
+            .lookup("wide", &key(200), &[2], &input)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.num_columns(), 63);
+        assert_eq!(
+            row.column(62)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            200 * 100 + 59
         );
     }
 
