@@ -227,16 +227,25 @@ jobs:
         include:
           - suite: rust
             needs_uv: false
+            needs_jvm: false
           - suite: datafusion
             needs_uv: false
+            needs_jvm: false
           - suite: python
             needs_uv: true
+            needs_jvm: false
           - suite: go
             needs_uv: false
+            needs_jvm: false
           - suite: jindo
             needs_uv: false
+            needs_jvm: false
           - suite: oss-cpp
             needs_uv: false
+            needs_jvm: false
+          - suite: jvm-compat
+            needs_uv: false
+            needs_jvm: true
     env:
       RUST_LOG: DEBUG
       RUST_BACKTRACE: full
@@ -271,9 +280,37 @@ jobs:
           restore-keys: |
             integration-datafusion-registry-${{ runner.os }}-
 
+      - name: Set up JDK 17
+        if: matrix.needs_jvm == true
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Install Maven
+        if: matrix.needs_jvm == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y maven
+          java -version
+          mvn -v
+
       - name: Rust Integration Test
         if: matrix.suite == 'rust'
         run: cargo test --locked -p paimon-integration-tests --all-targets
+
+      # Feature-gated; not part of the default unit matrix. Fail hard on tool or
+      # verifier errors (no silent skip). Full path + --exact so 0-match cannot pass.
+      - name: Sketch/bitmap JVM compatibility
+        if: matrix.suite == 'jvm-compat'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p paimon --lib --features jvm-compat \
+            table::aggregator::java_rust_compat::rust_written_bytes_pass_jvm_production_reader_and_merge \
+            -- --exact 2>&1 | tee /tmp/jvm-compat-test.log
+          grep -E 'running 1 test' /tmp/jvm-compat-test.log
+          grep -E 'test result: ok\. 1 passed' /tmp/jvm-compat-test.log
 
       - name: DataFusion Integration Test
         if: matrix.suite == 'datafusion'
