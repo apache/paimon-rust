@@ -44,13 +44,6 @@ pub(super) fn validate_partition_filter(
     Ok(())
 }
 
-/// Per-field min/max bounds for stats-based manifest pruning.
-#[derive(Debug, Clone)]
-pub(crate) struct FieldBounds {
-    min: Predicate,
-    max: Predicate,
-}
-
 struct FieldCandidates<'a> {
     predicate: &'a Predicate,
     values: Vec<Option<&'a Datum>>,
@@ -62,7 +55,7 @@ pub(crate) enum PartitionFilter {
     /// per-field min/max bounds for manifest-level stats pruning.
     PartitionSet {
         partitions: HashSet<Vec<u8>>,
-        bounds: Vec<FieldBounds>,
+        bounds: Vec<Predicate>,
     },
     /// General predicate for range/complex filters.
     Predicate(Predicate),
@@ -192,16 +185,9 @@ impl PartitionFilter {
             stats.null_counts().clone(),
         );
         match self {
-            PartitionFilter::PartitionSet { bounds, .. } => {
-                for b in bounds {
-                    if !predicate_may_match(&b.min, &stats, partition_fields)
-                        || !predicate_may_match(&b.max, &stats, partition_fields)
-                    {
-                        return false;
-                    }
-                }
-                true
-            }
+            PartitionFilter::PartitionSet { bounds, .. } => bounds
+                .iter()
+                .all(|bound| predicate_may_match(bound, &stats, partition_fields)),
             PartitionFilter::Predicate(pred) => predicate_may_match(pred, &stats, partition_fields),
         }
     }
@@ -243,7 +229,7 @@ fn predicate_may_match(
 fn build_bounds_from_candidates(
     field_candidates: &[Option<FieldCandidates<'_>>],
     partition_fields: &[DataField],
-) -> Option<Vec<FieldBounds>> {
+) -> Option<Vec<Predicate>> {
     let pb = PredicateBuilder::new(partition_fields);
     field_candidates
         .iter()
@@ -259,7 +245,7 @@ fn build_bounds_from_candidates(
 fn build_bounds_from_partition_bytes(
     partitions: &HashSet<Vec<u8>>,
     partition_fields: &[DataField],
-) -> crate::Result<Vec<FieldBounds>> {
+) -> crate::Result<Vec<Predicate>> {
     let num_fields = partition_fields.len();
     let partition_count = partitions.len();
     let mut field_values: Vec<Vec<Option<Datum>>> = (0..num_fields)
@@ -288,27 +274,28 @@ fn build_bounds_from_partition_bytes(
 
 /// Build min/max bounds for a single field from its candidate values.
 ///
-/// Mirrors Java's `MultiplePartitionPredicate` constructor logic:
-/// - All null → isNull for both min and max
-/// - Some null → OR(isNull, greaterOrEqual(min)) / OR(isNull, lessOrEqual(max))
-/// - No null → greaterOrEqual(min) / lessOrEqual(max)
+/// A closed interval covers all finite candidates. Include NULL separately if requested.
 fn build_field_bounds(
     pb: &PredicateBuilder,
     field_name: &str,
     values: &[Option<&Datum>],
-) -> Option<FieldBounds> {
+) -> Option<Predicate> {
     let null_count = values.iter().filter(|v| v.is_none()).count();
     let total = values.len();
 
     if null_count == total {
-        let is_null = pb.is_null(field_name).ok()?;
-        return Some(FieldBounds {
-            min: is_null.clone(),
-            max: is_null,
-        });
+        return pb.is_null(field_name).ok();
     }
 
     let non_null: Vec<&Datum> = values.iter().filter_map(|v| *v).collect();
+    // Legacy floating bounds may omit NaN; a set containing it cannot be
+    // summarized by the interval of its other values.
+    if non_null.iter().any(|d| {
+        matches!(d, Datum::Float(v) if !v.is_finite())
+            || matches!(d, Datum::Double(v) if !v.is_finite())
+    }) {
+        return Some(Predicate::AlwaysTrue);
+    }
     let min_val = non_null
         .iter()
         .copied()
@@ -322,19 +309,12 @@ fn build_field_bounds(
         .unwrap()
         .clone();
 
-    let mut min_pred = pb.greater_or_equal(field_name, min_val).ok()?;
-    let mut max_pred = pb.less_or_equal(field_name, max_val).ok()?;
-
+    let range = pb.between(field_name, min_val, max_val).ok()?;
     if null_count > 0 {
-        let is_null = pb.is_null(field_name).ok()?;
-        min_pred = Predicate::or(vec![is_null.clone(), min_pred]);
-        max_pred = Predicate::or(vec![is_null, max_pred]);
+        Some(Predicate::or(vec![pb.is_null(field_name).ok()?, range]))
+    } else {
+        Some(range)
     }
-
-    Some(FieldBounds {
-        min: min_pred,
-        max: max_pred,
-    })
 }
 
 /// Collect `Eq`/`In`/`IsNull` candidate values per partition field.
@@ -463,6 +443,61 @@ mod tests {
             );
             assert!(filter.matches_manifest(&unknown, &fields));
         }
+    }
+
+    #[test]
+    fn finite_float_partitions_prune_disjoint_manifests() {
+        use crate::spec::{stats::BinaryTableStats, DoubleType};
+        let fields = vec![DataField::new(
+            0,
+            "p".into(),
+            DataType::Double(DoubleType::new()),
+        )];
+        let pb = PredicateBuilder::new(&fields);
+        let mut row = BinaryRowBuilder::new(1);
+        row.write_double(0, 10.0);
+        let bytes = row.build_serialized();
+        let meta = ManifestFileMeta::new(
+            "m".into(),
+            1,
+            1,
+            0,
+            BinaryTableStats::new(bytes.clone(), bytes, vec![Some(0)]),
+            0,
+        );
+        for (predicate, expected) in [
+            (pb.equal("p", Datum::Double(5.)).unwrap(), false),
+            (
+                pb.is_in("p", vec![Datum::Double(1.), Datum::Double(5.)])
+                    .unwrap(),
+                false,
+            ),
+            (pb.equal("p", Datum::Double(10.)).unwrap(), true),
+            (
+                pb.is_in("p", vec![Datum::Double(5.), Datum::Double(f64::NAN)])
+                    .unwrap(),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                PartitionFilter::from_predicate(predicate, &fields)
+                    .matches_manifest(&meta, &fields),
+                expected
+            );
+        }
+        let from_values = |values: &[f64]| {
+            let partitions = values
+                .iter()
+                .map(|value| {
+                    let mut row = BinaryRowBuilder::new(1);
+                    row.write_double(0, *value);
+                    row.build_serialized()
+                })
+                .collect();
+            PartitionFilter::from_partition_set(partitions, &fields).unwrap()
+        };
+        assert!(!from_values(&[1.0, 5.0]).matches_manifest(&meta, &fields));
+        assert!(from_values(&[5.0, f64::NAN]).matches_manifest(&meta, &fields));
     }
 
     #[test]

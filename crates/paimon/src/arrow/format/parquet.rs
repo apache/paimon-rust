@@ -287,10 +287,10 @@ pub(crate) struct ParquetFormatWriter {
     /// Physical Arrow schema the writer was created with; re-encoded with the
     /// shredding field metadata at close time.
     schema: arrow_schema::SchemaRef,
-    write_fields: Option<Vec<DataField>>,
+    stats_fields: Option<Vec<DataField>>,
     stats_modes: Option<Vec<MetadataStatsMode>>,
     // Parquet footer bounds can exclude NaNs and normalize signed zeros.
-    // Stats field index -> (physical batch column index, aggregate over input rows).
+    // Stats field index -> (input batch column index, aggregate over input rows).
     floating_stats: HashMap<usize, (usize, ColumnStats)>,
     stats_dense_store: bool,
     max_row_group_bytes: Option<usize>,
@@ -417,7 +417,7 @@ impl ParquetFormatWriter {
             .transpose()?;
         let mut floating_stats = HashMap::new();
         if let (Some(fields), Some(modes)) = (stats_fields, &stats_modes) {
-            for (pos, (field, mode)) in fields.iter().zip(modes).enumerate() {
+            for (stats_field_index, (field, mode)) in fields.iter().zip(modes).enumerate() {
                 if !matches!(field.data_type(), DataType::Float(_) | DataType::Double(_))
                     || !matches!(
                         mode,
@@ -426,15 +426,21 @@ impl ParquetFormatWriter {
                 {
                     continue;
                 }
-                let Ok(index) = input_schema.index_of(field.name()) else {
+                let Ok(input_column_index) = input_schema.index_of(field.name()) else {
                     continue;
                 };
                 if matches!(
-                    (field.data_type(), input_schema.field(index).data_type()),
+                    (
+                        field.data_type(),
+                        input_schema.field(input_column_index).data_type()
+                    ),
                     (DataType::Float(_), arrow_schema::DataType::Float32)
                         | (DataType::Double(_), arrow_schema::DataType::Float64)
                 ) {
-                    floating_stats.insert(pos, (index, ColumnStats::default()));
+                    floating_stats.insert(
+                        stats_field_index,
+                        (input_column_index, ColumnStats::default()),
+                    );
                 }
             }
         }
@@ -442,7 +448,7 @@ impl ParquetFormatWriter {
             inner,
             input_schema,
             schema,
-            write_fields: stats_fields.map(|fields| fields.to_vec()),
+            stats_fields: stats_fields.map(|fields| fields.to_vec()),
             stats_modes,
             floating_stats,
             stats_dense_store: core_options.metadata_stats_dense_store(),
@@ -785,9 +791,13 @@ impl FormatFileWriter for ParquetFormatWriter {
                 source: None,
             });
         }
-        if let Some(fields) = &self.write_fields {
-            for (&pos, (index, stats)) in &mut self.floating_stats {
-                stats.collect(batch, *index, fields[pos].data_type())?;
+        if let Some(fields) = &self.stats_fields {
+            for (&stats_field_index, (input_column_index, stats)) in &mut self.floating_stats {
+                stats.collect(
+                    batch,
+                    *input_column_index,
+                    fields[stats_field_index].data_type(),
+                )?;
             }
         }
         let physical_batch;
@@ -889,10 +899,10 @@ impl FormatFileWriter for ParquetFormatWriter {
                 source: None,
             })?;
         let file_size = self.inner.bytes_written() as u64;
-        if let (Some(write_fields), Some(stats_modes)) = (&self.write_fields, &self.stats_modes) {
+        if let (Some(stats_fields), Some(stats_modes)) = (&self.stats_fields, &self.stats_modes) {
             let (value_stats, value_stats_cols) = extract_value_stats(
                 &metadata,
-                write_fields,
+                stats_fields,
                 stats_modes,
                 self.stats_dense_store,
                 &self.floating_stats,
@@ -2298,24 +2308,24 @@ fn build_row_group_column_indices(
 
 fn extract_value_stats(
     metadata: &ParquetMetaData,
-    write_fields: &[DataField],
+    stats_fields: &[DataField],
     stats_modes: &[MetadataStatsMode],
     stats_dense_store: bool,
     floating_stats: &HashMap<usize, (usize, ColumnStats)>,
 ) -> (BinaryTableStats, Option<Vec<String>>) {
-    debug_assert_eq!(write_fields.len(), stats_modes.len());
+    debug_assert_eq!(stats_fields.len(), stats_modes.len());
     let row_groups = metadata.row_groups();
     let column_indices = row_groups
         .first()
-        .map(|row_group| build_row_group_column_indices(row_group.columns(), write_fields))
-        .unwrap_or_else(|| vec![None; write_fields.len()]);
+        .map(|row_group| build_row_group_column_indices(row_group.columns(), stats_fields))
+        .unwrap_or_else(|| vec![None; stats_fields.len()]);
     let mut column_names = Vec::new();
     let mut column_types = Vec::new();
     let mut min_datums = Vec::new();
     let mut max_datums = Vec::new();
     let mut null_counts = Vec::new();
 
-    for (field_idx, field) in write_fields.iter().enumerate() {
+    for (field_idx, field) in stats_fields.iter().enumerate() {
         let mode = stats_modes
             .get(field_idx)
             .copied()
@@ -2335,7 +2345,7 @@ fn extract_value_stats(
                 })
         };
 
-        // Non-dense stats stay aligned with write_fields, including unavailable stats.
+        // Non-dense stats stay aligned with stats_fields, including unavailable stats.
         match column_stats {
             Some((min_datum, max_datum, null_count)) => {
                 if stats_dense_store {
@@ -2362,7 +2372,7 @@ fn extract_value_stats(
         binary_table_stats_from_datums(&column_types, &min_datums, &max_datums, null_counts)
     };
     // Java omits the dense mapping when stats already cover every write field.
-    let value_stats_cols = if stats_dense_store && column_types.len() != write_fields.len() {
+    let value_stats_cols = if stats_dense_store && column_types.len() != stats_fields.len() {
         Some(column_names)
     } else {
         None
@@ -4311,6 +4321,7 @@ mod tests {
             vec![None, None],
             vec![Some(-f64::NAN), None],
             vec![Some(0.0), Some(-0.0)],
+            vec![None, Some(42.0)],
         ] {
             let columns: Vec<arrow_array::ArrayRef> = vec![
                 Arc::new(Float64Array::from(vec![7.0; values.len()])),
@@ -4325,7 +4336,7 @@ mod tests {
         }
         let result = Box::new(writer).close().await.unwrap().value_stats.unwrap();
         assert_eq!(result.columns.unwrap(), ["bounded", "counted"]);
-        assert_eq!(result.stats.null_counts(), &[Some(3), Some(6)]);
+        assert_eq!(result.stats.null_counts(), &[Some(4), Some(8)]);
         let lo = BinaryRow::from_serialized_bytes(result.stats.min_values()).unwrap();
         let hi = BinaryRow::from_serialized_bytes(result.stats.max_values()).unwrap();
         assert!(lo.is_null_at(0) && hi.is_null_at(0));
@@ -4824,7 +4835,7 @@ mod tests {
                 inner,
                 input_schema: schema.clone(),
                 schema,
-                write_fields: None,
+                stats_fields: None,
                 stats_modes: None,
                 floating_stats: HashMap::new(),
                 stats_dense_store: false,

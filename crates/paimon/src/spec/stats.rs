@@ -171,7 +171,7 @@ impl ColumnStats {
     ) -> crate::Result<()> {
         let column = batch.column(index);
         self.null_count += column.null_count() as i64;
-        if ty.is_geospatial() {
+        if ty.is_geospatial() || self.has_nan() {
             return Ok(());
         }
         match bound_rows(column.as_ref(), ty) {
@@ -192,11 +192,16 @@ impl ColumnStats {
     /// A NaN sorts last in Java, but file readers can use a different float order.
     /// Neither bound can safely exclude rows in that case. Null counts are independent.
     pub(crate) fn file_bounds(&self) -> (Option<&Datum>, Option<&Datum>) {
-        match &self.max {
-            Some(Datum::Float(v)) if v.is_nan() => (None, None),
-            Some(Datum::Double(v)) if v.is_nan() => (None, None),
-            _ => (self.min.as_ref(), self.max.as_ref()),
+        if self.has_nan() {
+            (None, None)
+        } else {
+            (self.min.as_ref(), self.max.as_ref())
         }
+    }
+
+    fn has_nan(&self) -> bool {
+        matches!(&self.max, Some(Datum::Float(v)) if v.is_nan())
+            || matches!(&self.max, Some(Datum::Double(v)) if v.is_nan())
     }
 
     fn update(&mut self, value: Option<Datum>) {
@@ -269,19 +274,11 @@ fn bound_rows(col: &dyn Array, data_type: &DataType) -> Option<Option<(usize, us
         DataType::Float(_) => col
             .as_any()
             .downcast_ref::<arrow_array::Float32Array>()
-            .map(|array| {
-                arg_bounds_by(array.iter(), |a, b| {
-                    super::predicate::java_floating_cmp(f64::from(a), f64::from(b)).is_lt()
-                })
-            }),
+            .map(|array| arg_bounds_by(array.iter(), |a, b| a.total_cmp(&b).is_lt(), f32::is_nan)),
         DataType::Double(_) => col
             .as_any()
             .downcast_ref::<arrow_array::Float64Array>()
-            .map(|array| {
-                arg_bounds_by(array.iter(), |a, b| {
-                    super::predicate::java_floating_cmp(a, b).is_lt()
-                })
-            }),
+            .map(|array| arg_bounds_by(array.iter(), |a, b| a.total_cmp(&b).is_lt(), f64::is_nan)),
         DataType::TinyInt(_) => primitive_bound_rows::<Int8Type>(col),
         DataType::SmallInt(_) => primitive_bound_rows::<Int16Type>(col),
         DataType::Int(_) => primitive_bound_rows::<Int32Type>(col),
@@ -314,16 +311,21 @@ where
 
 /// First row of the minimum and of the maximum, skipping nulls.
 fn arg_bounds<V: Ord + Copy>(values: impl Iterator<Item = Option<V>>) -> Option<(usize, usize)> {
-    arg_bounds_by(values, |a, b| a < b)
+    arg_bounds_by(values, |a, b| a < b, |_| false)
 }
 
 fn arg_bounds_by<V: Copy>(
     values: impl Iterator<Item = Option<V>>,
     less: impl Fn(V, V) -> bool,
+    invalidates_bounds: impl Fn(V) -> bool,
 ) -> Option<(usize, usize)> {
     let mut bounds: Option<((usize, V), (usize, V))> = None;
     for (row, value) in values.enumerate() {
         let Some(value) = value else { continue };
+        if invalidates_bounds(value) {
+            // A single NaN is sufficient to suppress both bounds for this file.
+            return Some((row, row));
+        }
         match &mut bounds {
             None => bounds = Some(((row, value), (row, value))),
             Some((min, max)) => {
