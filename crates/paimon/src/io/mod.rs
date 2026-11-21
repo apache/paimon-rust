@@ -16,7 +16,13 @@
 // under the License.
 
 pub(crate) mod cache;
+mod cache_routing;
+#[doc(hidden)]
+pub use cache_routing::OpClass;
+pub(crate) use cache_routing::{RoutedOperator, IO_CACHE_ENABLED};
 mod file_io;
+#[cfg(all(test, feature = "storage-oss"))]
+pub(crate) mod oss_test_server;
 pub(crate) mod uri_reader;
 pub use file_io::*;
 pub use uri_reader::{UriInputStream, UriReader, UriReaderFactory};

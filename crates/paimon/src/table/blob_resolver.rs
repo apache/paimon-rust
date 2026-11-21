@@ -80,7 +80,8 @@ impl BlobReader {
             None => FileIO::from_path(descriptor.uri())
                 .and_then(|builder| builder.with_props(self.storage_options.iter()).build())
                 .map_err(|error| blob_error_with_context(error, &[0], Some(descriptor.uri())))?,
-        };
+        }
+        .for_row_data();
 
         Ok(BlobStream {
             file_io,

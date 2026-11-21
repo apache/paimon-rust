@@ -22,7 +22,7 @@ use std::collections::HashSet;
 const TEMP_FILE_SUFFIX_LEN: usize = 41;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) enum FileType {
+pub(crate) enum FileType {
     Meta,
     DedicatedData,
     StructuredData,
@@ -42,7 +42,7 @@ impl FileType {
     ];
 
     /// Keeps metadata/index classification ahead of dedicated data detection.
-    pub(super) fn classify(path: &str) -> Self {
+    pub(crate) fn classify(path: &str) -> Self {
         let mut segments = path.rsplit('/');
         let name = unwrap_temp_file_name(segments.next().unwrap_or(path));
 
@@ -88,12 +88,12 @@ impl FileType {
     }
 
     /// Matches Java's BLOB/video and vector-store file naming rules.
-    fn is_dedicated_file(name: &str) -> bool {
+    pub(crate) fn is_dedicated_file(name: &str) -> bool {
         let name = name.to_ascii_lowercase();
         name.ends_with(".blob") || name.ends_with(".video") || name.contains(".vector.")
     }
 
-    pub(super) fn is_mutable(path: &str) -> bool {
+    pub(crate) fn is_mutable(path: &str) -> bool {
         let name = path.rsplit('/').next().unwrap_or(path);
         // Iceberg-compatible `version-hint.text`, `retire-pending` and `v{N}.metadata.json`
         // (on tag changes) are rewritten in place.
@@ -110,7 +110,7 @@ impl FileType {
             || name.contains(".tmp.")
     }
 
-    pub(super) fn parse_whitelist(value: &str) -> HashSet<Self> {
+    pub(crate) fn parse_whitelist(value: &str) -> HashSet<Self> {
         value
             .split(',')
             .flat_map(|name| -> &'static [Self] {
