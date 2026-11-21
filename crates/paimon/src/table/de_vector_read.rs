@@ -50,6 +50,7 @@ use crate::vindex::executor::{
     acquire_process_global_search_permit, drain_indexed_jobs,
     ensure_global_index_executor_capacity, execute_global_index_with_guard,
 };
+use crate::vindex::pkvector::metric::cosine_similarity_wide;
 use crate::vindex::range_reader::{RangeReadLimiter, VindexFileReader};
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use crate::vindex::{is_vindex_index_type, vector_search_timing_enabled};
@@ -3155,10 +3156,18 @@ fn compute_raw_vector_score_matrix(
                 }
                 RawVectorMetric::Cosine => {
                     let denominator = stored_l2_squared_norm.sqrt() * query_l2_squared_norm.sqrt();
-                    if denominator == 0.0 {
-                        0.0
-                    } else {
+                    if stored_l2_squared_norm.is_normal()
+                        && query_l2_squared_norm.is_normal()
+                        && denominator.is_normal()
+                        && score.is_finite()
+                    {
                         *score / denominator
+                    } else {
+                        let stored =
+                            &stored_vectors[row_index * dimension..(row_index + 1) * dimension];
+                        let query = &query_vectors
+                            [matrix_query_index * dimension..(matrix_query_index + 1) * dimension];
+                        cosine_similarity_wide(query, stored)
                     }
                 }
                 RawVectorMetric::InnerProduct => unreachable!(),
@@ -3238,10 +3247,14 @@ fn compute_raw_vector_score_from_values(
                 norm_b += stored * stored;
             }
             let denominator = query_l2_squared_norm.sqrt() * norm_b.sqrt();
-            if denominator == 0.0 {
-                0.0
-            } else {
+            if query_l2_squared_norm.is_normal()
+                && norm_b.is_normal()
+                && denominator.is_normal()
+                && dot.is_finite()
+            {
                 dot / denominator
+            } else {
+                cosine_similarity_wide(query, &values.values()[start..end])
             }
         }
         RawVectorMetric::InnerProduct => query
@@ -3275,22 +3288,7 @@ fn row_id_to_u64(row_id: i64) -> crate::Result<u64> {
 fn compute_raw_vector_score(query: &[f32], stored: &[f32], metric: RawVectorMetric) -> f32 {
     match metric {
         RawVectorMetric::L2 => compute_raw_vector_l2_score(query, stored),
-        RawVectorMetric::Cosine => {
-            let mut dot = 0.0;
-            let mut norm_a = 0.0;
-            let mut norm_b = 0.0;
-            for (q, s) in query.iter().zip(stored.iter()) {
-                dot += q * s;
-                norm_a += q * q;
-                norm_b += s * s;
-            }
-            let denominator = norm_a.sqrt() * norm_b.sqrt();
-            if denominator == 0.0 {
-                0.0
-            } else {
-                dot / denominator
-            }
-        }
+        RawVectorMetric::Cosine => cosine_similarity_wide(query, stored),
         RawVectorMetric::InnerProduct => query.iter().zip(stored.iter()).map(|(q, s)| q * s).sum(),
     }
 }

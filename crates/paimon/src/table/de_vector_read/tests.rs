@@ -433,6 +433,56 @@ fn test_raw_vector_cosine_avoids_squared_norm_product_overflow() {
 }
 
 #[test]
+fn test_raw_cosine_top_k_is_invariant_to_vector_scale() {
+    for scale in [1.0e20_f32, 1.0e-23_f32] {
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        for vector in [[-scale, 0.0], [scale, 0.0], [0.0, scale]] {
+            builder.values().append_slice(&vector);
+            builder.append(true);
+        }
+        let vectors = builder.finish();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("embedding", vectors.data_type().clone(), false),
+            ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(vectors),
+                Arc::new(Int64Array::from(vec![10, 11, 12])),
+            ],
+        )
+        .unwrap();
+
+        for query_count in [1, RAW_SCORE_MATRIX_MIN_QUERY_COUNT] {
+            let searches = (0..query_count)
+                .map(|_| VectorSearch::new(vec![scale, 0.0], 1, "embedding".to_string()).unwrap())
+                .collect::<Vec<_>>();
+            let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::Cosine);
+            let mut top_k = (0..query_count)
+                .map(|_| RawScoreTopK::new(1))
+                .collect::<Vec<_>>();
+            collect_raw_batch_vector_batch(
+                &batch,
+                &searches,
+                RawVectorMetric::Cosine,
+                &scoring_plan,
+                &mut top_k,
+            )
+            .unwrap();
+            for result in top_k.into_iter().map(RawScoreTopK::into_search_result) {
+                assert_eq!(
+                    result.row_ids,
+                    vec![11],
+                    "scale={scale}, query count={query_count}"
+                );
+                assert_eq!(result.scores, vec![1.0]);
+            }
+        }
+    }
+}
+
+#[test]
 fn test_raw_score_top_k_matches_full_sort_with_linear_partial_selection() {
     let limit = 7;
     let mut top_k = RawScoreTopK::new(limit);

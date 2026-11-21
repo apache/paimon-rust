@@ -139,10 +139,34 @@ fn cosine_similarity(query: &[f32], stored: &[f32]) -> f32 {
         stored_norm += stored[i] * stored[i];
     }
     let denominator = ((query_norm as f64).sqrt() * (stored_norm as f64).sqrt()) as f32;
+    if query_norm.is_normal()
+        && stored_norm.is_normal()
+        && denominator.is_normal()
+        && dot.is_finite()
+    {
+        dot / denominator
+    } else {
+        cosine_similarity_wide(query, stored)
+    }
+}
+
+/// Computes cosine when squaring float coordinates would overflow or lose the norm.
+pub(crate) fn cosine_similarity_wide(query: &[f32], stored: &[f32]) -> f32 {
+    let mut dot = 0.0_f64;
+    let mut query_norm = 0.0_f64;
+    let mut stored_norm = 0.0_f64;
+    for (&query, &stored) in query.iter().zip(stored) {
+        let q = f64::from(query);
+        let s = f64::from(stored);
+        dot += q * s;
+        query_norm += q * q;
+        stored_norm += s * s;
+    }
+    let denominator = query_norm.sqrt() * stored_norm.sqrt();
     if denominator == 0.0 {
         0.0
     } else {
-        dot / denominator
+        (dot / denominator) as f32
     }
 }
 
@@ -242,6 +266,21 @@ mod tests {
         let zero = [0.0f32, 0.0];
         let s = [1.0f32, 0.0];
         assert_eq!(VectorSearchMetric::Cosine.compute_distance(&zero, &s), 1.0);
+    }
+
+    #[test]
+    fn test_cosine_exact_distance_is_invariant_to_vector_scale() {
+        for scale in [1.0e20_f32, 1.0e-23_f32] {
+            let query = [scale, 0.0];
+            assert_eq!(
+                VectorSearchMetric::Cosine.compute_distance(&query, &query),
+                0.0
+            );
+            assert_eq!(
+                VectorSearchMetric::Cosine.compute_distance(&query, &[-scale, 0.0]),
+                2.0
+            );
+        }
     }
 
     #[test]
