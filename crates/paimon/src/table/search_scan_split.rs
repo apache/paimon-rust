@@ -151,7 +151,7 @@ pub(super) async fn global_search_splits(
         .collect::<Vec<_>>();
     let scalar_mode = row_filter
         .as_ref()
-        .map(|_| core.scalar_index_search_mode())
+        .map(|_| core.scalar_prefilter_search_mode())
         .transpose()?;
     let detail_ranges = if mode == GlobalIndexSearchMode::Detail
         || scalar_mode == Some(GlobalIndexSearchMode::Detail)

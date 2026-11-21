@@ -1015,7 +1015,7 @@ async fn evaluate_batch_vector_search_with_executor(
     });
     let scalar_search_mode = scalar_filter
         .as_ref()
-        .map(|_| effective_core.scalar_index_search_mode())
+        .map(|_| effective_core.scalar_prefilter_search_mode())
         .transpose()?;
     if let Some(filter) = scalar_filter
         .as_ref()

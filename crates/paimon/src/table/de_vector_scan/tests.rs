@@ -926,7 +926,12 @@ async fn scalar_coverage_gaps_follow_scalar_and_vector_modes() {
                                 vector_mode.to_string(),
                             ),
                             (
-                                "scalar-index.search-mode".to_string(),
+                                if builder_options {
+                                    "scalar-index.prefilter.search-mode"
+                                } else {
+                                    "scalar-index.search-mode"
+                                }
+                                .to_string(),
                                 scalar_mode.to_string(),
                             ),
                         ]);

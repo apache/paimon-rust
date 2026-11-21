@@ -32,6 +32,7 @@ const GLOBAL_INDEX_FILTER_REFINE_FROM_DATA_OPTION: &str = "global-index.filter.r
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
 const SCALAR_INDEX_SEARCH_MODE_OPTION: &str = "scalar-index.search-mode";
+const SCALAR_INDEX_PREFILTER_SEARCH_MODE_OPTION: &str = "scalar-index.prefilter.search-mode";
 const VECTOR_INDEX_SEARCH_MODE_OPTION: &str = "vector-index.search-mode";
 const FULL_TEXT_INDEX_SEARCH_MODE_OPTION: &str = "full-text-index.search-mode";
 const GLOBAL_INDEX_BUILD_PARALLELISM_OPTION: &str = "global-index.build.parallelism";
@@ -1053,41 +1054,62 @@ impl<'a> CoreOptions<'a> {
     }
 
     pub fn global_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
-        self.index_search_mode(GLOBAL_INDEX_SEARCH_MODE_OPTION, GlobalIndexSearchMode::Fast)
+        self.index_search_mode(&[], GlobalIndexSearchMode::Fast)
     }
 
-    /// Resolves the scalar mode with the `Fast` default used by vector and full-text prefilters.
-    /// An explicit scalar option takes precedence over the legacy global option.
+    /// Resolves the legacy scalar mode with the `Fast` default.
     pub fn scalar_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
-        self.index_search_mode(SCALAR_INDEX_SEARCH_MODE_OPTION, GlobalIndexSearchMode::Fast)
+        self.index_search_mode(
+            &[SCALAR_INDEX_SEARCH_MODE_OPTION],
+            GlobalIndexSearchMode::Fast,
+        )
     }
 
     /// Resolves the scalar mode for ordinary Data Evolution batch scans, defaulting to `Full`.
     pub(crate) fn scalar_scan_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
-        self.index_search_mode(SCALAR_INDEX_SEARCH_MODE_OPTION, GlobalIndexSearchMode::Full)
+        self.index_search_mode(
+            &[SCALAR_INDEX_SEARCH_MODE_OPTION],
+            GlobalIndexSearchMode::Full,
+        )
+    }
+
+    /// Resolves scalar prefilter coverage for vector and full-text searches.
+    /// Explicit prefilter, scalar, and global settings take precedence in that order.
+    pub fn scalar_prefilter_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
+        self.index_search_mode(
+            &[
+                SCALAR_INDEX_PREFILTER_SEARCH_MODE_OPTION,
+                SCALAR_INDEX_SEARCH_MODE_OPTION,
+            ],
+            GlobalIndexSearchMode::Fast,
+        )
     }
 
     pub fn vector_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
-        self.index_search_mode(VECTOR_INDEX_SEARCH_MODE_OPTION, GlobalIndexSearchMode::Fast)
+        self.index_search_mode(
+            &[VECTOR_INDEX_SEARCH_MODE_OPTION],
+            GlobalIndexSearchMode::Fast,
+        )
     }
 
     pub fn full_text_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
         self.index_search_mode(
-            FULL_TEXT_INDEX_SEARCH_MODE_OPTION,
+            &[FULL_TEXT_INDEX_SEARCH_MODE_OPTION],
             GlobalIndexSearchMode::Fast,
         )
     }
 
     fn index_search_mode(
         &self,
-        family_option: &str,
+        family_options: &[&str],
         default: GlobalIndexSearchMode,
     ) -> crate::Result<GlobalIndexSearchMode> {
-        let (option, value) = if let Some(value) = self.options.get(family_option) {
-            (family_option, value)
-        } else if let Some(value) = self.options.get(GLOBAL_INDEX_SEARCH_MODE_OPTION) {
-            (GLOBAL_INDEX_SEARCH_MODE_OPTION, value)
-        } else {
+        let Some((option, value)) = family_options
+            .iter()
+            .copied()
+            .chain(std::iter::once(GLOBAL_INDEX_SEARCH_MODE_OPTION))
+            .find_map(|option| self.options.get(option).map(|value| (option, value)))
+        else {
             return Ok(default);
         };
 
@@ -2633,6 +2655,10 @@ mod tests {
             default_core.scalar_index_search_mode().unwrap(),
             GlobalIndexSearchMode::Fast
         );
+        assert_eq!(
+            default_core.scalar_prefilter_search_mode().unwrap(),
+            GlobalIndexSearchMode::Fast
+        );
 
         let legacy = HashMap::from([(
             GLOBAL_INDEX_SEARCH_MODE_OPTION.to_string(),
@@ -2642,13 +2668,14 @@ mod tests {
         for actual in [
             legacy_core.scalar_scan_search_mode().unwrap(),
             legacy_core.scalar_index_search_mode().unwrap(),
+            legacy_core.scalar_prefilter_search_mode().unwrap(),
             legacy_core.vector_index_search_mode().unwrap(),
             legacy_core.full_text_index_search_mode().unwrap(),
         ] {
             assert_eq!(actual, GlobalIndexSearchMode::Detail);
         }
 
-        let family = HashMap::from([
+        let mut family = HashMap::from([
             (
                 GLOBAL_INDEX_SEARCH_MODE_OPTION.to_string(),
                 "full".to_string(),
@@ -2681,6 +2708,24 @@ mod tests {
         );
         assert_eq!(
             family_core.full_text_index_search_mode().unwrap(),
+            GlobalIndexSearchMode::Fast
+        );
+        assert_eq!(
+            family_core.scalar_prefilter_search_mode().unwrap(),
+            GlobalIndexSearchMode::Fast
+        );
+
+        family.insert(
+            SCALAR_INDEX_PREFILTER_SEARCH_MODE_OPTION.into(),
+            "detail".into(),
+        );
+        let core = CoreOptions::new(&family);
+        assert_eq!(
+            core.scalar_prefilter_search_mode().unwrap(),
+            GlobalIndexSearchMode::Detail
+        );
+        assert_eq!(
+            core.scalar_scan_search_mode().unwrap(),
             GlobalIndexSearchMode::Fast
         );
     }

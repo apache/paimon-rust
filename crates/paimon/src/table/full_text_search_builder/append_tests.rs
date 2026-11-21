@@ -69,10 +69,13 @@ async fn scalar_modes_preserve_missing_and_partial_coverage() {
         ("full", vec![1, 5, 7]),
         ("detail", vec![1, 5, 7]),
     ] {
-        let table = table.copy_with_options(HashMap::from([(
-            "scalar-index.search-mode".into(),
-            mode.into(),
-        )]));
+        let table = table.copy_with_options(HashMap::from([
+            (
+                "scalar-index.search-mode".into(),
+                if mode == "fast" { "full" } else { "fast" }.into(),
+            ),
+            ("scalar-index.prefilter.search-mode".into(), mode.into()),
+        ]));
         assert_eq!(
             ids(query(&table)
                 .with_filter(filter.clone())
