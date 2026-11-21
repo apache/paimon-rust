@@ -16,13 +16,14 @@
 // under the License.
 
 mod blob_fallback;
+mod candidate_ranges;
 mod vector_versions;
 
 use super::blob_resolver::BlobReadLimiter;
 use super::data_file_reader::{
-    append_null_row_id_column, attach_row_id, expand_selected_row_ids,
-    file_index_selection_to_local_ranges, insert_column_at, project_residual_output,
-    DataFileReadTiming, DataFileReader,
+    dv_to_non_deleted_ranges, file_index_selection_to_local_ranges, insert_column_at,
+    project_residual_output, row_id_column_for_batch, row_ids_from_ranges, to_local_row_ranges,
+    DataFileReadTiming, DataFileReader, FileReadSelection,
 };
 use super::read_limit::take_limited_batch;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
@@ -38,6 +39,7 @@ use crate::spec::{
     ROW_ID_FIELD_NAME,
 };
 use crate::table::dedicated_format_file_writer::is_blob_or_video_file_name;
+use crate::table::row_id_predicate::intersect_sorted_ranges;
 use crate::table::schema_manager::SchemaManager;
 use crate::table::source::any_range_overlaps_file;
 use crate::table::stats_filter::group_by_overlapping_row_id;
@@ -46,6 +48,7 @@ use crate::{DataSplit, Error};
 use arrow_array::{Array, Int64Array, LargeBinaryArray, RecordBatch};
 use async_stream::try_stream;
 use futures::{StreamExt, TryStreamExt};
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -72,24 +75,15 @@ fn is_raw_convertible(files: &[DataFileMeta]) -> bool {
     if files.len() <= 1 {
         return true;
     }
-    // If all files have first_row_id and their row_id ranges don't overlap, they're independent.
-    if files.iter().any(|f| f.first_row_id.is_none()) {
-        return false;
-    }
-    let mut ranges: Vec<(i64, i64)> = files
+    let Some(mut ranges) = files
         .iter()
-        .map(|f| {
-            let start = f.first_row_id.unwrap();
-            (start, start + f.row_count)
-        })
-        .collect();
-    ranges.sort_by_key(|r| r.0);
-    for w in ranges.windows(2) {
-        if w[0].1 > w[1].0 {
-            return false;
-        }
-    }
-    true
+        .map(DataFileMeta::row_id_range)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    ranges.sort_unstable();
+    ranges.windows(2).all(|pair| pair[0].1 < pair[1].0)
 }
 
 /// Split a reader input into independently readable row-id groups.
@@ -108,7 +102,7 @@ fn reader_file_groups(files: &[DataFileMeta]) -> Vec<Vec<DataFileMeta>> {
 
 /// Reuse the field merger without an anchor or deletion mask. The compactor
 /// has already checked contiguous physical coverage for every written field.
-pub(super) fn read_vector_compaction(
+pub(super) async fn read_vector_compaction(
     table: &crate::table::Table,
     split: &DataSplit,
     fields: Vec<DataField>,
@@ -138,13 +132,14 @@ pub(super) fn read_vector_compaction(
     .with_table_options(table.schema().options().clone())
     .with_mosaic_prefetch(super::table_read::configured_mosaic_prefetch(table)?)
     .with_parquet_read_budget(Some(budget));
+    let group = PreparedMergeGroup {
+        files: normalize_merge_group(split.data_files().to_vec())?,
+        logical_row_count: last - first + 1,
+        first_row_id: first,
+    };
     reader.merge_files_by_columns(
         split,
-        &PreparedMergeGroup {
-            files: normalize_merge_group(split.data_files().to_vec())?,
-            logical_row_count: last - first + 1,
-            first_row_id: first,
-        },
+        reader.plan_sources(&group, false).await?,
         None,
         None,
         usize::try_from(last - first + 1).map_err(|_| Error::DataInvalid {
@@ -293,7 +288,10 @@ impl DataEvolutionReader {
             output_schema,
             output_read_type: read_type,
             wide_output_schema,
-            predicates,
+            predicates: predicates
+                .into_iter()
+                .flat_map(Predicate::split_and)
+                .collect(),
             blob_as_descriptor,
             blob_descriptor_fields,
             blob_view_fields,
@@ -542,23 +540,15 @@ impl DataEvolutionReader {
             let filter_before_blob_resolution =
                 self.can_filter_before_blob_resolution(blob_view_lookup.is_some(), &descriptor_fields);
 
-            // A raw-convertible split consists only of independent files: every
-            // row-id segment has a single column provider, so predicates can be
-            // pushed into its file reader. Keep the exact residual below as a
-            // format-independent backstop.
-            //
-            // Positional `_ROW_ID` attachment needs the unfiltered physical row
-            // stream, and predicates on resolved BLOB/BLOB-view values must run
-            // after that transformation. Both cases deliberately stay on the
-            // residual-only path.
-            let push_down_raw_predicates = !self.predicates.is_empty()
-                && self.row_id_index.is_none()
-                && filter_before_blob_resolution;
-            // A bitmap selection preserves physical positions, including when
-            // `_ROW_ID` needs attaching before the residual predicate runs.
-            let read_file_index = !self.predicates.is_empty()
-                && filter_before_blob_resolution
-                && CoreOptions::new(&self.table_options).file_index_read_enabled();
+            let has_data_filter = !self.predicates.is_empty() && filter_before_blob_resolution;
+            // Decoder filters discard positions needed to attach _ROW_ID.
+            let push_down_raw_predicates = has_data_filter && self.row_id_index.is_none();
+            let options = CoreOptions::new(&self.table_options);
+            let read_file_index = has_data_filter && options.file_index_read_enabled();
+            let read_merged_stats = options.data_evolution_merged_read_stats_pushdown_enabled()?
+                && has_data_filter
+                && options.row_tracking_enabled()
+                && options.bucket() == -1;
             // A managed BLOB file fetches payloads as its batch is decoded.
             // Keep batches small and restrict predicate-free file selections
             // to the remaining output quota below.
@@ -651,7 +641,7 @@ impl DataEvolutionReader {
                                                 .collect::<Vec<_>>();
                                             effective_row_ranges = Some(match effective_row_ranges {
                                                 Some(ref ranges) =>
-                                                    intersect_local_ranges(ranges, &index_ranges),
+                                                    intersect_sorted_ranges(ranges, &index_ranges),
                                                 None => index_ranges,
                                             });
                                         }
@@ -688,26 +678,18 @@ impl DataEvolutionReader {
                                 }
                             }
 
-                            let selected_row_ids = if self.row_id_index.is_some() && has_row_id {
-                                selected_absolute_row_ranges_for_file(
-                                    file_meta.first_row_id.unwrap(),
-                                    file_meta.row_count,
-                                    effective_row_ranges.as_deref(),
-                                    deletion_vector.as_deref(),
-                                )?
-                                .map(|ranges| {
-                                    expand_selected_row_ids(
-                                        file_meta.first_row_id.unwrap(),
+                            let mut row_ids = match (self.row_id_index, file_meta.first_row_id) {
+                                (Some(_), Some(first)) => {
+                                    let ranges = selected_absolute_row_ranges_for_file(
+                                        first,
                                         file_meta.row_count,
-                                        &ranges,
-                                    )
-                                })
-                            } else {
-                                None
+                                        effective_row_ranges.as_deref(),
+                                        deletion_vector.as_deref(),
+                                    )?;
+                                    Some(row_ids_from_ranges(first, ranges))
+                                }
+                                _ => None,
                             };
-                            let file_base_row_id = file_meta.first_row_id.unwrap_or(0);
-                            let mut row_id_cursor = file_base_row_id;
-                            let mut row_id_offset: usize = 0;
 
                             let mut stream = raw_file_reader.clone()
                                 .with_nested_field_enabled(
@@ -715,29 +697,19 @@ impl DataEvolutionReader {
                                         .data_evolution_nested_field_enabled()
                                         || file_schema_nested_enabled,
                                 )
-                                .read_single_file_stream_with_requested_ranges(
+                                .read_single_file_stream_with_row_id_ranges(
                                 &split,
                                 file_meta,
                                 data_fields,
                                 deletion_vector,
-                                effective_row_ranges,
-                                sidecar_row_ranges,
+                                FileReadSelection::new(effective_row_ranges, sidecar_row_ranges),
                             )?;
                             while remaining != Some(0) {
                                 let Some(batch) = stream.next().await else { break };
                                 let batch = batch?;
-                                let num_rows = batch.num_rows();
                                 let batch = if let Some(idx) = self.row_id_index {
-                                    if !has_row_id {
-                                        append_null_row_id_column(batch, idx, &self.wide_output_schema)?
-                                    } else if let Some(ref ids) = selected_row_ids {
-                                        attach_row_id(batch, idx, ids, &mut row_id_offset, &self.wide_output_schema)?
-                                    } else {
-                                        let row_ids: Vec<i64> = (row_id_cursor..row_id_cursor + num_rows as i64).collect();
-                                        row_id_cursor += num_rows as i64;
-                                        let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(row_ids));
-                                        insert_column_at(batch, array, idx, &self.wide_output_schema)?
-                                    }
+                                    let ids = row_id_column_for_batch(row_ids.as_mut(), batch.num_rows())?;
+                                    insert_column_at(batch, ids, idx, &self.wide_output_schema)?
                                 } else {
                                     batch
                                 };
@@ -770,7 +742,7 @@ impl DataEvolutionReader {
                                             )
                                         }).collect::<Vec<_>>();
                                         indexed_row_ranges = Some(match indexed_row_ranges {
-                                            Some(ref ranges) => intersect_local_ranges(ranges, &index_ranges),
+                                            Some(ref ranges) => intersect_sorted_ranges(ranges, &index_ranges),
                                             None => index_ranges,
                                         });
                                     }
@@ -781,7 +753,7 @@ impl DataEvolutionReader {
                         if indexed_row_ranges.as_ref().is_some_and(Vec::is_empty) {
                             continue;
                         }
-                        let anchor_deletion_vector = read_anchor_deletion_vector(
+                        let mut anchor_deletion_vector = read_anchor_deletion_vector(
                             &self.file_io,
                             &split,
                             &prepared_group.files,
@@ -795,16 +767,16 @@ impl DataEvolutionReader {
                                 .as_ref()
                                 .map(|ctx| ctx.deletion_vector.as_ref()),
                         )?;
-                        // Every provider shares the DV-aware bitmap. Without
-                        // a selective bitmap, only caller ranges choose ROW.
-                        // LIMIT never changes sidecar eligibility.
+                        if selected_ranges.as_ref().is_some_and(Vec::is_empty) {
+                            continue;
+                        }
                         let sidecar_row_ranges = if has_bitmap_selection {
                             selected_ranges.clone()
                         } else {
                             indexed_row_ranges.clone()
                         };
-                        let effective_row_ranges = if self.predicates.is_empty() {
-                            if let Some(left) = remaining {
+                        let mut effective_row_ranges = match remaining {
+                            Some(left) if self.predicates.is_empty() => {
                                 selected_ranges = Some(prefix_row_ranges(
                                     selected_ranges,
                                     prepared_group.first_row_id,
@@ -812,34 +784,41 @@ impl DataEvolutionReader {
                                     left,
                                 ));
                                 selected_ranges.clone()
-                            } else {
-                                indexed_row_ranges.clone()
                             }
-                        } else {
-                            indexed_row_ranges
+                            _ => indexed_row_ranges,
                         };
+                        let mut source_plan = self
+                            .plan_sources(&prepared_group, effective_row_ranges.is_some())
+                            .await?;
+                        if read_merged_stats && !source_plan.nested_enabled {
+                            if let Some(live) = self
+                                .candidate_ranges(
+                                    &split,
+                                    &mut source_plan,
+                                    selected_ranges.as_deref(),
+                                    sidecar_row_ranges.as_deref(),
+                                )
+                                .await
+                            {
+                                if live.is_empty() {
+                                    continue;
+                                }
+                                effective_row_ranges = Some(live.clone());
+                                selected_ranges = Some(live);
+                                // The shared selection already excludes deleted rows from every source.
+                                anchor_deletion_vector = None;
+                            }
+                        }
                         let expected_output_rows = match selected_ranges.as_ref() {
                             Some(ranges) => ranges.iter().map(|r| r.count() as usize).sum(),
                             None => prepared_group.logical_row_count as usize,
                         };
 
-                        let selected_row_ids = if self.row_id_index.is_some() {
-                            selected_ranges.as_ref().map(|ranges| {
-                                expand_selected_row_ids(
-                                    prepared_group.first_row_id,
-                                    prepared_group.logical_row_count,
-                                    ranges,
-                                )
-                            })
-                        } else {
-                            None
-                        };
-                        let mut row_id_cursor = prepared_group.first_row_id;
-                        let mut row_id_offset: usize = 0;
+                        let mut row_ids = row_ids_from_ranges(prepared_group.first_row_id, selected_ranges);
 
                         let mut merge_stream = self.merge_files_by_columns(
                             &split,
-                            &prepared_group,
+                            source_plan,
                             effective_row_ranges,
                             sidecar_row_ranges,
                             expected_output_rows,
@@ -848,16 +827,9 @@ impl DataEvolutionReader {
                         while remaining != Some(0) {
                             let Some(batch) = merge_stream.next().await else { break };
                             let batch = batch?;
-                            let num_rows = batch.num_rows();
                             let batch = if let Some(idx) = self.row_id_index {
-                                if let Some(ref ids) = selected_row_ids {
-                                    attach_row_id(batch, idx, ids, &mut row_id_offset, &self.wide_output_schema)?
-                                } else {
-                                    let row_ids: Vec<i64> = (row_id_cursor..row_id_cursor + num_rows as i64).collect();
-                                    row_id_cursor += num_rows as i64;
-                                    let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(row_ids));
-                                    insert_column_at(batch, array, idx, &self.wide_output_schema)?
-                                }
+                                let ids = row_id_column_for_batch(Some(&mut row_ids), batch.num_rows())?;
+                                insert_column_at(batch, ids, idx, &self.wide_output_schema)?
                             } else {
                                 batch
                             };
@@ -1151,21 +1123,48 @@ impl DataEvolutionReader {
         Ok(result)
     }
 
-    /// Merge multiple logical sources column-wise for data evolution.
-    ///
-    /// Normal partial-column files remain one source per file. Rolling `.blob`
-    /// files are first grouped into a logical BlobBunch source per field, then
-    /// source streams are merged by projected field position.
+    async fn plan_sources(
+        &self,
+        group: &PreparedMergeGroup,
+        row_id_pushdown: bool,
+    ) -> crate::Result<SourcePlan> {
+        let (infos, historical_nested) = load_file_infos(
+            &self.schema_manager,
+            self.table_schema_id,
+            &self.table_fields,
+            &group.files,
+        )
+        .await?;
+        let nested_enabled = CoreOptions::new(&self.table_options)
+            .data_evolution_nested_field_enabled()
+            || historical_nested;
+        let mut blob_inline_fields = self.blob_descriptor_fields.clone();
+        blob_inline_fields.extend(self.blob_view_fields.iter().cloned());
+        build_source_plan_with_row_id_pushdown(
+            group,
+            &infos,
+            &self.wide_file_read_type,
+            &blob_inline_fields,
+            SourcePlanReadContext {
+                table_fields: &self.table_fields,
+                partition_fields: &self.partition_fields,
+                row_id_pushdown,
+                nested_enabled,
+            },
+        )
+    }
+
+    /// Advance all column sources over the same row positions even when their batch boundaries differ.
     fn merge_files_by_columns(
         &self,
         split: &DataSplit,
-        prepared_group: &PreparedMergeGroup,
+        source_plan: SourcePlan,
         row_ranges: Option<Vec<RowRange>>,
         requested_row_ranges: Option<Vec<RowRange>>,
         expected_output_rows: usize,
         anchor_deletion_vector: Option<DeletionVectorContext>,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        if prepared_group.files.is_empty() {
+        if source_plan.sources.is_empty() {
             return Ok(futures::stream::empty().boxed());
         }
 
@@ -1173,7 +1172,6 @@ impl DataEvolutionReader {
         let schema_manager = self.schema_manager.clone();
         let table_schema_id = self.table_schema_id;
         let split = split.clone();
-        let prepared_group = prepared_group.clone();
         // The merge plan reads the WIDE field set so widened predicate columns
         // are materialized for the residual filter. Blob descriptor/view
         // resolution is intentionally deferred to `finish_wide_batch`, where
@@ -1182,8 +1180,6 @@ impl DataEvolutionReader {
         let read_type = self.wide_file_read_type.clone();
         let table_fields = self.table_fields.clone();
         let partition_fields = self.partition_fields.clone();
-        let mut blob_inline_fields = self.blob_descriptor_fields.clone();
-        blob_inline_fields.extend(self.blob_view_fields.iter().cloned());
         let blob_as_descriptor = self.blob_as_descriptor;
         let blob_parallelism = self.blob_parallelism;
         let batch_size = self.effective_batch_size();
@@ -1191,36 +1187,12 @@ impl DataEvolutionReader {
         let table_options = Arc::clone(&self.table_options);
         let mosaic_prefetch = self.mosaic_prefetch;
         let read_timing = self.read_timing.clone();
-        let anchor_deletion_vector = anchor_deletion_vector.clone();
         // Match the input cap so a LIMIT cannot resolve payloads for rows that
         // are only going to be discarded from the merge output.
         let merge_batch_size = batch_size.unwrap_or(1024).clamp(1, 1024);
         let target_schema = crate::arrow::build_read_arrow_schema(&read_type)?;
 
         Ok(try_stream! {
-            let (file_infos, file_schema_nested_enabled) = load_file_infos(
-                &schema_manager,
-                table_schema_id,
-                &table_fields,
-                &prepared_group.files,
-            )
-            .await?;
-            let nested_enabled = CoreOptions::new(&table_options)
-                .data_evolution_nested_field_enabled()
-                || file_schema_nested_enabled;
-            let source_plan = build_source_plan_with_row_id_pushdown(
-                &prepared_group,
-                &file_infos,
-                &read_type,
-                &blob_inline_fields,
-                SourcePlanReadContext {
-                    table_fields: &table_fields,
-                    partition_fields: &partition_fields,
-                    row_id_pushdown: row_ranges.is_some(),
-                    nested_enabled,
-                },
-            )?;
-
             let active_source_indices: Vec<usize> = source_plan
                 .sources
                 .iter()
@@ -1295,7 +1267,7 @@ impl DataEvolutionReader {
                             blob_parallelism,
                             source_parquet_read_budget.clone(),
                             Arc::clone(&table_options),
-                            nested_enabled,
+                            source_plan.nested_enabled,
                             mosaic_prefetch,
                             read_timing.clone(),
                             anchor_deletion_vector.as_ref(),
@@ -2036,16 +2008,22 @@ fn open_source_stream(
             )
         }
         FieldSource::DataFile {
-            file, data_fields, ..
+            file,
+            data_fields,
+            parquet_metadata,
+            ..
         } => {
             let deletion_vector = shifted_deletion_vector_for_file(file, anchor_deletion_vector)?;
-            file_reader.read_single_file_stream_with_requested_ranges(
+            file_reader.read_single_file_stream_with_row_id_ranges(
                 split,
                 file.as_ref().clone(),
                 data_fields.clone(),
                 deletion_vector,
-                row_ranges,
-                requested_row_ranges,
+                FileReadSelection {
+                    rows: row_ranges,
+                    sidecar_rows: requested_row_ranges,
+                    parquet_metadata: parquet_metadata.clone(),
+                },
             )
         }
         FieldSource::BlobBunch { bunch, .. } => {
@@ -2341,25 +2319,14 @@ fn selected_absolute_row_ranges_for_file(
     }
 
     let mut local_ranges = if let Some(dv) = deletion_vector {
-        non_deleted_local_ranges(row_count, dv)
+        dv_to_non_deleted_ranges(dv, row_count)
     } else {
         vec![RowRange::new(0, row_count - 1)]
     };
 
     if let Some(ranges) = row_ranges {
-        let selected = crate::table::merge_row_ranges(
-            ranges
-                .iter()
-                .filter_map(|range| {
-                    range
-                        .intersect_inclusive(first_row_id, first_row_id + row_count - 1)
-                        .map(|range| {
-                            RowRange::new(range.from() - first_row_id, range.to() - first_row_id)
-                        })
-                })
-                .collect(),
-        );
-        local_ranges = intersect_local_ranges(&local_ranges, &selected);
+        let selected = to_local_row_ranges(ranges, first_row_id, row_count);
+        local_ranges = intersect_sorted_ranges(&local_ranges, &selected);
     }
 
     let absolute = local_ranges
@@ -2381,7 +2348,7 @@ fn prefix_row_ranges(
         if row_count == 0 {
             Vec::new()
         } else {
-            vec![RowRange::new(first_row_id, first_row_id + row_count - 1)]
+            vec![RowRange::new(first_row_id, first_row_id + (row_count - 1))]
         }
     });
     let mut left = limit;
@@ -2395,7 +2362,7 @@ fn prefix_row_ranges(
         }
         prefix.push(RowRange::new(
             range.from(),
-            range.from() + i64::try_from(take).unwrap_or(i64::MAX) - 1,
+            range.from() + (i64::try_from(take).unwrap_or(i64::MAX) - 1),
         ));
         left -= take;
         if left == 0 {
@@ -2403,43 +2370,6 @@ fn prefix_row_ranges(
         }
     }
     prefix
-}
-
-fn non_deleted_local_ranges(row_count: i64, deletion_vector: &DeletionVector) -> Vec<RowRange> {
-    let mut ranges = Vec::new();
-    let mut cursor = 0i64;
-    for (start, end) in deletion_vector.deleted_ranges() {
-        let (start, end) = (i64::from(start), i64::from(end));
-        if start >= row_count {
-            break;
-        }
-        if start > cursor {
-            ranges.push(RowRange::new(cursor, start - 1));
-        }
-        cursor = end + 1;
-    }
-    if cursor < row_count {
-        ranges.push(RowRange::new(cursor, row_count - 1));
-    }
-    ranges
-}
-
-fn intersect_local_ranges(left: &[RowRange], right: &[RowRange]) -> Vec<RowRange> {
-    let mut result = Vec::new();
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < left.len() && j < right.len() {
-        let from = left[i].from().max(right[j].from());
-        let to = left[i].to().min(right[j].to());
-        if from <= to {
-            result.push(RowRange::new(from, to));
-        }
-        if left[i].to() < right[j].to() {
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    result
 }
 
 #[derive(Debug, Clone)]
@@ -2613,6 +2543,7 @@ struct SourcePlan {
     sources: Vec<FieldSource>,
     column_plan: Vec<Option<(usize, usize)>>,
     nested_plan: Vec<Option<super::data_evolution_nested::NestedFieldPlan>>,
+    nested_enabled: bool,
 }
 
 /// Logical inputs needed while selecting physical column providers.
@@ -2793,6 +2724,7 @@ fn build_source_plan_with_row_id_pushdown(
                 file: Box::new(file.clone()),
                 data_fields: info.data_fields.clone(),
                 read_fields: Vec::new(),
+                parquet_metadata: None,
             });
             // Java rowTypeWithRowTracking adds this metadata provider even
             // when write_cols omits the physical sequence column. The newest
@@ -2949,6 +2881,7 @@ fn build_source_plan_with_row_id_pushdown(
         sources,
         column_plan,
         nested_plan,
+        nested_enabled,
     })
 }
 
@@ -2979,6 +2912,7 @@ enum FieldSource {
         file: Box<DataFileMeta>,
         data_fields: Option<Vec<DataField>>,
         read_fields: Vec<DataField>,
+        parquet_metadata: Option<ArrowReaderMetadata>,
     },
     VectorBunch {
         bunch: VectorBunch,
@@ -3865,6 +3799,10 @@ mod tests {
             vec![RowRange::new(10, 12)]
         );
         assert!(prefix_row_ranges(None, 10, 4, 0).is_empty());
+        assert_eq!(
+            prefix_row_ranges(None, i64::MAX - 3, 4, 4),
+            [RowRange::new(i64::MAX - 3, i64::MAX)]
+        );
     }
 
     #[test]
@@ -8433,7 +8371,7 @@ mod tests {
         file
     }
 
-    async fn write_schema_file(table: &Table, schema: &TableSchema) {
+    pub(super) async fn write_schema_file(table: &Table, schema: &TableSchema) {
         let path = table.schema_manager().schema_path(schema.id());
         let dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap();
         table.file_io().mkdirs(dir).await.unwrap();
@@ -8447,7 +8385,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn write_test_deletion_file(
+    pub(super) async fn write_test_deletion_file(
         file_io: &crate::io::FileIO,
         path: &str,
         deleted_rows: &[u32],
@@ -9148,60 +9086,6 @@ mod tests {
         }
     }
 
-    /// _ROW_ID + predicate, raw branch: surviving rows keep their ORIGINAL row
-    /// ids (ids are attached before the residual filter), not renumbered ones.
-    #[tokio::test]
-    async fn test_evolution_read_row_id_with_predicate_raw_branch() {
-        let tempdir = tempdir().unwrap();
-        let table_path = local_file_path(tempdir.path());
-        let bucket_dir = tempdir.path().join("bucket-0");
-        fs::create_dir_all(&bucket_dir).unwrap();
-
-        let parquet_path = bucket_dir.join("data.parquet");
-        write_int_parquet_file(&parquet_path, vec![("id", vec![1, 2, 3, 4])], None);
-
-        let table = two_col_evolution_table(table_path);
-        let split = DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path(local_file_path(&bucket_dir))
-            .with_total_buckets(1)
-            .with_data_files(vec![data_file_meta_with_path(
-                "data.parquet",
-                100,
-                4,
-                1,
-                parquet_path.metadata().unwrap().len() as i64,
-                Some(vec!["id"]),
-            )])
-            .build()
-            .unwrap();
-
-        let pb = PredicateBuilder::new(table.schema().fields());
-        let predicate = pb.greater_or_equal("id", Datum::Int(3)).unwrap();
-
-        let mut builder = table.new_read_builder();
-        builder
-            .with_projection(&["id", crate::spec::ROW_ID_FIELD_NAME])
-            .unwrap()
-            .with_filter(predicate);
-        let read = builder.new_read().unwrap();
-        let batches = read
-            .to_arrow(&[split])
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(collect_int_values(&batches, "id"), vec![3, 4]);
-        // Original ids 102, 103 — NOT renumbered to 100, 101.
-        assert_eq!(
-            collect_long_values(&batches, crate::spec::ROW_ID_FIELD_NAME),
-            vec![102, 103]
-        );
-    }
-
     #[tokio::test]
     async fn test_evolution_read_applies_row_id_residual_to_the_row_ids() {
         let tempdir = tempdir().unwrap();
@@ -9394,68 +9278,94 @@ mod tests {
         );
     }
 
-    /// _ROW_ID + predicate, merge branch: same guarantee across a column merge.
     #[tokio::test]
-    async fn test_evolution_read_row_id_with_predicate_merge_branch() {
+    async fn filtered_raw_and_merged_groups_keep_their_row_ids() {
         let tempdir = tempdir().unwrap();
-        let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
         fs::create_dir_all(&bucket_dir).unwrap();
-
-        let id_path = bucket_dir.join("id.parquet");
-        write_int_parquet_file(&id_path, vec![("id", vec![1, 2, 3, 4])], None);
-        let value_path = bucket_dir.join("value.parquet");
-        write_int_parquet_file(&value_path, vec![("value", vec![5, 20, 30, 40])], None);
-
-        let table = two_col_evolution_table(table_path);
+        let table = two_col_evolution_table(local_file_path(tempdir.path()));
+        let mut files = Vec::new();
+        for (name, first, version, columns) in [
+            ("id.parquet", 100, 1, vec![("id", vec![1, 2, 3, 4])]),
+            (
+                "value.parquet",
+                100,
+                2,
+                vec![("value", vec![5, 20, 30, 40])],
+            ),
+            (
+                "raw.parquet",
+                i64::MAX - 3,
+                1,
+                vec![("id", vec![5, 6, 7, 8]), ("value", vec![0, 40, 0, 40])],
+            ),
+        ] {
+            let path = bucket_dir.join(name);
+            let names = columns.iter().map(|(name, _)| *name).collect();
+            write_int_parquet_file(&path, columns, Some(2));
+            files.push(data_file_meta_with_path(
+                name,
+                first,
+                4,
+                version,
+                path.metadata().unwrap().len() as i64,
+                Some(names),
+            ));
+        }
         let split = DataSplitBuilder::new()
             .with_snapshot(1)
             .with_partition(BinaryRow::new(0))
             .with_bucket(0)
             .with_bucket_path(local_file_path(&bucket_dir))
             .with_total_buckets(1)
-            .with_data_files(vec![
-                data_file_meta_with_path(
-                    "id.parquet",
-                    100,
-                    4,
-                    1,
-                    id_path.metadata().unwrap().len() as i64,
-                    Some(vec!["id"]),
-                ),
-                data_file_meta_with_path(
-                    "value.parquet",
-                    100,
-                    4,
-                    2,
-                    value_path.metadata().unwrap().len() as i64,
-                    Some(vec!["value"]),
-                ),
-            ])
+            .with_data_files(files)
             .build()
             .unwrap();
-
         let pb = PredicateBuilder::new(table.schema().fields());
-        let predicate = pb.equal("value", Datum::Int(40)).unwrap();
-
-        let mut builder = table.new_read_builder();
-        builder
-            .with_projection(&["id", crate::spec::ROW_ID_FIELD_NAME])
-            .unwrap()
-            .with_filter(predicate);
-        let read = builder.new_read().unwrap();
-        let batches = read
-            .to_arrow(&[split])
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(collect_int_values(&batches, "id"), vec![4]);
-        assert_eq!(
-            collect_long_values(&batches, crate::spec::ROW_ID_FIELD_NAME),
-            vec![103]
-        );
+        let sparse = split.clone().with_selected_row_ranges(vec![
+            RowRange::new(102, 103),
+            RowRange::new(i64::MAX - 2, i64::MAX - 2),
+            RowRange::new(i64::MAX, i64::MAX),
+        ]);
+        for enabled in [true, false] {
+            let table = table.copy_with_options(HashMap::from([
+                (
+                    "data-evolution.merged-read.stats-pushdown.enabled".into(),
+                    enabled.to_string(),
+                ),
+                ("read.batch-size".into(), "2".into()),
+            ]));
+            for (split, predicate, ids, row_ids) in [
+                (
+                    &split,
+                    pb.equal("value", Datum::Int(40)).unwrap(),
+                    vec![4, 6, 8],
+                    vec![103, i64::MAX - 2, i64::MAX],
+                ),
+                (
+                    &sparse,
+                    pb.greater_or_equal("id", Datum::Int(3)).unwrap(),
+                    vec![3, 4, 6, 8],
+                    vec![102, 103, i64::MAX - 2, i64::MAX],
+                ),
+            ] {
+                let mut builder = table.new_read_builder();
+                builder
+                    .with_projection(&["id", ROW_ID_FIELD_NAME])
+                    .unwrap()
+                    .with_filter(predicate);
+                let batches = builder
+                    .new_read()
+                    .unwrap()
+                    .to_arrow(std::slice::from_ref(split))
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(collect_int_values(&batches, "id"), ids);
+                assert_eq!(collect_long_values(&batches, ROW_ID_FIELD_NAME), row_ids);
+            }
+        }
     }
 
     /// A predicate on a column that one file group lacks (null-filled):

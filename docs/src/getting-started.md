@@ -163,6 +163,29 @@ Parquet Page Index pruning is enabled by default. Set
 this may reduce request count while increasing bytes read. The option does not
 change Page Index generation.
 
+### Merged Data Evolution reads
+
+On row-tracked Data Evolution append tables with `bucket=-1`, ordinary
+Parquet files that share a complete row-ID range support merged-read pruning
+by default. The reader splits filters at `AND` and uses a file's statistics
+only when that file supplies every field in the condition. Field IDs and file
+versions identify the current provider across column renames and updates.
+
+The reader intersects candidate row IDs from row-group and page statistics
+with requested ranges and file-index hits. It excludes deleted rows, reads
+the same positions from each file, and applies the full filter to the
+reconstructed rows before `LIMIT`.
+
+If page indexes are missing, unreadable, or describe truncated or overlapping
+pages, the reader uses the available row-group statistics. If a provider's row
+count disagrees with the manifest, the merge uses the original selection.
+Dedicated BLOB and vector groups, nested-field evolution and ROW sidecar reads
+follow their usual read paths.
+
+Set `data-evolution.merged-read.stats-pushdown.enabled=false` to disable this
+optimization. For selective and full-range scan results, see the
+[merged Parquet read benchmark](benchmark.md#data-evolution-merged-parquet-reads).
+
 ## Mosaic File Format
 
 Mosaic data file reads and writes are available for ordinary Paimon tables. Set

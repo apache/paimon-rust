@@ -41,6 +41,23 @@ pub(crate) fn predicates_may_match_with_schema<T: StatsAccessor>(
     })
 }
 
+fn ordered_bounds<T: StatsAccessor>(
+    stats: &T,
+    index: usize,
+    stats_data_type: &DataType,
+    predicate_data_type: &DataType,
+) -> Option<(Datum, Datum)> {
+    let min = coerce_stats_datum_for_predicate(
+        stats.min_value(index, stats_data_type)?,
+        predicate_data_type,
+    )?;
+    let max = coerce_stats_datum_for_predicate(
+        stats.max_value(index, stats_data_type)?,
+        predicate_data_type,
+    )?;
+    (min <= max).then_some((min, max))
+}
+
 pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
     index: usize,
     stats_data_type: &DataType,
@@ -116,34 +133,16 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         None => return true,
     };
 
-    let min_value = match stats
-        .min_value(index, stats_data_type)
-        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
-    {
-        Some(value) => value,
-        None => return true,
+    let Some((min_value, max_value)) =
+        ordered_bounds(stats, index, stats_data_type, predicate_data_type)
+    else {
+        return true;
     };
-    let max_value = match stats
-        .max_value(index, stats_data_type)
-        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
-    {
-        Some(value) => value,
-        None => return true,
-    };
-
     match op {
-        PredicateOperator::In => {
-            if !matches!(
-                min_value.partial_cmp(&max_value),
-                Some(Ordering::Less | Ordering::Equal)
-            ) {
-                return true;
-            }
-            literals.iter().any(|literal| {
-                !matches!(literal.partial_cmp(&min_value), Some(Ordering::Less))
-                    && !matches!(literal.partial_cmp(&max_value), Some(Ordering::Greater))
-            })
-        }
+        PredicateOperator::In => literals.iter().any(|literal| {
+            !matches!(literal.partial_cmp(&min_value), Some(Ordering::Less))
+                && !matches!(literal.partial_cmp(&max_value), Some(Ordering::Greater))
+        }),
         PredicateOperator::Eq => {
             !matches!(literal.partial_cmp(&min_value), Some(Ordering::Less))
                 && !matches!(literal.partial_cmp(&max_value), Some(Ordering::Greater))
@@ -284,48 +283,24 @@ pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
     match op {
         PredicateOperator::IsNull => return null_count == Some(row_count),
         PredicateOperator::IsNotNull => return null_count == Some(0),
-        _ => {
-            if null_count != Some(0) {
-                return false;
-            }
-        }
+        _ if null_count != Some(0) => return false,
+        _ => {}
     }
-
-    let min_value = match stats
-        .min_value(index, stats_data_type)
-        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
-    {
-        Some(value) => value,
-        None => return false,
-    };
-    let max_value = match stats
-        .max_value(index, stats_data_type)
-        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
-    {
-        Some(value) => value,
-        None => return false,
-    };
-    if !matches!(
-        min_value.partial_cmp(&max_value),
-        Some(Ordering::Less | Ordering::Equal)
-    ) {
+    // Floating-point bounds can omit NaNs even when the null count is zero.
+    if matches!(stats_data_type, DataType::Float(_) | DataType::Double(_)) {
         return false;
     }
 
+    let Some((min_value, max_value)) =
+        ordered_bounds(stats, index, stats_data_type, predicate_data_type)
+    else {
+        return false;
+    };
+
     match op {
-        // `must_match` asserts *every* non-null row equals the literal, which
-        // `min == max == literal` only proves when the bounds cover every row.
-        // For FLOAT/DOUBLE a NaN row is left out of min/max without being counted
-        // null (see `equality_exclusion_is_sound`), so `[1.0, NaN]` reports
-        // `min == max == 1.0` yet not every row equals 1.0 -- claiming must_match
-        // there makes `NOT(= 1.0)` wrongly prune the file and drop the NaN row.
-        // The dual `may_match` NotEq/NotIn arms already carry this guard.
-        PredicateOperator::Eq => {
-            equality_exclusion_is_sound(&min_value)
-                && literals
-                    .first()
-                    .is_some_and(|literal| min_value == *literal && max_value == *literal)
-        }
+        PredicateOperator::Eq => literals
+            .first()
+            .is_some_and(|literal| min_value == *literal && max_value == *literal),
         PredicateOperator::NotEq => literals.first().is_some_and(|literal| {
             matches!(literal.partial_cmp(&min_value), Some(Ordering::Less))
                 || matches!(literal.partial_cmp(&max_value), Some(Ordering::Greater))
@@ -348,11 +323,7 @@ pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
                 Some(Ordering::Greater | Ordering::Equal)
             )
         }),
-        PredicateOperator::In => {
-            equality_exclusion_is_sound(&min_value)
-                && min_value == max_value
-                && literals.contains(&min_value)
-        }
+        PredicateOperator::In => min_value == max_value && literals.contains(&min_value),
         PredicateOperator::Between => {
             let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
                 return false;
@@ -455,21 +426,11 @@ fn between_may_match<T: StatsAccessor>(
     let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
         return true;
     };
-    let min_value = match stats
-        .min_value(index, stats_data_type)
-        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
-    {
-        Some(value) => value,
-        None => return true,
+    let Some((min_value, max_value)) =
+        ordered_bounds(stats, index, stats_data_type, predicate_data_type)
+    else {
+        return true;
     };
-    let max_value = match stats
-        .max_value(index, stats_data_type)
-        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
-    {
-        Some(value) => value,
-        None => return true,
-    };
-
     let max_ge_low = !matches!(max_value.partial_cmp(low), Some(Ordering::Less));
     let min_le_high = !matches!(min_value.partial_cmp(high), Some(Ordering::Greater));
     let overlaps = max_ge_low && min_le_high;
@@ -578,7 +539,7 @@ fn predicate_must_match_with_schema<T: StatsAccessor>(
     }
 }
 
-fn stats_evolution_is_safe(source: &DataType, target: &DataType) -> bool {
+pub(crate) fn stats_evolution_is_safe(source: &DataType, target: &DataType) -> bool {
     // Java's CastExecutors.castLiteralsWithEvolution permits unchanged types
     // and integer widening. Narrowing can wrap, and timestamp precision changes
     // alter values even when their Arrow storage types are identical. Neither
@@ -1019,13 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn not_eq_and_not_in_on_float_keep_files_that_may_hold_nan() {
-        // A Rust-written FLOAT/DOUBLE column `[1.0, NaN]` reports `min == max ==
-        // 1.0` with `null_count == 0` (the writer leaves NaN out of min/max
-        // without counting it null). `must_match(Eq 1.0)` must NOT claim every
-        // row equals 1.0 -- the NaN row does not -- so `NOT(v = 1.0)` and
-        // `NOT(v IN (1.0))` must KEEP the file (the NaN row satisfies `<> 1.0`).
-        // Mirrors the guard already on the `may_match` NotEq/NotIn arms.
+    fn negated_float_predicates_keep_files_that_may_contain_nan() {
         let dt = DataType::Double(DoubleType::new());
         let fields = vec![DataField::new(0, "v".to_string(), dt.clone())];
         let mapping = vec![Some(0)];
@@ -1036,17 +991,22 @@ mod tests {
             max: Some(Datum::Double(1.0)),
         };
 
-        for op in [PredicateOperator::Eq, PredicateOperator::In] {
+        for (op, values) in [
+            (PredicateOperator::Eq, vec![1.0]),
+            (PredicateOperator::In, vec![1.0]),
+            (PredicateOperator::Lt, vec![2.0]),
+            (PredicateOperator::Between, vec![0.0, 2.0]),
+        ] {
             let not_pred = Predicate::negate(Predicate::Leaf {
                 column: "v".to_string(),
                 index: 0,
                 data_type: dt.clone(),
                 op,
-                literals: vec![Datum::Double(1.0)],
+                literals: values.into_iter().map(Datum::Double).collect(),
             });
             assert!(
                 predicates_may_match_with_schema(&[not_pred], &stats, &mapping, &fields),
-                "NOT({op:?} 1.0) must keep a float file whose min==max==1.0 (may hold NaN)"
+                "NOT({op:?}) must retain the possible NaN row"
             );
         }
     }
