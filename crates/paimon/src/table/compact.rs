@@ -323,10 +323,6 @@ impl CompactTask {
         &self.files
     }
 
-    pub(super) fn force_level_zero(&self) -> bool {
-        self.force_level_zero
-    }
-
     pub(super) fn expire_now_secs(&self) -> Option<i64> {
         self.expire_now_secs
     }

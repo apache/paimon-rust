@@ -141,7 +141,8 @@ fn mergeable_field(schema: &TableSchema, field: &DataField, function: &str) -> b
     }
 }
 
-pub(in crate::table::compact) fn select(
+#[cfg(test)]
+fn select(
     files: Vec<DataFileMeta>,
     properties: &std::collections::HashMap<String, String>,
 ) -> Result<Option<(Vec<DataFileMeta>, i32)>> {
@@ -456,7 +457,7 @@ mod tests {
         let files = vec![l0.clone(), expired.clone()];
 
         assert!(
-            force_level_zero(&schema, true).unwrap() == false,
+            !force_level_zero(&schema, true).unwrap(),
             "plain automatic deduplicate must not force L0"
         );
         assert!(
