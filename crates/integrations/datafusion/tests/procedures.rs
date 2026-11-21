@@ -2799,6 +2799,11 @@ async fn test_drop_global_index_removes_btree_and_reads_fallback() {
     )
     .await;
 
+    exec(
+        &sql_context,
+        "SET 'paimon.global-index.search-mode' = 'fast'",
+    )
+    .await;
     let fast_rows = collect_id_name(
         &sql_context,
         "SELECT id, name FROM paimon.test_db.btree_drop WHERE id >= 2",
@@ -2957,6 +2962,21 @@ async fn test_create_global_index_fast_full_detail_after_append() {
     )
     .await;
 
+    let default_rows = collect_id_name(
+        &sql_context,
+        "SELECT id, name FROM paimon.test_db.btree_coverage WHERE id >= 2",
+    )
+    .await;
+    assert_eq!(
+        default_rows,
+        vec![(2, "bob".to_string()), (3, "carol".to_string())]
+    );
+
+    exec(
+        &sql_context,
+        "SET 'paimon.global-index.search-mode' = 'fast'",
+    )
+    .await;
     let fast_rows = collect_id_name(
         &sql_context,
         "SELECT id, name FROM paimon.test_db.btree_coverage WHERE id >= 2",
