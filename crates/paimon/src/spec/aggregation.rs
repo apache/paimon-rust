@@ -36,6 +36,7 @@ const NESTED_KEY_SUFFIX: &str = ".nested-key";
 const NESTED_SEQUENCE_FIELD_SUFFIX: &str = ".nested-sequence-field";
 const NESTED_KEY_NULL_STRATEGY_SUFFIX: &str = ".nested-key-null-strategy";
 const COUNT_LIMIT_SUFFIX: &str = ".count-limit";
+const OVERWRITE_ON_EQUAL_TS_SUFFIX: &str = ".overwrite-on-equal-ts";
 const MAP_STORAGE_LAYOUT_SUFFIX: &str = ".map.storage-layout";
 const MAP_SHARED_SHREDDING_MAX_COLUMNS_SUFFIX: &str = ".map.shared-shredding.max-columns";
 const MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY_SUFFIX: &str =
@@ -215,7 +216,7 @@ impl<'a> AggregationConfig<'a> {
                     continue;
                 }
 
-                validate_aggregator_for_type(value, col, field.data_type())?;
+                validate_aggregator_for_type(value, col, field.data_type(), self.options)?;
             }
         }
 
@@ -250,6 +251,7 @@ enum FieldScopedOptionKind {
     NestedKeyNullStrategy,
     CountLimit,
     IgnoreRetract,
+    OverwriteOnEqualTs,
 }
 
 /// Parse the `<col>` segment and option kind out of a
@@ -278,6 +280,10 @@ fn parse_field_scoped_option_key(key: &str) -> Option<(&str, FieldScopedOptionKi
         ),
         (COUNT_LIMIT_SUFFIX, FieldScopedOptionKind::CountLimit),
         (IGNORE_RETRACT_SUFFIX, FieldScopedOptionKind::IgnoreRetract),
+        (
+            OVERWRITE_ON_EQUAL_TS_SUFFIX,
+            FieldScopedOptionKind::OverwriteOnEqualTs,
+        ),
     ] {
         if let Some(col) = inner.strip_suffix(suffix) {
             if col.is_empty() {
@@ -298,11 +304,12 @@ fn parse_field_scoped_option_key(key: &str) -> Option<(&str, FieldScopedOptionKi
 /// `SchemaManager.applyRenameColumnsToOptions` (Java's case-2 list; the
 /// aggregation/partial-update engines do not accept every entry at create
 /// time, but the keys can still arrive in Java-written metadata).
-const FIELD_SCOPED_RENAMEABLE_SUFFIXES: [&str; 7] = [
+const FIELD_SCOPED_RENAMEABLE_SUFFIXES: [&str; 8] = [
     AGG_FUNCTION_SUFFIX,
     IGNORE_RETRACT_SUFFIX,
     DISTINCT_SUFFIX,
     LIST_AGG_DELIMITER_SUFFIX,
+    OVERWRITE_ON_EQUAL_TS_SUFFIX,
     MAP_STORAGE_LAYOUT_SUFFIX,
     MAP_SHARED_SHREDDING_MAX_COLUMNS_SUFFIX,
     MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY_SUFFIX,
@@ -437,12 +444,16 @@ pub(crate) fn is_known_aggregator_name(name: &str) -> bool {
 
 /// Mirror of the per-aggregator type checks in `crate::table::aggregator::*`.
 /// `Ok(())` means the runtime `*Agg::new` constructor will accept the given
-/// `(name, data_type)` pair.  Must stay in sync — guarded by
+/// `(name, data_type[, options])` pair.  Must stay in sync — guarded by
 /// `tests::validation_table_matches_constructors`.
+///
+/// `options` supplies field-scoped keys such as `fields.<col>.ts-field` for
+/// `merge_map_with_keytime`.
 pub(crate) fn validate_aggregator_for_type(
     name: &str,
     field_name: &str,
     dt: &DataType,
+    options: &HashMap<String, String>,
 ) -> crate::Result<()> {
     // Errors below echo the caller's `name`, not the canonical one, so a user
     // never reads back a function name they did not write.
@@ -496,7 +507,11 @@ pub(crate) fn validate_aggregator_for_type(
         "collect" => matches!(dt, DataType::Array(_)),
         "merge_map" => matches!(dt, DataType::Map(_)),
         "merge_map_with_keytime" => {
-            matches!(dt, DataType::Map(map) if matches!(map.value_type(), DataType::Row(row) if row.fields().len() >= 2))
+            // Reuse the aggregator constructor's keytime resolution so the
+            // supported-type set and ts-field errors stay in one place.
+            return crate::table::aggregator::validate_merge_map_with_keytime(
+                field_name, dt, options,
+            );
         }
         "nested_update" | "nested_partial_update" => {
             matches!(dt, DataType::Array(array) if matches!(array.element_type(), DataType::Row(_)))
@@ -990,13 +1005,29 @@ mod tests {
                     ),
                 ])),
             )),
+            // Unsupported default keytime type: both sides must reject.
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type()),
+                DataType::Row(RowType::new(vec![
+                    DataField::new(1, "value".into(), DataType::Int(IntType::new())),
+                    DataField::new(2, "timestamp".into(), DataType::Boolean(BooleanType::new())),
+                ])),
+            )),
+            // Supported typed keytime (FLOAT): both sides must accept.
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type()),
+                DataType::Row(RowType::new(vec![
+                    DataField::new(1, "value".into(), DataType::Int(IntType::new())),
+                    DataField::new(2, "timestamp".into(), DataType::Float(FloatType::new())),
+                ])),
+            )),
         ];
 
         let opts: HashMap<String, String> =
             HashMap::from([("fields.field.nested-key".to_string(), "id".to_string())]);
         for name in names {
             for dt in &sample_types {
-                let from_validator = validate_aggregator_for_type(name, "field", dt);
+                let from_validator = validate_aggregator_for_type(name, "field", dt, &opts);
                 let from_constructor = new_aggregator(name, "field", dt, &opts).map(|_| ());
                 assert_eq!(
                     from_validator.is_ok(),
@@ -1008,6 +1039,112 @@ mod tests {
         }
     }
 
+    fn keytime_map_type(ts_type: DataType) -> DataType {
+        DataType::Map(crate::spec::MapType::new(
+            DataType::VarChar(VarCharType::string_type()),
+            DataType::Row(crate::spec::RowType::new(vec![
+                DataField::new(1, "value".into(), DataType::Int(IntType::new())),
+                DataField::new(2, "event_time".into(), ts_type.clone()),
+                DataField::new(3, "ts".into(), ts_type),
+            ])),
+        ))
+    }
+
+    #[test]
+    fn merge_map_with_keytime_validation_rejects_unsupported_default_and_ts_field() {
+        use crate::spec::BooleanType;
+
+        let boolean_last = keytime_map_type(DataType::Boolean(BooleanType::new()));
+        let err = validate_aggregator_for_type(
+            "merge_map_with_keytime",
+            "updates",
+            &boolean_last,
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        match err {
+            crate::Error::ConfigInvalid { message } => {
+                assert!(
+                    message.contains("Timestamp field 'ts'")
+                        && message.contains("TIMESTAMP or TIMESTAMP_LTZ"),
+                    "{message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        // Last field is INT (valid default), but ts-field points at BOOLEAN.
+        let mixed = DataType::Map(crate::spec::MapType::new(
+            DataType::VarChar(VarCharType::string_type()),
+            DataType::Row(crate::spec::RowType::new(vec![
+                DataField::new(1, "value".into(), DataType::Int(IntType::new())),
+                DataField::new(
+                    2,
+                    "event_time".into(),
+                    DataType::Boolean(BooleanType::new()),
+                ),
+                DataField::new(3, "ts".into(), DataType::Int(IntType::new())),
+            ])),
+        ));
+        let opts = HashMap::from([(
+            "fields.updates.ts-field".to_string(),
+            "event_time".to_string(),
+        )]);
+        let err = validate_aggregator_for_type("merge_map_with_keytime", "updates", &mixed, &opts)
+            .unwrap_err();
+        match err {
+            crate::Error::ConfigInvalid { message } => {
+                assert!(
+                    message.contains("Timestamp field 'event_time'")
+                        && message.contains("TIMESTAMP or TIMESTAMP_LTZ"),
+                    "{message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_map_with_keytime_validation_accepts_supported_types() {
+        use crate::spec::{
+            BigIntType, CharType, DateType, DecimalType, DoubleType, FloatType,
+            LocalZonedTimestampType, SmallIntType, TimeType, TimestampType, TinyIntType,
+        };
+
+        let cases = [
+            DataType::Char(CharType::new(8).unwrap()),
+            DataType::VarChar(VarCharType::string_type()),
+            DataType::TinyInt(TinyIntType::new()),
+            DataType::SmallInt(SmallIntType::new()),
+            DataType::Int(IntType::new()),
+            DataType::BigInt(BigIntType::new()),
+            DataType::Float(FloatType::new()),
+            DataType::Double(DoubleType::new()),
+            DataType::Date(DateType::new()),
+            DataType::Time(TimeType::new(3).unwrap()),
+            DataType::Decimal(DecimalType::new(10, 2).unwrap()),
+            DataType::Timestamp(TimestampType::new(6).unwrap()),
+            DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(9).unwrap()),
+        ];
+        for ts_type in cases {
+            let dt = keytime_map_type(ts_type.clone());
+            validate_aggregator_for_type("merge_map_with_keytime", "updates", &dt, &HashMap::new())
+                .unwrap_or_else(|e| {
+                    panic!("default keytime {ts_type:?} should be accepted: {e:?}")
+                });
+
+            // Explicit ts-field to the middle event_time column (same type).
+            let opts = HashMap::from([(
+                "fields.updates.ts-field".to_string(),
+                "event_time".to_string(),
+            )]);
+            validate_aggregator_for_type("merge_map_with_keytime", "updates", &dt, &opts)
+                .unwrap_or_else(|e| {
+                    panic!("ts-field=event_time with {ts_type:?} should be accepted: {e:?}")
+                });
+        }
+    }
+
     #[test]
     fn test_rename_field_scoped_options_case2_rewrites_key_only() {
         let mut options: HashMap<String, String> = [
@@ -1015,6 +1152,7 @@ mod tests {
             ("fields.a.ignore-retract", "true"),
             ("fields.a.distinct", "true"),
             ("fields.a.list-agg-delimiter", ";"),
+            ("fields.a.overwrite-on-equal-ts", "true"),
             ("fields.a.map.storage-layout", "shared-shredding"),
             ("fields.a.map.shared-shredding.max-columns", "64"),
             (
@@ -1035,6 +1173,7 @@ mod tests {
             ("ignore-retract", "true"),
             ("distinct", "true"),
             ("list-agg-delimiter", ";"),
+            ("overwrite-on-equal-ts", "true"),
             ("map.storage-layout", "shared-shredding"),
             ("map.shared-shredding.max-columns", "64"),
             ("map.shared-shredding.column-placement-policy", "even"),
