@@ -467,9 +467,15 @@ struct LateralVectorSearchExec {
 }
 
 #[derive(Debug)]
+struct PinnedFilter {
+    table: Table,
+    prepared: Option<PreparedVectorSearchFilter>,
+}
+
+#[derive(Debug)]
 struct ExecutionPreparedFilterEntry {
     context: Weak<TaskContext>,
-    prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
+    prepared_filter: Arc<OnceCell<PinnedFilter>>,
     partition_count: usize,
     completed_partitions: HashSet<usize>,
     active_partition_leases: HashMap<usize, usize>,
@@ -478,8 +484,9 @@ struct ExecutionPreparedFilterEntry {
 #[derive(Debug, Default)]
 struct ExecutionPreparedFilterCache {
     // DataFusion passes the same TaskContext Arc to every partition of one
-    // execution. Keep the prepared filter alive for that TaskContext so
-    // sequential partitions resolve the same target snapshot. DataFusion
+    // execution. Reuse fully covered exact scalar-index answers across batches;
+    // other filters keep only the pinned table and check each ANN candidate set.
+    // Sequential partitions resolve the same target snapshot. DataFusion
     // exposes no TaskContext drop hook, so one cache-level reaper observes the
     // weak contexts and removes subset executions after their context dies.
     entries: Mutex<Vec<ExecutionPreparedFilterEntry>>,
@@ -488,7 +495,7 @@ struct ExecutionPreparedFilterCache {
 
 #[derive(Clone)]
 struct ExecutionPreparedFilterLease {
-    prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
+    prepared_filter: Arc<OnceCell<PinnedFilter>>,
     _completion: Arc<ExecutionPartitionCompletion>,
 }
 
@@ -496,7 +503,7 @@ impl ExecutionPreparedFilterLease {
     fn new(
         cache: &Arc<ExecutionPreparedFilterCache>,
         context: Arc<TaskContext>,
-        prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
+        prepared_filter: Arc<OnceCell<PinnedFilter>>,
         partition: usize,
     ) -> Self {
         Self {
@@ -514,7 +521,7 @@ impl ExecutionPreparedFilterLease {
 struct ExecutionPartitionCompletion {
     cache: Weak<ExecutionPreparedFilterCache>,
     context: Arc<TaskContext>,
-    prepared_filter: Arc<OnceCell<PreparedVectorSearchFilter>>,
+    prepared_filter: Arc<OnceCell<PinnedFilter>>,
     partition: usize,
 }
 
@@ -622,7 +629,7 @@ impl ExecutionPreparedFilterCache {
     fn finish_partition(
         &self,
         context: &Arc<TaskContext>,
-        prepared_filter: &Arc<OnceCell<PreparedVectorSearchFilter>>,
+        prepared_filter: &Arc<OnceCell<PinnedFilter>>,
         partition: usize,
     ) {
         let mut entries = self
@@ -745,7 +752,7 @@ impl LateralVectorSearchExec {
     async fn process_batch(
         &self,
         batch: RecordBatch,
-        prepared_filter: Option<&OnceCell<PreparedVectorSearchFilter>>,
+        prepared_filter: Option<&OnceCell<PinnedFilter>>,
     ) -> DFResult<RecordBatch> {
         if batch.num_rows() == 0 {
             return empty_batch(self.output_schema.clone());
@@ -768,9 +775,15 @@ impl LateralVectorSearchExec {
                     )
                 })?;
                 let prepared = prepared_filter
-                    .get_or_try_init(|| {
-                        self.target_table
-                            .prepare_vector_search_filter(filter.clone())
+                    .get_or_try_init(|| async {
+                        let snapshot = self.target_table.resolve_read_snapshot().await?;
+                        let table = self
+                            .target_table
+                            .copy_with_pinned_snapshot(snapshot.as_ref());
+                        let prepared = table
+                            .try_prepare_indexed_vector_search_filter(filter.clone())
+                            .await?;
+                        Ok::<_, paimon::Error>(PinnedFilter { table, prepared })
                     })
                     .await
                     .map_err(to_datafusion_error)?;
@@ -779,15 +792,17 @@ impl LateralVectorSearchExec {
             None => None,
         };
         let target_table = prepared_filter
-            .map(PreparedVectorSearchFilter::table)
+            .map(|pinned| &pinned.table)
             .unwrap_or(&self.target_table);
         let mut builder = target_table.new_batch_vector_search_builder();
         builder
             .with_vector_column(&self.target_column)
             .with_query_vectors(query_vectors)
             .with_limit(self.limit);
-        if let Some(prepared_filter) = prepared_filter {
-            builder.with_prepared_filter(prepared_filter.clone());
+        if let Some(prepared) = prepared_filter.and_then(|pinned| pinned.prepared.as_ref()) {
+            builder.with_prepared_filter(prepared.clone());
+        } else if let Some(filter) = &self.filter {
+            builder.with_filter(filter.clone());
         }
         let results = builder
             .execute()
@@ -1145,6 +1160,10 @@ fn empty_batch(schema: ArrowSchemaRef) -> DFResult<RecordBatch> {
 pub(crate) fn session_config() -> SessionConfig {
     SessionConfig::new().with_information_schema(true)
 }
+
+#[cfg(test)]
+#[path = "lateral_vector_search_filter_tests.rs"]
+mod filter_tests;
 
 #[cfg(test)]
 mod tests {

@@ -547,6 +547,13 @@ impl GlobalIndexScanner {
         let pruning_info: Vec<_> = effective_predicates
             .iter()
             .map(|(op, literals, data_type)| {
+                let bounds = (*op == PredicateOperator::BBoxIntersects)
+                    .then(|| crate::rtree::BoundingBox::from_literals(literals))
+                    .transpose()
+                    .map_err(|e| Error::DataInvalid {
+                        message: "Invalid bbox predicate".into(),
+                        source: Some(Box::new(e)),
+                    })?;
                 let btree_cmp = make_key_comparator(data_type);
                 let btree_serialized = literals
                     .iter()
@@ -557,21 +564,30 @@ impl GlobalIndexScanner {
                     .iter()
                     .map(|l| serialize_bitmap_datum(l, data_type))
                     .collect::<Vec<_>>();
-                (
+                Ok((
+                    bounds,
                     *op,
                     *data_type,
                     btree_cmp,
                     btree_serialized,
                     bitmap_cmp,
                     bitmap_serialized,
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let predicate_matches: Vec<Vec<bool>> = pruning_info
             .iter()
             .map(
-                |(op, data_type, btree_cmp, btree_serialized, bitmap_cmp, bitmap_serialized)| {
+                |(
+                    bounds,
+                    op,
+                    data_type,
+                    btree_cmp,
+                    btree_serialized,
+                    bitmap_cmp,
+                    bitmap_serialized,
+                )| {
                     entries
                         .iter()
                         .map(|entry| match entry.index_type {
@@ -591,6 +607,21 @@ impl GlobalIndexScanner {
                                 bitmap_serialized,
                                 bitmap_cmp.as_ref(),
                             ),
+                            GlobalIndexFileKind::RTree => {
+                                let super::entry::GlobalIndexEntryMeta::RTree(_, header) =
+                                    &entry.meta
+                                else {
+                                    unreachable!("R-tree metadata")
+                                };
+                                match op {
+                                    PredicateOperator::IsNull => header.nulls > 0,
+                                    PredicateOperator::IsNotNull => header.non_nulls > 0,
+                                    PredicateOperator::BBoxIntersects => bounds
+                                        .as_ref()
+                                        .is_some_and(|q| q.intersects(&header.bounds)),
+                                    _ => false,
+                                }
+                            }
                             GlobalIndexFileKind::FM => true,
                         })
                         .collect()
@@ -635,7 +666,9 @@ impl GlobalIndexScanner {
                                 &bitmap_to,
                                 bitmap_cmp.as_ref(),
                             ),
-                            GlobalIndexFileKind::Multivalue | GlobalIndexFileKind::FM => false,
+                            GlobalIndexFileKind::Multivalue
+                            | GlobalIndexFileKind::FM
+                            | GlobalIndexFileKind::RTree => false,
                         })
                         .collect()
                 }
@@ -676,7 +709,9 @@ impl GlobalIndexScanner {
                 match entry.index_type {
                     GlobalIndexFileKind::Bitmap => bitmap_ranges.push(range.clone()),
                     GlobalIndexFileKind::BTree => exact_ranges.push(range.clone()),
-                    GlobalIndexFileKind::Multivalue | GlobalIndexFileKind::FM => {}
+                    GlobalIndexFileKind::Multivalue
+                    | GlobalIndexFileKind::FM
+                    | GlobalIndexFileKind::RTree => {}
                 }
                 all_matching_ranges.push(range);
                 continue;
@@ -752,7 +787,9 @@ impl GlobalIndexScanner {
                 match entry.index_type {
                     GlobalIndexFileKind::Bitmap => bitmap_ranges.push(range.clone()),
                     GlobalIndexFileKind::BTree => exact_ranges.push(range.clone()),
-                    GlobalIndexFileKind::Multivalue | GlobalIndexFileKind::FM => {}
+                    GlobalIndexFileKind::Multivalue
+                    | GlobalIndexFileKind::FM
+                    | GlobalIndexFileKind::RTree => {}
                 }
                 all_matching_ranges.push(range);
                 continue;

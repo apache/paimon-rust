@@ -319,6 +319,12 @@ pub(crate) fn data_type_to_sql(data_type: &DataType) -> DFResult<String> {
         DataType::Binary(t) => Ok(format!("BINARY({})", t.length())),
         DataType::VarBinary(t) => Ok(format!("VARBINARY({})", t.length())),
         DataType::Blob(_) => Ok("BLOB".to_string()),
+        DataType::Geometry(t) => Ok(format!("GEOMETRY('{}')", t.crs().replace('\'', "''"))),
+        DataType::Geography(t) => Ok(format!(
+            "GEOGRAPHY('{}', {})",
+            t.crs().replace('\'', "''"),
+            t.algorithm()
+        )),
         DataType::Char(t) => Ok(format!("CHAR({})", t.length())),
         DataType::VarChar(t) => Ok(format!("VARCHAR({})", t.length())),
         DataType::Date(_) => Ok("DATE".to_string()),

@@ -53,6 +53,7 @@ mod format_partition_ddl;
 mod format_partition_repair;
 mod format_table_truncate;
 mod full_text_search;
+mod geospatial;
 #[cfg(test)]
 #[path = "../testdata/warehouse/mod.rs"]
 mod golden_warehouse;

@@ -99,7 +99,7 @@ impl CollectAgg {
             unreachable!("ARRAY must map to Arrow List")
         };
         // Java `FieldCollectAgg#needsEqualiser`: constructed types and
-        // BINARY/VARBINARY (Rust has no GEOMETRY/GEOGRAPHY).
+        // fields backed by byte arrays, including WKB.
         let java_uses_equaliser = matches!(
             array_type.element_type(),
             DataType::Array(_)
@@ -109,6 +109,8 @@ impl CollectAgg {
                 | DataType::Row(_)
                 | DataType::Binary(_)
                 | DataType::VarBinary(_)
+                | DataType::Geometry(_)
+                | DataType::Geography(_)
         );
         let key_encoder = if distinct && !java_uses_equaliser {
             RowConverter::new(vec![SortField::new(element.data_type().clone())]).ok()

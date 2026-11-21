@@ -352,12 +352,13 @@ impl PhysicalFormatWriterFactory for ParquetWriterFactory {
             }
             _ => input_schema.clone(),
         };
-        let mut writer = ParquetFormatWriter::new(
+        let mut writer = ParquetFormatWriter::new_with_stats_fields(
             output,
             schema,
             compression,
             self.zstd_level,
-            self.stats_fields.as_deref().or(write_fields),
+            write_fields,
+            self.stats_fields.as_deref(),
             &self.format_options,
         )
         .await?;
@@ -367,12 +368,34 @@ impl PhysicalFormatWriterFactory for ParquetWriterFactory {
 }
 
 impl ParquetFormatWriter {
+    #[cfg(test)]
     pub(crate) async fn new(
         output: &OutputFile,
         schema: arrow_schema::SchemaRef,
         compression: &str,
         zstd_level: i32,
         write_fields: Option<&[DataField]>,
+        format_options: &HashMap<String, String>,
+    ) -> crate::Result<Self> {
+        Self::new_with_stats_fields(
+            output,
+            schema,
+            compression,
+            zstd_level,
+            write_fields,
+            None,
+            format_options,
+        )
+        .await
+    }
+
+    async fn new_with_stats_fields(
+        output: &OutputFile,
+        schema: arrow_schema::SchemaRef,
+        compression: &str,
+        zstd_level: i32,
+        write_fields: Option<&[DataField]>,
+        stats_fields: Option<&[DataField]>,
         format_options: &HashMap<String, String>,
     ) -> crate::Result<Self> {
         // Reject a bad codec before allocating the writer.
@@ -384,15 +407,16 @@ impl ParquetFormatWriter {
         let async_write = output.async_writer().await?;
         let input_schema = schema;
         let schema = timestamp_millis_schema(&input_schema);
-        let inner = create_parquet_arrow_writer(async_write, schema.clone(), props)?;
-        let stats_modes = write_fields
+        let inner = create_parquet_arrow_writer(async_write, schema.clone(), props, write_fields)?;
+        let stats_fields = stats_fields.or(write_fields);
+        let stats_modes = stats_fields
             .map(|fields| core_options.metadata_stats_modes(fields.iter().map(DataField::name)))
             .transpose()?;
         Ok(Self {
             inner,
             input_schema,
             schema,
-            write_fields: write_fields.map(|fields| fields.to_vec()),
+            write_fields: stats_fields.map(|fields| fields.to_vec()),
             stats_modes,
             stats_dense_store: core_options.metadata_stats_dense_store(),
             max_row_group_bytes,
@@ -414,17 +438,85 @@ fn create_parquet_arrow_writer(
     async_write: Box<dyn crate::io::AsyncFileWrite>,
     schema: arrow_schema::SchemaRef,
     props: WriterProperties,
+    write_fields: Option<&[DataField]>,
 ) -> crate::Result<AsyncArrowWriter<Box<dyn crate::io::AsyncFileWrite>>> {
     // Commit one final Arrow schema at close, after shredding metadata is known.
-    let options = parquet::arrow::arrow_writer::ArrowWriterOptions::new()
+    let geo_schema = geospatial_parquet_schema(&schema, props.coerce_types(), write_fields)?;
+    let mut options = parquet::arrow::arrow_writer::ArrowWriterOptions::new()
         .with_properties(props)
         .with_skip_arrow_metadata(true);
+    if let Some(descriptor) = geo_schema {
+        options = options.with_parquet_schema(descriptor);
+    }
     AsyncArrowWriter::try_new_with_options(async_write, schema, options).map_err(|e| {
         crate::Error::DataInvalid {
             message: format!("Failed to create parquet writer: {e}"),
             source: None,
         }
     })
+}
+
+/// Keep the exact CRS (including EPSG:4326) and algorithm in the physical footer.
+/// Parquet's GeoArrow converter normalizes some CRS identifiers to its default.
+fn geospatial_parquet_schema(
+    schema: &arrow_schema::Schema,
+    coerce_types: bool,
+    write_fields: Option<&[DataField]>,
+) -> crate::Result<Option<parquet::schema::types::SchemaDescriptor>> {
+    use parquet::basic::LogicalType;
+    use parquet::schema::types::{SchemaDescriptor, Type, TypePtr};
+
+    let fields = schema.flattened_fields();
+    if !fields
+        .iter()
+        .any(|f| f.extension_type_name() == Some(crate::arrow::GEOARROW_WKB))
+    {
+        return Ok(None);
+    }
+    let file_schema =
+        write_fields.map(|fields| variant_schema::with_parquet_field_ids(schema, fields));
+    let descriptor = parquet::arrow::ArrowSchemaConverter::new()
+        .with_coerce_types(coerce_types)
+        .convert(file_schema.as_ref().unwrap_or(schema))?;
+    // Arrow and Parquet enumerate primitive leaves in depth-first order. Parquet
+    // may add wrapper groups (LIST/MAP), so only pair up the leaves.
+    fn annotate<'a>(
+        node: &mut TypePtr,
+        leaves: &mut impl Iterator<Item = &'a arrow_schema::Field>,
+    ) -> crate::Result<()> {
+        if let Type::GroupType { fields, .. } = Arc::make_mut(node) {
+            for child in fields {
+                annotate(child, leaves)?;
+            }
+            return Ok(());
+        }
+        let field = leaves.next().ok_or_else(|| Error::DataTypeInvalid {
+            message: "Missing Arrow field for Parquet leaf".into(),
+        })?;
+        if field.extension_type_name() == Some(crate::arrow::GEOARROW_WKB) {
+            let logical = match crate::arrow::arrow_field_to_paimon_type(field)? {
+                DataType::Geometry(g) => LogicalType::geometry(Some(g.crs().into())),
+                DataType::Geography(g) => LogicalType::geography(
+                    Some(g.crs().into()),
+                    Some(g.algorithm().to_string().parse()?),
+                ),
+                _ => unreachable!("geoarrow.wkb maps to GEOMETRY or GEOGRAPHY"),
+            };
+            let info = node.get_basic_info();
+            *node = Arc::new(
+                Type::primitive_type_builder(info.name(), parquet::basic::Type::BYTE_ARRAY)
+                    .with_repetition(info.repetition())
+                    .with_id(info.has_id().then(|| info.id()))
+                    .with_logical_type(Some(logical))
+                    .build()?,
+            );
+        }
+        Ok(())
+    }
+    let mut root = descriptor.root_schema_ptr();
+    let mut leaves = fields.into_iter().filter(|f| !f.data_type().is_nested());
+    annotate(&mut root, &mut leaves)?;
+    Ok(Some(SchemaDescriptor::new(root)))
 }
 
 fn parquet_writer_properties(
@@ -1964,6 +2056,7 @@ fn parquet_row_filter_literals_supported(
     file_data_type: &DataType,
 ) -> crate::Result<bool> {
     match op {
+        PredicateOperator::BBoxIntersects => Ok(false),
         PredicateOperator::IsNull | PredicateOperator::IsNotNull => Ok(true),
         PredicateOperator::Eq
         | PredicateOperator::NotEq
@@ -5104,6 +5197,198 @@ mod tests {
                 .unwrap();
             assert_eq!(array.value(0), 2_000, "filter on {column}");
         }
+    }
+
+    #[tokio::test]
+    async fn geospatial_parquet_preserves_logical_types_wkb_and_null_counts() {
+        use crate::spec::{BinaryRow, EdgeAlgorithm, GeographyType, GeometryType};
+        use parquet::basic::{EdgeInterpolationAlgorithm, LogicalType};
+
+        let geometry = DataType::Geometry(GeometryType::new("EPSG:4326").unwrap());
+        let geography =
+            DataType::Geography(GeographyType::new("OGC:CRS84", EdgeAlgorithm::Karney).unwrap());
+        let fields = [
+            DataField::new(7, "geom".into(), geometry.clone()),
+            DataField::new(8, "geog".into(), geography),
+            DataField::new(
+                9,
+                "shapes".into(),
+                DataType::Array(ArrayType::new(geometry)),
+            ),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let point: &[u8] = &[
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64,
+        ];
+        let values = Arc::new(BinaryArray::from(vec![Some(point), None]));
+        let ArrowDataType::List(element) = schema.field(2).data_type() else {
+            unreachable!()
+        };
+        let list = arrow_array::ListArray::new(
+            element.clone(),
+            OffsetBuffer::from_lengths([2, 0]),
+            values.clone(),
+            None,
+        );
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![values.clone(), values, Arc::new(list)])
+                .unwrap();
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/geospatial.parquet";
+        let mut writer = create_format_writer(
+            &io.new_output(path).unwrap(),
+            schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            None,
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        let stats = writer.close().await.unwrap().value_stats.unwrap().stats;
+        assert_eq!(&stats.null_counts()[..2], &[Some(1), Some(1)]);
+        for bound in [stats.min_values(), stats.max_values()] {
+            let row = BinaryRow::from_serialized_bytes(bound).unwrap();
+            assert!(row.is_null_at(0) && row.is_null_at(1));
+        }
+
+        let bytes = io.new_input(path).unwrap().read().await.unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+        let geometry = LogicalType::geometry(Some("EPSG:4326".into()));
+        let geography = LogicalType::geography(
+            Some("OGC:CRS84".into()),
+            Some(EdgeInterpolationAlgorithm::KARNEY),
+        );
+        for (i, (id, logical)) in [
+            (7, &geometry),
+            (8, &geography),
+            (i32::MAX / 4 + 9 * 1024 + 1, &geometry),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let col = reader.parquet_schema().column(i);
+            assert_eq!(col.physical_type(), parquet::basic::Type::BYTE_ARRAY);
+            assert_eq!(col.logical_type_ref(), Some(*logical));
+            assert_eq!(col.self_type().get_basic_info().id(), *id);
+            let stats = reader
+                .metadata()
+                .row_group(0)
+                .column(i)
+                .statistics()
+                .unwrap();
+            assert!(stats.min_bytes_opt().is_none() && stats.max_bytes_opt().is_none());
+        }
+        let decoded = reader.build().unwrap().next().unwrap().unwrap();
+        let list = decoded
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+        assert_eq!(list.value_offsets(), &[0, 2, 2]);
+        let values = list
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(0), point);
+        assert!(values.is_null(1));
+    }
+
+    #[tokio::test]
+    async fn geospatial_parquet_ids_preserve_mixed_nested_types() {
+        use crate::arrow::arrow_field_to_paimon_type;
+        use crate::spec::{GeographyType, GeometryType, RowType, VarBinaryType, VectorType};
+
+        let bytes = DataType::VarBinary(VarBinaryType::default())
+            .copy_with_nullable(false)
+            .unwrap();
+        let pair = DataType::Row(RowType::new(vec![
+            DataField::new(0, "value".into(), bytes.clone()),
+            DataField::new(1, "metadata".into(), bytes),
+        ]));
+        let fields = [
+            DataField::new(
+                5,
+                "container".into(),
+                DataType::Row(RowType::new(vec![
+                    DataField::new(2, "pair".into(), pair),
+                    DataField::new(
+                        3,
+                        "shapes".into(),
+                        DataType::Map(MapType::new(
+                            DataType::Geometry(GeometryType::default()),
+                            DataType::Geography(GeographyType::default()),
+                        )),
+                    ),
+                    DataField::new(
+                        4,
+                        "vector".into(),
+                        DataType::Vector(
+                            VectorType::new(2, DataType::Int(IntType::new())).unwrap(),
+                        ),
+                    ),
+                ])),
+            ),
+            DataField::new(
+                6,
+                "codes".into(),
+                DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            ),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/mixed_geo.parquet";
+        let writer = create_format_writer(
+            &io.new_output(path).unwrap(),
+            schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            None,
+        )
+        .await
+        .unwrap();
+        writer.close().await.unwrap();
+        let raw = io.new_input(path).unwrap().read().await.unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(raw).unwrap();
+        let ArrowDataType::Struct(children) = reader.schema().field(0).data_type() else {
+            panic!("expected the container struct");
+        };
+        // Giving this ordinary ROW's two children Parquet IDs 0 and 1 in Arrow
+        // would cause Paimon's schema inference to mistake it for a VARIANT.
+        assert!(matches!(
+            arrow_field_to_paimon_type(&children[0]).unwrap(),
+            DataType::Row(_)
+        ));
+        // Java's footer schema converter reads the ID of every nested field.
+        let base = i32::MAX / 4;
+        let ids = reader
+            .parquet_schema()
+            .columns()
+            .iter()
+            .map(|col| {
+                let info = col.self_type().get_basic_info();
+                info.has_id().then(|| info.id())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                0,
+                1,
+                base - 3 * 1024 - 1,
+                base + 3 * 1024 + 1,
+                base + 4 * 1024 + 1,
+                base + 6 * 1024 + 1
+            ]
+            .map(Some)
+        );
     }
 
     #[tokio::test]

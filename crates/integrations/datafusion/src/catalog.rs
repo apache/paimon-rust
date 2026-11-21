@@ -1396,9 +1396,18 @@ fn enforce_view_schema(plan: LogicalPlan, view: &View) -> DFResult<LogicalPlan> 
                 Some(qualifier) => Column::new(Some(qualifier.clone()), actual.name()),
                 None => Column::new_unqualified(actual.name()),
             };
-            let target_type = paimon::arrow::paimon_type_to_arrow(declared.data_type())
-                .map_err(to_datafusion_error)?;
-            Ok(cast(Expr::Column(column), target_type).alias(declared.name()))
+            let target =
+                paimon::arrow::paimon_type_to_arrow_field(declared.name(), declared.data_type())
+                    .map_err(to_datafusion_error)?;
+            let expr = if target.extension_type_name().is_some() {
+                Expr::Cast(datafusion::logical_expr::Cast::new_from_field(
+                    Box::new(Expr::Column(column)),
+                    Arc::new(target),
+                ))
+            } else {
+                cast(Expr::Column(column), target.data_type().clone())
+            };
+            Ok(expr.alias(declared.name()))
         })
         .collect::<DFResult<Vec<_>>>()?;
 

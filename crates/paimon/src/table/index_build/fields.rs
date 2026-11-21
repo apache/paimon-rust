@@ -56,6 +56,17 @@ pub(in crate::table) fn index_key_type<'a>(
             });
         }
         Ok(array_type.element_type())
+    } else if index_type == super::super::global_index_types::RTREE_GLOBAL_INDEX_TYPE {
+        if !matches!(field.data_type(), DataType::Geometry(_)) {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "R-tree requires a GEOMETRY column, got {} for '{}'",
+                    field.data_type(),
+                    field.name()
+                ),
+            });
+        }
+        Ok(field.data_type())
     } else if index_type == FM_GLOBAL_INDEX_TYPE {
         if !matches!(field.data_type(), DataType::Char(_) | DataType::VarChar(_)) {
             return Err(Error::Unsupported {

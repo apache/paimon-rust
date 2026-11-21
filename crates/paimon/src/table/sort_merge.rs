@@ -142,8 +142,9 @@ pub(crate) enum MergeResult {
     SourceRow { batch_idx: usize, row_idx: usize },
     /// Emit a synthesized one-row batch matching the merge output schema.
     MaterializedRow(RecordBatch),
-    /// Persist a synthesized tombstone during a write; scans omit it.
-    MaterializedDeleteRow(RecordBatch),
+    /// Persist a synthesized DELETE or UPDATE_BEFORE during a write; scans
+    /// omit it.
+    MaterializedRetractRow(RecordBatch, RowKind),
     /// Omit this key from the output.
     Omit,
 }
@@ -207,8 +208,8 @@ pub(crate) trait MergeFunction: Send + Sync {
     ) -> crate::Result<MergeResult>;
 
     /// Emit at most one key's changelog alongside its merged state. The reader
-    /// drains it before advancing to the next key, keeping memory bounded even
-    /// when all data rows are deleted.
+    /// hands changelog on in batches of up to its batch size, keeping memory
+    /// bounded even when all data rows are deleted.
     fn merge_with_changelog(
         &self,
         rows: &[MergeRow],
@@ -455,7 +456,7 @@ fn is_merged_metadata_field(field: &arrow_schema::Field) -> bool {
 fn merged_metadata_column(
     field: &arrow_schema::Field,
     row: &MergeRow,
-    deleted: bool,
+    kind: RowKind,
 ) -> Option<ArrayRef> {
     match field.name().as_str() {
         crate::spec::SEQUENCE_NUMBER_FIELD_NAME => {
@@ -464,11 +465,6 @@ fn merged_metadata_column(
             ])))
         }
         crate::spec::VALUE_KIND_FIELD_NAME => {
-            let kind = if deleted {
-                RowKind::Delete
-            } else {
-                RowKind::Insert
-            };
             Some(std::sync::Arc::new(Int8Array::from(vec![kind as i8])))
         }
         _ => None,
@@ -502,6 +498,39 @@ impl PartialUpdateMergeFunction {
                         row_idx,
                     )?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Java `updateNonNullFields`: ungrouped fields take the row's non-null
+    /// values, or feed their aggregator.
+    fn update_non_null_fields(
+        &self,
+        selected_by_col: &mut [Option<(usize, usize)>],
+        mut aggregators: Option<&mut [Option<Box<dyn FieldAggregator>>]>,
+        row: &MergeRow,
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+    ) -> crate::Result<()> {
+        for (output_col_idx, selected) in selected_by_col.iter_mut().enumerate() {
+            if self.grouped_fields.contains(&output_col_idx) {
+                continue;
+            }
+            let source_array = batch_buffer[row.batch_idx]
+                .column_for_output(output_col_idx, source_output_col_indices);
+            if let Some(aggregator) = aggregators
+                .as_mut()
+                .and_then(|aggregators| aggregators.get_mut(output_col_idx))
+                .and_then(Option::as_mut)
+            {
+                aggregator.agg_array(
+                    batch_buffer[row.batch_idx]
+                        .column_ref_for_output(output_col_idx, source_output_col_indices),
+                    row.row_idx,
+                )?;
+            } else if !source_array.is_null(row.row_idx) {
+                *selected = Some((row.batch_idx, row.row_idx));
             }
         }
         Ok(())
@@ -741,6 +770,8 @@ impl PartialUpdateMergeFunction {
         }
         let mut saw_add = false;
         let mut current_delete_row = false;
+        // Whether a DELETE re-initialized the row, see the result kind below.
+        let mut meet_delete = false;
         let mut initialized = false;
         let mut latest_row = None;
 
@@ -826,6 +857,7 @@ impl PartialUpdateMergeFunction {
                     }
                     if full_delete {
                         current_delete_row = true;
+                        meet_delete = true;
                         Self::replace_with_source(
                             &mut selected_by_col,
                             aggregators.as_mut().map(|guard| guard.as_mut_slice()),
@@ -839,13 +871,26 @@ impl PartialUpdateMergeFunction {
                     continue;
                 }
                 if self.remove_record_on_delete {
+                    current_delete_row = true;
                     if kind == RowKind::Delete {
-                        current_delete_row = true;
+                        meet_delete = true;
                         Self::replace_with_source(
                             &mut selected_by_col,
                             aggregators.as_mut().map(|guard| guard.as_mut_slice()),
                             row.batch_idx,
                             row.row_idx,
+                            batch_buffer,
+                            source_output_col_indices,
+                        )?;
+                    } else {
+                        // Java PR 11178: an UPDATE_BEFORE is a retraction. It
+                        // marks the row removed without re-initializing it, so
+                        // a later add keeps the fields of other writers, and
+                        // it applies its own non-null fields like an add.
+                        self.update_non_null_fields(
+                            &mut selected_by_col,
+                            aggregators.as_mut().map(|guard| guard.as_mut_slice()),
+                            row,
                             batch_buffer,
                             source_output_col_indices,
                         )?;
@@ -863,26 +908,13 @@ impl PartialUpdateMergeFunction {
             }
             latest_row = Some(row);
 
-            for (output_col_idx, selected) in selected_by_col.iter_mut().enumerate() {
-                if self.grouped_fields.contains(&output_col_idx) {
-                    continue;
-                }
-                let source_array = batch_buffer[row.batch_idx]
-                    .column_for_output(output_col_idx, source_output_col_indices);
-                if let Some(aggregator) = aggregators
-                    .as_mut()
-                    .and_then(|aggregators| aggregators.get_mut(output_col_idx))
-                    .and_then(Option::as_mut)
-                {
-                    aggregator.agg_array(
-                        batch_buffer[row.batch_idx]
-                            .column_ref_for_output(output_col_idx, source_output_col_indices),
-                        row.row_idx,
-                    )?;
-                } else if !source_array.is_null(row.row_idx) {
-                    *selected = Some((row.batch_idx, row.row_idx));
-                }
-            }
+            self.update_non_null_fields(
+                &mut selected_by_col,
+                aggregators.as_mut().map(|guard| guard.as_mut_slice()),
+                row,
+                batch_buffer,
+                source_output_col_indices,
+            )?;
 
             for (group_idx, group) in self.sequence_groups.iter().enumerate() {
                 let sequence_is_empty = group.sequence_indices.iter().all(|&output_col_idx| {
@@ -947,7 +979,21 @@ impl PartialUpdateMergeFunction {
         if !initialized {
             return Ok(PickedMerge::Result(MergeResult::Omit));
         }
-        let deleted = current_delete_row || !saw_add;
+        // A row removed only by UPDATE_BEFORE stays UPDATE_BEFORE, so merging
+        // a pre-merged result again does not re-initialize the row like a
+        // DELETE would. This also covers keys with only UPDATE_BEFORE rows.
+        let result_kind = if current_delete_row {
+            if meet_delete {
+                RowKind::Delete
+            } else {
+                RowKind::UpdateBefore
+            }
+        } else if saw_add {
+            RowKind::Insert
+        } else {
+            RowKind::Delete
+        };
+        let deleted = result_kind != RowKind::Insert;
         // Ignored legacy retracts seed the value but do not advance Java's
         // latestSequenceNumber, whose reset value is zero.
         let ignored_retract_metadata = latest_row.is_none().then(|| MergeRow {
@@ -990,7 +1036,7 @@ impl PartialUpdateMergeFunction {
             .iter()
             .enumerate()
             .map(|(output_col_idx, field)| {
-                if let Some(column) = merged_metadata_column(field, latest_row, deleted) {
+                if let Some(column) = merged_metadata_column(field, latest_row, result_kind) {
                     return Ok(column);
                 }
                 let column = match aggregators
@@ -1027,8 +1073,10 @@ impl PartialUpdateMergeFunction {
         })?;
 
         if deleted {
-            Ok(PickedMerge::Result(MergeResult::MaterializedDeleteRow(
+            debug_assert!(result_kind.is_retract());
+            Ok(PickedMerge::Result(MergeResult::MaterializedRetractRow(
                 batch,
+                result_kind,
             )))
         } else {
             Ok(PickedMerge::Result(MergeResult::MaterializedRow(batch)))
@@ -1321,7 +1369,11 @@ impl AggregateMergeFunction {
                 if let Some(column) = merged_metadata_column(
                     output_schema.field(col_idx),
                     pk_source,
-                    current_delete_row,
+                    if current_delete_row {
+                        RowKind::Delete
+                    } else {
+                        RowKind::Insert
+                    },
                 ) {
                     return Ok(column);
                 }
@@ -1388,7 +1440,7 @@ impl MergeFunction for AggregateMergeFunction {
             output_schema,
         )?;
         Ok(if delete {
-            MergeResult::MaterializedDeleteRow(batch)
+            MergeResult::MaterializedRetractRow(batch, RowKind::Delete)
         } else {
             MergeResult::MaterializedRow(batch)
         })
@@ -1832,6 +1884,14 @@ fn sort_merge_stream(
         let mut output_indices: Vec<(usize, usize)> = Vec::with_capacity(batch_size);
         // Output rows at `(PICKED_ROW, i)` are `picked_rows[i]`.
         let mut picked_rows: Vec<PickedRow> = Vec::new();
+        // Changelog rows not yet handed on, and the schema that marks them.
+        let mut pending_changelog: Vec<RecordBatch> = Vec::new();
+        let mut changelog_rows = 0;
+        let changelog_schema = {
+            let mut metadata = output_schema.metadata().clone();
+            metadata.insert(CHANGELOG_BATCH_METADATA_KEY.into(), "true".into());
+            Arc::new(output_schema.as_ref().clone().with_metadata(metadata))
+        };
         // Reused for every key, so grouping allocates nothing per key.
         let mut winner_key: Vec<u8> = Vec::new();
         let mut same_key_rows: Vec<MergeRow> = Vec::new();
@@ -1973,18 +2033,25 @@ fn sort_merge_stream(
                     batch_buffer.push(BufferedBatch::Materialized(batch));
                     output_indices.push((batch_idx, 0));
                 }
-                MergeResult::Omit | MergeResult::MaterializedDeleteRow(_) => {}
+                MergeResult::Omit | MergeResult::MaterializedRetractRow(..) => {}
             }
 
             if let Some(changelog) = changelog {
-                if changelog.schema().as_ref() != output_schema.as_ref() {
+                if !Arc::ptr_eq(&changelog.schema(), &output_schema)
+                    && changelog.schema().as_ref() != output_schema.as_ref()
+                {
                     Err(Error::UnexpectedError { message: "Changelog merge result schema does not match merge output schema".into(), source: None })?;
                 }
-                let mut metadata = output_schema.metadata().clone();
-                metadata.insert(CHANGELOG_BATCH_METADATA_KEY.into(), "true".into());
-                yield RecordBatch::try_new(
-                    Arc::new(output_schema.as_ref().clone().with_metadata(metadata)), changelog.columns().to_vec(),
-                ).map_err(|error| Error::DataInvalid { message: format!("Invalid changelog batch: {error}"), source: Some(Box::new(error)) })?;
+                changelog_rows += changelog.num_rows();
+                pending_changelog.push(changelog);
+                // Changelog comes one key at a time; hand it on in batches so the
+                // writer does not handle a one-row batch per key. The buffer stays
+                // bounded by the batch size even when every data row is deleted.
+                if changelog_rows >= batch_size {
+                    yield changelog_batch(&changelog_schema, &pending_changelog)?;
+                    pending_changelog.clear();
+                    changelog_rows = 0;
+                }
             }
             if output_indices.is_empty() {
                 compact_batch_buffer(&mut batch_buffer, &mut stream_batch_idx, &cursors);
@@ -2014,6 +2081,10 @@ fn sort_merge_stream(
             }
         }
 
+        if !pending_changelog.is_empty() {
+            yield changelog_batch(&changelog_schema, &pending_changelog)?;
+        }
+
         // Yield remaining rows.
         if !output_indices.is_empty() {
             let batch = build_output(
@@ -2027,6 +2098,14 @@ fn sort_merge_stream(
         }
     }
     .boxed())
+}
+
+/// Concatenates per-key changelog batches into one changelog batch.
+fn changelog_batch(schema: &SchemaRef, batches: &[RecordBatch]) -> crate::Result<RecordBatch> {
+    arrow_select::concat::concat_batches(schema, batches).map_err(|error| Error::DataInvalid {
+        message: format!("Invalid changelog batch: {error}"),
+        source: Some(Box::new(error)),
+    })
 }
 
 /// Batch index marking an output row as a [`PickedRow`].
@@ -3344,6 +3423,111 @@ mod tests {
         );
     }
 
+    /// Changelog from consecutive keys is handed on in key order, in batches of up
+    /// to the batch size rather than one batch per key.
+    #[tokio::test]
+    async fn test_changelog_is_emitted_in_batches() {
+        struct EveryKeyChangelog;
+        impl MergeFunction for EveryKeyChangelog {
+            fn merge(
+                &self,
+                rows: &[MergeRow],
+                batch_buffer: &[BufferedBatch],
+                source_output_col_indices: &[usize],
+                output_schema: &SchemaRef,
+            ) -> crate::Result<MergeResult> {
+                DeduplicateMergeFunction.merge(
+                    rows,
+                    batch_buffer,
+                    source_output_col_indices,
+                    output_schema,
+                )
+            }
+
+            fn merge_with_changelog(
+                &self,
+                rows: &[MergeRow],
+                batches: &[BufferedBatch],
+                columns: &[usize],
+                schema: &SchemaRef,
+            ) -> crate::Result<(MergeResult, Option<RecordBatch>)> {
+                let last = rows.last().unwrap();
+                let changelog = build_output_interleave(
+                    schema,
+                    batches,
+                    columns,
+                    &[(last.batch_idx, last.row_idx)],
+                )?;
+                Ok((self.merge(rows, batches, columns, schema)?, Some(changelog)))
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let stream = |pk: Vec<i32>, seq: i64| {
+            let n = pk.len();
+            stream_from_batches(vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(pk.clone())),
+                    Arc::new(Int64Array::from(vec![seq; n])),
+                    Arc::new(Int8Array::from(vec![0; n])),
+                    Arc::new(Int32Array::from_iter_values(pk.iter().map(|k| k * 10))),
+                ],
+            )
+            .unwrap()])
+        };
+        let batches = SortMergeReaderBuilder::new(
+            vec![stream(vec![1, 2, 4], 1), stream(vec![2, 3, 5], 2)],
+            schema.clone(),
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema.clone(),
+            Box::new(EveryKeyChangelog),
+        )
+        .with_batch_size(2)
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let pks = |batch: &RecordBatch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        let (changelog, data): (Vec<_>, Vec<_>) = batches.iter().partition(|batch| {
+            batch
+                .schema()
+                .metadata()
+                .contains_key(CHANGELOG_BATCH_METADATA_KEY)
+        });
+        assert_eq!(
+            changelog.iter().map(|batch| pks(batch)).collect::<Vec<_>>(),
+            vec![vec![1, 2], vec![3, 4], vec![5]]
+        );
+        assert_eq!(
+            data.iter().flat_map(|batch| pks(batch)).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+    }
+
     #[tokio::test]
     async fn test_partial_update_merge_keeps_latest_non_null_values() {
         let schema = Arc::new(Schema::new(vec![
@@ -4338,7 +4522,7 @@ mod tests {
                 &schema,
             )
             .unwrap();
-        let MergeResult::MaterializedDeleteRow(deleted) = result else {
+        let MergeResult::MaterializedRetractRow(deleted, RowKind::Delete) = result else {
             panic!("expected a materialized delete row");
         };
         assert_eq!(
@@ -4366,7 +4550,9 @@ mod tests {
                 .downcast_ref::<StringArray>()
                 .unwrap()
                 .value(0),
-            "deleted"
+            // Java PR 11178: the UPDATE_BEFORE after the DELETE applies its
+            // non-null fields and keeps the DELETE result kind.
+            "before"
         );
     }
 

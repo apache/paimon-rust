@@ -35,7 +35,7 @@ use super::global_index_freshness::indexed_columns_unchanged;
 use super::key_normalization::canonical_partition_key;
 use super::update_input::unique_column_index;
 use super::upsert_key_matcher::UpsertKeyMatcher;
-use super::write_batch_normalize::{normalize_blob_write_field, normalize_write_array};
+use super::write_batch_normalize::{normalize_blob_write_field, normalize_write_field};
 use crate::spec::{
     batch_to_serialized_bytes, extract_datum_from_arrow, CoreOptions, Predicate, PredicateBuilder,
 };
@@ -247,7 +247,7 @@ impl TableUpsert {
                     super::write_batch_normalize::normalize_blob_update_field(column, field)
                 }
             } else if append {
-                normalize_write_array(column, field.data_type())
+                normalize_write_field(column, field, None)
                     .map(|column| (field.as_ref().clone(), column))
             } else {
                 Ok((
@@ -432,8 +432,8 @@ impl TableUpsert {
                 .iter()
                 .find(|field| field.name() == key)
                 .unwrap();
-            // BLOB keys can be matched as Arrow bytes but have no scalar Datum.
-            if field.data_type().is_blob_type() {
+            // BLOB and WKB keys use byte matching without a scalar index predicate.
+            if field.data_type().is_blob_type() || field.data_type().is_geospatial() {
                 continue;
             }
             let mut seen = HashSet::new();
@@ -1422,11 +1422,30 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_blob_keys_fall_back_to_byte_matching() {
-        use crate::spec::BlobType;
-        use arrow_array::LargeBinaryArray;
+        let keys = arrow_array::LargeBinaryArray::from_vec(vec![b"blob-key"]);
+        assert_upsert_matches_bytes(
+            PaimonType::Blob(crate::spec::BlobType::new()),
+            Arc::new(keys),
+        )
+        .await;
+    }
 
+    #[tokio::test]
+    async fn upsert_geospatial_keys_fall_back_to_byte_matching() {
+        let point = [
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64,
+        ];
+        let keys = arrow_array::BinaryArray::from_vec(vec![point.as_slice()]);
+        assert_upsert_matches_bytes(
+            PaimonType::Geometry(crate::spec::GeometryType::default()),
+            Arc::new(keys),
+        )
+        .await;
+    }
+
+    async fn assert_upsert_matches_bytes(key_type: PaimonType, key: ArrayRef) {
         let schema = PaimonSchema::builder()
-            .column("key", PaimonType::Blob(BlobType::new()))
+            .column("key", key_type)
             .column("value", PaimonType::Int(IntType::new()))
             .option("data-evolution.enabled", "true")
             .option("row-tracking.enabled", "true")
@@ -1441,10 +1460,7 @@ mod tests {
         );
         for value in [41, 42] {
             let source = RecordBatch::try_from_iter([
-                (
-                    "key",
-                    Arc::new(LargeBinaryArray::from_vec(vec![b"blob-key"])) as ArrayRef,
-                ),
+                ("key", key.clone()),
                 ("value", Arc::new(Int32Array::from(vec![value])) as ArrayRef),
             ])
             .unwrap();

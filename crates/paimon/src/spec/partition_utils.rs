@@ -469,6 +469,8 @@ fn format_partition_value(
         }
 
         DataType::Variant(_)
+        | DataType::Geometry(_)
+        | DataType::Geography(_)
         | DataType::Blob(_)
         | DataType::Array(_)
         | DataType::Map(_)

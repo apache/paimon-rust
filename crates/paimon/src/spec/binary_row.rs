@@ -348,9 +348,10 @@ impl BinaryRow {
             DataType::VarChar(_) | DataType::Char(_) => {
                 Datum::String(self.get_string(pos)?.to_string())
             }
-            DataType::Binary(_) | DataType::VarBinary(_) => {
-                Datum::Bytes(self.get_binary(pos)?.to_vec())
-            }
+            DataType::Binary(_)
+            | DataType::VarBinary(_)
+            | DataType::Geometry(_)
+            | DataType::Geography(_) => Datum::Bytes(self.get_binary(pos)?.to_vec()),
             DataType::Variant(_) => {
                 let (value, metadata) = decode_variant_bytes(self.get_binary(pos)?)?;
                 Datum::Variant { value, metadata }
@@ -1143,7 +1144,10 @@ pub(crate) fn extract_datum_from_array(
                 scale: d.scale(),
             }
         }
-        DataType::Binary(_) | DataType::VarBinary(_) => {
+        DataType::Binary(_)
+        | DataType::VarBinary(_)
+        | DataType::Geometry(_)
+        | DataType::Geography(_) => {
             let arr = col
                 .as_any()
                 .downcast_ref::<arrow_array::BinaryArray>()
@@ -1469,7 +1473,10 @@ fn downcast_columns<'a>(
                     d.precision(),
                     d.scale(),
                 ),
-                DataType::Binary(_) | DataType::VarBinary(_) => TypedColumn::Binary(
+                DataType::Binary(_)
+                | DataType::VarBinary(_)
+                | DataType::Geometry(_)
+                | DataType::Geography(_) => TypedColumn::Binary(
                     col.as_any()
                         .downcast_ref()
                         .ok_or_else(|| type_mismatch_err("Binary", col_idx))?,

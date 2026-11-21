@@ -169,6 +169,11 @@ impl<'a> ColumnStatsCollector<'a> {
 
     pub(crate) fn collect(&mut self, batch: &RecordBatch, indices: &[usize]) -> crate::Result<()> {
         for (pos, (&col_idx, data_type)) in indices.iter().zip(self.types.iter()).enumerate() {
+            if data_type.is_geospatial() {
+                *self.null_counts[pos].as_mut().unwrap() +=
+                    batch.column(col_idx).null_count() as i64;
+                continue;
+            }
             match bound_rows(batch.column(col_idx).as_ref(), data_type) {
                 Some(bounds) => {
                     *self.null_counts[pos].as_mut().unwrap() +=
