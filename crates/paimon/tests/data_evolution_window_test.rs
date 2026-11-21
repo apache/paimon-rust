@@ -253,3 +253,108 @@ async fn window_filters_physical_events_by_stored_values() {
         .unwrap();
     assert_eq!(rows(&batches), vec![(Some(1), Some(1))]);
 }
+
+#[tokio::test]
+async fn window_keeps_insert_payloads_with_their_rows_after_compaction() {
+    use arrow_array::{cast::AsArray, types::Int32Type};
+    use arrow_array::{ArrayRef, LargeBinaryArray};
+    use paimon::spec::BlobType;
+
+    let path = "memory:/data_evolution_window/blob_insert";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .column("payload", DataType::Blob(BlobType::new()))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("write-only", "true")
+        .option("compaction.min.file-num", "2")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    for first in [1, 3] {
+        let ids = Int32Array::from(vec![first, first + 1]);
+        let payloads = [[first as u8], [(first + 1) as u8]];
+        let batch = RecordBatch::try_from_iter([
+            ("id", Arc::new(ids.clone()) as ArrayRef),
+            ("value", Arc::new(ids) as ArrayRef),
+            (
+                "payload",
+                Arc::new(LargeBinaryArray::from_iter_values(payloads)) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        write_batch(&table, &batch).await;
+    }
+    compact(&table).await;
+    update_values(&table, vec![50; 4]).await;
+
+    let window = table
+        .copy_with_time_travel(HashMap::from([(
+            "incremental-between-timestamp".into(),
+            "0,9999999999999".into(),
+        )]))
+        .await
+        .unwrap();
+    for (filtered, chunked) in [(false, false), (true, false), (true, true)] {
+        let mut builder = window.new_read_builder();
+        if filtered {
+            builder.with_filter(
+                PredicateBuilder::new(window.schema().fields())
+                    .equal("value", Datum::Int(1))
+                    .unwrap(),
+            );
+        }
+        let scan = if chunked {
+            // The chunk carries multiple events for the same row ID. The
+            // filtered reader must fetch the BLOB from the matching event.
+            window
+                .new_read_builder()
+                .new_scan()
+                .with_chunk_shuffle(42, 4)
+                .unwrap()
+        } else {
+            builder.new_scan()
+        };
+        let plan = scan.plan().await.unwrap();
+        if !filtered {
+            assert_eq!(
+                plan.splits()
+                    .iter()
+                    .map(|split| split.merged_row_count())
+                    .sum::<Option<i64>>(),
+                Some(8)
+            );
+        }
+        let batches: Vec<_> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        for batch in batches {
+            let ids = batch.column(0).as_primitive::<Int32Type>();
+            let values = batch.column(1).as_primitive::<Int32Type>();
+            let payloads = batch.column(2).as_binary::<i64>();
+            actual.extend(
+                ids.iter()
+                    .zip(values.iter())
+                    .zip(payloads.iter())
+                    .map(|((id, value), payload)| (id, value, payload.map(<[u8]>::to_vec))),
+            );
+        }
+        let mut expected = vec![(Some(1), Some(1), Some(vec![1]))];
+        if !filtered {
+            expected.extend((2..=4).map(|i| (Some(i), Some(i), Some(vec![i as u8]))));
+            expected.extend(vec![(None, Some(50), None); 4]);
+        }
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+}

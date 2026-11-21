@@ -111,6 +111,66 @@ pub(super) fn is_data_evolution_column_slice_group(files: &[DataFileMeta]) -> bo
         })
 }
 
+/// Split overlapping files of a mixed-range window into readable events.
+pub(super) fn incremental_event_groups(
+    files: &[DataFileMeta],
+) -> crate::Result<Option<Vec<Vec<DataFileMeta>>>> {
+    let mixed =
+        |group: &[DataFileMeta]| group.len() > 1 && !is_data_evolution_column_slice_group(group);
+    if !mixed(files) {
+        return Ok(None);
+    }
+    let groups = group_by_overlapping_row_id(files.to_vec());
+    if !groups.iter().any(|group| mixed(group)) {
+        return Ok(None);
+    }
+    let mut events = Vec::new();
+    for group in groups {
+        if !mixed(&group) {
+            events.push(group);
+        } else if group.iter().all(is_data_evolution_normal_file) {
+            events.extend(group.into_iter().map(|file| vec![file]));
+        } else {
+            // APPEND files in a row-tracked table get the snapshot sequence
+            // at commit. Row IDs alone cannot distinguish a later update from
+            // the normal and independently rolled dedicated files of an insert.
+            let mut commits = std::collections::BTreeMap::<i64, Vec<DataFileMeta>>::new();
+            for file in group {
+                if file.file_source != Some(0) || file.max_sequence_number <= 0 {
+                    return Err(Error::Unsupported {
+                        message: format!("Cannot identify the write of '{}' in a mixed-range data-evolution window", file.file_name),
+                    });
+                }
+                commits
+                    .entry(file.max_sequence_number)
+                    .or_default()
+                    .push(file);
+            }
+            for files in commits.into_values() {
+                for event in group_by_overlapping_row_id(files) {
+                    if event.len() > 1
+                        && (!is_data_evolution_column_slice_group(&event)
+                            || event
+                                .iter()
+                                .filter(|file| is_data_evolution_normal_file(file))
+                                .count()
+                                != 1
+                            || event
+                                .iter()
+                                .any(|file| file.min_sequence_number != file.max_sequence_number))
+                    {
+                        return Err(Error::Unsupported {
+                            message: format!("Cannot identify dedicated-file companions at row ID {:?} in a mixed-range data-evolution window", event[0].first_row_id),
+                        });
+                    }
+                    events.push(event);
+                }
+            }
+        }
+    }
+    Ok(Some(events))
+}
+
 /// Split a reader input into independently readable row-id groups.
 ///
 /// Native chunk shuffle can deliberately combine several disjoint groups in
@@ -477,7 +537,23 @@ impl DataEvolutionReader {
         if self.limit == Some(0) {
             return Ok(futures::stream::empty().boxed());
         }
-        let splits: Vec<DataSplit> = data_splits.to_vec();
+        let mut splits = Vec::with_capacity(data_splits.len());
+        for split in data_splits {
+            if split.is_streaming() && !split.raw_convertible() {
+                // Externally planned or chunk-shuffled splits may pack events
+                // back together. Row-ID based BLOB preselection must run on
+                // each event separately: different events can share a row ID.
+                if let Some(events) = incremental_event_groups(split.data_files())? {
+                    splits.extend(
+                        events
+                            .into_iter()
+                            .map(|files| split.for_data_evolution_files(files)),
+                    );
+                    continue;
+                }
+            }
+            splits.push(split.clone());
+        }
 
         if self.needs_managed_blob_preselection(&splits) {
             return Ok(try_stream! {
@@ -571,11 +647,8 @@ impl DataEvolutionReader {
                     if remaining == Some(0) {
                         break 'splits;
                     }
-                    // Change events are physical file changes. Files of a streaming
-                    // split that are not column slices of one row range are
-                    // independent changes and are read as they are stored.
                     if is_raw_convertible(&files)
-                        || (split.is_streaming() && !is_data_evolution_column_slice_group(&files))
+                        || (split.is_streaming() && files.len() == 1)
                     {
                         for file_meta in files {
                             if remaining == Some(0) {
@@ -4195,6 +4268,28 @@ mod tests {
 
         let only_dedicated = vec![data_file("payload.blob", 0, 5, 1, Some(vec!["payload"]))];
         assert!(!is_data_evolution_column_slice_group(&only_dedicated));
+    }
+
+    #[test]
+    fn ambiguous_mixed_range_blob_events_are_rejected() {
+        let mut files = vec![
+            data_file("base.parquet", 0, 2, 1, Some(vec!["id"])),
+            data_file("payload.blob", 0, 2, 1, Some(vec!["payload"])),
+            data_file("update.parquet", 0, 4, 1, Some(vec!["value"])),
+        ];
+        assert!(matches!(
+            incremental_event_groups(&files),
+            Err(Error::Unsupported { .. })
+        ));
+        // A known commit still has two overlapping normal-file candidates.
+        for file in &mut files {
+            file.file_source = Some(0);
+            file.min_sequence_number = file.max_sequence_number;
+        }
+        assert!(matches!(
+            incremental_event_groups(&files),
+            Err(Error::Unsupported { .. })
+        ));
     }
 
     #[test]

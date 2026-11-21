@@ -22,7 +22,9 @@
 
 use super::bucket_filter::{compute_target_buckets, BucketSelector};
 use super::chunk_shuffle::{chunk_shuffle_splits, ChunkShuffle};
-use super::data_evolution_reader::is_data_evolution_column_slice_group;
+use super::data_evolution_reader::{
+    incremental_event_groups, is_data_evolution_column_slice_group,
+};
 use super::format_table_scan::FormatTableScan;
 use super::global_index_result::GlobalIndexResult;
 use super::global_index_scanner::RowRangeIndex;
@@ -3310,6 +3312,24 @@ impl<'a> PaimonTableScan<'a> {
                     .collect()
             };
 
+            let file_groups = if data_evolution_enabled && self.is_streaming() {
+                let mut events = Vec::with_capacity(file_groups.len());
+                for group in file_groups {
+                    if !group.raw_convertible {
+                        if let Some(groups) = incremental_event_groups(&group.files)? {
+                            events.extend(groups.into_iter().map(|files| SplitGroup {
+                                raw_convertible: files.len() == 1,
+                                files,
+                            }));
+                            continue;
+                        }
+                    }
+                    events.push(group);
+                }
+                events
+            } else {
+                file_groups
+            };
             for group in file_groups {
                 let SplitGroup {
                     files: file_group,
