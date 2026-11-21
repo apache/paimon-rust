@@ -2540,6 +2540,18 @@ fn collect_raw_batch_vector_batch(
             });
         }
         let row_id = row_id_to_u64(row_ids.value(row))?;
+        let candidate_queries = scoring_plan.candidate_query_indices.get(&row_id);
+        let mut shared_filter_groups = scoring_plan
+            .shared_filter_groups
+            .iter()
+            .filter(|group| group.include_row_ids.contains(row_id))
+            .peekable();
+        if scoring_plan.all_query_indices.is_empty()
+            && candidate_queries.is_none()
+            && shared_filter_groups.peek().is_none()
+        {
+            continue;
+        }
         let is_null = match layout {
             VectorLayout::List(a) => a.is_null(row),
             VectorLayout::Fixed(a) => a.is_null(row),
@@ -2591,7 +2603,7 @@ fn collect_raw_batch_vector_batch(
                 )?;
             }
         }
-        if let Some(query_indices) = scoring_plan.candidate_query_indices.get(&row_id) {
+        if let Some(query_indices) = candidate_queries {
             for &query_index in query_indices {
                 offer_raw_vector_score(
                     raw_row,
@@ -2603,18 +2615,16 @@ fn collect_raw_batch_vector_batch(
                 )?;
             }
         }
-        for group in &scoring_plan.shared_filter_groups {
-            if group.include_row_ids.contains(row_id) {
-                for &query_index in &group.query_indices {
-                    offer_raw_vector_score(
-                        raw_row,
-                        query_index,
-                        metric,
-                        vector_searches,
-                        scoring_plan,
-                        top_k_out,
-                    )?;
-                }
+        for group in shared_filter_groups {
+            for &query_index in &group.query_indices {
+                offer_raw_vector_score(
+                    raw_row,
+                    query_index,
+                    metric,
+                    vector_searches,
+                    scoring_plan,
+                    top_k_out,
+                )?;
             }
         }
     }

@@ -894,9 +894,14 @@ fn test_collect_raw_batch_vector_batch_respects_fixed_size_list_offset() {
 fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
     let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
     let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element_field);
-    for vector in [[1.0, 0.0], [0.0, 1.0], [0.8, 0.2]] {
-        builder.values().append_value(vector[0]);
-        builder.values().append_value(vector[1]);
+    for vector in [
+        [None, Some(0.0)],
+        [Some(0.0), Some(1.0)],
+        [Some(0.8), Some(0.2)],
+    ] {
+        for coordinate in vector {
+            builder.values().append_option(coordinate);
+        }
         builder.append(true);
     }
     let schema = Arc::new(ArrowSchema::new(vec![
@@ -918,34 +923,39 @@ fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
         ],
     )
     .unwrap();
-    let mut include_row_ids = RoaringTreemap::new();
-    include_row_ids.insert(12);
-    let searches = vec![
-        VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string())
-            .unwrap()
-            .with_include_row_ids(include_row_ids),
-    ];
-    let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
-    let mut top_k = searches
-        .iter()
-        .map(|search| RawScoreTopK::new(search.limit))
-        .collect::<Vec<_>>();
+    for included in [&[12][..], &[12, 11][..]] {
+        let searches = included
+            .iter()
+            .map(|&row_id| {
+                VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string())
+                    .unwrap()
+                    .with_include_row_ids(std::iter::once(row_id).collect())
+            })
+            .collect::<Vec<_>>();
+        let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
+        let mut top_k = searches
+            .iter()
+            .map(|search| RawScoreTopK::new(search.limit))
+            .collect::<Vec<_>>();
 
-    collect_raw_batch_vector_batch(
-        &batch,
-        &searches,
-        RawVectorMetric::L2,
-        &scoring_plan,
-        &mut top_k,
-    )
-    .unwrap();
-    let results = top_k
-        .into_iter()
-        .map(RawScoreTopK::into_search_result)
-        .collect::<Vec<_>>();
+        collect_raw_batch_vector_batch(
+            &batch,
+            &searches,
+            RawVectorMetric::L2,
+            &scoring_plan,
+            &mut top_k,
+        )
+        .unwrap();
 
-    assert_eq!(results[0].row_ids, vec![12]);
-    assert_eq!(results[0].scores.len(), 1);
+        for (result, &row_id) in top_k
+            .into_iter()
+            .map(RawScoreTopK::into_search_result)
+            .zip(included)
+        {
+            assert_eq!(result.row_ids, vec![row_id]);
+            assert_eq!(result.scores.len(), 1);
+        }
+    }
 }
 
 #[tokio::test]
