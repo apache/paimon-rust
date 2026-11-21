@@ -17,13 +17,13 @@
 
 //! DELETE execution for Paimon tables.
 //!
-//! Supports copy-on-write file rewriting for append-only tables (no PK, no deletion vectors).
+//! Supports primary-key tombstones, append copy-on-write, and Data Evolution deletion vectors.
 
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{Delete, FromTable, TableFactor};
 
-use paimon::spec::CoreOptions;
+use paimon::spec::{CoreOptions, RowKind};
 use paimon::table::{CopyOnWriteMergeWriter, Table};
 
 use crate::error::to_datafusion_error;
@@ -33,6 +33,7 @@ use crate::merge_into::{
     extract_tracking_columns, is_delete_conflict, is_row_id_conflict, ok_result,
     register_cow_target_table, retry_on_conflict,
 };
+use crate::primary_key_dml;
 use crate::sql_context::SQLContext;
 
 /// Execute a DELETE statement on a Paimon table.
@@ -64,12 +65,56 @@ pub(crate) async fn execute_delete(
         return execute_data_evolution_delete(ctx, delete, &table, table_ref).await;
     }
     if !schema.trimmed_primary_keys().is_empty() {
-        return Err(DataFusionError::Plan(
-            "DELETE on primary-key tables is not yet supported".to_string(),
-        ));
+        return execute_primary_key_delete(ctx, delete, &table, table_ref).await;
     }
 
     execute_cow_delete(ctx, delete, &table, table_ref).await
+}
+
+async fn execute_primary_key_delete(
+    ctx: &SQLContext,
+    delete: &Delete,
+    table: &Table,
+    table_ref: &str,
+) -> DFResult<DataFrame> {
+    primary_key_dml::validate_table(table, "DELETE")?;
+    if table.schema().core_options().ignore_delete() {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE on primary-key tables requires ignore-delete=false".into(),
+        ));
+    }
+    let from = match &delete.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+    };
+    if from.len() != 1
+        || !from[0].joins.is_empty()
+        || !delete.tables.is_empty()
+        || delete.using.is_some()
+        || delete.returning.is_some()
+        || delete.output.is_some()
+        || !delete.order_by.is_empty()
+        || delete.limit.is_some()
+        || !matches!(&from[0].relation,
+            TableFactor::Table {
+                args: None, version: None, with_ordinality: false,
+                json_path: None, sample: None, with_hints, partitions, index_hints, ..
+            } if with_hints.is_empty() && partitions.is_empty() && index_hints.is_empty())
+    {
+        return Err(DataFusionError::NotImplemented(
+            "Primary-key DELETE supports a single target with an optional WHERE clause".into(),
+        ));
+    }
+
+    let input = primary_key_dml::plan_input(
+        ctx,
+        table,
+        table_ref,
+        "*",
+        delete.selection.as_ref(),
+        "DELETE",
+    )
+    .await?;
+    primary_key_dml::write_rows(ctx, table, input, RowKind::Delete, "DELETE").await
 }
 
 /// Execute DELETE on a data-evolution table with retry on row ID conflict.

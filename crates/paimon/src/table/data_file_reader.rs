@@ -238,6 +238,13 @@ impl DataFileReader {
         self
     }
 
+    pub(super) fn without_parquet_prefetch(mut self) -> Self {
+        self.parquet_read_budget = self
+            .parquet_read_budget
+            .map(|budget| Arc::new(budget.without_prefetch()));
+        self
+    }
+
     pub(crate) fn with_table_options(
         mut self,
         options: impl Into<Arc<HashMap<String, String>>>,
@@ -962,13 +969,9 @@ impl DataFileReader {
     /// engine-supplied bucket split does — hands them over directly rather than
     /// expanding them into positions this would only coalesce back.
     ///
-    /// The emitted rows are always exactly the selected ones, but what that saves is
-    /// the format's business, and it differs: mosaic skips a row group before
-    /// touching its column data, parquet skips pages through the offset index,
-    /// `.row` prunes blocks. Avro is the exception — its reader loads the whole file
-    /// and deserializes every record before applying the selection, so there a
-    /// narrow selection saves only what comes after decoding: Arrow column
-    /// materialization, and whatever the caller does per row.
+    /// Mosaic prunes row groups, Parquet uses its page offset index, and the row
+    /// format prunes blocks. Avro skips blocks outside the selected ranges and
+    /// decodes records sequentially within each selected block.
     pub(super) fn read_single_file_stream_local_ranges(
         &self,
         split: &DataSplit,

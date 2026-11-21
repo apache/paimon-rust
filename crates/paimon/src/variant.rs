@@ -231,7 +231,10 @@ impl<'a> VariantRef<'a> {
         self.get_path_segments(&parse_path(path)?)
     }
 
-    fn get_path_segments(&self, segments: &[PathSegment]) -> Result<Option<VariantRef<'a>>> {
+    pub(crate) fn get_path_segments(
+        &self,
+        segments: &[PathSegment],
+    ) -> Result<Option<VariantRef<'a>>> {
         let mut current = *self;
         for segment in segments {
             match (segment, current.kind()?) {
@@ -287,7 +290,7 @@ impl<'a> VariantRef<'a> {
         Ok(out)
     }
 
-    fn get_field_by_key(&self, key: &str) -> Result<Option<VariantRef<'a>>> {
+    pub(crate) fn get_field_by_key(&self, key: &str) -> Result<Option<VariantRef<'a>>> {
         let layout = object_layout(self.value, self.pos)?;
         if layout.size < BINARY_SEARCH_THRESHOLD {
             for i in 0..layout.size {
@@ -2523,6 +2526,9 @@ fn variant_shredding_row_type(
     is_object_field: bool,
 ) -> Result<RowType> {
     let mut fields = Vec::new();
+    // Java creates a fresh RowType builder for each wrapper. Only the root
+    // contains metadata, shifting its value/typed_value IDs from 0/1 to 1/2.
+    let value_id = i32::from(is_top_level);
     if is_top_level {
         fields.push(DataField::new(
             0,
@@ -2539,12 +2545,12 @@ fn variant_shredding_row_type(
                 false,
             )?);
             fields.push(DataField::new(
-                1,
+                value_id,
                 VARIANT_VALUE_FIELD_NAME.to_string(),
                 variant_binary_type(true)?,
             ));
             fields.push(DataField::new(
-                2,
+                value_id + 1,
                 VARIANT_TYPED_VALUE_FIELD_NAME.to_string(),
                 DataType::Array(ArrayType::with_nullable(data_type.is_nullable(), element)),
             ));
@@ -2562,31 +2568,31 @@ fn variant_shredding_row_type(
                 })
                 .collect::<Result<Vec<_>>>()?;
             fields.push(DataField::new(
-                1,
+                value_id,
                 VARIANT_VALUE_FIELD_NAME.to_string(),
                 variant_binary_type(true)?,
             ));
             fields.push(DataField::new(
-                2,
+                value_id + 1,
                 VARIANT_TYPED_VALUE_FIELD_NAME.to_string(),
                 DataType::Row(RowType::new(object_fields)),
             ));
         }
         DataType::Variant(_) => {
             fields.push(DataField::new(
-                1,
+                value_id,
                 VARIANT_VALUE_FIELD_NAME.to_string(),
                 variant_binary_type(is_object_field)?,
             ));
         }
         dt if scalar_schema_for_type(dt)?.is_some() => {
             fields.push(DataField::new(
-                1,
+                value_id,
                 VARIANT_VALUE_FIELD_NAME.to_string(),
                 variant_binary_type(true)?,
             ));
             fields.push(DataField::new(
-                2,
+                value_id + 1,
                 VARIANT_TYPED_VALUE_FIELD_NAME.to_string(),
                 shredding_typed_value_type(data_type)?,
             ));
@@ -3769,14 +3775,14 @@ fn decimal_to_integral(variant: VariantRef<'_>, min: i128, max: i128) -> Result<
 }
 
 #[derive(Clone)]
-struct ObjectFieldRef<'a> {
-    key: String,
+pub(crate) struct ObjectFieldRef<'a> {
+    pub(crate) key: String,
     id: usize,
-    value: VariantRef<'a>,
+    pub(crate) value: VariantRef<'a>,
 }
 
 impl<'a> VariantRef<'a> {
-    fn object_fields(&self) -> Result<Vec<ObjectFieldRef<'a>>> {
+    pub(crate) fn object_fields(&self) -> Result<Vec<ObjectFieldRef<'a>>> {
         let layout = object_layout(self.value, self.pos)?;
         let mut fields = Vec::with_capacity(layout.size);
         for i in 0..layout.size {
@@ -3800,7 +3806,7 @@ impl<'a> VariantRef<'a> {
         Ok(fields)
     }
 
-    fn array_elements(&self) -> Result<Vec<VariantRef<'a>>> {
+    pub(crate) fn array_elements(&self) -> Result<Vec<VariantRef<'a>>> {
         let layout = array_layout(self.value, self.pos)?;
         let mut elements = Vec::with_capacity(layout.size);
         for i in 0..layout.size {

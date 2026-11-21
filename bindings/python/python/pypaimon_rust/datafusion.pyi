@@ -619,14 +619,16 @@ class BatchTableWrite:
 
 class BatchTableUpdate:
     def with_plan(self, plan: Plan) -> "BatchTableUpdate":
-        """Reuse complete plan_all file groups for row-ID updates and deletes.
+        """Reuse complete plan_all file groups for row-ID updates, deletes and shards.
 
         Workers reauthorize against the table; a plan is metadata, not a grant.
         Data manifests are not replanned. Deletes still read the captured index
         manifest to preserve deletion vectors for every file in the bucket.
         Assign all deletes for one partition/bucket to the same worker.
         Selected row ranges, scores and streaming splits are not mutation plans.
-        Other update operations reject this configuration before consuming input.
+        Shards balance only the supplied groups; use (0, 1) for a worker's
+        already assigned groups. Predicate, key-based and MERGE operations
+        reject this configuration before consuming input.
         """
         ...
     def with_blob_uri_reader_factory(
@@ -663,6 +665,8 @@ class BatchTableUpdate:
 
         None reads all table fields; an empty ROW reads zero columns while
         preserving row counts. Read fields are independent of with_update_type.
+        with_plan reuses its snapshot and groups without replanning manifests;
+        use shard_num=0, total_shard_count=1 for already assigned worker groups.
         """
         ...
     def with_update_type(self, update_cols: List[str]) -> "BatchTableUpdate": ...
@@ -699,14 +703,16 @@ class TableUpdateByRowId:
 
 class StreamTableUpdate:
     def with_plan(self, plan: Plan) -> "StreamTableUpdate":
-        """Reuse complete plan_all file groups for row-ID updates and deletes.
+        """Reuse complete plan_all file groups for row-ID updates, deletes and shards.
 
         Workers reauthorize against the table; a plan is metadata, not a grant.
         Data manifests are not replanned. Deletes still read the captured index
         manifest to preserve deletion vectors for every file in the bucket.
         Assign all deletes for one partition/bucket to the same worker.
         Selected row ranges, scores and streaming splits are not mutation plans.
-        Other update operations reject this configuration before consuming input.
+        Shards balance only the supplied groups; use (0, 1) for a worker's
+        already assigned groups. Predicate, key-based and MERGE operations
+        reject this configuration before consuming input.
         """
         ...
     def with_blob_uri_reader_factory(
@@ -743,6 +749,8 @@ class StreamTableUpdate:
 
         None reads all table fields; an empty ROW reads zero columns while
         preserving row counts. Read fields are independent of with_update_type.
+        with_plan reuses its snapshot and groups without replanning manifests;
+        use shard_num=0, total_shard_count=1 for already assigned worker groups.
         """
         ...
     def with_update_type(self, update_cols: List[str]) -> "StreamTableUpdate": ...

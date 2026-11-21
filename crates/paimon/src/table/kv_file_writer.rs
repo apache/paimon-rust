@@ -718,9 +718,9 @@ impl KeyValueFileWriter {
                     merged_kinds.push(RowKind::Insert as i8);
                     last_indices.push(sorted_indices.value(end - 1));
                 }
-                MergeResult::MaterializedDeleteRow(row) => {
+                MergeResult::MaterializedRetractRow(row, kind) => {
                     merged.push(row);
-                    merged_kinds.push(RowKind::Delete as i8);
+                    merged_kinds.push(kind as i8);
                     last_indices.push(sorted_indices.value(end - 1));
                 }
                 MergeResult::Omit => {}
@@ -852,7 +852,8 @@ impl KeyValueFileWriter {
                     match first_row_merge.merge(&rows, &[], &[], &schema)? {
                         MergeResult::SourceRow { row_idx, .. } => result.push(row_idx as u32),
                         MergeResult::Omit => {}
-                        MergeResult::MaterializedRow(_) | MergeResult::MaterializedDeleteRow(_) => {
+                        MergeResult::MaterializedRow(_)
+                        | MergeResult::MaterializedRetractRow(..) => {
                             unreachable!("first-row merge must return an input row")
                         }
                     }

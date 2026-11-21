@@ -36,6 +36,7 @@
 //! This version supports partition predicate pushdown by extracting
 //! translatable partition-only conjuncts from DataFusion filters.
 
+mod approx_percentile;
 mod binary_cast;
 mod blob_descriptor_functions;
 mod blob_reader;
@@ -52,6 +53,7 @@ mod format_partition_ddl;
 mod format_partition_repair;
 mod format_table_truncate;
 mod full_text_search;
+mod geospatial;
 #[cfg(test)]
 #[path = "../testdata/warehouse/mod.rs"]
 mod golden_warehouse;
@@ -64,8 +66,11 @@ mod memory;
 mod merge_condition;
 mod merge_into;
 mod partition_count_pushdown;
+mod partition_functions;
 mod physical_plan;
+mod primary_key_dml;
 mod procedures;
+mod read_files;
 mod regex_operators;
 mod relation_planner;
 pub mod runtime;
@@ -84,6 +89,7 @@ mod update;
 mod variant_functions;
 mod variant_pushdown;
 mod vector_search;
+mod vector_type;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};

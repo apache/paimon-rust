@@ -210,6 +210,8 @@ pub(super) fn read(
             }
         }
 
+        coalesce_disjoint_groups(&mut sequence_groups);
+
         let mut row_cursor = RowIdBatchCursor::new(selected_ranges, batch_size);
         while let Some(row_ids) = row_cursor.next_batch() {
             yield resolve_batch(
@@ -224,6 +226,26 @@ pub(super) fn read(
         }
     }
     .boxed())
+}
+
+// Disjoint files cannot compete for a row, even if they have different sequences.
+// Keep the fallback reader so gaps and placeholders still resolve to NULL.
+fn coalesce_disjoint_groups(groups: &mut Vec<VecDeque<LazyBlobFile>>) {
+    if groups.len() <= 1 {
+        return;
+    }
+    let mut ranges = groups
+        .iter()
+        .flatten()
+        .map(|file| &file.range)
+        .collect::<Vec<_>>();
+    ranges.sort_unstable_by_key(|range| range.from());
+    if ranges.windows(2).any(|pair| pair[0].to() >= pair[1].from()) {
+        return;
+    }
+    let mut files = groups.drain(..).flatten().collect::<Vec<_>>();
+    files.sort_unstable_by_key(|file| file.range.from());
+    groups.push(files.into());
 }
 
 async fn resolve_batch(
@@ -438,6 +460,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_disjoint_sequences_coalesce_and_read_in_row_order() {
+        use BlobFixtureValue::Value;
+        let mut groups = Vec::new();
+        for i in (0..128).rev() {
+            let (file, _) =
+                tracking_blob_file(&format!("{i}.blob"), i * 2, &[Value(b"a"), Value(b"b")]).await;
+            groups.push(VecDeque::from([file]));
+        }
+        coalesce_disjoint_groups(&mut groups);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 128);
+        let schema = build_target_arrow_schema(&[DataField::new(
+            0,
+            "payload".to_string(),
+            DataType::Blob(BlobType::new()),
+        )])
+        .unwrap();
+        let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
+        for i in 0..128 {
+            let batch = resolve_batch(
+                &mut groups,
+                &[i * 2, i * 2 + 1],
+                schema.clone(),
+                &file_io,
+                false,
+                1,
+                &BlobFieldKind::Scalar,
+            )
+            .await
+            .unwrap();
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            assert_eq!(values.value(0), b"a");
+            assert_eq!(values.value(1), b"b");
+        }
+        assert!(groups[0].is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_disjoint_sequences_preserve_gaps_nulls_and_placeholders() {
+        use BlobFixtureValue::{Null, Placeholder, Value};
+        let (left, _) = tracking_blob_file("left.blob", 1, &[Value(b"left"), Placeholder]).await;
+        let (right, _) = tracking_blob_file("right.blob", 5, &[Value(b"right"), Null]).await;
+        let mut groups = vec![VecDeque::from([right]), VecDeque::from([left])];
+        coalesce_disjoint_groups(&mut groups);
+        assert_eq!(groups.len(), 1);
+        let schema = build_target_arrow_schema(&[DataField::new(
+            0,
+            "payload".to_string(),
+            DataType::Blob(BlobType::new()),
+        )])
+        .unwrap();
+        let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
+        let batch = resolve_batch(
+            &mut groups,
+            &[0, 1, 2, 4, 5, 6, 7],
+            schema,
+            &file_io,
+            false,
+            1,
+            &BlobFieldKind::Scalar,
+        )
+        .await
+        .unwrap();
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(1), b"left");
+        assert_eq!(values.value(4), b"right");
+        for index in [0, 2, 3, 5, 6] {
+            assert!(values.is_null(index));
+        }
+    }
+
+    #[tokio::test]
     async fn test_resolve_batch_skips_payloads_for_resolved_rows() {
         use BlobFixtureValue::{Null, Placeholder, Value};
 
@@ -477,6 +579,8 @@ mod tests {
             VecDeque::from([older]),
             VecDeque::from([oldest]),
         ];
+        coalesce_disjoint_groups(&mut groups);
+        assert_eq!(groups.len(), 3);
         let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
         let batch = resolve_batch(
             &mut groups,

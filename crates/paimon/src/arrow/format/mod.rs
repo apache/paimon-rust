@@ -49,6 +49,16 @@ use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+fn panic_payload_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 /// Predicates with the file-level field context needed for pushdown.
 /// Only used by formats that support predicate pushdown (e.g. Parquet).
 pub(crate) struct FilePredicates {
@@ -506,6 +516,7 @@ fn supported_write_formats() -> Vec<&'static str> {
     vec![
         ".parquet",
         ".blob",
+        ".video",
         ".orc",
         ".csv",
         ".json",
@@ -582,6 +593,13 @@ pub(crate) fn create_format_writer_factory(
         return Ok(Arc::new(blob::BlobWriterFactory::new(
             file_io,
             write_fields.and_then(|fields| fields.first()),
+            format_options,
+        )?));
+    }
+    if file_format.eq_ignore_ascii_case("video") {
+        return Ok(Arc::new(video::VideoWriterFactory::new(
+            file_io,
+            write_fields,
             format_options,
         )?));
     }

@@ -459,6 +459,25 @@ pub(crate) fn evaluate_exact_leaf_predicate(
         return evaluate_decimal_leaf(array, op, literals).map(sanitize_filter_mask);
     }
     match op {
+        PredicateOperator::BBoxIntersects => {
+            let query = crate::rtree::BoundingBox::from_literals(literals)
+                .map_err(|e| ArrowError::InvalidArgumentError(e.to_string()))?;
+            let values = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| {
+                    ArrowError::InvalidArgumentError("BBOX_INTERSECTS requires binary WKB".into())
+                })?;
+            let mut result = arrow_array::builder::BooleanBuilder::with_capacity(values.len());
+            for value in values.iter() {
+                let hit = value
+                    .map(crate::rtree::BoundingBox::from_wkb)
+                    .transpose()
+                    .map_err(|e| ArrowError::InvalidArgumentError(e.to_string()))?;
+                result.append_value(hit.is_some_and(|bounds| bounds.intersects(&query)));
+            }
+            Ok(result.finish())
+        }
         PredicateOperator::IsNull => Ok(boolean_mask_from_predicate(array.len(), |row_index| {
             array.is_null(row_index)
         })),
@@ -1213,6 +1232,7 @@ fn evaluate_column_predicate(
         | PredicateOperator::NotBetween
         | PredicateOperator::ArrayContains
         | PredicateOperator::ArraysOverlap
+        | PredicateOperator::BBoxIntersects
         | PredicateOperator::ArrayContainsAll => Ok(BooleanArray::new_null(column.len())),
     }
 }
@@ -1388,6 +1408,8 @@ pub(crate) fn literal_scalar_for_arrow_filter(
         | DataType::Multiset(_)
         | DataType::Row(_)
         | DataType::Variant(_)
+        | DataType::Geometry(_)
+        | DataType::Geography(_)
         | DataType::Vector(_) => {
             return Ok(None);
         }

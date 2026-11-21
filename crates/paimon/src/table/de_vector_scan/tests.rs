@@ -22,6 +22,7 @@ use crate::table::vector_read::Read;
 use crate::table::vector_search_test_utils::{
     de_vector_table, id_gt_filter, vector_test_table, vector_test_table_at,
 };
+use crate::table::RowRange;
 use crate::table::{TableCommit, TableWrite};
 use crate::vector_search::GlobalIndexResult;
 use arrow_array::builder::{Float32Builder, ListBuilder};
@@ -42,6 +43,11 @@ async fn prepared_empty_filter_keeps_its_read_table_empty_after_commit() {
     let prepared = table
         .prepare_vector_search_filter(id_gt_filter(&table, 0))
         .await
+        .unwrap();
+    let indexed_prepared = table
+        .try_prepare_indexed_vector_search_filter(id_gt_filter(&table, 0))
+        .await
+        .unwrap()
         .unwrap();
     let field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
     let mut vectors = ListBuilder::new(Float32Builder::new()).with_field(field.clone());
@@ -67,31 +73,33 @@ async fn prepared_empty_filter_keeps_its_read_table_empty_after_commit() {
         .unwrap();
 
     assert!(table.resolve_read_snapshot().await.unwrap().is_some());
-    assert!(prepared
-        .table()
-        .resolve_read_snapshot()
-        .await
-        .unwrap()
-        .is_none());
-    assert!(prepared
-        .table()
-        .new_read_builder()
-        .new_scan()
-        .plan()
-        .await
-        .unwrap()
-        .splits()
-        .is_empty());
-    assert!(prepared
-        .table()
-        .new_vector_search_builder()
-        .with_vector_column("embedding")
-        .with_query_vector(vec![1.0, 0.0])
-        .with_limit(2)
-        .execute()
-        .await
-        .unwrap()
-        .is_empty());
+    for prepared in [prepared, indexed_prepared] {
+        assert!(prepared
+            .table()
+            .resolve_read_snapshot()
+            .await
+            .unwrap()
+            .is_none());
+        assert!(prepared
+            .table()
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .unwrap()
+            .splits()
+            .is_empty());
+        assert!(prepared
+            .table()
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0, 0.0])
+            .with_limit(2)
+            .execute()
+            .await
+            .unwrap()
+            .is_empty());
+    }
     assert!(!table
         .new_vector_search_builder()
         .with_vector_column("embedding")
@@ -436,7 +444,7 @@ async fn de_scalar_filter_applies_to_unindexed_raw_fallback() {
 }
 
 #[tokio::test]
-async fn unevaluable_scalar_filter_routes_covered_ranges_to_raw_in_every_mode() {
+async fn unevaluable_scalar_filter_preserves_ann_hits_in_every_mode() {
     let table = de_vector_table().await;
     for mode in ["fast", "full", "detail"] {
         let table = table.copy_with_options(HashMap::from([(
@@ -449,7 +457,8 @@ async fn unevaluable_scalar_filter_routes_covered_ranges_to_raw_in_every_mode() 
             .await
             .unwrap();
         // Keep the committed IVF shards but remove the scalar index from this
-        // plan. A data-derived ANN allow-list can lose hits with nprobe=1.
+        // plan. With nprobe=1 the ANN may legitimately return fewer than K;
+        // post-filtering an all-matching predicate must preserve those hits.
         plan.index_entries
             .retain(|entry| entry.index_file.index_type == "ivf-flat");
         let read = DeVectorRead::new(
@@ -459,12 +468,313 @@ async fn unevaluable_scalar_filter_routes_covered_ranges_to_raw_in_every_mode() 
             &HashMap::from([("ivf.nprobe".to_string(), "1".to_string())]),
         )
         .unwrap();
+        let mut unfiltered = plan.clone();
+        unfiltered.filter = None;
+        let expected = read.read(unfiltered).await.unwrap();
         let results = read.read(plan).await.unwrap();
-        for result in results {
+        for (result, expected) in results.into_iter().zip(expected) {
             let mut ids = result.row_ids().unwrap().row_ids.clone();
             ids.sort_unstable();
-            assert_eq!(ids, vec![0, 1, 2], "{mode}");
+            let mut expected = expected.row_ids().unwrap().row_ids.clone();
+            expected.sort_unstable();
+            assert_eq!(ids, expected, "{mode}");
         }
+    }
+}
+
+/// Two physical data files, one vector shard, and no scalar index. Keeping the
+/// files separate lets a missing unrelated file expose accidental full scans.
+async fn post_filter_table(shard_size: usize) -> (Table, Vec<String>) {
+    let table =
+        vector_test_table_at("memory:/post_vector_filter").copy_with_options(HashMap::from([
+            ("row-tracking.enabled".into(), "true".into()),
+            ("data-evolution.enabled".into(), "true".into()),
+            (
+                "global-index.row-count-per-shard".into(),
+                shard_size.to_string(),
+            ),
+            ("ivf-flat.dimension".into(), "2".into()),
+            ("ivf-flat.nlist".into(), "1".into()),
+            ("ivf-flat.metric".into(), "l2".into()),
+        ]));
+    let mut tail_files = Vec::new();
+    for start in [0, 64] {
+        let field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut vectors = ListBuilder::new(Float32Builder::new()).with_field(field.clone());
+        for id in start..start + 64 {
+            vectors.values().append_value(id as f32);
+            vectors.values().append_value(0.0);
+            vectors.append(true);
+        }
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("embedding", ArrowDataType::List(field), true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from_iter_values(start..start + 64)),
+                Arc::new(vectors.finish()),
+            ],
+        )
+        .unwrap();
+        let mut writer = TableWrite::new(&table, "test".into()).unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        if start == 64 {
+            tail_files.extend(
+                messages
+                    .iter()
+                    .flat_map(|m| &m.new_files)
+                    .map(|file| file.data_file_path(&format!("{}/bucket-0", table.location()))),
+            );
+        }
+        TableCommit::new(table.clone(), "test".into())
+            .commit(messages)
+            .await
+            .unwrap();
+    }
+    table
+        .new_global_index_build_builder()
+        .with_index_type("ivf-flat")
+        .with_index_column("embedding")
+        .execute()
+        .await
+        .unwrap();
+    assert!(!tail_files.is_empty());
+    (table, tail_files)
+}
+
+#[tokio::test]
+async fn post_filter_does_not_scan_unrelated_scalar_data() {
+    let (table, tail_files) = post_filter_table(128).await;
+    for path in tail_files {
+        table.file_io().delete_file(&path).await.unwrap();
+    }
+    let filter = crate::spec::PredicateBuilder::new(table.schema().fields())
+        .less_than("id", crate::spec::Datum::Int(100))
+        .unwrap();
+    for mode in ["fast", "full", "detail"] {
+        let table = table.copy_with_options(HashMap::from([
+            ("vector-index.search-mode".into(), mode.into()),
+            ("scalar-index.search-mode".into(), "full".into()),
+        ]));
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![0.0, 0.0])
+            .with_limit(2)
+            .with_filter(filter.clone())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.row_ids().unwrap().row_ids, vec![0, 1], "{mode}");
+    }
+    // The old central pre-filter would have to open the missing second file.
+    assert!(table
+        .try_prepare_indexed_vector_search_filter(filter.clone())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(table.prepare_vector_search_filter(filter).await.is_err());
+}
+
+#[tokio::test]
+async fn indexed_filter_preparation_uses_only_complete_exact_index_answers() {
+    let (table, tail_files) = post_filter_table(128).await;
+    table
+        .new_global_index_build_builder()
+        .with_index_type("btree")
+        .with_index_column("id")
+        .execute()
+        .await
+        .unwrap();
+    for path in tail_files {
+        table.file_io().delete_file(&path).await.unwrap();
+    }
+    // A full scalar-data read would fail on the missing tail file.
+    let filter = id_gt_filter(&table, 90);
+    let prepared = table
+        .try_prepare_indexed_vector_search_filter(filter.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        prepared.include_row_ids().iter().collect::<Vec<_>>(),
+        (91..128).collect::<Vec<_>>()
+    );
+    let predicates = crate::spec::PredicateBuilder::new(table.schema().fields());
+    let partial = Predicate::and(vec![
+        filter.clone(),
+        predicates.is_not_null("embedding").unwrap(),
+    ]);
+    assert!(table
+        .try_prepare_indexed_vector_search_filter(partial)
+        .await
+        .unwrap()
+        .is_none());
+    let table = table.copy_with_options(HashMap::from([(
+        "btree-index.fallback-scan-max-size".into(),
+        "0".into(),
+    )]));
+    assert!(table
+        .try_prepare_indexed_vector_search_filter(filter)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn post_filter_returns_short_results_without_retry_or_raw_scoring() {
+    let (table, _) = post_filter_table(128).await;
+    for mode in ["fast", "full", "detail"] {
+        for factor in ["2", "64"] {
+            let table = table.copy_with_options(HashMap::from([
+                ("vector-index.search-mode".into(), mode.into()),
+                ("scalar-index.search-mode".into(), "full".into()),
+            ]));
+            let results = table
+                .new_batch_vector_search_builder()
+                .with_vector_column("embedding")
+                .with_query_vectors(vec![vec![0.0, 0.0], vec![127.0, 0.0]])
+                .with_limit(2)
+                .with_filter(id_gt_filter(&table, 90))
+                .with_options(HashMap::from([(
+                    "vector-index.post-filter.candidates-factor".into(),
+                    factor.into(),
+                )]))
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(
+                results[0].row_ids().unwrap().row_ids,
+                if factor == "2" { vec![] } else { vec![91, 92] },
+                "{mode} {factor}"
+            );
+            assert_eq!(
+                results[1].row_ids().unwrap().row_ids,
+                vec![127, 126],
+                "{mode} {factor}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn post_filter_with_an_unindexed_or_arm_avoids_duplicate_raw_scan() {
+    let (table, tail_files) = post_filter_table(128).await;
+    table
+        .new_global_index_build_builder()
+        .with_index_type("btree")
+        .with_index_column("id")
+        .execute()
+        .await
+        .unwrap();
+    for path in tail_files {
+        table.file_io().delete_file(&path).await.unwrap();
+    }
+    let predicates = crate::spec::PredicateBuilder::new(table.schema().fields());
+    let filter = crate::spec::Predicate::or(vec![
+        predicates
+            .less_than("id", crate::spec::Datum::Int(0))
+            .unwrap(),
+        predicates.is_not_null("embedding").unwrap(),
+    ]);
+    for scalar_mode in ["full", "detail"] {
+        let table = table.copy_with_options(HashMap::from([(
+            "scalar-index.search-mode".into(),
+            scalar_mode.into(),
+        )]));
+        let mut builder = table.new_vector_search_builder();
+        builder
+            .with_vector_column("embedding")
+            .with_query_vector(vec![0.0, 0.0])
+            .with_limit(2)
+            .with_filter(filter.clone());
+        let plan = builder.new_scan().unwrap().plan().await.unwrap();
+        let wire = serde_json::to_value(&plan).unwrap();
+        assert!(
+            !plan
+                .splits()
+                .iter()
+                .any(|split| matches!(split, crate::table::SearchScanSplit::Raw { .. })),
+            "an unevaluable OR must not create scalar-gap Raw sources"
+        );
+        let plan = serde_json::from_value(wire).unwrap();
+        let result = builder.new_read().unwrap().read(plan).await.unwrap();
+        assert_eq!(result.row_ids().unwrap().row_ids, vec![0, 1]);
+    }
+}
+
+#[tokio::test]
+async fn post_filter_large_batch_reuses_the_reader_across_candidate_chunks() {
+    let (table, _) = post_filter_table(128).await;
+    let queries = (0..8193)
+        .map(|i| vec![if i % 2 == 0 { 0.0 } else { 127.0 }, 0.0])
+        .collect();
+    // C=128 puts 8192 queries in the first candidate chunk and one in the
+    // second. Reopening the stream instead of retaining the reader is an error.
+    let results = table
+        .new_batch_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vectors(queries)
+        .with_limit(1)
+        .with_filter(id_gt_filter(&table, 90))
+        .with_options(HashMap::from([(
+            "vector-index.post-filter.candidates-factor".into(),
+            "128".into(),
+        )]))
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 8193);
+    for (i, result) in results.into_iter().enumerate() {
+        assert_eq!(
+            result.row_ids().unwrap().row_ids,
+            vec![if i % 2 == 0 { 91 } else { 127 }]
+        );
+    }
+}
+
+#[tokio::test]
+async fn post_filter_preserves_shard_offsets_and_input_allow_lists() {
+    let (table, _) = post_filter_table(64).await;
+    let filter = id_gt_filter(&table, 105);
+    let include = Arc::new(RoaringTreemap::from_iter(99..=110));
+    for factor in ["2", "32"] {
+        let plan = DeVectorScan::new(&table, Some(&filter), Some(&include), None)
+            .plan()
+            .await
+            .unwrap();
+        assert!(plan.index_entries.iter().any(|entry| entry
+            .index_file
+            .global_index_meta
+            .as_ref()
+            .is_some_and(|meta| meta.row_range_start == 64)));
+        let reader = DeVectorRead::new(
+            "embedding",
+            &[&[0.0, 0.0], &[127.0, 0.0]],
+            2,
+            &HashMap::from([(
+                "vector-index.post-filter.candidates-factor".into(),
+                factor.into(),
+            )]),
+        )
+        .unwrap();
+        let results = reader.read(plan).await.unwrap();
+        assert_eq!(
+            results[0].row_ids().unwrap().row_ids,
+            if factor == "2" {
+                vec![]
+            } else {
+                vec![106, 107]
+            },
+            "{factor}"
+        );
+        assert_eq!(
+            results[1].row_ids().unwrap().row_ids,
+            vec![110, 109],
+            "{factor}"
+        );
     }
 }
 
@@ -589,56 +899,122 @@ async fn scalar_coverage_gaps_follow_scalar_and_vector_modes() {
                 .await
                 .unwrap();
         }
-        let filter = id_gt_filter(&table, 3);
-        for scalar_mode in ["fast", "full", "detail"] {
-            for vector_mode in ["fast", "full", "detail"] {
-                for builder_options in [false, true] {
-                    let modes = HashMap::from([
-                        (
-                            "vector-index.search-mode".to_string(),
-                            vector_mode.to_string(),
-                        ),
-                        (
-                            "scalar-index.search-mode".to_string(),
-                            scalar_mode.to_string(),
-                        ),
-                    ]);
-                    let mut table_options = if builder_options {
-                        HashMap::from([
-                            ("vector-index.search-mode".to_string(), "fast".to_string()),
-                            ("scalar-index.search-mode".to_string(), "fast".to_string()),
-                        ])
-                    } else {
-                        modes.clone()
-                    };
-                    table_options.insert(
-                        "global-index.filter.refine-from-data".to_string(),
-                        "false".to_string(),
-                    );
-                    let table = table.copy_with_options(table_options);
-                    let mut builder = table.new_batch_vector_search_builder();
-                    builder
-                        .with_vector_column("embedding")
-                        .with_query_vectors(vec![vec![0.0, 0.0], vec![1.0, 0.0]])
-                        .with_limit(10)
-                        .with_filter(filter.clone());
-                    if builder_options {
-                        builder.with_options(modes);
-                    }
-                    let expected = if (vector_covers_tail && scalar_mode != "fast")
-                        || (!vector_covers_tail && vector_mode != "fast")
-                    {
-                        vec![3]
-                    } else {
-                        vec![]
-                    };
-                    let results = builder.execute().await.unwrap();
-                    assert_eq!(results.len(), 2);
-                    for result in results {
-                        assert_eq!(result.row_ids().unwrap().row_ids, expected,
-                            "scalar={scalar_mode}, vector={vector_mode}, vector_covers_tail={vector_covers_tail}, builder_options={builder_options}");
+        let predicate = crate::spec::PredicateBuilder::new(table.schema().fields());
+        // No covered row matches these predicates. Empty scalar results must
+        // still recover the tail, including an AND with an unsupported arm.
+        let exact = id_gt_filter(&table, 3);
+        assert!(table
+            .try_prepare_indexed_vector_search_filter(exact.clone())
+            .await
+            .unwrap()
+            .is_none());
+        let filters = [
+            exact.clone(),
+            Predicate::and(vec![
+                exact.clone(),
+                predicate.is_not_null("embedding").unwrap(),
+            ]),
+            Predicate::or(vec![exact, predicate.is_null("embedding").unwrap()]),
+        ];
+        for (filter_index, filter) in filters.into_iter().enumerate() {
+            for scalar_mode in ["fast", "full", "detail"] {
+                for vector_mode in ["fast", "full", "detail"] {
+                    for builder_options in [false, true] {
+                        let modes = HashMap::from([
+                            (
+                                "vector-index.search-mode".to_string(),
+                                vector_mode.to_string(),
+                            ),
+                            (
+                                "scalar-index.search-mode".to_string(),
+                                scalar_mode.to_string(),
+                            ),
+                        ]);
+                        let mut table_options = if builder_options {
+                            HashMap::from([
+                                ("vector-index.search-mode".to_string(), "fast".to_string()),
+                                ("scalar-index.search-mode".to_string(), "fast".to_string()),
+                            ])
+                        } else {
+                            modes.clone()
+                        };
+                        table_options.insert(
+                            "global-index.filter.refine-from-data".to_string(),
+                            "false".to_string(),
+                        );
+                        let table = table.copy_with_options(table_options);
+                        let mut builder = table.new_batch_vector_search_builder();
+                        builder
+                            .with_vector_column("embedding")
+                            .with_query_vectors(vec![vec![0.0, 0.0], vec![1.0, 0.0]])
+                            .with_limit(10)
+                            .with_filter(filter.clone());
+                        if builder_options {
+                            builder.with_options(modes);
+                        }
+                        let post_filter = filter_index == 2;
+                        let expected = if (vector_covers_tail
+                            && (post_filter || scalar_mode != "fast"))
+                            || (!vector_covers_tail && vector_mode != "fast")
+                        {
+                            vec![3]
+                        } else {
+                            vec![]
+                        };
+                        let plan = builder.new_scan().unwrap().plan().await.unwrap();
+                        let raw_ranges: Vec<_> = plan
+                            .splits()
+                            .iter()
+                            .filter_map(|split| {
+                                if let crate::table::SearchScanSplit::Raw { row_ranges, .. } = split
+                                {
+                                    Some(row_ranges.as_slice())
+                                } else {
+                                    None
+                                }
+                            })
+                            .flatten()
+                            .cloned()
+                            .collect();
+                        let expect_raw = (!vector_covers_tail && vector_mode != "fast")
+                            || (vector_covers_tail && !post_filter && scalar_mode != "fast");
+                        assert_eq!(raw_ranges, if expect_raw { vec![RowRange::new(3, 3)] } else { vec![] },
+                        "scalar={scalar_mode}, vector={vector_mode}, vector_covers_tail={vector_covers_tail}, filter={filter_index}, builder_options={builder_options}");
+                        let results = builder.new_read().unwrap().read(plan).await.unwrap();
+                        assert_eq!(results.len(), 2);
+                        for result in results {
+                            assert_eq!(result.row_ids().unwrap().row_ids, expected,
+                            "scalar={scalar_mode}, vector={vector_mode}, vector_covers_tail={vector_covers_tail}, filter={filter_index}, builder_options={builder_options}");
+                        }
                     }
                 }
+            }
+        }
+        if vector_covers_tail {
+            // Metadata alone reports a partial BTree. This range lookup is
+            // declined by its scan budget, so it must use post-filtering.
+            for scalar_mode in ["full", "detail"] {
+                let table = table.copy_with_options(HashMap::from([
+                    ("scalar-index.search-mode".into(), scalar_mode.into()),
+                    ("btree-index.fallback-scan-max-size".into(), "0".into()),
+                    (
+                        "vector-index.post-filter.candidates-factor".into(),
+                        "1".into(),
+                    ),
+                ]));
+                let mut builder = table.new_vector_search_builder();
+                builder
+                    .with_vector_column("embedding")
+                    .with_query_vector(vec![1.0, -2.0])
+                    .with_limit(1)
+                    .with_filter(id_gt_filter(&table, 1));
+                let plan = builder.new_scan().unwrap().plan().await.unwrap();
+                assert!(!plan
+                    .splits()
+                    .iter()
+                    .any(|split| matches!(split, crate::table::SearchScanSplit::Raw { .. })));
+                let result = builder.new_read().unwrap().read(plan).await.unwrap();
+                assert!(result.row_ids().unwrap().row_ids.iter().all(|id| *id > 0));
             }
         }
     }

@@ -329,6 +329,27 @@ impl<'a> FilterTranslator<'a> {
     }
 
     fn translate_scalar_function(&self, func: &ScalarFunction) -> Option<TranslatedPredicate> {
+        if func.func.inner().is::<crate::geospatial::BBoxIntersects>() {
+            let [column, xmin, ymin, xmax, ymax] = func.args.as_slice() else {
+                return None;
+            };
+            let field = self.resolve_field(column)?;
+            let coordinate = |expr: &Expr| match extract_scalar_literal(expr)? {
+                ScalarValue::Float64(Some(value)) => Some(*value),
+                _ => None,
+            };
+            return self.exact(
+                self.predicate_builder
+                    .bbox_intersects(
+                        field.name(),
+                        coordinate(xmin)?,
+                        coordinate(ymin)?,
+                        coordinate(xmax)?,
+                        coordinate(ymax)?,
+                    )
+                    .ok()?,
+            );
+        }
         if matches!(
             func.name(),
             "array_has"

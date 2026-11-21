@@ -26,6 +26,9 @@ use std::{
     str::FromStr,
 };
 
+mod geospatial;
+pub use geospatial::{EdgeAlgorithm, GeographyType, GeometryType};
+
 bitflags! {
 /// An enumeration of Data type families for clustering {@link DataTypeRoot}s into categories.
 ///
@@ -76,6 +79,10 @@ pub enum DataType {
     Binary(BinaryType),
     /// Data type of a variable-length binary string (=a sequence of bytes).
     VarBinary(VarBinaryType),
+    /// Planar geometry encoded as OGC Well-Known Binary.
+    Geometry(GeometryType),
+    /// Geography encoded as OGC Well-Known Binary.
+    Geography(GeographyType),
     /// Data type of semi-structured values encoded as Variant value + metadata.
     Variant(VariantType),
     /// Data type of binary large object.
@@ -201,6 +208,8 @@ impl DataType {
             "DATE" => DataType::Date(DateType::with_nullable(plain("DATE")?)),
             "VARIANT" => DataType::Variant(VariantType::with_nullable(plain("VARIANT")?)),
             "BLOB" => DataType::Blob(BlobType::with_nullable(plain("BLOB")?)),
+            "GEOMETRY" => DataType::Geometry(s.parse()?),
+            "GEOGRAPHY" => DataType::Geography(s.parse()?),
             "DECIMAL" => DataType::Decimal(DecimalType::from_str(s)?),
             "BINARY" => DataType::Binary(BinaryType::from_str(s)?),
             "BYTES" | "VARBINARY" => DataType::VarBinary(VarBinaryType::from_str(s)?),
@@ -236,6 +245,26 @@ impl DataType {
         matches!(self, DataType::Blob(_))
     }
 
+    pub(crate) fn is_geospatial(&self) -> bool {
+        matches!(self, Self::Geometry(_) | Self::Geography(_))
+    }
+
+    /// Whether this type or a nested field is GEOMETRY or GEOGRAPHY.
+    pub fn contains_geospatial(&self) -> bool {
+        match self {
+            Self::Array(a) => a.element_type().contains_geospatial(),
+            Self::Map(m) => {
+                m.key_type().contains_geospatial() || m.value_type().contains_geospatial()
+            }
+            Self::Multiset(m) => m.element_type().contains_geospatial(),
+            Self::Row(r) => r
+                .fields()
+                .iter()
+                .any(|f| f.data_type().contains_geospatial()),
+            _ => self.is_geospatial(),
+        }
+    }
+
     /// Returns whether this field is stored in a dedicated `.blob` file.
     pub(crate) fn is_blob_file_field(&self) -> bool {
         match self {
@@ -259,6 +288,8 @@ impl DataType {
             DataType::Float(v) => v.nullable,
             DataType::Binary(v) => v.nullable,
             DataType::VarBinary(v) => v.nullable,
+            DataType::Geometry(v) => v.nullable,
+            DataType::Geography(v) => v.nullable,
             DataType::Variant(v) => v.nullable,
             DataType::Blob(v) => v.nullable,
             DataType::Char(v) => v.nullable,
@@ -313,6 +344,14 @@ impl DataType {
                 DataType::VarBinary(VarBinaryType::try_new(nullable, v.length())?)
             }
             DataType::Variant(_) => DataType::Variant(VariantType::with_nullable(nullable)),
+            DataType::Geometry(v) => DataType::Geometry(GeometryType {
+                nullable,
+                ..v.clone()
+            }),
+            DataType::Geography(v) => DataType::Geography(GeographyType {
+                nullable,
+                ..v.clone()
+            }),
             DataType::Blob(_) => DataType::Blob(BlobType::with_nullable(nullable)),
             DataType::Char(v) => DataType::Char(CharType::with_nullable(nullable, v.length())?),
             DataType::VarChar(v) => {
@@ -2060,6 +2099,8 @@ impl Display for DataType {
             DataType::VarBinary(t) => Display::fmt(t, f),
             DataType::Variant(t) => Display::fmt(t, f),
             DataType::Blob(t) => Display::fmt(t, f),
+            DataType::Geometry(t) => Display::fmt(t, f),
+            DataType::Geography(t) => Display::fmt(t, f),
             DataType::Char(t) => Display::fmt(t, f),
             DataType::VarChar(t) => Display::fmt(t, f),
             DataType::Date(t) => Display::fmt(t, f),

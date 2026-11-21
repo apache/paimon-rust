@@ -986,3 +986,65 @@ async fn test_unknown_cardinality_falls_back_before_data_manifests() {
     assert_eq!(rows(&ctx, aliased).await, vec![row("unknown", 1)]);
     assert_eq!(warnings().len(), 2);
 }
+
+/// A table that stores or is given `incremental-between-timestamp` reads the
+/// changes of the window, not its partitions' manifest totals, so a count over it
+/// must read the same rows the scan returns.
+#[tokio::test]
+async fn test_count_of_an_incremental_window_counts_the_rows_the_window_reads() {
+    let (_tmp, catalog, ctx) = setup().await;
+    exec(
+        &ctx,
+        "CREATE TABLE paimon.test_db.w (id INT NOT NULL, dt STRING) PARTITIONED BY (dt)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "INSERT INTO paimon.test_db.w VALUES (1, 'a'), (2, 'a')",
+    )
+    .await;
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "w"))
+        .await
+        .unwrap();
+    let snapshots = SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let before = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    exec(&ctx, "INSERT INTO paimon.test_db.w VALUES (3, 'b')").await;
+    let after = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+    assert!(after.time_millis() > before.time_millis());
+    let window = format!("{},{}", before.time_millis(), after.time_millis());
+
+    let grouped = "SELECT dt, COUNT(*) FROM paimon.test_db.w GROUP BY dt";
+    let total = "SELECT COUNT(*) FROM paimon.test_db.w";
+    // Without a window the manifests answer both counts.
+    assert!(!scans_table(&ctx, grouped).await);
+    assert_eq!(rows(&ctx, grouped).await, vec![row("a", 2), row("b", 1)]);
+    assert_eq!(rows(&ctx, total).await, vec![row("", 3)]);
+
+    // Set for the session.
+    exec(
+        &ctx,
+        &format!("SET 'paimon.incremental-between-timestamp' = '{window}'"),
+    )
+    .await;
+    assert!(scans_table(&ctx, grouped).await);
+    assert_eq!(rows(&ctx, grouped).await, vec![row("b", 1)]);
+    assert_eq!(rows(&ctx, total).await, vec![row("", 1)]);
+    exec(&ctx, "RESET 'paimon.incremental-between-timestamp'").await;
+    assert!(!scans_table(&ctx, grouped).await);
+    assert_eq!(rows(&ctx, total).await, vec![row("", 3)]);
+
+    // Stored in the table's options.
+    exec(
+        &ctx,
+        &format!(
+            "ALTER TABLE paimon.test_db.w SET TBLPROPERTIES \
+             ('incremental-between-timestamp' = '{window}')"
+        ),
+    )
+    .await;
+    assert!(scans_table(&ctx, grouped).await);
+    assert_eq!(rows(&ctx, grouped).await, vec![row("b", 1)]);
+    assert_eq!(rows(&ctx, total).await, vec![row("", 1)]);
+}

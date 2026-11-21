@@ -20,7 +20,7 @@ under the License.
 # Table Compaction
 
 Rust supports small-file compaction for ordinary append tables, normal-file and
-opt-in dedicated BLOB compaction for Data Evolution tables, and sorted-run
+opt-in dedicated BLOB/Vector compaction for Data Evolution tables, and sorted-run
 compaction for primary-key tables with fixed or dynamic buckets. `CompactBuilder`
 creates a `CompactPlanner`, a `CompactExecutor`, and a `TableCommit`. Planning and
 execution do not publish snapshots; `commit_compact` atomically publishes the
@@ -134,6 +134,9 @@ let options = std::collections::HashMap::from([
     ),
 ]);
 ```
+
+Append and Data Evolution tables also support `global-index.rtree.index-columns`
+for planar `GEOMETRY` columns.
 
 Maintenance reuses the global-index builders and their table, column-type,
 and native writer restrictions. Tables must have row tracking enabled, no
@@ -522,6 +525,9 @@ legitimately ignored, compaction can remove the selected files without
 creating an output file. Key bounds, sequence bounds, delete counts and file
 indexes are regenerated, using metadata statistics options for the output level.
 Compound `partial-update` DELETE states with field aggregators are rejected.
+Compound UPDATE_BEFORE states, which `partial-update.remove-record-on-delete`
+produces when only UPDATE_BEFORE records removed the row, are compacted
+because a later merge only replays their non-null fields.
 For both reducer engines, compound groups containing retracts are also rejected
 when they use `first_value`, `first_non_null_value`, `collect`, `listagg`,
 `nested_update` or `nested_partial_update`. These states may carry initialization
@@ -693,8 +699,8 @@ physical row slots so every local position remains deletable by the current
 Rust writer. Wider rewrites are rejected before execution; 64-bit deletion-vector
 writing is not yet supported.
 
-Dedicated Vector compaction, splitting large normal files, and materializing
-deletions into reassigned row IDs are not provided. Setting
+Splitting large normal files and materializing deletions into reassigned row IDs
+are not provided. Setting
 `data-evolution.compaction.split-large-files=true` or
 `data-evolution.compaction.rewrite-row-ids=true` is rejected.
 
@@ -753,6 +759,73 @@ outputs, so it can count the same logical row in more than one task.
 
 This operation copies dedicated BLOB payloads. Primary-key managed BLOB
 compaction below merges descriptors and rebuilds reference sidecars instead.
+
+### Dedicated Vector files
+
+Enable Vector storage compaction with the Rust builder:
+
+```rust
+let builder = table.new_compact_builder().with_vector_compaction(true);
+let plan = builder.new_planner()?.plan().await?;
+let executor = builder.new_executor()?;
+let mut results = Vec::new();
+for task in plan.tasks() {
+    results.push(executor.execute(task).await?);
+}
+builder.new_commit()?.commit_compact(results).await?;
+```
+
+This follows Java's `DataEvolutionVectorCompactTask` for Data Evolution append
+tables with row tracking, no primary key, `bucket=-1`, and `vector.file.format`
+configured. `vector.target-file-size` must be positive. The switch can be combined
+with `with_blob_compaction(true)`. Default and automatic compaction, SQL, and
+language bindings continue to select normal files.
+
+A Vector task contains every overlapping Vector version in its selected range,
+including shadowed files and independent column projections. It requires at
+least two files and respects `compaction.min.file-num`. Adjacent normal groups
+can share a task only when normal compaction selects them for the same merge.
+If a combined range is unsafe, planning tries the original normal groups.
+Gaps and partial field coverage are not filled: every current Vector field
+represented by the inputs must cover the entire task range, or that range is
+skipped. Fields are resolved by stable IDs in each file's historical schema.
+Dropped fields are ignored, renamed fields keep their identity, and newly added
+fields absent from all inputs remain absent. Reads return NULL for missing
+nullable fields after a normal merge; Vector compaction still requires complete
+field coverage. Field-type and inline-storage migrations are unsupported.
+
+Execution streams effective column values in row-ID order into the configured
+`*.vector.<format>` files, rolling by `vector.target-file-size`. As with other
+Rust writers, a batch stays intact even when it crosses the size target. Outputs
+have consecutive first-row IDs and exactly the input union's physical row count,
+including deleted slots. Sequence bounds and per-column freshness metadata are
+preserved, including `global-index.column-update-action=ignore`. Vector tasks
+replace only their selected Vector inputs and preserve valid global indexes.
+A simultaneous normal task remaps the latest deletion vectors. Historical
+snapshots keep their original inputs.
+
+For example, a six-row baseline plus two overlapping partial-column updates can
+be consolidated from three Vector files into one, without changing any row ID
+or the winner of a later update. Disjoint rolled outputs from one completed
+Vector task are not selected again solely because compression puts them below
+the target size. New inputs and outputs from independent tasks can be combined
+when at least two files are below the target. Overlapping versions still require
+a rewrite.
+
+A cross-group output requires its normal merge in the same or an earlier commit.
+Other serialized task subsets can commit independently. Execution rejects inputs
+that omit overlapping Vector versions from the captured snapshot. Commit also
+rejects concurrently added overlapping Vector versions. Disjoint appends,
+normal-column updates that preserve the layout, and deletion-vector changes
+can coexist. Commit rechecks output fields, format, row ranges and
+sequence metadata against the captured inputs and latest snapshot. Failed
+execution removes partial outputs; `abort_compact` cleans unsubmitted results.
+After an uncertain commit, retain submitted outputs and retry with the same
+`commit_user` and results. In a mixed plan, `rows_written` counts the physical
+slots written by each normal, BLOB and Vector task separately.
+
+This operation consolidates row-aligned Vector storage. It does not build ANN
+indexes or compact primary-key vector indexes.
 
 ## Primary-key managed BLOB compaction
 

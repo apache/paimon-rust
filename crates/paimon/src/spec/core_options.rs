@@ -652,7 +652,11 @@ impl<'a> CoreOptions<'a> {
 
     /// The numeric timestamp window supported by PyPaimon. Snapshot resolution
     /// and ordering checks belong to the batch scanner, as in Java.
-    pub(crate) fn incremental_timestamp_window(&self) -> crate::Result<Option<(i64, i64)>> {
+    ///
+    /// A table that sets it reads the changes of the window, not its current
+    /// state, so engines must not answer a read of such a table from table
+    /// metadata alone.
+    pub fn incremental_timestamp_window(&self) -> crate::Result<Option<(i64, i64)>> {
         let Some(raw) = self.options.get(INCREMENTAL_BETWEEN_TIMESTAMP_OPTION) else {
             return Ok(None);
         };

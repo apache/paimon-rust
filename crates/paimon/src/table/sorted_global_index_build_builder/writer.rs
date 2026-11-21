@@ -18,7 +18,7 @@
 //! Adapt a captured DE shard to the shared native index writer.
 use super::extraction::build_read_splits_for_shard;
 use super::planning::SortedGlobalIndexShard;
-use super::{ScalarIndexOptions, SortedGlobalIndexBuildBuilder};
+use super::{ShardWriteOptions, SortedGlobalIndexBuildBuilder};
 use crate::spec::{DataField, GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME};
 use crate::table::index_build::{scalar, IndexFileWriter};
 use crate::table::index_file_path::IndexFileLocation;
@@ -26,13 +26,12 @@ use crate::table::RowRange;
 use crate::Result;
 
 impl SortedGlobalIndexBuildBuilder<'_> {
-    pub(super) async fn build_index_file(
+    pub(super) async fn build_index_files(
         &self,
         shard: &SortedGlobalIndexShard,
         fields: &[&DataField],
-        options: &ScalarIndexOptions,
-    ) -> Result<IndexFileMeta> {
-        let kind = options.index_type();
+        options: &ShardWriteOptions,
+    ) -> Result<Vec<IndexFileMeta>> {
         let splits = build_read_splits_for_shard(shard)?;
         let mut read = self.table.new_read_builder();
         let mut projection = fields.iter().map(|f| f.name()).collect::<Vec<_>>();
@@ -51,6 +50,16 @@ impl SortedGlobalIndexBuildBuilder<'_> {
             ),
             index_meta: None,
         };
+        let options = match options {
+            ShardWriteOptions::RTree(options) => {
+                return crate::table::index_build::rtree::write_files(
+                    self.table, stream, range, meta, options,
+                )
+                .await
+            }
+            ShardWriteOptions::Scalar(options) => options,
+        };
+        let kind = options.index_type();
         IndexFileWriter::new(
             self.table,
             kind,
@@ -68,6 +77,6 @@ impl SortedGlobalIndexBuildBuilder<'_> {
                 .map(Some)
         })
         .await
-        .map(|file| file.expect("a scalar shard contains source rows"))
+        .map(|file| vec![file.expect("a scalar shard contains source rows")])
     }
 }

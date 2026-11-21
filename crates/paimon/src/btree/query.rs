@@ -140,6 +140,7 @@ where
             }
             PredicateOperator::ArrayContains
             | PredicateOperator::ArraysOverlap
+            | PredicateOperator::BBoxIntersects
             | PredicateOperator::ArrayContainsAll => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("BTree index does not support {op}"),

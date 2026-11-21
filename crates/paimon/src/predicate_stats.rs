@@ -71,7 +71,7 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         PredicateOperator::In => {
             return true;
         }
-        PredicateOperator::ArrayContains => {
+        PredicateOperator::BBoxIntersects | PredicateOperator::ArrayContains => {
             return all_null != Some(true);
         }
         PredicateOperator::ArraysOverlap => {
@@ -239,6 +239,7 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         | PredicateOperator::NotBetween
         | PredicateOperator::ArrayContains
         | PredicateOperator::ArraysOverlap
+        | PredicateOperator::BBoxIntersects
         | PredicateOperator::ArrayContainsAll => true,
     }
 }
@@ -377,6 +378,7 @@ pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
         | PredicateOperator::Like
         | PredicateOperator::ArrayContains
         | PredicateOperator::ArraysOverlap
+        | PredicateOperator::BBoxIntersects
         | PredicateOperator::ArrayContainsAll => false,
     }
 }

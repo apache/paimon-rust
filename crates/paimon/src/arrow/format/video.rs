@@ -36,6 +36,9 @@ const FOOTER_SIZE: u64 = 29;
 const MAGIC: i32 = 0x4F454449;
 const VERSION: u8 = 1;
 
+pub(crate) mod writer;
+pub(crate) use writer::VideoWriterFactory;
+
 fn corrupt(message: impl Into<String>) -> Error {
     Error::DataInvalid {
         message: format!("Corrupt video file: {}", message.into()),

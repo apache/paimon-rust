@@ -577,6 +577,8 @@ mod tests {
         assert!(writer.num_bytes() > first_size);
         assert_eq!(writer.in_progress_size(), 0);
         let size = Box::new(writer).close().await.unwrap().file_size;
+        let expected =
+            arrow_select::concat::concat_batches(&first.schema(), [&first, &second]).unwrap();
 
         let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
         assert_eq!(size, bytes.len() as u64);
@@ -611,13 +613,10 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(decoded.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
-        let ids = decoded[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(ids.iter().collect::<Vec<_>>(), vec![Some(1), None, Some(3)]);
+        assert_eq!(
+            arrow_select::concat::concat_batches(&expected.schema(), &decoded).unwrap(),
+            expected
+        );
     }
 
     #[test]
