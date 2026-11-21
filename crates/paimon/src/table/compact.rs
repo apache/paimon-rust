@@ -235,6 +235,10 @@ impl CompactPlan {
     }
 }
 
+fn default_force_level_zero() -> bool {
+    true
+}
+
 /// Complete metadata for rewriting files in one partition and bucket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactTask {
@@ -246,6 +250,12 @@ pub struct CompactTask {
     files: Vec<DataFileMeta>,
     #[serde(default)]
     output_level: Option<i32>,
+    /// Matches the force-L0 policy used when this task was planned.
+    #[serde(default = "default_force_level_zero")]
+    force_level_zero: bool,
+    /// Wall-clock seconds frozen at plan time for record-level expire selection.
+    #[serde(default)]
+    expire_now_secs: Option<i64>,
 }
 
 impl CompactTask {
@@ -271,6 +281,14 @@ impl CompactTask {
 
     pub fn files(&self) -> &[DataFileMeta] {
         &self.files
+    }
+
+    pub(super) fn force_level_zero(&self) -> bool {
+        self.force_level_zero
+    }
+
+    pub(super) fn expire_now_secs(&self) -> Option<i64> {
+        self.expire_now_secs
     }
 }
 
@@ -774,6 +792,8 @@ impl CompactTask {
                     .map(|entry| entry.file().clone())
                     .collect(),
                 &self.context.schema,
+                self.force_level_zero,
+                self.expire_now_secs,
             )?
             .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?;
             if selected.0 != self.files || Some(selected.1) != self.output_level {
@@ -851,11 +871,17 @@ impl CompactTask {
 }
 
 /// Validate published PK file changes without depending on executor task metadata.
+///
+/// `force_level_zero` / `expire_now_secs` must match the values frozen on the
+/// planned tasks when available so automatic expire-only selections and clock
+/// drift do not fail an otherwise unchanged task.
 pub(super) fn validate_primary_key_changes(
     schema: &TableSchema,
     changes: &[ManifestEntry],
     changelog: &[ManifestEntry],
     captured: &[ManifestEntry],
+    force_level_zero: Option<bool>,
+    expire_now_secs: Option<i64>,
 ) -> Result<()> {
     fn group(entry: &ManifestEntry) -> (&[u8], i32, i32) {
         (entry.partition(), entry.bucket(), entry.total_buckets())
@@ -884,8 +910,13 @@ pub(super) fn validate_primary_key_changes(
             .cloned()
             .collect::<Vec<_>>();
         let (selected, output_level) = if incremental {
-            primary_key::planner::select_or_expire(files, schema)?
-                .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?
+            primary_key::planner::select_or_expire(
+                files,
+                schema,
+                force_level_zero.unwrap_or(true),
+                expire_now_secs,
+            )?
+            .ok_or_else(|| invalid("No incremental PK compaction is eligible"))?
         } else {
             let level = files
                 .iter()
@@ -936,6 +967,9 @@ pub(super) struct PreparedCompact {
     pub read_snapshot: Option<Box<Snapshot>>,
     pub commit_suffix: String,
     pub metrics: CompactMetrics,
+    /// Frozen PK selection policy from the planned tasks (when present).
+    pub pk_force_level_zero: Option<bool>,
+    pub pk_expire_now_secs: Option<i64>,
 }
 
 pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Result<PreparedCompact> {
@@ -1149,6 +1183,10 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
     for id in ids {
         digest.update((id as u64).to_le_bytes());
     }
+    let pk_task = results
+        .iter()
+        .map(|result| &result.task)
+        .find(|task| task.is_primary_key());
     Ok(PreparedCompact {
         entries,
         changelog_entries,
@@ -1162,6 +1200,8 @@ pub(super) fn prepare_results(table: &Table, results: &[CompactResult]) -> Resul
             .then(|| Box::new(first.task.context.snapshot.clone())),
         commit_suffix: hex::encode(digest.finalize()),
         metrics,
+        pk_force_level_zero: pk_task.map(|task| task.force_level_zero),
+        pk_expire_now_secs: pk_task.and_then(|task| task.expire_now_secs),
     })
 }
 

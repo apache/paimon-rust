@@ -109,7 +109,15 @@ impl RecordLevelExpire {
 
     /// Whole-file expire only when min(time) is known and already past the
     /// expire watermark. Unknown stats return `false` (never force rewrite).
-    pub(crate) fn is_expire_file(&self, file: &DataFileMeta, schema: &TableSchema) -> bool {
+    ///
+    /// Callers must pass the same `now_secs` used when the compaction task was
+    /// planned so selection stays stable through execute and validation.
+    pub(crate) fn is_expire_file(
+        &self,
+        file: &DataFileMeta,
+        schema: &TableSchema,
+        now_secs: i64,
+    ) -> bool {
         let Some(stats) =
             file.value_stats_for_field(schema.id(), schema.fields(), &self.time_field)
         else {
@@ -121,7 +129,6 @@ impl RecordLevelExpire {
         let Ok(Some(min_secs)) = self.datum_to_seconds(min) else {
             return false;
         };
-        let now_secs = current_epoch_secs();
         now_secs.saturating_sub(self.expire_secs) > min_secs
     }
 
@@ -276,11 +283,49 @@ fn datum_to_seconds(data_type: &DataType, datum: &Datum) -> Result<Option<i64>> 
     }
 }
 
+/// Sentinel: no override; use the system clock.
+const CLOCK_OVERRIDE_UNSET: i64 = i64::MIN;
+
+static CLOCK_OVERRIDE_SECS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(CLOCK_OVERRIDE_UNSET);
+
 pub(crate) fn current_epoch_secs() -> i64 {
+    let override_secs = CLOCK_OVERRIDE_SECS.load(std::sync::atomic::Ordering::SeqCst);
+    if override_secs != CLOCK_OVERRIDE_UNSET {
+        return override_secs;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Pin [`current_epoch_secs`] for deterministic expire planning tests.
+///
+/// Restores the previous override when dropped. Nested guards restore in LIFO
+/// order; the outermost drop clears back to the system clock when appropriate.
+#[cfg(test)]
+pub(crate) struct TestClockGuard {
+    previous: i64,
+}
+
+#[cfg(test)]
+impl TestClockGuard {
+    pub(crate) fn set(now_secs: i64) -> Self {
+        assert_ne!(
+            now_secs, CLOCK_OVERRIDE_UNSET,
+            "test clock cannot use the unset sentinel"
+        );
+        let previous = CLOCK_OVERRIDE_SECS.swap(now_secs, std::sync::atomic::Ordering::SeqCst);
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestClockGuard {
+    fn drop(&mut self) {
+        CLOCK_OVERRIDE_SECS.store(self.previous, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Drops expired versions before the inner merge function runs.
@@ -500,7 +545,8 @@ mod tests {
             write_cols: None,
             column_max_sequence_numbers: None,
         };
-        assert!(!expire.is_expire_file(&file, &schema));
+        let now = current_epoch_secs();
+        assert!(!expire.is_expire_file(&file, &schema, now));
 
         let mut min = BinaryRowBuilder::new(2);
         min.write_int(0, 1);
@@ -513,14 +559,14 @@ mod tests {
             max.build().to_serialized_bytes(),
             vec![Some(0), Some(0)],
         );
-        assert!(expire.is_expire_file(&file, &schema));
+        assert!(expire.is_expire_file(&file, &schema, now));
 
         file.schema_id = 1;
-        assert!(!expire.is_expire_file(&file, &schema));
+        assert!(!expire.is_expire_file(&file, &schema, now));
 
         file.schema_id = 0;
         file.value_stats_cols = Some(vec!["id".into()]);
-        assert!(!expire.is_expire_file(&file, &schema));
+        assert!(!expire.is_expire_file(&file, &schema, now));
     }
 
     #[test]

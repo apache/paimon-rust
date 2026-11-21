@@ -62,12 +62,17 @@ impl PrimaryKeyCompactPlanner {
         context: &CompactContext,
     ) -> Result<Vec<CompactTask>> {
         let mut tasks = Vec::new();
-        let options = context.schema.core_options();
-        let force_level_zero = !self.automatic
-            || options.compaction_force_up_level0()?
-            || options.try_changelog_producer()? == ChangelogProducer::Lookup
-            || options.merge_engine()? == MergeEngine::FirstRow
-            || options.deletion_vectors_enabled();
+        let force_level_zero = planner::force_level_zero(&context.schema, self.automatic)?;
+        // Freeze expire evaluation at plan time so execute/validation agree.
+        let expire_now_secs = if context
+            .schema
+            .options()
+            .contains_key("record-level.expire-time")
+        {
+            Some(crate::table::record_level_expire::current_epoch_secs())
+        } else {
+            None
+        };
         for ((partition, bucket, total_buckets), files) in split_files_by_bucket(source) {
             for file in &files {
                 validate_file(file, true)?;
@@ -87,10 +92,15 @@ impl PrimaryKeyCompactPlanner {
                         total_buckets,
                         files,
                         output_level: Some(output_level),
+                        force_level_zero,
+                        expire_now_secs,
                     });
-                } else if let Some((files, output_level)) =
-                    planner::select_expired_max_level(&bucket_files, &context.schema)?
-                {
+                } else if let Some((files, output_level)) = planner::select_expired_max_level(
+                    &bucket_files,
+                    &context.schema,
+                    expire_now_secs
+                        .unwrap_or_else(crate::table::record_level_expire::current_epoch_secs),
+                )? {
                     // Max-level files that UniversalCompaction would skip still
                     // need a rewrite when value stats prove every record expired.
                     tasks.push(CompactTask {
@@ -101,6 +111,8 @@ impl PrimaryKeyCompactPlanner {
                         total_buckets,
                         files,
                         output_level: Some(output_level),
+                        force_level_zero,
+                        expire_now_secs,
                     });
                 }
                 continue;
@@ -133,6 +145,8 @@ impl PrimaryKeyCompactPlanner {
                     total_buckets,
                     files,
                     output_level: None,
+                    force_level_zero,
+                    expire_now_secs,
                 });
             }
         }
@@ -396,12 +410,17 @@ pub(super) async fn execute(
     let lookup_changelog = options.try_changelog_producer()? == ChangelogProducer::Lookup;
     let output_level = task.output_level();
     let drop_delete = options.deletion_vectors_enabled() && output_level > 0;
-    // Java wraps both compact and LevelLookup readers with RecordLevelExpire so
-    // LookupChangelogMergeFunction never observes expiration-only deletes.
+    // Java wraps compact input readers with RecordLevelExpire. For first-row
+    // Lookup, history uses an unwrapped existence-only reader (PersistEmpty /
+    // FirstRowMergeFunctionWrapper), so expired retained history must still be
+    // visible until that key is retired. Other Lookup engines filter history.
     let expire = crate::table::record_level_expire::RecordLevelExpire::create(schema)?;
-    let now_secs = crate::table::record_level_expire::current_epoch_secs();
+    let now_secs = task
+        .expire_now_secs()
+        .unwrap_or_else(crate::table::record_level_expire::current_epoch_secs);
+    let first_row = options.merge_engine()? == MergeEngine::FirstRow;
     let lookup = match (lookup, &expire) {
-        (Some(provider), Some(expire)) => {
+        (Some(provider), Some(expire)) if !first_row => {
             Some(crate::table::record_level_expire::ExpiringLookup::wrap(
                 provider,
                 expire.clone(),
@@ -417,7 +436,8 @@ pub(super) async fn execute(
         reader.read_with_merge_function(std::slice::from_ref(split), move |config, fields| {
             let engine = new_merge_function(config, fields, output_level)?;
             if lookup_changelog {
-                // Input/history expire filtering happens before Lookup.add.
+                // Input expire filtering happens before Lookup.add; first-row
+                // history is intentionally not expire-wrapped above.
                 lookup::wrap(engine, config, fields)
             } else {
                 Ok(match expire.clone() {

@@ -78,8 +78,10 @@ struct LookupChangelogMergeFunction {
 
 /// Wrap the merge engine for lookup changelog production.
 ///
-/// Record-level expire must filter compact input and LevelLookup hits *before*
-/// this wrapper observes rows (Java `RecordLevelExpire.wrap(readerFactory)`).
+/// Record-level expire filters compact inputs before this wrapper observes
+/// rows. Non-first-row Lookup also filters LevelLookup hits (Java wraps the
+/// shared compact reader factory). First-row Lookup history uses an unwrapped
+/// existence reader, so expired retained history stays visible until retired.
 pub(super) fn wrap(
     inner: Box<dyn MergeFunction>,
     config: &KeyValueReadConfig,

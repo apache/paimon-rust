@@ -712,3 +712,167 @@ async fn non_lookup_expire_still_drops_expired_without_changelog() {
     compact(&table).await;
     assert_eq!(id_values(&table).await, vec![(2, 20)]);
 }
+
+/// First-row Lookup must keep expired max-level history visible until retired.
+///
+/// Java uses an unwrapped existence-only Lookup reader for first-row; wrapping
+/// history with record-level expire makes Changelog disagree with ordinary
+/// first-row queries that still see the retained first record.
+#[tokio::test]
+async fn first_row_lookup_expire_keeps_query_and_changelog_aligned() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("ts", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "first-row")
+        .option("changelog-producer", "lookup")
+        .option("num-sorted-run.compaction-trigger", "2")
+        .build()
+        .unwrap();
+    let table = table_with_schema(TableSchema::new(0, &schema)).await;
+    let mut ids = vec![1];
+    let mut timestamps = vec![Some(1)];
+    let mut values = vec![10];
+    for id in 2..=1000 {
+        ids.push(id);
+        timestamps.push(Some(1));
+        values.push(id);
+    }
+    write_batch(&table, &int_batch(ids, timestamps, values)).await;
+    lookup_compact(&table).await;
+    assert_eq!(id_value(&table, 1).await, Some(10));
+
+    let table = table.copy_with_options(std::collections::HashMap::from([
+        ("record-level.expire-time".into(), "1 s".into()),
+        ("record-level.time-field".into(), "ts".into()),
+    ]));
+    let before = table
+        .snapshot_manager()
+        .get_latest_snapshot_id()
+        .await
+        .unwrap()
+        .unwrap();
+    write_batch(&table, &int_batch(vec![1], vec![Some(live_ts())], vec![99])).await;
+    let after = lookup_compact(&table).await;
+    // Ordinary first-row query still returns the retained first record.
+    assert_eq!(id_value(&table, 1).await, Some(10));
+    // Lookup Changelog must agree: history exists, so no +I for the later L0.
+    assert!(
+        super::lookup_changelog_tests::events(&table, before, after)
+            .await
+            .is_empty(),
+        "first-row Lookup must not emit insert when expired history is still retained"
+    );
+}
+
+/// Automatic expire-only rewrite must validate with the same non-forcing L0
+/// policy used at plan time when new L0 files sit below the compaction trigger.
+#[tokio::test]
+async fn automatic_expire_only_with_sub_trigger_l0_commits() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("ts", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "deduplicate")
+        .option("num-sorted-run.compaction-trigger", "2")
+        .option("write-only", "true")
+        .build()
+        .unwrap();
+    let table = table_with_schema(TableSchema::new(0, &schema)).await;
+    write_batch(
+        &table,
+        &int_batch(vec![1, 2], vec![Some(1), Some(1)], vec![10, 20]),
+    )
+    .await;
+    compact(&table).await;
+    let expired_inputs = active_files(&table).await;
+    assert!(expired_inputs.iter().all(|file| file.level > 0));
+
+    let table = table.copy_with_options(std::collections::HashMap::from([
+        ("record-level.expire-time".into(), "1 s".into()),
+        ("record-level.time-field".into(), "ts".into()),
+        ("write-only".into(), "false".into()),
+    ]));
+    let live = live_ts();
+    // One L0 is below trigger=2; automatic planning must expire-only rewrite
+    // the max-level inputs and still pass commit validation.
+    write_batch(&table, &int_batch(vec![3], vec![Some(live)], vec![30])).await;
+    let snapshot = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot.commit_kind(),
+        &paimon::spec::CommitKind::COMPACT,
+        "automatic expire-only compact should publish"
+    );
+    let active = active_files(&table).await;
+    for file in &expired_inputs {
+        assert!(
+            active.iter().all(|alive| alive.file_name != file.file_name),
+            "expired max-level input {} must be retired",
+            file.file_name
+        );
+    }
+    assert_eq!(id_values(&table).await, vec![(3, 30)]);
+}
+
+/// Planned expire tasks persist `expire_now_secs` across serde so retries and
+/// deferred execution keep the same selection watermark.
+#[tokio::test]
+async fn expire_task_serializes_frozen_expire_now_for_retries() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("ts", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "deduplicate")
+        .option("num-sorted-run.compaction-trigger", "2")
+        .build()
+        .unwrap();
+    let table = table_with_schema(TableSchema::new(0, &schema)).await;
+    write_batch(
+        &table,
+        &int_batch(vec![1, 2], vec![Some(1), Some(1)], vec![10, 20]),
+    )
+    .await;
+    compact(&table).await;
+    let table = table.copy_with_options(std::collections::HashMap::from([
+        ("record-level.expire-time".into(), "1 s".into()),
+        ("record-level.time-field".into(), "ts".into()),
+    ]));
+    let builder = table.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    assert_eq!(plan.tasks().len(), 1);
+    let task = &plan.tasks()[0];
+    let value = serde_json::to_value(task).unwrap();
+    assert!(
+        value
+            .get("expire_now_secs")
+            .and_then(|v| v.as_i64())
+            .is_some_and(|secs| secs > 0),
+        "plan must freeze expire_now_secs for stable validation: {value}"
+    );
+    let restored: paimon::table::CompactTask = serde_json::from_value(value).unwrap();
+    let results = vec![table
+        .new_compact_builder()
+        .new_executor()
+        .unwrap()
+        .execute(&restored)
+        .await
+        .unwrap()];
+    builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap();
+    assert!(id_values(&table).await.is_empty());
+}

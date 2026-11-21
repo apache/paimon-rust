@@ -203,6 +203,8 @@ impl DataEvolutionCompactPlanner {
                     total_buckets,
                     files,
                     output_level: None,
+                    force_level_zero: true,
+                    expire_now_secs: None,
                 });
             }
         }
