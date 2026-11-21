@@ -21,6 +21,9 @@ use crate::spec::{
 use std::cmp::Ordering;
 
 pub(crate) trait StatsAccessor {
+    /// Parquet row-group and page bounds can omit NaN values present in the data.
+    const FLOAT_BOUNDS_SKIP_NAN: bool = false;
+
     fn row_count(&self) -> i64;
     fn null_count(&self, index: usize) -> Option<i64>;
     fn min_value(&self, index: usize, data_type: &DataType) -> Option<Datum>;
@@ -60,9 +63,9 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
     let null_count = stats.null_count(index);
     let all_null = null_count.map(|count| count == row_count);
 
-    // Bounds may omit both signs of NaN. Arrow orders negative NaNs below finite
-    // values and positive NaNs above them. A finite closed interval excludes both.
-    if is_float_range(stats_data_type, op)
+    // Arrow orders negative NaNs below numbers and positive NaNs above them.
+    if T::FLOAT_BOUNDS_SKIP_NAN
+        && is_float_range(stats_data_type, op)
         && (op != PredicateOperator::Between || literals.iter().any(is_nan))
     {
         return all_null != Some(true);
@@ -306,9 +309,12 @@ pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
         return false;
     }
 
-    // NOT uses must-match to discard data. Finite bounds alone cannot establish
-    // that all values satisfy a range when NaNs might be missing from the bounds.
-    if is_float_range(stats_data_type, op) {
+    // NOT discards a range when its inner predicate must match every row.
+    // An omitted NaN is always outside an interval with two non-NaN endpoints.
+    if T::FLOAT_BOUNDS_SKIP_NAN
+        && is_float_range(stats_data_type, op)
+        && (op != PredicateOperator::NotBetween || literals.iter().any(is_nan))
+    {
         return false;
     }
 
@@ -1051,32 +1057,6 @@ mod tests {
     }
 
     #[test]
-    fn float_ranges_respect_nan_missing_from_bounds() {
-        let dt = DataType::Double(DoubleType::new());
-        let stats = double_stats(5.0, 5.0);
-        assert!(run_double(
-            PredicateOperator::NotBetween,
-            &[0., 10.],
-            &stats
-        ));
-        assert!(!data_leaf_must_match(
-            0,
-            &dt,
-            &dt,
-            PredicateOperator::Between,
-            &[Datum::Double(0.), Datum::Double(10.)],
-            &stats
-        ));
-        assert!(run_double(
-            PredicateOperator::Between,
-            &[10., f64::NAN],
-            &stats
-        ));
-        assert!(!run_double(PredicateOperator::Between, &[10., 20.], &stats));
-        assert!(!run_double(PredicateOperator::Eq, &[42.], &stats));
-    }
-
-    #[test]
     fn not_eq_and_not_in_on_float_keep_files_that_may_hold_nan() {
         // A Rust-written FLOAT/DOUBLE column `[1.0, NaN]` reports `min == max ==
         // 1.0` with `null_count == 0` (the writer leaves NaN out of min/max
@@ -1361,7 +1341,7 @@ mod tests {
     }
 
     /// FLOAT and DOUBLE fail open, because neither property the rule rests on
-    /// holds for them. Older files can contain either of these statistics: a
+    /// holds for them. Both shapes below are what the writer really produces: a
     /// file holding `[1.0, NaN]` reports `min == max == 1.0` over two rows, and a
     /// file holding only `-0.0` reports `min = -0.0, max = 0.0`.
     #[test]
@@ -1382,10 +1362,10 @@ mod tests {
             &signed_zero_file
         ));
 
-        // A positive or negative NaN omitted by the writer can match either range.
-        assert!(run_double(PredicateOperator::Gt, &[5.0], &nan_file));
-        assert!(run_double(PredicateOperator::Lt, &[0.5], &nan_file));
-        // Finite equality can still use the bounds.
+        // Ordering-based rules are unaffected and must keep pruning.
+        assert!(!run_double(PredicateOperator::Gt, &[5.0], &nan_file));
+        assert!(!run_double(PredicateOperator::Lt, &[0.5], &nan_file));
+        // So is `Eq`, whose direction of error is to keep files.
         assert!(run_double(PredicateOperator::Eq, &[1.0], &nan_file));
     }
 

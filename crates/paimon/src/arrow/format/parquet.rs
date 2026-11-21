@@ -2205,6 +2205,8 @@ struct ParquetRowGroupStats<'a> {
 }
 
 impl StatsAccessor for ParquetRowGroupStats<'_> {
+    const FLOAT_BOUNDS_SKIP_NAN: bool = true;
+
     fn row_count(&self) -> i64 {
         self.row_group.num_rows()
     }
@@ -2615,6 +2617,8 @@ struct ParquetPageStats<'a> {
 }
 
 impl StatsAccessor for ParquetPageStats<'_> {
+    const FLOAT_BOUNDS_SKIP_NAN: bool = true;
+
     fn row_count(&self) -> i64 {
         self.page_row_count
     }
@@ -6023,6 +6027,55 @@ mod tests {
             .unwrap();
         writer.close().await.unwrap();
         buf
+    }
+
+    #[tokio::test]
+    async fn float_ranges_preserve_nan_in_row_groups_and_pages() {
+        use crate::spec::DoubleType;
+        use arrow_array::{ArrayRef, Float64Array};
+
+        let values = Float64Array::from(vec![-f64::NAN, 5.0, f64::NAN, 5.0]);
+        let batch = RecordBatch::try_from_iter([("v", Arc::new(values) as ArrayRef)]).unwrap();
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_dictionary_enabled(false)
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer =
+            AsyncArrowWriter::try_new(&mut bytes, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+        let meta = load_metadata_with_page_index(&bytes, true);
+        assert_eq!(meta.column_index().unwrap()[0][0].num_pages(), 2);
+
+        // Both pages have numeric bounds [5, 5]. NaN can be outside either end.
+        let fields = [DataField::new(
+            0,
+            "v".into(),
+            DataType::Double(DoubleType::new()),
+        )];
+        let pb = PredicateBuilder::new(&fields);
+        let d = Datum::Double;
+        for (predicate, expected_rows) in [
+            (pb.less_than("v", d(0.)).unwrap(), 4),
+            (pb.greater_than("v", d(10.)).unwrap(), 4),
+            (pb.not_between("v", d(0.), d(10.)).unwrap(), 4),
+            (pb.between("v", d(6.), d(10.)).unwrap(), 0),
+        ] {
+            let predicates = [predicate];
+            let group =
+                super::build_predicate_row_selection(meta.row_groups(), &predicates, &fields)
+                    .unwrap();
+            let page = super::build_predicate_page_selection(&meta, &predicates, &fields).unwrap();
+            for selection in [group, page] {
+                assert_eq!(
+                    selection.map_or(batch.num_rows(), |s| s.row_count()),
+                    expected_rows
+                );
+            }
+        }
     }
 
     #[tokio::test]
