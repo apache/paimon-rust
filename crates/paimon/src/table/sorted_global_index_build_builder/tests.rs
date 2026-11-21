@@ -1699,12 +1699,10 @@ async fn test_global_index_prunes_during_manifest_read() {
 }
 
 #[tokio::test]
-async fn test_scalar_full_search_includes_unindexed_rows() {
-    let mut options = table_options("2");
-    options.insert("scalar-index.search-mode".to_string(), "full".to_string());
+async fn test_scalar_scan_includes_unindexed_rows_by_default() {
     let table = test_table_with_path(
-        "memory:/test_scalar_full_search_includes_unindexed_rows",
-        options,
+        "memory:/test_scalar_scan_includes_unindexed_rows_by_default",
+        table_options("2"),
     );
     setup_dirs(&table).await;
 
@@ -1738,7 +1736,7 @@ async fn test_scalar_full_search_includes_unindexed_rows() {
         .equal("name", crate::spec::Datum::String("alice".to_string()))
         .unwrap();
     let mut read_builder = table.new_read_builder();
-    read_builder.with_filter(predicate);
+    read_builder.with_filter(predicate.clone());
     let plan = read_builder.new_scan().plan().await.unwrap();
     let planned_ranges = merge_row_ranges(
         plan.splits()
@@ -1752,16 +1750,18 @@ async fn test_scalar_full_search_includes_unindexed_rows() {
         planned_ranges,
         vec![RowRange::new(0, 0), RowRange::new(2, 3)]
     );
-    assert_eq!(
-        scan_ids(
-            &table,
-            PredicateBuilder::new(table.schema().fields())
-                .equal("name", crate::spec::Datum::String("alice".to_string()))
-                .unwrap(),
-        )
-        .await,
-        vec![1, 3]
-    );
+    assert_eq!(scan_ids(&table, predicate.clone()).await, vec![1, 3]);
+
+    let fast = table.copy_with_options(HashMap::from([(
+        "global-index.search-mode".to_string(),
+        "fast".to_string(),
+    )]));
+    assert_eq!(scan_ids(&fast, predicate.clone()).await, vec![1]);
+    let full = fast.copy_with_options(HashMap::from([(
+        "scalar-index.search-mode".to_string(),
+        "full".to_string(),
+    )]));
+    assert_eq!(scan_ids(&full, predicate).await, vec![1, 3]);
 }
 
 #[tokio::test]

@@ -1053,28 +1053,39 @@ impl<'a> CoreOptions<'a> {
     }
 
     pub fn global_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
-        self.index_search_mode(GLOBAL_INDEX_SEARCH_MODE_OPTION)
+        self.index_search_mode(GLOBAL_INDEX_SEARCH_MODE_OPTION, GlobalIndexSearchMode::Fast)
     }
 
     pub fn scalar_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
-        self.index_search_mode(SCALAR_INDEX_SEARCH_MODE_OPTION)
+        self.index_search_mode(SCALAR_INDEX_SEARCH_MODE_OPTION, GlobalIndexSearchMode::Fast)
+    }
+
+    pub(crate) fn scalar_scan_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
+        self.index_search_mode(SCALAR_INDEX_SEARCH_MODE_OPTION, GlobalIndexSearchMode::Full)
     }
 
     pub fn vector_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
-        self.index_search_mode(VECTOR_INDEX_SEARCH_MODE_OPTION)
+        self.index_search_mode(VECTOR_INDEX_SEARCH_MODE_OPTION, GlobalIndexSearchMode::Fast)
     }
 
     pub fn full_text_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
-        self.index_search_mode(FULL_TEXT_INDEX_SEARCH_MODE_OPTION)
+        self.index_search_mode(
+            FULL_TEXT_INDEX_SEARCH_MODE_OPTION,
+            GlobalIndexSearchMode::Fast,
+        )
     }
 
-    fn index_search_mode(&self, family_option: &str) -> crate::Result<GlobalIndexSearchMode> {
+    fn index_search_mode(
+        &self,
+        family_option: &str,
+        default: GlobalIndexSearchMode,
+    ) -> crate::Result<GlobalIndexSearchMode> {
         let (option, value) = if let Some(value) = self.options.get(family_option) {
             (family_option, value)
         } else if let Some(value) = self.options.get(GLOBAL_INDEX_SEARCH_MODE_OPTION) {
             (GLOBAL_INDEX_SEARCH_MODE_OPTION, value)
         } else {
-            return Ok(GlobalIndexSearchMode::Fast);
+            return Ok(default);
         };
 
         match value.to_ascii_lowercase().as_str() {

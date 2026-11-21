@@ -2528,7 +2528,7 @@ impl<'a> PaimonTableScan<'a> {
             )
         {
             Ok(Some(GlobalIndexScanSettings {
-                search_mode: core_options.scalar_index_search_mode()?,
+                search_mode: core_options.scalar_scan_search_mode()?,
                 thread_num: core_options.global_index_thread_num()?,
             }))
         } else {
