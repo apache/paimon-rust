@@ -708,7 +708,7 @@ impl UpdateContext {
     fn ensure_unplanned(&self) -> PyResult<()> {
         if self.planned {
             return Err(PyValueError::new_err(
-                "with_plan supports only row-ID update and delete operations",
+                "with_plan supports only row-ID update, delete and shard operations",
             ));
         }
         Ok(())
@@ -890,7 +890,6 @@ impl UpdateContext {
         count: usize,
         read_type: Option<&str>,
     ) -> PyResult<crate::shard_update::PyShardTableUpdator> {
-        self.ensure_unplanned()?;
         let read_type = read_type
             .map(|json| {
                 serde_json::from_str::<RowType>(json)

@@ -119,12 +119,13 @@ pub use types::*;
 mod partition;
 pub use partition::Partition;
 mod partition_utils;
-pub(crate) use partition_utils::decode_java_utf8;
 pub(crate) use partition_utils::{
     bucket_path, bucket_path_under, data_file_path, escape_path_name, relative_bucket_path,
     unescape_path_name, PartitionComputer,
 };
-pub use partition_utils::{format_java_float, is_java_whitespace_only};
+pub use partition_utils::{
+    decode_java_utf8, format_java_double, format_java_float, is_java_whitespace_only,
+};
 mod predicate;
 pub(crate) use predicate::datum_cmp;
 pub(crate) use predicate::eval_row;

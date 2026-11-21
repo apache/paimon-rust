@@ -244,6 +244,25 @@ balances complete Data Evolution file groups by row ID. The returned
 replacement columns in that reader's visible row order, including when deletion
 vectors remove physical rows. Input batch boundaries may differ from read batches.
 
+To reuse a coordinator's captured plan, configure `with_plan` before creating
+the updater. Core balances only those supplied groups and keeps their snapshot;
+it reauthorizes the worker without scanning data manifests. If the coordinator
+has already assigned complete file groups to this worker, use `(0, 1)`.
+Transport the snapshot ID together with the picklable splits, then reconstruct
+`Plan` in the worker:
+
+```python
+from pypaimon_rust.datafusion import Plan
+
+worker_plan = Plan(captured_snapshot_id, assigned_complete_splits)
+update = table.new_batch_write_builder().new_update().with_update_type(["result"])
+shard = update.with_plan(worker_plan).new_shard_updator(0, 1)
+```
+
+Keep every group's normal and partial-column files and deletion metadata.
+Selected row ranges, scores and incremental/streaming splits are not mutation
+plans. An empty worker plan stays empty even after new data is appended.
+
 Finish the reader and supply exactly the same number of rows before calling
 `prepare_commit()`. Core buffers one file group, reuses the normal partial-column
 writer and returns messages with the captured snapshot's conflict check. Repeated
@@ -298,6 +317,49 @@ Rust handles descriptor ranges, successful short reads, stream reuse, reopening
 and closure for scalar, array and map Blob writes, including managed primary-key
 Blob packs. Exceptions raised by Python source callbacks are propagated to the
 caller. The Python layer does not copy payloads or cache source streams.
+
+### Packed video frame writes
+
+Append-only tables with `data-evolution.enabled=true` can store scalar BLOB
+columns as packed videos by setting `video-frame-field` to their comma-separated
+names. Supply serialized `VideoFrameDescriptor` values in Arrow binary columns;
+the batch and stream table writers route these columns to `.video` files and
+commit them alongside normal columns. Reads return lazy frame descriptors.
+Raw video bytes and ordinary BlobDescriptors are rejected for these columns.
+Video-column updates, video compaction, and BlobConsumer callbacks are unsupported.
+
+For PyPaimon format-writer adapters, the low-level API owns a Python binary
+output stream and accepts the same descriptor bytes as PyPaimon:
+
+```python
+from pypaimon_rust.data import VideoFormatWriter, VideoFrameDescriptor
+
+output = open("packed.video", "wb")
+writer = VideoFormatWriter(output, copy_buffer_size=4096)
+try:
+    frames = [VideoFrameDescriptor("file:///data/source.mp4", 0, -1, i).serialize()
+              for i in range(100)]
+    writer.write_frames(frames)  # PyPaimon VideoFrameDescriptor.serialize() also works
+    file_size = writer.close()  # writes indexes and closes output; safe to repeat
+except BaseException:
+    writer.abort()
+    raise
+```
+
+`write_arrow(batch)` accepts one `large_binary` column of descriptors and NULLs.
+The same video URI/range is copied once per output file, and consecutive frame
+ordinals share one run. `num_bytes()` reports payload bytes before close and total
+file bytes after close. Packing does not require the optional video decoding
+dependencies.
+
+Pass `uri_reader_factory=file_io.uri_reader_factory` to use PyPaimon's source
+readers; the factory/stream protocol is described above. Without a custom
+factory, the low-level API resolves local files and HTTP sources. Each distinct
+physical video is copied with bounded reads and its source stream is closed.
+The output stream must provide `write(bytes)` and `close()`; `flush()` is optional.
+Write and close errors preserve the original Python exception and close the output
+stream. `abort()` closes without writing a footer. The caller removes incomplete
+destinations and owns table metadata and commit handling for this low-level API.
 
 ### Native commit from serialized messages
 

@@ -82,7 +82,7 @@ fn validate_non_empty_multi(values: &[(&str, &str)]) -> Result<()> {
 }
 
 /// `url` normalizes dot segments even when their dots are percent encoded.
-/// Reject them before a branch mutation can be redirected to a parent resource.
+/// Reject them before a metadata request can be redirected to a parent resource.
 fn validate_resource_path(values: &[(&str, &str)]) -> Result<()> {
     validate_non_empty_multi(values)?;
     for (value, field_name) in values {
@@ -602,7 +602,7 @@ impl RESTApi {
     /// Create a persistent function.
     pub async fn create_function(&self, function: &Function) -> Result<()> {
         let database = function.identifier().database();
-        validate_non_empty_multi(&[
+        validate_resource_path(&[
             (database, "database name"),
             (function.name(), "function name"),
         ])?;
@@ -672,6 +672,15 @@ impl RESTApi {
         validate_non_empty_multi(&[(database, "database name"), (function, "function name")])?;
         let path = self.resource_paths.function(database, function);
         self.client.get(&path, None::<&[(&str, &str)]>).await
+    }
+
+    /// Drop a persistent function.
+    pub async fn drop_function(&self, identifier: &Identifier) -> Result<()> {
+        let database = identifier.database();
+        let function = identifier.object();
+        validate_resource_path(&[(database, "database name"), (function, "function name")])?;
+        let path = self.resource_paths.function(database, function);
+        self.client.delete_without_response(&path).await
     }
 
     // ==================== Partition Operations ====================

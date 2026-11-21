@@ -36,7 +36,7 @@ use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, Sch
 use datafusion::arrow::record_batch::RecordBatchOptions;
 use datafusion::catalog::Session;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, DFSchema, DFSchemaRef};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, TableReference};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -49,6 +49,7 @@ use datafusion::physical_expr::{expressions::Column as PhysicalColumn, PhysicalE
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan};
 use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, OrderByExpr};
 use futures::TryStreamExt;
 
 use paimon::spec::{datums_to_binary_row, extract_datum_from_arrow, CoreOptions, DataField};
@@ -196,11 +197,6 @@ pub(crate) fn plan_merge(
                 if de && matched_count > 0 {
                     return Err(DataFusionError::NotImplemented(
                         "Multiple WHEN MATCHED clauses are not yet supported".into(),
-                    ));
-                }
-                if de && clause.predicate.is_some() {
-                    return Err(DataFusionError::NotImplemented(
-                        "WHEN MATCHED AND <predicate> is not yet supported".into(),
                     ));
                 }
                 matched_count += 1;
@@ -1161,6 +1157,42 @@ pub(crate) fn build_partition_set_from_batches(
     }
 
     Ok(Some(partition_set))
+}
+
+/// Use the original target name as the alias of an internal DML relation.
+pub(crate) fn dml_table_alias(ctx: &SessionContext, table_ref: &str) -> String {
+    let normalize = ctx
+        .state()
+        .config_options()
+        .sql_parser
+        .enable_ident_normalization;
+    let target = TableReference::parse_str_normalized(table_ref, !normalize);
+    quote_identifier(target.table())
+}
+
+/// Preserve DML row selection in the internal SELECT so filtering, global sorting,
+/// and limiting finish before any selected rows are passed to the writer.
+pub(crate) fn build_dml_selection_clause(
+    selection: Option<&SqlExpr>,
+    order_by: &[OrderByExpr],
+    limit: Option<&SqlExpr>,
+) -> String {
+    let mut clause = String::new();
+    if let Some(selection) = selection {
+        clause.push_str(&format!(" WHERE {selection}"));
+    }
+    if !order_by.is_empty() {
+        let order_by = order_by
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        clause.push_str(&format!(" ORDER BY {order_by}"));
+    }
+    if let Some(limit) = limit {
+        clause.push_str(&format!(" LIMIT {limit}"));
+    }
+    clause
 }
 
 /// Query a table for distinct partition values matching an optional WHERE clause.

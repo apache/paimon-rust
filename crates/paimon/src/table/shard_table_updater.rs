@@ -27,10 +27,11 @@ use futures::TryStreamExt;
 
 use crate::spec::{row_id_data_field, DataField};
 
-use super::data_evolution_writer::RowIdFileIndex;
-use super::source::is_data_evolution_normal_file;
+use super::data_evolution_writer::{authorize_row_id_plan, RowIdFileIndex};
 use super::update_input::{cast_update_value, unique_column_index, CastMode};
-use super::{ArrowRecordBatchStream, CommitMessage, DataEvolutionWriter, DataSplit, Table};
+use super::{
+    ArrowRecordBatchStream, CommitMessage, DataEvolutionWriter, DataSplit, Plan, RowIdPlan, Table,
+};
 
 const ROW_ID: &str = "_ROW_ID";
 
@@ -82,6 +83,7 @@ impl ShardTableUpdater {
         write_columns: Vec<String>,
         shard: usize,
         shard_count: usize,
+        plan: Option<&Plan>,
     ) -> crate::Result<Self> {
         if shard_count == 0 || shard >= shard_count {
             return Err(invalid(
@@ -92,15 +94,23 @@ impl ShardTableUpdater {
             return Err(invalid("Shard update columns must not be empty"));
         }
         let writer = DataEvolutionWriter::for_row_id(table, write_columns.clone())?;
-        let snapshot = super::time_travel::resolve_snapshot(table).await?;
-        let table = table
-            .copy_with_options(HashMap::from([(
-                "scalar-index.search-mode".into(),
-                "FULL".into(),
-            )]))
-            .copy_with_pinned_snapshot(snapshot.as_ref());
-        let plan = table.new_read_builder().new_scan().plan_all().await?;
-        let splits = select_shard(plan.splits(), shard, shard_count)?;
+        let table = table.copy_with_options(HashMap::from([(
+            "scalar-index.search-mode".into(),
+            "FULL".into(),
+        )]));
+        let (table, plan) = match plan {
+            Some(plan) => {
+                let (table, _, plan) = authorize_row_id_plan(&table, plan).await?;
+                (table, plan)
+            }
+            None => {
+                let snapshot = super::time_travel::resolve_snapshot(&table).await?;
+                let table = table.copy_with_pinned_snapshot(snapshot.as_ref());
+                let plan = table.new_read_builder().new_scan().plan_all().await?;
+                (table, plan)
+            }
+        };
+        let splits = select_shard(plan, shard, shard_count)?;
         let index = RowIdFileIndex::from_splits(table.clone(), &splits)?;
         let read_type = read_type.unwrap_or_else(|| table.schema().fields().to_vec());
         // Validate the same canonical request used by ordinary table readers.
@@ -346,50 +356,18 @@ fn with_row_id(read_type: &[DataField]) -> crate::Result<Vec<DataField>> {
     Ok(fields)
 }
 
-fn select_shard(splits: &[DataSplit], shard: usize, count: usize) -> crate::Result<Vec<DataSplit>> {
-    let mut ranges = splits
-        .iter()
-        .flat_map(|split| split.data_files())
-        .filter(|file| is_data_evolution_normal_file(file))
-        .map(|file| {
-            file.row_id_range()
-                .ok_or_else(|| invalid("Data Evolution file is missing its row-ID range"))
-        })
-        .collect::<crate::Result<Vec<_>>>()?;
-    ranges.sort_unstable();
-    let mut groups = Vec::<(i64, i64)>::new();
-    for (start, end) in ranges {
-        if let Some(last) = groups.last_mut().filter(|last| start <= last.1) {
-            last.1 = last.1.max(end);
-        } else {
-            groups.push((start, end));
-        }
-    }
+fn select_shard(plan: Plan, shard: usize, count: usize) -> crate::Result<Vec<DataSplit>> {
+    let routing = RowIdPlan::from_plan(plan)?;
+    let groups = routing.groups();
     let size = groups.len() / count;
     let remainder = groups.len() % count;
     let begin = shard * size + shard.min(remainder);
     let end = begin + size + usize::from(shard < remainder);
-    let Some(&(first, _)) = groups.get(begin).filter(|_| begin < end) else {
-        return Ok(Vec::new());
-    };
-    let last = groups[end - 1].1;
-    // The selected groups are a contiguous slice in global row-ID order.
-    // One interval avoids a scan of every selected group for each split.
-    Ok(splits
+    // Select complete groups physically, retaining dedicated files, deletion
+    // metadata and worker-local grants without row-range trimming.
+    Ok(groups[begin..end]
         .iter()
-        .filter(|split| {
-            split
-                .data_files()
-                .iter()
-                .filter(|file| is_data_evolution_normal_file(file))
-                .filter_map(|file| file.row_id_range())
-                .any(|(start, end)| first <= end && last >= start)
-        })
-        .map(|split| {
-            split
-                .clone()
-                .with_selected_row_ranges(vec![super::RowRange::new(first, last)])
-        })
+        .map(|(_, _, split)| split.clone())
         .collect())
 }
 

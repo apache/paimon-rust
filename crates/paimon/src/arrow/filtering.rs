@@ -120,17 +120,64 @@ fn remap_predicate(predicate: &Predicate, mapping: &[Option<usize>]) -> Predicat
                 }
             }
         }
-        Predicate::Not(inner) => {
-            let remapped = remap_predicate(inner, mapping);
-            match remapped {
-                Predicate::AlwaysTrue => Predicate::AlwaysFalse,
-                Predicate::AlwaysFalse => Predicate::AlwaysTrue,
-                other => Predicate::Not(Box::new(other)),
-            }
-        }
+        Predicate::Not(inner) => remap_negated(inner, mapping),
         Predicate::AlwaysTrue => Predicate::AlwaysTrue,
         Predicate::AlwaysFalse => Predicate::AlwaysFalse,
     }
+}
+
+/// Remaps `NOT predicate`. A field missing from the file is NULL, so a leaf on
+/// it is unknown and stays unknown under the NOT: it keeps no row, except for
+/// the null checks. The NOT is pushed down before missing leaves are folded,
+/// because folding first would turn the unknown into `AlwaysFalse` and the NOT
+/// would flip it to `AlwaysTrue`.
+fn remap_negated(predicate: &Predicate, mapping: &[Option<usize>]) -> Predicate {
+    let missing_under_not = |index: usize, op: &PredicateOperator| {
+        if mapping.get(index).copied().flatten().is_some() {
+            return None;
+        }
+        Some(match op {
+            PredicateOperator::IsNotNull => Predicate::AlwaysTrue,
+            _ => Predicate::AlwaysFalse,
+        })
+    };
+    match predicate {
+        Predicate::Leaf {
+            column, index, op, ..
+        } if !is_row_tracking_column(column) => {
+            if let Some(folded) = missing_under_not(*index, op) {
+                return folded;
+            }
+        }
+        Predicate::NestedLeaf { index, op, .. } => {
+            if let Some(folded) = missing_under_not(*index, op) {
+                return folded;
+            }
+        }
+        Predicate::And(children) => {
+            return remap_predicate(
+                &Predicate::Or(children.iter().map(negated_child).collect()),
+                mapping,
+            );
+        }
+        Predicate::Or(children) => {
+            return remap_predicate(
+                &Predicate::And(children.iter().map(negated_child).collect()),
+                mapping,
+            );
+        }
+        Predicate::Not(inner) => return remap_predicate(inner, mapping),
+        _ => {}
+    }
+    match remap_predicate(predicate, mapping) {
+        Predicate::AlwaysTrue => Predicate::AlwaysFalse,
+        Predicate::AlwaysFalse => Predicate::AlwaysTrue,
+        other => Predicate::Not(Box::new(other)),
+    }
+}
+
+fn negated_child(child: &Predicate) -> Predicate {
+    Predicate::Not(Box::new(child.clone()))
 }
 
 pub(crate) fn build_field_mapping(

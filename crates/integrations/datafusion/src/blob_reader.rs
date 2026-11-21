@@ -25,10 +25,13 @@ struct BlobFileIO {
     file_io: FileIO,
 }
 
-/// Session-scoped registry of Paimon [`FileIO`] instances for BlobDescriptor reads.
+/// Session-scoped registry of Paimon [`FileIO`] instances for blob and external file reads.
+/// Blob resolution uses table routes; only external scans include catalog fallbacks.
 #[derive(Clone, Debug, Default)]
 pub struct BlobReaderRegistry {
     readers: Arc<RwLock<Vec<BlobFileIO>>>,
+    // Catalog roots are available only to explicit external-file reads.
+    catalog_readers: Arc<RwLock<Vec<BlobFileIO>>>,
 }
 
 fn allows_backslash_boundary(location: &str) -> bool {
@@ -70,6 +73,68 @@ impl BlobReaderRegistry {
         readers.push(BlobFileIO { prefix, file_io });
     }
 
+    fn register_location(readers: &RwLock<Vec<BlobFileIO>>, prefix: &str, file_io: FileIO) {
+        let mut prefixes = vec![prefix.to_string()];
+        if let Ok(url) = datafusion::datasource::listing::ListingTableUrl::parse(prefix) {
+            let url: &url::Url = url.as_ref();
+            if let Ok(path) = url
+                .to_file_path()
+                .and_then(|path| std::fs::canonicalize(path).map_err(|_| ()))
+            {
+                prefixes.push(path.to_string_lossy().to_string());
+            }
+        }
+        let mut readers = readers.write().unwrap_or_else(|e| e.into_inner());
+        for prefix in prefixes {
+            if !readers.iter().any(|reader| reader.prefix == prefix) {
+                readers.push(BlobFileIO {
+                    prefix,
+                    file_io: file_io.clone(),
+                });
+            }
+        }
+    }
+
+    pub(crate) fn register_location_if_absent(&self, prefix: &str, file_io: FileIO) {
+        Self::register_location(&self.readers, prefix, file_io);
+    }
+
+    pub(crate) fn register_catalog_location(&self, prefix: &str, file_io: FileIO) {
+        Self::register_location(&self.catalog_readers, prefix, file_io);
+    }
+
+    /// Compare equivalent URI/path spellings before choosing the closest route.
+    pub(crate) fn resolve_paths(&self, paths: &[String]) -> Option<FileIO> {
+        let readers = self.readers.read().unwrap_or_else(|e| e.into_inner());
+        let catalogs = self
+            .catalog_readers
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        readers
+            .iter()
+            .map(|reader| (0, reader))
+            .chain(catalogs.iter().map(|reader| (1, reader)))
+            .filter_map(|(kind, reader)| {
+                let remaining = paths
+                    .iter()
+                    .filter(|path| matches_location(path, &reader.prefix))
+                    .map(|path| {
+                        let suffix = &path[reader.prefix.len()..];
+                        suffix
+                            .trim_start_matches(|c| {
+                                c == '/' || (c == '\\' && allows_backslash_boundary(&reader.prefix))
+                            })
+                            .len()
+                    })
+                    .min()?;
+                Some((remaining, kind, reader))
+            })
+            .min_by_key(|(remaining, kind, reader)| {
+                (*remaining, *kind, std::cmp::Reverse(reader.prefix.len()))
+            })
+            .map(|(_, _, reader)| reader.file_io.clone())
+    }
+
     pub fn resolve(&self, uri: &str) -> Option<FileIO> {
         let readers = self.readers.read().unwrap_or_else(|e| e.into_inner());
         readers
@@ -91,6 +156,47 @@ mod tests {
 
     fn memory_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn catalog_file_io_is_an_external_read_fallback_only() {
+        let uri = "memory:/warehouse/data";
+        let catalog_io = memory_file_io();
+        let table_io = memory_file_io();
+        write_file(&catalog_io, uri, b"catalog").await;
+        write_file(&table_io, uri, b"table").await;
+        for catalog_prefix in ["memory:/warehouse", "memory:/warehouse/"] {
+            for table_prefix in ["memory:/warehouse", "memory:/warehouse/"] {
+                let registry = BlobReaderRegistry::default();
+                registry.register_catalog_location(catalog_prefix, catalog_io.clone());
+                assert!(registry.resolve(uri).is_none());
+                let paths = vec![uri.to_string()];
+                let selected = registry.resolve_paths(&paths).unwrap();
+                assert_eq!(
+                    selected
+                        .new_input(uri)
+                        .unwrap()
+                        .read()
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    b"catalog"
+                );
+                registry.register_location_if_absent(table_prefix, table_io.clone());
+                assert_resolves_to(&registry, uri, b"table").await;
+                let selected = registry.resolve_paths(&paths).unwrap();
+                assert_eq!(
+                    selected
+                        .new_input(uri)
+                        .unwrap()
+                        .read()
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    b"table"
+                );
+            }
+        }
     }
 
     async fn write_file(file_io: &FileIO, uri: &str, contents: &[u8]) {

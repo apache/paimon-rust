@@ -41,11 +41,33 @@ and writes to ordinary Paimon tables can create them with `file.format=mosaic`.
 SQL support has two layers:
 
 - DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
-- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `MSCK REPAIR TABLE`, `ANALYZE TABLE`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`. `MERGE INTO` uses DataFusion's native planner and the Paimon table provider for execution.
+- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, `CREATE FUNCTION`, and `DROP FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `MSCK REPAIR TABLE`, `ANALYZE TABLE`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`. `MERGE INTO` uses DataFusion's native planner and the Paimon table provider for execution.
 
 Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. Persistent `CREATE FUNCTION` is supported only for the REST Catalog SQL scalar form documented below. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
 
 For the exact delegated SQL grammar, see the [DataFusion SQL Reference](https://datafusion.apache.org/user-guide/sql/index.html).
+
+### SQL compatibility
+
+`GROUP_CONCAT` joins non-NULL values with a comma by default. `SEPARATOR` accepts
+a string literal, including an empty string. Multiple arguments are concatenated
+within each row; a row with any NULL argument is skipped. Empty groups and
+groups containing only NULL values return NULL. `DISTINCT`, aggregate `ORDER BY`,
+and `FILTER` are supported. `DISTINCT` accepts one expression, and its ordering
+expressions must match that expression, as required by DataFusion's distinct
+aggregation.
+Numeric `ORDER BY` positions refer to the aggregate arguments. Calls reject
+positions that reference volatile expressions, because those
+arguments cannot safely be evaluated again as native aggregate sort keys.
+Compute such a value in a subquery first, then pass its column to `GROUP_CONCAT`.
+String conversion follows DataFusion's `CAST(... AS STRING)` after typed
+deduplication and sorting.
+
+```sql
+SELECT group_concat(DISTINCT name ORDER BY name SEPARATOR ' | ') FROM users;
+```
+
+`GROUP_CONCAT` also works in Paimon persistent and temporary view definitions.
 
 ### DataFusion 55 integration
 
@@ -132,9 +154,95 @@ function `blob_view` (alias `sys.blob_view`) and the built-in table-valued
 functions (`vector_search`, `hybrid_search`, and `full_text_search`) against it.
 It also manages session-scoped dynamic options internally for `SET`/`RESET` support.
 
+### Reading files with `read_files`
+
+`SQLContext` registers a Databricks-style batch table function without requiring
+a catalog:
+
+```sql
+SELECT * FROM read_files('oss://my-bucket/imports/users.csv',
+    format => 'csv', header => true, schema => 'id BIGINT, name STRING');
+SELECT id FROM read_files('oss://my-bucket/imports/*.parquet');
+SELECT * FROM read_files('oss://my-bucket/imports/events.ndjson', format => 'json');
+SELECT * FROM read_files('oss://my-bucket/imports/document.json',
+    format => 'json', multiLine => true);
+SELECT value FROM read_files('oss://my-bucket/imports/logs/', format => 'text');
+SELECT path, length FROM read_files('oss://my-bucket/imports/images/',
+    format => 'binaryFile');
+```
+
+The function is registered by default. Local paths use the process's filesystem
+permissions; no separate directory registration is required. Loaded tables share
+their FileIO routes with blob readers, including REST credential refresh and FUSE
+routing. In addition, `read_files` can use the warehouse FileIO from a registered
+filesystem catalog; these warehouse fallbacks do not enable table-less blob reads.
+The longest matching location wins, with table IO preferred for equivalent
+locations. Other paths use a configured
+DataFusion object store or Paimon's default FileIO for that path.
+
+Each query captures its selected store and credentials without replacing the
+shared RuntimeEnv registry. Catalog FileIO credentials retain the permissions of
+the underlying storage provider; reading a raw file does not perform a catalog
+table permission check. Credentials are configured on the catalog or application,
+never as SQL arguments. Default local reads retain an open directory handle,
+reject special files and skip symlinks during recursive discovery. HTTP/HTTPS
+file URLs are unsupported.
+
+ADLS container URLs (`abfss://container@host/...`) require a matching FileIO
+route or a container-aware object store registry; DataFusion's default registry
+discards the container portion of those URLs and is rejected for these reads.
+
+Supported formats and options:
+
+| Format | Behavior and options |
+| --- | --- |
+| `csv` | Infer columns or use a DDL `schema`; `header`, `sep`/`delimiter`, `quote`, `escape`, `nullValue`, `multiLine`, `mode => 'FAILFAST'`. Without `schema`, headers default to enabled; with `schema`, headers default to disabled. Headerless inference names columns `_c0`, `_c1`, etc. The default escape is backslash; `quote => ''` disables quoting. Quoted line breaks require `multiLine => true`. |
+| `parquet` | Native Parquet schema, column pruning and predicate pushdown; optional `schema`. |
+| `json` | One object per line by default, including `.jsonl`/`.ndjson` files. `multiLine => true` reads one object or an array of objects per file. Optional `schema` and `mode => 'FAILFAST'`. |
+| `text` | One UTF-8 line per `value STRING` row; default separators are LF, CRLF and CR. `lineSep` sets a separator; `wholeText => true` reads each file as one row, including empty files. |
+| `binaryFile` | One row per file: `path STRING`, `modificationTime TIMESTAMP`, `length BIGINT`, `content BINARY`. Selecting only metadata avoids reading file contents. |
+
+Options are named, case-insensitive and must evaluate to constants. Duplicate,
+unknown and format-inappropriate options are rejected. `format` can be omitted
+for recognized extensions; mixed formats require an explicit format. Directories
+are scanned recursively. Path globs support `*`, `?` and character classes,
+including Hadoop-style negation `[^a]`. Unsupported brace expansion is rejected.
+Each wildcard matches one path component; a matched directory includes its descendants.
+`pathGlobFilter` (alias `fileNamePattern`) filters leaf names. Hidden path
+components beginning with `.` or `_` are skipped. No matching files is an error.
+
+Every source row exposes `_metadata` with `file_path`, `file_name`, `file_size`,
+`file_modification_time`, `file_block_start` and `file_block_length`, unless the
+data already contains a column named `_metadata`, which takes precedence.
+`SQLContext.sql` excludes generated metadata from `SELECT *` and `alias.*`;
+select `_metadata` explicitly to include it. Metadata explicitly exported by
+a subquery, CTE or view remains an ordinary visible column. Each file is exposed
+as one logical block with offset zero and length equal to the file size.
+Wildcard selection through an alias on a parenthesized join containing
+`read_files` is unsupported; alias the individual sources instead.
+With DataFusion's default identifier normalization, quote the camel-case binary
+column as `"modificationTime"` when selecting it explicitly.
+CSV and Parquet inference uses DataFusion's inference limits. NDJSON inference
+samples up to 1,000 records per file; multi-line JSON inference uses the whole
+document. JSON merges fields across the discovered files, including numeric
+widening. Supply `schema` for a fixed contract.
+
+This is a supported subset of [Databricks `read_files`](https://docs.databricks.com/aws/en/sql/language-manual/functions/read_files).
+It does not add the `read_csv`, `read_parquet`, `read_json`, `read_text`, `read_blob`
+or `read_ndjson` aliases. Hive partition inference, compressed text inputs, schema
+hints/rescued-data modes, streaming ingestion, Avro, ORC, XML and service-specific
+connections are not implemented. CSV/JSON currently use strict parsing, including
+when `mode` is omitted; this differs from Databricks' default `PERMISSIVE` mode.
+Use `mode => 'FAILFAST', schemaEvolutionMode => 'none'` for an explicit strict-reading
+contract with rescued data disabled. Only `none` is supported for schema evolution.
+Other parsing modes are rejected; malformed input fails rather than being rescued or silently
+dropped. JSON single-quoted strings and non-finite numbers are also unsupported.
+Whole-file text, binary content and multi-line JSON
+materialize a file in memory; ordinary text and CSV are streamed in batches.
+
 ### REST Catalog Views and SQL Functions
 
-When the registered catalog is a Paimon REST Catalog, `SQLContext` can read, execute, create, and drop persistent views and can create SQL scalar functions.
+When the registered catalog is a Paimon REST Catalog, `SQLContext` can read, execute, create, and drop persistent views and SQL scalar functions.
 
 Create a persistent view with this syntax:
 
@@ -167,6 +275,22 @@ Unqualified relations and REST SQL functions in the defining query resolve in
 the new view's owning catalog and database, not the session's current database.
 The canonical query is stored as both the default query and the `datafusion`
 dialect definition.
+
+`SHOW CREATE VIEW view_name` returns the owning catalog, database, view name,
+and a fully qualified `CREATE VIEW` definition with its declared column names
+and types. The exported query includes the same type casts as view reads.
+It prefers the stored `datafusion` query and reads catalog metadata directly,
+without planning or executing the defining query. Temporary views shadow
+persistent objects and return `CREATE TEMPORARY VIEW`; session-native
+DataFusion views are also supported. Temporary definitions bind table and
+Catalog function names to the namespace used at creation, so recreating them
+after `USE` preserves their dependencies. Native views created through
+`SQLContext::sql` also bind their table dependencies at creation. Definitions
+created directly through `SessionContext` must fully qualify physical table
+references as `catalog.schema.table`; exports with unqualified dependencies
+are rejected because their creation namespace cannot be recovered reliably.
+Repeated exports and recreations keep the type projection stable. Table targets
+are rejected.
 
 Persistent `CREATE VIEW` and `DROP VIEW` are currently implemented by REST
 Catalog. `DROP VIEW` sends a direct delete request; `IF EXISTS` ignores only a
@@ -222,6 +346,21 @@ RETURN amount * DECIMAL '1.10';
 SELECT add_tax(total) FROM orders;
 ```
 
+Drop a persistent function using a bare, two-part, or three-part name:
+
+```sql
+DROP FUNCTION add_tax;
+DROP FUNCTION IF EXISTS reporting.add_tax;
+DROP FUNCTION IF EXISTS paimon.reporting.add_tax;
+```
+
+Persistent `DROP FUNCTION` is implemented by REST Catalog and sends a direct
+delete request. `IF EXISTS` ignores only a missing function; permission and
+server errors are preserved. Only one function may be dropped per statement.
+Argument signatures, `CASCADE`, `RESTRICT`, and `DROP TEMPORARY FUNCTION` are not
+supported for Paimon catalogs. Catalogs without persistent function support may
+return `Unsupported`.
+
 Bare, two-part (`database.function`), and three-part
 (`catalog.database.function`) names are accepted as creation targets. Unquoted
 names are normalized and quoted names are preserved. Calls remain limited to
@@ -275,9 +414,9 @@ functions. Two-part function names such as `database.function(...)`, lambda or
 file definitions, aggregate/table/multi-return functions, and non-deterministic
 functions are not supported. `CREATE OR REPLACE/ALTER/TEMPORARY FUNCTION`,
 non-SQL bodies, `STABLE`/`VOLATILE`, null-input/parallel/security/SET clauses,
-options/remote functions, and persistent `ALTER FUNCTION` / `DROP FUNCTION`
-are also not supported. Catalog implementations other than REST Catalog may
-return `Unsupported` for persistent function creation.
+options/remote functions, and persistent `ALTER FUNCTION` are also not supported.
+Catalog implementations other than REST Catalog may return `Unsupported` for
+persistent function creation or deletion.
 
 ## Data Types
 
@@ -298,19 +437,42 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `BINARY(n)` | BinaryType | Fixed-length; defaults to `BINARY(1)` when `n` is omitted |
 | `VARIANT` | VariantType | Semi-structured value encoded as value + metadata binary buffers |
 | `BLOB` | BlobType | Binary large object |
+| `GEOMETRY`, `GEOMETRY('crs')` | GeometryType | Planar WKB with a default CRS of `OGC:CRS84` |
+| `GEOGRAPHY`, `GEOGRAPHY('crs'[, algorithm])` | GeographyType | WKB with a default CRS of `OGC:CRS84`. Edge algorithms are `spherical` (default), `vincenty`, `thomas`, `andoyer`, and `karney`. |
 | `DATE` | DateType | |
 | `TIMESTAMP[(p)]` | TimestampType | Precision p: 0/3/6/9, default 3 |
 | `TIMESTAMP WITH TIME ZONE` | LocalZonedTimestampType | |
 | `DECIMAL(p, s)` | DecimalType | |
 | `ARRAY<element>` | ArrayType | e.g. `ARRAY<INT>` |
+| `VECTOR<element, n>` | VectorType | Fixed-size vector; `n` is between 1 and 2147483647 |
 | `MAP(key, value)` | MapType | e.g. `MAP(STRING, INT)` |
 | `STRUCT<field TYPE, ...>` | RowType | e.g. `STRUCT<city STRING, zip INT>` |
 
-For vector search tables created from SQL, use `ARRAY<FLOAT>` for embedding
-columns. Existing Paimon tables may also expose logical `VECTOR<FLOAT,N>`
-columns; DataFusion reads those as Arrow `FixedSizeList<Float32>`, and vindex
-index creation uses `N` as the vector dimension. `SHOW CREATE TABLE` currently
-does not round-trip `VECTOR` columns.
+Supply WKB bytes in the column's declared CRS on insert. Direct projections
+return Arrow binary fields with the `geoarrow.wkb` extension, CRS, and geography
+edge algorithm. Assignments copy the WKB bytes. The target column supplies the
+CRS and edge algorithm, so reproject the coordinates before inserting if needed.
+Equality compares WKB bytes, even across different CRSs. Spatial functions
+such as `ST_Intersects` require a separate spatial function provider.
+Use Parquet when exchanging geospatial data with Java Paimon. The Rust Row
+format also accepts WKB, but the Java Row reader and writer do not handle these types.
+For an array of WKB literals, use `INSERT INTO shapes VALUES ([decode('0101000000000000000000F03F0000000000000040', 'hex')])`.
+
+`VECTOR<element, n>` follows Paimon's logical vector type. Elements must be
+`BOOLEAN`, `TINYINT`, `SMALLINT`, `INT` / `INTEGER`, `BIGINT`, `FLOAT` / `REAL`,
+or `DOUBLE` / `DOUBLE PRECISION`. The vector and its elements are nullable by
+default; for example, `embedding VECTOR<FLOAT NOT NULL, 128> NOT NULL` disallows
+both null vectors and null elements. The syntax is supported in `CREATE TABLE`,
+`ALTER TABLE`, and `CAST`, including vectors nested in arrays, maps, and structs.
+`SHOW CREATE TABLE` preserves the element type, dimension, and nullability.
+Nested vectors can also be non-null, for example
+`ARRAY<VECTOR<FLOAT NOT NULL, 128> NOT NULL>`.
+In `CAST` targets, SQL fixed-size arrays (`T[n]`) inside a `MAP` containing
+vectors are not supported; use `ARRAY<T>` for variable-length collections.
+
+For vector search embeddings, use `VECTOR<FLOAT, n>` or `ARRAY<FLOAT>`.
+DataFusion represents `VECTOR<FLOAT, n>` as Arrow `FixedSizeList<Float32>`, and
+vindex index creation uses `n` from the type as the vector dimension.
 
 ### Blob Columns
 
@@ -357,6 +519,14 @@ For serialized `BlobDescriptor` values supplied by another Paimon engine,
 The offset must be non-negative, and lengths below `-1` are invalid.
 
 The same directives are supported by `ALTER TABLE ... ADD COLUMN`.
+
+Append-only data-evolution tables can set `video-frame-field` to a
+comma-separated list of scalar BLOB columns. Native writers accept serialized
+`VideoFrameDescriptor` values for these columns and pack complete encoded videos
+into `.video` files, deduplicating each source URI/range within one file and
+indexing logical frame runs. Readers return lazy frame descriptors. Video packing
+does not decode or re-encode frames. Raw video bytes, ordinary BlobDescriptors,
+video-column updates, video compaction, and BlobConsumer callbacks are unsupported.
 
 ### Blob Descriptor Functions
 
@@ -918,10 +1088,10 @@ The table type determines which row-level DML operations are supported:
 | `TRUNCATE TABLE` | Supported | Supported | Supported |
 | `ALTER TABLE ... DROP PARTITION` | Supported for partitioned tables | Supported for partitioned tables | Supported for partitioned tables |
 | `UPDATE` | Supported via Copy-on-Write | Not supported | Supported via row-id update |
-| `DELETE` | Supported via Copy-on-Write | Not supported | Supported when deletion vectors are enabled |
+| `DELETE` | Supported via Copy-on-Write | Supported for [eligible `deduplicate` tables](#delete) | Supported when deletion vectors are enabled |
 | `MERGE INTO` | Supported via Copy-on-Write | Not supported | Supported for matched `UPDATE`, matched `DELETE` with deletion vectors, and not-matched `INSERT` |
 
-A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. `DELETE` and matched `DELETE` in `MERGE INTO` additionally require `'deletion-vectors.enabled' = 'true'`. Primary-key row-level `UPDATE`, `DELETE`, and `MERGE INTO` are not supported even when data evolution is enabled.
+A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. `DELETE` and matched `DELETE` in `MERGE INTO` additionally require `'deletion-vectors.enabled' = 'true'`. Primary-key row-level `UPDATE` and `MERGE INTO` are not supported.
 
 ### INSERT INTO
 
@@ -933,6 +1103,26 @@ INSERT INTO paimon.my_db.users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol');
 
 ```sql
 INSERT INTO paimon.my_db.users SELECT * FROM source_table;
+```
+
+An `INSERT INTO` an append-only table with `'bucket' = '-1'` (the default) can
+encode data files with several writers. The writer count is the table option
+`sink.parallelism`, capped at `datafusion.execution.target_partitions`; the sink
+deals input batches to the writers round-robin, and their files are committed
+together as one snapshot. Without the option, or with `-1` (Flink's default
+parallelism), one writer is used. Primary-key tables, fixed-bucket tables and
+`INSERT OVERWRITE` always use one writer, but the option must still be a
+positive integer or `-1`.
+
+Each writer rolls its own files in every partition it receives rows for, so on
+a partitioned table the file count grows to writers × partitions where one
+writer leaves one file per partition.
+`sink.parallelism` is the same option Flink reads for its sink, so a table that
+already sets it for Flink jobs also writes in parallel from DataFusion, with at
+most `target_partitions` writers whatever the Flink value is.
+
+```sql
+ALTER TABLE paimon.my_db.events SET TBLPROPERTIES ('sink.parallelism' = '4');
 ```
 
 For `VARIANT` columns, convert JSON text with `parse_json` or `try_parse_json`:
@@ -996,7 +1186,33 @@ For append-only tables (no primary key), updates are executed using Copy-on-Writ
 UPDATE paimon.my_db.t SET name = 'a_new' WHERE id = 1;
 ```
 
-For data-evolution row-tracking tables without primary keys, updates are executed with row-id-based partial-column writes. Primary-key tables are not supported for `UPDATE`.
+For data-evolution row-tracking tables without primary keys, updates are executed with row-id-based partial-column writes.
+
+Ordinary primary-key tables using `merge-engine=deduplicate` support `UPDATE` by
+writing complete updated rows with the `UPDATE_AFTER` row kind. All SET
+expressions use the original row; unassigned columns retain their values.
+Primary-key and partition columns cannot be assigned.
+
+The target and its live self-references in predicates and SET expressions use
+one captured snapshot, including uncompacted deletion-vector versions. Target
+validation and read-option restrictions follow the primary-key DELETE rules
+below. Explicit historical and incremental views keep their selected read view.
+
+Configured sequence values are preserved unless assigned by SET, and the normal
+sequence sort order applies to the updated rows. A lower-priority assigned
+sequence or a higher-priority concurrent upsert can leave the stored row
+unchanged. The affected-row count reports rows matching the predicate in the
+captured snapshot, including updates that lose under these merge rules. This
+does not provide serializable updates.
+
+No matches publish no snapshot. Publication retries reuse prepared files without
+rescanning; repeating the SQL statement is a new operation. A commit error can
+occur after publication, so prepared files are retained and the error identifies
+the table and commit user.
+
+Other merge engines, `rowkind.field`, query-authorized targets, aliases, joins,
+`FROM`, `RETURNING`, `OUTPUT`, `ORDER BY`, `LIMIT`, target modifiers and tuple or
+qualified/nested SET targets are not supported by this primary-key UPDATE path.
 
 ### DELETE
 
@@ -1008,7 +1224,46 @@ DELETE FROM paimon.my_db.t WHERE name = 'b';
 
 For data-evolution row-tracking tables without primary keys, deletes are executed via deletion vectors and require `'deletion-vectors.enabled' = 'true'`.
 
-`DELETE` is not supported on primary-key tables.
+Primary-key tables using `merge-engine=deduplicate` with data evolution disabled
+support `DELETE` by writing tombstones for the logical rows matching the
+predicate. `DELETE` without `WHERE` targets every row in the captured read
+snapshot. A delete with no matches returns zero without publishing a snapshot.
+
+The target and its live self-references, including those through views, use one
+captured snapshot and merge uncompacted primary-key versions before applying
+predicates. On deletion-vector tables this applies even when
+`deletion-vectors.merge-on-read` is disabled. Ordinary queries retain their
+configured read behavior. Explicitly historical and incremental views retain
+their selected snapshots or timestamp windows and configured read behavior.
+DELETE targets cannot use time-travel or incremental read options.
+
+The target and its live self-references must use the table's configured merge
+engine, sequence fields, sort order, bucket count, bucket keys and bucket
+function. Conflicting session options or options captured by a view are rejected
+before scanning, as are overrides that enable or disable deletion vectors or
+data evolution, or change row-kind handling or query authorization. Read tuning
+options, such as `read.batch-size`, remain supported.
+
+Tombstones preserve configured sequence values and sort order, so
+concurrent upserts follow the normal primary-key merge rules. With the default
+ascending order, a higher-sequence upsert survives; without a sequence field,
+normal write ordering applies. This does not provide serializable predicate
+deletion.
+
+The affected-row count reports logical rows matching the predicate in the
+captured snapshot. It includes keys whose concurrent upserts survive under the
+merge rules above.
+
+Publication retries reuse prepared files without rescanning. Repeating the SQL
+statement scans a new snapshot and is a new operation. A commit error does not
+necessarily mean that the deletion was rolled back. Prepared files are retained
+on publication errors; the error identifies the table and commit user for
+investigating an uncertain outcome.
+
+Other primary-key merge engines, `ignore-delete=true` (including its fallback
+options), `rowkind.field`, query-authorized primary-key tables, aliases,
+multi-target/join deletes, `USING`, `RETURNING`, `ORDER BY`, `LIMIT`, `OUTPUT`, and
+target table modifiers are not supported by this path.
 
 ### MERGE INTO
 
@@ -1056,14 +1311,16 @@ are published in one commit. Multiple source rows selecting conflicting actions
 for the same target row fail without publishing any actions. A sole unconditional
 matched DELETE collapses duplicate matches and counts each deleted target once.
 
-Append-only tables support multiple conditional matched clauses with the first
-true clause taking effect; NULL predicates fall through. Data-evolution tables
-retain the restriction of one unconditional matched clause. Both support
-conditional not-matched inserts. `NOT MATCHED BY SOURCE` and subqueries inside
-`ON` or action expressions are not supported by the Paimon executor. Native
-planner restrictions also apply, including `UPDATE SET *`, `INSERT *`, `OUTPUT`,
-and action-level `WHERE` predicates. After declaring a table alias, use that
-alias in column references.
+Append-only tables support multiple matched clauses and execute the first
+applicable action. Data-evolution tables support a single matched `UPDATE` or
+`DELETE` with an optional predicate. A clause predicate must evaluate to `TRUE`
+for its action to apply. If no matched action applies, the target row is
+preserved. Both table types support conditional `WHEN NOT MATCHED` inserts,
+which apply only to source rows without an `ON` match. The Paimon executor
+does not support `NOT MATCHED BY SOURCE` or subqueries inside `ON` or action
+expressions. Native planner restrictions also apply, including `UPDATE SET *`,
+`INSERT *`, `OUTPUT`, and action-level `WHERE` predicates. After declaring a
+table alias, use that alias in column references.
 
 `SQLContext` expands positional MERGE inserts to persisted column names for
 data-evolution tables, excluding the virtual `_ROW_ID`. When using a raw
@@ -1245,6 +1502,73 @@ anything is deleted.
 ## Procedures
 
 Use `CALL` to invoke built-in procedures. All procedures are under the `sys` namespace.
+
+### Compatibility procedures
+
+These procedures accept named arguments and positional
+arguments in the order shown. Other procedures continue to use named arguments.
+When qualifying one of these procedures, use `sys` or `catalog.sys`.
+Unquoted procedure names follow the session's identifier normalization setting.
+An explicit catalog qualifier checks the exact registered name first, then
+applies that setting if the name is unquoted and no exact match exists.
+
+| Procedure | Arguments in positional order | Result |
+|---|---|---|
+| `rollback` | `table, version, snapshot, tag` | `previous_snapshot_id` and `current_snapshot_id` as BIGINT |
+| `drop_partition` | `table, partitions...` | `OK` after committing the partition drop |
+| `create_function` | `function, inputParams, returnParams, deterministic, comment, options` | Boolean `result` |
+| `drop_function` | `function` | Boolean `result` |
+| `vector_search` | `table, vector_column, query_vector, top_k, projection` | Rows from the existing vector search table function |
+| `full_text_search` | `table, column, query, top_k, projection` | Rows from the existing full-text search table function |
+
+`rollback` takes exactly one of `version`, `snapshot`, or `tag`. A version
+containing only digits means a snapshot ID. Use `tag` for a numeric tag name.
+For a REST catalog, `rollback` first tries the resolved snapshot ID. A catalog
+that only supports restoring an expired snapshot by tag receives a tag rollback
+after the client checks the tag still points to that snapshot. The client verifies
+the resulting head before reporting success. A failed verification can follow an
+applied rollback, so inspect the table state before retrying.
+For a filesystem catalog, stop concurrent writes before calling `rollback`.
+For `drop_partition`, specify every partition key in each `key=value` list.
+Each positional argument represents one partition and can contain a semicolon
+in a partition value. Use semicolons to separate specifications in the named
+`partitions` argument. Whitespace after `=` is significant for string and binary
+values. Use `ALTER TABLE ... DROP PARTITION` for values containing commas.
+The procedure operates on Paimon FileStore tables.
+
+```sql
+CALL sys.rollback('my_db.events', 'release_1');
+CALL sys.drop_partition('my_db.events', 'dt=2026-10-01', 'dt=2026-10-02');
+```
+
+`create_function` registers Catalog metadata on catalogs that support
+persistent functions. Both parameter lists are JSON arrays of Paimon data
+fields. Omit IDs from an entire list to assign distinct IDs starting at zero,
+including nested fields. Function names inside string arguments preserve case.
+Quote a name component to include a dot. The optional
+`deterministic` argument defaults to true and `options` takes comma-separated
+`key=value` pairs. Use [CREATE FUNCTION](#rest-catalog-views-and-sql-functions)
+to register an executable SQL definition.
+
+```sql
+CALL sys.create_function(
+    'my_db.f',
+    '[{"name":"x","type":"BIGINT"}]',
+    '[{"name":"result","type":"BIGINT"}]'
+);
+CALL sys.drop_function('my_db.f');
+```
+
+The search procedures accept `top_k` between 1 and 10000 and an optional
+comma-separated `projection`. `vector_search` accepts a JSON array or a
+comma-separated vector. Both return typed table rows and honor session time-travel
+options such as `paimon.scan.version`. Per-call search options,
+filters and Flink's JSON score output are unsupported by these adapters.
+
+```sql
+CALL sys.vector_search('my_db.items', 'embedding', '1.0, 0.0', 10, 'id');
+CALL sys.full_text_search('my_db.docs', 'content', 'paimon', 10, 'id, title');
+```
 
 ### reset_consumer
 
@@ -1613,6 +1937,10 @@ offset and must not be passed directly as an epoch timestamp.
 
 Build and commit a global index for a table column.
 
+As in Paimon's Flink SQL and Spark SQL integrations, global indexes are created
+through `CALL sys.create_global_index`. `CREATE INDEX ... ON ...` DDL is not
+supported.
+
 To maintain indexes synchronously after writes, declare columns through options
 such as `global-index.btree.index-columns='id'`. Maintenance runs by default
 when `write-only=false`; see
@@ -1642,6 +1970,14 @@ CALL sys.create_global_index(
 );
 
 CALL sys.create_global_index(
+  table => 'paimon.my_db.places',
+  index_column => 'shape',
+  index_type => 'rtree'
+);
+
+SELECT id FROM paimon.my_db.places WHERE bbox_intersects(shape, 10, 20, 30, 40);
+
+CALL sys.create_global_index(
   table => 'paimon.my_db.my_table',
   index_column => 'message',
   index_type => 'fm',
@@ -1655,6 +1991,26 @@ CALL sys.create_global_index(
   options => 'full-text.tokenizer=jieba,full-text.remove-stop-words=false'
 );
 ```
+
+Set `partitions` to build indexes only for matching partitions. As in Flink SQL
+and Spark SQL, `,` combines constraints with AND and `;` combines alternatives
+with OR. Omitted partition keys are unrestricted; omitting `partitions` builds
+all partitions. Values are parsed using each partition column's type, and the
+table's `partition.default-name` selects NULL values. Invalid filters and
+partition filters on unpartitioned tables are rejected before files are written.
+
+```sql
+CALL sys.create_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'id',
+  index_type => 'btree',
+  partitions => 'dt=2026-10-10,hr=1;dt=2026-10-11,hr=2'
+);
+```
+
+Index coverage outside the selected partitions is preserved. If the selected
+data is already indexed and unchanged, or no data matches, no snapshot is
+committed.
 
 `index_type` defaults to `btree`. It is case-insensitive and surrounding
 whitespace is ignored. BTree and bitmap global indexes support scalar columns.
@@ -1744,6 +2100,17 @@ Build options are
 `fm-index.locate-cost-ratio`. When locating a dense result would cost more than
 the configured ratio, the FM index safely declines evaluation and the normal
 source scan applies the predicate.
+
+An R-tree indexes one planar `GEOMETRY` column. The arguments to
+`bbox_intersects(shape, min_x, min_y, max_x, max_y)` define a closed rectangle in
+the column's coordinate system. Touching envelopes match. Empty geometries have
+no envelope but still match `IS NOT NULL`. SQL returns null for a null argument.
+The reader and writer use the [Apache Paimon R-tree V1 file format](https://github.com/apache/paimon/blob/79b8ec4788e2cd8ed87b1745d5ca54aa8db0e293/docs/docs/multimodal-table/global-index/rtree.mdx#file-format-version-1). Exact shape intersection
+requires a separate geometry predicate.
+
+A bbox lookup in `fast` mode returns matches from indexed ranges. In `full` and
+`detail`, the scan also checks original geometries in uncovered ranges. A covered
+range with zero matches needs no additional scan.
 
 Full-text global indexes support character-string columns and serve the
 [`full_text_search`](#full-text-search) function. The build splits the table's
@@ -1847,7 +2214,7 @@ Supported vindex options:
 
 | Option | Default | Applies To | Description |
 |---|---:|---|---|
-| `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. Existing `VECTOR<FLOAT,N>` columns use `N` from the type. |
+| `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. `VECTOR<FLOAT,N>` columns use `N` from the type. |
 | `<index-type>.distance.metric` | `inner_product` | all vindex types | Distance metric: `inner_product`, `cosine`, or `l2`. |
 | `<index-type>.nlist` | automatic | all IVF types | Number of IVF lists. When omitted or `auto`, infer it from `expected-vector-count`. DiskANN rejects this option. |
 | `<index-type>.expected-vector-count` | unset, or inferred | all vindex types | Expected number of vectors used for automatic sizing. When omitted, an automatic IVF build counts the shard's non-NULL vectors before training. |
@@ -1920,7 +2287,7 @@ CALL sys.drop_global_index(
 ```
 
 `index_type` accepts every type the create procedures build: `btree`, `bitmap`,
-`multivalue`, `fm`, `full-text`, and the vindex types
+`multivalue`, `fm`, `rtree`, `full-text`, and the vindex types
 `ivf-flat`, `ivf-pq`, `ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is
 case-insensitive and surrounding whitespace is ignored.
 
@@ -1945,7 +2312,9 @@ when `N` is zero. `dry_run` defaults to `false`; an explicit `false` or an
 omitted argument performs the drop and returns `OK`. Other values are rejected.
 The preview uses the latest snapshot at the time of the call; concurrent changes
 can affect the number of files matched by a later drop. Reads retain the usual
-local-cache behavior. Partition filtering is not supported by this procedure.
+local-cache behavior. The optional `partitions` argument uses the same filter
+syntax as [create_global_index](#create_global_index) and restricts the drop to
+matching partitions.
 
 ### compact
 
@@ -2101,7 +2470,7 @@ CALL sys.list_policies(database => 'sales', table => 'orders');
 
 ### Constant procedure arguments
 
-CALL arguments still use named `name => expression` syntax. In addition to
+All CALL procedures accept named `name => expression` syntax. In addition to
 literals, SQLContext accepts immutable scalar constant expressions such as
 casts, arithmetic, string functions, CASE and boolean predicates.
 
@@ -2301,6 +2670,7 @@ with a custom escape is unsupported.
 | `curdate()` | Alias of `current_date()` |
 | `timestamp_millis(value)` | Alias of `to_timestamp_millis(value)`, preserving millisecond epoch units |
 | `to_timestamp_ltz(value[, format...])` | Alias of `to_timestamp`, preserving its session time zone and nanosecond result |
+| `approx_percentile(value, percentage[, accuracy])` | Spark-compatible discrete approximate percentile; `percentage` is a scalar or array; alias `percentile_approx` |
 
 Regular expressions use Rust regex syntax, like DataFusion's existing regex
 functions, rather than the full Java regex dialect. No match or an unmatched
@@ -2313,6 +2683,78 @@ including dictionary encodings and null dictionary values.
 The timestamp aliases retain DataFusion semantics: optional formats are Chrono
 strftime strings, not Spark/Java patterns; numeric `to_timestamp_ltz` inputs
 are epoch seconds. The Flink `(number, precision)` overload is not implemented.
+The existing `date_format` function also retains DataFusion's Chrono format
+strings; Java-style Spark/Flink datetime patterns are not translated.
+
+`approx_percentile` and `percentile_approx` follow Spark's Greenwald–Khanna
+summary algorithm and select observed values rather than interpolate between
+them. `accuracy` is a constant integer in `[1, 2147483647]`, defaulting to 10000;
+the relative rank error is `1 / accuracy`. Higher accuracy retains a larger
+summary. The percentage must be a constant number or array of numbers between
+0 and 1, inclusive. Constant expressions such as `1.0 / 2` are accepted. NULL
+percentages, NULL array elements, and invalid accuracy values are errors.
+SQL literal parsing and implicit casts retain DataFusion semantics.
+
+Scalar percentages produce the input column's type. Percentage arrays produce
+an array of that type, retaining the order and duplicates in the percentage
+array. NULL inputs are ignored. Empty/all-NULL groups and an empty percentage
+array produce NULL. Numeric, date, timestamp, and ANSI year-month or day-time
+interval inputs are supported; a mixture of the two interval families is rejected.
+`GROUP BY`, `FILTER`, `DISTINCT`, and window aggregation use the same contract.
+DISTINCT aggregation additionally retains the distinct input values for merging.
+Moving window frames retain their current rows and rebuild the summary when rows
+leave; ordinary aggregation and growing frames retain only the compact summary.
+Timestamp observations use Spark's microsecond precision, flooring Arrow
+timestamps to whole microseconds. Decimal results use Spark's decimal rounding
+and become NULL on precision overflow. Decimal result arrays expose nullable Arrow
+elements so those overflow positions can be represented safely; Spark's declared
+non-null element metadata can otherwise fail during result decoding.
+DataFusion's `approx_percentile_cont` remains available with its native t-digest
+and continuous interpolation semantics.
+
+```sql
+SELECT approx_percentile(latency_ms, 0.95, 10000) FROM events;
+SELECT approx_percentile(latency_ms, array(0.5, 0.9, 0.99), 10000) FROM events;
+-- Spark example: [1, 1, 0], preserving the order of requested percentages.
+SELECT approx_percentile(v, array(0.5, 0.4, 0.1), 100)
+FROM (VALUES (0), (1), (2), (10)) AS t(v);
+```
+
+### Maximum partition
+
+`max_pt('table')`, `sys.max_pt('database.table')`, and
+`catalog.sys.max_pt('catalog.database.table')` return the maximum non-null
+first-level partition value as a string, matching Paimon's `max_pt` contract.
+Comparison uses the partition column's logical type: integer 10 is greater than
+9, while string '9' is greater than '10'. Subpartition columns do not affect the
+result. Only partitions containing live data files qualify; empty catalog
+partitions and dropped partitions are skipped. Unpartitioned tables and tables
+without any qualifying partition produce an error.
+
+The argument must be one non-null string literal. Table names can have one,
+two, or three components, with SQL quoting for individual identifiers. Omitted
+table components use the session's current catalog/database even when the
+function is catalog-qualified. An explicit catalog in the table argument takes
+precedence. Paimon branch references are supported; system tables are
+rejected. Resolution reads scan metadata during planning and substitutes a
+literal so partition filters can be pushed down. Repeated calls are resolved
+once per statement, and later statements read fresh metadata.
+Temporary SQL views that depend on `max_pt`, including through other views,
+retain their SQL and resolve it again for each query. They retain the creation
+namespace and output schema, while reading current scan options and grants.
+The metadata lookup follows the same session scan options, including historical
+snapshots, as a normal table read. Temporary shadows are resolved normally and
+must still be Paimon data tables; a view cannot be passed as the source table.
+Because the result comes from raw partition metadata, grants with row filters or
+column masks are rejected; unrestricted grants are supported.
+Catalog SQL functions are required to be immutable and cannot contain `max_pt`,
+which reads table metadata that can change between statements.
+
+```sql
+SELECT * FROM events WHERE dt = max_pt('events');
+SELECT * FROM daily_counts WHERE day_id = CAST(sys.max_pt('default.daily_counts') AS INT);
+SELECT approx_percentile(latency_ms, 0.95) FROM events;
+```
 
 ### Additional scalar compatibility functions
 
@@ -2521,8 +2963,7 @@ score. If no matching index is found, an empty result is returned.
 
 ### Scalar Pre-Filters
 
-Add a `WHERE` clause to restrict the rows considered by vector Top-K. The
-predicate is evaluated before the vector index selects its nearest neighbors:
+Add a `WHERE` clause to restrict the rows returned by vector Top-K:
 
 ```sql
 SELECT id, event_time
@@ -2535,11 +2976,28 @@ FROM vector_search(
 WHERE event_time >= TIMESTAMP '2026-08-01 00:00:00';
 ```
 
-On data-evolution tables, Paimon resolves the predicate to matching global row
-IDs using a snapshot-pinned table read. Scalar global indexes such as BTree can
-narrow this read. The matching global row IDs are intersected with each vector
-index shard and passed to the vector backend as its row filter, so an excluded
-nearest neighbor does not consume one of the requested Top-K positions.
+On data-evolution tables, exact scalar global-index answers are passed to each
+vector shard as a row-ID filter. When no scalar index can evaluate the
+predicate, each shard retrieves ANN candidates once and checks their scalar
+values against the same pinned snapshot before returning results. Batch queries
+share a candidate row-ID union for each filtering read.
+
+`vector-index.post-filter.candidates-factor` defaults to `10`. Each query's
+candidate count is `max(original Top-K * factor, required candidate limit)`,
+capped by shard size and the backend limit (`2147483647`). The required limit
+includes reranking/deletion slack; neither that slack nor batch size multiplies
+the factor. For example, Top-K 10 requests 100 candidates with the default
+factor unless a larger required allowance applies.
+
+Every returned row satisfies the predicate, but filtering may leave fewer than
+Top-K rows, including no rows even when matches exist outside the candidates.
+There is no retry or automatic raw scoring of indexed ranges to fill results.
+Increase the factor to check more candidates, at additional query and scalar
+read cost. Post-filtering retains ANN's approximate recall. Raw work outside
+vector-index coverage still follows `fast`, `full`, and `detail` search modes;
+explicitly supplied Raw sources retain their exact scoring.
+When a scalar index can evaluate the predicate but covers only part of the row
+range, scalar `full` and `detail` modes still plan Raw work for its coverage gaps.
 
 Only predicates that can be translated completely to Paimon predicates are
 pushed into vector search. DataFusion keeps its residual filter for ordinary
@@ -3559,6 +4017,20 @@ Field-scoped options used by these functions:
   `fields.<field>.nested-key-null-strategy`, and `fields.<field>.count-limit`
   for nested array aggregators. `nested_partial_update` requires
   `nested-key`.
+- `fields.<field>.count-limit` also applies to `collect`, see below.
+
+`collect` supports `fields.<field>.distinct` and `fields.<field>.count-limit`.
+A positive limit `N` keeps the first `N` elements in merge order, a negative
+limit `-N` keeps the last `N`, and `0` keeps none. There is no limit by
+default. With `distinct=true`, the limit counts distinct elements: a positive
+limit keeps the first occurrence of each element and a negative limit keeps the
+last, both in their original order. For example, merging rows `[1, 2]` and
+`[1, 3]` of one key with `distinct=true` gives `[1, 2]` for `count-limit=2` and
+`[1, 3]` for `count-limit=-2`. Both options apply when two or more rows of the
+same key are merged, including in write-buffer flushes and compaction, and the
+merged array is what gets written to data files. As in Java, a key with only
+one row keeps the array it was written with until another row of that key
+arrives or, with `changelog-producer=lookup`, until it is compacted.
 
 `DELETE` / `UPDATE_BEFORE` rows are fed to each field aggregator's retract path
 (`AggregateMergeFunction`), except that
@@ -3594,12 +4066,12 @@ optimization may be disabled. Full-text builds reject deletion-vector tables.
 | `row-tracking.enabled` | `false` | Enables stable row ids required by global index files. |
 | `data-evolution.enabled` | `false` | Enables row-id-aware table evolution and partial-column writes. |
 | `global-index.enabled` | `true` | Enables global index metadata and global-index-aware reads. |
-| `global-index.<family>.index-columns` | unset | Comma-separated columns maintained automatically with `write-only=false`. Families: `btree`, `bitmap`, `multivalue`, `fm`, `full-text`, `vector`. Each column owns one index. |
+| `global-index.<family>.index-columns` | unset | Comma-separated columns maintained automatically with `write-only=false`. Families: `btree`, `bitmap`, `multivalue`, `fm`, `rtree`, `full-text`, `vector`. Each column owns one index. |
 | `fields.<column>.global-index.<family>.index-options` | unset | Per-column JSON object of native writer options, following primary-key index option resolution. |
 | `fields.<column>.global-index.vector.index-type` | required for declared vector columns | Vector algorithm, such as `diskann` or `ivf-flat`. Changes replace incompatible payloads atomically during maintenance. |
 | `fields.<column>.global-index.vector.distance-metric` | `inner_product` | Vector distance metric for builds and FULL/DETAIL raw fallback: `inner_product`, `cosine`, or `l2`. Changes replace incompatible payloads atomically during maintenance. |
 | `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
-| `sorted-index.records-per-range` | `100000` | Maximum row count per BTree, bitmap, multivalue, or FM global-index file range; falls back to legacy `btree-index.records-per-range`. |
+| `sorted-index.records-per-range` | `100000` | Maximum row count per BTree, bitmap, multivalue, FM, or R-tree global-index shard; falls back to legacy `btree-index.records-per-range`. |
 | `btree-index.block-size` | `64kb` | Target BTree data-block size. |
 | `btree-index.file-version` | `1` | BTree file version to write: `1` or `2`. V2 uses adaptive postings and requires V2-capable readers. |
 | `btree-index.bloom-filter.enabled` | `false` | Writes a Bloom filter used to avoid BTree data-block reads for missing equality and `IN` keys. |
@@ -3611,6 +4083,11 @@ optimization may be disabled. Full-text builds reject deletion-vector tables.
 | `multivalue-index.dictionary-block-size` | `16kb` | Target multivalue dictionary-block size. |
 | `multivalue-index.compression` | `none` | Multivalue dictionary/index block compression: `none`, `zstd`, `lz4`, or `lzo`. |
 | `multivalue-index.compression-level` | `1` | Multivalue compression level (used by codecs that support levels). |
+| `rtree-index.page-size` | `256` | Entries per packed page (2 to 4096). |
+| `rtree-index.partition-row-count` | `65536` | Source rows per physical R-tree file (1 to 1048576). |
+| `rtree-index.read-cache-size` | `8 MiB` | Shared page-cache budget. Zero disables caching. |
+| `rtree-index.read-batch-size` | `1 MiB` | Maximum bytes per coalesced read (4 KiB to 16 MiB, with at least one page per read). |
+| `rtree-index.read-file-concurrency` | `4` | Maximum concurrent file traversals sharing an index read context. |
 | `fm-index.partition-size` | `16mb` | Maximum encoded symbol count targeted by each FM partition. A single encoded value must be smaller than this limit. |
 | `fm-index.partition-row-count` | `100000` | Maximum row count per FM partition. |
 | `fm-index.sa-sample-rate` | `32` | Power-of-two suffix-array sampling rate used by FM locate operations. |
@@ -3622,6 +4099,7 @@ optimization may be disabled. Full-text builds reject deletion-vector tables.
 | `btree-index.fallback-scan-max-size` | `256mb` | Maximum total size of BTree global-index files requiring fallback scans for range/between and suffix/contains/complex LIKE predicates; files proven to match completely by metadata need no scan and are excluded. `0` disables BTree fallback index scans. |
 | `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected bitmap global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
 | `global-index.search-mode` | `fast` | Global index coverage mode for reads: `fast`, `full`, or `detail`. |
+| `vector-index.post-filter.candidates-factor` | `10` | Multiplier of each query's original Top-K for one ANN query followed by exact scalar post-filtering. At least the required reranking/deletion allowance, capped by shard size and the backend limit. Positive integer no greater than `2147483647`. Short results are returned without retry. |
 | `global-index.thread-num` | `32` | Number of concurrent global-index search tasks; must be greater than 0 and must not exceed the runtime's task limit. This does not limit Vindex file range reads. |
 | `global-index.vindex.read-thread-num` | `64` | Maximum number of concurrent Vindex file range reads shared by one search operation; must be greater than 0 and must not exceed the runtime semaphore limit. |
 | `global-index.column-update-action` | `THROW_ERROR` | What a commit does when it updates an indexed column: `THROW_ERROR` rejects the commit, `DROP_PARTITION_INDEX` drops the affected partition index instead. |

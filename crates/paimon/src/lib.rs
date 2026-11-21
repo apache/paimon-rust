@@ -36,6 +36,7 @@ pub mod full_text;
 pub mod io;
 mod predicate_stats;
 pub mod resource;
+pub mod rtree;
 pub mod spec;
 pub mod table;
 pub mod variant;

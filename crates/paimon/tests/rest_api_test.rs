@@ -342,6 +342,55 @@ async fn test_create_function() {
 }
 
 #[tokio::test]
+async fn test_drop_function_uses_encoded_individual_function_path() {
+    let ctx = setup_test_server(vec!["db+%"]).await;
+    let function = Function::new(
+        Identifier::new("db+%", "fn+?#%"),
+        None,
+        None,
+        true,
+        HashMap::new(),
+        None,
+        HashMap::new(),
+    );
+    ctx.api.create_function(&function).await.unwrap();
+
+    ctx.api.drop_function(function.identifier()).await.unwrap();
+
+    assert!(ctx.api.list_functions("db+%").await.unwrap().is_empty());
+    assert!(matches!(
+        ctx.api
+            .drop_function(function.identifier())
+            .await
+            .unwrap_err(),
+        paimon::Error::RestApi {
+            source: RestError::NoSuchResource { .. }
+        }
+    ));
+}
+
+#[tokio::test]
+async fn test_drop_function_rejects_dot_path_segments() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    for (database, function) in [
+        (".", "fn"),
+        ("..", "fn"),
+        ("default", "."),
+        ("default", ".."),
+    ] {
+        let error = ctx
+            .api
+            .drop_function(&Identifier::new(database, function))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, paimon::Error::ConfigInvalid { message } if message.contains("dot path segment"))
+        );
+    }
+    assert_eq!(ctx.api.list_databases().await.unwrap(), vec!["default"]);
+}
+
+#[tokio::test]
 async fn test_create_database() {
     let ctx = setup_test_server(vec!["default"]).await;
 

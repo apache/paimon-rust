@@ -603,9 +603,7 @@ impl RESTEnv {
 
         let mut builder = FileIO::from_path(path)?.with_props(options.to_map());
         builder = builder.with_cache_context(file_io_cache);
-        if let Some(local_cache) = local_cache {
-            builder = builder.with_local_cache(local_cache);
-        }
+        builder = builder.with_local_cache(local_cache);
         builder.build()
     }
 
@@ -867,6 +865,55 @@ mod tests {
                 .unwrap(),
             "an-already-encoded-outermost-table"
         );
+    }
+
+    #[tokio::test]
+    async fn test_file_io_paths_preserve_disabled_catalog_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        for mode in ["plain", "token", "fuse"] {
+            let mut options = Options::new();
+            options.set(CatalogOptions::URI, "http://localhost:1");
+            options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+            options.set(CatalogOptions::TOKEN, "test-token");
+            options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+            let resolver = if mode == "fuse" {
+                options.set("fuse.enabled", "true");
+                options.set("fuse.root", directory.path().to_string_lossy());
+                options.set("fuse.validation-mode", "none");
+                Some(FusePathResolver::new(&options))
+            } else {
+                None
+            };
+            if mode == "token" {
+                options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "false");
+            }
+            let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+            let file_io_cache = FileIOCacheContext::from_props(options.to_map()).unwrap();
+            let initial_token = RESTToken::new(
+                std::collections::HashMap::from([(
+                    CatalogOptions::LOCAL_CACHE_ENABLED.to_string(),
+                    "true".to_string(),
+                )]),
+                i64::MAX,
+            );
+            let file_io = RESTEnv::build_file_io_with_token(
+                &Identifier::new("default", "t"),
+                directory.path().to_str().unwrap(),
+                api,
+                &options,
+                mode == "token",
+                None,
+                file_io_cache,
+                Some(initial_token),
+                resolver.as_ref(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                !file_io.has_local_cache(),
+                "{mode} must keep the catalog cache disabled"
+            );
+        }
     }
 
     #[tokio::test]

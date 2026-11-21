@@ -249,13 +249,14 @@ jobs:
     env:
       RUST_LOG: DEBUG
       RUST_BACKTRACE: full
-      # DataFusion builds default and Vortex test binaries on the same runner.
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      # DataFusion links many default and Vortex test binaries on one runner.
+      CARGO_PROFILE_TEST_DEBUG: ${{ matrix.suite == 'datafusion' && '0' || 'line-tables-only' }}
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
 
       - name: Rust Cache
+        if: matrix.suite != 'datafusion'
         uses: actions/cache@v6
         with:
           path: |
@@ -265,6 +266,19 @@ jobs:
           key: integration-${{ matrix.suite }}-${{ runner.os }}-line-tables-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             integration-${{ matrix.suite }}-${{ runner.os }}-line-tables-
+
+      # Restoring older target trees retains obsolete copies of every test
+      # binary and can exhaust the runner before it can upload failure logs.
+      - name: DataFusion dependency cache
+        if: matrix.suite == 'datafusion'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: integration-datafusion-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            integration-datafusion-registry-${{ runner.os }}-
 
       - name: Set up JDK 17
         if: matrix.needs_jvm == true
@@ -303,10 +317,13 @@ jobs:
         env:
           # The partition-count DV fixture exceeds Rust's default 2 MiB test-thread stack.
           RUST_MIN_STACK: 16777216
+          CARGO_BUILD_JOBS: 2
         run: cargo test --locked -p paimon-datafusion --all-targets
 
       - name: DataFusion Vortex Integration Test
         if: matrix.suite == 'datafusion'
+        env:
+          CARGO_BUILD_JOBS: 2
         run: cargo test --locked -p paimon-datafusion --features vortex --test vortex_tables
 
       - name: Install uv

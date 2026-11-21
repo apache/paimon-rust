@@ -112,7 +112,7 @@ pub(super) fn unindexed_ranges_for_coverage(
     source::exclude_row_ranges(&data_ranges, &indexed_ranges)
 }
 
-pub(super) fn unindexed_ranges_for_indexed_coverage(
+pub(crate) fn unindexed_ranges_for_indexed_coverage(
     indexed_ranges: &[RowRange],
     search_mode: GlobalIndexSearchMode,
     next_row_id: Option<i64>,
@@ -125,7 +125,7 @@ pub(super) fn unindexed_ranges_for_indexed_coverage(
     source::exclude_row_ranges(&data_ranges, &merge_row_ranges(indexed_ranges.to_vec()))
 }
 
-/// Compute row ranges not covered by a family of global index files.
+/// Compute row ranges not covered by the selected files' primary fields.
 ///
 /// This mirrors Java `GlobalIndexCoverage`: `full` compares index coverage
 /// against `[0, snapshot.next_row_id - 1]`, while `detail` compares against
@@ -146,19 +146,13 @@ pub(crate) fn unindexed_ranges_for_global_index_entries(
         let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
             continue;
         };
-        let row_range = RowRange::new(global_meta.row_range_start, global_meta.row_range_end);
         coverage_by_field
             .entry(global_meta.index_field_id)
             .or_default()
-            .push(row_range.clone());
-        if let Some(extra_field_ids) = global_meta.extra_field_ids.as_ref() {
-            for extra_field_id in extra_field_ids {
-                coverage_by_field
-                    .entry(*extra_field_id)
-                    .or_default()
-                    .push(row_range.clone());
-            }
-        }
+            .push(RowRange::new(
+                global_meta.row_range_start,
+                global_meta.row_range_end,
+            ));
     }
     unindexed_ranges_for_coverage(
         &coverage_by_field,

@@ -22,7 +22,7 @@ use super::{
     extract_datum_from_arrow, serialize_binary_array_long, BinaryRowBuilder, DataType, Datum,
     EMPTY_SERIALIZED_ROW,
 };
-use arrow_array::RecordBatch;
+use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray, RecordBatch};
 
 /// Deserialize `_NULL_COUNTS` which in Avro is `["null", {"type":"array","items":["null","long"]}]`.
 /// Preserves null items as `None` (meaning "unknown") rather than collapsing to 0.
@@ -168,25 +168,48 @@ impl<'a> ColumnStatsCollector<'a> {
     }
 
     pub(crate) fn collect(&mut self, batch: &RecordBatch, indices: &[usize]) -> crate::Result<()> {
-        for row_idx in 0..batch.num_rows() {
-            for (pos, (&col_idx, data_type)) in indices.iter().zip(self.types.iter()).enumerate() {
-                let datum = extract_datum_from_arrow(batch, row_idx, col_idx, data_type)?;
-                match datum {
-                    Some(d) => {
-                        if self.min_datums[pos].as_ref().is_none_or(|m| d < *m) {
-                            self.min_datums[pos] = Some(d.clone());
-                        }
-                        if self.max_datums[pos].as_ref().is_none_or(|m| d > *m) {
-                            self.max_datums[pos] = Some(d);
-                        }
+        for (pos, (&col_idx, data_type)) in indices.iter().zip(self.types.iter()).enumerate() {
+            if data_type.is_geospatial() {
+                *self.null_counts[pos].as_mut().unwrap() +=
+                    batch.column(col_idx).null_count() as i64;
+                continue;
+            }
+            match bound_rows(batch.column(col_idx).as_ref(), data_type) {
+                Some(bounds) => {
+                    *self.null_counts[pos].as_mut().unwrap() +=
+                        batch.column(col_idx).null_count() as i64;
+                    if let Some((min_row, max_row)) = bounds {
+                        let min = extract_datum_from_arrow(batch, min_row, col_idx, data_type)?;
+                        let max = extract_datum_from_arrow(batch, max_row, col_idx, data_type)?;
+                        self.update(pos, min);
+                        self.update(pos, max);
                     }
-                    None => {
-                        *self.null_counts[pos].as_mut().unwrap() += 1;
+                }
+                None => {
+                    for row_idx in 0..batch.num_rows() {
+                        let datum = extract_datum_from_arrow(batch, row_idx, col_idx, data_type)?;
+                        self.update(pos, datum);
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    fn update(&mut self, pos: usize, datum: Option<Datum>) {
+        match datum {
+            Some(d) => {
+                if self.min_datums[pos].as_ref().is_none_or(|m| d < *m) {
+                    self.min_datums[pos] = Some(d.clone());
+                }
+                if self.max_datums[pos].as_ref().is_none_or(|m| d > *m) {
+                    self.max_datums[pos] = Some(d);
+                }
+            }
+            None => {
+                *self.null_counts[pos].as_mut().unwrap() += 1;
+            }
+        }
     }
 
     pub(crate) fn finish(&self) -> BinaryTableStats {
@@ -211,10 +234,126 @@ impl<'a> ColumnStatsCollector<'a> {
     }
 }
 
+/// Rows holding the smallest and largest non-null value of `col`, for types whose
+/// Arrow order is the same as `Datum`'s. `None` means the caller has to compare
+/// each row as a `Datum`; `Some(None)` means every row is null.
+fn bound_rows(col: &dyn Array, data_type: &DataType) -> Option<Option<(usize, usize)>> {
+    use arrow_array::types::{
+        Date32Type, Int16Type, Int32Type, Int64Type, Int8Type, Time32MillisecondType,
+    };
+    match data_type {
+        DataType::TinyInt(_) => primitive_bound_rows::<Int8Type>(col),
+        DataType::SmallInt(_) => primitive_bound_rows::<Int16Type>(col),
+        DataType::Int(_) => primitive_bound_rows::<Int32Type>(col),
+        DataType::BigInt(_) => primitive_bound_rows::<Int64Type>(col),
+        DataType::Date(_) => primitive_bound_rows::<Date32Type>(col),
+        DataType::Time(_) => primitive_bound_rows::<Time32MillisecondType>(col),
+        DataType::Char(_) | DataType::VarChar(_) => {
+            let any = col.as_any();
+            if let Some(arr) = any.downcast_ref::<arrow_array::StringArray>() {
+                Some(arg_bounds(arr.iter()))
+            } else if let Some(arr) = any.downcast_ref::<arrow_array::LargeStringArray>() {
+                Some(arg_bounds(arr.iter()))
+            } else {
+                any.downcast_ref::<arrow_array::StringViewArray>()
+                    .map(|arr| arg_bounds(arr.iter()))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn primitive_bound_rows<T: ArrowPrimitiveType>(col: &dyn Array) -> Option<Option<(usize, usize)>>
+where
+    T::Native: Ord,
+{
+    col.as_any()
+        .downcast_ref::<PrimitiveArray<T>>()
+        .map(|arr| arg_bounds(arr.iter()))
+}
+
+/// First row of the minimum and of the maximum, skipping nulls.
+fn arg_bounds<V: Ord + Copy>(values: impl Iterator<Item = Option<V>>) -> Option<(usize, usize)> {
+    let mut bounds: Option<((usize, V), (usize, V))> = None;
+    for (row, value) in values.enumerate() {
+        let Some(value) = value else { continue };
+        match &mut bounds {
+            None => bounds = Some(((row, value), (row, value))),
+            Some((min, max)) => {
+                if value < min.1 {
+                    *min = (row, value);
+                }
+                if value > max.1 {
+                    *max = (row, value);
+                }
+            }
+        }
+    }
+    bounds.map(|(min, max)| (min.0, max.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spec::BinaryRow;
+
+    /// The typed path for strings and integers keeps the same bounds as comparing every row
+    /// as a `Datum`, and other types still take the per-row path.
+    #[test]
+    fn typed_bounds_match_per_row_datum_comparison() {
+        use arrow_array::{Float64Array, Int64Array, StringArray};
+        use std::sync::Arc;
+        let types = vec![
+            DataType::VarChar(crate::spec::VarCharType::string_type()),
+            DataType::BigInt(crate::spec::BigIntType::new()),
+            DataType::Double(crate::spec::DoubleType::new()),
+        ];
+        let mut collector = ColumnStatsCollector::new(&types);
+        for (s, l, d) in [
+            (
+                vec![Some("m"), None, Some("b"), Some("zz")],
+                vec![Some(7), Some(-2), None, Some(40)],
+                vec![Some(1.5), Some(-0.5), None, Some(3.0)],
+            ),
+            (
+                vec![None, None, None, None],
+                vec![None, None, None, None],
+                vec![None, None, None, None],
+            ),
+            (
+                vec![Some("a"), Some("z"), Some("aa"), None],
+                vec![Some(41), Some(-3), Some(0), None],
+                vec![Some(9.0), None, Some(-1.0), Some(2.0)],
+            ),
+        ] {
+            let batch = RecordBatch::try_from_iter([
+                ("s", Arc::new(StringArray::from(s)) as arrow_array::ArrayRef),
+                ("l", Arc::new(Int64Array::from(l)) as arrow_array::ArrayRef),
+                (
+                    "d",
+                    Arc::new(Float64Array::from(d)) as arrow_array::ArrayRef,
+                ),
+            ])
+            .unwrap();
+            collector.collect(&batch, &[0, 1, 2]).unwrap();
+        }
+        let stats = collector.finish();
+        let min = BinaryRow::from_serialized_bytes(stats.min_values()).unwrap();
+        let max = BinaryRow::from_serialized_bytes(stats.max_values()).unwrap();
+        assert_eq!(
+            (min.get_string(0).unwrap(), max.get_string(0).unwrap()),
+            ("a", "zz")
+        );
+        assert_eq!(
+            (min.get_long(1).unwrap(), max.get_long(1).unwrap()),
+            (-3, 41)
+        );
+        assert_eq!(
+            (min.get_double(2).unwrap(), max.get_double(2).unwrap()),
+            (-1.0, 9.0)
+        );
+        assert_eq!(stats.null_counts(), &vec![Some(6), Some(6), Some(6)]);
+    }
 
     #[test]
     fn streaming_stats_keep_projected_bounds_and_nulls_across_batches() {

@@ -33,9 +33,9 @@ mod row_ranges;
 pub(crate) use deletion_vectors::deleted_row_ranges_for_data_evolution_dvs;
 use entry::{validate_fm_file_sets, GlobalIndexEntry, GlobalIndexEntryMeta, GlobalIndexFileKind};
 pub(super) use row_ranges::intersect_sorted_ranges;
-use row_ranges::unindexed_ranges_for_indexed_coverage;
 pub(crate) use row_ranges::{
-    search_limit_with_deleted_rows, unindexed_ranges_for_global_index_entries, RowRangeIndex,
+    search_limit_with_deleted_rows, unindexed_ranges_for_global_index_entries,
+    unindexed_ranges_for_indexed_coverage, RowRangeIndex,
 };
 
 use super::global_index_types::{
@@ -111,7 +111,7 @@ impl Drop for QueryIoProbeGuard<'_> {
 ///
 /// The scanner filters index manifest entries for global index files,
 /// uses type-specific metadata for file-level pruning, then reads matching
-/// BTree, bitmap, multivalue, or FM files to evaluate predicates and collect row IDs.
+/// BTree, bitmap, multivalue, FM, or R-tree files to evaluate predicates and collect row IDs.
 /// Opened BTreeIndexReaders are cached for reuse across evaluations.
 pub(crate) struct GlobalIndexScanner {
     file_io: FileIO,
@@ -125,6 +125,7 @@ pub(crate) struct GlobalIndexScanner {
     bitmap_fallback_scan_max_size: i64,
     fm_read_options: FMReadOptions,
     fm_read_context: Arc<FMReadContext>,
+    rtree: Arc<crate::rtree::RTreeReadContext>,
     field_read_options: HashMap<String, Arc<FieldReadOptions>>,
     /// Global index entries grouped by field_id.
     entries_by_field: Vec<(i32, Vec<GlobalIndexEntry>)>,
@@ -145,6 +146,7 @@ pub(crate) struct GlobalIndexScanner {
 }
 
 struct FieldReadOptions {
+    rtree: Option<Arc<crate::rtree::RTreeReadContext>>,
     btree_fallback: i64,
     bitmap_fallback: i64,
     btree_cache: Arc<BTreeDataBlockCache>,
@@ -247,10 +249,14 @@ impl GlobalIndexScanner {
                 BTREE_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::BTree,
                 BITMAP_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Bitmap,
                 MULTIVALUE_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Multivalue,
+                "rtree" => GlobalIndexFileKind::RTree,
                 FM_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::FM,
                 _ => unreachable!("normalized queryable global index type"),
             };
-            let parsed_meta = if kind == GlobalIndexFileKind::FM {
+            let parsed_meta = if kind == GlobalIndexFileKind::RTree {
+                let (meta, header) = super::rtree_manifest::file_metadata(&entry.index_file)?;
+                GlobalIndexEntryMeta::RTree(meta, header)
+            } else if kind == GlobalIndexFileKind::FM {
                 let (first_row_id, row_count) =
                     manifest_row_range(index_meta).map_err(|error| Error::DataInvalid {
                         message: format!(
@@ -304,23 +310,6 @@ impl GlobalIndexScanner {
                 meta: parsed_meta,
             };
 
-            #[cfg(test)]
-            let row_range = RowRange::new(global_meta.row_range_start, global_meta.row_range_end);
-            #[cfg(test)]
-            coverage_by_field
-                .entry(global_meta.index_field_id)
-                .or_default()
-                .push(row_range.clone());
-            #[cfg(test)]
-            if let Some(extra_field_ids) = global_meta.extra_field_ids.as_ref() {
-                for extra_field_id in extra_field_ids {
-                    coverage_by_field
-                        .entry(*extra_field_id)
-                        .or_default()
-                        .push(row_range.clone());
-                }
-            }
-
             if kind == GlobalIndexFileKind::BTree
                 && global_meta
                     .extra_field_ids
@@ -331,6 +320,14 @@ impl GlobalIndexScanner {
                 ids.extend(global_meta.extra_field_ids.as_ref().unwrap());
                 composite_entries.entry(ids).or_default().push(resolved);
             } else {
+                #[cfg(test)]
+                coverage_by_field
+                    .entry(global_meta.index_field_id)
+                    .or_default()
+                    .push(RowRange::new(
+                        global_meta.row_range_start,
+                        global_meta.row_range_end,
+                    ));
                 entries_by_field
                     .entry(global_meta.index_field_id)
                     .or_default()
@@ -355,6 +352,7 @@ impl GlobalIndexScanner {
             bitmap_fallback_scan_max_size,
             fm_read_options,
             fm_read_context: Arc::new(FMReadContext::new(fm_read_options.cache_size)),
+            rtree: Arc::new(crate::rtree::RTreeReadContext::default()),
             field_read_options: HashMap::new(),
             entries_by_field: entries_by_field.into_iter().collect(),
             composite_entries: composite_entries.into_iter().collect(),
@@ -471,6 +469,11 @@ impl GlobalIndexScanner {
                         self.fm_read_options
                     };
                     let settings = Arc::new(FieldReadOptions {
+                        rtree: (kind == "rtree")
+                            .then(|| {
+                                crate::rtree::RTreeReadContext::from_options(&map).map(Arc::new)
+                            })
+                            .transpose()?,
                         btree_fallback: if kind == "btree" {
                             core.btree_index_fallback_scan_max_size()?
                         } else {
@@ -536,17 +539,50 @@ impl GlobalIndexScanner {
     }
 
     /// Scalar candidates and Java's exactness contract for searches which rank
-    /// rows before applying the row predicate.
+    /// rows before applying the row predicate. The third value lists the rows
+    /// that are only candidates; the answer is exact for the rows a caller
+    /// keeps only if `exact` is true and none of them fall in those ranges.
     pub(super) async fn matching_ranges_with_exactness(
         &self,
         predicate: &Predicate,
-    ) -> Result<Option<(Vec<RowRange>, bool)>> {
+    ) -> Result<Option<(Vec<RowRange>, bool, Vec<RowRange>)>> {
         let Some(result) = self.evaluate(predicate).await? else {
             return Ok(None);
         };
         let exact = result.fully_evaluated
             && self.is_exact_predicate(predicate, &result.evaluated_field_ids);
-        Ok(Some((result.row_ranges, exact)))
+        Ok(Some((result.row_ranges, exact, result.candidate_ranges)))
+    }
+
+    /// Coverage of indexes which actually contributed to this evaluation.
+    pub(super) async fn matching_indexed_coverage(
+        &self,
+        predicate: &Predicate,
+    ) -> Result<Option<Vec<RowRange>>> {
+        Ok(self
+            .evaluate(predicate)
+            .await?
+            .map(|result| result.indexed_coverage))
+    }
+
+    /// An exact reusable answer must also cover every row the caller can read.
+    pub(super) async fn matching_exact_ranges(
+        &self,
+        predicate: &Predicate,
+        required_coverage: &[RowRange],
+    ) -> Result<Option<Vec<RowRange>>> {
+        let Some(result) = self.evaluate(predicate).await? else {
+            return Ok(None);
+        };
+        if !result.fully_evaluated
+            || !self.is_exact_predicate(predicate, &result.evaluated_field_ids)
+            || !result.candidate_ranges.is_empty()
+            || !super::source::exclude_row_ranges(required_coverage, &result.indexed_coverage)
+                .is_empty()
+        {
+            return Ok(None);
+        }
+        Ok(Some(result.row_ranges))
     }
 
     fn is_exact_predicate(

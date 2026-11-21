@@ -188,7 +188,8 @@ pub(super) async fn global_search_splits(
                 filter,
                 scalar_mode,
                 &detail_ranges,
-            );
+            )
+            .await?;
             if mode == GlobalIndexSearchMode::Fast {
                 let indexed = merge_row_ranges(
                     grouped

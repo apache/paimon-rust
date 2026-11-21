@@ -45,6 +45,7 @@ pub(super) fn is_sorted_global_index_supported_op(op: PredicateOperator) -> bool
             | PredicateOperator::ArrayContains
             | PredicateOperator::ArraysOverlap
             | PredicateOperator::ArrayContainsAll
+            | PredicateOperator::BBoxIntersects
     )
 }
 
@@ -63,6 +64,12 @@ pub(super) fn entry_supports_predicate(
     literals: &[Datum],
 ) -> bool {
     match entry.index_type {
+        GlobalIndexFileKind::RTree => matches!(
+            op,
+            PredicateOperator::BBoxIntersects
+                | PredicateOperator::IsNull
+                | PredicateOperator::IsNotNull
+        ),
         GlobalIndexFileKind::Multivalue => {
             is_multivalue_predicate(op)
                 && !(matches!(op, PredicateOperator::ArrayContainsAll) && literals.is_empty())
@@ -71,7 +78,9 @@ pub(super) fn entry_supports_predicate(
             matches!(op, PredicateOperator::IsNull | PredicateOperator::IsNotNull)
                 || (op == PredicateOperator::Contains && literals.len() == 1)
         }
-        GlobalIndexFileKind::BTree | GlobalIndexFileKind::Bitmap => !is_multivalue_predicate(op),
+        GlobalIndexFileKind::BTree | GlobalIndexFileKind::Bitmap => {
+            !is_multivalue_predicate(op) && op != PredicateOperator::BBoxIntersects
+        }
     }
 }
 
