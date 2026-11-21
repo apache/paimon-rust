@@ -157,8 +157,8 @@ pub(crate) struct ColumnStatsCollector<'a> {
 
 #[derive(Default, Clone)]
 pub(crate) struct ColumnStats {
-    pub(crate) min: Option<Datum>,
-    pub(crate) max: Option<Datum>,
+    min: Option<Datum>,
+    max: Option<Datum>,
     pub(crate) null_count: i64,
 }
 
@@ -187,6 +187,16 @@ impl ColumnStats {
             }
         }
         Ok(())
+    }
+
+    /// A NaN sorts last in Java, but file readers can use a different float order.
+    /// Neither bound can safely exclude rows in that case. Null counts are independent.
+    pub(crate) fn file_bounds(&self) -> (Option<&Datum>, Option<&Datum>) {
+        match &self.max {
+            Some(Datum::Float(v)) if v.is_nan() => (None, None),
+            Some(Datum::Double(v)) if v.is_nan() => (None, None),
+            _ => (self.min.as_ref(), self.max.as_ref()),
+        }
     }
 
     fn update(&mut self, value: Option<Datum>) {
@@ -229,11 +239,12 @@ impl<'a> ColumnStatsCollector<'a> {
         let mut min_builder = BinaryRowBuilder::new(self.types.len() as i32);
         let mut max_builder = BinaryRowBuilder::new(self.types.len() as i32);
         for (pos, data_type) in self.types.iter().enumerate() {
-            match &self.columns[pos].min {
+            let (min, max) = self.columns[pos].file_bounds();
+            match min {
                 Some(d) => min_builder.write_datum(pos, d, data_type),
                 None => min_builder.set_null_at(pos),
             }
-            match &self.columns[pos].max {
+            match max {
                 Some(d) => max_builder.write_datum(pos, d, data_type),
                 None => max_builder.set_null_at(pos),
             }

@@ -123,7 +123,7 @@ async fn nested_leaf_nulls_do_not_prune_non_null_parent_columns() {
 }
 
 #[tokio::test]
-async fn floating_file_bounds_follow_java_order() {
+async fn floating_file_bounds_preserve_signed_zero_and_omit_nan() {
     use arrow_array::{Float32Array, Float64Array};
     use paimon::spec::{BinaryRow, DoubleType, FloatType};
     for (values, low, high) in [
@@ -215,14 +215,14 @@ async fn floating_file_bounds_follow_java_order() {
         ] {
             let ks = BinaryRow::from_serialized_bytes(key_stats).unwrap();
             let vs = BinaryRow::from_serialized_bytes(value_stats).unwrap();
-            for actual in [
-                ks.get_double(0).unwrap(),
-                vs.get_double(1).unwrap(),
-                f64::from(vs.get_float(2).unwrap()),
-            ] {
-                if expected.is_nan() {
-                    assert!(actual.is_nan());
-                } else {
+            if high.is_nan() {
+                assert!(ks.is_null_at(0) && vs.is_null_at(1) && vs.is_null_at(2));
+            } else {
+                for actual in [
+                    ks.get_double(0).unwrap(),
+                    vs.get_double(1).unwrap(),
+                    f64::from(vs.get_float(2).unwrap()),
+                ] {
                     assert_eq!(actual.to_bits(), expected.to_bits());
                 }
             }
@@ -234,6 +234,76 @@ async fn floating_file_bounds_follow_java_order() {
                 keys.value(row).to_bits()
             );
             assert_eq!(endpoint.get_int(1).unwrap(), ids.value(row));
+        }
+    }
+}
+
+#[tokio::test]
+async fn nan_file_stats_preserve_filtered_rows_and_count_only_nulls() {
+    use arrow_array::Float64Array;
+    use futures::TryStreamExt;
+    use paimon::spec::{BinaryRow, Datum, DoubleType};
+
+    for (values, nulls, outside, negative) in [
+        (vec![Some(f64::NAN)], 0, 1, 0),
+        (vec![Some(-f64::NAN), Some(5.0)], 0, 1, 1),
+        (vec![Some(f64::NAN), None, Some(5.0)], 1, 1, 0),
+        (vec![None, None], 2, 0, 0),
+    ] {
+        let path = "memory:/floating_append_stats";
+        let schema = Schema::builder()
+            .column("v", DataType::Double(DoubleType::new()))
+            .option("metadata.stats-mode", "full")
+            .option("parquet.block.size", "1")
+            .build()
+            .unwrap();
+        let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+        setup_dirs(&io, path).await;
+        persist_table_schema(&io, path, table.schema()).await;
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        let rows = values.len();
+        let batch =
+            RecordBatch::try_from_iter([("v", Arc::new(Float64Array::from(values)) as ArrayRef)])
+                .unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        let stats = &messages[0].new_files[0].value_stats;
+        assert_eq!(stats.null_counts(), &[Some(nulls as i64)]);
+        for bytes in [stats.min_values(), stats.max_values()] {
+            assert!(BinaryRow::from_serialized_bytes(bytes)
+                .unwrap()
+                .is_null_at(0));
+        }
+        builder.new_commit().commit(messages).await.unwrap();
+
+        let pb = PredicateBuilder::new(table.schema().fields());
+        for (predicate, count) in [
+            (pb.is_null("v").unwrap(), nulls),
+            (pb.is_not_null("v").unwrap(), rows - nulls),
+            (
+                pb.not_between("v", Datum::Double(0.0), Datum::Double(10.0))
+                    .unwrap(),
+                outside,
+            ),
+            (pb.less_than("v", Datum::Double(0.0)).unwrap(), negative),
+        ] {
+            let mut read = table.new_read_builder();
+            read.with_filter(predicate.clone());
+            let splits = read.new_scan().plan().await.unwrap();
+            let batches: Vec<_> = read
+                .new_read()
+                .unwrap()
+                .to_arrow(splits.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                count,
+                "{predicate}"
+            );
         }
     }
 }

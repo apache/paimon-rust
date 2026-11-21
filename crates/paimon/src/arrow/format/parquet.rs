@@ -418,10 +418,12 @@ impl ParquetFormatWriter {
         let mut floating_stats = HashMap::new();
         if let (Some(fields), Some(modes)) = (stats_fields, &stats_modes) {
             for (pos, (field, mode)) in fields.iter().zip(modes).enumerate() {
-                if !matches!(
-                    mode,
-                    MetadataStatsMode::Full | MetadataStatsMode::Truncate(_)
-                ) {
+                if !matches!(field.data_type(), DataType::Float(_) | DataType::Double(_))
+                    || !matches!(
+                        mode,
+                        MetadataStatsMode::Full | MetadataStatsMode::Truncate(_)
+                    )
+                {
                     continue;
                 }
                 let Ok(index) = input_schema.index_of(field.name()) else {
@@ -2319,7 +2321,8 @@ fn extract_value_stats(
             .copied()
             .unwrap_or(MetadataStatsMode::None);
         let column_stats = if let Some((_, stats)) = floating_stats.get(&field_idx) {
-            Some((stats.min.clone(), stats.max.clone(), Some(stats.null_count)))
+            let (min, max) = stats.file_bounds();
+            Some((min.cloned(), max.cloned(), Some(stats.null_count)))
         } else if mode == MetadataStatsMode::None {
             None
         } else {
@@ -4309,23 +4312,23 @@ mod tests {
             vec![Some(-f64::NAN), None],
             vec![Some(0.0), Some(-0.0)],
         ] {
-            let col: arrow_array::ArrayRef = Arc::new(Float64Array::from(values));
+            let columns: Vec<arrow_array::ArrayRef> = vec![
+                Arc::new(Float64Array::from(vec![7.0; values.len()])),
+                Arc::new(Float64Array::from(values)),
+                Arc::new(Float64Array::new_null(2)),
+            ];
             writer
-                .write(
-                    &RecordBatch::try_new(schema.clone(), vec![col.clone(), col.clone(), col])
-                        .unwrap(),
-                )
+                .write(&RecordBatch::try_new(schema.clone(), columns).unwrap())
                 .await
                 .unwrap();
             writer.flush().await.unwrap();
         }
         let result = Box::new(writer).close().await.unwrap().value_stats.unwrap();
         assert_eq!(result.columns.unwrap(), ["bounded", "counted"]);
-        assert_eq!(result.stats.null_counts(), &[Some(3), Some(3)]);
+        assert_eq!(result.stats.null_counts(), &[Some(3), Some(6)]);
         let lo = BinaryRow::from_serialized_bytes(result.stats.min_values()).unwrap();
         let hi = BinaryRow::from_serialized_bytes(result.stats.max_values()).unwrap();
-        assert_eq!(lo.get_double(0).unwrap().to_bits(), (-0.0f64).to_bits());
-        assert!(hi.get_double(0).unwrap().is_nan());
+        assert!(lo.is_null_at(0) && hi.is_null_at(0));
         assert!(lo.is_null_at(1) && hi.is_null_at(1));
     }
 
