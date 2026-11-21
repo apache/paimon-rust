@@ -254,7 +254,7 @@ async fn nan_file_stats_preserve_filtered_rows_and_count_only_nulls() {
         let schema = Schema::builder()
             .column("v", DataType::Double(DoubleType::new()))
             .option("metadata.stats-mode", "full")
-            .option("parquet.block.size", "1")
+            // Keep NaN and the finite value in the same row group.
             .build()
             .unwrap();
         let (io, table) = memory_table(path, TableSchema::new(0, &schema));
@@ -287,6 +287,10 @@ async fn nan_file_stats_preserve_filtered_rows_and_count_only_nulls() {
                 outside,
             ),
             (pb.less_than("v", Datum::Double(0.0)).unwrap(), negative),
+            (
+                pb.greater_than("v", Datum::Double(5.0)).unwrap(),
+                outside - negative,
+            ),
         ] {
             let mut read = table.new_read_builder();
             read.with_filter(predicate.clone());
