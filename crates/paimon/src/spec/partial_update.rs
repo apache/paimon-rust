@@ -38,6 +38,7 @@ const LIST_AGG_DELIMITER_SUFFIX: &str = ".list-agg-delimiter";
 const IGNORE_RETRACT_SUFFIX: &str = ".ignore-retract";
 const DISTINCT_SUFFIX: &str = ".distinct";
 const NESTED_KEY_SUFFIX: &str = ".nested-key";
+const NESTED_SEQUENCE_OVERWRITE_ON_EQUAL_SUFFIX: &str = ".nested-sequence-overwrite-on-equal";
 const COUNT_LIMIT_SUFFIX: &str = ".count-limit";
 
 /// Partial-update mode recognized by the current Rust implementation.
@@ -508,6 +509,12 @@ impl<'a> PartialUpdateConfig<'a> {
                     ),
                 });
             }
+            reject_unsafe_nested_update_overwrite_on_equal(
+                field_name,
+                function,
+                &protected_fields,
+                self.options,
+            )?;
             functions.insert(field_name.to_string(), function.to_string());
         }
         Ok(functions)
@@ -559,6 +566,45 @@ impl<'a> PartialUpdateConfig<'a> {
         keys.sort();
         keys
     }
+}
+
+/// Reject nested_update equal-sequence retention under sequence-group gating.
+///
+/// Partial-update sequence groups call reverse aggregation for stale versions.
+/// Combined with `nested-sequence-overwrite-on-equal=false`, equal nested
+/// sequences then keep whichever side was loaded first into the aggregator, so
+/// the result can change with flush/commit grouping. Refuse the combination
+/// instead of silently accepting grouping-dependent results.
+fn reject_unsafe_nested_update_overwrite_on_equal(
+    field_name: &str,
+    function: &str,
+    protected_fields: &HashSet<&str>,
+    options: &HashMap<String, String>,
+) -> crate::Result<()> {
+    if function != "nested_update" || !protected_fields.contains(field_name) {
+        return Ok(());
+    }
+    let option_key =
+        format!("{FIELDS_PREFIX}{field_name}{NESTED_SEQUENCE_OVERWRITE_ON_EQUAL_SUFFIX}");
+    let overwrite_on_equal = match options.get(&option_key).map(String::as_str) {
+        None => true,
+        Some(value) if value.eq_ignore_ascii_case("true") => true,
+        Some(value) if value.eq_ignore_ascii_case("false") => false,
+        // Invalid values are rejected when the nested aggregator is constructed.
+        Some(_) => true,
+    };
+    if overwrite_on_equal {
+        return Ok(());
+    }
+    Err(crate::Error::ConfigInvalid {
+        message: format!(
+            "Option 'fields.{field_name}.nested-sequence-overwrite-on-equal=false' is not \
+             supported for nested_update fields that participate in a \
+             partial-update sequence-group, because equal-sequence \
+             retention can depend on flush/commit grouping via \
+             sequence-group reverse aggregation."
+        ),
+    })
 }
 
 fn is_unsupported_partial_update_option(key: &str) -> bool {
@@ -1341,6 +1387,87 @@ mod tests {
                 if message.contains("sume")
                     && message.contains(FIELDS_DEFAULT_AGG_FUNCTION_OPTION)),
             "expected unknown default aggregate function error, got {err:?}"
+        );
+    }
+
+    fn nested_items_fields() -> Vec<DataField> {
+        use crate::spec::{ArrayType, RowType};
+        vec![
+            DataField::new(0, "pk".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "version".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                2,
+                "items".to_string(),
+                DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                    DataField::new(3, "item_id".into(), DataType::Int(IntType::new())),
+                    DataField::new(4, "amount".into(), DataType::Int(IntType::new())),
+                ])))),
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_rejects_nested_update_overwrite_on_equal_false_with_sequence_group() {
+        let options = partial_update_options(&[
+            ("fields.version.sequence-group", "items"),
+            ("fields.items.aggregate-function", "nested_update"),
+            ("fields.items.nested-key", "item_id"),
+            ("fields.items.nested-sequence-field", "item_id"),
+            ("fields.items.nested-sequence-overwrite-on-equal", "false"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+        let err = config
+            .validated_aggregate_functions(&nested_items_fields(), &["pk".to_string()])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("nested-sequence-overwrite-on-equal=false")
+                    && message.contains("sequence-group")),
+            "expected unsafe nested_update overwrite rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_accepts_nested_update_overwrite_on_equal_true_with_sequence_group() {
+        for overwrite in [None, Some("true")] {
+            let mut extra = vec![
+                ("fields.version.sequence-group", "items"),
+                ("fields.items.aggregate-function", "nested_update"),
+                ("fields.items.nested-key", "item_id"),
+                ("fields.items.nested-sequence-field", "item_id"),
+            ];
+            if let Some(value) = overwrite {
+                extra.push(("fields.items.nested-sequence-overwrite-on-equal", value));
+            }
+            let options = partial_update_options(&extra);
+            let config = PartialUpdateConfig::new(&options);
+            let functions = config
+                .validated_aggregate_functions(&nested_items_fields(), &["pk".to_string()])
+                .unwrap();
+            assert_eq!(
+                functions.get("items").map(String::as_str),
+                Some("nested_update"),
+                "overwrite={overwrite:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nested_partial_update_not_rejected_for_overwrite_on_equal_false() {
+        let options = partial_update_options(&[
+            ("fields.version.sequence-group", "items"),
+            ("fields.items.aggregate-function", "nested_partial_update"),
+            ("fields.items.nested-key", "item_id"),
+            ("fields.items.nested-sequence-field", "item_id"),
+            ("fields.items.nested-sequence-overwrite-on-equal", "false"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+        let functions = config
+            .validated_aggregate_functions(&nested_items_fields(), &["pk".to_string()])
+            .unwrap();
+        assert_eq!(
+            functions.get("items").map(String::as_str),
+            Some("nested_partial_update")
         );
     }
 }
