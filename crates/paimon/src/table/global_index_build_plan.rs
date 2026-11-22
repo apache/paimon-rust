@@ -25,7 +25,7 @@ use super::global_index_build_common::vector::VectorIndexShard;
 use super::vindex_index_build_builder::timing::VectorIndexBuildTiming;
 use super::vindex_index_build_builder::VindexIndexBuildBuilder;
 use super::{CommitMessage, RowRange, Table};
-use crate::spec::{Snapshot, TableSchema};
+use crate::spec::{IndexManifestEntry, Snapshot, TableSchema};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +46,8 @@ struct BuildContext {
 pub struct GlobalIndexBuildPlan {
     context: BuildContext,
     shards: Vec<VectorIndexShard>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    replacements: Vec<IndexManifestEntry>,
 }
 
 impl GlobalIndexBuildPlan {
@@ -69,7 +71,33 @@ impl GlobalIndexBuildPlan {
                 options,
             },
             shards,
+            replacements: Vec::new(),
         }
+    }
+
+    pub(super) fn with_replacements(mut self, replacements: Vec<IndexManifestEntry>) -> Self {
+        self.replacements = replacements;
+        self
+    }
+
+    /// Index removals to publish in the same guarded commit as every built shard.
+    /// A centroid build replaces the previous generation in the selected partitions.
+    pub fn replacement_messages(&self) -> Vec<CommitMessage> {
+        let mut by_partition_bucket = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for entry in &self.replacements {
+            by_partition_bucket
+                .entry((&entry.partition, entry.bucket))
+                .or_default()
+                .push(entry.index_file.clone());
+        }
+        by_partition_bucket
+            .into_iter()
+            .map(|((partition, bucket), files)| {
+                let mut message = CommitMessage::new(partition.clone(), bucket, vec![]);
+                message.deleted_index_files = files;
+                message
+            })
+            .collect()
     }
 
     pub fn snapshot_id(&self) -> Option<i64> {

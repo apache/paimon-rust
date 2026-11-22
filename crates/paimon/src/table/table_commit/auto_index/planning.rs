@@ -134,6 +134,35 @@ async fn plan_impl(
     )?;
     let field_id = fields[0].id();
     let vector_semantics = if crate::vindex::is_vindex_index_type(&definition.index_type) {
+        let routed =
+            crate::table::vindex_index_build_builder::centroid::CentroidBuildOptions::resolve(
+                table.schema().options(),
+                &definition.options,
+                &HashMap::new(),
+                &definition.index_type,
+                &definition.column,
+            )?
+            .is_some()
+                || indexes.iter().any(|entry| {
+                    entry.kind == FileKind::Add
+                        && entry
+                            .index_file
+                            .global_index_meta
+                            .as_ref()
+                            .is_some_and(|meta| meta.index_field_id == field_id)
+                        && crate::table::centroid_index::Descriptor::is_wrapped(&entry.index_file)
+                });
+        // Range maintenance must not retire siblings or replace a routed
+        // generation with a partial rebuild over the pending input files.
+        if routed {
+            return Ok(MaintenancePlan {
+                replaced: HashSet::new(),
+                deletions: vec![],
+                needs_build: false,
+                build_ranges: HashMap::new(),
+                training_groups: vec![],
+            });
+        }
         let options = crate::vindex::VindexVectorIndexOptions::new(
             table.schema().options(),
             &definition.options,
