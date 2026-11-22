@@ -319,7 +319,7 @@ fn test_raw_vector_score_matches_java_metric_semantics() {
 #[test]
 fn test_raw_vector_score_matrix_matches_scalar_metrics() {
     let stored = vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0];
-    let queries = vec![1.0, 1.0, -1.0, 2.0, 0.0, 0.0];
+    let queries = [[1.0, 1.0], [-1.0, 2.0], [0.0, 0.0]];
     let query_indices = vec![0, 1, 2];
 
     for metric in [
@@ -330,16 +330,16 @@ fn test_raw_vector_score_matrix_matches_scalar_metrics() {
         let matrix_scores = compute_raw_vector_score_matrix(
             &stored,
             3,
-            &queries,
+            queries.as_flattened(),
             3,
             2,
-            &RawVectorNorms::new(queries.chunks_exact(2), metric),
+            &RawVectorNorms::new(queries.iter().map(<[_; 2]>::as_slice), metric),
             &query_indices,
             metric,
         )
         .unwrap();
         for (row_index, stored_vector) in stored.as_chunks::<2>().0.iter().enumerate() {
-            for (query_index, query) in queries.as_chunks::<2>().0.iter().enumerate() {
+            for (query_index, query) in queries.iter().enumerate() {
                 let expected = compute_raw_vector_score(query, stored_vector, metric);
                 let actual = matrix_scores[query_index * 3 + row_index];
                 assert!(
@@ -417,7 +417,7 @@ fn test_raw_vector_cosine_avoids_squared_norm_product_overflow() {
         &queries,
         4,
         2,
-        &RawVectorNorms::new(queries.chunks_exact(2), RawVectorMetric::Cosine),
+        &RawVectorNorms::new([query.as_slice(); 4].into_iter(), RawVectorMetric::Cosine),
         &[0, 1, 2, 3],
         RawVectorMetric::Cosine,
     )
