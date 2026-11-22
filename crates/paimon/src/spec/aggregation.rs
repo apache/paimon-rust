@@ -238,10 +238,11 @@ impl<'a> AggregationConfig<'a> {
                 });
             }
             if canonical_aggregator_name(default) == "merge_map_with_keytime" {
-                let sequence_fields: std::collections::HashSet<&str> =
+                let sequence_fields: std::collections::HashSet<String> =
                     CoreOptions::new(self.options)
                         .sequence_fields()
                         .into_iter()
+                        .map(str::to_string)
                         .collect();
                 for field in fields {
                     let name = field.name();
