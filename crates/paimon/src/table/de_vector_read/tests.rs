@@ -31,7 +31,7 @@ use crate::table::{find_field_id_by_name, RowRange};
 use crate::vector_search::{ScoredRowIds, VectorSearch};
 use crate::vindex::pkvector::metric::VectorSearchMetric;
 use crate::vindex::IVF_FLAT_IDENTIFIER;
-use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
 use arrow_array::{Array, ArrayRef, Float32Array, Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
@@ -756,6 +756,80 @@ fn assert_raw_cosine_top_one(
             );
             assert_eq!(result.scores, vec![expected_score]);
         }
+    }
+}
+
+fn score_single_embedding_lists(
+    rows: &[[f32; 3]],
+    queries: &[[f32; 3]],
+    mode: ListScoring,
+) -> Vec<ScoredRowIds> {
+    let mut builder = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), 3));
+    for row in rows {
+        builder.values().values().append_slice(row);
+        builder.values().append(true);
+        builder.append(true);
+    }
+    let vectors = builder.finish();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("embedding", vectors.data_type().clone(), false),
+        ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, false),
+    ]));
+    let row_ids = Int64Array::from_iter_values(10..10 + rows.len() as i64);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(vectors), Arc::new(row_ids)]).unwrap();
+    let searches = queries
+        .iter()
+        .map(|query| VectorSearch::new(query.to_vec(), 1, "embedding".to_string()).unwrap())
+        .collect::<Vec<_>>();
+    let scoring = RawBatchScoring::new(&searches, RawVectorMetric::Cosine, Some(mode)).unwrap();
+    let mut top_k = (0..mode.result_count(queries.len()))
+        .map(|_| RawScoreTopK::new(1))
+        .collect::<Vec<_>>();
+    scoring
+        .collect(&batch, &searches, RawVectorMetric::Cosine, &mut top_k)
+        .unwrap();
+    top_k
+        .into_iter()
+        .map(RawScoreTopK::into_search_result)
+        .collect()
+}
+
+#[test]
+fn test_list_cosine_top_k_matches_single_vectors_after_dot_cancellation() {
+    let tiny = 2.0_f32.powi(-27);
+    let query = [1.0, tiny, 1.0];
+    let rows = [[1.0, 0.0, -1.0], [1.0, tiny, -1.0]];
+    let expected_score = 2.0_f32.powi(-55);
+    assert_raw_cosine_top_one(&query, &[&rows[0], &rows[1]], 11, expected_score);
+
+    for (mode, count) in [
+        (ListScoring::Independent, 1),
+        (ListScoring::Independent, RAW_SCORE_MATRIX_MIN_QUERY_COUNT),
+        (ListScoring::MaxSim, 1),
+    ] {
+        let results = score_single_embedding_lists(&rows, &vec![query; count], mode);
+        assert_eq!(results.len(), count);
+        for result in results {
+            assert_eq!(result.row_ids, [11]);
+            assert_eq!(result.scores, [expected_score]);
+        }
+    }
+}
+
+#[test]
+fn test_list_cosine_top_k_max_sim_preserves_small_terms_between_opposite_scores() {
+    let tiny = 2.0_f32.powi(-27);
+    let rows = [[1.0, 0.0, -1.0], [1.0, tiny, -1.0]];
+    let positive = [1.0, 0.0, -1.0];
+    let negative = [-1.0, 0.0, 1.0];
+    let orthogonal = [1.0, tiny, 1.0];
+    for queries in [
+        [positive, orthogonal, negative],
+        [negative, orthogonal, positive],
+    ] {
+        let results = score_single_embedding_lists(&rows, &queries, ListScoring::MaxSim);
+        assert_eq!(results[0].row_ids, [11]);
+        assert_eq!(results[0].scores, [2.0_f32.powi(-55)]);
     }
 }
 

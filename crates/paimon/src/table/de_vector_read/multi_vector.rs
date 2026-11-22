@@ -16,8 +16,12 @@
 // under the License.
 
 use super::{RawScoreTopK, VectorSearch};
+use crate::common::number::{accumulate_f64_partials, round_f64_partials};
 use crate::spec::ROW_ID_FIELD_NAME;
-use crate::vindex::multi_vector::{cosine, invalid, norm, validate_queries, MultiVectorArray};
+use crate::vindex::multi_vector::{invalid, validate_queries, MultiVectorArray};
+use crate::vindex::pkvector::metric::{
+    cosine_norm, cosine_similarity_f64, cosine_similarity_with_norms,
+};
 use crate::Result;
 use arrow_array::{Array, Int64Array, RecordBatch};
 use serde::{Deserialize, Serialize};
@@ -51,7 +55,7 @@ impl ListScorer {
         validate_queries(&queries, None)?;
         Ok(Self {
             mode,
-            query_norms: queries.into_iter().map(norm).collect(),
+            query_norms: queries.into_iter().map(cosine_norm).collect(),
         })
     }
 
@@ -74,6 +78,8 @@ impl ListScorer {
             .ok_or_else(|| invalid("MultiVector scoring requires non-null Int64 _ROW_ID"))?;
         let mut selected = Vec::with_capacity(searches.len());
         let mut maxima = vec![f64::NEG_INFINITY; searches.len()];
+        let mut partials = Vec::new();
+        let aggregate_queries = matches!(self.mode, ListScoring::MaxSim) && searches.len() > 1;
         let shared_filter = searches[0].effective_include_row_ids();
         for (row, &id) in row_ids.values().iter().enumerate() {
             let id = u64::try_from(id).map_err(|_| invalid("Negative MultiVector row ID"))?;
@@ -102,19 +108,40 @@ impl ListScorer {
             for embedding in column.row(row, dimension) {
                 let embedding = embedding?;
                 found = true;
-                let vector_norm = norm(embedding);
+                let vector_norm = cosine_norm(embedding);
                 for &i in &selected {
-                    maxima[i] = maxima[i].max(cosine(
-                        &searches[i].vector,
-                        self.query_norms[i],
-                        embedding,
-                        vector_norm,
-                    ));
+                    let query = &searches[i].vector;
+                    let query_norm = self.query_norms[i];
+                    let similarity = if aggregate_queries {
+                        cosine_similarity_f64(
+                            query,
+                            embedding,
+                            query_norm * vector_norm,
+                            &mut partials,
+                        )
+                    } else {
+                        f64::from(cosine_similarity_with_norms(
+                            query,
+                            query_norm,
+                            embedding,
+                            vector_norm,
+                            &mut partials,
+                        ))
+                    };
+                    maxima[i] = maxima[i].max(similarity);
                 }
             }
             if found {
                 match self.mode {
-                    ListScoring::MaxSim => top_k[0].offer(id, maxima.iter().sum::<f64>() as f32),
+                    ListScoring::MaxSim => {
+                        let score = if aggregate_queries {
+                            accumulate_f64_partials(maxima.iter().copied(), &mut partials);
+                            round_f64_partials(&partials)
+                        } else {
+                            maxima[0]
+                        };
+                        top_k[0].offer(id, score as f32);
+                    }
                     ListScoring::Independent => {
                         for &i in &selected {
                             top_k[i].offer(id, maxima[i] as f32);

@@ -4948,6 +4948,7 @@ dependencies = [
  "matrixmultiply",
  "md-5 0.10.6",
  "num-bigint 0.4.8",
+ "num-rational",
  "num-traits",
  "opendal-core",
  "opendal-http-transport-reqwest",

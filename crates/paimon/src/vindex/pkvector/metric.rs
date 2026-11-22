@@ -21,6 +21,7 @@ use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{FromPrimitive, ToPrimitive};
 
 use super::data_invalid;
+use crate::common::number::{accumulate_f64_partials, round_f64_partials};
 
 /// Order two distances the way Java `Float.compare` does: every NaN sorts after
 /// all numeric values (so a NaN distance is always ranked worst, never best),
@@ -146,9 +147,14 @@ impl PreparedVectorQuery<'_> {
     pub(crate) fn compute_distance(&self, stored: &[f32]) -> f32 {
         match self.metric {
             VectorSearchMetric::L2 => squared_l2(self.query, stored),
-            VectorSearchMetric::Cosine => {
-                cosine_score(self.query, self.cosine_norm, stored, CosineOutput::Distance)
-            }
+            VectorSearchMetric::Cosine => cosine_score(
+                self.query,
+                self.cosine_norm,
+                stored,
+                None,
+                CosineOutput::Distance,
+                &mut Vec::new(),
+            ),
             VectorSearchMetric::InnerProduct => -inner_product(self.query, stored),
         }
     }
@@ -175,11 +181,57 @@ pub(crate) fn cosine_norm<T: Copy + Into<f64>>(vector: &[T]) -> f64 {
 }
 
 pub(crate) fn cosine_similarity(query: &[f32], query_norm: f64, stored: &[f32]) -> f32 {
-    cosine_score(query, query_norm, stored, CosineOutput::Similarity)
+    cosine_score(
+        query,
+        query_norm,
+        stored,
+        None,
+        CosineOutput::Similarity,
+        &mut Vec::new(),
+    )
+}
+
+pub(crate) fn cosine_similarity_with_norms(
+    query: &[f32],
+    query_norm: f64,
+    stored: &[f32],
+    stored_norm: f64,
+    partials: &mut Vec<f64>,
+) -> f32 {
+    cosine_score(
+        query,
+        query_norm,
+        stored,
+        Some(stored_norm),
+        CosineOutput::Similarity,
+        partials,
+    )
+}
+
+/// Similarity for aggregation across queries, with the dot accumulated before
+/// normalization and rounding deferred to the final score.
+pub(crate) fn cosine_similarity_f64(
+    query: &[f32],
+    stored: &[f32],
+    norm_product: f64,
+    partials: &mut Vec<f64>,
+) -> f64 {
+    if norm_product == 0.0 {
+        return 0.0;
+    }
+    accumulate_dot_partials(query, stored, partials);
+    (round_f64_partials(partials) / norm_product).clamp(-1.0, 1.0)
 }
 
 #[inline]
-fn cosine_score(query: &[f32], query_norm: f64, stored: &[f32], output: CosineOutput) -> f32 {
+fn cosine_score(
+    query: &[f32],
+    query_norm: f64,
+    stored: &[f32],
+    stored_norm: Option<f64>,
+    output: CosineOutput,
+    partials: &mut Vec<f64>,
+) -> f32 {
     let mut dot = 0.0_f64;
     let mut absolute_dot = 0.0_f64;
     let mut stored_squared_norm = 0.0_f64;
@@ -191,9 +243,11 @@ fn cosine_score(query: &[f32], query_norm: f64, stored: &[f32], output: CosineOu
         if matches!(output, CosineOutput::Similarity) {
             absolute_dot += product.abs();
         }
-        stored_squared_norm += s * s;
+        if stored_norm.is_none() {
+            stored_squared_norm += s * s;
+        }
     }
-    let stored_norm = stored_squared_norm.sqrt();
+    let stored_norm = stored_norm.unwrap_or_else(|| stored_squared_norm.sqrt());
     let norm_product = query_norm * stored_norm;
     let absolute_dot_bound = match output {
         CosineOutput::Similarity => absolute_dot,
@@ -217,7 +271,7 @@ fn cosine_score(query: &[f32], query_norm: f64, stored: &[f32], output: CosineOu
             return bounds.0;
         }
     }
-    output.round_exact(dot, norm_product, query, stored, bounds, &mut Vec::new())
+    output.round_exact(dot, norm_product, query, stored, bounds, partials)
 }
 
 fn positively_proportional(query: &[f32], stored: &[f32]) -> bool {
@@ -438,30 +492,20 @@ impl CosineOutput {
 /// nonzero f32. Keep the floating-point residuals until conversion so the loop
 /// over coordinates does not need arbitrary-precision arithmetic.
 fn exact_dot<T: Copy + Into<f64>>(query: &[T], stored: &[T], partials: &mut Vec<f64>) -> BigInt {
-    partials.clear();
-    for (&query, &stored) in query.iter().zip(stored) {
-        let mut term = query.into() * stored.into();
-        let mut kept = 0;
-        for i in 0..partials.len() {
-            let mut part = partials[i];
-            if term.abs() < part.abs() {
-                std::mem::swap(&mut term, &mut part);
-            }
-            // With |term| >= |part|, FastTwoSum gives an exact residual.
-            let sum = term + part;
-            let residual = part - (sum - term);
-            if residual != 0.0 {
-                partials[kept] = residual;
-                kept += 1;
-            }
-            term = sum;
-        }
-        partials.truncate(kept);
-        if term != 0.0 {
-            partials.push(term);
-        }
-    }
+    accumulate_dot_partials(query, stored, partials);
     partials.iter().copied().map(scale_f32_product).sum()
+}
+
+fn accumulate_dot_partials<T: Copy + Into<f64>>(
+    query: &[T],
+    stored: &[T],
+    partials: &mut Vec<f64>,
+) {
+    let products = query
+        .iter()
+        .zip(stored)
+        .map(|(&query, &stored)| query.into() * stored.into());
+    accumulate_f64_partials(products, partials);
 }
 
 fn scale_f32_product(value: f64) -> BigInt {

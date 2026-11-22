@@ -2058,6 +2058,100 @@ mod pk_hybrid_tests {
     }
 
     #[tokio::test]
+    async fn pk_hybrid_weighted_cosine_breaks_equal_totals_by_position_in_either_route_order() {
+        let a = [1.0, 0.0, 0.0, 0.0];
+        let b = [0.0, 1.0, 0.0, 0.0];
+        let middle = [1.0, 1.0, 0.0, 0.0];
+        let table = build_hybrid_table(
+            "memory:/pk_hybrid_weighted_cosine_route_order",
+            &[0, 1, 2],
+            &[a, b, [-1.0, -1.0, 15.0, 0.0]],
+            &["alpha", "beta", "gamma"],
+            &[("fields.embedding.pk-vector.distance.metric", "cosine")],
+        )
+        .await;
+
+        let mut scores = Vec::new();
+        for queries in [[a, middle, b], [b, middle, a]] {
+            let mut builder = table.new_hybrid_search_builder();
+            for query in queries {
+                builder
+                    .add_vector_route(
+                        VECTOR_COLUMN,
+                        query.to_vec(),
+                        3,
+                        1.0,
+                        HashMap::from([("fields.embedding.ivf.refine-factor".into(), "2".into())]),
+                    )
+                    .unwrap();
+            }
+            builder.with_limit(1).with_weighted_score_ranker();
+            let batches = builder
+                .execute_read()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(column_i32(&batches, "id"), [0], "queries={queries:?}");
+            scores.push(column_f32(&batches, SEARCH_SCORE_COLUMN));
+        }
+        assert_eq!(scores[0], scores[1]);
+    }
+
+    #[tokio::test]
+    async fn pk_hybrid_weighted_cosine_preserves_tiny_distance_with_a_full_text_route() {
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let table = build_hybrid_table(
+            "memory:/pk_hybrid_weighted_cosine_tiny_distance",
+            &[0, 1, 2],
+            &[
+                [1.0, 2.0_f32.powi(-30), 0.0, 0.0],
+                query,
+                [0.0, 1.0, 0.0, 0.0],
+            ],
+            &["nearby", "exact", "orthogonal"],
+            &[("fields.embedding.pk-vector.distance.metric", "cosine")],
+        )
+        .await;
+        let mut builder = table.new_hybrid_search_builder();
+        builder
+            .add_vector_route(
+                VECTOR_COLUMN,
+                query.to_vec(),
+                3,
+                1.0,
+                HashMap::from([("fields.embedding.ivf.refine-factor".into(), "2".into())]),
+            )
+            .unwrap()
+            .with_limit(1)
+            .with_weighted_score_ranker();
+
+        for include_text in [false, true] {
+            if include_text {
+                builder
+                    .add_full_text_route(
+                        TEXT_COLUMN,
+                        r#"{"match":{"query":"orthogonal"}}"#,
+                        1,
+                        0.5,
+                        HashMap::new(),
+                    )
+                    .unwrap();
+            }
+            let batches = builder
+                .execute_read()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(column_i32(&batches, "id"), [1], "full text={include_text}");
+            assert_eq!(column_f32(&batches, SEARCH_SCORE_COLUMN), [1.0]);
+        }
+    }
+
+    #[tokio::test]
     async fn pk_hybrid_weighted_score_uses_vector_scores_and_reads_in_fused_order() {
         let table = build_hybrid_table(
             "memory:/pk_hybrid_weighted_vector",

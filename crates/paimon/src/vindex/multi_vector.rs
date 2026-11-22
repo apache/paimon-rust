@@ -17,6 +17,7 @@
 
 //! Shared schema, Arrow and cosine semantics for embedding-list columns.
 
+use super::pkvector::metric::cosine_norm;
 use crate::spec::DataType;
 use crate::{Error, Result};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, ListArray};
@@ -51,31 +52,13 @@ pub(crate) fn validate_queries(queries: &[&[f32]], width: Option<usize>) -> Resu
 }
 
 pub(crate) fn normalize_into(vector: &[f32], output: &mut Vec<f32>) {
-    let norm = norm(vector);
+    let norm = cosine_norm(vector);
     let scale = if norm == 0.0 { 1.0 } else { 1.0 / norm };
     output.extend(
         vector
             .iter()
             .map(|value| (f64::from(*value) * scale) as f32),
     );
-}
-
-pub(crate) fn norm(vector: &[f32]) -> f64 {
-    vector
-        .iter()
-        .map(|&value| f64::from(value) * f64::from(value))
-        .sum::<f64>()
-        .sqrt()
-}
-
-pub(crate) fn cosine(query: &[f32], query_norm: f64, vector: &[f32], vector_norm: f64) -> f64 {
-    let denominator = query_norm * vector_norm;
-    if denominator == 0.0 {
-        return 0.0;
-    }
-    vector.iter().zip(query).fold(0.0, |sum, (&left, &right)| {
-        sum + f64::from(left) * f64::from(right)
-    }) / denominator
 }
 
 enum Embeddings<'a> {
