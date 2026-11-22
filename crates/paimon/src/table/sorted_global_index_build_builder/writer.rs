@@ -19,9 +19,11 @@
 use super::extraction::build_read_splits_for_shard;
 use super::planning::SortedGlobalIndexShard;
 use super::{ShardWriteOptions, SortedGlobalIndexBuildBuilder};
-use crate::spec::{DataField, GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME};
+use crate::spec::{
+    DataEvolutionIndexSourceMeta, DataField, GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME,
+};
 use crate::table::index_build::{scalar, IndexFileWriter};
-use crate::table::index_file_path::IndexFileLocation;
+use crate::table::index_file_path::{new_global_index_file_name, IndexFileLocation};
 use crate::table::RowRange;
 use crate::Result;
 
@@ -46,7 +48,11 @@ impl SortedGlobalIndexBuildBuilder<'_> {
             extra_field_ids: (fields.len() > 1)
                 .then(|| fields.iter().skip(1).map(|f| f.id()).collect()),
             source_meta: Some(
-                crate::spec::DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize(),
+                DataEvolutionIndexSourceMeta::new_with_schema_id(
+                    shard.snapshot_id,
+                    self.table.schema().id(),
+                )?
+                .serialize(),
             ),
             index_meta: None,
         };
@@ -63,7 +69,7 @@ impl SortedGlobalIndexBuildBuilder<'_> {
         IndexFileWriter::new(
             self.table,
             kind,
-            crate::table::global_index_schema::index_file_name(kind, self.table.schema().id()),
+            new_global_index_file_name(kind),
             IndexFileLocation::Global {
                 table_path: self.table.location().trim_end_matches('/'),
             },

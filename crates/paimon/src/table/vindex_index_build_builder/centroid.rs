@@ -429,7 +429,13 @@ impl VindexIndexBuildBuilder<'_> {
             row_range_end: shard.row_range_end,
             index_field_id: field_id,
             extra_field_ids: (!extra_fields.is_empty()).then(|| extra_fields.to_vec()),
-            source_meta: Some(DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize()),
+            source_meta: Some(
+                DataEvolutionIndexSourceMeta::new_with_schema_id(
+                    shard.snapshot_id,
+                    self.table.schema().id(),
+                )?
+                .serialize(),
+            ),
             index_meta: None,
         };
         IndexFileWriter::new(

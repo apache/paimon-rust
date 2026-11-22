@@ -23,6 +23,7 @@ use super::*;
 use crate::table::global_index_build_common::{
     resolve_index_fields, GlobalIndexBuildView, IndexColumns,
 };
+use crate::table::global_index_schema::GlobalIndexSchema;
 use crate::table::index_build::full_text::{full_text_config, native_full_text_options};
 use crate::table::source::exclude_row_ranges;
 use crate::table::universal_compaction::{Run, UniversalCompaction};
@@ -232,21 +233,12 @@ async fn plan_impl(
         .collect::<Vec<_>>();
     let mut current: HashMap<UnitKey, Vec<&IndexManifestEntry>> = HashMap::new();
     let mut replaced = HashSet::new();
-    let mut index_schema = matches!(
-        definition.index_type.as_str(),
-        "btree" | "bitmap" | "multivalue" | "fm" | "rtree" | "full-text"
-    )
-    .then(|| crate::table::global_index_schema::GlobalIndexSchema::new(table, fields[0]));
+    let mut index_schema = GlobalIndexSchema::new(table);
     for entry in selected.iter().copied() {
         let meta = entry.index_file.global_index_meta.as_ref().unwrap();
-        if let Some(proof) = &mut index_schema {
-            if !proof
-                .compatible(&entry.index_file.file_name, &definition.index_type)
-                .await
-            {
-                replaced.insert(index_file_key(entry));
-                continue;
-            }
+        if !index_schema.compatible(&entry.index_file).await {
+            replaced.insert(index_file_key(entry));
+            continue;
         }
         if let Some(expected) = &full_text_definition {
             // Analyzer options change matching semantics. Independent leaves

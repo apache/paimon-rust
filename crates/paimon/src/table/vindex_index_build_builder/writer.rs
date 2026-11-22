@@ -252,7 +252,11 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             index_field_id,
             extra_field_ids: None,
             source_meta: Some(
-                crate::spec::DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize(),
+                crate::spec::DataEvolutionIndexSourceMeta::new_with_schema_id(
+                    shard.snapshot_id,
+                    self.table.schema().id(),
+                )?
+                .serialize(),
             ),
             index_meta: None,
         };

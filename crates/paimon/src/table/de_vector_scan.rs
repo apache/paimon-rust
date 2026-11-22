@@ -328,6 +328,9 @@ impl Scan for DeVectorScan {
                 }
                 plan.index_entries = entries;
             }
+            plan.index_entries = super::global_index_schema::GlobalIndexSchema::new(&plan.table)
+                .filter_entries(plan.index_entries)
+                .await;
         }
         if let Some(timing) = &mut plan.timing {
             timing.manifest = manifest_start.map_or(Duration::ZERO, |start| start.elapsed());
