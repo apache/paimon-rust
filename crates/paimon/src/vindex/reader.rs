@@ -1702,7 +1702,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut vectors = Vec::new();
         let mut labels = Vec::new();
-        for (row, centroid) in centroids.chunks_exact(2).enumerate() {
+        for (row, centroid) in centroids.as_chunks::<2>().0.iter().enumerate() {
             for _ in 0..embeddings_per_row {
                 vectors.extend_from_slice(centroid);
                 labels.push(row as i64);
