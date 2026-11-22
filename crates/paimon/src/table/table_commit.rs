@@ -1252,6 +1252,16 @@ impl TableCommit {
                         )
                         .await?
                     {
+                        // A concurrent recovery can publish the same commit
+                        // identifier with its own outputs. Match the attempt
+                        // before marking our private files as published.
+                        if retry_state
+                            .as_deref()
+                            .and_then(|state| state.automatic_delta_manifest.as_deref())
+                            == Some(snapshot.delta_manifest_list())
+                        {
+                            automatic_outputs_published = true;
+                        }
                         if !self.commit_callbacks.is_empty() {
                             let entries = self.read_delta_entries(None, &snapshot).await?;
                             self.notify_commit_callbacks(snapshot.clone(), entries)
@@ -1456,7 +1466,7 @@ impl TableCommit {
             .await;
         // A file-store rejection may be a replay of a successful conditional
         // write. Only a different snapshot can prove that cleanup is safe.
-        // REST mutations are not replayed and return a definite rejection.
+        // For REST, only an explicit false in the commit response is a rejection.
         let publication = match publication {
             Ok(false) if automatic_outputs_published.is_some() && self.table.rest_env.is_none() => {
                 match self
@@ -1533,6 +1543,9 @@ impl TableCommit {
             latest_snapshot: latest_snapshot.clone(),
             base_data_files: resolved.base_data_files.take(),
             publication_error,
+            automatic_delta_manifest: automatic_outputs_published
+                .is_some()
+                .then(|| snapshot.delta_manifest_list().to_owned()),
         })))
     }
 
@@ -4139,6 +4152,7 @@ struct RetryState {
     latest_snapshot: Option<Snapshot>,
     base_data_files: Option<Vec<ManifestEntry>>,
     publication_error: Option<crate::Error>,
+    automatic_delta_manifest: Option<String>,
 }
 
 struct RowIdWriteRange {

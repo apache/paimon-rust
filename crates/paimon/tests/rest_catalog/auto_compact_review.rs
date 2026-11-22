@@ -156,6 +156,77 @@ async fn read_rows(table: &Table) -> Vec<(i32, i32, Option<i32>)> {
 }
 
 #[tokio::test]
+async fn rest_auto_compaction_preserves_outputs_after_unexpected_commit_response() {
+    for (status, body, retries) in [
+        (StatusCode::NO_CONTENT, None, "10"),
+        (StatusCode::OK, Some(serde_json::json!({})), "0"),
+        (
+            StatusCode::OK,
+            Some(serde_json::json!({"success": "false"})),
+            "0",
+        ),
+        // Also exercise duplicate detection when the publisher reports rejection
+        // even though this exact attempt is visible in the catalog.
+        (
+            StatusCode::OK,
+            Some(serde_json::json!({"success": false})),
+            "10",
+        ),
+    ] {
+        let ctx = setup_catalog(vec!["default"]).await;
+        let temp = tempfile::tempdir().unwrap();
+        let name = "rest_auto_compact_response";
+        ctx.server.add_table_with_schema(
+            "default",
+            name,
+            schema(true),
+            temp.path().to_str().unwrap(),
+        );
+        let table = ctx
+            .catalog
+            .get_table(&Identifier::new("default", name))
+            .await
+            .unwrap()
+            .copy_with_options(HashMap::from([(
+                "commit.max-retries".into(),
+                retries.into(),
+            )]));
+        let commit = table.new_write_builder().new_commit();
+        commit
+            .commit_with_identifier(stage(&table, 1, true).await, 1)
+            .await
+            .unwrap();
+        ctx.server.set_compact_commit_response(status, body);
+        let messages = stage(&table, 2, true).await;
+        let result = commit.commit_with_identifier(messages.clone(), 2).await;
+        if retries == "0" {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("Commit outcome may be unknown"),
+                "{error}"
+            );
+        } else {
+            result.unwrap();
+        }
+        let snapshots = table.snapshot_manager();
+        let published = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(
+            (published.id(), published.commit_kind()),
+            (3, &CommitKind::COMPACT)
+        );
+        assert_eq!(
+            read_rows(&table).await,
+            vec![(1, 10, Some(100)), (2, 20, Some(200))]
+        );
+        commit
+            .filter_and_commit_with_identifier(messages, 2)
+            .await
+            .unwrap();
+        assert_eq!(snapshots.get_latest_snapshot_id().await.unwrap(), Some(3));
+    }
+}
+
+#[tokio::test]
 async fn stale_rest_writer_can_publish_without_filesystem_schema_metadata() {
     let (_ctx, _temp, stale, current) = catalog_only_tables("stale_auto_writer").await;
     let messages = stage(&stale, 1, false).await;
