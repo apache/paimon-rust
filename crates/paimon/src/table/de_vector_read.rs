@@ -68,6 +68,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod centroid;
 mod post_filter;
 
 /// Owns the queries and executes the snapshot-scoped plan from `DeVectorScan`.
@@ -294,7 +295,7 @@ impl DeVectorRead {
     }
 }
 
-async fn execute_vector_index_work(
+async fn execute_vector_file_work(
     evaluation: VectorSearchEvaluation<'_>,
     work: VectorIndexWork,
     metric_check: VectorMetricCheck,
@@ -323,7 +324,11 @@ async fn execute_vector_index_work(
     );
     let file_name = work.entry.index_file.file_name.clone();
     let file_size = work.entry.index_file.file_size as u64;
-    let index_meta_bytes = global_meta.index_meta.clone().unwrap_or_default();
+    let descriptor = super::centroid_index::Descriptor::parse(&work.entry.index_file)?;
+    let index_meta_bytes = match &descriptor {
+        Some(descriptor) => descriptor.payload.unwrap_or_default().to_vec(),
+        None => global_meta.index_meta.clone().unwrap_or_default(),
+    };
     let row_range_start = global_meta.row_range_start;
     let mut vector_searches = work.queries;
     let options = if let Some(resolved) = work.resolved {
@@ -916,6 +921,7 @@ async fn evaluate_batch_vector_search_with_executor(
         return Ok(vec![ScoredRowIds::empty(); vector_searches.len()]);
     }
 
+    let (vector_search_entries, mut centroid_files) = centroid::plan(&vector_entries)?;
     let raw_index_type = sources
         .into_iter()
         .flatten()
@@ -1070,11 +1076,11 @@ async fn evaluate_batch_vector_search_with_executor(
     };
     let index_search_limit = indexed_search_limit(max_limit, refine_factor)?;
 
-    let vector_entry_count = vector_entries.len();
+    let vector_entry_count = vector_search_entries.len();
     let vector_search_plans = if let Some(include_row_ids) =
         shared_batch_include_row_ids(&indexed_searches)
     {
-        let ranges = vector_entries
+        let ranges = vector_search_entries
             .iter()
             .map(|entry| {
                 let meta = entry.index_file.global_index_meta.as_ref().ok_or_else(|| {
@@ -1089,7 +1095,7 @@ async fn evaluate_batch_vector_search_with_executor(
                 Ok((meta.row_range_start, meta.row_range_end))
             })
             .collect::<crate::Result<Vec<_>>>()?;
-        vector_entries
+        vector_search_entries
             .iter()
             .copied()
             .zip(localize_shared_include_row_ids(
@@ -1099,7 +1105,7 @@ async fn evaluate_batch_vector_search_with_executor(
             .filter_map(|(entry, local_filter)| local_filter.map(|filter| (entry, Some(filter))))
             .collect::<Vec<_>>()
     } else {
-        vector_entries
+        vector_search_entries
             .iter()
             .copied()
             .map(|entry| (entry, None))
@@ -1139,6 +1145,9 @@ async fn evaluate_batch_vector_search_with_executor(
         let mut works = vector_search_plans
             .into_iter()
             .map(|(entry, shared_local_filter)| {
+                let centroid_files = centroid_files
+                    .remove(entry.index_file.file_name.as_str())
+                    .unwrap_or_default();
                 let meta = entry.index_file.global_index_meta.as_ref().unwrap();
                 let index_limit = search_limit_with_deleted_rows(
                     index_search_limit,
@@ -1171,6 +1180,7 @@ async fn evaluate_batch_vector_search_with_executor(
                 }
                 Ok::<_, crate::Error>(VectorIndexWork {
                     entry: entry.clone(),
+                    centroid_files,
                     queries: searches,
                     resolved: Some(configuration.resolved.clone()),
                     filter: post_filter_predicate.clone(),
@@ -1194,6 +1204,7 @@ async fn evaluate_batch_vector_search_with_executor(
                         let work = work?;
                         let work = VectorIndexTask {
                             entry: work.entry,
+                            centroid_files: work.centroid_files,
                             queries: TaskVectorQueries::capture(&work.queries)?,
                             resolved: work.resolved,
                             filter: work.filter,
@@ -1203,7 +1214,9 @@ async fn evaluate_batch_vector_search_with_executor(
                             table,
                             // Older workers must reject this work instead of
                             // ignoring an unfamiliar predicate payload.
-                            if work.filter.is_some() {
+                            if !work.centroid_files.is_empty() {
+                                "vector-index-centroid"
+                            } else if work.filter.is_some() {
                                 "vector-index-filtered"
                             } else {
                                 "vector-index"
@@ -1238,7 +1251,7 @@ async fn evaluate_batch_vector_search_with_executor(
                 let metric_check = metric_check.clone();
                 let range_read_limiter = range_read_limiter.clone();
                 async move {
-                    execute_vector_index_work(
+                    centroid::execute_work(
                         evaluation,
                         work?,
                         metric_check,
@@ -2977,6 +2990,8 @@ impl TaskVectorQueries {
 #[derive(Serialize, Deserialize)]
 struct VectorIndexTask {
     entry: IndexManifestEntry,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    centroid_files: Vec<IndexManifestEntry>,
     queries: TaskVectorQueries,
     #[serde(default)]
     resolved: Option<crate::spec::VectorIndexOptions>,
@@ -2987,6 +3002,7 @@ struct VectorIndexTask {
 }
 struct VectorIndexWork {
     entry: IndexManifestEntry,
+    centroid_files: Vec<IndexManifestEntry>,
     queries: Vec<VectorSearch>,
     resolved: Option<crate::spec::VectorIndexOptions>,
     filter: Option<Predicate>,
@@ -3047,7 +3063,7 @@ pub(super) async fn execute_search_task(
     payload: &serde_json::Value,
 ) -> crate::Result<serde_json::Value> {
     let scores = match kind {
-        "vector-index" | "vector-index-filtered" => {
+        "vector-index" | "vector-index-filtered" | "vector-index-centroid" => {
             let work: VectorIndexTask = serde_json::from_value(payload.clone())
                 .map_err(|error| crate::table::search_task::invalid(error.to_string()))?;
             if kind == "vector-index-filtered" && work.filter.is_none() {
@@ -3076,10 +3092,11 @@ pub(super) async fn execute_search_task(
             let core = CoreOptions::new(table.schema().options());
             let (parallelism, range_concurrency) =
                 vindex_concurrency_limits(&core, 1, core.global_index_thread_num()?)?;
-            let (results, _) = execute_vector_index_work(
+            let (results, _) = centroid::execute_work(
                 evaluation,
                 VectorIndexWork {
                     entry: work.entry,
+                    centroid_files: work.centroid_files,
                     queries: work.queries.restore()?,
                     resolved: work.resolved,
                     filter: work.filter,

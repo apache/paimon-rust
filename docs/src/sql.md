@@ -2961,6 +2961,33 @@ The function performs ANN search across all matching vector index files for the
 target column, merges results, and returns the top-k rows ordered by relevance
 score. If no matching index is found, an empty result is returned.
 
+### Centroid Sharding
+
+For a row-tracked Data Evolution append table, set `<index-type>.sharding=centroid`
+when calling `sys.create_global_index`. For example:
+
+```sql
+CALL sys.create_global_index(
+    table => 'my_db.items',
+    index_column => 'embedding',
+    index_type => 'ivf-flat',
+    options => 'ivf-flat.sharding=centroid,ivf-flat.dimension=4,ivf-flat.centroid.nlist=64'
+);
+```
+
+Each contiguous row-ID range in a partition has a routing model and one local
+index per populated centroid. The build replaces the previous indexes of the
+same type on the column in the selected partitions. Refresh routed indexes
+explicitly with the build procedure. A Rust build plan also exposes
+`replacement_messages()` to publish with the completed shards in the same
+snapshot-guarded commit.
+
+Set `centroid.nprobe` to choose the outer probe width. `ivf.nprobe` controls a
+selected shard's local IVF search, and `diskann.l_search` controls its DiskANN
+search. Automatic cosine and L2 routing can widen the search when necessary.
+Automatic inner-product routing searches all centroids. The layout is stored
+in the index manifest and is available when searching Java-built indexes.
+
 ### Scalar Pre-Filters
 
 Add a `WHERE` clause to restrict the rows returned by vector Top-K:

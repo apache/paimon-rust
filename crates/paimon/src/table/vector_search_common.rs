@@ -57,6 +57,20 @@ pub(super) async fn read_index_vector_metric(
     if !is_vindex_index_type(&entry.index_file.index_type) {
         return Ok(None);
     }
+    if let Some(descriptor) = super::centroid_index::Descriptor::parse(&entry.index_file)? {
+        use super::centroid_index::{payload_options, Role, Router};
+        let Role::Router(nlist) = descriptor.role else {
+            return Ok(None);
+        };
+        if let Some(metric) = metric_from_index_options(&payload_options(&descriptor)?) {
+            return Ok(Some(metric));
+        }
+        if nlist == 0 {
+            return Ok(None);
+        }
+        let router = Router::load(file_io, table_path, &entry.index_file, &descriptor).await?;
+        return Ok(Some(router.metric));
+    }
     let path = IndexFileLocation::Global { table_path }.resolve(
         &entry.index_file.file_name,
         entry.index_file.external_path.as_deref(),
@@ -617,6 +631,7 @@ pub(super) fn merge_vector_read_options(
         let mut options = source.clone();
         for (native, suffixes) in [
             ("ivf.nprobe", &["nprobe", "ivf.nprobe"][..]),
+            ("centroid.nprobe", &["centroid.nprobe"][..]),
             ("diskann.l_search", &["l_search", "diskann.l_search"][..]),
         ] {
             let value = indexed_type_prefixes(column, kind)
