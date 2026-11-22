@@ -2575,6 +2575,7 @@ impl<'a> PaimonTableScan<'a> {
             HashSet::new()
         };
         let mut entries = Vec::new();
+        let mut index_schema = super::global_index_schema::GlobalIndexSchema::new(&self.table);
         for entry in IndexManifest::read(self.table.file_io(), &path).await? {
             if retain_index_manifest_entry_for_scan(
                 &entry,
@@ -2582,7 +2583,8 @@ impl<'a> PaimonTableScan<'a> {
                 deletion_vectors_needed,
                 self.partition_filter.as_ref(),
                 &predicate_field_ids,
-            )? {
+            )? && index_schema.compatible(&entry.index_file).await
+            {
                 entries.push(entry);
             }
         }

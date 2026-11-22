@@ -40,7 +40,7 @@ use crate::table::index_build::{
     full_text::{self, full_text_config, native_full_text_options, serialize_index_meta},
     IndexFileWriter,
 };
-use crate::table::index_file_path::IndexFileLocation;
+use crate::table::index_file_path::{new_global_index_file_name, IndexFileLocation};
 use crate::table::{CommitMessage, DataSplitBuilder, RowRange, Table};
 use crate::{Error, Result};
 use std::collections::HashMap;
@@ -216,17 +216,18 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
             index_field_id,
             extra_field_ids: None,
             source_meta: Some(
-                crate::spec::DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize(),
+                crate::spec::DataEvolutionIndexSourceMeta::new_with_schema_id(
+                    shard.snapshot_id,
+                    self.table.schema().id(),
+                )?
+                .serialize(),
             ),
             index_meta: None,
         };
         IndexFileWriter::new(
             self.table,
             FULL_TEXT_GLOBAL_INDEX_TYPE,
-            crate::table::global_index_schema::index_file_name(
-                FULL_TEXT_GLOBAL_INDEX_TYPE,
-                self.table.schema().id(),
-            ),
+            new_global_index_file_name(FULL_TEXT_GLOBAL_INDEX_TYPE),
             IndexFileLocation::Global {
                 table_path: self.table.location().trim_end_matches('/'),
             },

@@ -29,7 +29,7 @@ use crate::table::index_build::{
     vector::{serialize_writer, VectorSpill},
     IndexFileWriter, IndexPayload,
 };
-use crate::table::index_file_path::IndexFileLocation;
+use crate::table::index_file_path::{new_global_index_file_name, IndexFileLocation};
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::{CommitMessage, RowRange, Table};
 use crate::vindex::VindexVectorIndexOptions;
@@ -300,7 +300,12 @@ impl VindexIndexBuildBuilder<'_> {
                 {
                     let row_count = rows.vector_count() as i64;
                     let file = self
-                        .centroid_file_writer(shard, field_id, &extra_fields)
+                        .centroid_file_writer(
+                            shard,
+                            field_id,
+                            &extra_fields,
+                            new_global_index_file_name("centroid-bitmap"),
+                        )
                         .await?
                         .write(self.table, |output| async move {
                             bitmap
@@ -397,8 +402,17 @@ impl VindexIndexBuildBuilder<'_> {
         writer: Option<VectorIndexWriter>,
         bytes: Vec<u8>,
     ) -> Result<IndexFileMeta> {
+        let prefix = format!("vector-{}", self.index_type);
+        let file_name = if matches!(descriptor.role, Role::Router(_)) {
+            format!(
+                "{prefix}-global-index-training-model-{}.index",
+                descriptor.model_id
+            )
+        } else {
+            new_global_index_file_name(&prefix)
+        };
         let index_meta = descriptor.encode()?;
-        self.centroid_file_writer(shard, field_id, extra_fields)
+        self.centroid_file_writer(shard, field_id, extra_fields, file_name)
             .await?
             .write(self.table, |output| async move {
                 match writer {
@@ -418,18 +432,20 @@ impl VindexIndexBuildBuilder<'_> {
         shard: &VectorIndexShard,
         field_id: i32,
         extra_fields: &[i32],
+        file_name: String,
     ) -> Result<IndexFileWriter> {
-        let file_name = format!(
-            "vector-{}-global-index-{}.index",
-            self.index_type,
-            uuid::Uuid::new_v4()
-        );
         let meta = GlobalIndexMeta {
             row_range_start: shard.row_range_start,
             row_range_end: shard.row_range_end,
             index_field_id: field_id,
             extra_field_ids: (!extra_fields.is_empty()).then(|| extra_fields.to_vec()),
-            source_meta: Some(DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize()),
+            source_meta: Some(
+                DataEvolutionIndexSourceMeta::new_with_schema_id(
+                    shard.snapshot_id,
+                    self.table.schema().id(),
+                )?
+                .serialize(),
+            ),
             index_meta: None,
         };
         IndexFileWriter::new(

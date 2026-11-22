@@ -20,8 +20,7 @@ use super::{error, IndexFileWriter};
 use crate::io::FileWrite;
 use crate::rtree::{RTreeIndexOptions, RTreeIndexWriter, RTreeOutput};
 use crate::spec::{GlobalIndexMeta, IndexFileMeta};
-use crate::table::global_index_schema::index_file_name;
-use crate::table::index_file_path::IndexFileLocation;
+use crate::table::index_file_path::{new_global_index_file_name, IndexFileLocation};
 use crate::table::{ArrowRecordBatchStream, RowRange, Table};
 use crate::{Error, Result};
 use arrow_array::{Array, BinaryArray, Int64Array};
@@ -37,7 +36,7 @@ struct ShardOutput<'a> {
 #[async_trait::async_trait]
 impl RTreeOutput for &mut ShardOutput<'_> {
     async fn create(&mut self) -> io::Result<(String, Box<dyn FileWrite>)> {
-        let name = index_file_name("rtree", self.table.schema().id());
+        let name = new_global_index_file_name("rtree");
         let file = IndexFileWriter::new(
             self.table,
             "rtree",

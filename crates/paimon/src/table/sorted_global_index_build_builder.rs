@@ -27,7 +27,10 @@ use planning::plan_sorted_index_shards;
 use planning::SortedGlobalIndexShard;
 use validation::*;
 
-use super::global_index_build_common::IndexColumns;
+use super::global_index_build_common::{
+    indexed_row_ranges, matching_index_meta, validate_existing_index_overlap, IndexColumns,
+};
+use super::global_index_schema::GlobalIndexSchema;
 use super::global_index_types::{normalize_queryable_global_index_type, BTREE_GLOBAL_INDEX_TYPE};
 #[cfg(test)]
 use super::global_index_types::{BITMAP_GLOBAL_INDEX_TYPE, FM_GLOBAL_INDEX_TYPE};
@@ -177,8 +180,35 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         let manifest_entries = view
             .manifest_entries(self.table, self.partition_filter.as_ref())
             .await?;
-        let indexed = crate::table::global_index_build_common::indexed_row_ranges(
-            view.index_entries(),
+        let mut index_schema = GlobalIndexSchema::new(self.table);
+        let mut retained_indexes = Vec::new();
+        let mut replaced_by_bucket = HashMap::new();
+        let unpartitioned = self.table.schema().partition_keys().is_empty();
+        for entry in view.index_entries() {
+            if matching_index_meta(
+                entry,
+                index_type,
+                index_field.id(),
+                extra_field_ids.as_deref(),
+            )
+            .is_some()
+                && !index_schema.compatible(&entry.index_file).await
+            {
+                let partition = if unpartitioned {
+                    Vec::new()
+                } else {
+                    entry.partition.clone()
+                };
+                replaced_by_bucket
+                    .entry((partition, entry.bucket))
+                    .or_insert_with(Vec::new)
+                    .push(entry.index_file.clone());
+            } else {
+                retained_indexes.push(entry);
+            }
+        }
+        let indexed = indexed_row_ranges(
+            retained_indexes.iter().copied(),
             index_type,
             index_field.id(),
             extra_field_ids.as_deref(),
@@ -198,8 +228,8 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             return Ok((Some(snapshot.id()), vec![]));
         }
 
-        crate::table::global_index_build_common::validate_existing_index_overlap(
-            view.index_entries(),
+        validate_existing_index_overlap(
+            retained_indexes,
             index_type,
             index_field.id(),
             extra_field_ids.as_deref(),
@@ -228,6 +258,15 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             let mut message =
                 CommitMessage::new(shard.partition_bytes.clone(), shard.source_bucket, vec![]);
             message.new_index_files = index_files;
+            // Retire the old coverage once, together with the new shards in this bucket.
+            let partition = if unpartitioned {
+                Vec::new()
+            } else {
+                shard.partition_bytes
+            };
+            message.deleted_index_files = replaced_by_bucket
+                .remove(&(partition, shard.source_bucket))
+                .unwrap_or_default();
             messages.push(message);
         }
 

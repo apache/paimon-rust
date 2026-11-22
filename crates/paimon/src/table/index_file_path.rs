@@ -34,9 +34,13 @@
 //! index kind it reads. Cleanup after a failed commit does not — see
 //! [`committed_index_file_path`].
 
-use crate::spec::IndexFileMeta;
+use crate::spec::{DataEvolutionIndexSourceMeta, IndexFileMeta};
 
 const INDEX_DIR: &str = "index";
+
+pub(super) fn new_global_index_file_name(prefix: &str) -> String {
+    format!("{prefix}-global-index-{}.index", uuid::Uuid::new_v4())
+}
 
 /// How to resolve an index file that carries no explicit external path.
 pub(crate) enum IndexFileLocation<'a> {
@@ -88,11 +92,6 @@ impl IndexFileLocation<'_> {
     }
 }
 
-/// `"DEIX"` as a big-endian int, Java `DataEvolutionIndexSourceMeta`'s marker.
-/// `PrimaryKeyIndexSourceMeta` starts with its own version instead, so the marker
-/// tells the two apart — which is what Java added it for.
-const DATA_EVOLUTION_SOURCE_META_MAGIC: &[u8; 4] = b"DEIX";
-
 /// Whether an index file carried by a commit message is a global index file.
 ///
 /// A `_GLOBAL_INDEX` on its own does not say — a source-backed primary-key index
@@ -101,16 +100,15 @@ const DATA_EVOLUTION_SOURCE_META_MAGIC: &[u8; 4] = b"DEIX";
 /// `PrimaryKeyIndexSourceMeta` starts with its own version. A deletion vector or
 /// the dynamic-bucket hash index carries no `_GLOBAL_INDEX` at all.
 ///
-/// Absent source metadata is global because the index builders in this crate
-/// write it that way, and they are the only producers of the global index files
-/// it commits. Java records that predate `_SOURCE_META` cannot reach here: a
-/// commit message is built by this crate's writers, never decoded from Java.
+/// Legacy global index files may carry no source metadata.
 fn is_global_index_file(file: &IndexFileMeta) -> bool {
     file.global_index_meta
         .as_ref()
         .is_some_and(|meta| match meta.source_meta.as_deref() {
             None => true,
-            Some(source_meta) => source_meta.starts_with(DATA_EVOLUTION_SOURCE_META_MAGIC),
+            Some(source_meta) => {
+                DataEvolutionIndexSourceMeta::is_data_evolution_meta(Some(source_meta))
+            }
         })
 }
 
@@ -312,10 +310,10 @@ mod tests {
 
     #[test]
     fn a_global_index_file_is_committed_under_the_table_index_directory() {
-        // This crate's index builders leave `_SOURCE_META` empty, and Java marks
-        // its own with `DataEvolutionIndexSourceMeta`'s `DEIX`. Both are global
-        // even when the table keeps index files in the data-file directory.
-        for source_meta in [None, Some(data_evolution_source_meta(7))] {
+        let current = DataEvolutionIndexSourceMeta::new_with_schema_id(7, 2)
+            .unwrap()
+            .serialize();
+        for source_meta in [None, Some(data_evolution_source_meta(7)), Some(current)] {
             let file = committed_file(Some(source_meta));
             assert_eq!(committed_path(&file), "warehouse/db/tbl/index/idx-0");
         }

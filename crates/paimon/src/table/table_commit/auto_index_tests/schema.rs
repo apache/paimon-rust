@@ -16,7 +16,10 @@
 // under the License.
 
 use super::*;
-use crate::spec::{FloatType, PredicateBuilder, SchemaChange, VarCharType};
+use crate::spec::{
+    DataEvolutionIndexSourceMeta, FloatType, IndexFileMeta, PredicateBuilder, SchemaChange,
+    VarCharType,
+};
 use arrow_array::{ArrayRef, Float32Array, StringArray};
 
 async fn evolve(table: &Table, changes: Vec<SchemaChange>) -> Table {
@@ -109,6 +112,18 @@ async fn assert_scalar_complete(table: &Table, family: &str) {
         .await
         .unwrap()
         .is_empty());
+}
+
+fn index_source(file: &IndexFileMeta) -> DataEvolutionIndexSourceMeta {
+    DataEvolutionIndexSourceMeta::deserialize(
+        file.global_index_meta
+            .as_ref()
+            .unwrap()
+            .source_meta
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -245,17 +260,22 @@ async fn stale_scalar_build_keys_record_the_actual_builder_schema_and_are_retire
             .await
             .unwrap();
         assert_eq!(prepared.len(), 1);
-        assert!(prepared[0].new_index_files[0]
-            .file_name
-            .starts_with(&format!(
-                "{family}-global-index-schema-{}-",
-                original.schema().id()
-            )));
+        let built = index_source(&prepared[0].new_index_files[0]);
+        assert_eq!(built.scan_snapshot_id(), latest(&changed).await.id());
+        assert_eq!(built.source_schema_id(), original.schema().id());
         TableCommit::new(changed.clone(), "publish-stale-keys".into())
             .commit(prepared)
             .await
             .unwrap();
         let stale = indexes(&changed).await;
+        assert_eq!(
+            matching_ids(&changed, Datum::Float(10.), true).await,
+            vec![1]
+        );
+        assert_eq!(
+            matching_ids(&changed, Datum::Float(20.), true).await,
+            vec![2]
+        );
         TableCommit::new(changed.clone(), "replace-stale-keys".into())
             .commit(float_messages(&changed, 3, 30.).await)
             .await
@@ -272,8 +292,9 @@ async fn stale_scalar_build_keys_record_the_actual_builder_schema_and_are_retire
         );
 
         // A current handle may still intentionally build cast keys from an
-        // older captured snapshot. Its name records the FLOAT builder schema,
-        // not the INT source snapshot's schema.
+        // older captured snapshot. The source metadata records both the
+        // captured snapshot and the FLOAT builder schema.
+        let source_snapshot_id = source.id();
         let prepared = changed
             .new_global_index_build_builder()
             .with_index_column("value")
@@ -287,17 +308,109 @@ async fn stale_scalar_build_keys_record_the_actual_builder_schema_and_are_retire
             .unwrap();
         assert_eq!(prepared.len(), 1);
         assert_eq!(prepared[0].new_index_files[0].row_count, 1);
-        assert!(prepared[0].new_index_files[0]
-            .file_name
-            .starts_with(&format!(
-                "{family}-global-index-schema-{}-",
-                changed.schema().id()
-            )));
+        let built = index_source(&prepared[0].new_index_files[0]);
+        assert_eq!(built.scan_snapshot_id(), source_snapshot_id);
+        assert_eq!(built.source_schema_id(), changed.schema().id());
         TableCommit::new(changed.clone(), "abort-cast-probe".into())
             .abort(&prepared)
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn manual_scalar_build_replaces_incompatible_coverage_after_schema_only_change() {
+    for family in ["btree", "bitmap"] {
+        let original = scalar_table(family).await;
+        TableCommit::new(original.clone(), "manual-build-source".into())
+            .commit(messages(&original, vec![1]).await)
+            .await
+            .unwrap();
+        let snapshot = latest(&original).await;
+        let previous = indexes(&original).await;
+        assert_eq!(previous.len(), 1);
+
+        let changed = evolve(
+            &original,
+            vec![SchemaChange::UpdateColumnType {
+                field_names: vec!["value".into()],
+                new_data_type: DataType::Float(FloatType::new()),
+                keep_nullability: true,
+            }],
+        )
+        .await;
+        assert_eq!(latest(&changed).await.id(), snapshot.id());
+        assert_eq!(
+            matching_ids(&changed, Datum::Float(10.), true).await,
+            vec![1]
+        );
+
+        let count = changed
+            .new_global_index_build_builder()
+            .with_index_column("value")
+            .with_index_type(family)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let current = indexes(&changed).await;
+        assert_eq!(current.len(), 1);
+        assert_ne!(
+            previous[0].index_file.file_name,
+            current[0].index_file.file_name
+        );
+        let built = index_source(&current[0].index_file);
+        assert_eq!(built.scan_snapshot_id(), snapshot.id());
+        assert_eq!(built.source_schema_id(), changed.schema().id());
+        assert_eq!(
+            matching_ids(&changed, Datum::Float(10.), true).await,
+            vec![1]
+        );
+    }
+}
+
+#[tokio::test]
+async fn scalar_compatibility_uses_each_source_schema_and_composite_field() {
+    let original = scalar_table("btree").await;
+    TableCommit::new(original.clone(), "composite-field-source".into())
+        .commit(messages(&original, vec![1]).await)
+        .await
+        .unwrap();
+    let changed = evolve(
+        &original,
+        vec![SchemaChange::UpdateColumnType {
+            field_names: vec!["value".into()],
+            new_data_type: DataType::Float(FloatType::new()),
+            keep_nullability: true,
+        }],
+    )
+    .await;
+    let mut file = indexes(&original).await.remove(0).index_file;
+    let source = index_source(&file);
+    let mut schema = crate::table::global_index_schema::GlobalIndexSchema::new(&changed);
+
+    assert!(!schema.compatible(&file).await);
+    let meta = file.global_index_meta.as_mut().unwrap();
+    let changed_field = meta.index_field_id;
+    meta.index_field_id = changed.schema().fields()[0].id();
+    assert!(schema.compatible(&file).await);
+
+    file.global_index_meta.as_mut().unwrap().extra_field_ids = Some(vec![changed_field]);
+    assert!(!schema.compatible(&file).await);
+    for index_type in ["full-text", "ivf-pq"] {
+        file.index_type = index_type.into();
+        assert!(schema.compatible(&file).await);
+    }
+    file.index_type = "btree".into();
+    file.global_index_meta.as_mut().unwrap().source_meta = Some(
+        DataEvolutionIndexSourceMeta::new_with_schema_id(
+            source.scan_snapshot_id(),
+            changed.schema().id(),
+        )
+        .unwrap()
+        .serialize(),
+    );
+    assert!(schema.compatible(&file).await);
 }
 
 #[tokio::test]
@@ -309,17 +422,7 @@ async fn scalar_build_schema_proof_does_not_depend_on_source_snapshot_retention(
             .await
             .unwrap();
         let previous = indexes(&original).await;
-        let source = crate::spec::DataEvolutionIndexSourceMeta::deserialize(
-            previous[0]
-                .index_file
-                .global_index_meta
-                .as_ref()
-                .unwrap()
-                .source_meta
-                .as_deref()
-                .unwrap(),
-        )
-        .unwrap();
+        let source = index_source(&previous[0].index_file);
         let source_path = original
             .snapshot_manager()
             .snapshot_path(source.scan_snapshot_id());
@@ -350,11 +453,12 @@ async fn legacy_payloads(table: &Table) -> Vec<IndexManifestEntry> {
     for entry in indexes(table).await {
         let old = entry.index_file;
         let mut legacy = old.clone();
-        legacy.file_name = format!(
-            "{}-global-index-{}.index",
-            old.index_type,
-            uuid::Uuid::new_v4()
-        );
+        legacy.file_name =
+            crate::table::index_file_path::new_global_index_file_name(&old.index_type);
+        let mut source = b"DEIX".to_vec();
+        source.extend_from_slice(&1i32.to_be_bytes());
+        source.extend_from_slice(&index_source(&old).scan_snapshot_id().to_be_bytes());
+        legacy.global_index_meta.as_mut().unwrap().source_meta = Some(source);
         table
             .file_io()
             .copy_file(
@@ -368,7 +472,7 @@ async fn legacy_payloads(table: &Table) -> Vec<IndexManifestEntry> {
         message.new_index_files.push(legacy);
         messages.push(message);
     }
-    TableCommit::new(table.clone(), "legacy-file-names".into())
+    TableCommit::new(table.clone(), "legacy-source-metadata".into())
         .commit(messages)
         .await
         .unwrap();
@@ -376,7 +480,7 @@ async fn legacy_payloads(table: &Table) -> Vec<IndexManifestEntry> {
 }
 
 #[tokio::test]
-async fn legacy_scalar_files_require_a_complete_unchanged_type_history() {
+async fn legacy_scalar_files_skip_type_history_validation() {
     for family in ["btree", "bitmap"] {
         for history in ["same-type", "round-trip", "missing"] {
             let original = scalar_table(family).await;
@@ -426,9 +530,8 @@ async fn legacy_scalar_files_require_a_complete_unchanged_type_history() {
                 .await
                 .unwrap();
             let current = indexes(&changed).await;
-            assert_eq!(
+            assert!(
                 previous.iter().all(|entry| current.contains(entry)),
-                history == "same-type",
                 "{family}, history={history}"
             );
             assert_eq!(matching_ids(&changed, Datum::Int(10), true).await, vec![1]);
@@ -482,75 +585,47 @@ async fn text_matches(table: &Table, query: &str, mode: &str) -> Vec<u64> {
 }
 
 #[tokio::test]
-async fn full_text_narrowing_rebuilds_same_shard_tokens_to_match_current_text() {
+async fn full_text_split_read_rechecks_scalar_index_schema() {
     let original = evolve(
-        &table(Some(true), false).await,
-        vec![
-            SchemaChange::remove_option("global-index.btree.index-columns".into()),
-            SchemaChange::remove_option("global-index.bitmap.index-columns".into()),
-            SchemaChange::add_column(
-                "text".into(),
-                DataType::VarChar(VarCharType::new(100).unwrap()),
-            ),
-            SchemaChange::set_option("global-index.full-text.index-columns".into(), "text".into()),
-            SchemaChange::set_option("global-index.row-count-per-shard".into(), "64".into()),
-        ],
+        &analyzer_table().await,
+        vec![SchemaChange::set_option(
+            "global-index.btree.index-columns".into(),
+            "value".into(),
+        )],
     )
     .await;
-    TableCommit::new(original.clone(), "wide-text".into())
+    TableCommit::new(original.clone(), "mixed-search-source".into())
         .commit(text_messages(&original, 1, "sentinel").await)
         .await
         .unwrap();
-    let previous = indexes(&original).await;
-    assert_eq!(text_matches(&original, "sentinel", "fast").await, vec![0]);
     let changed = evolve(
         &original,
-        vec![SchemaChange::UpdateColumnType {
-            field_names: vec!["text".into()],
-            new_data_type: DataType::VarChar(VarCharType::new(3).unwrap()),
-            keep_nullability: true,
-        }],
+        vec![
+            SchemaChange::UpdateColumnType {
+                field_names: vec!["value".into()],
+                new_data_type: DataType::Float(FloatType::new()),
+                keep_nullability: true,
+            },
+            SchemaChange::set_option("scalar-index.prefilter.search-mode".into(), "full".into()),
+        ],
     )
     .await;
-    TableCommit::new(changed.clone(), "narrow-text".into())
-        .commit(text_messages(&changed, 2, "new").await)
-        .await
-        .unwrap();
-    let native = [
-        ("sentinel", text_matches(&changed, "sentinel", "fast").await),
-        ("sen", text_matches(&changed, "sen", "fast").await),
-    ];
-    assert!(
-        native[0].1.is_empty(),
-        "old tokens must not match truncated text"
+    let mut search = changed.new_full_text_search_builder();
+    search
+        .with_text_column("text")
+        .with_query_text("sentinel")
+        .with_limit(10);
+    let plan = search.new_scan().unwrap().scan().await.unwrap();
+    search.with_filter(
+        PredicateBuilder::new(changed.schema().fields())
+            .equal("value", Datum::Float(10.))
+            .unwrap(),
     );
-    assert_eq!(
-        native[1].1,
-        vec![0],
-        "current text must be indexed as 'sen'"
-    );
-    let current = indexes(&changed).await;
-    assert!(previous.iter().all(|entry| !current.contains(entry)));
 
-    // Remove index references to force the existing raw FULL/DETAIL paths.
-    // Their document text is read through the same real VARCHAR narrowing.
-    changed
-        .new_global_index_drop_builder()
-        .with_index_column("text")
-        .with_index_type("full-text")
-        .execute()
-        .await
-        .unwrap();
-    assert!(indexes(&changed).await.is_empty());
-    for mode in ["full", "detail"] {
-        for (query, expected) in &native {
-            assert_eq!(
-                text_matches(&changed, query, mode).await,
-                *expected,
-                "{query}, {mode}"
-            );
-        }
-    }
+    let direct = search.execute().await.unwrap();
+    assert_eq!(direct.row_ids().unwrap().row_ids, vec![0]);
+    let split_read = search.new_read().unwrap().read(plan).await.unwrap();
+    assert_eq!(split_read.row_ids().unwrap().row_ids, vec![0]);
 }
 
 async fn analyzer_table() -> Table {
@@ -683,8 +758,7 @@ async fn full_text_unproven_analyzer_metadata_requires_rebuilding() {
             .unwrap();
         let previous = indexes(&table).await.remove(0);
         let mut legacy = previous.index_file.clone();
-        legacy.file_name =
-            crate::table::global_index_schema::index_file_name("full-text", table.schema().id());
+        legacy.file_name = crate::table::index_file_path::new_global_index_file_name("full-text");
         legacy.global_index_meta.as_mut().unwrap().index_meta = index_meta;
         table
             .file_io()
