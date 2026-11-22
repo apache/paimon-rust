@@ -106,10 +106,11 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     .strip_prefix(&format!("{}.", self.index_type))
                     .or_else(|| key.strip_prefix(&format!("fields.{column}.")))
                     .unwrap_or(key);
-                !matches!(key, "sharding" | "centroid.nlist")
-                    && !(centroid.is_some()
+                let outer_only = matches!(key, "sharding" | "centroid.nlist")
+                    || (centroid.is_some()
                         && self.index_type == "diskann"
-                        && key == "ivf.train.max-points-per-centroid")
+                        && key == "ivf.train.max-points-per-centroid");
+                !outer_only
             });
         }
         let native = VindexVectorIndexOptions::new_with_defaults(
