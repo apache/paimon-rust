@@ -282,7 +282,7 @@ async fn centroid_empty_router_does_not_define_raw_scoring() {
 }
 
 #[tokio::test]
-async fn centroid_rerank_uses_live_candidates_before_cutting_top_k() {
+async fn centroid_search_uses_live_rows_before_capping_candidates() {
     let path = "memory:/centroid_rerank_deleted";
     let mut options = vindex_e2e_options("8");
     options.insert("deletion-vectors.enabled".into(), "true".into());
@@ -292,7 +292,12 @@ async fn centroid_rerank_uses_live_candidates_before_cutting_top_k() {
         vindex_schema_builder(options).build().unwrap(),
     );
     setup_dirs(table.file_io(), path).await;
-    write_vectors(&table, vec![0, 1], vec![vec![0., 0.], vec![1., 0.]]).await;
+    write_vectors(
+        &table,
+        vec![0, 1, 2],
+        vec![vec![0., 0.], vec![1., 0.], vec![2., 0.]],
+    )
+    .await;
     let mut options = centroid_options();
     options.insert("ivf-flat.centroid.nlist".into(), "1".into());
     table
@@ -326,6 +331,27 @@ async fn centroid_rerank_uses_live_candidates_before_cutting_top_k() {
         .unwrap();
     for result in [local, scheduled] {
         assert_eq!(result.row_ids().unwrap().row_ids, [1]);
+    }
+
+    search
+        .with_filter(
+            PredicateBuilder::new(table.schema().fields())
+                .equal("id", Datum::Int(2))
+                .unwrap(),
+        )
+        .with_options(HashMap::from([(
+            "vector-index.post-filter.candidates-factor".into(),
+            "2".into(),
+        )]));
+    let plan = search.new_scan().unwrap().plan().await.unwrap();
+    let reader = search.new_read().unwrap();
+    let local = reader.read(plan.clone()).await.unwrap();
+    let scheduled = reader
+        .read_with_executor(plan, &Worker(&table))
+        .await
+        .unwrap();
+    for result in [local, scheduled] {
+        assert_eq!(result.row_ids().unwrap().row_ids, [2]);
     }
 }
 

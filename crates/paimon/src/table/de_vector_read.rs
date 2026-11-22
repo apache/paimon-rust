@@ -1078,7 +1078,7 @@ async fn evaluate_batch_vector_search_with_executor(
         .map(|vector_search| vector_search.limit)
         .max()
         .unwrap_or(0);
-    let refine_factor = match vector_entries.first() {
+    let refine_factor = match vector_search_entries.first() {
         Some(entry) => super::vector_search_common::resolved_refine_factor(
             &configuration.query_options,
             &configuration.resolved.options,
@@ -1162,15 +1162,33 @@ async fn evaluate_batch_vector_search_with_executor(
                     .remove(entry.index_file.file_name.as_str())
                     .unwrap_or_default();
                 let meta = entry.index_file.global_index_meta.as_ref().unwrap();
+                let is_centroid = !centroid_files.is_empty();
+                let deleted = deleted_row_index.as_ref();
+                // Deleted rows must not consume the routed candidate budget.
+                let live_rows = if is_centroid {
+                    deleted
+                        .and_then(|deleted| {
+                            local_live_row_ids(deleted, meta.row_range_start, meta.row_range_end)
+                        })
+                        .map(Arc::new)
+                } else {
+                    None
+                };
                 let index_limit = search_limit_with_deleted_rows(
                     index_search_limit,
                     meta.row_range_start,
                     meta.row_range_end,
-                    deleted_row_index.as_ref(),
+                    if is_centroid { None } else { deleted },
                 )
                 .min(i32::MAX as usize);
                 let mut searches = indexed_searches.to_vec();
-                let shared_local_filter = shared_local_filter.map(Arc::new);
+                let restrict_to_live = |rows| {
+                    Arc::new(match &live_rows {
+                        Some(live) => rows & live.as_ref(),
+                        None => rows,
+                    })
+                };
+                let shared_local_filter = shared_local_filter.map(&restrict_to_live);
                 for search in &mut searches {
                     search.limit = index_limit;
                     let local = match shared_local_filter.as_ref() {
@@ -1185,7 +1203,8 @@ async fn evaluate_batch_vector_search_with_executor(
                                 )
                             })
                             .transpose()?
-                            .map(Arc::new),
+                            .map(&restrict_to_live)
+                            .or_else(|| live_rows.clone()),
                     };
                     if let Some(local) = local {
                         search.set_shared_include_row_ids(local);
@@ -1824,6 +1843,19 @@ fn prune_raw_ranges_by_include_row_ids(
             sorted_row_ids_to_row_ranges(union.iter())?
         };
     Ok(intersect_sorted_ranges(raw_ranges, &include_ranges))
+}
+
+fn local_live_row_ids(deleted: &RowRangeIndex, from: i64, to: i64) -> Option<RoaringTreemap> {
+    let deleted = deleted.intersected_ranges(from, to);
+    if deleted.is_empty() {
+        return None;
+    }
+    let mut live = RoaringTreemap::new();
+    live.insert_range(0..=(to - from) as u64);
+    for range in deleted {
+        live.remove_range((range.from() - from) as u64..=(range.to() - from) as u64);
+    }
+    Some(live)
 }
 
 fn localize_include_row_ids(
