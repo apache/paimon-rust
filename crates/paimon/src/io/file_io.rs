@@ -87,6 +87,13 @@ pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
     /// Rename requires both paths to resolve to the same shared service instance.
     async fn create(&self, path: &str) -> crate::Result<(Operator, String)>;
 
+    /// Return the current generation of reader credentials, refreshing them
+    /// first if needed. `None` disables cross-scan reader reuse for providers
+    /// that cannot identify when their existing file handles become stale.
+    async fn reader_cache_epoch(&self) -> crate::Result<Option<u64>> {
+        Ok(None)
+    }
+
     /// Optionally publish a complete immutable file without replacing an existing file.
     ///
     /// Return `Some(true)` on success or `Some(false)` for a definite conflict.
@@ -438,6 +445,13 @@ impl std::fmt::Debug for FileIO {
 }
 
 impl FileIO {
+    pub(crate) async fn reader_cache_epoch(&self) -> crate::Result<Option<u64>> {
+        match &self.backend {
+            FileIOBackend::Storage(_) => Ok(Some(0)),
+            FileIOBackend::Provider(provider) => provider.reader_cache_epoch().await,
+        }
+    }
+
     /// Attach an externally managed block cache.
     ///
     /// `block_size` controls the aligned ranges presented to the cache.

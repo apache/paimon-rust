@@ -2604,33 +2604,49 @@ impl<'a> PaimonTableScan<'a> {
             self.table.schema().fields(),
         )?;
         let core_options = CoreOptions::new(&resolved);
-        super::global_index_scanner::evaluate_global_index_with_options(
-            super::global_index_scanner::GlobalIndexEvaluation {
-                file_io: self.table.file_io(),
-                table_path: self.table.location().trim_end_matches('/'),
-                index_entries,
-                predicates: &self.data_predicates,
-                schema_fields: self.table.schema().fields(),
-                search_mode: settings.search_mode,
-                global_index_thread_num: settings.thread_num,
-                btree_fallback_scan_max_size: core_options.btree_index_fallback_scan_max_size()?,
-                btree_data_block_cache_size: core_options.btree_index_data_block_cache_size()?,
-                bitmap_fallback_scan_max_size: core_options
-                    .bitmap_index_fallback_scan_max_size()?,
-                fm_read_options: if index_entries
-                    .iter()
-                    .any(|entry| entry.index_file.index_type.eq_ignore_ascii_case("fm"))
-                {
-                    crate::fm_index::FMOptions::from_options(&resolved)?.read
-                } else {
-                    crate::fm_index::FMReadOptions::default()
-                },
-                next_row_id: snapshot.next_row_id(),
-                data_ranges,
+        let evaluation = super::global_index_scanner::GlobalIndexEvaluation {
+            file_io: self.table.file_io(),
+            table_path: self.table.location().trim_end_matches('/'),
+            index_entries,
+            predicates: &self.data_predicates,
+            schema_fields: self.table.schema().fields(),
+            search_mode: settings.search_mode,
+            global_index_thread_num: settings.thread_num,
+            btree_fallback_scan_max_size: core_options.btree_index_fallback_scan_max_size()?,
+            btree_data_block_cache_size: core_options.btree_index_data_block_cache_size()?,
+            bitmap_fallback_scan_max_size: core_options.bitmap_index_fallback_scan_max_size()?,
+            fm_read_options: if index_entries
+                .iter()
+                .any(|entry| entry.index_file.index_type.eq_ignore_ascii_case("fm"))
+            {
+                crate::fm_index::FMOptions::from_options(&resolved)?.read
+            } else {
+                crate::fm_index::FMReadOptions::default()
             },
-            self.table.schema().options(),
-        )
-        .await
+            next_row_id: snapshot.next_row_id(),
+            data_ranges,
+        };
+        if self.table.schema().core_options().query_auth_enabled() {
+            super::global_index_scanner::evaluate_global_index_with_options(
+                evaluation,
+                self.table.schema().options(),
+            )
+            .await
+        } else if let Some(epoch) = self.table.file_io().reader_cache_epoch().await? {
+            super::global_index_scanner::evaluate_global_index_with_options_cached(
+                evaluation,
+                self.table.schema().options(),
+                Arc::clone(&self.table.btree_reader_cache),
+                epoch,
+            )
+            .await
+        } else {
+            super::global_index_scanner::evaluate_global_index_with_options(
+                evaluation,
+                self.table.schema().options(),
+            )
+            .await
+        }
     }
 
     async fn manifest_row_ranges(

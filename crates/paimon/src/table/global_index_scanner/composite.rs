@@ -152,7 +152,11 @@ impl GlobalIndexScanner {
                         unreachable!()
                     };
                     let queried = reader.query_composite(plan).await;
-                    self.return_reader(entry.resolved_path(&self.table_path), reader);
+                    self.return_reader(
+                        entry.resolved_path(&self.table_path),
+                        key_type.clone(),
+                        reader,
+                    );
                     match queried {
                         Ok(bitmap) => Ok(Some(
                             bitmap_to_ranges(&bitmap)
