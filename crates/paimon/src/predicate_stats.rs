@@ -71,7 +71,7 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         PredicateOperator::In => {
             return true;
         }
-        PredicateOperator::ArrayContains => {
+        PredicateOperator::BBoxIntersects | PredicateOperator::ArrayContains => {
             return all_null != Some(true);
         }
         PredicateOperator::ArraysOverlap => {
@@ -239,6 +239,7 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         | PredicateOperator::NotBetween
         | PredicateOperator::ArrayContains
         | PredicateOperator::ArraysOverlap
+        | PredicateOperator::BBoxIntersects
         | PredicateOperator::ArrayContainsAll => true,
     }
 }
@@ -377,6 +378,7 @@ pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
         | PredicateOperator::Like
         | PredicateOperator::ArrayContains
         | PredicateOperator::ArraysOverlap
+        | PredicateOperator::BBoxIntersects
         | PredicateOperator::ArrayContainsAll => false,
     }
 }
@@ -1054,13 +1056,14 @@ mod tests {
         let dt = DataType::Int(IntType::new());
         let fields = vec![DataField::new(0, "id".to_string(), dt.clone())];
         let mapping = vec![Some(0)];
-        let predicate = Predicate::negate(Predicate::Leaf {
+        // Built directly: `Predicate::negate` would flip the leaf to `<=`.
+        let predicate = Predicate::Not(Box::new(Predicate::Leaf {
             column: "id".to_string(),
             index: 0,
             data_type: dt,
             op: PredicateOperator::Gt,
             literals: vec![Datum::Int(5)],
-        });
+        }));
 
         let with_nulls = MockStats {
             row_count: 5,

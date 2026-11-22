@@ -25,13 +25,37 @@ Apache Paimon Rust follows [Semantic Versioning](https://semver.org/). All relea
 
 ## Upcoming
 
-### 0.5.0 (In Development)
-
-- Removed Lumina vector index support; use vindex DiskANN via `create_global_index` with `index_type => 'diskann'`. Rebuild existing Lumina indexes in the vindex format.
+### 0.6.0 (In Development)
 
 See [GitHub Issues](https://github.com/apache/paimon-rust/issues) for the current roadmap.
 
 ## Past Releases
+
+### [0.5.0](https://github.com/apache/paimon-rust/releases/tag/v0.5.0)
+
+Released on November 13, 2026.
+
+[Source, signature, and SHA-512 checksum](https://downloads.apache.org/paimon/paimon-rust-0.5.0/)
+ · [KEYS](https://downloads.apache.org/paimon/KEYS).
+
+The minimum supported Rust version for 0.5.0 is 1.95.
+
+Key features:
+
+- Append, primary-key and data-evolution compaction, with lookup changelog production and incremental primary-key compaction
+- Prepared and captured mutation plans, native MERGE execution, distributed dynamic-bucket execution, and expanded Arrow row-ID inputs
+- Native batch and streaming read improvements, REST query authorization, catalog branch and version management, and external table engine time travel
+- DataFusion 55.2 integration with expanded SQL functions, JSON operations, lateral collection generators, comments, and tag, branch and consumer procedures
+- Built-in full-text search, BTree-accelerated upsert key lookups, global-index maintenance, and scheduled hybrid search execution
+- Broader Java-compatible schema evolution, nested Parquet projection, temporal and decimal casts, VARIANT and ROW reads, and manifest codec support
+- Node-shared disk block caching, cached Parquet metadata, coalesced cache reads, and reuse of BTree and ROW sidecar metadata
+- Expanded C commit-message and schema APIs, Python streaming SQL results, temporal matching kernels and compaction APIs
+
+Compatibility changes:
+
+- The release lockfile uses DataFusion 55.2.0, Arrow 59.3.2 and Parquet 59.3.2.
+- Removed Lumina vector index support; use vindex DiskANN via `create_global_index` with `index_type => 'diskann'`. Rebuild existing Lumina indexes in the vindex format.
+- Full-text search is now built in. Remove the former `fulltext` Cargo feature from downstream dependency feature lists.
 
 ### [0.4.0](https://github.com/apache/paimon-rust/releases/tag/v0.4.0)
 

@@ -16,7 +16,7 @@
 // under the License.
 
 //! Shared sparse-vector spill, training, and native serialization.
-use super::vector_extraction::{local_ids, validate_vector_batch};
+use super::vector_extraction::{local_ids, validate_multi_vector_batch, validate_vector_batch};
 use super::vector_validation::{
     checked_std_vector_bytes, checked_training_sample_index, checked_training_vector_count,
     checked_vector_bytes,
@@ -32,7 +32,8 @@ use futures::TryStreamExt;
 use paimon_vindex_core::autotune::default_training_vector_count;
 use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
 use paimon_vindex_core::io::PosWriter;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::SyncIoBridge;
@@ -43,6 +44,7 @@ pub(in crate::table) struct VectorSpill {
     ids: tokio::fs::File,
     range: RowRange,
     dimension: usize,
+    multi_vector: bool,
     next_id: i64,
     rows: usize,
     vectors: usize,
@@ -65,11 +67,17 @@ impl VectorSpill {
             next_id: range.from(),
             range,
             dimension,
+            multi_vector: false,
             rows: 0,
             vectors: 0,
             bytes: 0,
         })
     }
+    pub fn with_multi_vector(mut self, multi_vector: bool) -> Self {
+        self.multi_vector = multi_vector;
+        self
+    }
+
     pub fn bytes_written(&self) -> usize {
         self.bytes
     }
@@ -80,7 +88,11 @@ impl VectorSpill {
         column: &str,
         timing_enabled: bool,
     ) -> Result<Duration> {
-        let vectors = validate_vector_batch(batch, column, self.dimension, &mut self.next_id)?;
+        let vectors = if self.multi_vector {
+            validate_multi_vector_batch(batch, column, self.dimension, &mut self.next_id)?
+        } else {
+            validate_vector_batch(batch, column, self.dimension, &mut self.next_id)?
+        };
         self.rows =
             self.rows
                 .checked_add(vectors.source_rows)
@@ -343,11 +355,60 @@ fn train_and_add_spilled_vectors(
     timing_enabled: bool,
 ) -> std::io::Result<(VectorIndexWriter, Duration, Duration, Duration)> {
     let train_start = timing_enabled.then(Instant::now);
+    let mut writer = train_spilled_model(&mut raw_file, config, vector_count, dimension, ratio)?;
+    let batch_rows = batch_rows(vector_count, dimension)?;
+    let mut buffer = MutableBuffer::new(checked_std_vector_bytes(batch_rows, dimension)?);
+    let train_finish = train_start.map_or(Duration::ZERO, |start| start.elapsed());
+    let mut raw_temp_reread = Duration::ZERO;
+    let mut index_add = Duration::ZERO;
+    raw_file.seek(SeekFrom::Start(0))?;
+    id_file.seek(SeekFrom::Start(0))?;
+    let mut ids = MutableBuffer::new(batch_rows * std::mem::size_of::<i64>());
+    let mut rows_added = 0;
+    while rows_added < vector_count {
+        let rows = batch_rows.min(vector_count - rows_added);
+        buffer.resize(checked_std_vector_bytes(rows, dimension)?, 0);
+        ids.resize(rows * std::mem::size_of::<i64>(), 0);
+        let read_start = timing_enabled.then(Instant::now);
+        raw_file.read_exact(buffer.as_slice_mut())?;
+        id_file.read_exact(ids.as_slice_mut())?;
+        if let Some(start) = read_start {
+            raw_temp_reread = raw_temp_reread.saturating_add(start.elapsed());
+        }
+        let add_start = timing_enabled.then(Instant::now);
+        writer.add_vectors(ids.typed_data::<i64>(), buffer.typed_data::<f32>(), rows)?;
+        if let Some(start) = add_start {
+            index_add = index_add.saturating_add(start.elapsed());
+        }
+        rows_added += rows;
+    }
+    let mut trailing = [0u8; 1];
+    if raw_file.read(&mut trailing)? != 0 || id_file.read(&mut trailing)? != 0 {
+        return Err(std::io::Error::other(
+            "temporary vindex vector or row ID file contains trailing bytes",
+        ));
+    }
+    Ok((writer, train_finish, raw_temp_reread, index_add))
+}
+
+fn batch_rows(vector_count: usize, dimension: usize) -> std::io::Result<usize> {
+    Ok(
+        (VECTOR_BUFFER_BYTES / checked_std_vector_bytes(1, dimension)?)
+            .max(1)
+            .min(vector_count),
+    )
+}
+
+fn train_spilled_model(
+    raw_file: &mut std::fs::File,
+    config: VectorIndexConfig,
+    vector_count: usize,
+    dimension: usize,
+    ratio: f64,
+) -> std::io::Result<VectorIndexWriter> {
     let samples =
         checked_training_vector_count(vector_count, ratio).map_err(std::io::Error::other)?;
-    let batch_rows = (VECTOR_BUFFER_BYTES / checked_std_vector_bytes(1, dimension)?)
-        .max(1)
-        .min(vector_count);
+    let batch_rows = batch_rows(vector_count, dimension)?;
     let mut buffer = MutableBuffer::new(checked_std_vector_bytes(batch_rows, dimension)?);
     let mut sample_buffer = Vec::with_capacity(batch_rows * dimension);
     let mut trainer = VectorIndexTrainer::new(config)?;
@@ -380,37 +441,148 @@ fn train_and_add_spilled_vectors(
             "vindex training sample count mismatch",
         ));
     }
-    let training = trainer.finish()?;
-    let train_finish = train_start.map_or(Duration::ZERO, |start| start.elapsed());
-    let mut writer = VectorIndexWriter::new(training);
-    let mut raw_temp_reread = Duration::ZERO;
-    let mut index_add = Duration::ZERO;
-    raw_file.seek(SeekFrom::Start(0))?;
-    id_file.seek(SeekFrom::Start(0))?;
-    let mut ids = MutableBuffer::new(batch_rows * std::mem::size_of::<i64>());
-    let mut rows_added = 0;
-    while rows_added < vector_count {
-        let rows = batch_rows.min(vector_count - rows_added);
-        buffer.resize(checked_std_vector_bytes(rows, dimension)?, 0);
-        ids.resize(rows * std::mem::size_of::<i64>(), 0);
-        let read_start = timing_enabled.then(Instant::now);
-        raw_file.read_exact(buffer.as_slice_mut())?;
-        id_file.read_exact(ids.as_slice_mut())?;
-        if let Some(start) = read_start {
-            raw_temp_reread = raw_temp_reread.saturating_add(start.elapsed());
-        }
-        let add_start = timing_enabled.then(Instant::now);
-        writer.add_vectors(ids.typed_data::<i64>(), buffer.typed_data::<f32>(), rows)?;
-        if let Some(start) = add_start {
-            index_add = index_add.saturating_add(start.elapsed());
-        }
-        rows_added += rows;
+    Ok(VectorIndexWriter::new(trainer.finish()?))
+}
+
+/// Keep one pair of files open for all centroids. Each source batch contributes
+/// a contiguous block per populated centroid, preserving its input row order.
+pub(in crate::table) struct RoutedVectors {
+    raw: std::fs::File,
+    ids: std::fs::File,
+    dimension: usize,
+    range: RowRange,
+    blocks: Vec<Vec<Range<usize>>>,
+}
+
+impl SpilledVectors {
+    pub fn vector_count(&self) -> usize {
+        self.count
     }
-    let mut trailing = [0u8; 1];
-    if raw_file.read(&mut trailing)? != 0 || id_file.read(&mut trailing)? != 0 {
-        return Err(std::io::Error::other(
-            "temporary vindex vector or row ID file contains trailing bytes",
-        ));
+
+    pub fn train_router(
+        &mut self,
+        config: VectorIndexConfig,
+        ratio: f64,
+    ) -> Result<VectorIndexWriter> {
+        train_spilled_model(&mut self.raw, config, self.count, self.dimension, ratio)
+            .map_err(spill_error)
     }
-    Ok((writer, train_finish, raw_temp_reread, index_add))
+
+    pub fn route(
+        mut self,
+        nlist: usize,
+        assign: impl Fn(&[f32]) -> Result<usize>,
+    ) -> Result<RoutedVectors> {
+        let mut raw = tempfile::tempfile().map_err(spill_error)?;
+        let mut ids = tempfile::tempfile().map_err(spill_error)?;
+        let batch_rows = batch_rows(self.count, self.dimension).map_err(spill_error)?;
+        let mut values = MutableBuffer::new(checked_vector_bytes(batch_rows, self.dimension)?);
+        let mut row_ids = MutableBuffer::new(batch_rows * size_of::<i64>());
+        let mut blocks = vec![Vec::new(); nlist];
+        let mut positions = vec![Vec::new(); nlist];
+        self.raw.seek(SeekFrom::Start(0)).map_err(spill_error)?;
+        self.ids.seek(SeekFrom::Start(0)).map_err(spill_error)?;
+        let mut start = 0;
+        while start < self.count {
+            let rows = batch_rows.min(self.count - start);
+            values.resize(checked_vector_bytes(rows, self.dimension)?, 0);
+            row_ids.resize(rows * size_of::<i64>(), 0);
+            self.raw
+                .read_exact(values.as_slice_mut())
+                .map_err(spill_error)?;
+            self.ids
+                .read_exact(row_ids.as_slice_mut())
+                .map_err(spill_error)?;
+            for (row, vector) in values
+                .typed_data::<f32>()
+                .chunks_exact(self.dimension)
+                .enumerate()
+            {
+                positions[assign(vector)?].push(row);
+            }
+            let stride = checked_vector_bytes(1, self.dimension)?;
+            let mut raw_block = Vec::new();
+            let mut id_block = Vec::new();
+            for (centroid, rows) in positions
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, rows)| !rows.is_empty())
+            {
+                let end = start + rows.len();
+                blocks[centroid].push(start..end);
+                for row in rows.drain(..) {
+                    raw_block
+                        .extend_from_slice(&values.as_slice()[row * stride..(row + 1) * stride]);
+                    id_block.extend_from_slice(
+                        &row_ids.as_slice()[row * size_of::<i64>()..(row + 1) * size_of::<i64>()],
+                    );
+                }
+                raw.write_all(&raw_block).map_err(spill_error)?;
+                ids.write_all(&id_block).map_err(spill_error)?;
+                raw_block.clear();
+                id_block.clear();
+                start = end;
+            }
+        }
+        Ok(RoutedVectors {
+            raw,
+            ids,
+            dimension: self.dimension,
+            range: self.range,
+            blocks,
+        })
+    }
+}
+
+impl RoutedVectors {
+    pub fn partition(&mut self, centroid: usize) -> Result<Option<SpilledVectors>> {
+        let blocks = &self.blocks[centroid];
+        if blocks.is_empty() {
+            return Ok(None);
+        }
+        let mut raw = tempfile::tempfile().map_err(spill_error)?;
+        let mut ids = tempfile::tempfile().map_err(spill_error)?;
+        let mut count = 0;
+        let mut buffer = Vec::new();
+        for block in blocks {
+            copy_vector_block(
+                &mut self.raw,
+                &mut raw,
+                &mut buffer,
+                block,
+                checked_vector_bytes(1, self.dimension)?,
+            )?;
+            copy_vector_block(
+                &mut self.ids,
+                &mut ids,
+                &mut buffer,
+                block,
+                size_of::<i64>(),
+            )?;
+            count += block.len();
+        }
+        Ok(Some(SpilledVectors {
+            raw,
+            ids,
+            count,
+            dimension: self.dimension,
+            range: self.range.clone(),
+        }))
+    }
+}
+
+fn copy_vector_block(
+    source: &mut std::fs::File,
+    target: &mut std::fs::File,
+    buffer: &mut Vec<u8>,
+    block: &Range<usize>,
+    stride: usize,
+) -> Result<()> {
+    buffer.resize(block.len() * stride, 0);
+    source
+        .seek(SeekFrom::Start((block.start * stride) as u64))
+        .map_err(spill_error)?;
+    source.read_exact(buffer).map_err(spill_error)?;
+    target.write_all(buffer).map_err(spill_error)?;
+    Ok(())
 }

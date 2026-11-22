@@ -88,7 +88,8 @@ impl RESTCatalog {
             .get(CatalogOptions::WAREHOUSE)
             .cloned()
             .unwrap_or_default();
-        let local_cache = create_local_cache_with_namespace_async(&options, &api_options).await?;
+        let local_cache =
+            create_local_cache_with_namespace_async(&api_options, &api_options).await?;
         let file_io_cache = FileIOCacheContext::from_props(api_options.to_map())?;
 
         let fuse_resolver = Arc::new(super::FusePathResolver::new(&api_options));
@@ -639,6 +640,21 @@ impl Catalog for RESTCatalog {
             .map_err(|error| map_rest_error_for_create_function(error, function.identifier()));
         ignore_error_if(result, |error| {
             ignore_if_exists && matches!(error, Error::FunctionAlreadyExist { .. })
+        })
+    }
+
+    async fn drop_function(
+        &self,
+        identifier: &Identifier,
+        ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        let result = self
+            .api
+            .drop_function(identifier)
+            .await
+            .map_err(|error| map_rest_error_for_function(error, identifier));
+        ignore_error_if(result, |error| {
+            ignore_if_not_exists && matches!(error, Error::FunctionNotExist { .. })
         })
     }
 
@@ -1234,6 +1250,79 @@ mod tests {
             assert_eq!(catalog.warehouse(), warehouse.unwrap_or("server-default"));
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_server_cache_options_share_one_catalog_cache_across_table_loads() {
+        use crate::spec::{DataType, IntType};
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let directory = tempfile::tempdir().unwrap();
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let response = serde_json::json!({
+            "id": "table-uuid", "database": "default", "name": "t",
+            "path": directory.path().to_str().unwrap(), "isExternal": false,
+            "schemaId": 0, "schema": schema
+        });
+        // Defaults are overridden by the client, while server overrides win over both.
+        for (client_enabled, server_override, expected_enabled) in [
+            (None, None, true),
+            (Some("false"), None, false),
+            (Some("true"), Some("false"), false),
+            (Some("false"), Some("true"), true),
+        ] {
+            let mut overrides = HashMap::new();
+            if let Some(value) = server_override {
+                overrides.insert(CatalogOptions::LOCAL_CACHE_ENABLED, value);
+            }
+            let config = serde_json::json!({
+                "defaults": {"local-cache.enabled": "true", "local-cache.max-size": "1 MiB"},
+                "overrides": overrides
+            });
+            let table_response = response.clone();
+            let app = Router::new()
+                .route("/v1/config", get(move || async move { Json(config) }))
+                .route(
+                    "/v1/databases/default/tables/t",
+                    get(move || async move { Json(table_response) }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut options = Options::new();
+            options.set(CatalogOptions::URI, format!("http://{address}"));
+            options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+            options.set(CatalogOptions::TOKEN, "test-token");
+            if let Some(value) = client_enabled {
+                options.set(CatalogOptions::LOCAL_CACHE_ENABLED, value);
+            }
+            let catalog = RESTCatalog::new(options, true).await.unwrap();
+            let identifier = Identifier::new("default", "t");
+            let first = catalog.get_table(&identifier).await.unwrap();
+            let second = catalog.get_table(&identifier).await.unwrap();
+            let first_cache = first.file_io().local_cache();
+            let second_cache = second.file_io().local_cache();
+            assert_eq!(catalog.local_cache.is_some(), expected_enabled);
+            assert_eq!(first_cache.is_some(), expected_enabled);
+            assert_eq!(second_cache.is_some(), expected_enabled);
+            if let Some(cache) = &catalog.local_cache {
+                // Sharing this manager also shares its configured capacity budget.
+                assert!(Arc::ptr_eq(cache, first_cache.as_ref().unwrap()));
+                assert!(Arc::ptr_eq(cache, second_cache.as_ref().unwrap()));
+                assert_eq!(
+                    catalog
+                        .options
+                        .get(CatalogOptions::LOCAL_CACHE_MAX_SIZE)
+                        .unwrap(),
+                    "1 MiB"
+                );
+            }
+            server.abort();
+        }
     }
 
     #[tokio::test]

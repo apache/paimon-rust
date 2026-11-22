@@ -48,6 +48,20 @@ pub fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
     (temp_dir, Arc::new(catalog))
 }
 
+#[allow(dead_code)]
+pub fn files_under(path: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    let mut files = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(path).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(files_under(&path));
+        } else {
+            files.insert(path);
+        }
+    }
+    files
+}
+
 pub async fn create_sql_context(catalog: Arc<FileSystemCatalog>) -> SQLContext {
     let mut ctx = SQLContext::new();
     ctx.register_catalog("paimon", catalog).await.unwrap();

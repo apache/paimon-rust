@@ -17,7 +17,7 @@
 
 //! Shared field declarations and native options for global-index maintenance and raw reads.
 
-use crate::spec::CoreOptions;
+use crate::spec::{CoreOptions, DataField, TableSchema};
 use crate::table::global_index_types::normalize_global_index_type;
 use crate::table::{GlobalIndexBuildBuilder, Table};
 use crate::Result;
@@ -42,8 +42,8 @@ impl Definition {
 }
 
 /// Ownership is shared by maintenance and both table modes' read paths.
-pub(super) fn declarations(options: &HashMap<String, String>) -> Result<Vec<Definition>> {
-    declarations_impl(options, true)
+pub(super) fn declarations(schema: &TableSchema) -> Result<Vec<Definition>> {
+    declarations_impl(schema.options(), Some(schema.fields()))
 }
 
 /// Read planning can encounter unresolved legacy schema properties. Ignore
@@ -51,13 +51,17 @@ pub(super) fn declarations(options: &HashMap<String, String>) -> Result<Vec<Defi
 pub(super) fn declarations_for_read(
     options: &HashMap<String, String>,
 ) -> Result<Vec<(String, String)>> {
-    Ok(declarations_impl(options, false)?
+    Ok(declarations_impl(options, None)?
         .into_iter()
         .map(|definition| (definition.column, definition.index_type))
         .collect())
 }
 
-fn declarations_impl(options: &HashMap<String, String>, strict: bool) -> Result<Vec<Definition>> {
+fn declarations_impl(
+    options: &HashMap<String, String>,
+    fields: Option<&[DataField]>,
+) -> Result<Vec<Definition>> {
+    let strict = fields.is_some();
     let core = CoreOptions::new(options);
     for kind in core.global_index_types() {
         if strict && kind != "vector" && normalize_global_index_type(&kind).is_none() {
@@ -68,7 +72,15 @@ fn declarations_impl(options: &HashMap<String, String>, strict: bool) -> Result<
     }
     let mut result = Vec::new();
     let mut owners = HashSet::new();
-    for family in ["btree", "bitmap", "multivalue", "fm", "full-text", "vector"] {
+    for family in [
+        "btree",
+        "bitmap",
+        "multivalue",
+        "fm",
+        "rtree",
+        "full-text",
+        "vector",
+    ] {
         let columns = if family == "vector" {
             core.vector_index_columns()
         } else {
@@ -85,8 +97,14 @@ fn declarations_impl(options: &HashMap<String, String>, strict: bool) -> Result<
             if !owners.insert(column.clone()) {
                 return Err(crate::Error::ConfigInvalid { message: format!("Column '{column}' can own at most one primary-key index or automatically maintained global index") });
             }
-            let (kind, resolved) = if family == "vector" && strict {
-                let resolved = core.vector_index_options(None, &column, true)?;
+            let (kind, resolved) = if let ("vector", Some(fields)) = (family, fields) {
+                let default_metric = fields
+                    .iter()
+                    .find(|field| field.name() == column)
+                    .is_none_or(|field| {
+                        crate::vindex::multi_vector::embedding_type(field.data_type()).is_none()
+                    });
+                let resolved = core.vector_index_options(None, &column, default_metric)?;
                 let kind = resolved
                     .index_type
                     .ok_or_else(|| crate::Error::ConfigInvalid {
@@ -125,7 +143,7 @@ fn declarations_impl(options: &HashMap<String, String>, strict: bool) -> Result<
 
 pub(super) fn definitions(table: &Table) -> Result<Vec<Definition>> {
     let options = table.schema().options();
-    let owners = declarations(options)?
+    let owners = declarations(table.schema())?
         .into_iter()
         .map(|definition| (definition.column.clone(), definition))
         .collect::<HashMap<_, _>>();
@@ -164,9 +182,18 @@ pub(super) fn field_index_options(
     _family: &str,
     index_type: &str,
 ) -> Result<HashMap<String, String>> {
+    field_index_option_overrides(table_options, column, index_type, true)
+}
+
+fn field_index_option_overrides(
+    table_options: &HashMap<String, String>,
+    column: &str,
+    index_type: &str,
+    default_vector_metric: bool,
+) -> Result<HashMap<String, String>> {
     let core = CoreOptions::new(table_options);
     let resolved = if crate::vindex::is_vindex_index_type(index_type) {
-        core.vector_index_options(Some(index_type), column, true)?
+        core.vector_index_options(Some(index_type), column, default_vector_metric)?
             .options
     } else {
         core.global_index_options(index_type, column)?
@@ -284,6 +311,7 @@ pub(super) fn declared_options(
     column: &str,
     family: &str,
     index_type: &str,
+    default_vector_metric: bool,
 ) -> Result<HashMap<String, String>> {
     let prefixes = [
         format!("fields.{column}.global-index.{family}."),
@@ -295,7 +323,7 @@ pub(super) fn declared_options(
             .keys()
             .any(|key| prefixes.iter().any(|prefix| key.starts_with(prefix)))
     {
-        field_index_options(options, column, family, index_type)
+        field_index_option_overrides(options, column, index_type, default_vector_metric)
     } else {
         Ok(HashMap::new())
     }

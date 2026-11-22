@@ -61,7 +61,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             message: "vindex row count does not fit usize".into(),
             source: Some(Box::new(error)),
         })?;
-        let use_granule = self.index_type != DISKANN_IDENTIFIER
+        let use_granule = !options.multi_vector && self.index_type != DISKANN_IDENTIFIER
             && options.granule_build_enabled
             && !options.needs_vector_count()
             // Invalid training options still produce no file for an all-NULL
@@ -139,7 +139,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let mut spill = VectorSpill::new(
             RowRange::new(shard.row_range_start, shard.row_range_end),
             dimension_usize,
-        )?;
+        )?
+        .with_multi_vector(options.multi_vector);
         let split = data_split_for_shard(shard)?;
         let mut read_builder = self.table.new_read_builder();
         read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;

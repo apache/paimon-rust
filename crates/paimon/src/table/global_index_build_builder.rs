@@ -124,6 +124,7 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
             columns[0],
             index_type,
             index_type,
+            true,
         )?;
         Ok(effective.copy_with_options(defaults))
     }

@@ -46,7 +46,7 @@ mod variant;
 
 pub use read_budget::ReadBudget;
 pub use row_filter::{RowFilter, RowFilterContext, RowFilterFactory};
-pub use variant::variant_get_numeric_fields;
+pub use variant::{variant_get, variant_get_numeric_fields};
 
 use crate::spec::{
     ArrayType, BigIntType, BinaryType, BooleanType, DataField, DataType as PaimonDataType,
@@ -63,6 +63,11 @@ const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
 
 /// Converts a Paimon [`DataType`](PaimonDataType) to an Arrow [`DataType`](ArrowDataType).
 pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType> {
+    paimon_arrow_type(dt, false)
+}
+
+fn paimon_arrow_type(dt: &PaimonDataType, for_read: bool) -> crate::Result<ArrowDataType> {
+    let field = |name: &str, ty: &PaimonDataType| paimon_arrow_field(name, ty, for_read);
     Ok(match dt {
         PaimonDataType::Boolean(_) => ArrowDataType::Boolean,
         PaimonDataType::TinyInt(_) => ArrowDataType::Int8,
@@ -72,7 +77,10 @@ pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType>
         PaimonDataType::Float(_) => ArrowDataType::Float32,
         PaimonDataType::Double(_) => ArrowDataType::Float64,
         PaimonDataType::VarChar(_) | PaimonDataType::Char(_) => ArrowDataType::Utf8,
-        PaimonDataType::Binary(_) | PaimonDataType::VarBinary(_) => ArrowDataType::Binary,
+        PaimonDataType::Binary(_)
+        | PaimonDataType::VarBinary(_)
+        | PaimonDataType::Geometry(_)
+        | PaimonDataType::Geography(_) => ArrowDataType::Binary,
         PaimonDataType::Blob(_) => ArrowDataType::LargeBinary,
         PaimonDataType::Variant(_) => variant_arrow_type(),
         PaimonDataType::Date(_) => ArrowDataType::Date32,
@@ -93,60 +101,41 @@ pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType>
             ArrowDataType::Decimal128(p, s)
         }
         PaimonDataType::Array(a) => {
-            let element_type = paimon_type_to_arrow(a.element_type())?;
-            ArrowDataType::List(Arc::new(ArrowField::new(
-                "element",
-                element_type,
-                a.element_type().is_nullable(),
-            )))
+            ArrowDataType::List(Arc::new(field("element", a.element_type())?))
         }
-        PaimonDataType::Map(m) => {
-            let key_type = paimon_type_to_arrow(m.key_type())?;
-            let value_type = paimon_type_to_arrow(m.value_type())?;
-            ArrowDataType::Map(
-                Arc::new(ArrowField::new(
-                    "entries",
-                    ArrowDataType::Struct(
-                        vec![
-                            ArrowField::new("key", key_type, false),
-                            ArrowField::new("value", value_type, m.value_type().is_nullable()),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
+        PaimonDataType::Map(m) => ArrowDataType::Map(
+            Arc::new(ArrowField::new(
+                "entries",
+                ArrowDataType::Struct(
+                    vec![
+                        field("key", m.key_type())?.with_nullable(false),
+                        field("value", m.value_type())?,
+                    ]
+                    .into(),
+                ),
                 false,
-            )
-        }
-        PaimonDataType::Multiset(m) => {
-            let element_type = paimon_type_to_arrow(m.element_type())?;
-            ArrowDataType::Map(
-                Arc::new(ArrowField::new(
-                    "entries",
-                    ArrowDataType::Struct(
-                        vec![
-                            ArrowField::new("key", element_type, false),
-                            ArrowField::new("value", ArrowDataType::Int32, false),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
+            )),
+            false,
+        ),
+        PaimonDataType::Multiset(m) => ArrowDataType::Map(
+            Arc::new(ArrowField::new(
+                "entries",
+                ArrowDataType::Struct(
+                    vec![
+                        field("key", m.element_type())?.with_nullable(false),
+                        ArrowField::new("value", ArrowDataType::Int32, false),
+                    ]
+                    .into(),
+                ),
                 false,
-            )
-        }
+            )),
+            false,
+        ),
         PaimonDataType::Row(r) => {
             let fields: Vec<ArrowField> = r
                 .fields()
                 .iter()
-                .map(|f| {
-                    let arrow_type = paimon_type_to_arrow(f.data_type())?;
-                    Ok(ArrowField::new(
-                        f.name(),
-                        arrow_type,
-                        f.data_type().is_nullable(),
-                    ))
-                })
+                .map(|f| field(f.name(), f.data_type()))
                 .collect::<crate::Result<Vec<_>>>()?;
             ArrowDataType::Struct(fields.into())
         }
@@ -241,7 +230,7 @@ pub fn arrow_to_paimon_type(
             nullable, *p as u32, *s as u32,
         )?)),
         ArrowDataType::List(field) | ArrowDataType::LargeList(field) => {
-            let element = arrow_to_paimon_type(field.data_type(), field.is_nullable())?;
+            let element = arrow_field_to_paimon_type(field)?;
             Ok(PaimonDataType::Array(ArrayType::with_nullable(
                 nullable, element,
             )))
@@ -249,9 +238,8 @@ pub fn arrow_to_paimon_type(
         ArrowDataType::Map(entries_field, _) => {
             if let ArrowDataType::Struct(fields) = entries_field.data_type() {
                 if fields.len() == 2 {
-                    let key = arrow_to_paimon_type(fields[0].data_type(), fields[0].is_nullable())?;
-                    let value =
-                        arrow_to_paimon_type(fields[1].data_type(), fields[1].is_nullable())?;
+                    let key = arrow_field_to_paimon_type(&fields[0])?;
+                    let value = arrow_field_to_paimon_type(&fields[1])?;
                     return Ok(PaimonDataType::Map(MapType::with_nullable(
                         nullable, key, value,
                     )));
@@ -322,9 +310,11 @@ pub(crate) fn is_variant_arrow_fields(fields: &arrow_schema::Fields) -> bool {
     fields.len() == 2
         && fields[0].name() == "value"
         && fields[0].data_type() == &ArrowDataType::Binary
+        && fields[0].extension_type_name().is_none()
         && !fields[0].is_nullable()
         && fields[1].name() == "metadata"
         && fields[1].data_type() == &ArrowDataType::Binary
+        && fields[1].extension_type_name().is_none()
         && !fields[1].is_nullable()
 }
 
@@ -353,117 +343,142 @@ fn arrow_field_with_paimon_id(
     ArrowField::new(name, data_type, nullable).with_metadata(metadata)
 }
 
-/// Convert Arrow fields to Paimon [`DataField`]s with auto-assigned IDs starting from 0.
+/// Convert Arrow fields to Paimon [`DataField`]s, preserving explicit field IDs.
+/// Fields without IDs receive positional IDs starting from 0.
 pub fn arrow_fields_to_paimon(fields: &[ArrowField]) -> crate::Result<Vec<DataField>> {
     fields
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            let paimon_type = arrow_to_paimon_type(f.data_type(), f.is_nullable())?;
-            Ok(DataField::new(i as i32, f.name().clone(), paimon_type))
+            let paimon_type = arrow_field_to_paimon_type(f)?;
+            Ok(DataField::new(
+                arrow_field_id(f).unwrap_or(i as i32),
+                f.name().clone(),
+                paimon_type,
+            ))
         })
         .collect()
 }
 
 /// Build an Arrow [`Schema`](ArrowSchema) from Paimon [`DataField`]s.
 pub fn build_target_arrow_schema(fields: &[DataField]) -> crate::Result<Arc<ArrowSchema>> {
-    let arrow_fields: Vec<ArrowField> = fields
-        .iter()
-        .map(|f| {
-            let arrow_type = paimon_type_to_arrow(f.data_type())?;
-            Ok(arrow_field_with_paimon_id(
-                f.name(),
-                arrow_type,
-                f.data_type().is_nullable(),
-                f.id(),
-            ))
-        })
-        .collect::<crate::Result<Vec<_>>>()?;
-    Ok(Arc::new(ArrowSchema::new(arrow_fields)))
+    build_arrow_schema(fields, false)
 }
 
 /// Read results can contain NULL after a Java cast overflows or a historical
 /// file lacks a requested field, even when the current logical type is NOT NULL.
-/// Keep those runtime values representable without relaxing the writer schema.
 pub(crate) fn paimon_type_to_arrow_for_read(dt: &PaimonDataType) -> crate::Result<ArrowDataType> {
-    Ok(match dt {
-        PaimonDataType::Row(row) => ArrowDataType::Struct(
-            row.fields()
-                .iter()
-                .map(|field| {
-                    Ok(ArrowField::new(
-                        field.name(),
-                        paimon_type_to_arrow_for_read(field.data_type())?,
-                        true,
-                    ))
-                })
-                .collect::<crate::Result<Vec<_>>>()?
-                .into(),
-        ),
-        PaimonDataType::Array(array) => ArrowDataType::List(Arc::new(ArrowField::new(
-            "element",
-            paimon_type_to_arrow_for_read(array.element_type())?,
-            true,
-        ))),
-        PaimonDataType::Map(map) => ArrowDataType::Map(
-            Arc::new(ArrowField::new(
-                "entries",
-                ArrowDataType::Struct(
-                    vec![
-                        ArrowField::new(
-                            "key",
-                            paimon_type_to_arrow_for_read(map.key_type())?,
-                            false,
-                        ),
-                        ArrowField::new(
-                            "value",
-                            paimon_type_to_arrow_for_read(map.value_type())?,
-                            true,
-                        ),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        ),
-        PaimonDataType::Multiset(multiset) => ArrowDataType::Map(
-            Arc::new(ArrowField::new(
-                "entries",
-                ArrowDataType::Struct(
-                    vec![
-                        ArrowField::new(
-                            "key",
-                            paimon_type_to_arrow_for_read(multiset.element_type())?,
-                            false,
-                        ),
-                        ArrowField::new("value", ArrowDataType::Int32, false),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        ),
-        _ => paimon_type_to_arrow(dt)?,
-    })
+    paimon_arrow_type(dt, true)
 }
 
-/// Build the nullable runtime schema used by table readers. Logical table
-/// constraints and the schema used to validate/write new records are unchanged.
+/// Build the nullable runtime schema used by table readers.
 pub fn build_read_arrow_schema(fields: &[DataField]) -> crate::Result<Arc<ArrowSchema>> {
+    build_arrow_schema(fields, true)
+}
+
+fn build_arrow_schema(fields: &[DataField], for_read: bool) -> crate::Result<Arc<ArrowSchema>> {
     let fields = fields
         .iter()
-        .map(|field| {
-            Ok(arrow_field_with_paimon_id(
-                field.name(),
-                paimon_type_to_arrow_for_read(field.data_type())?,
-                true,
-                field.id(),
-            ))
+        .map(|f| {
+            let mut field = paimon_arrow_field(f.name(), f.data_type(), for_read)?;
+            field
+                .metadata_mut()
+                .insert(PARQUET_FIELD_ID_META_KEY.into(), f.id().to_string());
+            Ok(field)
         })
         .collect::<crate::Result<Vec<_>>>()?;
     Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+pub(crate) const GEOARROW_WKB: &str = "geoarrow.wkb";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GeoArrowMetadata<C> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edges: Option<String>,
+    crs: Option<C>,
+}
+
+fn geoarrow_metadata_error(error: serde_json::Error) -> crate::Error {
+    crate::Error::DataTypeInvalid {
+        message: format!("Invalid geoarrow.wkb metadata: {error}"),
+    }
+}
+
+/// Build an Arrow field, including extension metadata for logical types such as WKB.
+pub fn paimon_type_to_arrow_field(name: &str, ty: &PaimonDataType) -> crate::Result<ArrowField> {
+    paimon_arrow_field(name, ty, false)
+}
+
+fn paimon_arrow_field(
+    name: &str,
+    ty: &PaimonDataType,
+    for_read: bool,
+) -> crate::Result<ArrowField> {
+    use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
+    let mut field = ArrowField::new(
+        name,
+        paimon_arrow_type(ty, for_read)?,
+        for_read || ty.is_nullable(),
+    );
+    let (crs, edges) = match ty {
+        PaimonDataType::Geometry(g) => (g.crs(), None),
+        PaimonDataType::Geography(g) => (g.crs(), Some(g.algorithm().to_string())),
+        _ => return Ok(field),
+    };
+    // Java writes the original CRS as a string, including PROJJSON.
+    let metadata = serde_json::to_string(&GeoArrowMetadata {
+        edges,
+        crs: Some(crs),
+    })
+    .map_err(geoarrow_metadata_error)?;
+    field
+        .metadata_mut()
+        .insert(EXTENSION_TYPE_NAME_KEY.into(), GEOARROW_WKB.into());
+    field
+        .metadata_mut()
+        .insert(EXTENSION_TYPE_METADATA_KEY.into(), metadata);
+    Ok(field)
+}
+
+/// Convert an Arrow field, preserving its GeoArrow logical type when present.
+pub fn arrow_field_to_paimon_type(field: &ArrowField) -> crate::Result<PaimonDataType> {
+    if field.extension_type_name() != Some(GEOARROW_WKB) {
+        return arrow_to_paimon_type(field.data_type(), field.is_nullable());
+    }
+    if !matches!(
+        field.data_type(),
+        ArrowDataType::Binary | ArrowDataType::LargeBinary | ArrowDataType::BinaryView
+    ) {
+        return Err(crate::Error::DataTypeInvalid {
+            message: format!("Invalid geoarrow.wkb storage type: {}", field.data_type()),
+        });
+    }
+    let md: GeoArrowMetadata<&serde_json::value::RawValue> =
+        serde_json::from_str(field.extension_type_metadata().unwrap_or("{}"))
+            .map_err(geoarrow_metadata_error)?;
+    // GeoArrow omits the CRS when unknown. Parquet represents an unknown CRS with srid:0.
+    let crs = match md.crs.map(serde_json::value::RawValue::get) {
+        None => "srid:0".into(),
+        Some(s) if s.starts_with('"') => {
+            serde_json::from_str(s).map_err(geoarrow_metadata_error)?
+        }
+        Some(object) if object.starts_with('{') => object.to_owned(),
+        Some(value) => {
+            return Err(crate::Error::DataTypeInvalid {
+                message: format!("Invalid geoarrow.wkb CRS: {value}"),
+            })
+        }
+    };
+    let nullable = field.is_nullable();
+    match md.edges.as_deref() {
+        None | Some("planar") => Ok(PaimonDataType::Geometry(
+            crate::spec::GeometryType::with_nullable(nullable, crs)?,
+        )),
+        Some(edges) => Ok(PaimonDataType::Geography(
+            crate::spec::GeographyType::with_nullable(nullable, crs, edges.parse()?)?,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -485,6 +500,61 @@ mod tests {
     ) {
         let paimon = arrow_to_paimon_type(arrow, nullable).unwrap();
         assert_eq!(&paimon, expected_paimon, "arrow_to_paimon_type mismatch");
+    }
+
+    #[test]
+    fn geospatial_arrow_crs_preserves_identifiers_and_projjson() {
+        let projjson = r#" { "type": "GeographicCRS", "name": "Example" } "#;
+        for crs in ["OGC:CRS84", "srid:0", projjson, "{custom"] {
+            let ty = PaimonDataType::Geometry(crate::spec::GeometryType::new(crs).unwrap());
+            let field = paimon_type_to_arrow_field("geometry", &ty).unwrap();
+            assert_eq!(arrow_field_to_paimon_type(&field).unwrap(), ty);
+            let metadata: serde_json::Value =
+                serde_json::from_str(field.extension_type_metadata().unwrap()).unwrap();
+            assert_eq!(metadata, serde_json::json!({ "crs": crs }));
+            assert_eq!(field.metadata().len(), 2);
+        }
+
+        let mut field = ArrowField::new("geom", ArrowDataType::Binary, true);
+        field.metadata_mut().insert(
+            arrow_schema::extension::EXTENSION_TYPE_NAME_KEY.into(),
+            GEOARROW_WKB.into(),
+        );
+        for (metadata, expected) in [
+            (format!(r#"{{"crs":{projjson}}}"#), projjson.trim()),
+            ("{}".to_owned(), "srid:0"),
+        ] {
+            field.metadata_mut().insert(
+                arrow_schema::extension::EXTENSION_TYPE_METADATA_KEY.into(),
+                metadata,
+            );
+            assert_eq!(
+                arrow_field_to_paimon_type(&field).unwrap(),
+                PaimonDataType::Geometry(GeometryType::new(expected).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn geospatial_fields_with_variant_names_stay_a_row() {
+        let geometry = PaimonDataType::Geometry(GeometryType::default());
+        let binary = PaimonDataType::VarBinary(
+            VarBinaryType::try_new(false, VarBinaryType::MAX_LENGTH).unwrap(),
+        );
+        let fields = [
+            DataField::new(
+                0,
+                "value".into(),
+                geometry.copy_with_nullable(false).unwrap(),
+            ),
+            DataField::new(1, "metadata".into(), binary),
+        ];
+        let row =
+            ArrowDataType::Struct(build_target_arrow_schema(&fields).unwrap().fields().clone());
+        assert_eq!(
+            arrow_to_paimon_type(&row, true).unwrap(),
+            PaimonDataType::Row(RowType::new(fields.to_vec()))
+        );
     }
 
     #[test]

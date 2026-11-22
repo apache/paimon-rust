@@ -54,7 +54,7 @@ use std::fmt;
 /// e.g. `Decimal(10, scale=1)` == `Decimal(100, scale=2)`
 /// because both represent `1.0`.
 ///
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Datum {
     Bool(bool),
     TinyInt(i8),
@@ -269,7 +269,7 @@ fn java_bytes_cmp(a: &[u8], b: &[u8]) -> Ordering {
 // ---------------------------------------------------------------------------
 
 /// Predicate operators for leaf predicates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PredicateOperator {
     IsNull,
     IsNotNull,
@@ -290,6 +290,48 @@ pub enum PredicateOperator {
     Like,
     Between,
     NotBetween,
+    BBoxIntersects,
+}
+
+impl PredicateOperator {
+    /// The operator selecting the complement of the non-NULL rows, matching
+    /// Java `LeafFunction.negate`. `None` when there is no such operator.
+    fn negate(self) -> Option<Self> {
+        Some(match self {
+            Self::IsNull => Self::IsNotNull,
+            Self::IsNotNull => Self::IsNull,
+            Self::Eq => Self::NotEq,
+            Self::NotEq => Self::Eq,
+            Self::Lt => Self::GtEq,
+            Self::GtEq => Self::Lt,
+            Self::LtEq => Self::Gt,
+            Self::Gt => Self::LtEq,
+            Self::In => Self::NotIn,
+            Self::NotIn => Self::In,
+            Self::Between => Self::NotBetween,
+            Self::NotBetween => Self::Between,
+            Self::StartsWith
+            | Self::EndsWith
+            | Self::Contains
+            | Self::ArrayContains
+            | Self::ArraysOverlap
+            | Self::ArrayContainsAll
+            | Self::BBoxIntersects
+            | Self::Like => return None,
+        })
+    }
+}
+
+/// The operator [`Predicate::negate`] flips `op` to on a field of `data_type`.
+fn negated_op(op: PredicateOperator, data_type: &DataType) -> Option<PredicateOperator> {
+    // `NaN < 1.0` and `NaN >= 1.0` are both false, so a flipped comparison
+    // would drop NaN. `Not` keeps it, as Java's NaN-last ordering does.
+    if matches!(data_type, DataType::Float(_) | DataType::Double(_))
+        && !matches!(op, PredicateOperator::IsNull | PredicateOperator::IsNotNull)
+    {
+        return None;
+    }
+    op.negate()
 }
 
 impl fmt::Display for PredicateOperator {
@@ -311,6 +353,7 @@ impl fmt::Display for PredicateOperator {
             Self::ArrayContains => write!(f, "ARRAY_CONTAINS"),
             Self::ArraysOverlap => write!(f, "ARRAYS_OVERLAP"),
             Self::ArrayContainsAll => write!(f, "ARRAY_CONTAINS_ALL"),
+            Self::BBoxIntersects => write!(f, "BBOX_INTERSECTS"),
             Self::Like => write!(f, "LIKE"),
             Self::Between => write!(f, "BETWEEN"),
             Self::NotBetween => write!(f, "NOT BETWEEN"),
@@ -328,7 +371,7 @@ impl fmt::Display for PredicateOperator {
 /// - `And` / `Or`: N-ary logical connectives (auto-flattened)
 /// - `Not`: logical negation
 /// - `AlwaysTrue` / `AlwaysFalse`: constant predicates
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Predicate {
     /// Leaf: column op literal(s).
     Leaf {
@@ -470,34 +513,26 @@ impl Predicate {
 
     /// Negate a predicate with simplification.
     ///
+    /// Like Java `Predicate.negate`, leaf operators are flipped (`=` / `!=`,
+    /// `<` / `>=`, `IS NULL` / `IS NOT NULL`, `IN` / `NOT IN`, ...) and AND/OR
+    /// are pushed down with De Morgan, so a NULL input still evaluates to false.
+    /// A plain `!p` would select NULL rows for `NOT(p = 'a')`.
+    ///
     /// - `NOT(NOT(p))` → `p` (double negation elimination)
     /// - `NOT(AlwaysTrue)` → `AlwaysFalse`
     /// - `NOT(AlwaysFalse)` → `AlwaysTrue`
+    /// - Leaves without a negated operator stay wrapped in `Not`, and so do
+    ///   FLOAT/DOUBLE comparisons, which NaN makes non-complementary.
     pub fn negate(predicate: Predicate) -> Predicate {
         match predicate {
             Predicate::Not(inner) => *inner,
             Predicate::AlwaysTrue => Predicate::AlwaysFalse,
             Predicate::AlwaysFalse => Predicate::AlwaysTrue,
-            Predicate::NestedLeaf {
-                root,
-                index,
-                path,
-                op,
-                literals,
-            } if literals.is_empty()
-                && matches!(op, PredicateOperator::In | PredicateOperator::NotIn) =>
-            {
-                Predicate::NestedLeaf {
-                    root,
-                    index,
-                    path,
-                    op: if op == PredicateOperator::In {
-                        PredicateOperator::NotIn
-                    } else {
-                        PredicateOperator::In
-                    },
-                    literals,
-                }
+            Predicate::And(children) => {
+                Predicate::or(children.into_iter().map(Predicate::negate).collect())
+            }
+            Predicate::Or(children) => {
+                Predicate::and(children.into_iter().map(Predicate::negate).collect())
             }
             Predicate::Leaf {
                 column,
@@ -505,23 +540,86 @@ impl Predicate {
                 data_type,
                 op,
                 literals,
-            } if literals.is_empty()
-                && matches!(op, PredicateOperator::In | PredicateOperator::NotIn) =>
-            {
-                // Java negates the leaf function, retaining its NULL exclusion.
-                Predicate::Leaf {
+            } => match negated_op(op, &data_type) {
+                Some(op) => Predicate::Leaf {
                     column,
                     index,
                     data_type,
-                    op: if op == PredicateOperator::In {
-                        PredicateOperator::NotIn
-                    } else {
-                        PredicateOperator::In
-                    },
+                    op,
                     literals,
-                }
+                },
+                None => Predicate::Not(Box::new(Predicate::Leaf {
+                    column,
+                    index,
+                    data_type,
+                    op,
+                    literals,
+                })),
+            },
+            Predicate::NestedLeaf {
+                root,
+                index,
+                path,
+                op,
+                literals,
+            } => match negated_op(op, path[path.len() - 1].data_type()) {
+                Some(op) => Predicate::NestedLeaf {
+                    root,
+                    index,
+                    path,
+                    op,
+                    literals,
+                },
+                None => Predicate::Not(Box::new(Predicate::NestedLeaf {
+                    root,
+                    index,
+                    path,
+                    op,
+                    literals,
+                })),
+            },
+        }
+    }
+
+    /// `IS NOT NULL` on the field of a leaf kept under `Not` by [`negate`].
+    /// Like Java `NotStartsWith`, `NotLike`, ..., that `Not` is false for NULL
+    /// input, so it is evaluated as `guard AND NOT leaf`. `None` for other
+    /// predicates and for `IS [NOT] NULL` leaves.
+    ///
+    /// [`negate`]: Predicate::negate
+    pub(crate) fn not_null_guard(&self) -> Option<Predicate> {
+        match self {
+            Predicate::Leaf {
+                column,
+                index,
+                data_type,
+                op,
+                ..
+            } if !matches!(op, PredicateOperator::IsNull | PredicateOperator::IsNotNull) => {
+                Some(Predicate::Leaf {
+                    column: column.clone(),
+                    index: *index,
+                    data_type: data_type.clone(),
+                    op: PredicateOperator::IsNotNull,
+                    literals: Vec::new(),
+                })
             }
-            other => Predicate::Not(Box::new(other)),
+            Predicate::NestedLeaf {
+                root,
+                index,
+                path,
+                op,
+                ..
+            } if !matches!(op, PredicateOperator::IsNull | PredicateOperator::IsNotNull) => {
+                Some(Predicate::NestedLeaf {
+                    root: root.clone(),
+                    index: *index,
+                    path: path.clone(),
+                    op: PredicateOperator::IsNotNull,
+                    literals: Vec::new(),
+                })
+            }
+            _ => None,
         }
     }
 
@@ -709,6 +807,7 @@ impl fmt::Display for Predicate {
                     PredicateOperator::In
                     | PredicateOperator::NotIn
                     | PredicateOperator::ArraysOverlap
+                    | PredicateOperator::BBoxIntersects
                     | PredicateOperator::ArrayContainsAll => {
                         write!(f, " (")?;
                         for (i, lit) in literals.iter().enumerate() {
@@ -878,6 +977,7 @@ fn rest_leaf_function(op: PredicateOperator) -> &'static str {
         PredicateOperator::Contains => "CONTAINS",
         PredicateOperator::ArrayContains => "ARRAY_CONTAINS",
         PredicateOperator::ArraysOverlap => "ARRAYS_OVERLAP",
+        PredicateOperator::BBoxIntersects => "BBOX_INTERSECTS",
         PredicateOperator::ArrayContainsAll => "ARRAY_CONTAINS_ALL",
         PredicateOperator::Like => "LIKE",
         PredicateOperator::Between => "BETWEEN",
@@ -985,7 +1085,9 @@ fn parse_rest_leaf(
         .ok_or_else(|| rest_json_err(format!("unknown field `{field}`")))?;
 
     let function = str_prop(value, "function")?;
+    let double = DataType::Double(Default::default());
     let literal_data_type = match function {
+        "BBOX_INTERSECTS" => &double,
         "ARRAY_CONTAINS" | "ARRAYS_OVERLAP" | "ARRAY_CONTAINS_ALL" => match data_type {
             DataType::Array(array) => array.element_type(),
             other => {
@@ -1044,6 +1146,16 @@ fn parse_rest_leaf(
         "STARTS_WITH" => binary(one_literal()?, &|l| builder.starts_with(field, l)),
         "ENDS_WITH" => binary(one_literal()?, &|l| builder.ends_with(field, l)),
         "CONTAINS" => binary(one_literal()?, &|l| builder.contains(field, l)),
+        "BBOX_INTERSECTS" => {
+            let [Some(Datum::Double(a)), Some(Datum::Double(b)), Some(Datum::Double(c)), Some(Datum::Double(d))] =
+                literals.as_slice()
+            else {
+                return Err(rest_json_err(
+                    "BBOX_INTERSECTS expects four double coordinates",
+                ));
+            };
+            builder.bbox_intersects(field, *a, *b, *c, *d)
+        }
         "ARRAY_CONTAINS" => binary(one_literal()?, &|l| builder.array_contains(field, l)),
         "ARRAYS_OVERLAP" => {
             let datums = literals.iter().flatten().cloned().collect::<Vec<_>>();
@@ -1886,6 +1998,25 @@ impl PredicateBuilder {
         self.leaf(field, PredicateOperator::GtEq, vec![literal])
     }
 
+    /// Closed XY envelope intersection on a planar GEOMETRY field.
+    pub fn bbox_intersects<'a>(
+        &self,
+        field: impl Into<PredicateField<'a>>,
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+    ) -> Result<Predicate> {
+        self.leaf(
+            field,
+            PredicateOperator::BBoxIntersects,
+            [min_x, min_y, max_x, max_y]
+                .into_iter()
+                .map(Datum::Double)
+                .collect(),
+        )
+    }
+
     // -- null operators --
 
     pub fn is_null<'a>(&self, field: impl Into<PredicateField<'a>>) -> Result<Predicate> {
@@ -2145,6 +2276,19 @@ impl PredicateBuilder {
         literals: Vec<Datum>,
     ) -> Result<Predicate> {
         let data_type = field.data_type();
+        if op == PredicateOperator::BBoxIntersects {
+            if !matches!(data_type, DataType::Geometry(_)) {
+                return Err(Error::ConfigInvalid {
+                    message: format!("BBOX_INTERSECTS requires GEOMETRY, got {data_type:?}"),
+                });
+            }
+            crate::rtree::BoundingBox::from_literals(&literals).map_err(|e| {
+                Error::ConfigInvalid {
+                    message: e.to_string(),
+                }
+            })?;
+            return Ok(field.predicate(op, literals));
+        }
         let literal_type = if matches!(
             op,
             PredicateOperator::ArrayContains
@@ -2376,7 +2520,9 @@ pub(crate) fn extract_datum(
                 scale,
             }
         }
-        DataType::Binary(_) | DataType::VarBinary(_) => Datum::Bytes(row.get_binary(pos)?.to_vec()),
+        DataType::Binary(_) | DataType::VarBinary(_) | DataType::Geometry(_) => {
+            Datum::Bytes(row.get_binary(pos)?.to_vec())
+        }
         other => {
             return Err(Error::Unsupported {
                 message: format!("extract_datum: unsupported DataType {other:?}"),
@@ -2433,7 +2579,7 @@ pub(crate) fn eval_row(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
                 data_type = field.data_type();
             }
             let value = extract_datum(&current, position, data_type)?;
-            Ok(eval_leaf(*op, value.as_ref(), literals))
+            eval_row_leaf(*op, value.as_ref(), literals)
         }
         Predicate::AlwaysTrue => Ok(true),
         Predicate::AlwaysFalse => Ok(false),
@@ -2453,7 +2599,7 @@ pub(crate) fn eval_row(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
             }
             Ok(false)
         }
-        Predicate::Not(inner) => Ok(!eval_row(inner, row)?),
+        Predicate::Not(inner) => eval_row_negated(inner, row),
         Predicate::Leaf {
             index,
             data_type,
@@ -2462,8 +2608,37 @@ pub(crate) fn eval_row(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
             ..
         } => {
             let datum = extract_datum(row, *index, data_type)?;
-            Ok(eval_leaf(*op, datum.as_ref(), literals))
+            eval_row_leaf(*op, datum.as_ref(), literals)
         }
+    }
+}
+
+/// Evaluates `NOT predicate`. The `NOT` is pushed down to the leaves with
+/// De Morgan first: a leaf yields false for NULL, so negating a compound
+/// result would turn UNKNOWN into true.
+fn eval_row_negated(predicate: &Predicate, row: &BinaryRow) -> Result<bool> {
+    match predicate {
+        Predicate::And(children) => {
+            for child in children {
+                if eval_row_negated(child, row)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Predicate::Or(children) => {
+            for child in children {
+                if !eval_row_negated(child, row)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Predicate::Not(inner) => eval_row(inner, row),
+        _ => match predicate.not_null_guard() {
+            Some(guard) => Ok(eval_row(&guard, row)? && !eval_row(predicate, row)?),
+            None => Ok(!eval_row(predicate, row)?),
+        },
     }
 }
 
@@ -2490,6 +2665,27 @@ pub(crate) fn java_cmp(lhs: &Datum, rhs: &Datum) -> Option<Ordering> {
 
 fn java_eq(lhs: &Datum, rhs: &Datum) -> bool {
     java_cmp(lhs, rhs) == Some(Ordering::Equal)
+}
+
+fn eval_row_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -> Result<bool> {
+    if op == PredicateOperator::BBoxIntersects {
+        let invalid = |error| Error::DataInvalid {
+            message: "Invalid bounding-box predicate or WKB geometry".into(),
+            source: Some(Box::new(error)),
+        };
+        let query = crate::rtree::BoundingBox::from_literals(literals).map_err(invalid)?;
+        return match datum {
+            None => Ok(false),
+            Some(Datum::Bytes(wkb)) => Ok(crate::rtree::BoundingBox::from_wkb(wkb)
+                .map_err(invalid)?
+                .intersects(&query)),
+            _ => Err(Error::DataInvalid {
+                message: "BBOX_INTERSECTS requires GEOMETRY".into(),
+                source: None,
+            }),
+        };
+    }
+    Ok(eval_leaf(op, datum, literals))
 }
 
 fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -> bool {
@@ -2553,6 +2749,7 @@ fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -
                         "LIKE must have Datum::String value and literal (validated by builder)"
                     ),
                 },
+                PredicateOperator::BBoxIntersects => unreachable!("evaluated on WKB in eval_row_leaf"),
                 PredicateOperator::Between => eval_between(val, literals),
                 PredicateOperator::NotBetween => !eval_between(val, literals),
                 PredicateOperator::ArrayContains
@@ -3193,13 +3390,39 @@ mod tests {
     #[test]
     fn test_not() {
         let pb = PredicateBuilder::new(&test_fields());
-        let p = pb.equal("id", Datum::Int(1)).unwrap();
-        let negated = Predicate::negate(p.clone());
+        let eq = pb.equal("id", Datum::Int(1)).unwrap();
+        let gt = pb.greater_than("hr", Datum::Int(2)).unwrap();
 
-        match &negated {
-            Predicate::Not(inner) => assert_eq!(inner.as_ref(), &p),
-            other => panic!("expected Not, got {other:?}"),
-        }
+        // Like Java, leaves flip their operator instead of becoming `Not`.
+        assert_eq!(
+            Predicate::negate(eq.clone()),
+            pb.not_equal("id", Datum::Int(1)).unwrap()
+        );
+        assert_eq!(
+            Predicate::negate(Predicate::and(vec![eq.clone(), gt.clone()])),
+            Predicate::or(vec![
+                pb.not_equal("id", Datum::Int(1)).unwrap(),
+                pb.less_or_equal("hr", Datum::Int(2)).unwrap(),
+            ])
+        );
+        assert_eq!(
+            Predicate::negate(Predicate::or(vec![eq.clone(), gt.clone()])),
+            Predicate::and(vec![
+                pb.not_equal("id", Datum::Int(1)).unwrap(),
+                pb.less_or_equal("hr", Datum::Int(2)).unwrap(),
+            ])
+        );
+        assert_eq!(
+            Predicate::negate(pb.is_null("id").unwrap()),
+            pb.is_not_null("id").unwrap()
+        );
+
+        // No negated operator: stays `Not`.
+        let starts = pb.starts_with("name", Datum::String("a".into())).unwrap();
+        assert_eq!(
+            Predicate::negate(starts.clone()),
+            Predicate::Not(Box::new(starts))
+        );
     }
 
     // ======================== field_idx_to_partition_idx ========================
@@ -3278,7 +3501,7 @@ mod tests {
     fn test_display_not() {
         let pb = PredicateBuilder::new(&test_fields());
         let p = pb.equal("id", Datum::Int(1)).unwrap();
-        let negated = Predicate::negate(p);
+        let negated = Predicate::Not(Box::new(p));
         assert_eq!(format!("{negated}"), "NOT (id = 1)");
     }
 
@@ -3695,6 +3918,27 @@ mod tests {
         // NULL compared to any value → false (SQL null semantics)
         assert!(!eval_row(
             &make_leaf("x", 0, PredicateOperator::Eq, vec![Datum::Int(42)]),
+            &row
+        )
+        .unwrap());
+        // ... and so is its negation.
+        assert!(!eval_row(
+            &Predicate::negate(make_leaf(
+                "x",
+                0,
+                PredicateOperator::Eq,
+                vec![Datum::Int(42)]
+            )),
+            &row
+        )
+        .unwrap());
+        assert!(!eval_row(
+            &Predicate::Not(Box::new(make_leaf(
+                "x",
+                0,
+                PredicateOperator::Gt,
+                vec![Datum::Int(42)]
+            ))),
             &row
         )
         .unwrap());

@@ -41,6 +41,7 @@ mod bucket_assigner_fixed;
 mod bucket_filter;
 mod bucket_function;
 mod bucket_router;
+mod centroid_index;
 mod chunk_shuffle;
 mod commit_callback;
 mod commit_message;
@@ -143,6 +144,7 @@ mod postpone_fixed_bucket_write_builder;
 mod postpone_retract;
 mod prepared_files;
 mod query_auth;
+mod rtree_manifest;
 mod system_table;
 pub use system_table::SystemRead;
 

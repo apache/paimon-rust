@@ -40,7 +40,8 @@ pub struct VectorSearchBuilder<'a> {
 #[derive(Clone, Default)]
 struct VectorSearchConfig {
     vector_column: Option<String>,
-    query_vector: Option<Vec<f32>>,
+    query_vectors: Option<Vec<Vec<f32>>>,
+    max_sim: bool,
     limit: Option<usize>,
     options: HashMap<String, String>,
     filter: Option<Predicate>,
@@ -75,7 +76,20 @@ impl<'a> VectorSearchBuilder<'a> {
     }
 
     pub fn with_query_vector(&mut self, vector: Vec<f32>) -> &mut Self {
-        self.config.write().unwrap().query_vector = Some(vector);
+        let mut config = self.config.write().unwrap();
+        config.query_vectors = Some(vec![vector]);
+        config.max_sim = false;
+        drop(config);
+        self
+    }
+
+    /// Query a list of embeddings with MaxSim, returning a single ranked result.
+    /// Each query vector contributes its highest cosine similarity per row.
+    pub fn with_multi_vector(&mut self, vectors: Vec<Vec<f32>>) -> &mut Self {
+        let mut config = self.config.write().unwrap();
+        config.query_vectors = Some(vectors);
+        config.max_sim = true;
+        drop(config);
         self
     }
 
@@ -98,8 +112,13 @@ impl<'a> VectorSearchBuilder<'a> {
     /// refined against snapshot-pinned data when
     /// `global-index.filter.refine-from-data=true`; otherwise those candidates
     /// are excluded. If no scalar index can evaluate the predicate, indexed
-    /// ranges are scored from raw data even in FAST mode. Raw searches always
-    /// apply the row predicate before Top-K, matching Java.
+    /// searches retrieve ANN candidates once and check their scalar values
+    /// against the pinned data before the final Top-K. Candidate count is the
+    /// original Top-K times `vector-index.post-filter.candidates-factor`
+    /// (default 10), with at least the required reranking/deletion allowance.
+    /// Results may contain fewer than Top-K matches, including zero; there is
+    /// no retry or automatic raw scoring of indexed ranges. Approximate recall
+    /// is retained. Raw sources outside index coverage follow the search mode.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         add_filter(&mut self.config.write().unwrap().filter, filter);
         self
@@ -137,19 +156,30 @@ impl<'a> VectorSearchBuilder<'a> {
     }
 
     fn read_with_config(&self, config: &VectorSearchConfig) -> crate::Result<VectorRead> {
-        let (column, query, limit) = self.query(config)?;
+        let (column, queries, limit) = self.query(config)?;
         let context = PlanContext::new(&self.table, column, config.filter.as_ref(), None, None)?;
-        Ok(VectorRead {
-            batch: BatchVectorRead::new(
+        let queries = queries.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let batch = if config.max_sim {
+            BatchVectorRead::new_max_sim(
                 &self.table,
                 column,
-                &[query],
+                &queries,
+                limit,
+                &config.options,
+                context,
+            )?
+        } else {
+            BatchVectorRead::new(
+                &self.table,
+                column,
+                &queries,
                 limit,
                 &config.options,
                 config.filter.as_ref(),
                 context,
-            )?,
-        })
+            )?
+        };
+        Ok(VectorRead { batch })
     }
 
     pub(crate) fn new_scan_and_read(&self) -> crate::Result<(VectorScan, VectorRead)> {
@@ -168,7 +198,7 @@ impl<'a> VectorSearchBuilder<'a> {
     fn query<'c>(
         &self,
         config: &'c VectorSearchConfig,
-    ) -> crate::Result<(&'c str, &'c [f32], usize)> {
+    ) -> crate::Result<(&'c str, &'c [Vec<f32>], usize)> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let column =
             config
@@ -177,16 +207,17 @@ impl<'a> VectorSearchBuilder<'a> {
                 .ok_or_else(|| crate::Error::ConfigInvalid {
                     message: "Vector column must be set via with_vector_column()".to_string(),
                 })?;
-        let vector = config
-            .query_vector
-            .as_deref()
-            .ok_or_else(|| crate::Error::ConfigInvalid {
-                message: "Query vector must be set via with_query_vector()".to_string(),
-            })?;
+        let queries =
+            config
+                .query_vectors
+                .as_deref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Query vector must be set via with_query_vector()".to_string(),
+                })?;
         let limit = config.limit.ok_or_else(|| crate::Error::ConfigInvalid {
             message: "Limit must be set via with_limit()".to_string(),
         })?;
-        Ok((column, vector, limit))
+        Ok((column, queries, limit))
     }
 }
 

@@ -46,7 +46,7 @@ impl FallbackScanPlan {
         match kind {
             GlobalIndexFileKind::BTree => self.allow_btree,
             GlobalIndexFileKind::Bitmap | GlobalIndexFileKind::Multivalue => self.allow_bitmap,
-            GlobalIndexFileKind::FM => true,
+            GlobalIndexFileKind::FM | GlobalIndexFileKind::RTree => true,
         }
     }
 }

@@ -53,6 +53,13 @@ struct ParsedIndex {
     block: BlockReader,
 }
 
+/// A decoded data block of a Lookup File.
+struct DataBlock {
+    path: String,
+    offset: u64,
+    block: BlockReader,
+}
+
 pub(in crate::table::compact) struct LookupFileCache {
     local: Arc<LocalCache>,
     limit: usize,
@@ -62,6 +69,9 @@ pub(in crate::table::compact) struct LookupFileCache {
     working: tokio::sync::Mutex<()>,
     // One parsed index, charged to the same working budget as the IPC payload.
     index: Mutex<Option<Arc<ParsedIndex>>>,
+    // The data block of the previous lookup. Compaction looks keys up in
+    // order, so consecutive keys usually land in the same block.
+    data_block: Mutex<Option<Arc<DataBlock>>>,
     // One decoded IPC batch across all files, never one cache per file/key.
     payload: Mutex<Option<Payload>>,
     vector: Mutex<
@@ -141,6 +151,7 @@ impl LookupFileCache {
             compression,
             working: tokio::sync::Mutex::new(()),
             index: Mutex::new(None),
+            data_block: Mutex::new(None),
             payload: Mutex::new(None),
             vector: Mutex::new(None),
         })
@@ -190,6 +201,7 @@ impl LookupFileCache {
                 Err(_) => {
                     *self.payload.lock().unwrap() = None;
                     *self.index.lock().unwrap() = None;
+                    *self.data_block.lock().unwrap() = None;
                     // A new immutable generation replaces the head only after
                     // close. Do not invalidate a shared backend's global epoch.
                 }
@@ -425,6 +437,38 @@ impl LookupFileCache {
         read_block_from_bytes(&bytes, handle.size).map_err(invalid)
     }
 
+    /// Reuses the data block of the previous lookup when the key falls in it.
+    async fn data_block(
+        &self,
+        reader: &GeneratedFileRead,
+        path: &str,
+        size: u64,
+        handle: BlockHandle,
+    ) -> Result<Arc<DataBlock>> {
+        {
+            let mut cached = self.data_block.lock().unwrap();
+            if let Some(block) = cached
+                .as_ref()
+                .filter(|block| block.path == path && block.offset == handle.offset)
+            {
+                return Ok(block.clone());
+            }
+            // Drop the previous block before decoding its replacement.
+            *cached = None;
+        }
+        let block = self.block(reader, size, handle).await?;
+        if block.retained_bytes() > self.limit {
+            return Err(exhausted("Lookup data block exceeds the memory budget"));
+        }
+        let block = Arc::new(DataBlock {
+            path: path.into(),
+            offset: handle.offset,
+            block,
+        });
+        *self.data_block.lock().unwrap() = Some(block.clone());
+        Ok(block)
+    }
+
     async fn parsed_index(&self, path: &str, size: u64) -> Result<Arc<ParsedIndex>> {
         {
             let mut cached = self.index.lock().unwrap();
@@ -468,14 +512,9 @@ impl LookupFileCache {
         let Some((_, bytes)) = candidates.next() else {
             return Ok(None);
         };
-        let block = self
-            .block(
-                &reader,
-                footer_start,
-                BlockHandle::decode(bytes).map_err(invalid)?,
-            )
-            .await?;
-        let (found, mut entries) = block.seek_and_iter(key, &cmp).map_err(invalid)?;
+        let handle = BlockHandle::decode(bytes).map_err(invalid)?;
+        let block = self.data_block(&reader, path, footer_start, handle).await?;
+        let (found, mut entries) = block.block.seek_and_iter(key, &cmp).map_err(invalid)?;
         let Some((_, bytes)) = entries.next().filter(|_| found) else {
             return Ok(None);
         };
@@ -517,7 +556,15 @@ impl LookupFileCache {
                 if stream.next().is_some() {
                     return Err(invalid("Lookup IPC payload contains multiple batches"));
                 }
-                if batch.get_array_memory_size() > self.limit {
+                // Decoded columns are views into one IPC body. Counting each
+                // column's backing buffer would charge that body once per column.
+                let decoded_size = batch
+                    .columns()
+                    .iter()
+                    .map(|column| column.to_data().get_slice_memory_size())
+                    .sum::<std::result::Result<usize, _>>()
+                    .map_err(invalid)?;
+                if decoded_size > self.limit {
                     return Err(exhausted("Decoded Lookup IPC exceeds the memory budget"));
                 }
                 *self.payload.lock().unwrap() = Some(Payload {
@@ -782,6 +829,79 @@ mod tests {
             .await
     }
 
+    /// Keys spread over many data blocks still resolve after the cached block
+    /// changes, in both directions, and an ascending sweep reads each block once.
+    #[tokio::test]
+    async fn lookups_across_data_blocks_switch_the_cached_block() {
+        const ROWS: i32 = 20_000;
+        let (local, blocks) = external();
+        let cache = LookupFileCache::new(local, &HashMap::new()).unwrap();
+        let input = || -> Result<ArrowRecordBatchStream> {
+            let ids: Vec<i32> = (1..=ROWS).collect();
+            let batch = RecordBatch::try_from_iter([
+                (
+                    "_SEQUENCE_NUMBER",
+                    Arc::new(Int64Array::from_iter_values(
+                        ids.iter().map(|&id| id as i64),
+                    )) as ArrayRef,
+                ),
+                (
+                    "_VALUE_KIND",
+                    Arc::new(Int8Array::from(vec![0; ids.len()])) as ArrayRef,
+                ),
+                ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
+            ])
+            .unwrap();
+            Ok(stream::once(async { Ok(batch) }).boxed())
+        };
+        let id_of = |row: Option<RecordBatch>| {
+            row.map(|row| {
+                row.column(2)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0)
+            })
+        };
+        assert_eq!(
+            id_of(cache.lookup("blocks", &key(1), &[2], &input).await.unwrap()),
+            Some(1)
+        );
+
+        blocks.gets.store(0, Ordering::SeqCst);
+        let ascending: Vec<i32> = (1..=ROWS).step_by(7).collect();
+        for &value in &ascending {
+            assert_eq!(
+                id_of(
+                    cache
+                        .lookup("blocks", &key(value), &[2], &input)
+                        .await
+                        .unwrap()
+                ),
+                Some(value)
+            );
+        }
+        // One head read per key, plus far fewer data block reads than keys.
+        let gets = blocks.gets.load(Ordering::SeqCst);
+        assert!(
+            gets > ascending.len() && gets < 2 * ascending.len(),
+            "{gets}"
+        );
+
+        for value in (1..=ROWS).rev().step_by(13).chain([ROWS + 1, 0]) {
+            let expected = (1..=ROWS).contains(&value).then_some(value);
+            assert_eq!(
+                id_of(
+                    cache
+                        .lookup("blocks", &key(value), &[2], &input)
+                        .await
+                        .unwrap()
+                ),
+                expected
+            );
+        }
+    }
+
     #[tokio::test]
     async fn parsed_index_is_reused_and_missing_data_still_rebuilds_its_generation() {
         let (local, blocks) = external();
@@ -801,15 +921,18 @@ mod tests {
                     Some(batch().slice((value - 1) as usize, 1))
                 );
             }
-            // Only the head and target data block are read for each key; the
-            // footer/index and decoded IPC payload remain resident.
-            assert_eq!(blocks.gets.load(Ordering::SeqCst), 6);
+            // Only the head is read for each key; the footer/index, the data
+            // block holding these keys and the decoded IPC payload remain resident.
+            assert_eq!(blocks.gets.load(Ordering::SeqCst), 3);
             if !rebuilt {
                 blocks
                     .blocks
                     .lock()
                     .unwrap()
                     .retain(|(path, _), _| path.ends_with("/head"));
+                // The decoded block of these keys is still resident; drop it so
+                // the next lookup reads the missing data.
+                *cache.data_block.lock().unwrap() = None;
                 assert_eq!(
                     cache.lookup("index", &key(1), &[2], &input).await.unwrap(),
                     Some(batch().slice(0, 1))
@@ -1126,6 +1249,61 @@ mod tests {
                 .await
                 .unwrap(),
             Some(batch().slice(1, 1))
+        );
+    }
+
+    /// A wide payload within the budget can be read back: its decoded columns
+    /// share one IPC body, which must be charged once, not once per column.
+    #[tokio::test]
+    async fn wide_payload_within_the_budget_is_read_back() {
+        const ROWS: i32 = 256;
+        let options = HashMap::from([
+            ("lookup.cache-max-memory-size".into(), "2mb".into()),
+            ("lookup.cache-spill-compression".into(), "none".into()),
+        ]);
+        let cache = LookupFileCache::new(local(None, false, "16mb"), &options).unwrap();
+        let input = || -> Result<ArrowRecordBatchStream> {
+            let ids: Vec<i32> = (1..=ROWS).collect();
+            let mut columns = vec![
+                (
+                    "_SEQUENCE_NUMBER".to_string(),
+                    Arc::new(Int64Array::from_iter_values(
+                        ids.iter().map(|&id| id as i64),
+                    )) as ArrayRef,
+                ),
+                (
+                    "_VALUE_KIND".to_string(),
+                    Arc::new(Int8Array::from(vec![0; ids.len()])) as ArrayRef,
+                ),
+                (
+                    "id".to_string(),
+                    Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
+                ),
+            ];
+            for column in 0..60 {
+                columns.push((
+                    format!("v{column}"),
+                    Arc::new(Int64Array::from_iter_values(
+                        ids.iter().map(|&id| id as i64 * 100 + column),
+                    )) as ArrayRef,
+                ));
+            }
+            let batch = RecordBatch::try_from_iter(columns).unwrap();
+            Ok(stream::once(async { Ok(batch) }).boxed())
+        };
+        let row = cache
+            .lookup("wide", &key(200), &[2], &input)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.num_columns(), 63);
+        assert_eq!(
+            row.column(62)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            200 * 100 + 59
         );
     }
 

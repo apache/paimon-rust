@@ -684,8 +684,10 @@ pub(super) async fn merge_into(
     }
     // Spark validates cardinality before evaluating action predicates. A sole
     // unconditional DELETE may match multiple source rows without ambiguity.
-    let check_cardinality = !matched.is_empty()
-        && !(matched.len() == 1 && matched[0].delete && matched[0].condition.is_none());
+    let check_cardinality = matched.len() > 1
+        || matched
+            .first()
+            .is_some_and(|clause| !clause.delete || clause.condition.is_some());
     let mut joined = Vec::new();
     let mut stream = builder.new_read()?.for_update().to_arrow(plan.splits())?;
     while let Some(target) = stream.try_next().await? {

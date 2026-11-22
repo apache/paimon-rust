@@ -38,6 +38,45 @@ pub fn normalize_write_array(array: &ArrayRef, expected: &DataType) -> Result<Ar
     normalize_visible_array(array, expected, None)
 }
 
+pub(super) fn normalize_write_field(
+    array: &ArrayRef,
+    expected: &Field,
+    parent_nulls: Option<&NullBuffer>,
+) -> Result<ArrayRef> {
+    if expected.extension_type_name() == Some(crate::arrow::GEOARROW_WKB) {
+        match array.data_type() {
+            DataType::LargeBinary => {
+                return normalize_large_binary(array.as_any().downcast_ref().unwrap())
+            }
+            DataType::BinaryView => {
+                let views = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryViewArray>()
+                    .unwrap();
+                let bytes = views.total_bytes_len();
+                if bytes > i32::MAX as usize {
+                    return Err(Error::DataInvalid {
+                        message: "WKB byte range exceeds 32-bit offsets".into(),
+                        source: None,
+                    });
+                }
+                let mut builder =
+                    arrow_array::builder::BinaryBuilder::with_capacity(views.len(), bytes);
+                builder.extend(views.iter());
+                return Ok(Arc::new(builder.finish()));
+            }
+            DataType::Null => {
+                return Ok(arrow_array::new_null_array(
+                    expected.data_type(),
+                    array.len(),
+                ))
+            }
+            _ => {}
+        }
+    }
+    normalize_visible_array(array, expected.data_type(), parent_nulls)
+}
+
 /// Java Blob maps allow a NULL key. Arrow Map does not, so dedicated Blob
 /// writers use a list of key/value structs as their physical input. This
 /// representation must never be passed to an ordinary Parquet MAP writer.
@@ -332,7 +371,7 @@ fn normalize_visible_array(
             let nulls = NullBuffer::union(list.nulls(), parent_nulls);
             let (values, offsets) =
                 visible_children(list.values(), list.offsets(), nulls.as_ref())?;
-            let values = normalize_write_array(&values, expected_child.data_type())?;
+            let values = normalize_write_field(&values, expected_child, None)?;
             let normalized = ListArray::try_new(expected_child.clone(), offsets, values, nulls)
                 .map_err(normalization_error)?;
             Ok(Arc::new(normalized))
@@ -346,7 +385,7 @@ fn normalize_visible_array(
             // the values of sliced inputs and let Arrow validate NOT NULL
             // elements against the combined vector/containing ROW validity.
             let nulls = NullBuffer::union(list.nulls(), parent_nulls);
-            let values = normalize_write_array(list.values(), expected_child.data_type())?;
+            let values = normalize_write_field(list.values(), expected_child, None)?;
             let normalized = FixedSizeListArray::try_new_with_length(
                 expected_child.clone(),
                 *expected_size,
@@ -377,7 +416,7 @@ fn normalize_visible_array(
                             source: None,
                         });
                     }
-                    normalize_visible_array(row.column(index), expected.data_type(), nulls.as_ref())
+                    normalize_write_field(row.column(index), expected, nulls.as_ref())
                 })
                 .collect::<Result<Vec<_>>>()?;
             let normalized = StructArray::try_new_with_length(
@@ -407,7 +446,7 @@ fn normalize_visible_array(
                 .columns()
                 .iter()
                 .zip(fields)
-                .map(|(column, field)| normalize_write_array(column, field.data_type()))
+                .map(|(column, field)| normalize_write_field(column, field, None))
                 .collect::<Result<Vec<_>>>()?;
             let entries =
                 StructArray::try_new(fields.clone(), columns, None).map_err(normalization_error)?;

@@ -1355,18 +1355,25 @@ fn weighted_score(route_results: &[WeightedRouteResult], limit: usize) -> Scored
             min = min.min(*score);
             max = max.max(*score);
         }
-        let range = max - min;
-
         for (row_id, score) in ranked {
-            let normalized = if range > 0.0 {
-                (score - min) / range
-            } else {
-                1.0
-            };
+            let normalized = normalize_route_score(score, min, max);
             add_score(&mut scores, row_id, route_result.weight * normalized);
         }
     }
     top_k(scores, limit)
+}
+
+/// Min-max normalizes a route score. A route with no spread maps to one.
+pub(super) fn normalize_route_score(score: f32, min: f32, max: f32) -> f32 {
+    let range = max - min;
+    if range.is_infinite() && min.is_finite() && max.is_finite() {
+        return ((f64::from(score) - f64::from(min)) / (f64::from(max) - f64::from(min))) as f32;
+    }
+    if range > 0.0 {
+        (score - min) / range
+    } else {
+        1.0
+    }
 }
 
 fn ranked_row_ids(result: &ScoredRowIds) -> Vec<(u64, f32)> {
@@ -1375,7 +1382,7 @@ fn ranked_row_ids(result: &ScoredRowIds) -> Vec<(u64, f32)> {
         best_scores
             .entry(row_id)
             .and_modify(|old: &mut f32| {
-                if score > *old {
+                if score.total_cmp(old).is_gt() {
                     *old = score;
                 }
             })
@@ -1385,8 +1392,7 @@ fn ranked_row_ids(result: &ScoredRowIds) -> Vec<(u64, f32)> {
     let mut ranked: Vec<_> = best_scores.into_iter().collect();
     ranked.sort_by(|(left_id, left_score), (right_id, right_score)| {
         right_score
-            .partial_cmp(left_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(left_score)
             .then_with(|| left_id.cmp(right_id))
     });
     ranked
@@ -1407,8 +1413,7 @@ fn top_k(scores: HashMap<u64, f32>, limit: usize) -> ScoredRowIds {
     let mut entries: Vec<_> = scores.into_iter().collect();
     entries.sort_by(|(left_id, left_score), (right_id, right_score)| {
         right_score
-            .partial_cmp(left_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(left_score)
             .then_with(|| left_id.cmp(right_id))
     });
     entries.truncate(limit);
@@ -1443,6 +1448,18 @@ mod tests {
     }
 
     #[test]
+    fn rank_based_fusion_preserves_vector_top_k_score_order() {
+        let route = route_result(vec![1, 2, 3], vec![-0.0, 0.0, 0.0], 1.0);
+        let expected = route.result.top_k(1).row_ids;
+        assert_eq!(expected, vec![2]);
+
+        for ranker in [HybridSearchRanker::Rrf, HybridSearchRanker::Mrr] {
+            let ranked = rank_results(ranker, std::slice::from_ref(&route), 1);
+            assert_eq!(ranked.row_ids, expected);
+        }
+    }
+
+    #[test]
     fn test_weighted_score_min_max_normalizes_per_route() {
         let ranked = rank_results(
             HybridSearchRanker::WeightedScore,
@@ -1457,6 +1474,21 @@ mod tests {
         assert!((scores[&1] - 3.0).abs() < 1e-6);
         assert!((scores[&2] - 1.5).abs() < 1e-6);
         assert!((scores[&3] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_weighted_score_handles_finite_scores_with_overflowing_range() {
+        let ranked = rank_results(
+            HybridSearchRanker::WeightedScore,
+            &[
+                route_result(vec![1, 2, 3], vec![-f32::MAX, 0.0, f32::MAX], 4.0),
+                route_result(vec![1, 2, 3], vec![1.0, 0.0, 0.0], 1.0),
+            ],
+            2,
+        );
+
+        assert_eq!(ranked.row_ids, vec![3, 2]);
+        assert_eq!(ranked.scores, vec![4.0, 2.0]);
     }
 
     #[test]

@@ -112,7 +112,7 @@ where
     (ordinal, result)
 }
 
-async fn abort_private_outputs(table: &Table, messages: &[CommitMessage]) {
+pub(in crate::table) async fn abort_private_outputs(table: &Table, messages: &[CommitMessage]) {
     if !messages.is_empty() {
         let commit = TableCommit::new(
             table.clone(),

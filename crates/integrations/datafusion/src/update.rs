@@ -17,7 +17,8 @@
 
 //! UPDATE execution for Paimon tables.
 //!
-//! Supports two execution paths:
+//! Supports three execution paths:
+//! - **Deduplicate primary-key tables**: complete-row upserts via the normal writer.
 //! - **Data evolution tables**: partial-column writes via [`paimon::table::DataEvolutionWriter`].
 //! - **Append-only tables** (no PK, no deletion vectors): copy-on-write file rewriting
 //!   via [`paimon::table::CopyOnWriteMergeWriter`].
@@ -26,19 +27,23 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, RecordBatch};
 use datafusion::arrow::datatypes::{Field, Schema};
+use datafusion::common::Column;
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::logical_expr::{Expr, ExprSchemable};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{AssignmentTarget, TableFactor, Update};
 
-use paimon::spec::CoreOptions;
+use paimon::spec::{CoreOptions, RowKind};
 use paimon::table::{CopyOnWriteMergeWriter, Table};
 
 use crate::error::to_datafusion_error;
 use crate::merge_into::{
-    build_partition_set_from_where, extract_tracking_columns, is_delete_conflict,
-    is_row_id_conflict, ok_result, project_update_columns, quote_identifier,
-    register_cow_target_table, retry_on_conflict, validate_update_columns, TempTableTracker,
+    build_dml_selection_clause, build_partition_set_from_where, dml_table_alias,
+    extract_tracking_columns, is_delete_conflict, is_row_id_conflict, ok_result,
+    project_update_columns, quote_identifier, register_cow_target_table, retry_on_conflict,
+    validate_update_columns, TempTableTracker,
 };
+use crate::primary_key_dml;
 use crate::sql_context::{normalize_schema_identifier, SQLContext};
 
 /// Execute an UPDATE statement on a Paimon table.
@@ -63,10 +68,87 @@ pub(crate) async fn execute_update(
     } else if schema.trimmed_primary_keys().is_empty() {
         execute_cow_update(ctx, update, &table, enable_ident_normalization).await
     } else {
-        Err(DataFusionError::Plan(
-            "UPDATE on primary-key tables without data-evolution is not supported".to_string(),
-        ))
+        execute_primary_key_update(ctx, update, &table, enable_ident_normalization).await
     }
+}
+
+async fn execute_primary_key_update(
+    ctx: &SQLContext,
+    update: &Update,
+    table: &Table,
+    enable_ident_normalization: bool,
+) -> DFResult<DataFrame> {
+    primary_key_dml::validate_table(table, "UPDATE")?;
+    if !update.table.joins.is_empty()
+        || update.from.is_some()
+        || update.returning.is_some()
+        || update.output.is_some()
+        || update.or.is_some()
+        || !update.optimizer_hints.is_empty()
+        || !update.order_by.is_empty()
+        || update.limit.is_some()
+        || !matches!(&update.table.relation,
+            TableFactor::Table {
+                args: None, version: None, with_ordinality: false,
+                json_path: None, sample: None, with_hints, partitions, index_hints, ..
+            } if with_hints.is_empty() && partitions.is_empty() && index_hints.is_empty())
+    {
+        return Err(DataFusionError::NotImplemented(
+            "Primary-key UPDATE supports a single target, SET assignments and an optional WHERE clause".into(),
+        ));
+    }
+    if update.assignments.iter().any(|assignment| {
+        !matches!(&assignment.target, AssignmentTarget::ColumnName(name) if name.0.len() == 1)
+    }) {
+        return Err(DataFusionError::NotImplemented(
+            "Primary-key UPDATE requires unqualified, top-level SET columns".into(),
+        ));
+    }
+    let schema = table.schema();
+    let (columns, expressions) = extract_set_assignments(update, enable_ident_normalization)?;
+    validate_update_columns(&columns, schema.fields())?;
+    for column in &columns {
+        if schema.primary_keys().contains(column) || schema.partition_keys().contains(column) {
+            return Err(DataFusionError::Plan(format!(
+                "Primary-key UPDATE cannot modify primary-key or partition column '{column}'"
+            )));
+        }
+    }
+    // All assignments share the original row, including references to other SET columns.
+    let projection = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let name = quote_identifier(field.name());
+            match columns.iter().position(|column| column == field.name()) {
+                Some(index) => format!("({}) AS {name}", expressions[index]),
+                None => name,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let input = primary_key_dml::plan_input(
+        ctx,
+        table,
+        &update.table.to_string(),
+        &projection,
+        update.selection.as_ref(),
+        "UPDATE",
+    )
+    .await?;
+    let target_schema =
+        paimon::arrow::build_target_arrow_schema(schema.fields()).map_err(to_datafusion_error)?;
+    let projection = target_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            Expr::Column(Column::from_name(field.name()))
+                .cast_to(field.data_type(), input.schema())
+                .map(|expr| expr.alias(field.name()))
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+    let input = input.select(projection)?;
+    primary_key_dml::write_rows(ctx, table, input, RowKind::UpdateAfter, "UPDATE").await
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +185,7 @@ async fn execute_update_once(
         .new_data_evolution_writer(columns.clone())
         .map_err(to_datafusion_error)?;
 
-    // 3. Query the target table directly with WHERE filter.
+    // 3. Select the target rows with filtering, ordering, and limit.
     let table_ref = update.table.to_string();
 
     let select_parts: Vec<String> =
@@ -113,13 +195,17 @@ async fn execute_update_once(
             }))
             .collect();
 
-    let select_clause = select_parts.join(", ");
-    let where_clause = match &update.selection {
-        Some(expr) => format!(" WHERE {expr}"),
-        None => String::new(),
-    };
+    let selection_clause = build_dml_selection_clause(
+        update.selection.as_ref(),
+        &update.order_by,
+        update.limit.as_ref(),
+    );
 
-    let query_sql = format!("SELECT {select_clause} FROM {table_ref}{where_clause}");
+    let alias = dml_table_alias(ctx.ctx(), &table_ref);
+    let select_clause = select_parts.join(", ");
+    let query_sql = format!(
+        "SELECT {select_clause} FROM (SELECT * FROM {table_ref}{selection_clause}) AS {alias}"
+    );
     let batches = ctx.ctx().sql(&query_sql).await?.collect().await?;
 
     // 4. Project update columns (rename __upd_X → X)
@@ -234,14 +320,18 @@ async fn execute_cow_update_inner(
             }))
             .collect();
 
+    let table_ref = update.table.to_string();
+    let selection_clause = build_dml_selection_clause(
+        update.selection.as_ref(),
+        &update.order_by,
+        update.limit.as_ref(),
+    );
+    let alias = dml_table_alias(ctx, &table_ref);
     let select_clause = select_parts.join(", ");
-    let where_clause = match &update.selection {
-        Some(expr) => format!(" WHERE {expr}"),
-        None => String::new(),
-    };
-
-    // Safety: where_clause comes from sqlparser AST to_string(), not raw user input.
-    let query_sql = format!("SELECT {select_clause} FROM {cow_table_name}{where_clause}");
+    let query_sql = format!(
+        "SELECT {select_clause} FROM \
+         (SELECT * FROM {cow_table_name} AS {alias}{selection_clause}) AS {alias}"
+    );
     let join_result = ctx.sql(&query_sql).await?.collect().await?;
 
     let mut update_value_batches: Vec<RecordBatch> = Vec::new();
@@ -329,8 +419,6 @@ mod tests {
     use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
     use paimon::catalog::{Catalog, Identifier};
-    use paimon::io::FileIOBuilder;
-    use paimon::spec::{DataType, IntType, Schema as PaimonSchema, TableSchema};
     use paimon::{CatalogOptions, FileSystemCatalog, Options};
     use tempfile::TempDir;
 
@@ -615,44 +703,6 @@ mod tests {
 
         // Row IDs should remain the same
         assert_eq!(before, after);
-    }
-
-    #[tokio::test]
-    async fn test_update_rejects_pk_table_without_data_evolution() {
-        let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let table_path = "memory:/test_update_reject";
-        file_io
-            .mkdirs(&format!("{table_path}/snapshot/"))
-            .await
-            .unwrap();
-        file_io
-            .mkdirs(&format!("{table_path}/manifest/"))
-            .await
-            .unwrap();
-
-        let schema = PaimonSchema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .primary_key(["id"])
-            .option("bucket", "1")
-            .build()
-            .unwrap();
-        let table_schema = TableSchema::new(0, &schema);
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "t"),
-            table_path.to_string(),
-            table_schema,
-            None,
-        );
-
-        let sql_context = SQLContext::new();
-        let update = parse_update("UPDATE t SET id = 1");
-        let result = execute_update(&sql_context, &update, table, true).await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("primary-key tables without data-evolution"));
     }
 
     // -----------------------------------------------------------------------

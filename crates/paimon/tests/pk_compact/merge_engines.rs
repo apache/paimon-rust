@@ -226,6 +226,51 @@ async fn partial_update_compaction_keeps_sequence_group_delete_and_payload() {
 }
 
 #[tokio::test]
+async fn partial_update_compaction_keeps_update_before_state() {
+    // Java PR 11178: with remove-record-on-delete, a -U marks the row removed
+    // without re-initializing it, and a merge result removed only by -U stays
+    // UPDATE_BEFORE. Compaction must write that state, so the following +U
+    // brings the row back with `other` from another writer. With a field
+    // aggregator a DELETE state is rejected by compaction; without one a
+    // DELETE state would re-initialize the row and drop `other`.
+    for aggregate in [Some("last_non_null_value"), None] {
+        for producer in ["none", "lookup"] {
+            for same_commit in [true, false] {
+                let mut options = vec![
+                    ("partial-update.remove-record-on-delete", "true"),
+                    ("changelog-producer", producer),
+                ];
+                if let Some(function) = aggregate {
+                    options.push(("fields.value.aggregate-function", function));
+                }
+                let table = partial(&options).await;
+                let case = format!("{aggregate:?} {producer} {same_commit}");
+                write_batch(&table, &update(None, None, Some(20), 0)).await;
+                let insert = update(None, Some(10), None, 0);
+                let before = update(None, Some(10), None, 1);
+                if same_commit {
+                    let batch =
+                        arrow_select::concat::concat_batches(&insert.schema(), &[insert, before])
+                            .unwrap();
+                    write_batch(&table, &batch).await;
+                } else {
+                    write_batch(&table, &insert).await;
+                    write_batch(&table, &before).await;
+                }
+                compact(&table).await;
+                assert!(state(&table).await.is_empty(), "{case}");
+                write_batch(&table, &update(None, Some(11), None, 2)).await;
+                assert_eq!(
+                    state(&table).await,
+                    vec![(None, Some(11), Some(20))],
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn aggregation_compaction_keeps_accumulators_for_later_updates() {
     for (function, before, after) in [
         ("sum", 30, 35),

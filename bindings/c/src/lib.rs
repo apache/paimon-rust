@@ -19,7 +19,9 @@
 // So it's type node can't meet camel case.
 #![allow(non_camel_case_types)]
 
+mod audit_read;
 mod blob_reader;
+mod bucket_router;
 mod bucket_vector_search_split;
 mod catalog;
 mod error;

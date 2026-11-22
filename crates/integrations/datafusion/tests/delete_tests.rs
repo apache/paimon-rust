@@ -452,33 +452,72 @@ async fn test_delete_multiple_rows_from_single_commit() {
     assert_eq!(query(&sql_context).await, vec![(1, "a".into(), 10)]);
 }
 
-// ======================= Unsupported cases =======================
+// ======================= ORDER BY and LIMIT =======================
 
 #[tokio::test]
-async fn test_delete_rejects_primary_key_table() {
-    let (tmp, catalog) = create_test_env();
-    let sql_context = create_sql_context(catalog).await;
-    sql_context
-        .sql("CREATE SCHEMA paimon.test_db")
-        .await
-        .unwrap();
-    sql_context
-        .sql(
-            "CREATE TABLE paimon.test_db.pk_t (\
-                id INT NOT NULL, name VARCHAR, PRIMARY KEY (id)\
-            ) WITH ('bucket' = '1')",
-        )
-        .await
-        .unwrap();
+async fn test_delete_with_order_by_and_limit() {
+    for options in [
+        "",
+        "WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true',
+            'deletion-vectors.enabled' = 'true'
+        )",
+    ] {
+        let (_tmp, catalog) = create_test_env();
+        let sql_context = create_sql_context(catalog).await;
+        sql_context
+            .sql("CREATE SCHEMA paimon.test_db")
+            .await
+            .unwrap();
+        sql_context
+            .sql(&format!(
+                "CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, pt INT) \
+                 PARTITIONED BY (pt) {options}"
+            ))
+            .await
+            .unwrap();
 
-    assert_sql_error(
-        &sql_context,
-        "DELETE FROM paimon.test_db.pk_t WHERE id = 1",
-        "DELETE on primary-key tables is not yet supported",
-    )
-    .await;
-    drop(tmp);
+        // Separate commits and partitions exercise global row selection.
+        exec(
+            &sql_context,
+            "INSERT INTO paimon.test_db.t (id, name, pt) VALUES (1, 'a', 1), (4, 'd', 2)",
+        )
+        .await;
+        exec(
+            &sql_context,
+            "INSERT INTO paimon.test_db.t (id, name, pt) VALUES (2, 'b', 1), (3, 'c', 2)",
+        )
+        .await;
+
+        let before = query_pt(&sql_context).await;
+        let cnt = dml_count(
+            &sql_context,
+            "DELETE FROM paimon.test_db.t WHERE id > 1 LIMIT 0",
+        )
+        .await;
+        assert_eq!(cnt, 0);
+        assert_eq!(query_pt(&sql_context).await, before);
+
+        let cnt = dml_count(
+            &sql_context,
+            "DELETE FROM paimon.test_db.t \
+             WHERE t.id <> 4 ORDER BY paimon.test_db.t.pt DESC, t.id ASC LIMIT 2",
+        )
+        .await;
+        assert_eq!(cnt, 2);
+        assert_eq!(
+            query_pt(&sql_context).await,
+            vec![(2, "b".into(), 1), (4, "d".into(), 2)]
+        );
+
+        let cnt = dml_count(&sql_context, "DELETE FROM paimon.test_db.t LIMIT 1").await;
+        assert_eq!(cnt, 1);
+        assert_eq!(query_pt(&sql_context).await.len(), 1);
+    }
 }
+
+// ======================= Unsupported cases =======================
 
 #[tokio::test]
 async fn test_delete_rejects_data_evolution_table_without_deletion_vectors() {

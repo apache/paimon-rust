@@ -121,7 +121,7 @@ async fn plan_impl(
     let strategy = UniversalCompaction::from_options(&options, "global-index.")?;
     let width = if matches!(
         definition.index_type.as_str(),
-        "btree" | "bitmap" | "multivalue" | "fm"
+        "btree" | "bitmap" | "multivalue" | "fm" | "rtree"
     ) {
         core.sorted_index_records_per_range()?
     } else {
@@ -134,6 +134,35 @@ async fn plan_impl(
     )?;
     let field_id = fields[0].id();
     let vector_semantics = if crate::vindex::is_vindex_index_type(&definition.index_type) {
+        let routed =
+            crate::table::vindex_index_build_builder::centroid::CentroidBuildOptions::resolve(
+                table.schema().options(),
+                &definition.options,
+                &HashMap::new(),
+                &definition.index_type,
+                &definition.column,
+            )?
+            .is_some()
+                || indexes.iter().any(|entry| {
+                    entry.kind == FileKind::Add
+                        && entry
+                            .index_file
+                            .global_index_meta
+                            .as_ref()
+                            .is_some_and(|meta| meta.index_field_id == field_id)
+                        && crate::table::centroid_index::Descriptor::is_wrapped(&entry.index_file)
+                });
+        // Range maintenance must not retire siblings or replace a routed
+        // generation with a partial rebuild over the pending input files.
+        if routed {
+            return Ok(MaintenancePlan {
+                replaced: HashSet::new(),
+                deletions: vec![],
+                needs_build: false,
+                build_ranges: HashMap::new(),
+                training_groups: vec![],
+            });
+        }
         let options = crate::vindex::VindexVectorIndexOptions::new(
             table.schema().options(),
             &definition.options,
@@ -205,7 +234,7 @@ async fn plan_impl(
     let mut replaced = HashSet::new();
     let mut index_schema = matches!(
         definition.index_type.as_str(),
-        "btree" | "bitmap" | "multivalue" | "fm" | "full-text"
+        "btree" | "bitmap" | "multivalue" | "fm" | "rtree" | "full-text"
     )
     .then(|| crate::table::global_index_schema::GlobalIndexSchema::new(table, fields[0]));
     for entry in selected.iter().copied() {
@@ -310,6 +339,10 @@ async fn plan_impl(
             // Increasing row IDs act as append sequence: newest runs first, as
             // in PK L0 selection. Only adjacent ranges of one group may merge.
             runs.sort_by_key(|run| std::cmp::Reverse(run.range.from()));
+            if definition.index_type == "rtree" {
+                // All physical files in one shard form a single maintenance run.
+                runs.dedup_by(|a, b| a.range == b.range);
+            }
             let candidates = runs
                 .iter()
                 .map(|run| Run {
@@ -321,7 +354,16 @@ async fn plan_impl(
             if let Some(count) = strategy.pick(&candidates, 0).filter(|&count| count >= 2) {
                 for run in &runs[..count] {
                     if let Some(entry) = run.index {
-                        replaced.insert(index_file_key(entry));
+                        if definition.index_type == "rtree" {
+                            replaced.extend(
+                                existing
+                                    .iter()
+                                    .filter(|part| index_range(part) == run.range)
+                                    .map(|part| index_file_key(part)),
+                            );
+                        } else {
+                            replaced.insert(index_file_key(entry));
+                        }
                     }
                     pending.push(run.range.clone());
                 }
@@ -397,7 +439,12 @@ fn retire_overlaps(files: &mut Vec<&IndexManifestEntry>, replaced: &mut HashSet<
             end = end.max(index_range(files[next]).to());
             next += 1;
         }
-        if next > first + 1 {
+        if next > first + 1
+            && !(files[first].index_file.index_type == "rtree"
+                && files[first..next]
+                    .iter()
+                    .all(|f| index_range(f) == index_range(files[first])))
+        {
             replaced.extend(files[first..next].iter().map(|entry| index_file_key(entry)));
         }
         first = next;

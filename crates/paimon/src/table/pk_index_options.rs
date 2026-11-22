@@ -41,7 +41,7 @@ pub(super) fn field_options(
 
 pub(super) fn definitions(schema: &TableSchema) -> Result<Vec<Definition>> {
     let options = schema.options();
-    let owners = crate::table::global_index_options::declarations(options)?
+    let owners = crate::table::global_index_options::declarations(schema)?
         .into_iter()
         .map(|definition| (definition.column.clone(), definition))
         .collect::<HashMap<_, _>>();
@@ -70,6 +70,11 @@ pub(super) fn definitions(schema: &TableSchema) -> Result<Vec<Definition>> {
         let mut merged = options.clone();
         merged.extend(configured.clone());
         match family {
+            "rtree" => {
+                return Err(Error::Unsupported {
+                    message: "R-tree indexes require an append table with row tracking".into(),
+                })
+            }
             "vector" => {
                 match field.data_type() {
                     DataType::Vector(_) => {}

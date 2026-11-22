@@ -42,10 +42,11 @@ use paimon::api::{
     ListPartitionsByFilterRequest, ListPartitionsByNamesRequest, ListPartitionsResponse,
     ListPermissionsResponse, ListPoliciesResponse, ListTablesResponse, ListViewsResponse,
     PermissionAssignment, PermissionResource, PolicyRequest, PolicyType, RESTUtil,
-    RenameTableRequest, ResourcePaths, ResourceType, RevokePermissionRequest,
+    RenameTableRequest, ResourcePaths, ResourceType, RevokePermissionRequest, RollbackTableRequest,
 };
 use paimon::catalog::{Function, Identifier};
 use paimon::spec::{CommitKind, Partition, Snapshot};
+use paimon::table::Instant;
 
 type PartitionPageResponse = (Vec<Partition>, Option<String>);
 type PartitionSpecPageResponse = (Vec<HashMap<String, String>>, Option<String>);
@@ -73,7 +74,9 @@ struct MockState {
     views: HashMap<String, GetViewResponse>,
     functions: HashMap<String, GetFunctionResponse>,
     tags: HashMap<String, GetTagResponse>,
+    tags_replaced_after_read: HashMap<String, (usize, Snapshot)>,
     catalog_snapshots: HashMap<String, Snapshot>,
+    rollback_snapshots: HashMap<(String, i64), Snapshot>,
     create_tag_calls: Vec<(String, String, CreateTagRequest)>,
     get_tag_calls: Vec<(String, String, String)>,
     delete_tag_calls: Vec<(String, String, String)>,
@@ -94,6 +97,7 @@ struct MockState {
     list_partitions_by_filter_error_status: Option<StatusCode>,
     view_function_endpoints_unsupported: bool,
     drop_view_error_status: Option<StatusCode>,
+    drop_function_error_status: Option<StatusCode>,
     list_page_size: Option<usize>,
     no_permission_databases: HashSet<String>,
     no_permission_tables: HashSet<String>,
@@ -644,6 +648,39 @@ impl RESTServer {
         let key = format!("{db}.{function}");
         if let Some(response) = s.functions.get(&key) {
             (StatusCode::OK, Json(response.clone())).into_response()
+        } else {
+            let err = ErrorResponse::new(
+                Some("function".to_string()),
+                Some(function),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            (StatusCode::NOT_FOUND, Json(err)).into_response()
+        }
+    }
+
+    /// Handle DELETE /databases/:db/functions/:function - drop a persistent function.
+    pub async fn drop_function(
+        Path((db, function)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut s = state.inner.lock().unwrap();
+        let status = if s.view_function_endpoints_unsupported {
+            Some(StatusCode::NOT_IMPLEMENTED)
+        } else {
+            s.drop_function_error_status
+        };
+        if let Some(status) = status {
+            let err = ErrorResponse::new(
+                Some("function".to_string()),
+                Some(function),
+                status.canonical_reason().map(ToString::to_string),
+                Some(status.as_u16() as i32),
+            );
+            return (status, Json(err)).into_response();
+        }
+        if s.functions.remove(&format!("{db}.{function}")).is_some() {
+            StatusCode::NO_CONTENT.into_response()
         } else {
             let err = ErrorResponse::new(
                 Some("function".to_string()),
@@ -1276,10 +1313,74 @@ impl RESTServer {
         if !state.tables.contains_key(&format!("{db}.{table}")) {
             return resource_error(StatusCode::NOT_FOUND, "table", &table);
         }
-        match state.tags.get(&format!("{db}.{table}.{tag}")) {
-            Some(response) => (StatusCode::OK, Json(response.clone())).into_response(),
+        let key = format!("{db}.{table}.{tag}");
+        let should_replace =
+            state
+                .tags_replaced_after_read
+                .get_mut(&key)
+                .is_some_and(|(reads, _)| {
+                    *reads -= 1;
+                    *reads == 0
+                });
+        let replacement = should_replace
+            .then(|| state.tags_replaced_after_read.remove(&key))
+            .flatten();
+        match state.tags.get_mut(&key) {
+            Some(tag) => {
+                let response = tag.clone();
+                if let Some((_, snapshot)) = replacement {
+                    tag.snapshot = snapshot;
+                }
+                (StatusCode::OK, Json(response)).into_response()
+            }
             None => resource_error(StatusCode::NOT_FOUND, "TAG", &tag),
         }
+    }
+
+    pub async fn rollback(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<RollbackTableRequest>,
+    ) -> impl IntoResponse {
+        let mut state = state.inner.lock().unwrap();
+        let key = format!("{db}.{table}");
+        let Some(head) = state.catalog_snapshots.get(&key) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if request
+            .from_snapshot
+            .is_some_and(|expected| head.id() != expected)
+            || request.table_id.as_ref()
+                != state.tables.get(&key).and_then(|table| table.id.as_ref())
+        {
+            return StatusCode::CONFLICT.into_response();
+        }
+        let snapshot = match request.instant {
+            Instant::Snapshot { snapshot_id } if snapshot_id == head.id() => head.clone(),
+            Instant::Snapshot { snapshot_id } => {
+                let Some(snapshot) = state.rollback_snapshots.get(&(key.clone(), snapshot_id))
+                else {
+                    return resource_error(
+                        StatusCode::NOT_FOUND,
+                        "SNAPSHOT",
+                        &snapshot_id.to_string(),
+                    );
+                };
+                snapshot.clone()
+            }
+            Instant::Tag { tag_name } => {
+                let Some(tag) = state.tags.get(&format!("{key}.{tag_name}")) else {
+                    return resource_error(StatusCode::NOT_FOUND, "TAG", &tag_name);
+                };
+                tag.snapshot.clone()
+            }
+        };
+        let tag_prefix = format!("{key}.");
+        state.tags.retain(|name, tag| {
+            !name.starts_with(&tag_prefix) || tag.snapshot.id() <= snapshot.id()
+        });
+        state.catalog_snapshots.insert(key, snapshot);
+        StatusCode::OK.into_response()
     }
 
     pub async fn delete_tag(
@@ -2193,6 +2294,11 @@ impl RESTServer {
         self.inner.lock().unwrap().drop_view_error_status = status;
     }
 
+    /// Make the drop-function endpoint return the given status.
+    pub fn set_drop_function_error_status(&self, status: Option<StatusCode>) {
+        self.inner.lock().unwrap().drop_function_error_status = status;
+    }
+
     /// Make the create-partitions endpoint return the given status.
     pub fn set_create_partitions_error_status(&self, status: Option<StatusCode>) {
         self.inner.lock().unwrap().create_partitions_error_status = status;
@@ -2567,6 +2673,30 @@ impl RESTServer {
         );
     }
 
+    /// Repoint a tag immediately after the nth successful tag read.
+    pub fn replace_tag_after_reads(
+        &self,
+        database: &str,
+        table: &str,
+        tag: &str,
+        reads: usize,
+        snapshot_id: i64,
+    ) {
+        assert!(reads > 0);
+        self.inner.lock().unwrap().tags_replaced_after_read.insert(
+            format!("{database}.{table}.{tag}"),
+            (reads, tag_snapshot(snapshot_id)),
+        );
+    }
+
+    pub fn add_rollback_snapshot(&self, database: &str, table: &str, snapshot: Snapshot) {
+        self.inner
+            .lock()
+            .unwrap()
+            .rollback_snapshots
+            .insert((format!("{database}.{table}"), snapshot.id()), snapshot);
+    }
+
     /// Serve a current snapshot from the catalog independently of table storage.
     pub fn set_catalog_snapshot(&self, database: &str, table: &str, snapshot: Snapshot) {
         self.inner
@@ -2791,6 +2921,10 @@ pub async fn start_mock_server(
             &format!("{prefix}/databases/:db/tables/:table/commit"),
             post(RESTServer::commit_snapshot),
         )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/rollback"),
+            post(RESTServer::rollback),
+        )
         // Database routes
         .route(
             &format!("{prefix}/databases"),
@@ -2862,7 +2996,7 @@ pub async fn start_mock_server(
         )
         .route(
             &format!("{prefix}/databases/:db/functions/:function"),
-            get(RESTServer::get_function),
+            get(RESTServer::get_function).delete(RESTServer::drop_function),
         )
         .route(
             &format!("{prefix}/databases/:db/tables/:table/auth"),

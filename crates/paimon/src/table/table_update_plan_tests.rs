@@ -29,6 +29,7 @@ async fn table(name: &str) -> Table {
     let schema = Schema::builder()
         .column("value", DataType::Int(IntType::new()))
         .option("bucket", "-1")
+        .option("write-only", "true")
         .option("data-evolution.enabled", "true")
         .option("row-tracking.enabled", "true")
         .option("deletion-vectors.enabled", "true")
@@ -48,9 +49,13 @@ async fn table(name: &str) -> Table {
 }
 
 async fn append(table: &Table, value: i32) {
+    append_values(table, vec![value]).await;
+}
+
+async fn append_values(table: &Table, values: Vec<i32>) {
     let batch = RecordBatch::try_from_iter(vec![(
         "value",
-        Arc::new(Int32Array::from(vec![value])) as ArrayRef,
+        Arc::new(Int32Array::from(values)) as ArrayRef,
     )])
     .unwrap();
     let builder = table.new_write_builder();
@@ -72,6 +77,222 @@ fn update_batch(row_id: i64) -> RecordBatch {
         ("value", Arc::new(Int32Array::from(vec![99])) as ArrayRef),
     ])
     .unwrap()
+}
+
+#[tokio::test]
+async fn planned_shards_keep_complete_groups_and_snapshot_without_manifest_rescan() {
+    use futures::TryStreamExt;
+
+    let table = table("planned_shard_baseline").await;
+    append_values(&table, vec![30, 40, 50]).await;
+    let update = table.new_write_builder().new_update().unwrap();
+    let messages = update
+        .update_by_arrow_with_row_id(vec![update_batch(0)])
+        .await
+        .unwrap();
+    let builder = table.new_write_builder();
+    builder.new_commit().commit(messages).await.unwrap();
+    let deletes = update.delete_by_row_id(vec![3]).await.unwrap();
+    builder.new_commit().commit(deletes).await.unwrap();
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .plan_all()
+        .await
+        .unwrap();
+    assert_eq!(plan.snapshot_id(), Some(5));
+    let routing = RowIdPlan::from_plan(plan.clone()).unwrap();
+    assert_eq!(routing.groups().len(), 3);
+    assert!(routing.groups()[0].2.data_files().len() > 1);
+    assert!(routing.groups()[2].2.data_deletion_files().is_some());
+    append(&table, 60).await;
+    table
+        .file_io()
+        .delete_dir(&format!("{}/manifest", table.location()))
+        .await
+        .unwrap();
+
+    for assigned in [false, true] {
+        for count in [1, 2, 6] {
+            let mut seen = Vec::new();
+            let mut updated_groups = Vec::new();
+            for shard in 0..count {
+                let worker_plan = if assigned {
+                    Plan::from_splits(
+                        plan.snapshot_id(),
+                        routing
+                            .groups()
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| index % count == shard)
+                            .map(|(_, (_, _, split))| split.clone())
+                            .collect(),
+                    )
+                } else {
+                    plan.clone()
+                };
+                let mut update = table.new_write_builder().new_update().unwrap();
+                update.with_plan(worker_plan).unwrap();
+                update.with_update_type(vec!["value".into()]).unwrap();
+                let (index, total) = if assigned { (0, 1) } else { (shard, count) };
+                let mut updater = update.new_shard_updater(index, total, None).await.unwrap();
+                let batches: Vec<RecordBatch> =
+                    updater.arrow_reader().unwrap().try_collect().await.unwrap();
+                let values: Vec<i32> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+                seen.extend(values.iter().copied());
+                // Write with different batch boundaries than the captured reader.
+                for value in values {
+                    updater
+                        .update_by_arrow_batch(
+                            RecordBatch::try_from_iter([(
+                                "value",
+                                Arc::new(Int32Array::from(vec![value + 100])) as ArrayRef,
+                            )])
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let messages = updater.prepare_commit().await.unwrap();
+                for message in &messages {
+                    assert_eq!(message.check_from_snapshot, Some(5));
+                    updated_groups.extend(
+                        message
+                            .new_files
+                            .iter()
+                            .map(|file| (file.first_row_id.unwrap(), file.row_count)),
+                    );
+                }
+                assert_eq!(
+                    updater.prepare_commit().await.unwrap().len(),
+                    messages.len()
+                );
+                updater.close();
+            }
+            seen.sort_unstable();
+            updated_groups.sort_unstable();
+            assert_eq!(
+                seen,
+                vec![20, 30, 50, 99],
+                "assigned={assigned}, count={count}"
+            );
+            assert_eq!(updated_groups, vec![(0, 1), (1, 1), (2, 3)]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn planned_shards_publish_only_assigned_groups_and_check_conflicts() {
+    use futures::TryStreamExt;
+
+    let table = table("planned_shard_publication").await;
+    let plan = table
+        .new_read_builder()
+        .new_scan()
+        .plan_all()
+        .await
+        .unwrap();
+    let routing = RowIdPlan::from_plan(plan).unwrap();
+    let plan = Plan::from_splits(Some(2), vec![routing.groups()[0].2.clone()]);
+    append(&table, 30).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_plan(plan).unwrap();
+    let mut prepared = Vec::new();
+    for value in [99, 100] {
+        let mut shard = update.new_shard_updater(0, 1, Some(vec![])).await.unwrap();
+        let batches: Vec<RecordBatch> = shard.arrow_reader().unwrap().try_collect().await.unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert!(batches.iter().all(|batch| batch.num_columns() == 0));
+        shard
+            .update_by_arrow_batch(
+                RecordBatch::try_from_iter([(
+                    "value",
+                    Arc::new(Int32Array::from(vec![value])) as ArrayRef,
+                )])
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let messages = shard.prepare_commit().await.unwrap();
+        assert_eq!(messages[0].check_from_snapshot, Some(2));
+        prepared.push(messages);
+    }
+    let builder = table.new_write_builder();
+    builder
+        .new_commit()
+        .commit(prepared.remove(0))
+        .await
+        .unwrap();
+    assert!(builder
+        .new_commit()
+        .commit(prepared.remove(0))
+        .await
+        .is_err());
+    let read = table.new_read_builder();
+    let plan = read.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = read
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut values: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    values.sort_unstable();
+    assert_eq!(values, vec![20, 30, 99]);
+}
+
+#[tokio::test]
+async fn planned_shards_validate_indices_and_keep_empty_plans_empty() {
+    use futures::TryStreamExt;
+
+    let table = table("planned_shard_empty").await;
+    for snapshot in [None, Some(2)] {
+        let mut update = table.new_write_builder().new_update().unwrap();
+        update
+            .with_plan(Plan::from_splits(snapshot, vec![]))
+            .unwrap();
+        for (shard, count) in [(0, 0), (1, 1)] {
+            let error = update
+                .new_shard_updater(shard, count, None)
+                .await
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("positive shard count"));
+        }
+        let mut shard = update.new_shard_updater(0, 1, None).await.unwrap();
+        assert!(shard
+            .arrow_reader()
+            .unwrap()
+            .try_next()
+            .await
+            .unwrap()
+            .is_none());
+        assert!(shard.prepare_commit().await.unwrap().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -149,6 +370,7 @@ async fn planned_mutations_reject_foreign_paths_and_selected_splits_before_writi
             continue;
         }
         assert!(update.new_update_by_row_id().await.is_err());
+        assert!(update.new_shard_updater(0, 1, None).await.is_err());
         assert!(update.delete_by_row_id(vec![0]).await.is_err());
     }
 }
@@ -653,12 +875,6 @@ async fn captured_plan_rejects_other_operation_families_before_io_or_callbacks()
         Ok(Vec::new())
     }));
     let errors = vec![
-        update
-            .new_shard_updater(0, 1, None)
-            .await
-            .err()
-            .unwrap()
-            .to_string(),
         update
             .update_by_predicate(None, vec![("value".into(), callback)], vec![])
             .await

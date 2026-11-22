@@ -133,7 +133,7 @@ fn result_row(
         MergeResult::SourceRow { batch_idx, row_idx } => {
             source_row(*batch_idx, *row_idx, batches, columns, schema).map(Some)
         }
-        MergeResult::MaterializedRow(batch) | MergeResult::MaterializedDeleteRow(batch) => {
+        MergeResult::MaterializedRow(batch) | MergeResult::MaterializedRetractRow(batch, _) => {
             Ok(Some(batch.clone()))
         }
         MergeResult::Omit => Ok(None),

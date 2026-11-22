@@ -27,7 +27,41 @@ use arrow_array::builder::{Float32Builder, ListBuilder};
 use arrow_array::{ArrayRef, Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Once};
+
+const VECTOR_SEARCH_LOG_TARGET: &str = "paimon::vector_search";
+static VECTOR_SEARCH_TEST_LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+struct VectorSearchTestLogger;
+
+impl log::Log for VectorSearchTestLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target() == VECTOR_SEARCH_LOG_TARGET && metadata.level() <= log::Level::Debug
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            VECTOR_SEARCH_TEST_LOGS
+                .lock()
+                .unwrap()
+                .push(record.args().to_string());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+pub(super) fn vector_search_log_start() -> usize {
+    static INIT: Once = Once::new();
+    static LOGGER: VectorSearchTestLogger = VectorSearchTestLogger;
+    INIT.call_once(|| log::set_logger(&LOGGER).unwrap());
+    log::set_max_level(log::LevelFilter::Debug);
+    VECTOR_SEARCH_TEST_LOGS.lock().unwrap().len()
+}
+
+pub(super) fn vector_search_logs_since(start: usize) -> Vec<String> {
+    VECTOR_SEARCH_TEST_LOGS.lock().unwrap()[start..].to_vec()
+}
 
 pub(super) fn vector_test_table() -> Table {
     vector_test_table_at("memory:/vector_test")

@@ -890,13 +890,17 @@ fn test_collect_raw_batch_vector_batch_respects_fixed_size_list_offset() {
     assert_eq!(top_k.pop().unwrap().into_search_result().row_ids, vec![11]);
 }
 
-#[test]
-fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
+fn raw_batch_with_null_vector_element() -> RecordBatch {
     let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
     let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element_field);
-    for vector in [[1.0, 0.0], [0.0, 1.0], [0.8, 0.2]] {
-        builder.values().append_value(vector[0]);
-        builder.values().append_value(vector[1]);
+    for vector in [
+        [None, Some(0.0)],
+        [Some(0.0), Some(1.0)],
+        [Some(0.8), Some(0.2)],
+    ] {
+        for coordinate in vector {
+            builder.values().append_option(coordinate);
+        }
         builder.append(true);
     }
     let schema = Arc::new(ArrowSchema::new(vec![
@@ -910,42 +914,88 @@ fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
         ),
         ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, true),
     ]));
-    let batch = RecordBatch::try_new(
+    RecordBatch::try_new(
         schema,
         vec![
             Arc::new(builder.finish()) as ArrayRef,
             Arc::new(Int64Array::from(vec![Some(10), Some(11), Some(12)])) as ArrayRef,
         ],
     )
-    .unwrap();
-    let mut include_row_ids = RoaringTreemap::new();
-    include_row_ids.insert(12);
-    let searches = vec![
-        VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string())
-            .unwrap()
-            .with_include_row_ids(include_row_ids),
-    ];
-    let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
-    let mut top_k = searches
-        .iter()
-        .map(|search| RawScoreTopK::new(search.limit))
-        .collect::<Vec<_>>();
+    .unwrap()
+}
 
-    collect_raw_batch_vector_batch(
-        &batch,
-        &searches,
-        RawVectorMetric::L2,
-        &scoring_plan,
-        &mut top_k,
-    )
-    .unwrap();
-    let results = top_k
-        .into_iter()
-        .map(RawScoreTopK::into_search_result)
-        .collect::<Vec<_>>();
+#[test]
+fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
+    let batch = raw_batch_with_null_vector_element();
+    let shared_include: Arc<RoaringTreemap> = Arc::new(std::iter::once(12).collect());
+    for (included, shared) in [([12, 12], true), ([12, 11], false)] {
+        let searches = included
+            .iter()
+            .map(|&row_id| {
+                let mut search =
+                    VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+                if shared {
+                    search.set_shared_include_row_ids(Arc::clone(&shared_include));
+                    search
+                } else {
+                    search.with_include_row_ids(std::iter::once(row_id).collect())
+                }
+            })
+            .collect::<Vec<_>>();
+        let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
+        assert_eq!(scoring_plan.shared_filter_groups.len(), usize::from(shared));
+        let mut top_k = searches
+            .iter()
+            .map(|search| RawScoreTopK::new(search.limit))
+            .collect::<Vec<_>>();
 
-    assert_eq!(results[0].row_ids, vec![12]);
-    assert_eq!(results[0].scores.len(), 1);
+        collect_raw_batch_vector_batch(
+            &batch,
+            &searches,
+            RawVectorMetric::L2,
+            &scoring_plan,
+            &mut top_k,
+        )
+        .unwrap();
+
+        for (result, row_id) in top_k
+            .into_iter()
+            .map(RawScoreTopK::into_search_result)
+            .zip(included)
+        {
+            assert_eq!(result.row_ids, vec![row_id]);
+            assert_eq!(result.scores.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn test_collect_raw_batch_vector_batch_rejects_selected_null_vector_element() {
+    let batch = raw_batch_with_null_vector_element();
+    let query = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+    let valid_row = query
+        .clone()
+        .with_include_row_ids(std::iter::once(12).collect());
+    let null_row = query
+        .clone()
+        .with_include_row_ids(std::iter::once(10).collect());
+    for other_query in [null_row, query] {
+        let searches = [valid_row.clone(), other_query];
+        let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
+        let mut top_k = [RawScoreTopK::new(2), RawScoreTopK::new(2)];
+        let error = collect_raw_batch_vector_batch(
+            &batch,
+            &searches,
+            RawVectorMetric::L2,
+            &scoring_plan,
+            &mut top_k,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, crate::Error::DataInvalid { message, .. } if message.contains("null vector element")),
+            "{error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1683,7 +1733,7 @@ async fn filtered_rerank_rejects_metric_from_a_skipped_shard() {
 }
 
 #[test]
-fn scalar_unindexed_coverage_intersects_all_predicate_fields() {
+fn scalar_coverage_gaps_use_single_field_definitions() {
     let io = FileIOBuilder::new("memory").build().unwrap();
     let options = HashMap::new();
     let fields = vec![make_field(1, "id"), make_field(2, "other")];
@@ -1700,40 +1750,32 @@ fn scalar_unindexed_coverage_intersects_all_predicate_fields() {
     let meta = composite.index_file.global_index_meta.as_mut().unwrap();
     meta.row_range_end = 19;
     meta.extra_field_ids = Some(vec![2]);
-    let builder = crate::spec::PredicateBuilder::new(&fields);
-    let predicates = vec![
-        builder.equal("id", crate::spec::Datum::Int(7)).unwrap(),
-        builder.equal("other", crate::spec::Datum::Int(7)).unwrap(),
-    ];
-    for filter in [
-        Predicate::and(predicates.clone()),
-        Predicate::or(predicates),
-    ] {
+    for field_ids in [HashSet::from([2]), HashSet::from([1, 2])] {
         let entries = vec![id.clone(), other.clone(), composite.clone()];
         assert_eq!(
-            scalar_unindexed_ranges(
+            scalar_coverage_gaps(
                 evaluation,
                 &entries,
-                &filter,
+                &field_ids,
                 GlobalIndexSearchMode::Full,
                 &[]
             ),
             vec![RowRange::new(5, 19)]
         );
         assert_eq!(
-            scalar_unindexed_ranges(
+            scalar_coverage_gaps(
                 evaluation,
                 &entries,
-                &filter,
+                &field_ids,
                 GlobalIndexSearchMode::Detail,
                 &[RowRange::new(0, 9), RowRange::new(15, 17)]
             ),
             vec![RowRange::new(5, 9), RowRange::new(15, 17)]
         );
-        assert!(scalar_unindexed_ranges(
+        assert!(scalar_coverage_gaps(
             evaluation,
             &entries,
-            &filter,
+            &field_ids,
             GlobalIndexSearchMode::Fast,
             &[]
         )
@@ -1741,10 +1783,10 @@ fn scalar_unindexed_coverage_intersects_all_predicate_fields() {
         // An index from another family cannot fill scalar coverage.
         id.index_file.index_type = "full-text".to_string();
         assert_eq!(
-            scalar_unindexed_ranges(
+            scalar_coverage_gaps(
                 evaluation,
                 &[id.clone(), other.clone()],
-                &filter,
+                &HashSet::from([1, 2]),
                 GlobalIndexSearchMode::Full,
                 &[]
             ),
@@ -1776,7 +1818,15 @@ impl crate::table::SearchTaskExecutor for WireSearchExecutor {
         let mut results = Vec::new();
         for (task, frame) in tasks.iter().zip(frames) {
             let value: serde_json::Value = serde_json::from_slice(&task.serialize()?).unwrap();
-            if value["kind"] == "vector-index" {
+            if value["kind"] == "vector-index-filtered" {
+                // This fixture requests K=1 with refine_factor=2: transport
+                // the original result limit, not the enlarged index limit.
+                assert_eq!(value["payload"]["top_ks"], serde_json::json!([1, 1]));
+            }
+            if matches!(
+                value["kind"].as_str(),
+                Some("vector-index" | "vector-index-filtered")
+            ) {
                 let resolved: crate::spec::VectorIndexOptions =
                     serde_json::from_value(value["payload"]["resolved"].clone()).unwrap();
                 assert_eq!(resolved.index_type.as_deref(), Some("ivf-flat"));
@@ -1797,6 +1847,93 @@ impl crate::table::SearchTaskExecutor for WireSearchExecutor {
         results.reverse();
         Ok(results)
     }
+}
+
+#[tokio::test]
+async fn scheduled_unevaluable_scalar_filter_keeps_vector_index() {
+    use crate::table::de_vector_scan::DeVectorScan;
+    use crate::table::vector_scan::Scan;
+
+    let table = de_vector_table().await;
+    let filter = id_gt_filter(&table, 1);
+    let mut plan = DeVectorScan::new(&table, Some(&filter), None, None)
+        .plan()
+        .await
+        .unwrap();
+    plan.index_entries
+        .retain(|entry| entry.index_file.index_type == "ivf-flat");
+    let reader = DeVectorRead::new(
+        "embedding",
+        &[&[1.0, 0.0], &[0.0, 1.0]],
+        1,
+        &HashMap::from([("refine_factor".into(), "2".into())]),
+    )
+    .unwrap();
+    let executor = WireSearchExecutor {
+        table,
+        kinds: std::sync::Mutex::new(Vec::new()),
+        fail: false,
+    };
+    let results = reader
+        .read_with_executor(plan, Some(&executor))
+        .await
+        .unwrap();
+    assert_eq!(results[0].row_ids().unwrap().row_ids, vec![2]);
+    assert_eq!(results[1].row_ids().unwrap().row_ids, vec![1]);
+    assert!(executor
+        .kinds
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|kind| kind == "vector-index-filtered"));
+}
+
+#[test]
+fn filtered_batch_preserves_buffered_search_without_tokio() {
+    use crate::table::de_vector_scan::DeVectorScan;
+    use crate::table::vector_scan::Scan;
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let table = runtime.block_on(de_vector_table());
+    let filter = id_gt_filter(&table, 1);
+    let mut plan = runtime
+        .block_on(DeVectorScan::new(&table, Some(&filter), None, None).plan())
+        .unwrap();
+    plan.index_entries
+        .retain(|entry| entry.index_file.index_type == IVF_FLAT_IDENTIFIER);
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    for factor in [1, 10] {
+        let reader = DeVectorRead::new(
+            "embedding",
+            &[&[1.0, 0.0], &[0.0, 1.0]],
+            1,
+            &HashMap::from([
+                (
+                    "vector-index.post-filter.candidates-factor".into(),
+                    factor.to_string(),
+                ),
+                ("refine_factor".into(), "2".into()),
+            ]),
+        )
+        .unwrap();
+        let executor = WireSearchExecutor {
+            table: table.clone(),
+            kinds: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        };
+        for scheduled in [false, true] {
+            let results = futures::executor::block_on(reader.read_with_executor(
+                plan.clone(),
+                scheduled.then_some(&executor as &dyn SearchTaskExecutor),
+            ))
+            .unwrap_or_else(|error| panic!("factor={factor}, scheduled={scheduled}: {error}"));
+            assert_eq!(results[0].row_ids().unwrap().row_ids, vec![2]);
+            assert_eq!(results[1].row_ids().unwrap().row_ids, vec![1]);
+        }
+    }
+    let single = DeVectorRead::new("embedding", &[&[1.0, 0.0]], 1, &HashMap::new()).unwrap();
+    let results = futures::executor::block_on(single.read(plan)).unwrap();
+    assert_eq!(results[0].row_ids().unwrap().row_ids, vec![2]);
 }
 
 #[tokio::test]
@@ -1862,6 +1999,77 @@ struct CandidateSearchExecutor {
     index_ordinal: std::sync::atomic::AtomicUsize,
     index_batch_sizes: std::sync::Mutex<Vec<usize>>,
 }
+
+struct MissingNearestExecutor {
+    table: Table,
+}
+
+#[async_trait::async_trait]
+impl crate::table::SearchTaskExecutor for MissingNearestExecutor {
+    async fn execute(
+        &self,
+        tasks: Vec<crate::table::SearchTask>,
+    ) -> crate::Result<Vec<crate::table::SearchTaskResult>> {
+        let mut results = Vec::new();
+        for task in tasks {
+            let wire: serde_json::Value = serde_json::from_slice(&task.serialize()?).unwrap();
+            if wire["kind"] == "vector-index-filtered" {
+                // A valid approximate answer can miss the nearest matching row.
+                let payload = serde_json::to_value(VectorTaskScores::capture(
+                    vec![ScoredRowIds::new(vec![1], vec![l2_score(2.0)])],
+                    Some(RawVectorMetric::L2),
+                ))
+                .unwrap();
+                let result =
+                    serde_json::json!({"version": 1, "id": wire["id"], "payload": payload});
+                results.push(crate::table::SearchTaskResult::deserialize(
+                    &serde_json::to_vec(&result).unwrap(),
+                )?);
+            } else {
+                results.push(task.execute(&self.table).await?);
+            }
+        }
+        Ok(results)
+    }
+}
+
+#[tokio::test]
+async fn explicit_overlapping_raw_source_recovers_an_ann_miss() {
+    let table =
+        crate::table::vector_search_test_utils::de_vector_table_with_metric(Some("l2")).await;
+    let mut builder = table.new_vector_search_builder();
+    builder
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1.0, 0.0])
+        .with_limit(1)
+        .with_filter(id_gt_filter(&table, 0));
+    let plan = builder.new_scan().unwrap().plan().await.unwrap();
+    let mut sources = plan.splits().to_vec();
+    for source in &mut sources {
+        if let crate::table::SearchScanSplit::Index {
+            scalar_index_files, ..
+        } = source
+        {
+            scalar_index_files.clear();
+        }
+    }
+    sources.push(crate::table::SearchScanSplit::Raw {
+        row_ranges: vec![RowRange::new(0, 0)],
+        scalar_index_files: vec![],
+        index_type: Some("ivf-flat".into()),
+    });
+    let plan = crate::table::VectorScanPlan::new(plan.snapshot().cloned(), sources).unwrap();
+    let wire = serde_json::to_value(&plan).unwrap();
+    let plan = serde_json::from_value(wire).unwrap();
+    let result = builder
+        .new_read()
+        .unwrap()
+        .read_with_executor(plan, &MissingNearestExecutor { table })
+        .await
+        .unwrap();
+    assert_eq!(result.row_ids().unwrap().row_ids, vec![0]);
+}
+
 #[async_trait::async_trait]
 impl crate::table::SearchTaskExecutor for CandidateSearchExecutor {
     async fn execute(
@@ -2020,10 +2228,16 @@ async fn scheduled_raw_vector_merges_bounded_windows_without_losing_late_winners
         batch_sizes: std::sync::Mutex::new(Vec::new()),
         ordinal: std::sync::atomic::AtomicUsize::new(0),
     };
-    let results =
-        execute_raw_vector_tasks(&table, &splits, &queries, RawVectorMetric::L2, &executor)
-            .await
-            .unwrap();
+    let results = execute_raw_vector_tasks(
+        &table,
+        &splits,
+        &queries,
+        RawVectorMetric::L2,
+        &executor,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         *executor.batch_sizes.lock().unwrap(),
         vec![

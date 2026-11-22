@@ -37,6 +37,8 @@ pub(crate) async fn execute_msck(ctx: &SQLContext, msck: &Msck) -> DFResult<Data
         ));
     }
     SQLContext::ensure_partition_command_target(&msck.table_name, "MSCK REPAIR TABLE")?;
+    ctx.reject_temporary_write_target(&msck.table_name, "MSCK REPAIR TABLE")
+        .await?;
     let (catalog, _catalog_name, identifier) = ctx.resolve_catalog_and_table(&msck.table_name)?;
     let table = catalog
         .get_table(&identifier)

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(super) mod centroid;
 mod extraction;
 mod pipeline;
 mod planning;
@@ -68,7 +69,11 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         &self,
         column: &str,
         field: &crate::spec::DataField,
-    ) -> Result<(HashMap<String, String>, VindexVectorIndexOptions)> {
+    ) -> Result<(
+        HashMap<String, String>,
+        VindexVectorIndexOptions,
+        Option<centroid::CentroidBuildOptions>,
+    )> {
         let procedure = super::global_index_options::build_procedure_options(
             self.table.schema().options(),
             &self.options,
@@ -78,25 +83,60 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             &procedure,
             column,
         );
+        let multi_vector = crate::vindex::multi_vector::embedding_type(field.data_type()).is_some();
         let defaults = super::global_index_options::declared_options(
             &effective,
             column,
             "vector",
             &self.index_type,
+            !multi_vector,
         )?;
         let user =
             super::global_index_options::build_options(&procedure, column, &self.index_type)?;
-        let native_user = crate::vindex::build_parameters(&user, &self.index_type, column);
-        let native = VindexVectorIndexOptions::new_with_defaults(
+        let centroid = centroid::CentroidBuildOptions::resolve(
             &effective,
             &defaults,
+            &user,
+            &self.index_type,
+            column,
+        )?;
+        if multi_vector {
+            if !self.table.schema().core_options().data_evolution_enabled() {
+                return Err(crate::vindex::multi_vector::invalid(
+                    "MultiVector indexes require a Data Evolution table",
+                ));
+            }
+            if centroid.is_some() {
+                return Err(crate::vindex::multi_vector::invalid(
+                    "MultiVector indexes require range sharding",
+                ));
+            }
+        }
+        let mut native_defaults = defaults.clone();
+        let mut native_user = crate::vindex::build_parameters(&user, &self.index_type, column);
+        for options in [&mut native_defaults, &mut native_user] {
+            options.retain(|key, _| {
+                let key = key
+                    .strip_prefix(&format!("{}.", self.index_type))
+                    .or_else(|| key.strip_prefix(&format!("fields.{column}.")))
+                    .unwrap_or(key);
+                let outer_only = matches!(key, "sharding" | "centroid.nlist")
+                    || (centroid.is_some()
+                        && self.index_type == "diskann"
+                        && key == "ivf.train.max-points-per-centroid");
+                !outer_only
+            });
+        }
+        let native = VindexVectorIndexOptions::new_with_defaults(
+            &effective,
+            &native_defaults,
             &native_user,
             &self.index_type,
             field,
         )?;
         effective.extend(defaults);
         effective.extend(user);
-        Ok((effective, native))
+        Ok((effective, native, centroid))
     }
 
     pub(super) async fn plan(&self) -> Result<GlobalIndexBuildPlan> {
@@ -123,7 +163,11 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         super::global_index_build_common::validate_build_table(self.table)?;
         let index_field = find_index_field(self.table, index_column)?;
         validate_vector_field(index_field)?;
-        let (merged_options, options) = self.configured_options(index_column, index_field)?;
+        let (merged_options, options, centroid) =
+            self.configured_options(index_column, index_field)?;
+        if let Some(centroid) = &centroid {
+            centroid.validate_table(self.table)?;
+        }
         let core_options = CoreOptions::new(&merged_options);
         let rows_per_shard = core_options.global_index_row_count_per_shard()?;
         core_options.global_index_build_parallelism()?;
@@ -150,12 +194,16 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let manifest_entries = view
             .manifest_entries(self.table, self.partition_filter.as_ref())
             .await?;
-        let indexed = crate::table::global_index_build_common::indexed_row_ranges(
-            view.index_entries(),
-            &self.index_type,
-            index_field.id(),
-            None, // single-column build; no extra fields today
-        );
+        let indexed = if centroid.is_some() {
+            vec![]
+        } else {
+            crate::table::global_index_build_common::indexed_row_ranges(
+                view.index_entries(),
+                &self.index_type,
+                index_field.id(),
+                None,
+            )
+        };
         let shards = plan_vindex_shards(
             self.table.location(),
             self.table.schema().partition_keys(),
@@ -163,11 +211,17 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             &self.table.schema().core_options(),
             snapshot.id(),
             manifest_entries,
-            rows_per_shard,
+            // Java splits build input for workers, then trains one router per
+            // contiguous range. Rust streams the range directly.
+            if centroid.is_some() {
+                i64::MAX
+            } else {
+                rows_per_shard
+            },
             &indexed,
         )?;
 
-        if !shards.is_empty() {
+        if centroid.is_none() && !shards.is_empty() {
             crate::table::global_index_build_common::validate_existing_index_overlap(
                 view.index_entries(),
                 &self.index_type,
@@ -180,6 +234,11 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             )?;
         }
 
+        let replacements = if centroid.is_some() {
+            self.centroid_replacements(&view, index_field.id())?
+        } else {
+            vec![]
+        };
         Ok(GlobalIndexBuildPlan::new(
             self.table,
             Some(snapshot.clone()),
@@ -187,7 +246,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             self.index_type.clone(),
             self.options.clone(),
             shards,
-        ))
+        )
+        .with_replacements(replacements))
     }
 
     pub(super) async fn build_planned_shard(
@@ -203,7 +263,14 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             })?;
         let index_field = find_index_field(self.table, index_column)?;
         validate_vector_field(index_field)?;
-        let (_, options) = self.configured_options(index_column, index_field)?;
+        let (_, options, centroid) = self.configured_options(index_column, index_field)?;
+        if let Some(centroid) = centroid {
+            centroid.validate_table(self.table)?;
+            let message = self
+                .build_centroid_index(shard, index_column, index_field.id(), &options, centroid)
+                .await?;
+            return Ok(Some((message, None)));
+        }
         let dimension = checked_i32(
             options.dimension() as u64,
             "vindex dimension is too large for Rust builder",
@@ -242,7 +309,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             .index_column
             .as_deref()
             .expect("plan validates index column");
-        let (options, _) =
+        let (options, _, _) =
             self.configured_options(column, find_index_field(self.table, column)?)?;
         let parallelism = CoreOptions::new(&options).global_index_build_parallelism()?;
         let prepared = super::global_index_build_common::preparation::prepare_shards(
@@ -260,6 +327,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 timings.push(timing);
             }
         }
+        messages.extend(plan.replacement_messages());
         Ok((plan.snapshot_id(), messages, timings))
     }
 }

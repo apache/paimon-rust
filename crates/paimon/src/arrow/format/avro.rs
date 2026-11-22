@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{FilePredicates, FormatFileReader};
+use super::{panic_payload_message, FilePredicates, FormatFileReader};
 use crate::arrow::build_target_arrow_schema;
+use crate::arrow::residual::{filter_record_batch_by_predicates, widen_scan_fields};
 use crate::io::FileRead;
 use crate::spec::{DataField, DataType, IntType, MapType, RowType};
 use crate::table::{ArrowRecordBatchStream, RowRange};
@@ -32,14 +33,24 @@ use arrow_array::{
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::SchemaRef;
-use async_stream::try_stream;
 use async_trait::async_trait;
-use futures::StreamExt;
-use std::sync::Arc;
+use bytes::{Buf, Bytes};
+use futures::{stream, StreamExt, TryFutureExt};
+use std::collections::VecDeque;
+use std::io::Read;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Arc, Mutex};
+use tokio_util::task::AbortOnDropHandle;
 
+/// Reads Avro object container files on demand, one block at a time.
 pub(crate) struct AvroFormatReader;
 
 const DEFAULT_BATCH_SIZE: usize = 8192;
+const INITIAL_READ_AHEAD: u64 = 512 * 1024;
+const MAX_READ_SIZE: u64 = 8 * 1024 * 1024;
+
+#[cfg(test)]
+mod streaming_tests;
 
 #[async_trait]
 impl FormatFileReader for AvroFormatReader {
@@ -52,66 +63,429 @@ impl FormatFileReader for AvroFormatReader {
         batch_size: Option<usize>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        // NOTE: Avro OCF requires sequential reading, so we load the entire file into memory.
-        // This is fine for typical Paimon data files but may be problematic for very large files.
-        let file_bytes = reader.read(0..file_size).await?;
-
-        // Widen the decoded schema to include any predicate columns that are not
-        // in the projection, so residual filtering can see them. DataFileReader
-        // projects the returned batch to `read_fields` by name, dropping extras.
-        let scan_fields = crate::arrow::residual::widen_scan_fields(read_fields, predicates);
+        let scan_fields = widen_scan_fields(read_fields, predicates);
         let target_schema = build_target_arrow_schema(&scan_fields)?;
-        let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
-        // Own the predicates so the returned 'static stream does not borrow the
-        // caller's `&FilePredicates` (FilePredicates is not `Clone`; rebuild it).
+        let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
         let predicates = predicates.map(|fp| FilePredicates {
             predicates: fp.predicates.clone(),
             row_filter_factory: None,
             file_fields: fp.file_fields.clone(),
         });
 
-        // Collect Avro records directly as apache_avro::Value, avoiding intermediate conversion.
-        let all_records: Vec<Value> = Reader::new(&file_bytes[..])
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to open Avro file: {e}"),
-                source: Some(Box::new(e)),
-            })?
-            .collect::<std::result::Result<Vec<Value>, _>>()
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to deserialize Avro record: {e}"),
-                source: Some(Box::new(e)),
-            })?;
-
-        // Apply row selection filtering.
-        let records: Vec<Value> = match row_selection {
-            Some(ref ranges) => {
-                let total_rows = all_records.len();
-                let mask = ranges_to_mask(total_rows, ranges);
-                all_records
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(i, _)| mask[*i])
-                    .map(|(_, r)| r)
-                    .collect()
-            }
-            None => all_records,
+        let context = AvroReadContext {
+            fields: scan_fields,
+            schema: target_schema,
+            predicates,
+            batch_size,
         };
+        let selection = AvroRowSelection::new(row_selection);
+        if selection.is_finished() {
+            return Ok(stream::empty().boxed());
+        }
 
-        Ok(try_stream! {
-            for chunk in records.chunks(batch_size) {
-                let batch = records_to_batch(chunk, &scan_fields, &target_schema)?;
-                let batch = match predicates.as_ref() {
-                    Some(fp) => crate::arrow::residual::filter_record_batch_by_predicates(
-                        batch,
-                        fp,
-                        &scan_fields,
-                    )?,
-                    None => batch,
-                };
-                yield batch;
+        Ok(async move {
+            let mut input = BufferedAvroInput::new(reader, file_size);
+            let (header, marker) = input.read_header().await?;
+            let decoder =
+                run_decode_task(move || AvroBatchDecoder::new(header, selection, context)).await?;
+            let scan = AvroScan {
+                input,
+                marker,
+                decoder,
+            };
+            Ok(stream::try_unfold(Some(scan), AvroScan::next_batch))
+        }
+        .try_flatten_stream()
+        .boxed())
+    }
+}
+
+struct AvroScan {
+    input: BufferedAvroInput,
+    marker: [u8; 16],
+    decoder: AvroBatchDecoder,
+}
+
+impl AvroScan {
+    fn has_more_to_scan(&self) -> bool {
+        !self.decoder.selection.is_finished()
+            && (self.decoder.row_position < self.decoder.block_end
+                || self.input.offset < self.input.file_size)
+    }
+
+    // Owning the scan here lets us drop it before yielding a terminal error
+    // or the batch that exhausts the file or row selection.
+    async fn next_batch(state: Option<Self>) -> crate::Result<Option<(RecordBatch, Option<Self>)>> {
+        let Some(mut scan) = state else {
+            return Ok(None);
+        };
+        while scan.has_more_to_scan() {
+            if scan.decoder.row_position == scan.decoder.block_end {
+                scan.read_next_selected_block().await?;
+                continue;
+            }
+
+            let batch;
+            (scan.decoder, batch) = run_decode_task(move || scan.decoder.decode_batch()).await?;
+            if let Some(batch) = batch {
+                if scan.decoder.selection.ranges.is_none() {
+                    scan.input.read_ahead = MAX_READ_SIZE;
+                }
+                let next = scan.has_more_to_scan().then_some(scan);
+                return Ok(Some((batch, next)));
             }
         }
-        .boxed())
+        Ok(None)
+    }
+
+    async fn read_next_selected_block(&mut self) -> crate::Result<()> {
+        let mut encoded = Vec::new();
+        while self.input.offset < self.input.file_size {
+            encoded.clear();
+            let count = self.input.read_length(&mut encoded).await?;
+            let size = self.input.read_length(&mut encoded).await?;
+            let block_end = self
+                .decoder
+                .row_position
+                .checked_add(count)
+                .ok_or_else(|| avro_invalid("Avro row position overflow"))?;
+            let selected = count > 0 && self.decoder.selection.overlaps_block(block_end);
+            let payload_to_read = if selected {
+                size
+            } else {
+                self.input.advance(size)?;
+                0
+            };
+            self.input
+                .read_into(payload_to_read + self.marker.len() as u64, &mut encoded)
+                .await?;
+            if !encoded.ends_with(&self.marker) {
+                return Err(avro_invalid("Avro sync marker mismatch"));
+            }
+            self.decoder.block_end = block_end;
+            if selected {
+                *self.decoder.input.lock().unwrap() = encoded.into();
+                break;
+            }
+            self.decoder.row_position = block_end;
+        }
+        Ok(())
+    }
+}
+
+struct AvroReadContext {
+    fields: Vec<DataField>,
+    schema: SchemaRef,
+    predicates: Option<FilePredicates>,
+    batch_size: usize,
+}
+
+/// The Avro reader owns its synchronous input. Sharing the current bytes lets
+/// the scan supply successive blocks while keeping the parsed writer schema.
+struct AvroBlockInput {
+    bytes: Arc<Mutex<Bytes>>,
+}
+
+impl Read for AvroBlockInput {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let mut bytes = self.bytes.lock().unwrap();
+        let count = output.len().min(bytes.len());
+        bytes.copy_to_slice(&mut output[..count]);
+        if bytes.is_empty() {
+            *bytes = Bytes::new();
+        }
+        Ok(count)
+    }
+}
+
+struct AvroBatchDecoder {
+    reader: Reader<'static, AvroBlockInput>,
+    input: Arc<Mutex<Bytes>>,
+    row_position: u64,
+    block_end: u64,
+    selection: AvroRowSelection,
+    context: AvroReadContext,
+}
+
+impl AvroBatchDecoder {
+    fn new(
+        header: Vec<u8>,
+        selection: AvroRowSelection,
+        context: AvroReadContext,
+    ) -> crate::Result<Self> {
+        let input = Arc::new(Mutex::new(header.into()));
+        let reader = Reader::new(AvroBlockInput {
+            bytes: input.clone(),
+        })
+        .map_err(avro_decode_error)?;
+        Ok(Self {
+            reader,
+            input,
+            row_position: 0,
+            block_end: 0,
+            selection,
+            context,
+        })
+    }
+
+    fn decode_batch(mut self) -> crate::Result<(Self, Option<RecordBatch>)> {
+        let physical_rows =
+            (self.block_end - self.row_position).min(self.context.batch_size as u64);
+        let mut records = Vec::new();
+        // Count discarded rows toward the batch limit so sparse scans stay cancellable.
+        for _ in 0..physical_rows {
+            if self.selection.is_finished() {
+                break;
+            }
+            let record = self
+                .reader
+                .next()
+                .ok_or_else(|| avro_invalid("Truncated Avro block"))?
+                .map_err(avro_decode_error)?;
+            if self.selection.select_row(self.row_position) {
+                records.push(record);
+            }
+            self.row_position += 1;
+        }
+        let batch = if records.is_empty() {
+            None
+        } else {
+            let context = &self.context;
+            let batch = records_to_batch(&records, &context.fields, &context.schema)?;
+            drop(records);
+            Some(match context.predicates.as_ref() {
+                Some(fp) => filter_record_batch_by_predicates(batch, fp, &context.fields)?,
+                None => batch,
+            })
+        };
+        Ok((self, batch))
+    }
+}
+
+async fn run_decode_task<T: Send + 'static>(
+    task: impl FnOnce() -> crate::Result<T> + Send + 'static,
+) -> crate::Result<T> {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // Yield between physical batches even when a sparse selection produces no output.
+        tokio::task::yield_now().await;
+        // apache-avro's bzip2 and xz decoders can panic on corrupt payloads.
+        return catch_unwind(AssertUnwindSafe(task)).map_err(|panic| Error::UnexpectedError {
+            message: format!(
+                "Avro decoding task panicked: {}",
+                panic_payload_message(panic)
+            ),
+            source: None,
+        })?;
+    };
+    // An aborted task can remain in Tokio's blocking queue. The stream owns
+    // its captured input until a worker takes it.
+    let pending = Arc::new(Mutex::new(Some(task)));
+    let queued = Arc::downgrade(&pending);
+    let handle = runtime.spawn_blocking(move || {
+        let task = queued
+            .upgrade()
+            .and_then(|pending| pending.lock().unwrap().take())
+            .ok_or_else(|| Error::UnexpectedError {
+                message: "Avro decoding task was canceled".to_string(),
+                source: None,
+            })?;
+        task()
+    });
+    AbortOnDropHandle::new(handle)
+        .await
+        .map_err(|error| Error::UnexpectedError {
+            message: "Avro decoding task failed".to_string(),
+            source: Some(Box::new(error)),
+        })?
+}
+
+fn avro_invalid(message: &str) -> Error {
+    Error::DataInvalid {
+        message: message.to_string(),
+        source: None,
+    }
+}
+
+fn avro_decode_error(error: apache_avro::Error) -> Error {
+    Error::UnexpectedError {
+        message: format!("Failed to decode Avro file: {error}"),
+        source: Some(Box::new(error)),
+    }
+}
+
+/// Inclusive physical row ranges, consumed in ascending order.
+struct AvroRowSelection {
+    ranges: Option<VecDeque<RowRange>>,
+}
+
+impl AvroRowSelection {
+    fn new(ranges: Option<Vec<RowRange>>) -> Self {
+        Self {
+            ranges: ranges.map(|ranges| {
+                crate::table::merge_row_ranges(ranges)
+                    .into_iter()
+                    .filter_map(|range| range.intersect_inclusive(0, i64::MAX))
+                    .collect()
+            }),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.ranges.as_ref().is_some_and(VecDeque::is_empty)
+    }
+
+    fn overlaps_block(&self, block_end: u64) -> bool {
+        self.ranges.as_ref().is_none_or(|ranges| {
+            ranges
+                .front()
+                .is_some_and(|range| (range.from() as u64) < block_end)
+        })
+    }
+
+    fn select_row(&mut self, position: u64) -> bool {
+        let Some(ranges) = &mut self.ranges else {
+            return true;
+        };
+        let Some(range) = ranges.front() else {
+            return false;
+        };
+        let selected = (range.from() as u64) <= position;
+        if range.to() as u64 == position {
+            ranges.pop_front();
+        }
+        selected
+    }
+}
+
+/// The buffer starts at the current file offset, including after a skipped payload.
+struct BufferedAvroInput {
+    reader: Box<dyn FileRead>,
+    file_size: u64,
+    offset: u64,
+    buffer: Bytes,
+    read_ahead: u64,
+}
+
+impl BufferedAvroInput {
+    fn new(reader: Box<dyn FileRead>, file_size: u64) -> Self {
+        Self {
+            reader,
+            file_size,
+            offset: 0,
+            buffer: Bytes::new(),
+            read_ahead: INITIAL_READ_AHEAD,
+        }
+    }
+
+    fn ensure_available(&self, len: u64) -> crate::Result<()> {
+        if len > self.file_size - self.offset {
+            return Err(avro_invalid("Truncated Avro file"));
+        }
+        Ok(())
+    }
+
+    async fn fill(&mut self, needed: u64) -> crate::Result<()> {
+        if self.buffer.is_empty() {
+            self.ensure_available(1)?;
+            let read_size = needed.clamp(self.read_ahead, MAX_READ_SIZE);
+            let end = self.offset.saturating_add(read_size).min(self.file_size);
+            self.buffer = self.reader.read(self.offset..end).await?;
+            if self.buffer.len() as u64 != end - self.offset {
+                return Err(avro_invalid("Short read from Avro file"));
+            }
+            // Give cancellation a chance between immediately ready cached reads.
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+
+    async fn read_into(&mut self, len: u64, out: &mut Vec<u8>) -> crate::Result<()> {
+        self.ensure_available(len)?;
+        let mut remaining = usize::try_from(len)
+            .map_err(|_| avro_invalid("Avro length exceeds addressable memory"))?;
+        out.try_reserve(remaining)
+            .map_err(|error| Error::UnexpectedError {
+                message: "Failed to allocate Avro buffer".to_string(),
+                source: Some(Box::new(error)),
+            })?;
+        while remaining > 0 {
+            self.fill(remaining as u64).await?;
+            let count = remaining.min(self.buffer.len());
+            out.extend_from_slice(&self.buffer[..count]);
+            self.advance(count as u64)?;
+            remaining -= count;
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self, len: u64) -> crate::Result<()> {
+        self.ensure_available(len)?;
+        if len < self.buffer.len() as u64 {
+            self.buffer.advance(len as usize);
+        } else {
+            // An empty slice would still own the exhausted storage window.
+            self.buffer = Bytes::new();
+        }
+        self.offset += len;
+        Ok(())
+    }
+
+    async fn read_long(&mut self, encoded: &mut Vec<u8>) -> crate::Result<i64> {
+        let mut value = 0_u64;
+        for shift in (0..70).step_by(7) {
+            self.fill(1).await?;
+            let byte = self.buffer[0];
+            self.advance(1)?;
+            encoded.push(byte);
+            if shift == 63 && byte > 1 {
+                return Err(avro_invalid("Avro long overflow"));
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok((value >> 1) as i64 ^ -((value & 1) as i64));
+            }
+        }
+        Err(avro_invalid("Invalid Avro long"))
+    }
+
+    async fn read_length(&mut self, encoded: &mut Vec<u8>) -> crate::Result<u64> {
+        u64::try_from(self.read_long(encoded).await?)
+            .map_err(|_| avro_invalid("Negative Avro count or length"))
+    }
+
+    async fn read_header(&mut self) -> crate::Result<(Vec<u8>, [u8; 16])> {
+        let mut header = Vec::new();
+        self.read_into(4, &mut header).await?;
+        if header.as_slice() != b"Obj\x01" {
+            return Err(avro_invalid("Invalid Avro magic bytes"));
+        }
+        // OCF metadata is a map<string, bytes>. Preserve its encoding, including
+        // negative-count map blocks and arbitrary binary user metadata.
+        loop {
+            let count = self.read_long(&mut header).await?;
+            if count == 0 {
+                break;
+            }
+            let metadata_end = if count < 0 {
+                let len = self.read_length(&mut header).await?;
+                self.ensure_available(len)?;
+                Some(self.offset + len)
+            } else {
+                None
+            };
+            for _ in 0..count.unsigned_abs() {
+                for _ in 0..2 {
+                    let len = self.read_length(&mut header).await?;
+                    self.read_into(len, &mut header).await?;
+                }
+            }
+            if metadata_end.is_some_and(|end| end != self.offset) {
+                return Err(avro_invalid("Invalid Avro metadata block length"));
+            }
+        }
+        self.read_into(16, &mut header).await?;
+        let marker = *header.last_chunk().unwrap();
+        Ok((header, marker))
     }
 }
 
@@ -196,26 +570,6 @@ fn value_as_bytes(v: &Value) -> Option<&[u8]> {
         Value::String(s) => Some(s.as_bytes()),
         _ => None,
     }
-}
-
-// ---------------------------------------------------------------------------
-// Row ranges → boolean mask
-// ---------------------------------------------------------------------------
-
-fn ranges_to_mask(total_rows: usize, ranges: &[RowRange]) -> Vec<bool> {
-    let mut mask = vec![false; total_rows];
-    if total_rows == 0 {
-        return mask;
-    }
-    let file_end = total_rows as i64 - 1;
-    for r in ranges {
-        let from = r.from().max(0) as usize;
-        let to = (r.to().min(file_end) as usize).min(total_rows - 1);
-        for item in mask.iter_mut().take(to + 1).skip(from) {
-            *item = true;
-        }
-    }
-    mask
 }
 
 // ---------------------------------------------------------------------------
@@ -921,31 +1275,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ranges_to_mask
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_ranges_to_mask_single_range() {
-        let ranges = vec![RowRange::new(1, 3)];
-        let mask = ranges_to_mask(5, &ranges);
-        assert_eq!(mask, vec![false, true, true, true, false]);
-    }
-
-    #[test]
-    fn test_ranges_to_mask_full_range() {
-        let ranges = vec![RowRange::new(0, 4)];
-        let mask = ranges_to_mask(5, &ranges);
-        assert_eq!(mask, vec![true, true, true, true, true]);
-    }
-
-    #[test]
-    fn test_ranges_to_mask_multiple_ranges() {
-        let ranges = vec![RowRange::new(0, 0), RowRange::new(3, 4)];
-        let mask = ranges_to_mask(5, &ranges);
-        assert_eq!(mask, vec![true, false, false, true, true]);
-    }
-
-    // -----------------------------------------------------------------------
     // build_column + records_to_batch
     // -----------------------------------------------------------------------
 
@@ -1362,236 +1691,5 @@ mod tests {
         let records: Vec<Value> = vec![];
         let batch = records_to_batch(&records, &fields, &schema).unwrap();
         assert_eq!(batch.num_rows(), 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // Exact residual predicate filtering on read
-    // -----------------------------------------------------------------------
-
-    use crate::spec::{Datum, Predicate, PredicateOperator};
-
-    fn leaf(
-        index: usize,
-        data_type: DataType,
-        op: PredicateOperator,
-        literals: Vec<Datum>,
-    ) -> Predicate {
-        Predicate::Leaf {
-            column: format!("c{index}"),
-            index,
-            data_type,
-            op,
-            literals,
-        }
-    }
-
-    /// Write the given records into an in-memory Avro OCF file, returning the
-    /// encoded bytes. The Avro schema mirrors `age: long, name: string`.
-    fn write_avro_age_name(rows: &[(i64, &str)]) -> Vec<u8> {
-        use apache_avro::{Codec, Schema, Writer};
-
-        let schema = Schema::parse_str(
-            r#"{"type": "record", "name": "row", "fields": [
-                {"name": "age", "type": "long"},
-                {"name": "name", "type": "string"}
-            ]}"#,
-        )
-        .unwrap();
-        let mut writer = Writer::with_codec(&schema, Vec::new(), Codec::Null);
-        for (age, name) in rows {
-            let mut record = apache_avro::types::Record::new(&schema).unwrap();
-            record.put("age", *age);
-            record.put("name", *name);
-            writer.append(record).unwrap();
-        }
-        writer.into_inner().unwrap()
-    }
-
-    #[tokio::test]
-    async fn avro_reader_applies_exact_residual_filter_int() {
-        use crate::btree::test_util::BytesFileRead;
-        use crate::spec::{BigIntType, VarCharType};
-        use futures::TryStreamExt;
-
-        let bytes = write_avro_age_name(&[(10, "a"), (20, "b"), (30, "c"), (40, "d"), (50, "e")]);
-
-        let age = DataField::new(0, "age".to_string(), DataType::BigInt(BigIntType::new()));
-        let name = DataField::new(
-            1,
-            "name".to_string(),
-            DataType::VarChar(VarCharType::new(50).unwrap()),
-        );
-        let read_fields = vec![age.clone(), name.clone()];
-        let file_fields = vec![age.clone(), name.clone()];
-
-        // age > 25 → [30, 40, 50].
-        let predicates = FilePredicates {
-            predicates: vec![leaf(
-                0,
-                DataType::BigInt(BigIntType::new()),
-                PredicateOperator::Gt,
-                vec![Datum::Long(25)],
-            )],
-            row_filter_factory: None,
-            file_fields,
-        };
-
-        let batches = AvroFormatReader
-            .read_batch_stream(
-                Box::new(BytesFileRead(bytes.clone().into())),
-                bytes.len() as u64,
-                &read_fields,
-                Some(&predicates),
-                None,
-                None,
-            )
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 3);
-        let ages: Vec<i64> = batches
-            .iter()
-            .flat_map(|b| {
-                b.column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .values()
-                    .to_vec()
-            })
-            .collect();
-        assert_eq!(ages, vec![30, 40, 50]);
-    }
-
-    #[tokio::test]
-    async fn avro_reader_filters_on_non_projected_predicate_column() {
-        use crate::btree::test_util::BytesFileRead;
-        use crate::spec::{BigIntType, VarCharType};
-        use futures::TryStreamExt;
-
-        let bytes = write_avro_age_name(&[(10, "a"), (20, "b"), (30, "c"), (40, "d"), (50, "e")]);
-
-        let age = DataField::new(0, "age".to_string(), DataType::BigInt(BigIntType::new()));
-        let name = DataField::new(
-            1,
-            "name".to_string(),
-            DataType::VarChar(VarCharType::new(50).unwrap()),
-        );
-        // Project ONLY `name`; the predicate is on `age`, which is NOT projected.
-        let read_fields = vec![name.clone()];
-        let file_fields = vec![age.clone(), name.clone()];
-
-        // age > 25 → rows c, d, e (age is a BigInt/long, so literal is Datum::Long).
-        let predicates = FilePredicates {
-            predicates: vec![leaf(
-                0,
-                DataType::BigInt(BigIntType::new()),
-                PredicateOperator::Gt,
-                vec![Datum::Long(25)],
-            )],
-            row_filter_factory: None,
-            file_fields,
-        };
-
-        let batches = AvroFormatReader
-            .read_batch_stream(
-                Box::new(BytesFileRead(bytes.clone().into())),
-                bytes.len() as u64,
-                &read_fields,
-                Some(&predicates),
-                None,
-                None,
-            )
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        // Assert on the FILTERED rows/values, not an exact column set (the batch
-        // may contain the extra `age` column — DataFileReader projects it away).
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 3);
-        let names: Vec<String> = batches
-            .iter()
-            .flat_map(|b| {
-                let col = b
-                    .column_by_name("name")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                (0..col.len())
-                    .map(|i| col.value(i).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        assert_eq!(names, vec!["c", "d", "e"]);
-    }
-
-    #[tokio::test]
-    async fn avro_reader_applies_exact_residual_filter_like() {
-        use crate::btree::test_util::BytesFileRead;
-        use crate::spec::{BigIntType, VarCharType};
-        use futures::TryStreamExt;
-
-        let bytes = write_avro_age_name(&[
-            (10, "apple"),
-            (20, "banana"),
-            (30, "apricot"),
-            (40, "cherry"),
-        ]);
-
-        let age = DataField::new(0, "age".to_string(), DataType::BigInt(BigIntType::new()));
-        let name = DataField::new(
-            1,
-            "name".to_string(),
-            DataType::VarChar(VarCharType::new(50).unwrap()),
-        );
-        let read_fields = vec![age.clone(), name.clone()];
-
-        // name LIKE 'a%' → ["apple", "apricot"].
-        let predicates = FilePredicates {
-            predicates: vec![leaf(
-                1,
-                DataType::VarChar(VarCharType::new(50).unwrap()),
-                PredicateOperator::Like,
-                vec![Datum::String("a%".to_string())],
-            )],
-            row_filter_factory: None,
-            file_fields: vec![age, name],
-        };
-
-        let batches = AvroFormatReader
-            .read_batch_stream(
-                Box::new(BytesFileRead(bytes.clone().into())),
-                bytes.len() as u64,
-                &read_fields,
-                Some(&predicates),
-                None,
-                None,
-            )
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 2);
-        let names: Vec<String> = batches
-            .iter()
-            .flat_map(|b| {
-                let col = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-                (0..col.len())
-                    .map(|i| col.value(i).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        assert_eq!(names, vec!["apple", "apricot"]);
     }
 }

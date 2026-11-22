@@ -31,7 +31,7 @@ use datafusion::execution::SessionState;
 use datafusion::logical_expr::{expr_fn::cast, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::planner::IdentNormalizer;
-use datafusion::sql::sqlparser::ast::{Ident, ObjectName, Query, Statement, Visit, Visitor};
+use datafusion::sql::sqlparser::ast::{Ident, ObjectName, Statement};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use paimon::catalog::{Catalog, Identifier, View};
@@ -850,64 +850,34 @@ impl PaimonSchemaProvider {
     }
 }
 
-#[async_trait]
-impl SchemaProvider for PaimonSchemaProvider {
-    fn table_names(&self) -> Vec<String> {
-        let catalog = Arc::clone(&self.catalog);
-        let database = self.database.clone();
-        let (mut names, views) = block_on_with_runtime(
-            {
-                let db = database.clone();
-                async move {
-                    let names = match catalog.list_tables(&db).await {
-                        Ok(names) => names,
-                        Err(e) => {
-                            log::error!("failed to list tables in '{}': {e}", db);
-                            vec![]
-                        }
-                    };
-                    let views = match catalog.list_views(&db).await {
-                        Ok(views) => views,
-                        Err(paimon::Error::Unsupported { .. }) => vec![],
-                        Err(error) => {
-                            log::error!("failed to list views in '{}': {error}", db);
-                            vec![]
-                        }
-                    };
-                    (names, views)
-                }
-            },
-            "paimon catalog access thread panicked",
-        );
-
-        let mut catalog_table_types = HashMap::with_capacity(names.len() + views.len());
-        for name in &names {
-            catalog_table_types.insert(name.clone(), TableType::Base);
-        }
-        for view in views {
-            catalog_table_types
-                .entry(view.clone())
-                .or_insert(TableType::View);
-            names.push(view);
-        }
-        *self
-            .catalog_table_types
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = catalog_table_types;
-
-        if let Some(temp) = &self.temp_provider {
-            names.extend(temp.table_names());
-        }
-
-        let mut seen = std::collections::HashSet::new();
-        names.retain(|name| seen.insert(name.clone()));
-
-        names
+impl PaimonSchemaProvider {
+    /// Resolve a metadata function's source through normal table handling,
+    /// without planning persistent view definitions. Temporary shadows remain
+    /// visible so the caller can reject a shadowing view or memory table.
+    pub(crate) async fn table_without_view_fallback(
+        &self,
+        name: &str,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.table_with_views(name, false).await
     }
 
-    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+    async fn table_with_views(
+        &self,
+        name: &str,
+        allow_views: bool,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
         if let Some(temp) = &self.temp_provider {
             if let Some(table) = temp.table(name).await? {
+                if allow_views {
+                    if let Some(view) =
+                        table.downcast_ref::<crate::partition_functions::MetadataView>()
+                    {
+                        let state = self.session_state.as_ref().and_then(|provider| provider()).ok_or_else(|| {
+                            plan_datafusion_err!("DataFusion session is unavailable while planning temporary view '{name}'")
+                        })?;
+                        return Ok(Some(Arc::new(Box::pin(view.resolve(&state)).await?)));
+                    }
+                }
                 return Ok(Some(table));
             }
         }
@@ -1084,6 +1054,9 @@ impl SchemaProvider for PaimonSchemaProvider {
                     if branch.is_some() {
                         return Ok(None);
                     }
+                    if !allow_views {
+                        return Ok(None);
+                    }
                     // DataFusion preloads every relation name before planning, including
                     // registered table functions. Do not reinterpret a missing UDTF name as
                     // a REST view; the planner will resolve it through the UDTF registry.
@@ -1130,7 +1103,11 @@ impl SchemaProvider for PaimonSchemaProvider {
                         identifier.database(),
                     )
                     .await?;
-                    let plan = state.create_logical_plan(&query).await?;
+                    let plan = crate::read_files::sql(
+                        &datafusion::prelude::SessionContext::new_with_state(state),
+                        &query,
+                        datafusion::execution::context::SQLOptions::new(),
+                    ).await?.into_unoptimized_plan();
                     let plan = enforce_view_schema(plan, &view)?;
                     Ok(Some(Arc::new(datafusion::datasource::ViewTable::new(
                         plan,
@@ -1145,6 +1122,66 @@ impl SchemaProvider for PaimonSchemaProvider {
             }
         })
         .await
+    }
+}
+
+#[async_trait]
+impl SchemaProvider for PaimonSchemaProvider {
+    fn table_names(&self) -> Vec<String> {
+        let catalog = Arc::clone(&self.catalog);
+        let database = self.database.clone();
+        let (mut names, views) = block_on_with_runtime(
+            {
+                let db = database.clone();
+                async move {
+                    let names = match catalog.list_tables(&db).await {
+                        Ok(names) => names,
+                        Err(e) => {
+                            log::error!("failed to list tables in '{}': {e}", db);
+                            vec![]
+                        }
+                    };
+                    let views = match catalog.list_views(&db).await {
+                        Ok(views) => views,
+                        Err(paimon::Error::Unsupported { .. }) => vec![],
+                        Err(error) => {
+                            log::error!("failed to list views in '{}': {error}", db);
+                            vec![]
+                        }
+                    };
+                    (names, views)
+                }
+            },
+            "paimon catalog access thread panicked",
+        );
+
+        let mut catalog_table_types = HashMap::with_capacity(names.len() + views.len());
+        for name in &names {
+            catalog_table_types.insert(name.clone(), TableType::Base);
+        }
+        for view in views {
+            catalog_table_types
+                .entry(view.clone())
+                .or_insert(TableType::View);
+            names.push(view);
+        }
+        *self
+            .catalog_table_types
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = catalog_table_types;
+
+        if let Some(temp) = &self.temp_provider {
+            names.extend(temp.table_names());
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        names.retain(|name| seen.insert(name.clone()));
+
+        names
+    }
+
+    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        self.table_with_views(name, true).await
     }
 
     async fn table_type(&self, name: &str) -> DFResult<Option<TableType>> {
@@ -1359,9 +1396,18 @@ fn enforce_view_schema(plan: LogicalPlan, view: &View) -> DFResult<LogicalPlan> 
                 Some(qualifier) => Column::new(Some(qualifier.clone()), actual.name()),
                 None => Column::new_unqualified(actual.name()),
             };
-            let target_type = paimon::arrow::paimon_type_to_arrow(declared.data_type())
-                .map_err(to_datafusion_error)?;
-            Ok(cast(Expr::Column(column), target_type).alias(declared.name()))
+            let target =
+                paimon::arrow::paimon_type_to_arrow_field(declared.name(), declared.data_type())
+                    .map_err(to_datafusion_error)?;
+            let expr = if target.extension_type_name().is_some() {
+                Expr::Cast(datafusion::logical_expr::Cast::new_from_field(
+                    Box::new(Expr::Column(column)),
+                    Arc::new(target),
+                ))
+            } else {
+                cast(Expr::Column(column), target.data_type().clone())
+            };
+            Ok(expr.alias(declared.name()))
         })
         .collect::<DFResult<Vec<_>>>()?;
 
@@ -1428,7 +1474,7 @@ async fn validate_view_dependencies(
 fn view_relation_identifiers(view: &View, catalog_name: &str) -> DFResult<Vec<Identifier>> {
     let regex_sql = crate::regex_operators::parseable_sql(view.query_for("datafusion"))?;
     let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
-    let statements =
+    let mut statements =
         Parser::parse_sql(&GenericDialect {}, parseable.as_ref()).map_err(|error| {
             plan_datafusion_err!(
                 "Invalid SQL for REST catalog view '{}': {error}",
@@ -1441,114 +1487,41 @@ fn view_relation_identifiers(view: &View, catalog_name: &str) -> DFResult<Vec<Id
             view.full_name()
         ));
     }
-    if !matches!(statements.first(), Some(Statement::Query(_))) {
+    let Some(Statement::Query(query)) = statements.first() else {
         return Err(plan_datafusion_err!(
             "REST catalog view '{}' must contain a single read-only query",
             view.full_name()
         ));
-    }
+    };
 
-    let mut visitor = ViewRelationVisitor::new(catalog_name, view.identifier().database());
-    let _: std::ops::ControlFlow<()> = statements.visit(&mut visitor);
-    Ok(visitor.identifiers)
+    let mut identifiers = Vec::new();
+    crate::sql_function::visit_view_table_dependencies(query, true, &mut |relation| {
+        if let Some(identifier) =
+            relation_identifier(relation, catalog_name, view.identifier().database())
+        {
+            identifiers.push(identifier);
+        }
+        Ok(())
+    })?;
+    // Preserve all native metadata lookup edges too, including prefetch-only
+    // syntax, without interpreting every relation lookup as a physical binding.
+    let statement = datafusion::sql::parser::Statement::Statement(Box::new(statements.remove(0)));
+    let (prefetched, _) = datafusion::sql::resolve::resolve_table_references(&statement, true)?;
+    let mut seen = identifiers.iter().cloned().collect::<HashSet<_>>();
+    for reference in prefetched {
+        let resolved = reference.resolve(catalog_name, view.identifier().database());
+        if resolved.catalog.as_ref() == catalog_name {
+            let identifier =
+                Identifier::new(resolved.schema.to_string(), resolved.table.to_string());
+            if seen.insert(identifier.clone()) {
+                identifiers.push(identifier);
+            }
+        }
+    }
+    Ok(identifiers)
 }
 
 type SqlIdentifierKey = String;
-
-struct QueryCteScope {
-    visible: HashSet<SqlIdentifierKey>,
-    cte_query_visibility: HashMap<usize, HashSet<SqlIdentifierKey>>,
-}
-
-struct ViewRelationVisitor<'a> {
-    catalog_name: &'a str,
-    current_database: &'a str,
-    scopes: Vec<QueryCteScope>,
-    identifiers: Vec<Identifier>,
-}
-
-impl<'a> ViewRelationVisitor<'a> {
-    fn new(catalog_name: &'a str, current_database: &'a str) -> Self {
-        Self {
-            catalog_name,
-            current_database,
-            scopes: Vec::new(),
-            identifiers: Vec::new(),
-        }
-    }
-}
-
-impl Visitor for ViewRelationVisitor<'_> {
-    type Break = ();
-
-    fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<Self::Break> {
-        let query_address = query as *const Query as usize;
-        let inherited = self
-            .scopes
-            .last()
-            .map(|scope| {
-                scope
-                    .cte_query_visibility
-                    .get(&query_address)
-                    .unwrap_or(&scope.visible)
-                    .clone()
-            })
-            .unwrap_or_default();
-        let mut visible = inherited.clone();
-        let mut cte_query_visibility = HashMap::new();
-
-        if let Some(with) = &query.with {
-            let local_ctes = with
-                .cte_tables
-                .iter()
-                .map(|cte| sql_identifier_key(&cte.alias.name))
-                .collect::<Vec<_>>();
-            if with.recursive {
-                visible.extend(local_ctes);
-                for cte in &with.cte_tables {
-                    cte_query_visibility
-                        .insert(cte.query.as_ref() as *const Query as usize, visible.clone());
-                }
-            } else {
-                for (cte, alias) in with.cte_tables.iter().zip(local_ctes) {
-                    cte_query_visibility
-                        .insert(cte.query.as_ref() as *const Query as usize, visible.clone());
-                    visible.insert(alias);
-                }
-            }
-        }
-
-        self.scopes.push(QueryCteScope {
-            visible,
-            cte_query_visibility,
-        });
-        std::ops::ControlFlow::Continue(())
-    }
-
-    fn post_visit_query(&mut self, _query: &Query) -> std::ops::ControlFlow<Self::Break> {
-        self.scopes.pop();
-        std::ops::ControlFlow::Continue(())
-    }
-
-    fn pre_visit_relation(&mut self, relation: &ObjectName) -> std::ops::ControlFlow<Self::Break> {
-        let is_cte = match relation.0.as_slice() {
-            [part] => part.as_ident().is_some_and(|identifier| {
-                self.scopes
-                    .last()
-                    .is_some_and(|scope| scope.visible.contains(&sql_identifier_key(identifier)))
-            }),
-            _ => false,
-        };
-        if !is_cte {
-            if let Some(identifier) =
-                relation_identifier(relation, self.catalog_name, self.current_database)
-            {
-                self.identifiers.push(identifier);
-            }
-        }
-        std::ops::ControlFlow::Continue(())
-    }
-}
 
 fn sql_identifier_key(identifier: &Ident) -> SqlIdentifierKey {
     IdentNormalizer::default().normalize(identifier.clone())

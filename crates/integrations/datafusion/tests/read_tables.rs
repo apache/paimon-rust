@@ -1938,6 +1938,74 @@ mod vector_search_tests {
         assert!(ids.contains(&0), "exact match [1,0,0,0] should be in top 3");
     }
 
+    #[tokio::test]
+    async fn test_compat_call_vector_search_returns_ranked_projected_rows() {
+        let (ctx, _catalog, _tmp) = create_java_vindex_vector_search_context().await;
+        super::common::assert_sql_error(
+            &ctx,
+            "CALL sys.vector_search(table => 'default.test_java_vindex_vector', \
+             vector_column => 'embedding', query_vector => '1, 0, 0, 0', top_k => 3, \
+             \"where\" => 'id = 5')",
+            "Argument where is unknown",
+        )
+        .await;
+        let batches = ctx
+            .sql(
+                "CALL paimon.sys.vector_search(\
+                 'default.test_java_vindex_vector', 'embedding', '1, 0, 0, 0', 3, 'id')",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let ids = extract_ids(&batches);
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], 0);
+        assert!(batches.iter().all(|batch| batch.num_columns() == 1));
+    }
+
+    #[tokio::test]
+    async fn test_multi_vector_call_matches_table_function() {
+        let (ctx, _catalog, _tmp) = create_empty_vector_search_context().await;
+        for sql in [
+            "CREATE TABLE paimon.default.multi_vector_sql (id INT, chunks FLOAT[][]) \
+             WITH ('bucket'='-1', 'row-tracking.enabled'='true', \
+             'data-evolution.enabled'='true', 'global-index.enabled'='true', \
+             'vector-index.search-mode'='fast')",
+            "INSERT INTO paimon.default.multi_vector_sql (id, chunks) VALUES \
+             (0, [[1.0, 0.0]]), (1, [[0.0, 1.0]]), (2, [[1.0, 1.0]])",
+            "CALL sys.create_global_index(table => 'default.multi_vector_sql', \
+             index_column => 'chunks', index_type => 'ivf-flat', \
+             options => 'ivf-flat.dimension=2,ivf-flat.nlist=1')",
+            "SET 'paimon.ivf.nprobe' = '1'",
+            "SET 'paimon.diskann.l_search' = '100'",
+        ] {
+            ctx.sql(sql)
+                .await
+                .unwrap_or_else(|error| panic!("{sql}: {error}"))
+                .collect()
+                .await
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+
+        for sql in [
+            "SELECT id FROM vector_search('paimon.default.multi_vector_sql', 'chunks', \
+             '[[1.0, 0.0], [0.0, 1.0]]', 1)",
+            "CALL paimon.sys.vector_search('default.multi_vector_sql', 'chunks', \
+             '[[1.0, 0.0], [0.0, 1.0]]', 1, 'id')",
+        ] {
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            assert_eq!(extract_ids_in_order(&batches), [2], "{sql}");
+        }
+        super::common::assert_sql_error(
+            &ctx,
+            "CALL sys.vector_search('default.multi_vector_sql', 'chunks', '[[1.0], [0.0, 1.0]]', 1)",
+            "rectangular JSON matrix",
+        )
+        .await;
+    }
+
     /// `vector_search` must return rows in relevance order, not file order. Querying
     /// id 2's vector ranks `[2, 5, 1]` by L2 distance, which differs from the
     /// ascending-id file order `[1, 2, 5]` the pre-fix scan produced.
@@ -2300,6 +2368,29 @@ mod vector_search_tests {
 
         let ids = extract_ids(&batches);
         assert_eq!(ids, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_filters_without_scalar_index() {
+        let (ctx, _catalog, _tmp) = create_java_vindex_vector_search_context().await;
+        let batches = ctx.sql(
+            "SELECT id FROM vector_search('paimon.default.test_java_vindex_vector', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 1) WHERE id = 2",
+        ).await.unwrap().collect().await.unwrap();
+        assert_eq!(extract_ids_in_order(&batches), vec![2]);
+
+        let queries = build_vector_batch(
+            vec![10, 20],
+            vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]],
+        );
+        let table = MemTable::try_new(queries.schema(), vec![vec![queries]]).unwrap();
+        ctx.register_temp_table("paimon.default.unindexed_filter_queries", Arc::new(table))
+            .unwrap();
+        let batches = ctx.sql(
+            "SELECT q.id AS query_id, r.id AS result_id FROM paimon.default.unindexed_filter_queries q \
+             CROSS JOIN LATERAL vector_search('paimon.default.test_java_vindex_vector', 'embedding', q.embedding, 1) AS r \
+             WHERE r.id = 2 ORDER BY query_id",
+        ).await.unwrap().collect().await.unwrap();
+        assert_eq!(extract_query_result_ids(&batches), vec![(10, 2), (20, 2)]);
     }
 
     #[tokio::test]

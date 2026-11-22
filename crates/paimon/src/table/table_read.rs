@@ -777,8 +777,14 @@ impl<'a> PaimonTableRead<'a> {
             }
         }
         // Delta / Changelog rows are read as-is from planned files (no full-table
-        // merge against historical base versions).
+        // merge against historical base versions). Primary-key BLOB descriptors
+        // still resolve to payloads, as in an ordinary read.
         let data_splits = self.matching_splits(&data_splits)?;
+        if !self.table.schema().primary_keys().is_empty() {
+            let core_options = self.table.schema().core_options();
+            return self
+                .resolving_primary_key_blobs(&core_options, |read| read.read_raw(&data_splits));
+        }
         self.new_data_file_reader()?.read(&data_splits)
     }
 
@@ -1901,6 +1907,18 @@ impl<'a> PaimonTableRead<'a> {
         data_splits: &[DataSplit],
         core_options: &CoreOptions<'_>,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        self.resolving_primary_key_blobs(core_options, |read| {
+            read.read_pk(data_splits, core_options)
+        })
+    }
+
+    /// Runs `read` over the stored BLOB descriptors and resolves primary-key
+    /// managed BLOB payloads in its output.
+    fn resolving_primary_key_blobs(
+        &self,
+        core_options: &CoreOptions<'_>,
+        read: impl FnOnce(&Self) -> crate::Result<ArrowRecordBatchStream>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         use super::managed_blob_reader::{resolve_primary_key_blob_stream, ManagedBlobReadPlan};
 
         if let Some(plan) = ManagedBlobReadPlan::new(
@@ -1912,7 +1930,7 @@ impl<'a> PaimonTableRead<'a> {
             let mut inner = self.clone();
             inner.read_type = plan.scan_fields().to_vec();
             inner.data_predicates.clear();
-            let stream = inner.read_pk(data_splits, core_options)?;
+            let stream = read(&inner)?;
             return Ok(plan.finish(
                 stream,
                 core_options,
@@ -1922,7 +1940,7 @@ impl<'a> PaimonTableRead<'a> {
             ));
         }
 
-        let stream = self.read_pk(data_splits, core_options)?;
+        let stream = read(self)?;
         Ok(resolve_primary_key_blob_stream(
             stream,
             self.read_type(),
