@@ -42,8 +42,11 @@ struct RouterState {
 ///
 /// Does not open a catalog, touch storage, or allocate file writers. Supports
 /// fixed-bucket (`default`, `mod`, `hive`) and postpone-bucket schemas.
-/// For postpone buckets, set the same plan as the writer with
-/// `paimon_bucket_router_with_bucket_plan` when using per-partition bucket counts.
+/// For postpone buckets with per-partition counts, pass the same plan to
+/// `paimon_bucket_router_with_bucket_plan` and
+/// `paimon_postpone_fixed_bucket_write_builder_with_bucket_plan`. After shuffling,
+/// call `paimon_postpone_fixed_bucket_table_write_write_arrow_batch`; that writer
+/// routes rows using the shared plan.
 ///
 /// # Safety
 /// `table_schema_json` must be a valid null-terminated UTF-8 C string, or null

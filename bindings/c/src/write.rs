@@ -651,7 +651,9 @@ pub unsafe extern "C" fn paimon_table_write_write_arrow_batch(
 }
 
 /// Write a batch whose rows all belong to the supplied bucket and a single partition.
-/// The caller is responsible for routing the rows to the correct bucket.
+/// Supports HASH_FIXED and HASH_DYNAMIC (excluding cross-partition updates).
+/// Postpone-bucket tables (`bucket = -2`) are rejected even if a routing plan
+/// has been configured. The caller is responsible for routing the rows to the correct bucket.
 /// Ownership of `array` and `schema` is transferred once Arrow import starts.
 ///
 /// # Safety
