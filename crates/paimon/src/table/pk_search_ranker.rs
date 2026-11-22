@@ -51,6 +51,7 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
 pub(crate) struct Ranking {
     positions: Vec<PrimaryKeySearchPosition>,
     weight: f64,
+    cosine_distance_scores: bool,
 }
 
 impl Ranking {
@@ -65,7 +66,16 @@ impl Ranking {
                 "Search route weight must be finite and positive: {weight}."
             )));
         }
-        Ok(Self { positions, weight })
+        Ok(Self {
+            positions,
+            weight,
+            cosine_distance_scores: false,
+        })
+    }
+
+    pub(crate) fn with_cosine_distance_scores(mut self, cosine_distance_scores: bool) -> Self {
+        self.cosine_distance_scores = cosine_distance_scores;
+        self
     }
 
     pub(crate) fn positions(&self) -> &[PrimaryKeySearchPosition] {
@@ -150,8 +160,9 @@ pub(crate) fn weighted_rrf(
 }
 
 /// Fuses heterogeneous route scores by normalizing each route to `[0, 1]`
-/// as in Java `weightedScore`. A single route keeps its input score order
-/// after normalization, including when distinct scores round to a tie.
+/// as in Java `weightedScore`. Cosine routes retain precision through
+/// normalization and fused ordering. A single cosine route keeps its
+/// distance order, including when normalized scores round to a tie.
 pub(crate) fn weighted_score(
     rankings: &[Ranking],
     limit: usize,
@@ -173,20 +184,38 @@ pub(crate) fn weighted_score(
             max = max.max(position.score());
         }
         for position in ranking.positions() {
-            let normalized = f64::from(normalize_route_score(position.score(), min, max));
+            let normalized = if ranking.cosine_distance_scores && max > min {
+                (f64::from(position.score()) - f64::from(min)) / (f64::from(max) - f64::from(min))
+            } else {
+                f64::from(normalize_route_score(position.score(), min, max))
+            };
             *fused_scores.entry(position.clone()).or_insert(0.0) += ranking.weight() * normalized;
         }
     }
-    if rankings.len() == 1 {
+    if rankings
+        .iter()
+        .any(|ranking| ranking.cosine_distance_scores)
+    {
         // Min-max normalization is monotone within one route. Use its input
-        // scores for ordering before the normalized scores round to f32.
-        let mut ranked: Vec<_> = fused_scores.into_iter().collect();
-        ranked.sort_by(|(left, _), (right, _)| best_first(left, right));
-        ranked.truncate(limit);
-        return ranked
+        // order in that case and the f64 fused totals for multiple routes.
+        let mut ranked = fused_scores
             .into_iter()
-            .map(|(position, score)| position.with_score(score as f32))
-            .collect();
+            .map(|(position, score)| {
+                let order = if rankings.len() == 1 {
+                    f64::from(position.score())
+                } else {
+                    score
+                };
+                Ok((position.with_score(score as f32)?, order))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        ranked.sort_by(|(left, left_order), (right, right_order)| {
+            right_order
+                .total_cmp(left_order)
+                .then_with(|| compare_to(left, right))
+        });
+        ranked.truncate(limit);
+        return Ok(ranked.into_iter().map(|(position, _)| position).collect());
     }
     top_k(fused_scores, limit)
 }
@@ -387,6 +416,21 @@ mod tests {
         assert_eq!(file_names(&ranked), vec!["c", "b"]);
         assert_eq!(ranked[0].score(), 4.0);
         assert_eq!(ranked[1].score(), 2.0);
+    }
+
+    #[test]
+    fn weighted_score_uses_physical_ties_for_non_cosine_routes() {
+        let route = ranking(
+            vec![
+                position("file", 0, 1.0_f32.next_down()),
+                position("file", 1, 1.0),
+                position("file", 2, -1.0),
+            ],
+            1.0,
+        );
+        let fused = weighted_score(&[route], 1).unwrap();
+        assert_eq!(fused[0].row_position(), 0);
+        assert_eq!(fused[0].score(), 1.0);
     }
 
     #[test]

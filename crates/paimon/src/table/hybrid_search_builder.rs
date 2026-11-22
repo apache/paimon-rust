@@ -911,6 +911,7 @@ impl<'a> HybridSearchBuilder<'a> {
             source_splits,
             snapshot_id: result.snapshot_id().unwrap_or(0),
             weight: route.weight as f64,
+            cosine_distance_scores: cosine_distances.is_some(),
         })
     }
 
@@ -1018,6 +1019,7 @@ impl<'a> HybridSearchBuilder<'a> {
             source_splits,
             snapshot_id: result.snapshot_id,
             weight: route.weight as f64,
+            cosine_distance_scores: false,
         })
     }
 
@@ -1032,7 +1034,10 @@ impl<'a> HybridSearchBuilder<'a> {
         let mut rankings = Vec::with_capacity(routes.len());
         for route in routes {
             if !route.positions.is_empty() {
-                rankings.push(Ranking::new(route.positions.clone(), route.weight)?);
+                rankings.push(
+                    Ranking::new(route.positions.clone(), route.weight)?
+                        .with_cosine_distance_scores(route.cosine_distance_scores),
+                );
             }
         }
         match self.ranker {
@@ -1051,6 +1056,7 @@ struct PkRoute {
     source_splits: Vec<DataSplit>,
     snapshot_id: i64,
     weight: f64,
+    cosine_distance_scores: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1994,10 +2000,11 @@ mod pk_hybrid_tests {
         )
         .await;
 
-        for ranker in [
-            HybridSearchRanker::Rrf,
-            HybridSearchRanker::Mrr,
-            HybridSearchRanker::WeightedScore,
+        for (ranker, include_text) in [
+            (HybridSearchRanker::Rrf, false),
+            (HybridSearchRanker::Mrr, false),
+            (HybridSearchRanker::WeightedScore, false),
+            (HybridSearchRanker::WeightedScore, true),
         ] {
             for route_limit in [1, 2, 3] {
                 let mut builder = table.new_hybrid_search_builder();
@@ -2013,6 +2020,17 @@ mod pk_hybrid_tests {
                         )]),
                     )
                     .unwrap();
+                if include_text {
+                    builder
+                        .add_full_text_route(
+                            TEXT_COLUMN,
+                            r#"{"match":{"query":"orthogonal"}}"#,
+                            1,
+                            0.5,
+                            HashMap::new(),
+                        )
+                        .unwrap();
+                }
                 builder.with_limit(1).with_ranker(ranker.as_str()).unwrap();
                 let batches = builder
                     .execute_read()
@@ -2024,7 +2042,7 @@ mod pk_hybrid_tests {
                 assert_eq!(
                     column_i32(&batches, "id"),
                     vec![1],
-                    "{ranker:?}, {route_limit}"
+                    "{ranker:?}, limit={route_limit}, full text={include_text}"
                 );
                 let expected_score = if ranker == HybridSearchRanker::Rrf {
                     (1.0 / (f64::from(pk_search_ranker::DEFAULT_RRF_K) + 1.0)) as f32
