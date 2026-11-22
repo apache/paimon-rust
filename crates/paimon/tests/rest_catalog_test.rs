@@ -1935,34 +1935,300 @@ async fn test_catalog_get_table_propagates_oss_options_in_else_branch() {
 #[tokio::test]
 async fn test_catalog_create_table() {
     let ctx = setup_catalog(vec!["default"]).await;
-
-    let schema = test_schema();
     let identifier = Identifier::new("default", "new_table");
-
-    let result = ctx.catalog.create_table(&identifier, schema, false).await;
-    assert!(result.is_ok(), "failed to create table: {result:?}");
-
-    // Verify table exists
-    let tables = ctx.catalog.list_tables("default").await.unwrap();
-    assert!(tables.contains(&"new_table".to_string()));
+    ctx.catalog
+        .create_table(&identifier, test_schema(), false)
+        .await
+        .unwrap();
+    for result in [
+        ctx.catalog
+            .create_table(&identifier, test_schema(), false)
+            .await,
+        ctx.catalog
+            .create_table_exclusive(&identifier, test_schema())
+            .await,
+    ] {
+        assert!(matches!(
+            result,
+            Err(paimon::Error::TableAlreadyExist { full_name }) if full_name == identifier.full_name()
+        ));
+    }
+    ctx.catalog
+        .create_table(&identifier, test_schema(), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.catalog.list_tables("default").await.unwrap(),
+        ["new_table"]
+    );
+    let missing = Identifier::new("missing_db", "new_table");
+    assert!(matches!(
+        ctx.catalog.create_table_exclusive(&missing, test_schema()).await,
+        Err(paimon::Error::DatabaseNotExist { database }) if database == missing.database()
+    ));
 }
 
 #[tokio::test]
-async fn test_catalog_create_table_already_exists() {
-    let ctx = setup_catalog(vec!["default"]).await;
+async fn rest_ctas_validates_target_lookup_and_creation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
-    // Add a table first
-    ctx.server.add_table("default", "existing_table");
+    use axum::body::{Body, Bytes};
+    use axum::extract::Path;
+    use axum::http::Method;
+    use axum::response::{IntoResponse, Redirect};
+    use axum::routing::{any, get, post};
+    use axum::{Json, Router};
+    use futures::{stream, StreamExt};
+    use paimon::api::CreateTableRequest;
+    use serde_json::json;
 
-    let schema = test_schema();
-    let identifier = Identifier::new("default", "existing_table");
-
-    // Create with ignore_if_exists=false should fail
-    let result = ctx.catalog.create_table(&identifier, schema, false).await;
-    assert!(
-        result.is_err(),
-        "creating duplicate table should fail when ignore_if_exists=false"
+    let followed = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/v1/config",
+            get(|| async { Json(ConfigResponse::new(HashMap::new())) }),
+        )
+        .route(
+            "/v1/databases/default/tables",
+            post(|Json(request): Json<CreateTableRequest>| async move {
+                let conflict = |resource_name: &str| {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "resourceType": "TABLE",
+                            "resourceName": resource_name,
+                            "code": 409,
+                            "message": "Already exists",
+                        })),
+                    )
+                        .into_response()
+                };
+                match request.identifier.object() {
+                    "created" => (StatusCode::OK, "Created").into_response(),
+                    "created_without_body" => StatusCode::NO_CONTENT.into_response(),
+                    "created_with_pending_body" => {
+                        let body = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                            b"Created",
+                        ))])
+                        .chain(stream::pending());
+                        (StatusCode::CREATED, Body::from_stream(body)).into_response()
+                    }
+                    "bare_conflict" => StatusCode::CONFLICT.into_response(),
+                    "qualified_conflict" => conflict("DEFAULT.Qualified_Conflict"),
+                    "different_conflict" => conflict("other"),
+                    "see_other" => Redirect::to("/result").into_response(),
+                    "temporary_redirect" => Redirect::temporary("/result").into_response(),
+                    "accepted" => (StatusCode::ACCEPTED, Json(json!(null))).into_response(),
+                    "multi_status" => StatusCode::MULTI_STATUS.into_response(),
+                    "unavailable" => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"resourceType": "TABLE", "code": 409, "message": "Already exists"})),
+                    )
+                        .into_response(),
+                    other => panic!("unexpected create target {other}"),
+                }
+            }),
+        )
+        .route(
+            "/v1/databases/default/tables/:table",
+            get(|Path(table): Path<String>| async move {
+                let lookup_error = |status, resource_name: Option<&str>| {
+                    (
+                        status,
+                        Json(json!({
+                            "resourceType": "TABLE",
+                            "resourceName": resource_name,
+                            "code": 404,
+                            "message": "Table lookup failed",
+                        })),
+                    )
+                        .into_response()
+                };
+                let metadata = match table.as_str() {
+                    "canonical.name" => json!({"database": "DEFAULT", "name": "Canonical.Name"}),
+                    "different_table" => json!({"database": "default", "name": "other"}),
+                    "missing_name" => json!({}),
+                    "bare_missing" => return StatusCode::NOT_FOUND.into_response(),
+                    "missing" => return lookup_error(StatusCode::NOT_FOUND, None),
+                    "named_missing" => {
+                        return lookup_error(StatusCode::NOT_FOUND, Some("DEFAULT.Named_Missing"));
+                    }
+                    "different_missing" => return lookup_error(StatusCode::NOT_FOUND, Some("other")),
+                    "redirected_missing" => return Redirect::temporary("/missing").into_response(),
+                    "denied" => return lookup_error(StatusCode::FORBIDDEN, None),
+                    other => panic!("unexpected lookup target {other}"),
+                };
+                Json(metadata).into_response()
+            }),
+        )
+        .route("/missing", get(|| async { StatusCode::NOT_FOUND }))
+        .route(
+            "/result",
+            any({
+                let followed = followed.clone();
+                move |method: Method| async move {
+                    followed.fetch_add(1, Ordering::SeqCst);
+                    if method == Method::GET {
+                        Json(json!(null)).into_response()
+                    } else {
+                        StatusCode::CONFLICT.into_response()
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut options = Options::new();
+    options.set(
+        CatalogOptions::URI,
+        format!("http://{}", listener.local_addr().unwrap()),
     );
+    options.set(CatalogOptions::WAREHOUSE, "test_warehouse");
+    options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+    options.set(CatalogOptions::TOKEN, "test_token");
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let catalog = RESTCatalog::new(options, true).await.unwrap();
+    for (identifier, field) in [
+        (Identifier::new("default", "."), "table"),
+        (Identifier::new("default", ".."), "table"),
+        (Identifier::new(".", "created"), "database"),
+        (Identifier::new("..", "created"), "database"),
+    ] {
+        let expected = format!("{field} name must not be a dot path segment");
+        for result in [
+            catalog.check_table_exists(&identifier).await,
+            catalog
+                .create_table_exclusive(&identifier, test_schema())
+                .await,
+        ] {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(&error, paimon::Error::ConfigInvalid { message } if *message == expected),
+                "{}: {error}",
+                identifier.full_name()
+            );
+        }
+    }
+    catalog
+        .check_table_exists(&Identifier::new("default", "canonical.name"))
+        .await
+        .unwrap();
+    for (table, expected) in [
+        ("different_table", "does not match requested identifier"),
+        ("missing_name", "missing name"),
+    ] {
+        let error = catalog
+            .check_table_exists(&Identifier::new("default", table))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, paimon::Error::DataInvalid { ref message, .. }
+                if message.contains(expected)),
+            "{table}: {error}"
+        );
+    }
+    for table in ["bare_missing", "missing", "named_missing"] {
+        let identifier = Identifier::new("default", table);
+        assert!(matches!(
+            catalog.check_table_exists(&identifier).await,
+            Err(paimon::Error::TableNotExist { full_name }) if full_name == identifier.full_name()
+        ));
+    }
+    let error = catalog
+        .check_table_exists(&Identifier::new("default", "different_missing"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::RestApi {
+            source: paimon::api::RestError::NoSuchResource { resource_name: Some(name), .. }
+        } if name == "other"),
+        "{error}"
+    );
+    let error = catalog
+        .check_table_exists(&Identifier::new("default", "redirected_missing"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::UnexpectedError { message, .. }
+            if message.contains("HTTP 404 from a different URL")),
+        "{error}"
+    );
+    let error = catalog
+        .check_table_exists(&Identifier::new("default", "denied"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            paimon::Error::RestApi {
+                source: paimon::api::rest_error::RestError::Forbidden { .. },
+            }
+        ),
+        "{error}"
+    );
+    for table in [
+        "created",
+        "created_without_body",
+        "created_with_pending_body",
+    ] {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            catalog.create_table_exclusive(&Identifier::new("default", table), test_schema()),
+        )
+        .await
+        .expect("exclusive create should complete from the HTTP status")
+        .unwrap();
+    }
+    for table in ["bare_conflict", "qualified_conflict"] {
+        let identifier = Identifier::new("default", table);
+        assert!(matches!(
+            catalog.create_table_exclusive(&identifier, test_schema()).await,
+            Err(paimon::Error::TableAlreadyExist { full_name }) if full_name == identifier.full_name()
+        ));
+    }
+    let identifier = Identifier::new("default", "different_conflict");
+    for result in [
+        catalog
+            .create_table_exclusive(&identifier, test_schema())
+            .await,
+        catalog.create_table(&identifier, test_schema(), true).await,
+    ] {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, paimon::Error::RestApi {
+                source: paimon::api::RestError::AlreadyExists { resource_name: Some(name), .. }
+            } if name == "other"),
+            "{error}"
+        );
+    }
+    for (table, status) in [
+        ("see_other", 303),
+        ("temporary_redirect", 307),
+        ("accepted", 202),
+        ("multi_status", 207),
+        ("unavailable", 503),
+    ] {
+        let result = catalog
+            .create_table_exclusive(&Identifier::new("default", table), test_schema())
+            .await;
+        let error = result.expect_err(table);
+        assert!(
+            matches!(error, paimon::Error::UnexpectedError { ref message, .. }
+                if message.contains(&format!("HTTP {status}")) && message.contains("outcome is unknown")),
+            "{table}: {error}"
+        );
+    }
+    assert_eq!(followed.load(Ordering::SeqCst), 0);
+    catalog
+        .create_table(
+            &Identifier::new("default", "see_other"),
+            test_schema(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(followed.load(Ordering::SeqCst), 1);
+    server.abort();
 }
 
 #[tokio::test]

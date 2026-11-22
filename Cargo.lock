@@ -4961,6 +4961,7 @@ dependencies = [
  "rand 0.8.7",
  "regex",
  "reqwest 0.12.28",
+ "reqwest 0.13.4",
  "roaring",
  "ryu",
  "serde",
@@ -5074,6 +5075,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

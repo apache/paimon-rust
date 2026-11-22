@@ -45,15 +45,26 @@ pub(crate) fn sql<'a>(
     sql: &'a str,
     options: SQLOptions,
 ) -> futures::future::BoxFuture<'a, Result<DataFrame>> {
+    Box::pin(async move {
+        let mut state = ctx.state();
+        let plan = plan_sql(&mut state, sql).await?;
+        execute_plan(ctx, state, plan, options).await
+    })
+}
+
+pub(crate) fn plan_sql<'a>(
+    state: &'a mut SessionState,
+    sql: &'a str,
+) -> futures::future::BoxFuture<'a, Result<LogicalPlan>> {
     // Keep this additional planning layer off SQLContext's already large future.
     Box::pin(async move {
         // The AST check below is authoritative; this avoids reparsing ordinary SQL.
         if !sql.to_ascii_lowercase().contains("read_files") {
-            return ctx.sql_with_options(sql, options).await;
+            return state.create_logical_plan(sql).await;
         }
         let mut statements = Parser::parse_sql(&GenericDialect, sql)?;
         let [statement] = statements.as_mut_slice() else {
-            return ctx.sql_with_options(sql, options).await;
+            return state.create_logical_plan(sql).await;
         };
         struct FindSource;
         impl VisitorMut for FindSource {
@@ -76,11 +87,10 @@ pub(crate) fn sql<'a>(
             }
         }
         if statement.visit(&mut FindSource).is_continue() {
-            return ctx.sql_with_options(sql, options).await;
+            return state.create_logical_plan(sql).await;
         }
-        let mut state = ctx.state();
         let Some(function) = state.table_functions().get("read_files").cloned() else {
-            return ctx.sql_with_options(sql, options).await;
+            return state.create_logical_plan(sql).await;
         };
         // Bind each source once for both schema planning and execution. The cache
         // belongs to this statement's cloned state, never to the shared session.
@@ -100,10 +110,22 @@ pub(crate) fn sql<'a>(
         if let ControlFlow::Break(error) = statement.visit(&mut rewriter) {
             return Err(*error);
         }
-        SessionContext::new_with_state(state)
-            .sql_with_options(&statement.to_string(), options)
-            .await
+        state.create_logical_plan(&statement.to_string()).await
     })
+}
+
+pub(crate) async fn execute_plan(
+    ctx: &SessionContext,
+    state: SessionState,
+    plan: LogicalPlan,
+    options: SQLOptions,
+) -> Result<DataFrame> {
+    options.verify_plan(&plan)?;
+    match plan {
+        // PREPARE and other session commands take effect on the caller's context.
+        LogicalPlan::Statement(_) | LogicalPlan::Ddl(_) => ctx.execute_logical_plan(plan).await,
+        plan => Ok(DataFrame::new(state, plan)),
+    }
 }
 
 #[derive(Debug)]

@@ -26,7 +26,7 @@ use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX}
 use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
 use crate::io::cache::{create_local_cache, LocalCache};
-use crate::io::FileIO;
+use crate::io::{AtomicPublication, FileIO};
 use crate::spec::{
     CoreOptions, Schema, Snapshot, TableSchema, TableType, INDEX_FILE_IN_DATA_FILE_DIR_OPTION,
     PRIMARY_KEY_NULLABLE_OPTION, TABLE_TYPE_OPTION,
@@ -45,6 +45,15 @@ const SCHEMA_PREFIX: &str = "schema-";
 
 fn make_path(parent: &str, child: &str) -> String {
     format!("{parent}/{child}")
+}
+
+fn serialize_table_schema(schema: &TableSchema) -> Result<Bytes> {
+    serde_json::to_vec(schema)
+        .map(Bytes::from)
+        .map_err(|error| Error::DataInvalid {
+            message: format!("Failed to serialize schema: {error}"),
+            source: Some(Box::new(error)),
+        })
 }
 
 /// Filesystem catalog implementation.
@@ -259,14 +268,64 @@ impl FileSystemCatalog {
         self.file_io.mkdirs(&schema_dir).await?;
         let schema_path = self.schema_file_path(table_path, schema.id());
         let output_file = self.file_io.new_output(&schema_path)?;
-        let content =
-            Bytes::from(
-                serde_json::to_string(schema).map_err(|e| Error::DataInvalid {
-                    message: format!("Failed to serialize schema: {e}"),
-                    source: Some(Box::new(e)),
-                })?,
-            );
-        output_file.write(content).await?;
+        output_file.write(serialize_table_schema(schema)?).await
+    }
+
+    async fn create_table_with_publication(
+        &self,
+        identifier: &Identifier,
+        creation: Schema,
+        ignore_if_exists: bool,
+        publication: AtomicPublication,
+    ) -> Result<()> {
+        identifier.validate()?;
+        identifier.validate_new_table_name()?;
+        // Never persist a type nothing can load.
+        let declared = CoreOptions::new(creation.options()).table_type()?;
+
+        let table_path = self.table_path(identifier);
+        let object_schema = if declared == TableType::ObjectTable {
+            Some(ObjectTable::normalize_creation(&creation, &table_path)?)
+        } else {
+            None
+        };
+        let table_exists = self.table_exists(identifier).await?;
+
+        if !ignore_if_exists && table_exists {
+            return Err(Error::TableAlreadyExist {
+                full_name: identifier.full_name(),
+            });
+        }
+
+        if !self.database_exists(identifier.database()).await? {
+            return Err(Error::DatabaseNotExist {
+                database: identifier.database().to_string(),
+            });
+        }
+
+        if !table_exists {
+            creation.validate_fields_for_create()?;
+            // Another catalog may have dropped a table at this path with cached schema or snapshots.
+            self.file_io.invalidate_directory_cache(&table_path).await?;
+            self.file_io
+                .mkdirs(&self.schema_dir_path(&table_path))
+                .await?;
+            let table_schema = TableSchema::new(0, object_schema.as_ref().unwrap_or(&creation));
+            let created = self
+                .file_io
+                .publish_new_file(
+                    &self.schema_file_path(&table_path, 0),
+                    serialize_table_schema(&table_schema)?,
+                    publication,
+                )
+                .await?;
+            if !created && !ignore_if_exists {
+                return Err(Error::TableAlreadyExist {
+                    full_name: identifier.full_name(),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -379,6 +438,17 @@ impl Catalog for FileSystemCatalog {
         Ok(())
     }
 
+    async fn check_table_exists(&self, identifier: &Identifier) -> Result<()> {
+        match self.fetch_table_schema(identifier).await {
+            Ok(_) => Ok(()),
+            Err(error @ Error::TableNotExist { .. }) => {
+                self.get_database(identifier.database()).await?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
         let (table_path, schema) = self.fetch_table_schema(identifier).await?;
         self.build_table(identifier, table_path, schema)
@@ -440,40 +510,22 @@ impl Catalog for FileSystemCatalog {
         creation: Schema,
         ignore_if_exists: bool,
     ) -> Result<()> {
-        identifier.validate()?;
-        identifier.validate_new_table_name()?;
-        // Never persist a type nothing can load.
-        let declared = CoreOptions::new(creation.options()).table_type()?;
+        self.create_table_with_publication(
+            identifier,
+            creation,
+            ignore_if_exists,
+            AtomicPublication::IfSupported,
+        )
+        .await
+    }
 
-        let table_path = self.table_path(identifier);
-        let object_schema = if declared == TableType::ObjectTable {
-            Some(ObjectTable::normalize_creation(&creation, &table_path)?)
-        } else {
-            None
-        };
-        let table_exists = self.table_exists(identifier).await?;
-
-        if !ignore_if_exists && table_exists {
-            return Err(Error::TableAlreadyExist {
-                full_name: identifier.full_name(),
-            });
-        }
-
-        if !self.database_exists(identifier.database()).await? {
-            return Err(Error::DatabaseNotExist {
-                database: identifier.database().to_string(),
-            });
-        }
-
-        // todo: consider with lock
-        if !table_exists {
-            creation.validate_fields_for_create()?;
-            self.file_io.mkdirs(&table_path).await?;
-            let table_schema = TableSchema::new(0, object_schema.as_ref().unwrap_or(&creation));
-            self.save_table_schema(&table_path, &table_schema).await?;
-        }
-
-        Ok(())
+    async fn create_table_exclusive(
+        &self,
+        identifier: &Identifier,
+        creation: Schema,
+    ) -> Result<()> {
+        self.create_table_with_publication(identifier, creation, false, AtomicPublication::Required)
+            .await
     }
 
     async fn drop_table(&self, identifier: &Identifier, ignore_if_not_exists: bool) -> Result<()> {
@@ -861,19 +913,50 @@ mod tests {
         FileSystemCatalog::new(options).unwrap()
     }
 
-    #[test]
-    fn test_filesystem_catalog_builds_local_cache_from_catalog_options() {
-        let warehouse = TempDir::new().unwrap();
+    #[tokio::test]
+    async fn test_cached_catalog_reads_the_recreated_table_schema() {
+        let (warehouse, other) = create_test_catalog();
+        let cache_dir = TempDir::new().unwrap();
         let mut options = Options::new();
         options.set(
             CatalogOptions::WAREHOUSE,
             warehouse.path().to_string_lossy(),
         );
         options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+        options.set(
+            CatalogOptions::LOCAL_CACHE_DIR,
+            cache_dir.path().to_string_lossy(),
+        );
 
         let catalog = FileSystemCatalog::new(options).unwrap();
-
         assert!(catalog.file_io().has_local_cache());
+        let id = Identifier::new("db", "t");
+        other
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+        other
+            .create_table(&id, testing_schema(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog.get_table(&id).await.unwrap().schema().fields()[0].name(),
+            "id"
+        );
+
+        other.drop_table(&id, false).await.unwrap();
+        let schema = Schema::builder()
+            .column(
+                "replacement",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .build()
+            .unwrap();
+        catalog.create_table_exclusive(&id, schema).await.unwrap();
+        assert_eq!(
+            catalog.get_table(&id).await.unwrap().schema().fields()[0].name(),
+            "replacement"
+        );
     }
 
     #[test]
@@ -1756,6 +1839,205 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "storage-fs")]
+    #[tokio::test]
+    async fn test_table_creation_without_atomic_publication() {
+        use futures::TryStreamExt;
+
+        let (temp, mut catalog) = create_test_catalog();
+        let mut config = opendal_service_fs::FsConfig::default();
+        config.root = Some("/".into());
+        let operator = opendal::Operator::from_config(config).unwrap().layer(
+            opendal::layers::CapabilityOverrideLayer::new(|mut cap| {
+                cap.rename_with_if_not_exists = false;
+                cap.write_with_if_not_exists = false;
+                cap
+            }),
+        );
+        catalog.file_io = crate::io::FileIOBuilder::new("file")
+            .with_fs_operator(operator)
+            .build()
+            .unwrap();
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+
+        let data = temp.path().join("existing");
+        std::fs::create_dir(&data).unwrap();
+        let batch = arrow_array::record_batch!(("id", Int32, [42])).unwrap();
+        let file = std::fs::File::create(data.join("part.parquet")).unwrap();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let identifier = Identifier::new("db", "registered");
+        assert!(matches!(
+            catalog
+                .create_table_exclusive(&identifier, testing_schema())
+                .await,
+            Err(Error::IoUnsupported { .. })
+        ));
+        assert!(matches!(
+            catalog.get_table(&identifier).await,
+            Err(Error::TableNotExist { .. })
+        ));
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("type", "format-table")
+            .option("file.format", "parquet")
+            .option("path", data.to_str().unwrap())
+            .build()
+            .unwrap();
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap();
+        catalog
+            .create_table(&identifier, testing_schema(), true)
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.create_table(&identifier, testing_schema(), false).await,
+            Err(Error::TableAlreadyExist { full_name }) if full_name == identifier.full_name()
+        ));
+        let table = catalog.get_table(&identifier).await.unwrap();
+        let builder = table.new_read_builder();
+        let plan = builder.new_scan().plan().await.unwrap();
+        let batches = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].columns(), batch.columns());
+
+        assert!(matches!(
+            catalog.create_table_exclusive(&identifier, testing_schema()).await,
+            Err(Error::TableAlreadyExist { full_name }) if full_name == identifier.full_name()
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_create_table_propagates_a_failed_conditional_rename() {
+        let (_warehouse, mut catalog) = create_test_catalog();
+        let operator = opendal::Operator::from_config(opendal::services::MemoryConfig::default())
+            .unwrap()
+            .layer(opendal::layers::CapabilityOverrideLayer::new(|mut cap| {
+                cap.rename = true;
+                cap.rename_with_if_not_exists = true;
+                cap
+            }));
+        catalog.file_io = crate::io::FileIOBuilder::new("file")
+            .with_fs_operator(operator)
+            .build()
+            .unwrap();
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+        let id = Identifier::new("db", "t");
+        let schema_dir = catalog.schema_dir_path(&catalog.table_path(&id));
+        let other_staged_schema = format!("{schema_dir}/schema-0.tmp-other");
+        catalog
+            .file_io
+            .new_output(&other_staged_schema)
+            .unwrap()
+            .write(Bytes::from_static(b"other creator"))
+            .await
+            .unwrap();
+        for create in [
+            catalog.create_table(&id, testing_schema(), false),
+            catalog.create_table(&id, testing_schema(), true),
+            catalog.create_table_exclusive(&id, testing_schema()),
+        ] {
+            let error = create.await.unwrap_err();
+            assert!(
+                matches!(error, Error::IoUnexpected { ref source, .. } if source.kind() == opendal::ErrorKind::Unsupported)
+            );
+            assert!(matches!(
+                catalog.get_table(&id).await,
+                Err(Error::TableNotExist { .. })
+            ));
+            let files = catalog.file_io.list_status(&schema_dir).await.unwrap();
+            assert_eq!(
+                files.iter().map(|file| &file.path).collect::<Vec<_>>(),
+                [&other_staged_schema]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_table_atomically_rejects_a_raced_creator() {
+        #[derive(Debug)]
+        struct SharedMemoryStorage {
+            operator: opendal::Operator,
+            publication: tokio::sync::Barrier,
+        }
+
+        #[async_trait]
+        impl crate::io::FileIOProvider for SharedMemoryStorage {
+            async fn create(&self, path: &str) -> Result<(opendal::Operator, String)> {
+                Ok((
+                    self.operator.clone(),
+                    path.trim_start_matches("memory:/").into(),
+                ))
+            }
+
+            async fn write_atomic_if_not_exists(
+                &self,
+                _path: &str,
+                _bytes: Bytes,
+            ) -> Result<Option<bool>> {
+                self.publication.wait().await;
+                Ok(None)
+            }
+        }
+
+        for ignore_if_exists in [false, true] {
+            let storage = std::sync::Arc::new(SharedMemoryStorage {
+                operator:
+                    opendal::Operator::from_config(opendal::services::MemoryConfig::default())
+                        .unwrap(),
+                publication: tokio::sync::Barrier::new(2),
+            });
+            let mut first = create_memory_catalog();
+            let mut second = create_memory_catalog();
+            first.file_io = first.file_io.clone().with_provider(storage.clone());
+            second.file_io = second.file_io.clone().with_provider(storage);
+            first
+                .create_database("db", false, HashMap::new())
+                .await
+                .unwrap();
+            let identifier = Identifier::new("db", "raced");
+            let schema = |name: &str| {
+                Schema::builder()
+                    .column(name, DataType::Int(IntType::new()))
+                    .build()
+                    .unwrap()
+            };
+            let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(
+                    first.create_table_exclusive(&identifier, schema("first")),
+                    second.create_table(&identifier, schema("second"), ignore_if_exists),
+                )
+            })
+            .await
+            .unwrap();
+            let winner = match (a, b) {
+                (Ok(()), Ok(())) if ignore_if_exists => "first",
+                (Ok(()), Err(Error::TableAlreadyExist { .. })) if !ignore_if_exists => "first",
+                (Err(Error::TableAlreadyExist { .. }), Ok(())) => "second",
+                results => panic!("unexpected creation results: {results:?}"),
+            };
+            let table = first.get_table(&identifier).await.unwrap();
+            assert_eq!(table.schema().fields()[0].name(), winner);
+        }
+    }
+
     #[tokio::test]
     async fn test_create_table_rejects_an_unknown_type() {
         let (_temp_dir, catalog) = create_test_catalog();
@@ -2195,13 +2477,19 @@ mod tests {
             "events$malformed$snapshots",
         ] {
             let identifier = Identifier::new("db1", name);
-            let result = catalog
-                .create_table(&identifier, testing_schema(), true)
-                .await;
-            assert!(
-                matches!(result, Err(Error::IdentifierInvalid { .. })),
-                "{result:?}"
-            );
+            for result in [
+                catalog
+                    .create_table(&identifier, testing_schema(), true)
+                    .await,
+                catalog
+                    .create_table_exclusive(&identifier, testing_schema())
+                    .await,
+            ] {
+                assert!(
+                    matches!(result, Err(Error::IdentifierInvalid { .. })),
+                    "{result:?}"
+                );
+            }
             assert!(!catalog.table_exists(&identifier).await.unwrap());
         }
     }

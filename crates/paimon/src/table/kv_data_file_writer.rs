@@ -20,6 +20,7 @@
 
 use super::data_file_index_writer::{DataFileIndexWriter, FileIndexOptions};
 use super::data_file_path_factory::{DataFilePath, DataFilePathFactory};
+use super::data_file_writer::discard_uncommitted_file;
 use super::managed_blob_reference::ManagedBlobReferences;
 use crate::arrow::format::{
     create_format_writer_factory, with_write_resources, FormatFileWriter, FormatWriterFactory,
@@ -207,7 +208,7 @@ impl<'a> KeyValueFileOptions<'a> {
         let writer = match factory.create_writer(&output, self.file_compression).await {
             Ok(writer) => with_write_resources(writer, self.resources),
             Err(error) => {
-                let _ = self.file_io.delete_file(&location.path).await;
+                discard_uncommitted_file(self.file_io, &location.path).await;
                 return Err(error);
             }
         };
@@ -418,14 +419,14 @@ impl KeyValueDataFileWriter<'_> {
         if let Some(writer) = self.writer.take() {
             let _ = writer.close().await;
         }
-        let _ = self.options.file_io.delete_file(&self.location.path).await;
+        discard_uncommitted_file(self.options.file_io, &self.location.path).await;
         if self.options.index_options.is_some() && !self.options.is_changelog {
             let path = format!(
                 "{}/{}",
                 self.location.parent(),
                 data_file_to_file_index_file_name(&self.name)
             );
-            let _ = self.options.file_io.delete_file(&path).await;
+            discard_uncommitted_file(self.options.file_io, &path).await;
         }
     }
 }
@@ -535,7 +536,7 @@ impl<'a> KeyValueRollingWriter<'a> {
         }
         for file in self.files.drain(..) {
             for path in file.collect_files(self.options.paths.bucket_path()) {
-                let _ = self.options.file_io.delete_file(&path).await;
+                discard_uncommitted_file(self.options.file_io, &path).await;
             }
         }
     }

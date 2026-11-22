@@ -50,7 +50,7 @@ use futures::TryStreamExt;
 use url::Url;
 
 use options::{Format, Options};
-pub(crate) use projection::sql;
+pub(crate) use projection::{execute_plan, plan_sql, sql};
 
 const GENERATED_METADATA: &str = "paimon.read_files.generated_metadata";
 

@@ -18,7 +18,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use opendal::{Configurator, Operator};
+use http::{header::IF_NONE_MATCH, Method, Request, Response, StatusCode};
+use opendal::{
+    Buffer, Configurator, HttpBody, HttpTransport, HttpTransporter, OperationContext, Operator,
+};
 use opendal_layer_retry::RetryLayer;
 use opendal_service_s3::S3Config;
 use url::Url;
@@ -27,6 +30,7 @@ use crate::error::Error;
 use crate::Result;
 
 use super::storage_config::normalize_storage_config;
+use super::user_agent::StorageHttpTransport;
 
 /// Configuration key for S3 endpoint.
 ///
@@ -182,10 +186,41 @@ pub(crate) fn s3_config_build(cfg: &S3StorageConfig, path: &str) -> Result<Opera
 
     let builder = cfg.service.clone().into_builder().bucket(bucket);
     let retry = RetryLayer::default()
+        .with_notify(super::file_io::observe_retry)
         .with_min_delay(cfg.retry_interval)
         .with_max_times(cfg.retry_count)
         .with_jitter();
-    Ok(super::with_http_transport(Operator::new(builder)?, &cfg.user_agent).layer(retry))
+    Ok(with_s3_http_transport(Operator::new(builder)?, &cfg.user_agent).layer(retry))
+}
+
+fn with_s3_http_transport(op: Operator, user_agent: &str) -> Operator {
+    let transport = HttpTransporter::new(S3HttpTransport(StorageHttpTransport::new(user_agent)));
+    op.with_context(OperationContext::new().with_http_transport(transport))
+}
+
+#[derive(Debug, snafu::Snafu)]
+#[snafu(display("S3 endpoint returned HTTP 501 for conditional PUT"))]
+pub(super) struct ConditionalPutNotImplemented;
+
+struct S3HttpTransport(StorageHttpTransport);
+
+impl HttpTransport for S3HttpTransport {
+    async fn fetch(&self, request: Request<Buffer>) -> opendal::Result<Response<HttpBody>> {
+        let conditional_put = request.method() == Method::PUT
+            && request
+                .headers()
+                .get(IF_NONE_MATCH)
+                .is_some_and(|value| value == "*");
+        let response = self.0.fetch(request).await?;
+        if conditional_put && response.status() == StatusCode::NOT_IMPLEMENTED {
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unsupported,
+                "S3 conditional PUT is unsupported",
+            )
+            .set_source(ConditionalPutNotImplemented));
+        }
+        Ok(response)
+    }
 }
 
 #[cfg(test)]
@@ -547,6 +582,248 @@ mod tests {
         let op = s3_config_build(&storage_config(cfg), "s3://bucket/path").unwrap();
         assert_eq!(op.read("object").await.unwrap().to_bytes(), "ok");
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn conditional_put_conflict_after_a_retry_has_an_unknown_outcome() {
+        use axum::routing::put;
+        use bytes::Bytes;
+
+        let object = Arc::new(Mutex::new(None));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/bucket/table/schema/schema-0",
+            put({
+                let object = object.clone();
+                let attempts = attempts.clone();
+                move |headers: HeaderMap, body: Bytes| {
+                    let object = object.clone();
+                    let attempts = attempts.clone();
+                    async move {
+                        assert_eq!(headers[header::IF_NONE_MATCH], "*");
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        let mut stored = object.lock().unwrap();
+                        if stored.is_none() {
+                            *stored = Some(body);
+                            return temporary_failure();
+                        }
+                        Response::builder()
+                            .status(StatusCode::PRECONDITION_FAILED)
+                            .body(Body::from("<Error><Code>PreconditionFailed</Code></Error>"))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let properties = [
+            (S3_ENDPOINT, endpoint.as_str()),
+            (S3_REGION, "us-east-1"),
+            (S3_PATH_STYLE_ACCESS, "true"),
+            ("s3.anonymous", "true"),
+            (S3_RETRY_COUNT, "1"),
+            (S3_RETRY_INTERVAL_MILLIS, "1"),
+        ];
+        let io = crate::io::FileIOBuilder::new("s3")
+            .with_props(properties)
+            .build()
+            .unwrap();
+        let path = "s3://bucket/table/schema/schema-0";
+        let schema = Bytes::from_static(b"schema");
+        let error = io
+            .write_atomic_if_not_exists(path, schema.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outcome is unknown"), "{error}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(object.lock().unwrap().as_ref(), Some(&schema));
+
+        assert!(!io
+            .write_atomic_if_not_exists(path, schema.clone())
+            .await
+            .unwrap());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        *object.lock().unwrap() = None;
+        let cfg = s3_config_parse(make_props(&properties)).unwrap();
+        let op = Operator::new(cfg.service.into_builder().bucket("bucket")).unwrap();
+        let op = with_s3_http_transport(op, &cfg.user_agent).layer(
+            RetryLayer::default()
+                .with_max_times(1)
+                .with_min_delay(Duration::from_millis(1)),
+        );
+        let custom = crate::io::FileIOBuilder::new("file")
+            .with_fs_operator(op)
+            .build()
+            .unwrap();
+        let error = custom
+            .write_atomic_if_not_exists("/table/schema/schema-0", schema.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outcome is unknown"), "{error}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+        assert_eq!(object.lock().unwrap().as_ref(), Some(&schema));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn create_table_falls_back_only_after_definite_s3_conditional_put_rejection() {
+        use axum::extract::{Path, Query};
+        use axum::routing::{head, put};
+        use bytes::Bytes;
+
+        use crate::catalog::{Catalog, FileSystemCatalog, Identifier};
+        use crate::common::{CatalogOptions, Options};
+        use crate::spec::{DataType, IntType, Schema};
+
+        let writes = Arc::new(Mutex::new(Vec::<(String, bool, Bytes)>::new()));
+        let redirected_requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/publication-status",
+                get({
+                    let redirected_requests = redirected_requests.clone();
+                    move || async move {
+                        redirected_requests.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NOT_IMPLEMENTED
+                    }
+                })
+                .put({
+                    let redirected_requests = redirected_requests.clone();
+                    move || async move {
+                        redirected_requests.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .route(
+                "/bucket",
+                get(|Query(query): Query<HashMap<String, String>>| async move {
+                    if query.get("prefix").is_some_and(|p| p == "warehouse/db.db/") {
+                        "<ListBucketResult><IsTruncated>false</IsTruncated><Contents>\
+                         <Key>warehouse/db.db/</Key><Size>0</Size>\
+                         <LastModified>2026-01-01T00:00:00Z</LastModified>\
+                         </Contents></ListBucketResult>"
+                    } else {
+                        "<ListBucketResult/>"
+                    }
+                }),
+            )
+            .route(
+                "/bucket/warehouse/db.db/:table/schema/",
+                put(|| async { StatusCode::OK }),
+            )
+            .route(
+                "/bucket/warehouse/db.db/:table/schema/schema-0",
+                head(|| async { StatusCode::NOT_FOUND }).put({
+                    let writes = writes.clone();
+                    move |Path(table): Path<String>, headers: HeaderMap, body: Bytes| {
+                        let writes = writes.clone();
+                        async move {
+                            let mut writes = writes.lock().unwrap();
+                            let first = !writes.iter().any(|(name, _, _)| name == &table);
+                            let conditional = headers.contains_key(header::IF_NONE_MATCH);
+                            writes.push((table.clone(), conditional, body));
+                            if !conditional {
+                                return Response::new(Body::empty());
+                            }
+                            assert_eq!(headers[header::IF_NONE_MATCH], "*");
+                            if table == "uncertain" && first {
+                                return temporary_failure();
+                            }
+                            if table == "mislabeled_conflict" {
+                                return Response::builder()
+                                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                                    .body(Body::from(
+                                        "<Error><Code>PreconditionFailed</Code></Error>",
+                                    ))
+                                    .unwrap();
+                            }
+                            let redirect = match table.as_str() {
+                                "redirected" => Some(StatusCode::SEE_OTHER),
+                                "misdirected" => Some(StatusCode::TEMPORARY_REDIRECT),
+                                _ => None,
+                            };
+                            if let Some(status) = redirect {
+                                return Response::builder()
+                                    .status(status)
+                                    .header(header::LOCATION, "/publication-status")
+                                    .body(Body::empty())
+                                    .unwrap();
+                            }
+                            Response::builder()
+                                .status(StatusCode::NOT_IMPLEMENTED)
+                                .body(Body::from("<Error><Code>NotImplemented</Code></Error>"))
+                                .unwrap()
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut options = Options::new();
+        for (key, value) in [
+            (CatalogOptions::WAREHOUSE, "s3://bucket/warehouse"),
+            (S3_ENDPOINT, endpoint.as_str()),
+            (S3_REGION, "us-east-1"),
+            (S3_PATH_STYLE_ACCESS, "true"),
+            ("s3.anonymous", "true"),
+            (S3_RETRY_COUNT, "1"),
+            (S3_RETRY_INTERVAL_MILLIS, "1"),
+        ] {
+            options.set(key, value);
+        }
+        let catalog = FileSystemCatalog::new(options).unwrap();
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let id = Identifier::new("db", "plain");
+        let error = catalog
+            .create_table_exclusive(&id, schema.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::IoUnsupported { .. }), "{error:?}");
+        catalog
+            .create_table(&id, schema.clone(), false)
+            .await
+            .unwrap();
+        for table in ["uncertain", "redirected", "mislabeled_conflict"] {
+            let error = catalog
+                .create_table(&Identifier::new("db", table), schema.clone(), true)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("outcome is unknown"), "{error}");
+        }
+        let error = catalog
+            .create_table_exclusive(&Identifier::new("db", "misdirected"), schema)
+            .await
+            .expect_err("a successful write to a different object cannot confirm table creation");
+        assert!(error.to_string().contains("outcome is unknown"), "{error}");
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(
+            writes
+                .iter()
+                .map(|(table, conditional, _)| (table.as_str(), *conditional))
+                .collect::<Vec<_>>(),
+            [
+                ("plain", true),
+                ("plain", true),
+                ("plain", false),
+                ("uncertain", true),
+                ("uncertain", true),
+                ("redirected", true),
+                ("mislabeled_conflict", true),
+                ("misdirected", true),
+            ]
+        );
+        assert_eq!(writes[1].2, writes[2].2);
+        assert_eq!(redirected_requests.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 
     #[tokio::test]

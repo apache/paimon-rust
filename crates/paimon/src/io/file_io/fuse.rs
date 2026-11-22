@@ -43,9 +43,14 @@ impl FileIOProvider for FuseFileIO {
         if let Some(relative) = self.relative_path(path) {
             // Require the mount to implement no-replace publication. An
             // unsupported hard link must never fall back to copy or rename.
-            FileIO::write_local_atomic_if_not_exists(path, &self.mounted, relative, bytes)
-                .await
-                .map(Some)
+            FileIO::publish_local_file(
+                path,
+                &self.mounted,
+                relative,
+                bytes,
+                AtomicPublication::Required,
+            )
+            .await
         } else {
             self.fallback
                 .write_atomic_if_not_exists(path, bytes)

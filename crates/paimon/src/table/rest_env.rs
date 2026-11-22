@@ -19,9 +19,10 @@
 
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
-use crate::api::GetTableResponse;
+use crate::api::{GetTableResponse, ResourceType};
 use crate::catalog::{
-    FusePathResolver, Identifier, RESTToken, RESTTokenFileIO, DEFAULT_MAIN_BRANCH,
+    map_table_metadata_error, FusePathResolver, Identifier, RESTToken, RESTTokenFileIO,
+    DEFAULT_MAIN_BRANCH,
 };
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
@@ -330,7 +331,15 @@ impl RESTEnv {
     ) -> Result<crate::api::GetTableResponse> {
         api.get_table(identifier)
             .await
-            .map_err(|e| map_rest_error_for_table(e, identifier))
+            .map_err(|e| map_table_metadata_error(e, identifier, ResourceType::Table))
+    }
+
+    pub(crate) async fn check_table_exists(identifier: &Identifier, api: &RESTApi) -> Result<()> {
+        let response = api
+            .get_table_for_existence_check(identifier)
+            .await
+            .map_err(|error| map_table_metadata_error(error, identifier, ResourceType::Table))?;
+        response_identifier(identifier, &response).map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]

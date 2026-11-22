@@ -192,6 +192,359 @@ async fn test_version_as_of_uses_snapshot_schema() {
 }
 
 #[tokio::test]
+async fn prepared_statement_keeps_its_snapshot_in_the_original_session() {
+    use datafusion::arrow::array::Int32Array;
+
+    let (_tmp, ctx) = setup_evolved_table().await;
+    ctx.sql(
+        "PREPARE historical(INT) AS SELECT paimon.default.t.id + t.id
+         FROM paimon.default.t VERSION AS OF 1
+         JOIN t VERSION AS OF 2 AS t ON paimon.default.t.id = t.id
+         WHERE t.id >= $1",
+    )
+    .await
+    .unwrap();
+    let batches = ctx
+        .sql("EXECUTE historical(3)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&batches), 1);
+    assert_eq!(column_names(&batches), ["paimon.default.t.id + t.id"]);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        6
+    );
+    ctx.sql("DEALLOCATE historical").await.unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_join_qualifiers_follow_sql_scope() {
+    use datafusion::arrow::array::Int64Array;
+
+    let (warehouse, mut ctx) = setup_evolved_table().await;
+    let other_warehouse = TempDir::new().unwrap();
+    let mut options = Options::new();
+    options.set(
+        CatalogOptions::WAREHOUSE,
+        format!("file://{}", other_warehouse.path().display()),
+    );
+    ctx.register_catalog("other", Arc::new(FileSystemCatalog::new(options).unwrap()))
+        .await
+        .unwrap();
+    for sql in [
+        "CREATE TABLE other.default.t (id INT, t STRUCT<field INT>)",
+        "INSERT INTO other.default.t VALUES (5, named_struct('field', 7))",
+    ] {
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    }
+    let sums = "SELECT paimon.default.t.id + t.id FROM paimon.default.t VERSION AS OF 1
+                CROSS JOIN t VERSION AS OF 2 AS t WHERE t.id = 5";
+    let column = r#""paimon.default.t.id + t.id""#;
+    let derived = format!("({sums}) s WHERE s.{column} = 8");
+    let cte =
+        format!("(WITH pairs AS ({sums}) SELECT pairs.{column} FROM pairs) s WHERE s.{column} = 8");
+    for (from, expected) in [
+        ("t VERSION AS OF 1 JOIN t VERSION AS OF 2 USING (id)", 3),
+        (
+            "t VERSION AS OF 1 JOIN paimon.default.t VERSION AS OF 2 USING (id)",
+            3,
+        ),
+        (
+            "t VERSION AS OF 1 CROSS JOIN t VERSION AS OF 2 AS t WHERE t.id = 5",
+            3,
+        ),
+        (
+            "paimon.default.t VERSION AS OF 1 CROSS JOIN t VERSION AS OF 2 AS t
+             WHERE paimon.default.t.id = 1 AND t.id = 5",
+            1,
+        ),
+        ("t VERSION AS OF 1 CROSS JOIN t WHERE t.id = 5", 3),
+        ("t VERSION AS OF 1 CROSS JOIN default.t WHERE t.id = 5", 3),
+        (
+            "default.t VERSION AS OF 1 CROSS JOIN paimon.default.t WHERE default.t.id = 5",
+            3,
+        ),
+        (
+            "default.t VERSION AS OF 1 CROSS JOIN t WHERE default.t.id = 5",
+            3,
+        ),
+        (
+            "paimon.default.t VERSION AS OF 1 CROSS JOIN t WHERE paimon.default.t.id = 5",
+            3,
+        ),
+        (
+            "(t VERSION AS OF 1 JOIN (SELECT 1 AS minimum) x ON t.id >= x.minimum)
+             RIGHT ANTI JOIN t VERSION AS OF 2 USING (id) WHERE t.id >= 4",
+            2,
+        ),
+        (
+            "(SELECT t.* FROM t VERSION AS OF 1 RIGHT ANTI JOIN t VERSION AS OF 2 USING (id)) s
+             WHERE s.id = 5",
+            1,
+        ),
+        (
+            "paimon.default.t VERSION AS OF 1 LEFT SEMI JOIN other.default.t VERSION AS OF 1
+             ON paimon.default.t.id + 4 = other.default.t.id
+             JOIN (SELECT 1 AS id) x ON t.id = x.id",
+            1,
+        ),
+        (
+            "(t VERSION AS OF 1 JOIN (SELECT 1 AS minimum) x ON t.id >= x.minimum)
+             JOIN t VERSION AS OF 2 AS t USING (id)",
+            3,
+        ),
+        (
+            "t VERSION AS OF 1 JOIN (SELECT 1 AS minimum) x ON t.id >= x.minimum
+             JOIN t VERSION AS OF 2 AS t USING (id)",
+            3,
+        ),
+        (
+            "(SELECT paimon.default.t.* FROM paimon.default.t VERSION AS OF 1
+              CROSS JOIN t VERSION AS OF 2 AS t WHERE t.id = 5
+              ORDER BY paimon.default.t.id DESC LIMIT 1) s WHERE s.id = 3",
+            1,
+        ),
+        (
+            "(SELECT COUNT(paimon.default.t.*) AS n FROM paimon.default.t VERSION AS OF 1
+              CROSS JOIN t AS t WHERE t.id = 5) s WHERE s.n = 3",
+            1,
+        ),
+        (derived.as_str(), 1),
+        (cte.as_str(), 1),
+        (
+            "(WITH t AS (SELECT 5 AS id)
+              SELECT paimon.default.t.id FROM paimon.default.t VERSION AS OF 1
+              CROSS JOIN t WHERE paimon.default.t.id = 1 AND t.id = 5) s",
+            1,
+        ),
+        (
+            "(WITH t AS (
+                SELECT paimon.default.t.id FROM paimon.default.t VERSION AS OF 1
+                CROSS JOIN t WHERE paimon.default.t.id = 5
+              ) SELECT * FROM t) s",
+            3,
+        ),
+        (
+            "(SELECT t.id FROM t VERSION AS OF 1) a
+             JOIN (SELECT t.id FROM t VERSION AS OF 2) b USING (id)",
+            3,
+        ),
+        (
+            "paimon.default.t VERSION AS OF 1 CROSS JOIN other.default.t VERSION AS OF 1
+             WHERE other.default.t.id = 5",
+            3,
+        ),
+        (
+            "paimon.default.t VERSION AS OF 1 JOIN (SELECT 1 AS id) minimum
+             ON default.t.id = minimum.id
+             CROSS JOIN other.default.t VERSION AS OF 1",
+            1,
+        ),
+        (
+            "paimon.default.t VERSION AS OF 1 JOIN (SELECT 1 AS id) minimum
+             ON t.id = minimum.id CROSS JOIN other.default.t",
+            1,
+        ),
+        (
+            "other.default.t AS t WHERE EXISTS (
+                SELECT 1 FROM (SELECT 5 AS id) x JOIN (SELECT 5 AS id) y
+                ON x.id = y.id AND t.id = x.id
+                CROSS JOIN paimon.default.t VERSION AS OF 1
+                CROSS JOIN other.default.t VERSION AS OF 1
+             )",
+            1,
+        ),
+        (
+            "other.default.t AS t WHERE EXISTS (
+                SELECT 1 FROM ((SELECT 5 AS id) x JOIN (SELECT 5 AS id) y
+                ON x.id = y.id AND t.id = x.id) early_join
+                CROSS JOIN paimon.default.t VERSION AS OF 1
+                CROSS JOIN other.default.t VERSION AS OF 1
+             )",
+            1,
+        ),
+        (
+            "paimon.default.t VERSION AS OF 1 CROSS JOIN other.default.t WHERE EXISTS (
+                SELECT 1 FROM (SELECT 1 AS id) x JOIN (SELECT 1 AS id) y
+                ON x.id = y.id AND paimon.default.t.id = x.id
+                CROSS JOIN paimon.default.t VERSION AS OF 1
+             )",
+            1,
+        ),
+    ] {
+        let batches = ctx
+            .sql(&format!("SELECT COUNT(*) FROM {from}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, expected, "{from}");
+    }
+
+    for (target, query, expected) in [
+        (
+            "snapshot_and_live_join",
+            "SELECT COUNT(*) AS n FROM t VERSION AS OF 1
+             CROSS JOIN paimon.default.t WHERE t.id = 5",
+            3,
+        ),
+        (
+            "full_live_join",
+            "SELECT COUNT(*) AS n FROM paimon.default.t VERSION AS OF 1
+             CROSS JOIN other.default.t WHERE t.id = 5 AND paimon.default.t.id >= 1",
+            3,
+        ),
+        (
+            "partial_live_join",
+            "SELECT COUNT(*) AS n FROM default.t VERSION AS OF 1
+             CROSS JOIN other.default.t WHERE t.id = 5 AND paimon.default.t.id >= 1",
+            3,
+        ),
+        (
+            "right_anti",
+            "SELECT CAST(t.id AS BIGINT) AS n FROM paimon.default.t VERSION AS OF 1
+             RIGHT ANTI JOIN other.default.t VERSION AS OF 1 USING (id)",
+            5,
+        ),
+        (
+            "nested_field",
+            "SELECT CAST(t.field AS BIGINT) AS n FROM paimon.default.t VERSION AS OF 1
+             CROSS JOIN other.default.t VERSION AS OF 1 WHERE paimon.default.t.id = 1",
+            7,
+        ),
+        (
+            "correlated_derived_source",
+            "SELECT COUNT(*) AS n FROM other.default.t AS t WHERE EXISTS (
+                SELECT 1 FROM (SELECT 1 AS id WHERE t.id = 5) matched
+                CROSS JOIN paimon.default.t VERSION AS OF 1
+                CROSS JOIN other.default.t VERSION AS OF 1
+             )",
+            1,
+        ),
+        (
+            "lateral_join_source",
+            "SELECT COUNT(*) AS n FROM paimon.default.t VERSION AS OF 1
+             CROSS JOIN LATERAL (SELECT 1 AS id WHERE t.id = 1) matched
+             CROSS JOIN other.default.t",
+            1,
+        ),
+        (
+            "lateral_from_source",
+            "SELECT COUNT(*) AS n FROM paimon.default.t VERSION AS OF 1,
+             LATERAL (SELECT 1 AS id WHERE t.id = 1) matched, other.default.t",
+            1,
+        ),
+        (
+            "local_lateral_in_correlated_subquery",
+            "SELECT COUNT(*) AS n FROM other.default.t AS outer_t WHERE EXISTS (
+                SELECT 1 FROM paimon.default.t VERSION AS OF 1
+                CROSS JOIN LATERAL (SELECT 1 AS id WHERE t.id = 5) matched
+                CROSS JOIN other.default.t WHERE outer_t.id = 5
+             )",
+            0,
+        ),
+    ] {
+        ctx.sql(&format!("CREATE TABLE {target} AS {query}"))
+            .await
+            .unwrap_or_else(|error| panic!("{query}: {error}"));
+        let batches = ctx
+            .sql(&format!("SELECT n FROM {target}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(total_rows(&batches), 1, "{query}");
+        let value = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(value, expected, "{query}");
+    }
+
+    for sql in [
+        "SELECT t.id FROM t VERSION AS OF 1 CROSS JOIN t VERSION AS OF 2",
+        "SELECT t.id FROM t VERSION AS OF 1 CROSS JOIN paimon.default.t VERSION AS OF 2",
+        "SELECT paimon.default.t.id FROM t VERSION AS OF 1
+         CROSS JOIN paimon.default.t VERSION AS OF 2",
+        "SELECT default.t.id FROM paimon.default.t VERSION AS OF 1
+         CROSS JOIN default.t VERSION AS OF 2",
+        "SELECT COUNT(*) FROM t VERSION AS OF 1
+         RIGHT ANTI JOIN t VERSION AS OF 2 ON t.id = t.id",
+        "CREATE TABLE ambiguous_snapshots AS
+         SELECT t.id FROM t VERSION AS OF 1 CROSS JOIN paimon.default.t VERSION AS OF 2",
+        "SELECT paimon.default.t.* FROM paimon.default.t VERSION AS OF 1
+         CROSS JOIN paimon.default.t VERSION AS OF 2",
+        "SELECT COUNT(*) FROM paimon.default.t VERSION AS OF 1
+         CROSS JOIN other.default.t VERSION AS OF 1 WHERE default.t.id = 5",
+        "SELECT COUNT(*) FROM default.t VERSION AS OF 1
+         CROSS JOIN other.default.t VERSION AS OF 1 WHERE default.t.id = 5",
+    ] {
+        let Err(error) = ctx.sql(sql).await else {
+            panic!("Unexpectedly planned {sql}");
+        };
+        let error = error.to_string();
+        assert!(error.contains("Ambiguous snapshot qualifier"), "{error}");
+    }
+    assert!(!warehouse
+        .path()
+        .join("default.db/ambiguous_snapshots/schema/schema-0")
+        .exists());
+
+    for (target, inputs) in [
+        (
+            "correlated_lateral_live",
+            "(SELECT id FROM paimon.default.t WHERE id <= 3) AS t CROSS JOIN other.default.t",
+        ),
+        (
+            "correlated_lateral_snapshots",
+            "paimon.default.t VERSION AS OF 1 CROSS JOIN other.default.t VERSION AS OF 1",
+        ),
+    ] {
+        let sql = format!(
+            "CREATE TABLE {target} AS SELECT COUNT(*) AS n FROM other.default.t AS t WHERE EXISTS (
+                SELECT 1 FROM (SELECT 1 AS id) seed
+                CROSS JOIN LATERAL (SELECT 1 AS id WHERE t.id = 5) matched
+                CROSS JOIN {inputs}
+             )"
+        );
+        let error = ctx.sql(&sql).await.unwrap_err().to_string();
+        assert!(
+            error.contains("LATERAL source referencing enclosing query column 't.id'"),
+            "{sql}: {error}"
+        );
+        assert!(!warehouse
+            .path()
+            .join(format!("default.db/{target}"))
+            .exists());
+    }
+
+    ctx.sql(
+        "CREATE TABLE IF NOT EXISTS t AS
+         SELECT t.id FROM t VERSION AS OF 1 CROSS JOIN t VERSION AS OF 2",
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn test_version_as_of_java_watermark_prefix() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let warehouse = format!("file://{}", temp_dir.path().display());

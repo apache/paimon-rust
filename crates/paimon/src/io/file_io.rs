@@ -19,6 +19,7 @@ use crate::common::options::{parse_memory_size, CatalogOptions};
 use crate::error::*;
 use lru::LruCache;
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -32,6 +33,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
+use http::StatusCode;
 use opendal::raw::{new_std_io_error, normalize_path, normalize_root};
 use opendal::Operator;
 use sha2::{Digest, Sha256};
@@ -93,6 +95,8 @@ pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
     /// Return `None` only if no publication was attempted; FileIO then uses the
     /// resolved operator's safe publication primitives. An error may have an
     /// unknown outcome and is propagated without falling back to another write.
+    /// If that operator's retry layer hides earlier attempts, a persistent
+    /// conflict also has an unknown outcome.
     async fn write_atomic_if_not_exists(
         &self,
         _path: &str,
@@ -116,6 +120,73 @@ pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
 enum FileIOBackend {
     Storage(Arc<Storage>),
     Provider(Arc<dyn FileIOProvider>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicPublication {
+    Required,
+    /// Allow a plain write when conditional publication is definitively unsupported.
+    IfSupported,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PublicationAttempt {
+    replayed: bool,
+    response_status: Option<StatusCode>,
+}
+
+tokio::task_local! {
+    static PUBLICATION_ATTEMPT: Cell<PublicationAttempt>;
+}
+
+#[cfg(all(test, feature = "storage-fs"))]
+tokio::task_local! {
+    static TEST_LOCAL_PERSIST: fn(tempfile::NamedTempFile, &std::path::Path) -> std::io::Result<()>;
+}
+
+#[cfg(any(
+    feature = "storage-s3",
+    feature = "storage-oss",
+    feature = "storage-gcs"
+))]
+pub(super) fn is_conditional_publication() -> bool {
+    PUBLICATION_ATTEMPT.try_with(|_| ()).is_ok()
+}
+
+#[cfg(any(
+    feature = "storage-s3",
+    feature = "storage-oss",
+    feature = "storage-gcs"
+))]
+pub(super) fn record_publication_replay() {
+    let _ = PUBLICATION_ATTEMPT.try_with(|state| {
+        state.update(|mut attempt| {
+            attempt.replayed = true;
+            attempt
+        });
+    });
+}
+
+#[cfg(any(
+    feature = "storage-s3",
+    feature = "storage-oss",
+    feature = "storage-gcs"
+))]
+pub(super) fn record_publication_status(status: StatusCode) {
+    let _ = PUBLICATION_ATTEMPT.try_with(|state| {
+        state.update(|mut attempt| {
+            attempt.response_status = Some(status);
+            attempt
+        });
+    });
+}
+
+#[cfg(any(feature = "storage-s3", feature = "storage-oss"))]
+pub(super) fn observe_retry(event: opendal_layer_retry::RetryEvent<'_>) {
+    use opendal_layer_retry::{DefaultRetryInterceptor, RetryInterceptor};
+
+    record_publication_replay();
+    DefaultRetryInterceptor.intercept(event);
 }
 
 #[derive(Clone)]
@@ -874,6 +945,10 @@ impl FileIO {
             self.file_format_metadata_cache
                 .invalidate_row_sidecar_size(cache_path);
         }
+        self.invalidate_cached_blocks(path, cache_path).await
+    }
+
+    async fn invalidate_cached_blocks(&self, path: &str, cache_path: Option<String>) -> Result<()> {
         if let (Some(cache), Some(cache_path)) = (
             self.cache.as_ref().filter(|cache| cache.is_cacheable(path)),
             cache_path,
@@ -903,14 +978,31 @@ impl FileIO {
                     format!("Failed to delete directory '{path}'"),
                 )
             })?;
-        if let Some(ref cache_path) = cache_path {
+        self.invalidate_cached_prefix(cache_path.as_deref()).await
+    }
+
+    pub(crate) async fn invalidate_directory_cache(&self, path: &str) -> Result<()> {
+        if self.cache.is_none()
+            && self
+                .file_format_metadata_cache
+                .row_sidecar_sizes
+                .get()
+                .is_none()
+        {
+            return Ok(());
+        }
+        let (_, _, cache_path) = self.create_with_cache_path(path).await?;
+        self.invalidate_cached_prefix(cache_path.as_deref()).await
+    }
+
+    async fn invalidate_cached_prefix(&self, cache_path: Option<&str>) -> Result<()> {
+        if let Some(cache_path) = cache_path {
             self.file_format_metadata_cache
                 .invalidate_row_sidecar_prefix(cache_path);
+            if let Some(cache) = &self.cache {
+                cache.invalidate_prefix(cache_path).await?;
+            }
         }
-        if let (Some(cache), Some(cache_path)) = (&self.cache, cache_path) {
-            cache.invalidate_prefix(&cache_path).await?;
-        }
-
         Ok(())
     }
 
@@ -949,6 +1041,16 @@ impl FileIO {
         path: &str,
         bytes: Bytes,
     ) -> Result<bool> {
+        self.publish_new_file(path, bytes, AtomicPublication::Required)
+            .await
+    }
+
+    pub(crate) async fn publish_new_file(
+        &self,
+        path: &str,
+        bytes: Bytes,
+        publication: AtomicPublication,
+    ) -> Result<bool> {
         if let FileIOBackend::Provider(provider) = &self.backend {
             if let Some(published) = provider
                 .write_atomic_if_not_exists(path, bytes.clone())
@@ -958,89 +1060,168 @@ impl FileIO {
             }
         }
         let source = self.file_source(path)?;
-        let (op, relative_path, _) = source.resolve(path).await?;
+        let (op, relative_path, cache_path) = source.resolve(path).await?;
 
         #[cfg(feature = "storage-fs")]
         if matches!(source, FileSource::Static { local_fs: true, .. }) {
-            return Self::write_local_atomic_if_not_exists(path, &op, &relative_path, bytes).await;
+            if let Some(published) =
+                Self::publish_local_file(path, &op, &relative_path, bytes.clone(), publication)
+                    .await?
+            {
+                return Ok(published);
+            }
         }
 
         let info = op.info();
         let capability = info.capability();
-        let result = if capability.rename_with_if_not_exists {
+        if capability.rename_with_if_not_exists {
             let staging_path = format!("{relative_path}.tmp-{}", uuid::Uuid::new_v4());
-            op.write(&staging_path, bytes).await?;
-            let result = op
-                .rename_with(&staging_path, &relative_path)
-                .if_not_exists(true)
-                .await;
-            if result.as_ref().is_err_and(|error| {
-                matches!(
-                    error.kind(),
-                    opendal::ErrorKind::AlreadyExists | opendal::ErrorKind::ConditionNotMatch
-                )
-            }) {
-                let _ = op.delete(&staging_path).await;
+            let discard_staging = || async {
+                if let Err(error) = op.delete(&staging_path).await {
+                    log::warn!(
+                        "Failed to delete staging file '{staging_path}' for '{path}': {error}"
+                    );
+                }
+            };
+            if let Err(error) = op.write(&staging_path, bytes).await {
+                discard_staging().await;
+                return Err(Error::from_opendal_with_context(
+                    error,
+                    format!("Failed to stage '{path}'"),
+                ));
             }
-            result
-        } else if capability.write_with_if_not_exists
+            let result = self
+                .conditional_publication(
+                    path,
+                    op.rename_with(&staging_path, &relative_path)
+                        .if_not_exists(true),
+                )
+                .await;
+            if !matches!(result, Ok(true)) {
+                discard_staging().await;
+            }
+            return result;
+        }
+        if capability.write_with_if_not_exists
             // Only known whole-object publishers are safe here: position
             // writers can expose incomplete files, and COS ignores conditional
             // puts on buckets that have ever enabled versioning. OSS requires
             // the bucket's default, never-enabled versioning configuration.
             && matches!(info.scheme(), "memory" | "s3" | "oss" | "gcs")
         {
-            op.write_with(&relative_path, bytes)
-                .if_not_exists(true)
-                .await
-                .map(|_| ())
+            let result = self
+                .conditional_publication(
+                    path,
+                    op.write_with(&relative_path, bytes.clone())
+                        .if_not_exists(true),
+                )
+                .await;
+            if publication == AtomicPublication::Required
+                || !matches!(result, Err(Error::IoUnsupported { .. }))
+            {
+                return result;
+            }
+        }
+        if publication == AtomicPublication::IfSupported {
+            op.write(&relative_path, bytes).await.map_err(|error| {
+                Error::from_opendal_with_context(error, format!("Failed to write '{path}'"))
+            })?;
+            self.invalidate_cached_blocks(path, cache_path).await?;
+            Ok(true)
         } else {
-            return Err(Error::IoUnsupported {
+            Err(Error::IoUnsupported {
                 message: format!(
-                    "Storage '{}' cannot atomically publish a complete snapshot without overwriting '{path}'; use a catalog SnapshotCommit with concurrency control",
+                    "Storage '{}' cannot atomically publish '{path}' without overwriting it. \
+                     Use storage or a FileIOProvider with atomic publication support. \
+                     For snapshots, a catalog SnapshotCommit can also coordinate publication.",
                     info.scheme()
                 ),
-            });
-        };
-        match result {
-            Ok(()) => Ok(true),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    opendal::ErrorKind::AlreadyExists | opendal::ErrorKind::ConditionNotMatch
-                ) =>
-            {
-                Ok(false)
-            }
-            Err(error) => Err(Error::from_opendal_with_context(
-                error,
-                format!("Failed to publish '{path}'"),
-            )),
+            })
         }
     }
 
+    async fn conditional_publication<T>(
+        &self,
+        path: &str,
+        publish: impl std::future::IntoFuture<Output = opendal::Result<T>>,
+    ) -> Result<bool> {
+        let (result, attempt) = PUBLICATION_ATTEMPT
+            .scope(Cell::new(PublicationAttempt::default()), async {
+                (publish.await, PUBLICATION_ATTEMPT.with(Cell::get))
+            })
+            .await;
+        let Err(error) = result else { return Ok(true) };
+        // OpenDAL's RetryLayer marks its final error persistent even on the
+        // first attempt. Only built-in operators install our retry observer.
+        let built_in = matches!(&self.backend, FileIOBackend::Storage(storage)
+            if !matches!(storage.as_ref(), Storage::CustomFs { .. }));
+        // OpenDAL can classify an error from the response body even if the status disagrees.
+        let status_allows_conflict = attempt.response_status.is_none_or(|status| {
+            matches!(
+                status,
+                StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED
+            )
+        });
+        if !attempt.replayed
+            && (built_in || !error.is_persistent())
+            && status_allows_conflict
+            && matches!(
+                error.kind(),
+                opendal::ErrorKind::AlreadyExists | opendal::ErrorKind::ConditionNotMatch
+            )
+        {
+            return Ok(false);
+        }
+        #[cfg(feature = "storage-s3")]
+        if !attempt.replayed
+            && built_in
+            && std::error::Error::source(&error).is_some_and(|source| {
+                source.is::<super::storage_s3::ConditionalPutNotImplemented>()
+            })
+        {
+            return Err(Error::IoUnsupported {
+                message: format!("S3 storage cannot atomically publish '{path}': {error}"),
+            });
+        }
+        Err(Error::from_opendal_with_context(
+            error,
+            format!("Failed to publish '{path}': publication outcome is unknown"),
+        ))
+    }
+
+    /// Returns `None` when optional native publication is explicitly unsupported.
     #[cfg(feature = "storage-fs")]
-    async fn write_local_atomic_if_not_exists(
+    async fn publish_local_file(
         path: &str,
         op: &Operator,
         relative_path: &str,
         bytes: Bytes,
-    ) -> Result<bool> {
-        // OpenDAL's filesystem conditional write exposes the target before
-        // its contents are complete. Stage locally, then publish without
-        // replacing another process's snapshot.
+        publication: AtomicPublication,
+    ) -> Result<Option<bool>> {
+        // OpenDAL's filesystem conditional write can expose incomplete contents.
         let relative = normalize_path(relative_path);
         if std::path::Path::new(&relative)
             .components()
             .any(|component| matches!(component, std::path::Component::ParentDir))
         {
             return Err(Error::IoUnsupported {
-                message: format!("Cannot publish a snapshot through a parent path: '{path}'"),
+                message: format!("Cannot atomically publish '{path}' through a parent path"),
             });
         }
         let target = std::path::Path::new(&op.info().root()).join(relative);
-        tokio::task::spawn_blocking(move || -> opendal::Result<bool> {
-            use std::io::Write;
+        let persist = |staged: tempfile::NamedTempFile, target: &std::path::Path| {
+            staged
+                .persist_noclobber(target)
+                .map(|_| ())
+                .map_err(|error| error.error)
+        };
+        #[cfg(test)]
+        let persist = TEST_LOCAL_PERSIST
+            .try_with(|persist| *persist)
+            .unwrap_or(persist);
+
+        tokio::task::spawn_blocking(move || -> opendal::Result<Option<bool>> {
+            use std::io::{ErrorKind, Write};
 
             let parent = target.parent().ok_or_else(|| {
                 opendal::Error::new(opendal::ErrorKind::IsADirectory, "target has no parent")
@@ -1056,10 +1237,17 @@ impl FileIO {
             let mut staged = builder.tempfile_in(parent).map_err(new_std_io_error)?;
             staged.write_all(&bytes).map_err(new_std_io_error)?;
             staged.as_file().sync_all().map_err(new_std_io_error)?;
-            match staged.persist_noclobber(target) {
-                Ok(_) => Ok(true),
-                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-                Err(error) => Err(new_std_io_error(error.error)),
+            match persist(staged, &target) {
+                Ok(()) => Ok(Some(true)),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(Some(false)),
+                // Mounts can support writes while rejecting both no-replace rename and hard links.
+                Err(error)
+                    if publication == AtomicPublication::IfSupported
+                        && error.kind() == ErrorKind::Unsupported =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(new_std_io_error(error)),
             }
         })
         .await
@@ -2026,6 +2214,16 @@ impl OutputFile {
 }
 
 #[cfg(test)]
+fn local_file_path(path: &std::path::Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if normalized.starts_with('/') {
+        format!("file:{normalized}")
+    } else {
+        format!("file:/{normalized}")
+    }
+}
+
+#[cfg(test)]
 mod file_action_test {
     use std::collections::BTreeSet;
     use std::fs;
@@ -2320,15 +2518,6 @@ mod file_action_test {
 
     fn setup_fs_file_io() -> FileIO {
         FileIOBuilder::new("file").build().unwrap()
-    }
-
-    fn local_file_path(path: &std::path::Path) -> String {
-        let normalized = path.to_string_lossy().replace('\\', "/");
-        if normalized.starts_with('/') {
-            format!("file:{normalized}")
-        } else {
-            format!("file:/{normalized}")
-        }
     }
 
     async fn common_test_get_status(file_io: &FileIO, path: &str) {
@@ -4532,20 +4721,106 @@ mod input_output_test {
         );
     }
 
+    #[cfg(feature = "storage-fs")]
+    #[tokio::test]
+    async fn test_native_publication_unsupported_allows_only_optional_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = local_file_path(&directory.path().join("schema-0"));
+        let io = FileIOBuilder::new("file").build().unwrap();
+        let schema = Bytes::from_static(b"table schema");
+        let unsupported = |_, _: &std::path::Path| Err(std::io::ErrorKind::Unsupported.into());
+
+        let error = TEST_LOCAL_PERSIST
+            .scope(
+                unsupported,
+                io.write_atomic_if_not_exists(&path, schema.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::IoUnexpected { source, .. } if source.kind() == opendal::ErrorKind::Unsupported
+        ));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+
+        assert!(TEST_LOCAL_PERSIST
+            .scope(
+                unsupported,
+                io.publish_new_file(&path, schema.clone(), AtomicPublication::IfSupported),
+            )
+            .await
+            .unwrap());
+        assert!(!io
+            .publish_new_file(
+                &path,
+                Bytes::from_static(b"competing table schema"),
+                AtomicPublication::IfSupported,
+            )
+            .await
+            .unwrap());
+        let file = directory.path().join("schema-0");
+        assert_eq!(std::fs::read(&file).unwrap(), schema.as_ref());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(feature = "storage-fs")]
+    #[tokio::test]
+    async fn test_native_publication_propagates_uncertain_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = local_file_path(&directory.path().join("schema-0"));
+        let io = FileIOBuilder::new("file").build().unwrap();
+        let schema = Bytes::from_static(b"table schema");
+        let timed_out = |staged: tempfile::NamedTempFile, target: &std::path::Path| {
+            staged
+                .persist_noclobber(target)
+                .map_err(|error| error.error)?;
+            Err(std::io::ErrorKind::TimedOut.into())
+        };
+
+        let error = TEST_LOCAL_PERSIST
+            .scope(
+                timed_out,
+                io.publish_new_file(&path, schema.clone(), AtomicPublication::IfSupported),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::IoUnexpected { message, .. } if message.contains("Failed to publish")
+        ));
+        assert_eq!(
+            std::fs::read(directory.path().join("schema-0")).unwrap(),
+            schema.as_ref(),
+        );
+    }
+
     #[cfg(feature = "storage-oss")]
     #[tokio::test]
     async fn test_atomic_publication_oss_has_one_winner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         use axum::body::Body;
-        use axum::http::{HeaderMap, Response, StatusCode, Uri};
+        use axum::http::{header::LOCATION, HeaderMap, Response, StatusCode, Uri};
+        use axum::routing::get;
         use axum::Router;
         use opendal::Configurator;
 
         let objects = Arc::new(Mutex::new(HashMap::<String, Bytes>::new()));
         let stored = objects.clone();
+        let redirected_gets = Arc::new(AtomicUsize::new(0));
+        let counted_gets = redirected_gets.clone();
         // An OSS bucket with default versioning atomically enforces this header.
         let app = Router::new().fallback(move |uri: Uri, headers: HeaderMap, body: Bytes| {
             let stored = stored.clone();
             async move {
+                if uri.path() == "/bucket/table/schema/schema-0" {
+                    assert_eq!(headers["x-oss-forbid-overwrite"], "true");
+                    return Response::builder()
+                        .status(StatusCode::SEE_OTHER)
+                        .header(LOCATION, "/publication-status")
+                        .body(Body::empty())
+                        .unwrap();
+                }
                 let mut objects = stored.lock().unwrap();
                 if headers.get("x-oss-forbid-overwrite").is_some_and(|value| value == "true")
                     && objects.contains_key(uri.path())
@@ -4561,7 +4836,13 @@ mod input_output_test {
                     .body(Body::empty())
                     .unwrap()
             }
-        });
+        }).route("/publication-status", get(move || async move {
+            counted_gets.fetch_add(1, Ordering::SeqCst);
+            Response::builder()
+                .header("etag", "\"mock-etag\"")
+                .body(Body::empty())
+                .unwrap()
+        }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -4584,7 +4865,6 @@ mod input_output_test {
             io.write_atomic_if_not_exists(path, first.clone()),
             io.write_atomic_if_not_exists(path, second.clone())
         );
-        server.abort();
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_ne!(a, b, "exactly one conditional OSS PUT must win");
         assert_eq!(
@@ -4594,5 +4874,12 @@ mod input_output_test {
                 .get("/bucket/table/snapshot/snapshot-1"),
             Some(if a { &first } else { &second })
         );
+        let error = io
+            .write_atomic_if_not_exists("/table/schema/schema-0", first)
+            .await
+            .expect_err("a redirected GET cannot confirm publication");
+        assert!(error.to_string().contains("outcome is unknown"), "{error}");
+        assert_eq!(redirected_gets.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 }

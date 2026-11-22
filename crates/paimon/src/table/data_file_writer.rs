@@ -40,6 +40,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
+pub(super) async fn discard_uncommitted_file(file_io: &FileIO, path: &str) {
+    if let Err(error) = file_io.delete_file(path).await {
+        log::warn!("Failed to discard uncommitted file '{path}': {error}");
+    }
+}
+
 /// Low-level writer that produces Parquet data files for a single (partition, bucket).
 ///
 /// Batches are accumulated into a single `FormatFileWriter` that streams directly
@@ -573,7 +579,7 @@ impl DataFileWriter {
         while self.in_flight_closes.join_next().await.is_some() {}
         for path in self.created_paths.drain(..) {
             if self.delete_file_upon_abort {
-                let _ = self.file_io.delete_file(&path).await;
+                discard_uncommitted_file(&self.file_io, &path).await;
             }
         }
         self.written_files.clear();
@@ -585,7 +591,7 @@ impl DataFileWriter {
         }
         for file in files {
             for path in file.collect_files(self.bucket_dir()) {
-                let _ = self.file_io.delete_file(&path).await;
+                discard_uncommitted_file(&self.file_io, &path).await;
             }
         }
     }

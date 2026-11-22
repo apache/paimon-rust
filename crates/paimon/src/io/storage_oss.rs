@@ -140,6 +140,7 @@ pub(crate) fn oss_config_build(cfg: &OssStorageConfig, path: &str) -> Result<Ope
 
     let builder = cfg.service.clone().into_builder().bucket(bucket);
     let retry = RetryLayer::default()
+        .with_notify(super::file_io::observe_retry)
         .with_min_delay(cfg.retry_interval)
         .with_max_times(cfg.retry_count)
         .with_jitter();
