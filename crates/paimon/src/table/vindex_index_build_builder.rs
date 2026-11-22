@@ -197,7 +197,13 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             &self.table.schema().core_options(),
             snapshot.id(),
             manifest_entries,
-            rows_per_shard,
+            // Java splits build input for workers, then trains one router per
+            // contiguous range. Rust streams the range directly.
+            if centroid.is_some() {
+                i64::MAX
+            } else {
+                rows_per_shard
+            },
             &indexed,
         )?;
 

@@ -62,11 +62,11 @@ pub(super) async fn read_index_vector_metric(
         let Role::Router(nlist) = descriptor.role else {
             return Ok(None);
         };
-        if let Some(metric) = metric_from_index_options(&payload_options(&descriptor)?) {
-            return Ok(Some(metric));
-        }
         if nlist == 0 {
             return Ok(None);
+        }
+        if let Some(metric) = metric_from_index_options(&payload_options(&descriptor)?) {
+            return Ok(Some(metric));
         }
         let router = Router::load(file_io, table_path, &entry.index_file, &descriptor).await?;
         return Ok(Some(router.metric));
@@ -219,6 +219,9 @@ pub(super) fn validate_global_vector_index_types(
                 .as_ref()
                 .is_none_or(|meta| meta.index_field_id != field_id)
         {
+            continue;
+        }
+        if super::centroid_index::Descriptor::is_empty_router(file)? {
             continue;
         }
         if let Some(previous) = index_type {
@@ -815,6 +818,27 @@ mod tests {
                 .await
                 .unwrap(),
             Some(MetricType::L2)
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_centroid_router_has_no_scoring_metric() {
+        use crate::table::centroid_index::{Descriptor, Role};
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let descriptor = Descriptor {
+            model_id: "empty-centroid",
+            version: 1,
+            role: Role::Router(0),
+            payload: Some(br#"{"metric":"cosine"}"#),
+        };
+        let mut entry = entry(Some(descriptor.encode().unwrap()));
+        entry.index_file.row_count = 0;
+        assert_eq!(
+            read_index_vector_metric(&file_io, "memory:/metric-empty-centroid", &entry)
+                .await
+                .unwrap(),
+            None
         );
     }
 

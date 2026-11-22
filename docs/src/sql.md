@@ -2975,8 +2975,8 @@ CALL sys.create_global_index(
 );
 ```
 
-Each contiguous row-ID range in a partition has a routing model and one local
-index per populated centroid. The build replaces the previous indexes of the
+Each maximal contiguous row-ID range in a partition has a routing model and one
+local index per populated centroid. The build replaces the previous indexes of the
 same type on the column in the selected partitions. Refresh routed indexes
 explicitly with the build procedure. A Rust build plan also exposes
 `replacement_messages()` to publish with the completed shards in the same
@@ -2987,6 +2987,7 @@ selected shard's local IVF search, and `diskann.l_search` controls its DiskANN
 search. Automatic cosine and L2 routing can widen the search when necessary.
 Automatic inner-product routing searches all centroids. The layout is stored
 in the index manifest and is available when searching Java-built indexes.
+The current native DiskANN reader supports up to 1,024 dimensions.
 
 ### Scalar Pre-Filters
 
@@ -3015,6 +3016,8 @@ capped by shard size and the backend limit (`2147483647`). The required limit
 includes reranking/deletion slack; neither that slack nor batch size multiplies
 the factor. For example, Top-K 10 requests 100 candidates with the default
 factor unless a larger required allowance applies.
+With centroid sharding, the budget applies to the merged candidates for each
+routed row-ID range.
 
 Every returned row satisfies the predicate, but filtering may leave fewer than
 Top-K rows, including no rows even when matches exist outside the candidates.

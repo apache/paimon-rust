@@ -49,6 +49,10 @@ pub(super) struct Descriptor<'a> {
 }
 
 impl<'a> Descriptor<'a> {
+    pub(super) fn is_empty_router(file: &'a IndexFileMeta) -> Result<bool> {
+        Ok(Self::parse(file)?.is_some_and(|descriptor| descriptor.role == Role::Router(0)))
+    }
+
     pub(super) fn is_wrapped(file: &IndexFileMeta) -> bool {
         file.global_index_meta
             .as_ref()

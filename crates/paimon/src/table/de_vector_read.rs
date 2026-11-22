@@ -301,6 +301,7 @@ async fn execute_vector_file_work(
     metric_check: VectorMetricCheck,
     range_read_limiter: RangeReadLimiter,
     batch_index_parallelism: usize,
+    allow_buffered_read: bool,
 ) -> crate::Result<(Vec<ScoredRowIds>, IndexSearchTiming)> {
     let timing_enabled = vector_search_timing_enabled();
     let concurrency = CoreOptions::new(evaluation.table_options).global_index_thread_num()?;
@@ -330,6 +331,9 @@ async fn execute_vector_file_work(
         None => global_meta.index_meta.clone().unwrap_or_default(),
     };
     let row_range_start = global_meta.row_range_start;
+    let max_centroid_label = descriptor
+        .is_some()
+        .then(|| global_meta.row_range_end.abs_diff(row_range_start));
     let mut vector_searches = work.queries;
     let options = if let Some(resolved) = work.resolved {
         if resolved.index_type.as_deref() != Some(work.entry.index_file.index_type.as_str()) {
@@ -447,7 +451,7 @@ async fn execute_vector_file_work(
             }
             results
         }
-        Err(_) if query_count > 1 || work.filter.is_some() => {
+        Err(_) if allow_buffered_read => {
             let read_start = timing_enabled.then(Instant::now);
             let data = input.read().await.map_err(|e| crate::Error::DataInvalid {
                 message: format!("Failed to read vindex index file '{}': {}", file_name, e),
@@ -503,10 +507,19 @@ async fn execute_vector_file_work(
     let results = results
         .into_iter()
         .map(|result| match result {
-            Some(scored_map) => ScoredRowIds::from_scored_map(scored_map).offset(row_range_start),
-            None => ScoredRowIds::empty(),
+            Some(scored_map) => {
+                if max_centroid_label
+                    .is_some_and(|max_label| scored_map.keys().any(|&id| id > max_label))
+                {
+                    return Err(super::centroid_index::invalid(format!(
+                        "Vector candidate in '{file_name}' lies outside its centroid shard"
+                    )));
+                }
+                Ok(ScoredRowIds::from_scored_map(scored_map).offset(row_range_start))
+            }
+            None => Ok(ScoredRowIds::empty()),
         })
-        .collect::<Vec<_>>();
+        .collect::<crate::Result<Vec<_>>>()?;
     Ok::<_, crate::Error>((
         results,
         IndexSearchTiming {
@@ -933,7 +946,7 @@ async fn evaluate_batch_vector_search_with_executor(
         evaluation.table_options,
         &search_options,
         field_name,
-        vector_entries
+        vector_search_entries
             .first()
             .map(|entry| entry.index_file.index_type.as_str())
             .or(raw_index_type),
@@ -1277,6 +1290,11 @@ async fn evaluate_batch_vector_search_with_executor(
 
     if refine_factor != 0 {
         let refine_start = timing_enabled.then(Instant::now);
+        if let Some(deleted) = deleted_row_index.as_ref() {
+            for result in &mut merged {
+                *result = result.without_deleted_row_ranges(Some(deleted))?;
+            }
+        }
         merged = maybe_rerank_indexed_batch_results(
             evaluation,
             index_entries,

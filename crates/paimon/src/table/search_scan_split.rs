@@ -204,12 +204,14 @@ pub(super) async fn global_search_splits(
     }
     let raw_ranges = merge_row_ranges(raw_ranges);
     if !raw_ranges.is_empty() {
-        let index_type = grouped
-            .values()
-            .flat_map(|files| files.iter())
-            .next()
-            .map(|file| file.index_type.clone());
-        let index_type = match index_type {
+        let mut populated_type = None;
+        for file in grouped.values().flatten() {
+            if full_text || !super::centroid_index::Descriptor::is_empty_router(file)? {
+                populated_type = Some(file.index_type.clone());
+                break;
+            }
+        }
+        let index_type = match populated_type {
             Some(kind) => Some(kind),
             None if full_text => None,
             None => {
