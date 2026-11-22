@@ -2948,7 +2948,7 @@ SELECT * FROM vector_search('table_name', 'column_name', 'query_vector_json', li
 |---|---|---|
 | `table_name` | STRING | Table name, fully qualified (`catalog.db.table`) or short form |
 | `column_name` | STRING | The vector column to search |
-| `query_vector_json` | STRING | Query vector as a JSON array of floats |
+| `query_vector_json` | STRING | JSON vector, or a matrix of floats for an embedding-list column |
 | `limit` | INT | Maximum number of results (top-k) |
 
 Example:
@@ -2988,6 +2988,29 @@ search. Automatic cosine and L2 routing can widen the search when necessary.
 Automatic inner-product routing searches all centroids. The layout is stored
 in the index manifest and is available when searching Java-built indexes.
 The current native DiskANN reader supports up to 1,024 dimensions.
+
+### MultiVector MaxSim
+
+On Data Evolution append tables, a range-sharded cosine index can search an
+`ARRAY<VECTOR<FLOAT, d>>` or `ARRAY<ARRAY<FLOAT>>` column. Give the second type an
+explicit embedding dimension when building the index. Each row can contain a
+different number of embeddings. Null elements are ignored, and rows without
+embeddings have no score.
+
+```sql
+SELECT id
+FROM vector_search('paimon.my_db.documents', 'chunks', '[[1.0, 0.0], [0.0, 1.0]]', 10);
+
+CALL sys.vector_search('my_db.documents', 'chunks', '[[1.0, 0.0], [0.0, 1.0]]', 10, 'id');
+```
+
+For each query vector, MaxSim takes the best cosine similarity over a row's
+embeddings and sums the scores across the matrix. ANN retrieves distinct row
+candidates for each query vector and the union is reranked using the full
+embedding lists. The default matrix candidate multiplier is four. A single
+query vector uses its best matching embedding and a default multiplier of
+one. Set `refine_factor` to override the multiplier. The Rust and Python
+single-search builders expose `with_multi_vector` for a query matrix.
 
 ### Scalar Pre-Filters
 

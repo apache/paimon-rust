@@ -286,6 +286,39 @@ def test_single_vector_keyword_matches_stub(table):
     assert builder.execute().row_ids() == _single(table).with_limit(1).execute().row_ids()
 
 
+def test_multi_vector_query_reranks_complete_embedding_lists(tmp_path):
+    ctx = SQLContext()
+    ctx.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    ctx.sql('CREATE SCHEMA paimon.db')
+    ctx.sql("CREATE TABLE paimon.db.chunks (id INT, embeddings FLOAT[][]) "
+            "WITH ('bucket'='-1', 'data-evolution.enabled'='true', "
+            "'row-tracking.enabled'='true', 'global-index.enabled'='true', "
+            "'vector-index.search-mode'='fast')")
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('db.chunks')
+    write = table.new_batch_write_builder()
+    writer = write.new_write()
+    commit = write.new_commit()
+    try:
+        writer.write_arrow(pa.record_batch([
+            pa.array([10, 20, 30], type=pa.int32()),
+            pa.array([[[1, 0], [1, 0]], [[0, 1]], [[1, 1]]],
+                     type=pa.list_(pa.list_(pa.float32()))),
+        ], names=['id', 'embeddings']))
+        commit.commit(writer.prepare_commit())
+    finally:
+        writer.close()
+        commit.close()
+
+    assert (table.new_global_index_build_builder().with_index_column('embeddings')
+            .with_index_type('ivf-flat').with_options({
+                'ivf-flat.dimension': '2', 'ivf-flat.nlist': '1'}).execute()) == 1
+    result = (table.new_vector_search_builder().with_vector_column('embeddings')
+              .with_multi_vector(vectors=[(1, 0), (0, 1)]).with_limit(1).execute())
+    assert list(result.row_ids().values()) == pytest.approx([2 ** 0.5])
+    rows = pa.Table.from_batches(result.new_read_builder().with_projection(['id']).read())
+    assert rows.column('id').to_pylist() == [30]
+
+
 @pytest.mark.parametrize('batch', [False, True])
 def test_raw_options_survive_scan_read_and_use_raw_metric_options(table, batch):
     import pickle

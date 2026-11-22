@@ -16,7 +16,7 @@
 // under the License.
 
 //! Shared sparse-vector spill, training, and native serialization.
-use super::vector_extraction::{local_ids, validate_vector_batch};
+use super::vector_extraction::{local_ids, validate_multi_vector_batch, validate_vector_batch};
 use super::vector_validation::{
     checked_std_vector_bytes, checked_training_sample_index, checked_training_vector_count,
     checked_vector_bytes,
@@ -44,6 +44,7 @@ pub(in crate::table) struct VectorSpill {
     ids: tokio::fs::File,
     range: RowRange,
     dimension: usize,
+    multi_vector: bool,
     next_id: i64,
     rows: usize,
     vectors: usize,
@@ -66,11 +67,17 @@ impl VectorSpill {
             next_id: range.from(),
             range,
             dimension,
+            multi_vector: false,
             rows: 0,
             vectors: 0,
             bytes: 0,
         })
     }
+    pub fn with_multi_vector(mut self, multi_vector: bool) -> Self {
+        self.multi_vector = multi_vector;
+        self
+    }
+
     pub fn bytes_written(&self) -> usize {
         self.bytes
     }
@@ -81,7 +88,11 @@ impl VectorSpill {
         column: &str,
         timing_enabled: bool,
     ) -> Result<Duration> {
-        let vectors = validate_vector_batch(batch, column, self.dimension, &mut self.next_id)?;
+        let vectors = if self.multi_vector {
+            validate_multi_vector_batch(batch, column, self.dimension, &mut self.next_id)?
+        } else {
+            validate_vector_batch(batch, column, self.dimension, &mut self.next_id)?
+        };
         self.rows =
             self.rows
                 .checked_add(vectors.source_rows)

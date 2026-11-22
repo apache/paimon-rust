@@ -41,7 +41,7 @@ pub(super) fn field_options(
 
 pub(super) fn definitions(schema: &TableSchema) -> Result<Vec<Definition>> {
     let options = schema.options();
-    let owners = crate::table::global_index_options::declarations(options)?
+    let owners = crate::table::global_index_options::declarations(schema)?
         .into_iter()
         .map(|definition| (definition.column.clone(), definition))
         .collect::<HashMap<_, _>>();

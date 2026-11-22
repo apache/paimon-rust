@@ -83,11 +83,13 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             &procedure,
             column,
         );
+        let multi_vector = crate::vindex::multi_vector::embedding_type(field.data_type()).is_some();
         let defaults = super::global_index_options::declared_options(
             &effective,
             column,
             "vector",
             &self.index_type,
+            !multi_vector,
         )?;
         let user =
             super::global_index_options::build_options(&procedure, column, &self.index_type)?;
@@ -98,6 +100,18 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             &self.index_type,
             column,
         )?;
+        if multi_vector {
+            if !self.table.schema().core_options().data_evolution_enabled() {
+                return Err(crate::vindex::multi_vector::invalid(
+                    "MultiVector indexes require a Data Evolution table",
+                ));
+            }
+            if centroid.is_some() {
+                return Err(crate::vindex::multi_vector::invalid(
+                    "MultiVector indexes require range sharding",
+                ));
+            }
+        }
         let mut native_defaults = defaults.clone();
         let mut native_user = crate::vindex::build_parameters(&user, &self.index_type, column);
         for options in [&mut native_defaults, &mut native_user] {
