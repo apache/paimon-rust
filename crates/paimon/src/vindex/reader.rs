@@ -282,6 +282,14 @@ impl VindexVectorGlobalIndexReader {
         self.ensure_loaded(stream_fn, |_| Ok(()))
     }
 
+    pub(crate) fn load_validated<S: SeekRead + 'static>(
+        &mut self,
+        stream_fn: impl FnOnce(&str) -> crate::Result<S>,
+        validate: impl FnOnce(&VectorIndexMetadata) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        self.ensure_loaded(stream_fn, validate)
+    }
+
     pub fn metadata(&self) -> crate::Result<&VectorIndexMetadata> {
         self.metadata
             .as_ref()
