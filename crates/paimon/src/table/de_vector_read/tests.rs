@@ -2228,10 +2228,16 @@ async fn scheduled_raw_vector_merges_bounded_windows_without_losing_late_winners
         batch_sizes: std::sync::Mutex::new(Vec::new()),
         ordinal: std::sync::atomic::AtomicUsize::new(0),
     };
-    let results =
-        execute_raw_vector_tasks(&table, &splits, &queries, RawVectorMetric::L2, &executor)
-            .await
-            .unwrap();
+    let results = execute_raw_vector_tasks(
+        &table,
+        &splits,
+        &queries,
+        RawVectorMetric::L2,
+        &executor,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         *executor.batch_sizes.lock().unwrap(),
         vec![

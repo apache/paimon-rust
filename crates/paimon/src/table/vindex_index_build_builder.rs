@@ -98,6 +98,18 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             &self.index_type,
             column,
         )?;
+        if crate::vindex::multi_vector::embedding_type(field.data_type()).is_some() {
+            if !self.table.schema().core_options().data_evolution_enabled() {
+                return Err(crate::vindex::multi_vector::invalid(
+                    "MultiVector indexes require a Data Evolution table",
+                ));
+            }
+            if centroid.is_some() {
+                return Err(crate::vindex::multi_vector::invalid(
+                    "MultiVector indexes require range sharding",
+                ));
+            }
+        }
         let mut native_defaults = defaults.clone();
         let mut native_user = crate::vindex::build_parameters(&user, &self.index_type, column);
         for options in [&mut native_defaults, &mut native_user] {

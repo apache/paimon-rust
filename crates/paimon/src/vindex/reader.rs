@@ -163,6 +163,7 @@ pub struct VindexVectorGlobalIndexReader {
     io_meta: GlobalIndexIOMeta,
     options: HashMap<String, String>,
     batch_index_parallelism: usize,
+    list_row_count: Option<u64>,
     reader: Option<VIndexReader<VindexInput>>,
     metadata: Option<VectorIndexMetadata>,
     timing_enabled: bool,
@@ -176,6 +177,7 @@ impl VindexVectorGlobalIndexReader {
             io_meta,
             options,
             batch_index_parallelism: 1,
+            list_row_count: None,
             reader: None,
             metadata: None,
             timing_enabled: vector_search_timing_enabled(),
@@ -186,6 +188,11 @@ impl VindexVectorGlobalIndexReader {
 
     pub(crate) fn with_batch_index_parallelism(mut self, parallelism: usize) -> Self {
         self.batch_index_parallelism = parallelism.max(1);
+        self
+    }
+
+    pub(crate) fn with_list_row_count(mut self, row_count: Option<u64>) -> Self {
+        self.list_row_count = row_count;
         self
     }
 
@@ -302,6 +309,19 @@ impl VindexVectorGlobalIndexReader {
                 message: "vindex metadata not initialized".to_string(),
                 source: None,
             })?;
+        if let Some(row_count) = self.list_row_count {
+            if metadata.metric != MetricType::Cosine {
+                return Err(super::multi_vector::invalid(
+                    "MultiVector indexes require cosine similarity",
+                ));
+            }
+            return vector_searches
+                .iter()
+                .map(|query| {
+                    search_distinct_rows(reader, metadata, &self.options, query, row_count)
+                })
+                .collect();
+        }
         let (results, batch_stats) = search_batch_vindex(
             reader,
             metadata,
@@ -598,6 +618,101 @@ fn execute_scalar_search(
                 })
         }
     }
+}
+
+/// The native Top-K counts embeddings. Page through unseen row labels so
+/// several hits from one document cannot consume its neighbors' candidate slots.
+fn search_distinct_rows(
+    reader: &mut VIndexReader<impl SeekRead>,
+    metadata: &VectorIndexMetadata,
+    options: &HashMap<String, String>,
+    query: &VectorSearch,
+    row_count: u64,
+) -> crate::Result<Option<HashMap<u64, f32>>> {
+    let Some(mut prepared) = prepare_search_with_shared_filter(metadata, options, query, None)?
+    else {
+        return Ok(None);
+    };
+    super::multi_vector::validate_queries(&[&query.vector], Some(metadata.dimension))?;
+    let limit = prepared.params.top_k;
+    let vectors = usize::try_from(metadata.total_vectors).unwrap_or(0);
+    let mut normalized = Vec::with_capacity(query.vector.len());
+    super::multi_vector::normalize_into(&query.vector, &mut normalized);
+    let query = VectorSearch {
+        vector: normalized,
+        ..query.clone()
+    };
+    let mut scores = HashMap::<u64, f32>::new();
+    let mut remaining = query.effective_include_row_ids().cloned();
+    let mut requested = limit;
+    loop {
+        prepared.params.top_k = requested;
+        let expected = remaining
+            .as_ref()
+            .map_or(requested, |ids| requested.min(ids.len() as usize));
+        let (ids, distances) = execute_scalar_search(reader, &query, &prepared)?;
+        let previous_count = scores.len();
+        let mut hits = 0;
+        for (id, distance) in ids.into_iter().zip(distances) {
+            if id >= 0 {
+                let id = id as u64;
+                if id >= row_count {
+                    return Err(super::multi_vector::invalid(
+                        "MultiVector index label is outside its row range",
+                    ));
+                }
+                let score = 1.0 - distance;
+                scores
+                    .entry(id)
+                    .and_modify(|previous| *previous = previous.max(score))
+                    .or_insert(score);
+                if let Some(remaining) = &mut remaining {
+                    remaining.remove(id);
+                }
+                hits += 1;
+            }
+        }
+
+        if scores.len() >= limit || hits < expected || hits == vectors {
+            break;
+        }
+
+        if remaining.is_none() {
+            if row_count >> 16 > vectors as u64 {
+                // A filter spanning an exceptionally sparse range can cost
+                // more than widening the native search itself.
+                let next = requested
+                    .saturating_mul(2)
+                    .min(vectors)
+                    .min(i32::MAX as usize);
+                if next == requested {
+                    break;
+                }
+                requested = next;
+                continue;
+            }
+            let mut ids = roaring::RoaringTreemap::new();
+            ids.insert_range(0..row_count);
+            for &id in scores.keys() {
+                ids.remove(id);
+            }
+            remaining = Some(ids);
+        }
+        let remaining = remaining.as_ref().expect("remaining rows initialized");
+        let added = scores.len() - previous_count;
+        let missing = (limit - scores.len()).min(remaining.len() as usize);
+        if added == 0 || missing == 0 {
+            break;
+        }
+        const MAX_RETRY_HITS: usize = 16_384;
+        requested = (missing as u128 * hits as u128)
+            .div_ceil(added as u128)
+            .min(requested.saturating_mul(2) as u128)
+            .min(vectors.min(limit.max(MAX_RETRY_HITS)) as u128) as usize;
+        prepared.filter_bytes = Some(serialize_row_id_filter(remaining)?);
+    }
+    let top = crate::vector_search::ScoredRowIds::from_scored_map(scores).top_k(limit);
+    Ok((!top.row_ids.is_empty()).then(|| top.row_ids.into_iter().zip(top.scores).collect()))
 }
 
 fn search_batch_vindex(

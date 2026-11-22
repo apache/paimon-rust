@@ -69,11 +69,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod centroid;
+mod multi_vector;
 mod post_filter;
+use multi_vector::{ListScorer, ListScoring};
 
 /// Owns the queries and executes the snapshot-scoped plan from `DeVectorScan`.
 pub(super) struct DeVectorRead {
     vector_searches: Vec<VectorSearch>,
+    max_sim: bool,
 }
 
 impl DeVectorRead {
@@ -102,7 +105,15 @@ impl DeVectorRead {
                     .map(|search| search.with_options(options.clone()))
             })
             .collect::<crate::Result<_>>()?;
-        Ok(Self { vector_searches })
+        Ok(Self {
+            vector_searches,
+            max_sim: false,
+        })
+    }
+
+    pub(super) fn with_max_sim(mut self) -> Self {
+        self.max_sim = true;
+        self
     }
 
     /// Validate a result read, including projections over an empty result.
@@ -134,7 +145,9 @@ impl DeVectorRead {
             DataType::Array(t) => matches!(t.element_type(), DataType::Float(_)),
             _ => false,
         };
-        if !is_float_vector {
+        if !is_float_vector
+            && crate::vindex::multi_vector::embedding_type(field.data_type()).is_none()
+        {
             return Err(crate::Error::DataInvalid {
                 message: format!(
                     "vector search column '{vector_column}' must be a FLOAT vector column \
@@ -241,7 +254,14 @@ impl DeVectorRead {
         };
         let evaluate_start = (timing_enabled && !skip_search).then(Instant::now);
         let results = if skip_search {
-            vec![ScoredRowIds::empty(); self.vector_searches.len()]
+            vec![
+                ScoredRowIds::empty();
+                if self.max_sim {
+                    1
+                } else {
+                    self.vector_searches.len()
+                }
+            ]
         } else {
             let mut vector_searches = Cow::Borrowed(self.vector_searches.as_slice());
             if let Some(include_row_ids) = include_row_ids {
@@ -263,6 +283,7 @@ impl DeVectorRead {
                 &vector_searches,
                 executor,
                 source_splits.as_deref(),
+                self.max_sim,
             )
             .await?
         };
@@ -318,6 +339,23 @@ async fn execute_vector_file_work(
             "Unsupported vector task index",
         ));
     }
+    let list_row_count = evaluation
+        .schema_fields
+        .iter()
+        .find(|field| field.id() == global_meta.index_field_id)
+        .and_then(|field| crate::vindex::multi_vector::embedding_type(field.data_type()))
+        .map(|_| {
+            global_meta
+                .row_range_end
+                .checked_sub(global_meta.row_range_start)
+                .and_then(|count| count.checked_add(1))
+                .filter(|&count| count > 0 && global_meta.row_range_start >= 0)
+                .map(|count| count as u64)
+                .ok_or_else(|| {
+                    crate::vindex::multi_vector::invalid("Invalid MultiVector source row range")
+                })
+        })
+        .transpose()?;
     let table_path = evaluation.table_path.trim_end_matches('/');
     let path = IndexFileLocation::Global { table_path }.resolve(
         &work.entry.index_file.file_name,
@@ -440,6 +478,7 @@ async fn execute_vector_file_work(
                 file_name.clone(),
                 VectorIndexSearchContext {
                     parallelism: batch_index_parallelism,
+                    list_row_count,
                     metrics: metric_check,
                     post_filter,
                 },
@@ -468,6 +507,7 @@ async fn execute_vector_file_work(
                 file_name.clone(),
                 VectorIndexSearchContext {
                     parallelism: batch_index_parallelism,
+                    list_row_count,
                     metrics: metric_check,
                     post_filter,
                 },
@@ -562,7 +602,8 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
     };
     execute_global_index_with_guard(panic_context, guard, move || {
         let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options)
-            .with_batch_index_parallelism(context.parallelism);
+            .with_batch_index_parallelism(context.parallelism)
+            .with_list_row_count(context.list_row_count);
         reader
             .visit_batch_vector_search_validated(
                 &vector_searches,
@@ -594,7 +635,8 @@ async fn execute_post_filter_vindex_searches<S: SeekRead + 'static, G: Send + 's
         post_filter::batch_size(vector_searches.iter().map(|q| q.limit).max().unwrap_or(1));
     let mut queries = vector_searches.into_iter().zip(filter.targets);
     let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options)
-        .with_batch_index_parallelism(context.parallelism);
+        .with_batch_index_parallelism(context.parallelism)
+        .with_list_row_count(context.list_row_count);
     let mut source = Some(source);
     let mut first_guard = Some(guard);
     let mut results = Vec::new();
@@ -713,6 +755,7 @@ impl VectorMetricCheck {
 
 struct VectorIndexSearchContext {
     parallelism: usize,
+    list_row_count: Option<u64>,
     metrics: VectorMetricCheck,
     post_filter: Option<VectorIndexPostFilter>,
 }
@@ -863,6 +906,7 @@ async fn evaluate_batch_vector_search(
         vector_searches,
         None,
         None,
+        false,
     )
     .await
 }
@@ -873,6 +917,7 @@ async fn evaluate_batch_vector_search_with_executor(
     vector_searches: &[VectorSearch],
     executor: Option<&dyn SearchTaskExecutor>,
     sources: Option<&[crate::table::SearchScanSplit]>,
+    max_sim: bool,
 ) -> crate::Result<Vec<ScoredRowIds>> {
     let timing_enabled = vector_search_timing_enabled();
     let total_start = timing_enabled.then(Instant::now);
@@ -911,10 +956,22 @@ async fn evaluate_batch_vector_search_with_executor(
     let effective_core = CoreOptions::new(&effective_options);
     let search_mode = effective_core.vector_index_search_mode()?;
 
-    let field_id = match find_field_id_by_name(evaluation.schema_fields, field_name) {
-        Some(id) => id,
-        None => return Ok(vec![ScoredRowIds::empty(); vector_searches.len()]),
+    let result_count = if max_sim { 1 } else { vector_searches.len() };
+    let Some(field) = evaluation
+        .schema_fields
+        .iter()
+        .find(|field| field.name() == field_name)
+    else {
+        return Ok(vec![ScoredRowIds::empty(); result_count]);
     };
+    let field_id = field.id();
+    let list_scoring = crate::vindex::multi_vector::embedding_type(field.data_type()).map(|_| {
+        if max_sim {
+            ListScoring::MaxSim
+        } else {
+            ListScoring::Independent
+        }
+    });
     validate_global_vector_index_types(index_entries, field_id, field_name)?;
 
     let vector_entries: Vec<_> = index_entries
@@ -931,7 +988,7 @@ async fn evaluate_batch_vector_search_with_executor(
 
     if sources.is_none() && vector_entries.is_empty() && search_mode == GlobalIndexSearchMode::Fast
     {
-        return Ok(vec![ScoredRowIds::empty(); vector_searches.len()]);
+        return Ok(vec![ScoredRowIds::empty(); result_count]);
     }
 
     let (vector_search_entries, mut centroid_files) = centroid::plan(&vector_entries)?;
@@ -1078,7 +1135,7 @@ async fn evaluate_batch_vector_search_with_executor(
         .map(|vector_search| vector_search.limit)
         .max()
         .unwrap_or(0);
-    let refine_factor = match vector_search_entries.first() {
+    let mut refine_factor = match vector_search_entries.first() {
         Some(entry) => super::vector_search_common::resolved_refine_factor(
             &configuration.query_options,
             &configuration.resolved.options,
@@ -1087,6 +1144,9 @@ async fn evaluate_batch_vector_search_with_executor(
         )?,
         None => 0,
     };
+    if refine_factor == 0 && list_scoring.is_some() {
+        refine_factor = if max_sim { 4 } else { 1 };
+    }
     let index_search_limit = indexed_search_limit(max_limit, refine_factor)?;
 
     let vector_entry_count = vector_search_entries.len();
@@ -1124,13 +1184,20 @@ async fn evaluate_batch_vector_search_with_executor(
             .map(|entry| (entry, None))
             .collect::<Vec<_>>()
     };
+    let requested_metric =
+        resolved_vector_metric_override(&configuration.query_options, field_name, index_type)?;
+    if list_scoring.is_some()
+        && requested_metric.is_some_and(|metric| metric != RawVectorMetric::Cosine)
+    {
+        return Err(crate::vindex::multi_vector::invalid(
+            "MultiVector searches require cosine similarity",
+        ));
+    }
     let metric_check = VectorMetricCheck {
         persisted: Arc::new(std::sync::Mutex::new(None)),
-        requested: resolved_vector_metric_override(
-            &configuration.query_options,
-            field_name,
-            index_type,
-        )?,
+        requested: list_scoring
+            .map(|_| RawVectorMetric::Cosine)
+            .or(requested_metric),
     };
     let mut permit_wait = Duration::ZERO;
     let mut file_reader_open = Duration::ZERO;
@@ -1248,6 +1315,8 @@ async fn evaluate_batch_vector_search_with_executor(
                             // ignoring an unfamiliar predicate payload.
                             if !work.centroid_files.is_empty() {
                                 "vector-index-centroid"
+                            } else if list_scoring.is_some() {
+                                "vector-index-multivector"
                             } else if work.filter.is_some() {
                                 "vector-index-filtered"
                             } else {
@@ -1307,7 +1376,16 @@ async fn evaluate_batch_vector_search_with_executor(
         merge = merge_start.map_or(Duration::ZERO, |start| start.elapsed());
     }
 
-    if refine_factor != 0 {
+    if let Some(mode) = list_scoring {
+        let refine_start = timing_enabled.then(Instant::now);
+        let candidates = merged
+            .into_iter()
+            .map(|result| result.without_deleted_row_ranges(deleted_row_index.as_ref()))
+            .collect::<crate::Result<Vec<_>>>()?;
+        merged =
+            rerank_list_candidates(evaluation, vector_searches, mode, candidates, executor).await?;
+        refine = refine_start.map_or(Duration::ZERO, |start| start.elapsed());
+    } else if refine_factor != 0 {
         let refine_start = timing_enabled.then(Instant::now);
         if let Some(deleted) = deleted_row_index.as_ref() {
             for result in &mut merged {
@@ -1394,25 +1472,30 @@ async fn evaluate_batch_vector_search_with_executor(
                 source: None,
             })?;
             let metric_start = timing_enabled.then(Instant::now);
-            let metric = resolve_raw_vector_metric_resolved(
-                evaluation.file_io,
-                table_path,
-                evaluation.table_options,
-                &configuration,
-                index_entries,
-                field_id,
-                field_name,
-            )
-            .await?;
+            let metric = if list_scoring.is_some() {
+                RawVectorMetric::Cosine
+            } else {
+                resolve_raw_vector_metric_resolved(
+                    evaluation.file_io,
+                    table_path,
+                    evaluation.table_options,
+                    &configuration,
+                    index_entries,
+                    field_id,
+                    field_name,
+                )
+                .await?
+            };
             let metric_resolve = metric_start.map_or(Duration::ZERO, |start| start.elapsed());
             metric_check.check(metric)?;
-            let (raw_results, raw_timing) = read_raw_batch_vector_search_with_executor(
+            let (raw_results, raw_timing) = read_raw_vector_scores(
                 table,
                 vector_searches,
                 &raw_ranges,
                 metric,
                 evaluation.filter,
                 executor,
+                list_scoring,
             )
             .await?;
             if let Some(raw_timing) = raw_timing {
@@ -1677,6 +1760,49 @@ fn attach_scores_by_row_id(
         source: None,
     })?;
     Ok(vec![out])
+}
+
+async fn rerank_list_candidates(
+    evaluation: VectorSearchEvaluation<'_>,
+    searches: &[VectorSearch],
+    mode: ListScoring,
+    candidates: Vec<ScoredRowIds>,
+    executor: Option<&dyn SearchTaskExecutor>,
+) -> crate::Result<Vec<ScoredRowIds>> {
+    let union: RoaringTreemap = candidates
+        .iter()
+        .flat_map(|hits| hits.row_ids.iter().copied())
+        .collect();
+    if union.is_empty() {
+        return Ok(vec![
+            ScoredRowIds::empty();
+            mode.result_count(searches.len())
+        ]);
+    }
+    let ranges = sorted_row_ids_to_row_ranges(union.iter())?;
+    let table = evaluation.table.ok_or_else(|| {
+        crate::vindex::multi_vector::invalid("MultiVector reranking requires table context")
+    })?;
+    let mut searches = searches.to_vec();
+    let union = Arc::new(union);
+    for (search, hits) in searches.iter_mut().zip(candidates) {
+        let include = match mode {
+            ListScoring::MaxSim => Arc::clone(&union),
+            ListScoring::Independent => Arc::new(hits.row_ids.into_iter().collect()),
+        };
+        search.set_shared_include_row_ids(include);
+    }
+    let (results, _) = read_raw_vector_scores(
+        table,
+        &searches,
+        &ranges,
+        RawVectorMetric::Cosine,
+        None,
+        executor,
+        Some(mode),
+    )
+    .await?;
+    Ok(results)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2168,9 +2294,13 @@ async fn execute_raw_vector_tasks(
     vector_searches: &[VectorSearch],
     metric: RawVectorMetric,
     executor: &dyn SearchTaskExecutor,
+    list_scoring: Option<ListScoring>,
 ) -> crate::Result<Vec<ScoredRowIds>> {
     let queries = TaskVectorQueries::capture(vector_searches)?;
-    let mut merged = vec![ScoredRowIds::empty(); vector_searches.len()];
+    let result_count = list_scoring.map_or(vector_searches.len(), |mode| {
+        mode.result_count(vector_searches.len())
+    });
+    let mut merged = vec![ScoredRowIds::empty(); result_count];
     for window in splits.chunks(SEARCH_TASK_WINDOW) {
         let tasks = window
             .iter()
@@ -2179,10 +2309,15 @@ async fn execute_raw_vector_tasks(
                     splits: vec![split.clone()],
                     queries: queries.clone(),
                     metric,
+                    list_scoring,
                 };
                 SearchTask::new(
                     table,
-                    "vector-rows",
+                    if list_scoring.is_some() {
+                        "vector-list-rows"
+                    } else {
+                        "vector-rows"
+                    },
                     serde_json::to_value(work)
                         .map_err(|error| crate::table::search_task::invalid(error.to_string()))?,
                 )
@@ -2213,17 +2348,41 @@ async fn read_raw_batch_vector_search_with_executor(
     filter: Option<&Predicate>,
     executor: Option<&dyn SearchTaskExecutor>,
 ) -> crate::Result<(Vec<ScoredRowIds>, Option<RawVectorReadTiming>)> {
+    read_raw_vector_scores(
+        table,
+        vector_searches,
+        raw_ranges,
+        metric,
+        filter,
+        executor,
+        None,
+    )
+    .await
+}
+
+async fn read_raw_vector_scores(
+    table: &Table,
+    vector_searches: &[VectorSearch],
+    raw_ranges: &[RowRange],
+    metric: RawVectorMetric,
+    filter: Option<&Predicate>,
+    executor: Option<&dyn SearchTaskExecutor>,
+    list_scoring: Option<ListScoring>,
+) -> crate::Result<(Vec<ScoredRowIds>, Option<RawVectorReadTiming>)> {
+    let result_count = list_scoring.map_or(vector_searches.len(), |mode| {
+        mode.result_count(vector_searches.len())
+    });
     let timing_enabled = vector_search_timing_enabled();
     let total_start = timing_enabled.then(Instant::now);
     if vector_searches.is_empty() {
         return Ok((Vec::new(), None));
     }
     if raw_ranges.is_empty() {
-        return Ok((vec![ScoredRowIds::empty(); vector_searches.len()], None));
+        return Ok((vec![ScoredRowIds::empty(); result_count], None));
     }
     let raw_ranges = prune_raw_ranges_by_include_row_ids(raw_ranges, vector_searches)?;
     if raw_ranges.is_empty() {
-        return Ok((vec![ScoredRowIds::empty(); vector_searches.len()], None));
+        return Ok((vec![ScoredRowIds::empty(); result_count], None));
     }
 
     let field_name = &vector_searches[0].field_name;
@@ -2256,7 +2415,7 @@ async fn read_raw_batch_vector_search_with_executor(
         .sum();
     if plan.splits().is_empty() {
         return Ok((
-            vec![ScoredRowIds::empty(); vector_searches.len()],
+            vec![ScoredRowIds::empty(); result_count],
             total_start.map(|start| RawVectorReadTiming {
                 plan: plan_elapsed,
                 total: start.elapsed(),
@@ -2285,16 +2444,24 @@ async fn read_raw_batch_vector_search_with_executor(
                 search.set_shared_include_row_ids(eligible);
             }
         }
-        let merged =
-            execute_raw_vector_tasks(table, plan.splits(), &searches, metric, executor).await?;
+        let merged = execute_raw_vector_tasks(
+            table,
+            plan.splits(),
+            &searches,
+            metric,
+            executor,
+            list_scoring,
+        )
+        .await?;
         return Ok((merged, None));
     }
     let read = read_builder.new_read()?;
     let mut stream = read.to_arrow(plan.splits())?;
 
-    let scoring_plan = RawScoringPlan::new(vector_searches, metric);
+    let scoring_plan = RawBatchScoring::new(vector_searches, metric, list_scoring)?;
     let mut top_k = vector_searches
         .iter()
+        .take(result_count)
         .map(|vector_search| RawScoreTopK::new(vector_search.limit))
         .collect::<Vec<_>>();
     let mut timing = timing_enabled.then(|| RawVectorReadTiming {
@@ -2319,7 +2486,7 @@ async fn read_raw_batch_vector_search_with_executor(
             timing.row_count = timing.row_count.saturating_add(batch.num_rows());
         }
         let score_start = timing_enabled.then(Instant::now);
-        collect_raw_batch_vector_batch(&batch, vector_searches, metric, &scoring_plan, &mut top_k)?;
+        scoring_plan.collect(&batch, vector_searches, metric, &mut top_k)?;
         if let (Some(timing), Some(score_start)) = (&mut timing, score_start) {
             timing.score_cpu = timing.score_cpu.saturating_add(score_start.elapsed());
         }
@@ -2335,6 +2502,39 @@ async fn read_raw_batch_vector_search_with_executor(
             .collect(),
         timing,
     ))
+}
+
+enum RawBatchScoring {
+    Vector(RawScoringPlan),
+    List(ListScorer),
+}
+
+impl RawBatchScoring {
+    fn new(
+        searches: &[VectorSearch],
+        metric: RawVectorMetric,
+        list_scoring: Option<ListScoring>,
+    ) -> crate::Result<Self> {
+        match list_scoring {
+            Some(mode) => Ok(Self::List(ListScorer::new(mode, searches)?)),
+            None => Ok(Self::Vector(RawScoringPlan::new(searches, metric))),
+        }
+    }
+
+    fn collect(
+        &self,
+        batch: &RecordBatch,
+        searches: &[VectorSearch],
+        metric: RawVectorMetric,
+        top_k: &mut [RawScoreTopK],
+    ) -> crate::Result<()> {
+        match self {
+            Self::Vector(plan) => {
+                collect_raw_batch_vector_batch(batch, searches, metric, plan, top_k)
+            }
+            Self::List(scorer) => scorer.collect(batch, searches, top_k),
+        }
+    }
 }
 
 struct RawScoringPlan {
@@ -3073,6 +3273,8 @@ struct VectorRowsTask {
     splits: Vec<crate::table::DataSplit>,
     queries: TaskVectorQueries,
     metric: RawVectorMetric,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    list_scoring: Option<ListScoring>,
 }
 #[derive(Serialize, Deserialize)]
 struct TaskScoredRows {
@@ -3123,7 +3325,10 @@ pub(super) async fn execute_search_task(
     payload: &serde_json::Value,
 ) -> crate::Result<serde_json::Value> {
     let scores = match kind {
-        "vector-index" | "vector-index-filtered" | "vector-index-centroid" => {
+        "vector-index"
+        | "vector-index-filtered"
+        | "vector-index-centroid"
+        | "vector-index-multivector" => {
             let work: VectorIndexTask = serde_json::from_value(payload.clone())
                 .map_err(|error| crate::table::search_task::invalid(error.to_string()))?;
             if kind == "vector-index-filtered" && work.filter.is_none() {
@@ -3173,7 +3378,7 @@ pub(super) async fn execute_search_task(
                 .map_err(|_| crate::table::search_task::invalid("Vector metric lock poisoned"))?;
             VectorTaskScores::capture(results, metric)
         }
-        "vector-rows" => {
+        "vector-rows" | "vector-list-rows" => {
             let work: VectorRowsTask = serde_json::from_value(payload.clone())
                 .map_err(|error| crate::table::search_task::invalid(error.to_string()))?;
             let searches = work.queries.restore()?;
@@ -3186,19 +3391,22 @@ pub(super) async fn execute_search_task(
             builder.with_projection(&[searches[0].field_name.as_str(), ROW_ID_FIELD_NAME])?;
             let read = builder.new_read()?;
             let mut stream = read.to_arrow(&work.splits)?;
-            let scoring = RawScoringPlan::new(&searches, work.metric);
+            if (kind == "vector-list-rows") != work.list_scoring.is_some() {
+                return Err(crate::table::search_task::invalid(
+                    "Invalid MultiVector scoring task",
+                ));
+            }
+            let scoring = RawBatchScoring::new(&searches, work.metric, work.list_scoring)?;
+            let result_count = work
+                .list_scoring
+                .map_or(searches.len(), |mode| mode.result_count(searches.len()));
             let mut top_k = searches
                 .iter()
+                .take(result_count)
                 .map(|search| RawScoreTopK::new(search.limit))
                 .collect::<Vec<_>>();
             while let Some(batch) = stream.try_next().await? {
-                collect_raw_batch_vector_batch(
-                    &batch,
-                    &searches,
-                    work.metric,
-                    &scoring,
-                    &mut top_k,
-                )?;
+                scoring.collect(&batch, &searches, work.metric, &mut top_k)?;
             }
             VectorTaskScores::capture(
                 top_k

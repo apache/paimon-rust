@@ -118,6 +118,13 @@ impl VectorSearchFunction {
     }
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+enum VectorQuery {
+    Single(Vec<f32>),
+    Matrix(Vec<Vec<f32>>),
+}
+
 impl TableFunctionImpl for VectorSearchFunction {
     fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
         if args.len() != 4 {
@@ -172,14 +179,14 @@ impl TableFunctionImpl for VectorSearchFunction {
                 Err(err) => return Err(err),
             };
 
-        let query_vector: Vec<f32> = serde_json::from_str(&query_vector_json).map_err(|e| {
+        let query_vector: VectorQuery = serde_json::from_str(&query_vector_json).map_err(|e| {
             DataFusionError::Plan(format!(
-                "vector_search: query_vector_json must be a JSON array of floats, got '{}': {}",
+                "vector_search: query_vector_json must be a JSON vector or matrix of floats, got '{}': {}",
                 query_vector_json, e
             ))
         })?;
 
-        if query_vector.is_empty() {
+        if matches!(&query_vector, VectorQuery::Single(vector) if vector.is_empty()) {
             return Err(DataFusionError::Plan(
                 "vector_search: query vector cannot be empty".to_string(),
             ));
@@ -247,7 +254,7 @@ impl TableProvider for LateralVectorSearchTableProvider {
 struct VectorSearchTableProvider {
     inner: PaimonTableProvider,
     column_name: String,
-    query_vector: Vec<f32>,
+    query_vector: VectorQuery,
     limit: usize,
 }
 
@@ -332,7 +339,7 @@ impl TableProvider for VectorSearchTableProvider {
 struct VectorSearchExec {
     table: Table,
     column_name: String,
-    query_vector: Vec<f32>,
+    query_vector: VectorQuery,
     /// The table function's own top-k — drives the ANN search width; never reduced.
     search_limit: usize,
     /// The outer DataFusion `LIMIT`, applied by truncating the ranked result.
@@ -347,7 +354,7 @@ impl VectorSearchExec {
     fn new(
         table: Table,
         column_name: String,
-        query_vector: Vec<f32>,
+        query_vector: VectorQuery,
         search_limit: usize,
         output_limit: Option<usize>,
         projection: Option<Vec<usize>>,
@@ -387,17 +394,21 @@ impl VectorSearchExec {
         // recall is unchanged (data-evolution / global-index path; PK-vector tables are
         // unsupported here, as before).
         let mut search_result = await_with_runtime(async {
-            let mut builder = search_table.new_batch_vector_search_builder();
+            let mut builder = search_table.new_vector_search_builder();
             builder
                 .with_vector_column(&self.column_name)
-                .with_query_vectors(vec![self.query_vector.clone()])
                 .with_limit(self.search_limit);
+            match &self.query_vector {
+                VectorQuery::Single(vector) => builder.with_query_vector(vector.clone()),
+                VectorQuery::Matrix(vectors) => builder.with_multi_vector(vectors.clone()),
+            };
             if let Some(filter) = &self.filter {
                 builder.with_filter(filter.clone());
             }
-            let mut results = builder.execute().await.map_err(to_datafusion_error)?;
-            results
-                .remove(0)
+            builder
+                .execute()
+                .await
+                .map_err(to_datafusion_error)?
                 .into_row_ids()
                 .map_err(to_datafusion_error)
         })
@@ -668,7 +679,7 @@ mod tests {
         let exec = VectorSearchExec::new(
             table,
             "embedding".into(),
-            vec![1.0],
+            VectorQuery::Single(vec![1.0]),
             1,
             None,
             None,

@@ -94,12 +94,30 @@ impl BatchVectorRead {
                 table, options, filter, &pk_col, queries, limit,
             )))
         } else {
+            validate_list_queries(table, column, queries, false)?;
             VectorReadKind::DataEvolution(DeVectorRead::new(column, queries, limit, options)?)
         };
         Ok(Self {
             context,
             table: table.clone(),
             reader,
+        })
+    }
+
+    pub(super) fn new_max_sim(
+        table: &Table,
+        column: &str,
+        queries: &[&[f32]],
+        limit: usize,
+        options: &HashMap<String, String>,
+        context: PlanContext,
+    ) -> crate::Result<Self> {
+        validate_list_queries(table, column, queries, true)?;
+        let reader = DeVectorRead::new(column, queries, limit, options)?.with_max_sim();
+        Ok(Self {
+            context,
+            table: table.clone(),
+            reader: VectorReadKind::DataEvolution(reader),
         })
     }
 
@@ -186,5 +204,44 @@ impl BatchVectorRead {
                     .await
             }
         }
+    }
+}
+
+fn validate_list_queries(
+    table: &Table,
+    column: &str,
+    queries: &[&[f32]],
+    matrix: bool,
+) -> crate::Result<()> {
+    use crate::vindex::multi_vector::{embedding_type, invalid, validate_queries};
+    let list = table
+        .schema()
+        .fields()
+        .iter()
+        .find(|field| field.name() == column)
+        .and_then(|field| embedding_type(field.data_type()));
+    if let Some(inner) = list {
+        let schema = table.schema();
+        if !schema.core_options().data_evolution_enabled() || !schema.primary_keys().is_empty() {
+            return Err(invalid(
+                "MultiVector search requires a Data Evolution append table",
+            ));
+        }
+        let width = match inner {
+            crate::spec::DataType::Vector(v) => Some(v.length() as usize),
+            _ => None,
+        };
+        if matrix {
+            validate_queries(queries, width)
+        } else {
+            for query in queries {
+                validate_queries(&[query], width)?;
+            }
+            Ok(())
+        }
+    } else if matrix {
+        Err(invalid("MaxSim queries require an embedding-list column"))
+    } else {
+        Ok(())
     }
 }

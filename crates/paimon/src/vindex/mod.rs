@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod executor;
+pub(crate) mod multi_vector;
 pub(crate) mod range_reader;
 pub mod reader;
 
@@ -113,6 +114,7 @@ pub(crate) struct VindexVectorIndexOptions {
     pub native_options: HashMap<String, String>,
     pub train_sample_ratio: f64,
     pub granule_build_enabled: bool,
+    pub(crate) multi_vector: bool,
 }
 
 impl VindexVectorIndexOptions {
@@ -138,6 +140,7 @@ impl VindexVectorIndexOptions {
         index_type: &str,
         field: &DataField,
     ) -> crate::Result<Self> {
+        let list = multi_vector::embedding_type(field.data_type());
         let mut native_options = Self::resolve_native_options(
             table_options,
             defaults,
@@ -145,8 +148,26 @@ impl VindexVectorIndexOptions {
             index_type,
             field.name(),
         )?;
-        let dimension = match field.data_type() {
+        let metric = native_options.entry("metric".into()).or_insert_with(|| {
+            if list.is_some() {
+                "cosine".into()
+            } else {
+                DEFAULT_METRIC.into()
+            }
+        });
+        *metric = normalize_metric(metric);
+        if list.is_some() && metric != "cosine" {
+            return Err(multi_vector::invalid(
+                "MultiVector indexes require cosine similarity",
+            ));
+        }
+        let dimension = match list.unwrap_or(field.data_type()) {
             DataType::Vector(vector) => vector.length().to_string(),
+            DataType::Array(_) if list.is_some() => {
+                native_options.get("dimension").cloned().ok_or_else(|| {
+                    multi_vector::invalid("ARRAY<ARRAY<FLOAT>> indexes require a dimension option")
+                })?
+            }
             _ => native_options
                 .get("dimension")
                 .cloned()
@@ -180,6 +201,7 @@ impl VindexVectorIndexOptions {
             native_options,
             train_sample_ratio,
             granule_build_enabled,
+            multi_vector: list.is_some(),
         })
     }
 
@@ -215,11 +237,6 @@ impl VindexVectorIndexOptions {
         collect_native_options(&mut native_options, defaults, index_type, column, true)?;
         collect_native_options(&mut native_options, user_options, index_type, column, true)?;
         native_options.insert("index.type".into(), native_index_type.into());
-        let metric = native_options
-            .entry("metric".into())
-            .or_insert_with(|| DEFAULT_METRIC.into());
-        *metric = normalize_metric(metric);
-
         Ok(native_options)
     }
 
