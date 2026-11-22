@@ -2060,6 +2060,40 @@ fn test_write_commit_read_roundtrip() {
 }
 
 #[test]
+fn route_with_postpone_bucket_plan() {
+    use crate::bucket_router::*;
+
+    let json =
+        CString::new(serde_json::to_string(&partitioned_postpone_table_schema()).unwrap()).unwrap();
+    unsafe {
+        let router = paimon_bucket_router_new_from_schema_json(json.as_ptr());
+        assert!(router.error.is_null());
+        let plan = make_postpone_bucket_plan_batch(vec!["a", "b"], vec![1, 3]);
+        let (mut array, mut schema) = export_batch_to_ffi(plan);
+        assert!(paimon_bucket_router_with_bucket_plan(
+            router.router,
+            (&mut **array as *mut FFI_ArrowArray).cast(),
+            (&mut **schema as *mut FFI_ArrowSchema).cast(),
+        )
+        .is_null());
+
+        let batch = make_partitioned_write_batch(vec!["a", "b"], vec![5, 5], vec!["x", "x"]);
+        let (mut array, mut schema) = export_batch_to_ffi(batch);
+        let mut buckets = [-1; 2];
+        assert!(paimon_bucket_router_route_arrow(
+            router.router,
+            (&mut **array as *mut FFI_ArrowArray).cast(),
+            (&mut **schema as *mut FFI_ArrowSchema).cast(),
+            buckets.as_mut_ptr(),
+            buckets.len(),
+        )
+        .is_null());
+        assert_eq!(buckets, [0, 2]);
+        paimon_bucket_router_free(router.router);
+    }
+}
+
+#[test]
 fn route_and_write_with_precomputed_bucket() {
     use crate::bucket_router::*;
 

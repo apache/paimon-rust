@@ -19,7 +19,7 @@ use std::ffi::{c_char, c_void};
 use std::ptr;
 
 use paimon::spec::TableSchema;
-use paimon::table::BucketRouter;
+use paimon::table::{BucketRouter, PostponeBucketPlan};
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
 use crate::result::paimon_result_bucket_router;
@@ -33,18 +33,17 @@ fn router_error(error: *mut paimon_error) -> paimon_result_bucket_router {
     }
 }
 
-fn router_ok(router: BucketRouter) -> paimon_result_bucket_router {
-    let inner = Box::into_raw(Box::new(router)) as *mut c_void;
-    paimon_result_bucket_router {
-        router: Box::into_raw(Box::new(paimon_bucket_router { inner })),
-        error: ptr::null_mut(),
-    }
+struct RouterState {
+    router: BucketRouter,
+    schema: TableSchema,
 }
 
-/// Create a stateless bucket router directly from a Paimon TableSchema JSON.
+/// Create a bucket router directly from a Paimon TableSchema JSON.
 ///
 /// Does not open a catalog, touch storage, or allocate file writers. Supports
 /// fixed-bucket (`default`, `mod`, `hive`) and postpone-bucket schemas.
+/// For postpone buckets, set the same plan as the writer with
+/// `paimon_bucket_router_with_bucket_plan` when using per-partition bucket counts.
 ///
 /// # Safety
 /// `table_schema_json` must be a valid null-terminated UTF-8 C string, or null
@@ -67,8 +66,56 @@ pub unsafe extern "C" fn paimon_bucket_router_new_from_schema_json(
         }
     };
     match BucketRouter::new(&schema) {
-        Ok(router) => router_ok(router),
+        Ok(router) => {
+            let inner = Box::into_raw(Box::new(RouterState { router, schema })).cast();
+            paimon_result_bucket_router {
+                router: Box::into_raw(Box::new(paimon_bucket_router { inner })),
+                error: ptr::null_mut(),
+            }
+        }
         Err(error) => router_error(paimon_error::from_paimon(error)),
+    }
+}
+
+/// Replace the routing plan of a postpone-bucket router, including its default.
+/// The Arrow batch uses the writer's plan format: partition columns followed
+/// by an Int32 `total_buckets` column. An error leaves the router unchanged.
+/// Once Arrow import starts this call consumes both Arrow structs.
+///
+/// # Safety
+/// The caller must have exclusive access to a live router for this call.
+/// `array` and `schema` must point to initialized Arrow C Data structs.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_bucket_router_with_bucket_plan(
+    router: *mut paimon_bucket_router,
+    array: *mut c_void,
+    schema: *mut c_void,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(router, "router") {
+        return error;
+    }
+    if let Err(error) = check_non_null((*router).inner, "router.inner") {
+        return error;
+    }
+    if let Err(error) = check_non_null(array, "array") {
+        return error;
+    }
+    if let Err(error) = check_non_null(schema, "schema") {
+        return error;
+    }
+    let batch = match import_record_batch(array, schema) {
+        Ok(batch) => batch,
+        Err(error) => return error,
+    };
+    let state = &mut *(*router).inner.cast::<RouterState>();
+    let result = PostponeBucketPlan::from_arrow(&state.schema, &batch)
+        .and_then(|plan| state.router.clone().with_bucket_plan(plan));
+    match result {
+        Ok(router) => {
+            state.router = router;
+            ptr::null_mut()
+        }
+        Err(error) => paimon_error::from_paimon(error),
     }
 }
 
@@ -130,8 +177,8 @@ pub unsafe extern "C" fn paimon_bucket_router_route_arrow(
         );
     }
 
-    let router = &*((*router).inner as *const BucketRouter);
-    let buckets = match router.route(&batch) {
+    let state = &*(*router).inner.cast::<RouterState>();
+    let buckets = match state.router.route(&batch) {
         Ok(buckets) => buckets,
         Err(error) => return paimon_error::from_paimon(error),
     };
@@ -151,7 +198,7 @@ pub unsafe extern "C" fn paimon_bucket_router_free(router: *mut paimon_bucket_ro
     if !router.is_null() {
         let wrapper = Box::from_raw(router);
         if !wrapper.inner.is_null() {
-            drop(Box::from_raw(wrapper.inner as *mut BucketRouter));
+            drop(Box::from_raw(wrapper.inner.cast::<RouterState>()));
         }
     }
 }
@@ -160,6 +207,11 @@ pub unsafe extern "C" fn paimon_bucket_router_free(router: *mut paimon_bucket_ro
 
 const _: unsafe extern "C" fn(*const c_char) -> paimon_result_bucket_router =
     paimon_bucket_router_new_from_schema_json;
+const _: unsafe extern "C" fn(
+    *mut paimon_bucket_router,
+    *mut c_void,
+    *mut c_void,
+) -> *mut paimon_error = paimon_bucket_router_with_bucket_plan;
 const _: unsafe extern "C" fn(
     *const paimon_bucket_router,
     *mut c_void,
