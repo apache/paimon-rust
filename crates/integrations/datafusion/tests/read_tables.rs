@@ -2006,6 +2006,38 @@ mod vector_search_tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn test_create_centroid_bitmap_prefilters_sql_top_k() {
+        let (ctx, _catalog, _tmp) = create_empty_vector_search_context().await;
+        for sql in [
+            "CREATE TABLE paimon.default.centroid_bitmap_sql \
+             (id INT, embedding FLOAT[], tenant INT, status INT) \
+             WITH ('bucket'='-1', 'row-tracking.enabled'='true', \
+             'data-evolution.enabled'='true', 'global-index.enabled'='true', \
+             'vector-index.post-filter.candidates-factor'='1')",
+            "INSERT INTO paimon.default.centroid_bitmap_sql (id, embedding, tenant, status) \
+             VALUES (0, [0.0, 0.0], 1, 0), (1, [1.0, 0.0], 2, 0), (2, [2.0, 0.0], 1, 3)",
+            "CALL sys.create_global_index(table => 'default.centroid_bitmap_sql', \
+             index_column => 'embedding', index_type => 'ivf-flat', \
+             options => 'ivf-flat.sharding=centroid,ivf-flat.centroid.nlist=1,\
+             ivf-flat.nlist=1,ivf-flat.dimension=2,ivf-flat.metric=l2', \
+             extra_fields => '{\"tenant\":\"bitmap\",\"status\":\"bitmap\"}')",
+        ] {
+            ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        }
+        let batches = ctx
+            .sql(
+                "SELECT id FROM vector_search('paimon.default.centroid_bitmap_sql', 'embedding', \
+                 '[0.0, 0.0]', 1) WHERE tenant = 2 OR status = 3",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(extract_ids_in_order(&batches), [1]);
+    }
+
     /// `vector_search` must return rows in relevance order, not file order. Querying
     /// id 2's vector ranks `[2, 5, 1]` by L2 distance, which differs from the
     /// ascending-id file order `[1, 2, 5]` the pre-fix scan produced.
