@@ -564,24 +564,39 @@ async fn primary_key_delete_rejects_extended_syntax() {
     let (_tmp, catalog, ctx) = setup("").await;
     exec(&ctx, "INSERT INTO paimon.test_db.t VALUES (1, 10)").await;
     let before = snapshot(&catalog).await;
-    for suffix in [
-        "RETURNING id",
-        "USING paimon.test_db.t other WHERE t.id = other.id",
-        "ORDER BY id LIMIT 1",
-        "LIMIT 1",
-        "JOIN paimon.test_db.t other ON t.id = other.id",
-        ", paimon.test_db.t",
-        "TABLESAMPLE BERNOULLI (50)",
-        "OUTPUT deleted.id",
-        "()",
-        "WITH (NOLOCK)",
-        "WITH ORDINALITY",
-        "PARTITION (p0)",
+    for (suffix, error) in [
+        ("RETURNING id", "optional WHERE"),
+        (
+            "USING paimon.test_db.t other WHERE t.id = other.id",
+            "DELETE ... USING is not supported",
+        ),
+        ("ORDER BY id LIMIT 1", "optional WHERE"),
+        ("LIMIT 1", "optional WHERE"),
+        (
+            "JOIN paimon.test_db.t other ON t.id = other.id",
+            "DELETE ... JOIN is not supported",
+        ),
+        (
+            ", paimon.test_db.t",
+            "DELETE requires a single target table",
+        ),
+        (
+            "TABLESAMPLE BERNOULLI (50)",
+            "DELETE with TABLESAMPLE or PARTITION is not supported",
+        ),
+        ("OUTPUT deleted.id", "optional WHERE"),
+        ("()", "DELETE on table functions is not supported"),
+        ("WITH (NOLOCK)", "optional WHERE"),
+        ("WITH ORDINALITY", "optional WHERE"),
+        (
+            "PARTITION (p0)",
+            "DELETE with TABLESAMPLE or PARTITION is not supported",
+        ),
     ] {
         assert_sql_error(
             &ctx,
             &format!("DELETE FROM paimon.test_db.t {suffix}"),
-            "optional WHERE",
+            error,
         )
         .await;
         assert_eq!(snapshot(&catalog).await, before, "{suffix}");

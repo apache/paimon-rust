@@ -86,6 +86,68 @@ async fn query_pt(sql_context: &SQLContext) -> Vec<(i32, String, i32)> {
 // ======================= Basic DELETE =======================
 
 #[tokio::test]
+async fn test_delete_rejects_unsupported_row_selection_before_writing() {
+    for options in [
+        "",
+        "WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true',
+            'deletion-vectors.enabled' = 'true'
+        )",
+    ] {
+        let (_tmp, catalog) = create_test_env();
+        let sql_context = create_sql_context(catalog).await;
+        exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+        exec(
+            &sql_context,
+            &format!(
+                "CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, pt INT) PARTITIONED BY (pt) {options}"
+            ),
+        )
+        .await;
+        exec(
+            &sql_context,
+            "INSERT INTO paimon.test_db.t (id, name, pt) VALUES (1, 'a', 1), (2, 'b', 2)",
+        )
+        .await;
+        exec(
+            &sql_context,
+            "CREATE TABLE paimon.test_db.src (source_id INT)",
+        )
+        .await;
+        let before = query_pt(&sql_context).await;
+
+        for (suffix, error) in [
+            (
+                "USING paimon.test_db.src",
+                "DELETE ... USING is not supported",
+            ),
+            (
+                "JOIN paimon.test_db.src ON t.id = src.source_id",
+                "DELETE ... JOIN is not supported",
+            ),
+            (
+                ", paimon.test_db.src",
+                "DELETE requires a single target table",
+            ),
+            ("()", "DELETE on table functions is not supported"),
+            (
+                "TABLESAMPLE BERNOULLI (0)",
+                "DELETE with TABLESAMPLE or PARTITION is not supported",
+            ),
+            (
+                "PARTITION (p0)",
+                "DELETE with TABLESAMPLE or PARTITION is not supported",
+            ),
+        ] {
+            let sql = format!("DELETE FROM paimon.test_db.t {suffix}");
+            assert_sql_error(&sql_context, &sql, error).await;
+            assert_eq!(query_pt(&sql_context).await, before, "{sql}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_delete_by_non_partition_column() {
     let (_tmp, sql_context) = setup().await;
 

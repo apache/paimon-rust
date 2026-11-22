@@ -382,11 +382,11 @@ async fn primary_key_update_rejects_unsupported_targets_and_syntax() {
         ),
         (
             "UPDATE paimon.test_db.t SET v = 1 FROM paimon.test_db.t other WHERE t.id = other.id",
-            "optional WHERE",
+            "UPDATE ... FROM is not supported",
         ),
         (
             "UPDATE paimon.test_db.t JOIN paimon.test_db.t other ON t.id = other.id SET v = 1",
-            "optional WHERE",
+            "UPDATE ... JOIN is not supported",
         ),
         (
             "UPDATE paimon.test_db.t SET v = 1 OUTPUT inserted.id",

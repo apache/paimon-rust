@@ -86,6 +86,60 @@ async fn query_pt(sql_context: &SQLContext) -> Vec<(i32, String, i32)> {
 // ======================= Basic UPDATE =======================
 
 #[tokio::test]
+async fn test_update_rejects_unsupported_row_selection_before_writing() {
+    for options in [
+        "",
+        "WITH ('row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true')",
+    ] {
+        let (_tmp, catalog) = create_test_env();
+        let sql_context = create_sql_context(catalog).await;
+        exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+        exec(
+            &sql_context,
+            &format!("CREATE TABLE paimon.test_db.t (id INT, name VARCHAR, age INT) {options}"),
+        )
+        .await;
+        exec(
+            &sql_context,
+            "INSERT INTO paimon.test_db.t (id, name, age) VALUES (1, 'a', 10), (2, 'b', 20)",
+        )
+        .await;
+        exec(
+            &sql_context,
+            "CREATE TABLE paimon.test_db.src (source_id INT)",
+        )
+        .await;
+        let before = query(&sql_context).await;
+
+        for (sql, error) in [
+            (
+                "UPDATE paimon.test_db.t SET age = 99 FROM (SELECT 1 WHERE FALSE) AS empty_source",
+                "UPDATE ... FROM is not supported",
+            ),
+            (
+                "UPDATE paimon.test_db.t SET age = 99 FROM (SELECT 1 AS source_id) AS source WHERE id = 1",
+                "UPDATE ... FROM is not supported",
+            ),
+            (
+                "UPDATE paimon.test_db.t JOIN paimon.test_db.src ON t.id = src.source_id SET age = 99",
+                "UPDATE ... JOIN is not supported",
+            ),
+            (
+                "UPDATE paimon.test_db.t TABLESAMPLE BERNOULLI (0) SET age = 99",
+                "UPDATE with TABLESAMPLE or PARTITION is not supported",
+            ),
+            (
+                "UPDATE paimon.test_db.t() SET age = 99",
+                "UPDATE on table functions is not supported",
+            ),
+        ] {
+            assert_sql_error(&sql_context, sql, error).await;
+            assert_eq!(query(&sql_context).await, before, "{sql}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_update_with_where() {
     let (_tmp, sql_context) = setup().await;
 
