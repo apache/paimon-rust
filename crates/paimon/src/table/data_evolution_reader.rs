@@ -1972,7 +1972,7 @@ fn open_source_stream(
                     file_io,
                     blob_as_descriptor,
                     blob_parallelism,
-                    crate::arrow::format::blob::crc_verification_enabled(&table_options)?,
+                    CoreOptions::new(&table_options).blob_read_verify_crc()?,
                     anchor_deletion_vector.cloned(),
                 );
             }
@@ -1989,7 +1989,7 @@ fn open_source_stream(
                 file_io,
                 blob_as_descriptor,
                 blob_parallelism,
-                crate::arrow::format::blob::crc_verification_enabled(&table_options)?,
+                CoreOptions::new(&table_options).blob_read_verify_crc()?,
                 anchor_deletion_vector.cloned(),
             );
         }
@@ -5446,6 +5446,144 @@ mod tests {
         assert_eq!(descriptor_rows[1], None);
         assert!(new_2.uri().ends_with("array-latest.blob"));
         assert_eq!(descriptor_rows[3], Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn test_nested_blob_fallback_obeys_crc_verification_option() {
+        use crate::spec::{MapType, VarCharType};
+        use arrow_array::{MapArray, StringArray};
+
+        // Historical Python writer fixtures. Corrupt only the outer BLOB entry CRC;
+        // the ARRAY/MAP payload and row index remain structurally valid.
+        let cases = [
+            (
+                "array",
+                "cf114e584243424101030000006c65676163790c0d0203000000260000000000000081ec551d4c0100000001",
+                34,
+                DataType::Array(ArrayType::new(DataType::Blob(BlobType::new()))),
+            ),
+            (
+                "map",
+                "cf114e584243424d01010000006b65796c6567616379060c01000000010000002c00000000000000495fc62d580100000001",
+                40,
+                DataType::Map(MapType::new(
+                    DataType::VarChar(VarCharType::string_type()),
+                    DataType::Blob(BlobType::new()),
+                )),
+            ),
+        ];
+
+        for (kind, fixture, crc_offset, blob_type) in cases {
+            let tempdir = tempdir().unwrap();
+            let bucket_dir = tempdir.path().join("bucket-0");
+            fs::create_dir_all(&bucket_dir).unwrap();
+            let parquet_path = bucket_dir.join("data.parquet");
+            write_int_parquet_file(&parquet_path, vec![("id", vec![7])], None);
+
+            let base_path = bucket_dir.join("base.blob");
+            let mut bytes = hex::decode(fixture).unwrap();
+            bytes[crc_offset] ^= 0xff;
+            fs::write(&base_path, &bytes).unwrap();
+            let latest_path = bucket_dir.join("latest.blob");
+            write_blob_file_with_values(&latest_path, &[BlobFixtureValue::Placeholder]);
+
+            let table_schema = TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("payloads", blob_type)
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true")
+                    .build()
+                    .unwrap(),
+            );
+            let table = Table::new(
+                FileIOBuilder::new("file").build().unwrap(),
+                Identifier::new("default", format!("blob_{kind}_crc_fallback")),
+                local_file_path(tempdir.path()),
+                table_schema,
+                None,
+            );
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(local_file_path(&bucket_dir))
+                .with_total_buckets(1)
+                .with_data_files(vec![
+                    data_file_meta_with_path(
+                        "data.parquet",
+                        0,
+                        1,
+                        1,
+                        parquet_path.metadata().unwrap().len() as i64,
+                        Some(vec!["id"]),
+                    ),
+                    data_file_meta_with_path(
+                        "base.blob",
+                        0,
+                        1,
+                        1,
+                        base_path.metadata().unwrap().len() as i64,
+                        Some(vec!["payloads"]),
+                    ),
+                    data_file_meta_with_path(
+                        "latest.blob",
+                        0,
+                        1,
+                        2,
+                        latest_path.metadata().unwrap().len() as i64,
+                        Some(vec!["payloads"]),
+                    ),
+                ])
+                .build()
+                .unwrap();
+
+            let default_read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+            let error = default_read
+                .to_arrow(std::slice::from_ref(&split))
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("CRC32 mismatch"),
+                "{kind}: expected CRC failure, got {error}"
+            );
+
+            let unchecked = table.copy_with_options(HashMap::from([(
+                "blob.read.verify-crc".to_string(),
+                "false".to_string(),
+            )]));
+            let read = TableRead::new(&unchecked, unchecked.schema().fields().to_vec(), Vec::new());
+            let batches = read
+                .to_arrow(std::slice::from_ref(&split))
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(collect_int_values(&batches, "id"), vec![7]);
+            let payload = batches[0].column_by_name("payloads").unwrap();
+            match kind {
+                "array" => assert_eq!(
+                    collect_blob_array_values(&batches, "payloads"),
+                    vec![Some(vec![Some(b"legacy".to_vec()), None, Some(Vec::new())])]
+                ),
+                "map" => {
+                    let map = payload.as_any().downcast_ref::<MapArray>().unwrap();
+                    let keys = map.keys().as_any().downcast_ref::<StringArray>().unwrap();
+                    let values = map
+                        .values()
+                        .as_any()
+                        .downcast_ref::<LargeBinaryArray>()
+                        .unwrap();
+                    assert_eq!(map.value_length(0), 1);
+                    assert_eq!(keys.value(0), "key");
+                    assert_eq!(values.value(0), b"legacy");
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[tokio::test]

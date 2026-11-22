@@ -45,22 +45,6 @@ use std::sync::Arc;
 mod writer;
 pub(crate) use writer::{BlobFormatWriter, BlobWriterFactory};
 
-pub(crate) fn crc_verification_enabled(
-    options: &std::collections::HashMap<String, String>,
-) -> crate::Result<bool> {
-    match options.get("blob.read.verify-crc") {
-        None => Ok(true),
-        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
-        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
-        Some(value) => Err(Error::DataInvalid {
-            message: format!(
-                "Invalid blob.read.verify-crc value '{value}': expected true or false"
-            ),
-            source: None,
-        }),
-    }
-}
-
 pub(crate) struct BlobFormatReader {
     descriptor_mode: bool,
     file_path: String,
@@ -4309,20 +4293,6 @@ mod tests {
         assert!(
             matches!(result, Err(Error::DataInvalid { message, .. }) if message.contains("minimum overhead"))
         );
-    }
-
-    #[test]
-    fn test_blob_crc_option() {
-        let mut options = std::collections::HashMap::new();
-        assert!(crc_verification_enabled(&options).unwrap());
-        for value in ["true", "TRUE"] {
-            options.insert("blob.read.verify-crc".to_string(), value.to_string());
-            assert!(crc_verification_enabled(&options).unwrap());
-        }
-        options.insert("blob.read.verify-crc".to_string(), "false".to_string());
-        assert!(!crc_verification_enabled(&options).unwrap());
-        options.insert("blob.read.verify-crc".to_string(), "typo".to_string());
-        assert!(crc_verification_enabled(&options).is_err());
     }
 
     #[tokio::test]
