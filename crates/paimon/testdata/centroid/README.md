@@ -19,10 +19,10 @@ under the License.
 
 # Java centroid index fixture
 
-Apache Paimon's `VectorTrainingModelIO` and `CentroidIndexMeta` from the
-centroid-sharding implementation wrote the router file and manifest envelopes.
-The Java paimon-vector-index 0.7.0-SNAPSHOT JNI trainer and writer produced the
-two IVF-FLAT shards. The router training input is four two-dimensional L2
+The Java implementation in [apache/paimon#11350](https://github.com/apache/paimon/pull/11350)
+wrote the router and shard files with the paimon-vector-index 0.7.0-SNAPSHOT JNI
+trainer and writer, and wrapped the descriptors with `CentroidIndexMeta`. The
+router training input is four two-dimensional L2
 vectors, `[0, 0]`, `[1, 0]`, `[100, 0]`, and `[101, 0]`, with two outer
 centers and one local IVF list in each shard. Native labels are 0 through 3.
 The Rust test publishes the files at row range [2, 5] to verify label rebasing.
@@ -32,3 +32,4 @@ The Java `CentroidBitmapIndex.Writer` produced `bitmap.index` and
 It contains a `tenant` section (field ID 0) with values `7` and `9` and a
 `status` section (field ID 2) with values NULL and `1`. The two labels
 are 2 and 4 relative to the common source range.
+`source.meta` is Java's `DataEvolutionIndexSourceMeta` for snapshot 1 and schema 0.

@@ -19,6 +19,7 @@ use super::*;
 use crate::spec::{Datum, PredicateBuilder};
 use crate::table::centroid_index::{self, Descriptor, Role};
 use crate::table::{SearchTask, SearchTaskExecutor, SearchTaskResult};
+use paimon_vindex_core::distance::MetricType;
 
 struct Worker<'a>(&'a Table);
 
@@ -111,8 +112,7 @@ async fn centroid_build_replaces_selected_range_files_and_is_queryable() {
         .all(|group| group.shards.len() == 2 && group.vector_count == 8));
     for shard in groups.iter().flat_map(|group| group.shards.values()) {
         let descriptor = Descriptor::parse(&shard.index_file).unwrap().unwrap();
-        let local = centroid_index::payload_options(&descriptor).unwrap();
-        assert_eq!(local["localNlist"], "2");
+        assert_eq!(descriptor.local_nlist().unwrap(), 2);
     }
     assert!(initial.iter().all(|old| !indexed.contains(old)));
 
@@ -257,6 +257,13 @@ async fn centroid_empty_router_does_not_define_raw_scoring() {
         .execute()
         .await
         .unwrap();
+    let entries = active_entries(&table).await;
+    let groups = centroid_index::group(&entries).unwrap();
+    let [empty] = groups.as_slice() else {
+        panic!("expected one empty centroid group");
+    };
+    assert_eq!(empty.descriptor.role, Role::Router(0));
+    assert_eq!(empty.router.index_file.file_size, 0);
     write_vectors(&table, vec![1, 2], vec![vec![1., 0.], vec![100., 0.]]).await;
 
     let mut search = table.new_vector_search_builder();
@@ -418,7 +425,9 @@ async fn centroid_query_reads_java_model_and_native_shards_with_rebased_labels()
                 index_field_id: find_index_field(&table, "embedding").unwrap().id(),
                 extra_field_ids: None,
                 index_meta: Some(meta.to_vec()),
-                source_meta: None,
+                source_meta: Some(
+                    include_bytes!("../../../testdata/centroid/source.meta").to_vec(),
+                ),
             }),
         });
     }
@@ -439,6 +448,8 @@ async fn centroid_query_reads_java_model_and_native_shards_with_rebased_labels()
     let groups = centroid_index::group(&indexed).unwrap();
     let group = &groups[0];
     assert_eq!(group.descriptor.role, Role::Router(2));
+    assert_eq!(group.descriptor.router_metric().unwrap(), MetricType::L2);
+    assert_eq!(group.local_nlists, [(0, 1), (1, 1)].into());
     assert_eq!(
         Descriptor::parse(&group.shards[&0].index_file)
             .unwrap()
@@ -623,13 +634,14 @@ async fn centroid_bitmaps_prefilter_or_before_ranking_and_drop_with_the_vector_c
     let groups = centroid_index::group(&entries).unwrap();
     let group = &groups[0];
     assert_eq!(group.bitmaps.len(), 2);
-    assert_eq!(
-        group.router.index_file.file_name,
-        format!(
-            "vector-ivf-flat-global-index-training-model-{}.index",
-            group.descriptor.model_id
-        )
-    );
+    let router_id = group
+        .router
+        .index_file
+        .file_name
+        .strip_prefix("vector-ivf-flat-global-index-training-model-")
+        .and_then(|name| name.strip_suffix(".index"))
+        .unwrap();
+    assert!(uuid::Uuid::parse_str(router_id).is_ok());
     for entry in group.bitmaps.values() {
         let id = entry
             .index_file
@@ -1060,7 +1072,7 @@ async fn centroid_bitmaps_check_referenced_fields_after_schema_changes() {
 
 #[tokio::test]
 async fn centroid_bitmaps_read_java_sparse_sections() {
-    use crate::spec::{Datum, PredicateOperator};
+    use crate::spec::{DataEvolutionIndexSourceMeta, Datum, PredicateOperator};
     use crate::table::centroid_bitmap::BitmapPredicate;
     let path = "memory:/centroid_java_bitmap";
     let table = vindex_e2e_table(path, "8");
@@ -1086,12 +1098,20 @@ async fn centroid_bitmaps_read_java_sparse_sections() {
             index_field_id: 1,
             extra_field_ids: Some(vec![0, 2]),
             index_meta: Some(metadata.to_vec()),
-            source_meta: None,
+            source_meta: Some(include_bytes!("../../../testdata/centroid/source.meta").to_vec()),
         }),
     };
-    let descriptor = Descriptor::parse(&file).unwrap().unwrap();
+    let source_meta = file
+        .global_index_meta
+        .as_ref()
+        .unwrap()
+        .source_meta
+        .as_ref()
+        .unwrap();
     assert_eq!(
-        crate::table::centroid_bitmap::schema_id(descriptor.payload.unwrap()).unwrap(),
+        DataEvolutionIndexSourceMeta::deserialize(source_meta)
+            .unwrap()
+            .source_schema_id(),
         0
     );
     let int = DataType::Int(IntType::new());

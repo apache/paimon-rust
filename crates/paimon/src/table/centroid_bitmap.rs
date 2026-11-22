@@ -18,7 +18,7 @@
 //! Directory for concatenated Bitmap sections in a centroid shard.
 
 use super::bitmap_global_index_reader::BitmapGlobalIndexReader;
-use super::centroid_index::{self, Descriptor, Generation};
+use super::centroid_index::{self, Descriptor, Generation, Role};
 use crate::btree::key_serde::normalize_key_literal;
 use crate::io::FileRead;
 use crate::spec::{
@@ -34,31 +34,6 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-const BITMAP: u8 = 1;
-const SECTION_HEADER: usize = 13;
-
-pub(super) fn add_section(directory: &mut Vec<u8>, length: usize, metadata: &[u8]) -> Result<()> {
-    let metadata_len = i32::try_from(metadata.len())
-        .map_err(|_| centroid_index::invalid("Centroid bitmap metadata is too large"))?;
-    directory.push(BITMAP);
-    directory.extend((length as u64).to_be_bytes());
-    directory.extend(metadata_len.to_be_bytes());
-    directory.extend(metadata);
-    Ok(())
-}
-
-pub(super) fn schema_id(payload: &[u8]) -> Result<i64> {
-    let bytes = payload
-        .get(..8)
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| centroid_index::invalid("Truncated centroid bitmap schema ID"))?;
-    let id = i64::from_be_bytes(bytes);
-    if id < 0 {
-        return Err(centroid_index::invalid("Invalid centroid bitmap schema ID"));
-    }
-    Ok(id)
-}
-
 fn directory(file: &IndexFileMeta) -> Result<HashMap<i32, Range<u64>>> {
     let invalid = || {
         centroid_index::invalid(format!(
@@ -66,39 +41,30 @@ fn directory(file: &IndexFileMeta) -> Result<HashMap<i32, Range<u64>>> {
             file.file_name
         ))
     };
-    let descriptor = Descriptor::parse(file)?.ok_or_else(invalid)?;
-    let payload = descriptor.payload.ok_or_else(invalid)?;
-    let mut input = payload.get(8..).ok_or_else(invalid)?;
+    let descriptor = Descriptor::parse(file)?
+        .filter(|descriptor| matches!(descriptor.role, Role::Bitmap(_)))
+        .ok_or_else(invalid)?;
+    let offsets = descriptor.payload.unwrap_or_default().chunks_exact(8);
     let field_ids = file
         .global_index_meta
         .as_ref()
         .and_then(|meta| meta.extra_field_ids.as_ref())
-        .filter(|fields| !fields.is_empty() && fields.len() <= input.len() / SECTION_HEADER)
+        .filter(|fields| !fields.is_empty())
         .ok_or_else(invalid)?;
+    if !offsets.remainder().is_empty() || offsets.len() != field_ids.len() - 1 {
+        return Err(invalid());
+    }
     let size = u64::try_from(file.file_size).map_err(|_| invalid())?;
+    let ends = offsets
+        .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
+        .chain(std::iter::once(size));
     let mut offset = 0u64;
-    let mut sections = HashMap::new();
-    for &field in field_ids {
-        let header = input.get(..SECTION_HEADER).ok_or_else(invalid)?;
-        if header[0] != BITMAP {
-            return Err(invalid());
-        }
-        let length = u64::from_be_bytes(header[1..9].try_into().unwrap());
-        let meta_len = usize::try_from(i32::from_be_bytes(header[9..13].try_into().unwrap()))
-            .map_err(|_| invalid())?;
-        let end = offset
-            .checked_add(length)
-            .filter(|&end| end > offset && end <= size)
-            .ok_or_else(invalid)?;
-        let next = SECTION_HEADER.checked_add(meta_len).ok_or_else(invalid)?;
-        input = input.get(next..).ok_or_else(invalid)?;
-        if sections.insert(field, offset..end).is_some() {
+    let mut sections = HashMap::with_capacity(field_ids.len());
+    for (&field, end) in field_ids.iter().zip(ends) {
+        if end <= offset || end > size || sections.insert(field, offset..end).is_some() {
             return Err(invalid());
         }
         offset = end;
-    }
-    if !input.is_empty() || offset != size {
-        return Err(invalid());
     }
     Ok(sections)
 }

@@ -21,7 +21,6 @@ use crate::table::bitmap_global_index_format::{
     make_bitmap_key_comparator, serialize_bitmap_datum,
 };
 use crate::table::bitmap_global_index_writer::write_sorted_bitmap_section;
-use crate::table::centroid_bitmap::add_section;
 use crate::table::centroid_index::{self, Descriptor, Role};
 use crate::table::index_build::{
     fields::validate_btree_field,
@@ -44,7 +43,6 @@ pub(super) struct BitmapBuild {
     fields: Vec<DataField>,
     options: SortedIndexWriteOptions,
     sort_budget: usize,
-    schema_id: i64,
 }
 
 impl BitmapBuild {
@@ -88,7 +86,6 @@ impl BitmapBuild {
             fields,
             options: SortedIndexWriteOptions::from_options("bitmap", options)?,
             sort_budget,
-            schema_id: table.schema().id(),
         }))
     }
 
@@ -101,12 +98,15 @@ impl BitmapBuild {
         output: OutputFile,
         columns: Vec<SortedRows>,
         row_count: i64,
-        model_id: &str,
         centroid: usize,
     ) -> Result<IndexPayload> {
         let mut writer = output.writer().await?;
-        let mut directory = self.schema_id.to_be_bytes().to_vec();
-        for column in columns {
+        let mut directory = Vec::with_capacity((self.fields.len() - 1) * 8);
+        let mut offset = 0u64;
+        for (section, column) in columns.into_iter().enumerate() {
+            if section > 0 {
+                directory.extend(offset.to_be_bytes());
+            }
             let (length, result) =
                 write_sorted_bitmap_section(writer.as_mut(), column, &self.options).await?;
             if result.row_count != row_count as u64 {
@@ -114,14 +114,14 @@ impl BitmapBuild {
                     "Centroid Bitmap row count mismatch",
                 ));
             }
-            add_section(&mut directory, length, &result.meta.serialize())?;
+            offset = offset
+                .checked_add(length as u64)
+                .ok_or_else(|| centroid_index::invalid("Centroid Bitmap file is too large"))?;
         }
         writer.close().await?;
         Ok(IndexPayload {
             row_count,
             index_meta: Descriptor {
-                model_id,
-                version: 2,
                 role: Role::Bitmap(centroid),
                 payload: Some(&directory),
             }

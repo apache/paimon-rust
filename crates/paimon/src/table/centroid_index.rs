@@ -19,16 +19,15 @@
 
 use super::index_file_path::IndexFileLocation;
 use crate::io::{FileIO, FileRead};
-use crate::spec::{IndexFileMeta, IndexManifestEntry};
+use crate::spec::{DataEvolutionIndexSourceMeta, IndexFileMeta, IndexManifestEntry};
 use crate::{Error, Result};
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::CentroidRouter;
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 const META_MAGIC: &[u8; 8] = b"PAIMCENT";
-const META_HEADER: usize = 22;
-const MAX_ENVELOPE: usize = 65536;
+const META_HEADER: usize = 14;
+const META_VERSION: u8 = 1;
 pub(super) const EMPTY_SHARD: &[u8] = b"PCEMPTY1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,9 +37,8 @@ pub(super) enum Role {
     Bitmap(usize),
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct Descriptor<'a> {
-    pub(super) model_id: &'a str,
-    pub(super) version: u8,
     pub(super) role: Role,
     pub(super) payload: Option<&'a [u8]>,
 }
@@ -58,12 +56,12 @@ impl<'a> Descriptor<'a> {
     }
 
     pub(super) fn has_bitmaps(file: &IndexFileMeta) -> bool {
-        file.global_index_meta
-            .as_ref()
-            .and_then(|meta| meta.index_meta.as_deref())
-            .is_some_and(|bytes| {
-                bytes.starts_with(META_MAGIC) && bytes.get(META_MAGIC.len()) == Some(&2)
-            })
+        Self::is_wrapped(file)
+            && file
+                .global_index_meta
+                .as_ref()
+                .and_then(|meta| meta.extra_field_ids.as_ref())
+                .is_some_and(|fields| !fields.is_empty())
     }
 
     pub(super) fn parse(file: &'a IndexFileMeta) -> Result<Option<Self>> {
@@ -81,65 +79,73 @@ impl<'a> Descriptor<'a> {
                 file.file_name
             ))
         };
-        if bytes.len() < META_HEADER {
+        if bytes.len() < META_HEADER || bytes[9] != META_VERSION {
             return Err(invalid());
         }
         let count = read_u32(bytes, 10, true);
-        let id_len = read_u32(bytes, 14, true) as usize;
-        let payload_len = read_u32(bytes, 18, true) as i32;
-        let version = bytes[8];
-        let role = match (version, bytes[9]) {
-            (1 | 2, 1) => Role::Router(count as usize),
-            (1 | 2, 2) => Role::Shard(count as usize),
-            (2, 3) => Role::Bitmap(count as usize),
-            _ => return Err(invalid()),
-        };
-        if count > i32::MAX as u32
-            || id_len == 0
-            || payload_len < -1
-            || Some(bytes.len() - META_HEADER) != id_len.checked_add(payload_len.max(0) as usize)
-        {
+        if count > i32::MAX as u32 {
             return Err(invalid());
         }
-        let rest = &bytes[META_HEADER..];
-        let model_id = std::str::from_utf8(&rest[..id_len]).map_err(|_| invalid())?;
+        let role = match bytes[8] {
+            b'R' => Role::Router(count as usize),
+            b'S' => Role::Shard(count as usize),
+            b'B' => Role::Bitmap(count as usize),
+            _ => return Err(invalid()),
+        };
         Ok(Some(Self {
-            model_id,
-            version,
             role,
-            payload: (payload_len >= 0).then_some(&rest[id_len..]),
+            payload: (bytes.len() > META_HEADER).then_some(&bytes[META_HEADER..]),
         }))
     }
 
     pub(super) fn encode(&self) -> Result<Vec<u8>> {
         let (role, count) = match self.role {
-            Role::Router(count) => (1, count),
-            Role::Shard(id) => (2, id),
-            Role::Bitmap(id) => (3, id),
+            Role::Router(count) => (b'R', count),
+            Role::Shard(id) => (b'S', id),
+            Role::Bitmap(id) => (b'B', id),
         };
-        let int =
-            |value| i32::try_from(value).map_err(|_| invalid("Centroid descriptor is too large"));
-        let mut bytes = META_MAGIC.to_vec();
-        bytes.extend([self.version, role]);
-        bytes.extend(int(count)?.to_be_bytes());
-        bytes.extend(int(self.model_id.len())?.to_be_bytes());
-        bytes.extend(
-            self.payload
-                .map(|bytes| int(bytes.len()))
-                .transpose()?
-                .unwrap_or(-1)
-                .to_be_bytes(),
-        );
-        bytes.extend(self.model_id.as_bytes());
-        bytes.extend(self.payload.unwrap_or_default());
+        let count =
+            i32::try_from(count).map_err(|_| invalid("Centroid descriptor value is too large"))?;
+        let payload = self.payload.unwrap_or_default();
+        let mut bytes = Vec::with_capacity(META_HEADER + payload.len());
+        bytes.extend_from_slice(META_MAGIC);
+        bytes.extend([role, META_VERSION]);
+        bytes.extend(count.to_be_bytes());
+        bytes.extend_from_slice(payload);
         Ok(bytes)
     }
+
+    pub(super) fn router_metric(&self) -> Result<MetricType> {
+        match self.payload {
+            Some(b"l2") => Ok(MetricType::L2),
+            Some(b"inner_product") => Ok(MetricType::InnerProduct),
+            Some(b"cosine") => Ok(MetricType::Cosine),
+            _ => Err(invalid("Invalid centroid routing metric")),
+        }
+    }
+
+    pub(super) fn local_nlist(&self) -> Result<usize> {
+        let bytes: [u8; 4] = self
+            .payload
+            .and_then(|payload| payload.try_into().ok())
+            .ok_or_else(|| invalid("Invalid centroid shard local nlist"))?;
+        let count = i32::from_be_bytes(bytes);
+        if count <= 0 {
+            return Err(invalid("Invalid centroid shard local nlist"));
+        }
+        Ok(count as usize)
+    }
+}
+
+pub(super) fn stores_local_nlist(index_type: &str, metric: MetricType) -> bool {
+    metric == MetricType::L2 && matches!(index_type, "ivf-flat" | "ivf-pq")
 }
 
 pub(super) struct Generation<'a> {
     pub(super) router: &'a IndexManifestEntry,
     pub(super) descriptor: Descriptor<'a>,
     pub(super) shards: BTreeMap<usize, &'a IndexManifestEntry>,
+    pub(super) local_nlists: BTreeMap<usize, usize>,
     pub(super) bitmaps: BTreeMap<usize, &'a IndexManifestEntry>,
     pub(super) bitmap_schema_id: Option<i64>,
     pub(super) vector_count: u64,
@@ -179,8 +185,8 @@ pub(super) fn group<'a>(
                 .ok_or_else(|| invalid("Centroid generation has no routing model"))?;
             let router = *router;
             let mut shards = BTreeMap::new();
+            let mut local_nlists = BTreeMap::new();
             let mut bitmaps = BTreeMap::new();
-            let mut bitmap_schema_id = None;
             let mut vector_count = 0u64;
             let mut router_count = 0;
             let Role::Router(nlist) = descriptor.role else {
@@ -195,13 +201,14 @@ pub(super) fn group<'a>(
                     .ok_or_else(|| invalid("Invalid centroid row range"))? as u64;
             let invalid = || {
                 invalid(format!(
-                    "Incomplete or conflicting centroid generation '{}'",
-                    descriptor.model_id
+                    "Incomplete or conflicting centroid generation for '{}'",
+                    router.index_file.file_name
                 ))
             };
+            let metric = descriptor.router_metric()?;
+            let has_local_nlist = stores_local_nlist(&router.index_file.index_type, metric);
             let extra = meta.extra_field_ids.as_deref().unwrap_or_default();
-            if (descriptor.version == 2) == extra.is_empty()
-                || extra.contains(&meta.index_field_id)
+            if extra.contains(&meta.index_field_id)
                 || extra
                     .iter()
                     .enumerate()
@@ -210,51 +217,41 @@ pub(super) fn group<'a>(
                 return Err(invalid());
             }
             for (entry, desc) in &files {
-                if desc.model_id != descriptor.model_id
-                    || desc.version != descriptor.version
-                    || entry.index_file.file_size <= 0
-                    || entry.index_file.row_count < 0
-                    || entry
-                        .index_file
-                        .global_index_meta
-                        .as_ref()
-                        .unwrap()
-                        .source_meta
-                        != meta.source_meta
-                    || entry
-                        .index_file
-                        .global_index_meta
-                        .as_ref()
-                        .unwrap()
-                        .extra_field_ids
-                        != meta.extra_field_ids
+                let file = &entry.index_file;
+                let file_meta = file.global_index_meta.as_ref().unwrap();
+                if file.file_size < 0
+                    || file.row_count < 0
+                    || file_meta.source_meta != meta.source_meta
+                    || file_meta.extra_field_ids != meta.extra_field_ids
                 {
                     return Err(invalid());
                 }
                 match desc.role {
-                    Role::Router(_) => {
+                    Role::Router(count) => {
                         router_count += 1;
-                        if entry.index_file.row_count != 0 {
+                        if file.row_count != 0 || (file.file_size == 0) != (count == 0) {
                             return Err(invalid());
                         }
                     }
                     Role::Shard(id) => {
-                        if id >= nlist || shards.insert(id, *entry).is_some() {
+                        if file.file_size == 0 || id >= nlist || shards.insert(id, *entry).is_some()
+                        {
+                            return Err(invalid());
+                        }
+                        if has_local_nlist && file.row_count > 0 {
+                            local_nlists.insert(id, desc.local_nlist()?);
+                        } else if desc.payload.is_some() {
                             return Err(invalid());
                         }
                         vector_count = vector_count
-                            .checked_add(entry.index_file.row_count as u64)
+                            .checked_add(file.row_count as u64)
                             .ok_or_else(invalid)?;
                     }
                     Role::Bitmap(id) => {
-                        if id >= nlist || bitmaps.insert(id, *entry).is_some() {
-                            return Err(invalid());
-                        }
-                        let schema_id =
-                            super::centroid_bitmap::schema_id(desc.payload.ok_or_else(invalid)?)?;
-                        if bitmap_schema_id
-                            .replace(schema_id)
-                            .is_some_and(|previous| previous != schema_id)
+                        if extra.is_empty()
+                            || file.file_size == 0
+                            || id >= nlist
+                            || bitmaps.insert(id, *entry).is_some()
                         {
                             return Err(invalid());
                         }
@@ -268,7 +265,7 @@ pub(super) fn group<'a>(
             {
                 return Err(invalid());
             }
-            if descriptor.version == 2
+            if !extra.is_empty()
                 && shards.iter().any(|(id, shard)| {
                     let count = shard.index_file.row_count;
                     bitmaps.get(id).map(|entry| entry.index_file.row_count)
@@ -277,10 +274,22 @@ pub(super) fn group<'a>(
             {
                 return Err(invalid());
             }
+            let bitmap_schema_id = if bitmaps.is_empty() {
+                None
+            } else {
+                let source = meta.source_meta.as_deref().ok_or_else(invalid)?;
+                let schema_id =
+                    DataEvolutionIndexSourceMeta::deserialize(source)?.source_schema_id();
+                if schema_id < 0 {
+                    return Err(invalid());
+                }
+                Some(schema_id)
+            };
             Ok(Generation {
                 router,
-                descriptor: Descriptor::parse(&router.index_file)?.unwrap(),
+                descriptor: *descriptor,
                 shards,
+                local_nlists,
                 bitmaps,
                 bitmap_schema_id,
                 vector_count,
@@ -288,27 +297,6 @@ pub(super) fn group<'a>(
             })
         })
         .collect()
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Envelope<'a> {
-    version: u8,
-    shard_mode: &'a str,
-    model_id: &'a str,
-}
-
-pub(super) fn encode_router_envelope(model_id: &str) -> Result<Vec<u8>> {
-    let header = serde_json::to_vec(&Envelope {
-        version: 1,
-        shard_mode: "centroid-based",
-        model_id,
-    })
-    .map_err(|error| invalid(format!("Cannot encode centroid router envelope: {error}")))?;
-    let mut bytes = Vec::with_capacity(4 + header.len());
-    bytes.extend((header.len() as u32).to_be_bytes());
-    bytes.extend(&header);
-    Ok(bytes)
 }
 
 pub(super) struct Router {
@@ -329,37 +317,20 @@ impl Router {
         let path = IndexFileLocation::Global { table_path }
             .resolve(&file.file_name, file.external_path.as_deref());
         let size = usize::try_from(file.file_size).unwrap_or_default();
-        let max_size = 4 + MAX_ENVELOPE + CentroidRouter::MAX_SERIALIZED_BYTES;
-        if !(4 + CentroidRouter::HEADER_BYTES..=max_size).contains(&size) {
+        if !(CentroidRouter::HEADER_BYTES..=CentroidRouter::MAX_SERIALIZED_BYTES).contains(&size) {
             return Err(invalid("Invalid centroid routing file size"));
         }
         let input = file_io.new_input(&path)?.reader().await?;
         let bytes = input.read(0..size as u64).await?;
-        Self::decode(&bytes, descriptor.model_id, nlist)
+        let router = Self::decode(&bytes, nlist)?;
+        if router.metric != descriptor.router_metric()? {
+            return Err(invalid("Routing metric differs from manifest metadata"));
+        }
+        Ok(router)
     }
 
-    fn decode(bytes: &[u8], model_id: &str, nlist: usize) -> Result<Self> {
-        let invalid = || {
-            invalid(format!(
-                "Invalid centroid routing payload for model '{model_id}'"
-            ))
-        };
-        if bytes.len() < 4 {
-            return Err(invalid());
-        }
-        let len = read_u32(bytes, 0, true) as usize;
-        if len == 0 || len > MAX_ENVELOPE || bytes.len() < 4 + len {
-            return Err(invalid());
-        }
-        let header: Envelope<'_> =
-            serde_json::from_slice(&bytes[4..4 + len]).map_err(|_| invalid())?;
-        let payload = &bytes[4 + len..];
-        if header.version != 1
-            || header.shard_mode != "centroid-based"
-            || header.model_id != model_id
-        {
-            return Err(invalid());
-        }
+    fn decode(payload: &[u8], nlist: usize) -> Result<Self> {
+        let invalid = || invalid("Invalid centroid routing payload");
         let model = CentroidRouter::deserialize(payload).map_err(router_error)?;
         if model.nlist() != nlist {
             return Err(invalid());
@@ -378,17 +349,6 @@ pub(super) fn index_identity_extra_fields(file: &IndexFileMeta) -> Option<&[i32]
     } else {
         meta.extra_field_ids.as_deref()
     }
-}
-
-pub(super) fn payload_options(descriptor: &Descriptor<'_>) -> Result<HashMap<String, String>> {
-    descriptor
-        .payload
-        .map(|payload| {
-            serde_json::from_slice(payload)
-                .map_err(|error| invalid(format!("Invalid centroid scoring metadata: {error}")))
-        })
-        .transpose()
-        .map(Option::unwrap_or_default)
 }
 
 pub(super) fn automatic_width(

@@ -58,18 +58,14 @@ pub(super) async fn read_index_vector_metric(
         return Ok(None);
     }
     if let Some(descriptor) = super::centroid_index::Descriptor::parse(&entry.index_file)? {
-        use super::centroid_index::{payload_options, Role, Router};
+        use super::centroid_index::Role;
         let Role::Router(nlist) = descriptor.role else {
             return Ok(None);
         };
         if nlist == 0 {
             return Ok(None);
         }
-        if let Some(metric) = metric_from_index_options(&payload_options(&descriptor)?) {
-            return Ok(Some(metric));
-        }
-        let router = Router::load(file_io, table_path, &entry.index_file, &descriptor).await?;
-        return Ok(Some(router.metric));
+        return descriptor.router_metric().map(Some);
     }
     let path = IndexFileLocation::Global { table_path }.resolve(
         &entry.index_file.file_name,
@@ -827,12 +823,11 @@ mod tests {
 
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let descriptor = Descriptor {
-            model_id: "empty-centroid",
-            version: 1,
             role: Role::Router(0),
-            payload: Some(br#"{"metric":"cosine"}"#),
+            payload: Some(b"cosine"),
         };
         let mut entry = entry(Some(descriptor.encode().unwrap()));
+        entry.index_file.file_size = 0;
         entry.index_file.row_count = 0;
         assert_eq!(
             read_index_vector_metric(&file_io, "memory:/metric-empty-centroid", &entry)

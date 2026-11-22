@@ -328,7 +328,7 @@ async fn execute_vector_file_work(
     batch_index_parallelism: usize,
     allow_buffered_read: bool,
 ) -> crate::Result<(Vec<ScoredRowIds>, IndexSearchTiming)> {
-    let (hits, timing) = execute_vector_file_probes(
+    execute_vector_file_probes(
         evaluation,
         work,
         metric_check,
@@ -337,8 +337,7 @@ async fn execute_vector_file_work(
         vec![],
         allow_buffered_read,
     )
-    .await?;
-    Ok((hits.into_iter().map(|hits| hits.standard).collect(), timing))
+    .await
 }
 
 async fn execute_vector_file_probes(
@@ -349,7 +348,7 @@ async fn execute_vector_file_probes(
     batch_index_parallelism: usize,
     probes: Vec<centroid::Probe>,
     allow_buffered_read: bool,
-) -> crate::Result<(Vec<centroid::ProbeMatches<ScoredRowIds>>, IndexSearchTiming)> {
+) -> crate::Result<(Vec<ScoredRowIds>, IndexSearchTiming)> {
     let timing_enabled = vector_search_timing_enabled();
     let concurrency = CoreOptions::new(evaluation.table_options).global_index_thread_num()?;
     let global_meta = work
@@ -390,9 +389,10 @@ async fn execute_vector_file_probes(
     let file_name = work.entry.index_file.file_name.clone();
     let file_size = work.entry.index_file.file_size as u64;
     let descriptor = super::centroid_index::Descriptor::parse(&work.entry.index_file)?;
-    let index_meta_bytes = match &descriptor {
-        Some(descriptor) => descriptor.payload.unwrap_or_default().to_vec(),
-        None => global_meta.index_meta.clone().unwrap_or_default(),
+    let index_meta_bytes = if descriptor.is_some() {
+        Vec::new()
+    } else {
+        global_meta.index_meta.clone().unwrap_or_default()
     };
     let row_range_start = global_meta.row_range_start;
     let max_centroid_label = descriptor
@@ -461,7 +461,7 @@ async fn execute_vector_file_probes(
             .is_some_and(|row_ids| row_ids.is_empty())
     }) {
         return Ok((
-            vec![centroid::ProbeMatches::standard(ScoredRowIds::empty()); vector_searches.len()],
+            vec![ScoredRowIds::empty(); vector_searches.len()],
             IndexSearchTiming::default(),
         ));
     }
@@ -587,12 +587,7 @@ async fn execute_vector_file_probes(
     };
     let results = results
         .into_iter()
-        .map(|hits| {
-            Ok(centroid::ProbeMatches {
-                standard: convert(hits.standard)?,
-                joint: hits.joint.map(&convert).transpose()?,
-            })
-        })
+        .map(convert)
         .collect::<crate::Result<Vec<_>>>()?;
     Ok::<_, crate::Error>((
         results,
@@ -619,7 +614,7 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
     file_name: String,
     context: VectorIndexSearchContext,
     guard: G,
-) -> crate::Result<Vec<centroid::ProbeMatches<centroid::NativeMatches>>> {
+) -> crate::Result<Vec<centroid::NativeMatches>> {
     if context.post_filter.is_some() {
         return execute_post_filter_vindex_searches(
             io_meta,
@@ -629,12 +624,7 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
             context,
             guard,
         )
-        .await
-        .map(|hits| {
-            hits.into_iter()
-                .map(centroid::ProbeMatches::standard)
-                .collect()
-        });
+        .await;
     }
     let panic_context = if vector_searches.len() > 1 {
         "vindex global-index batch search task failed"
