@@ -892,10 +892,22 @@ impl<'a> HybridSearchBuilder<'a> {
     ) -> crate::Result<PkRoute> {
         let builder = self.vector_route_builder(table, route);
         let result = builder.execute().await?;
+        let cosine_distances = match self.ranker {
+            HybridSearchRanker::Rrf | HybridSearchRanker::Mrr => {
+                result.primary_key_cosine_distances()
+            }
+            HybridSearchRanker::WeightedScore => None,
+        };
         let positions = result
             .positions()?
             .iter()
-            .map(PrimaryKeySearchPosition::from_vector_position)
+            .enumerate()
+            .map(|(index, position)| {
+                // Rank-based fusion uses this key only for local order and ties.
+                // Negation preserves all distance distinctions, including near 0.
+                let score = cosine_distances.map_or(position.score, |distances| -distances[index]);
+                PrimaryKeySearchPosition::from_vector_position(position, score)
+            })
             .collect::<crate::Result<Vec<_>>>()?;
         let source_splits = result.splits()?.to_vec();
         Ok(PkRoute {
@@ -1675,6 +1687,7 @@ mod pk_hybrid_tests {
         location: &str,
         file_name: &str,
         vectors: &[[f32; DIM]],
+        metric: &str,
     ) -> u64 {
         let n = vectors.len();
         let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
@@ -1683,7 +1696,7 @@ mod pk_hybrid_tests {
             ("index.type".to_string(), "ivf_flat".to_string()),
             ("dimension".to_string(), DIM.to_string()),
             ("nlist".to_string(), "1".to_string()),
-            ("metric".to_string(), "l2".to_string()),
+            ("metric".to_string(), metric.to_string()),
         ]);
         let config = VectorIndexConfig::from_options(&native_options).unwrap();
         let training = VectorIndexTrainer::train(config, &flat, n).unwrap();
@@ -1790,8 +1803,10 @@ mod pk_hybrid_tests {
 
         // Vector ANN segment.
         let vector_index_name = "vector-ivf-flat-pk-hybrid.index".to_string();
+        let metric =
+            &schema.options()[&format!("fields.{VECTOR_COLUMN}.pk-vector.distance.metric")];
         let vector_index_size =
-            write_ann_segment(&file_io, location, &vector_index_name, vectors).await;
+            write_ann_segment(&file_io, location, &vector_index_name, vectors, metric).await;
         let vector_index = IndexFileMeta {
             index_type: VECTOR_INDEX_TYPE.to_string(),
             file_name: vector_index_name,
@@ -1969,6 +1984,59 @@ mod pk_hybrid_tests {
             empty.is_empty(),
             "a pinned empty view must not observe the existing rows"
         );
+    }
+
+    #[tokio::test]
+    async fn pk_hybrid_preserves_cosine_distance_order_after_reranking() {
+        let query = [3.0, 4.0, 0.0, 0.0];
+        let table = build_hybrid_table(
+            "memory:/pk_hybrid_cosine_order",
+            &[0, 1],
+            &[[3.0015, 4.0, 0.0, 0.0], query],
+            &["nearby", "exact"],
+            &[("fields.embedding.pk-vector.distance.metric", "cosine")],
+        )
+        .await;
+
+        for ranker in [HybridSearchRanker::Rrf, HybridSearchRanker::Mrr] {
+            for route_limit in [1, 2] {
+                let mut builder = table.new_hybrid_search_builder();
+                builder
+                    .add_vector_route(
+                        VECTOR_COLUMN,
+                        query.to_vec(),
+                        route_limit,
+                        1.0,
+                        HashMap::from([(
+                            "fields.embedding.ivf.refine-factor".to_string(),
+                            "2".to_string(),
+                        )]),
+                    )
+                    .unwrap();
+                builder.with_limit(1).with_ranker(ranker.as_str()).unwrap();
+                let batches = builder
+                    .execute_read()
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    column_i32(&batches, "id"),
+                    vec![1],
+                    "{ranker:?}, {route_limit}"
+                );
+                let expected_score = if ranker == HybridSearchRanker::Rrf {
+                    (1.0 / (f64::from(pk_search_ranker::DEFAULT_RRF_K) + 1.0)) as f32
+                } else {
+                    1.0
+                };
+                assert_eq!(
+                    column_f32(&batches, SEARCH_SCORE_COLUMN),
+                    vec![expected_score]
+                );
+            }
+        }
     }
 
     #[tokio::test]

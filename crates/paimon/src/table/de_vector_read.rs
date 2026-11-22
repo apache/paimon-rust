@@ -64,7 +64,7 @@ use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -605,6 +605,8 @@ async fn execute_vector_file_probes(
 const RAW_SCORE_MATRIX_MIN_QUERY_COUNT: usize = 4;
 
 const RAW_SCORE_MATRIX_TARGET_ELEMENTS: usize = 1 << 20;
+const RAW_COSINE_ABSOLUTE_BLOCK_VECTORS: usize = 256;
+const RAW_COSINE_ABSOLUTE_BLOCK_VALUES: usize = 384 * 1024;
 
 const RAW_TOP_K_MIN_PARTITION_SIZE: usize = 1 << 12;
 
@@ -3214,6 +3216,7 @@ struct DenseCosineNorm {
     length: f64,
     mixed_signs: bool,
     at_most_one_nonzero: bool,
+    max_abs_integer: Option<f64>,
 }
 
 impl DenseCosineNorm {
@@ -3222,6 +3225,7 @@ impl DenseCosineNorm {
             length: cosine_norm(vector),
             mixed_signs: has_mixed_signs(vector),
             at_most_one_nonzero: has_at_most_one_nonzero(vector),
+            max_abs_integer: max_abs_integer(vector),
         }
     }
 }
@@ -3236,6 +3240,26 @@ fn has_at_most_one_nonzero(vector: &[f64]) -> bool {
         .filter(|&&value| value != 0.0)
         .nth(1)
         .is_none()
+}
+
+fn max_abs_integer(vector: &[f64]) -> Option<f64> {
+    let mut maximum = 0.0_f64;
+    for &value in vector {
+        if value.fract() != 0.0 {
+            return None;
+        }
+        maximum = maximum.max(value.abs());
+    }
+    Some(maximum)
+}
+
+fn integer_dot_is_exact(query_max: Option<f64>, stored_max: Option<f64>, dimension: usize) -> bool {
+    // Every partial sum of the integer products fits in the f64 significand
+    // when the sum of their absolute magnitudes is below 2^53.
+    const F64_INTEGER_LIMIT: f64 = (1_u64 << f64::MANTISSA_DIGITS) as f64;
+    query_max
+        .zip(stored_max)
+        .is_some_and(|(q, s)| q * s * (dimension as f64) < F64_INTEGER_LIMIT)
 }
 
 fn compute_raw_cosine_score_matrix(
@@ -3267,16 +3291,23 @@ fn compute_raw_cosine_score_matrix(
         let query_norm = query_norms[query_index];
         let query_mixed_signs = has_mixed_signs(query);
         let query_at_most_one_nonzero = has_at_most_one_nonzero(query);
+        let query_max_abs_integer = max_abs_integer(query);
         for ((stored, stored_norm), &dot) in stored_vectors
             .chunks_exact(dimension)
             .zip(stored_norms)
             .zip(query_dots)
         {
             let norm_product = query_norm * stored_norm.length;
-            // A single product is exact. For multiple products with uniform
-            // signs, estimate their absolute sum from the dot. Otherwise use
-            // the norm product (Cauchy-Schwarz).
-            let exact = query_at_most_one_nonzero || stored_norm.at_most_one_nonzero;
+            // A single product or a sufficiently small integer sum is exact.
+            // With uniform product signs, estimate the absolute sum from the
+            // dot. Otherwise use the norm product (Cauchy-Schwarz).
+            let exact = query_at_most_one_nonzero
+                || stored_norm.at_most_one_nonzero
+                || integer_dot_is_exact(
+                    query_max_abs_integer,
+                    stored_norm.max_abs_integer,
+                    dimension,
+                );
             let may_cancel = !exact && (query_mixed_signs || stored_norm.mixed_signs);
             let dot = if exact {
                 CosineDot::Exact(dot)
@@ -3298,28 +3329,13 @@ fn compute_raw_cosine_score_matrix(
         }
     }
 
-    // Refine a few uncertain pairs directly. A second multiply amortizes the
-    // coordinate scans when many mixed-sign pairs need the absolute-product sum.
-    let absolute_dots = if needs_tighter_bound.len() >= dots.len().div_ceil(8).max(32) {
-        let absolute_queries: Vec<_> = query_vectors.iter().map(|value| value.abs()).collect();
-        let absolute_rows: Vec<_> = stored_vectors.iter().map(|value| value.abs()).collect();
-        Some(compute_raw_cosine_dot_matrix(
-            &absolute_queries,
-            &absolute_rows,
-            dimension,
-        )?)
-    } else {
-        None
-    };
-    for position in needs_tighter_bound {
+    let mut refine = |position: usize, absolute_sum: Option<f64>| {
         let query_index = position / row_count;
         let row_index = position % row_count;
         let query = &query_vectors[query_index * dimension..][..dimension];
         let stored = &stored_vectors[row_index * dimension..][..dimension];
-        let absolute_sum_bound = absolute_dots.as_ref().map_or_else(
-            || query.iter().zip(stored).map(|(q, s)| (q * s).abs()).sum(),
-            |absolute_dots| absolute_dots[position],
-        );
+        let absolute_sum_bound = absolute_sum
+            .unwrap_or_else(|| query.iter().zip(stored).map(|(q, s)| (q * s).abs()).sum());
         let norm_product = query_norms[query_indices[query_index]] * stored_norms[row_index].length;
         scores[position] = similarity.round_from_dot(
             CosineDot::Approximate {
@@ -3331,6 +3347,60 @@ fn compute_raw_cosine_score_matrix(
             stored,
             &mut partials,
         );
+    };
+
+    // Refine a few uncertain pairs directly. Limit each temporary coordinate
+    // copy to a block of queries or rows when batching their refinement.
+    if needs_tighter_bound.len() >= dots.len().div_ceil(8).max(32) {
+        let block_size = (RAW_COSINE_ABSOLUTE_BLOCK_VALUES / dimension)
+            .clamp(1, RAW_COSINE_ABSOLUTE_BLOCK_VECTORS);
+        let mut blocks = BTreeMap::<(usize, usize), Vec<usize>>::new();
+        for position in needs_tighter_bound {
+            let query_block = position / row_count / block_size;
+            let row_block = (position % row_count) / block_size;
+            blocks
+                .entry((query_block, row_block))
+                .or_default()
+                .push(position);
+        }
+        let mut absolute_queries = Vec::with_capacity(block_size.min(query_count) * dimension);
+        let mut absolute_rows = Vec::with_capacity(block_size.min(row_count) * dimension);
+        let mut previous_query_block = None;
+        for ((query_block, row_block), positions) in blocks {
+            let query_start = query_block * block_size;
+            let row_start = row_block * block_size;
+            let row_end = (row_start + block_size).min(row_count);
+            if previous_query_block != Some(query_block) {
+                let query_end = (query_start + block_size).min(query_count);
+                absolute_queries.clear();
+                absolute_queries.extend(
+                    query_vectors[query_start * dimension..query_end * dimension]
+                        .iter()
+                        .map(|value| value.abs()),
+                );
+                previous_query_block = Some(query_block);
+            }
+            absolute_rows.clear();
+            absolute_rows.extend(
+                stored_vectors[row_start * dimension..row_end * dimension]
+                    .iter()
+                    .map(|value| value.abs()),
+            );
+            let absolute_dots =
+                compute_raw_cosine_dot_matrix(&absolute_queries, &absolute_rows, dimension)?;
+            for position in positions {
+                let local_query = position / row_count - query_start;
+                let local_row = position % row_count - row_start;
+                refine(
+                    position,
+                    Some(absolute_dots[local_query * (row_end - row_start) + local_row]),
+                );
+            }
+        }
+    } else {
+        for position in needs_tighter_bound {
+            refine(position, None);
+        }
     }
     Ok(scores)
 }

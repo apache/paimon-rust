@@ -208,7 +208,7 @@ fn cosine_score(query: &[f32], query_norm: f64, stored: &[f32], output: CosineOu
         Err(bounds) => bounds,
     };
     if matches!(output, CosineOutput::Distance) && bounds.1 <= 0.5 {
-        if query == stored {
+        if bounds.0 == 0.0 && (query == stored || positively_proportional(query, stored)) {
             return 0.0;
         }
         let (lower, upper) = normalized_distance_bounds(query, stored, query_norm, stored_norm);
@@ -218,6 +218,21 @@ fn cosine_score(query: &[f32], query_norm: f64, stored: &[f32], output: CosineOu
         }
     }
     output.round_exact(dot, query, stored, bounds, &mut Vec::new())
+}
+
+fn positively_proportional(query: &[f32], stored: &[f32]) -> bool {
+    let Some((&query_pivot, &stored_pivot)) = query.iter().zip(stored).find(|(q, _)| **q != 0.0)
+    else {
+        return false;
+    };
+    let query_pivot = f64::from(query_pivot);
+    let stored_pivot = f64::from(stored_pivot);
+    // Both cross products are exact because the coordinates are finite f32.
+    query_pivot * stored_pivot > 0.0
+        && query
+            .iter()
+            .zip(stored)
+            .all(|(&q, &s)| f64::from(q) * stored_pivot == f64::from(s) * query_pivot)
 }
 
 /// Bound the cosine distance as half the squared difference of unit vectors.
@@ -645,6 +660,25 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn test_cosine_distance_for_exact_rescalings() {
+        let mut query: Vec<_> = (0..256).map(|i| ((31 * i % 27) - 13) as f32).collect();
+        query[0] = 0.0;
+        let prepared = VectorSearchMetric::Cosine.prepare_query(&query);
+        for scale in 2..=17 {
+            let stored: Vec<_> = query.iter().map(|&value| value * scale as f32).collect();
+            assert!(positively_proportional(&query, &stored));
+            assert_eq!(prepared.compute_distance(&stored), 0.0);
+            let opposite: Vec<_> = stored.iter().map(|&value| -value).collect();
+            assert!(!positively_proportional(&query, &opposite));
+            assert_eq!(prepared.compute_distance(&opposite), 2.0);
+        }
+        let mut nearby = query.clone();
+        nearby[0] = 2.0_f32.powi(-50);
+        assert!(!positively_proportional(&query, &nearby));
+        assert!(prepared.compute_distance(&nearby) > 0.0);
     }
 
     #[test]

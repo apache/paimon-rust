@@ -424,13 +424,15 @@ fn test_raw_cosine_matrix_refines_mixed_sign_rounding_bounds() {
         Ok(cosine_similarity(&query, query_norms[0], &row))
     );
 
-    let query_indices = [1, 0, 1, 0];
-    let query_matrix: Vec<_> = query_indices
-        .iter()
-        .flat_map(|&index| queries[index].iter().copied().map(f64::from))
-        .collect();
-    // Exercise pairwise refinement and batched refinement.
-    for row_count in [2, 32] {
+    // Exercise pairwise refinement, batched refinement, and partial blocks
+    // in both result dimensions.
+    let block_edge = RAW_COSINE_ABSOLUTE_BLOCK_VECTORS + 1;
+    for (query_count, row_count) in [(4, 2), (4, 32), (4, block_edge), (block_edge, 32)] {
+        let query_indices: Vec<_> = [1, 0].into_iter().cycle().take(query_count).collect();
+        let query_matrix: Vec<_> = query_indices
+            .iter()
+            .flat_map(|&index| queries[index].iter().copied().map(f64::from))
+            .collect();
         let rows: Vec<_> = [&row, &other_row]
             .into_iter()
             .cycle()
@@ -462,6 +464,50 @@ fn test_raw_cosine_matrix_refines_mixed_sign_rounding_bounds() {
             }
         }
     }
+}
+
+#[test]
+fn test_raw_cosine_matrix_certifies_orthogonal_integer_dots() {
+    let dimension = 256;
+    let hadamard = |row: usize| {
+        (0..dimension).map(move |column| {
+            if (row & column).count_ones().is_multiple_of(2) {
+                1.0
+            } else {
+                -1.0
+            }
+        })
+    };
+    let queries: Vec<_> = (0..4).flat_map(hadamard).collect();
+    let stored: Vec<_> = (4..20).flat_map(hadamard).collect();
+    let stored_norms: Vec<_> = stored
+        .chunks_exact(dimension)
+        .map(DenseCosineNorm::new)
+        .collect();
+    let query_norms = queries
+        .chunks_exact(dimension)
+        .map(cosine_norm)
+        .collect::<Vec<_>>();
+    assert!(integer_dot_is_exact(
+        max_abs_integer(&queries),
+        stored_norms[0].max_abs_integer,
+        dimension
+    ));
+    let large = 2.0_f64.powi(26);
+    assert!(!integer_dot_is_exact(Some(large), Some(large), dimension));
+    assert_eq!(max_abs_integer(&[1.0, 0.25]), None);
+    assert_eq!(max_abs_integer(&[1.0, f64::INFINITY]), None);
+
+    let scores = compute_raw_cosine_score_matrix(
+        &stored,
+        &stored_norms,
+        &queries,
+        &query_norms,
+        &[0, 1, 2, 3],
+        dimension,
+    )
+    .unwrap();
+    assert_eq!(scores, vec![0.0; 4 * 16]);
 }
 
 #[test]

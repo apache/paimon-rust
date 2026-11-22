@@ -113,13 +113,14 @@ impl PrimaryKeySearchPosition {
 
     pub(crate) fn from_vector_position(
         position: &crate::vector_search::PrimaryKeySearchPosition,
+        score: f32,
     ) -> crate::Result<Self> {
         Self::new(
             position.partition.clone(),
             position.bucket,
             position.data_file_name.clone(),
             position.row_position,
-            position.score,
+            score,
         )
     }
 
@@ -220,20 +221,17 @@ mod tests {
     }
 
     #[test]
-    fn from_vector_position_preserves_score_and_validates_position() {
-        // GlobalIndexResult already converted distance to score; fusion must preserve it.
+    fn from_vector_position_uses_supplied_score_and_validates_position() {
         let mut hit = vector_position(0.5);
-        let position = PrimaryKeySearchPosition::from_vector_position(&hit).unwrap();
-        assert_eq!(position.score(), 0.5);
+        let position = PrimaryKeySearchPosition::from_vector_position(&hit, -0.25).unwrap();
+        assert_eq!(position.score(), -0.25);
         assert_eq!(position.row_position(), 0);
         assert_eq!(position.data_file_name(), "f");
         for score in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            hit.score = score;
-            assert!(PrimaryKeySearchPosition::from_vector_position(&hit).is_err());
+            assert!(PrimaryKeySearchPosition::from_vector_position(&hit, score).is_err());
         }
-        hit.score = 0.5;
         hit.row_position = -1;
-        assert!(PrimaryKeySearchPosition::from_vector_position(&hit).is_err());
+        assert!(PrimaryKeySearchPosition::from_vector_position(&hit, hit.score).is_err());
     }
 
     #[test]

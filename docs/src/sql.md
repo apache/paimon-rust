@@ -3156,7 +3156,12 @@ Larger refine factors may improve recall and ordering quality, but they also
 increase index result merging, raw-vector reads, and exact scoring work. Use the
 smallest factor that provides the desired recall.
 
-### Exact Cosine Distance on Primary-Key Tables
+### Exact Cosine Scoring in Rust and Java
+
+For the cosine metric on Data Evolution tables, exact raw scans and reranking
+rank by similarity. Rust accumulates the dot product in wider precision. Java
+can accumulate it in `float`, where cancellation can change scores and the
+Top-K order of closely matched candidates.
 
 Rust's exact scans and reranking on primary-key tables round the cosine distance
 (`1 - cosine`) to `f32`. The Java scorer rounds the similarity to `float` before

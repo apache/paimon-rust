@@ -53,6 +53,8 @@ struct IndexReadContext {
     table: Arc<Table>,
     vector_column: Option<String>,
     positions: Option<Vec<PrimaryKeySearchPosition>>,
+    // Aligned with positions so rank-based fusion can use the original distance order.
+    cosine_distances: Option<Vec<f32>>,
 }
 
 /// An evaluated global-index selection, accepted directly by table scans.
@@ -106,6 +108,7 @@ impl GlobalIndexResult {
                 table,
                 vector_column: Some(vector_column),
                 positions: None,
+                cosine_distances: None,
             }),
         }
     }
@@ -119,6 +122,7 @@ impl GlobalIndexResult {
                 table,
                 vector_column: None,
                 positions: None,
+                cosine_distances: None,
             }),
         }
     }
@@ -141,7 +145,7 @@ impl GlobalIndexResult {
             .collect();
         let splits =
             super::pk_full_text_read::build_full_text_indexed_splits(candidates, source_splits)?;
-        Self::from_indexed_splits(table, snapshot_id, positions, splits)
+        Self::from_indexed_splits(table, snapshot_id, positions, splits, None)
     }
 
     pub(super) fn from_primary_key(
@@ -151,6 +155,12 @@ impl GlobalIndexResult {
         source_splits: &[PkVectorSearchSplit],
         metric: VectorSearchMetric,
     ) -> crate::Result<Self> {
+        let cosine_distances = (metric == VectorSearchMetric::Cosine).then(|| {
+            candidates
+                .iter()
+                .map(|candidate| candidate.distance)
+                .collect()
+        });
         let positions = candidates
             .iter()
             .map(|c| PrimaryKeySearchPosition {
@@ -162,7 +172,7 @@ impl GlobalIndexResult {
             })
             .collect();
         let splits = build_indexed_splits(candidates, source_splits, metric)?;
-        Self::from_indexed_splits(table, snapshot_id, positions, splits)
+        Self::from_indexed_splits(table, snapshot_id, positions, splits, cosine_distances)
     }
 
     fn from_indexed_splits(
@@ -170,6 +180,7 @@ impl GlobalIndexResult {
         snapshot_id: i64,
         positions: Vec<PrimaryKeySearchPosition>,
         splits: Vec<PkVectorIndexedSplit>,
+        cosine_distances: Option<Vec<f32>>,
     ) -> crate::Result<Self> {
         let splits = splits
             .into_iter()
@@ -188,6 +199,7 @@ impl GlobalIndexResult {
                 table,
                 vector_column: None,
                 positions: Some(positions),
+                cosine_distances,
             }),
         })
     }
@@ -257,6 +269,10 @@ impl GlobalIndexResult {
                     "Ranked physical positions are only available on primary-key search results"
                         .into(),
             })
+    }
+
+    pub(super) fn primary_key_cosine_distances(&self) -> Option<&[f32]> {
+        self.read_context.as_ref()?.cosine_distances.as_deref()
     }
 
     /// Snapshot-scoped PK selections, including ranges and aligned scores.
