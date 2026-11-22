@@ -60,10 +60,7 @@ pub(in crate::table) fn validate_vector_batch(
     })
 }
 
-pub(in crate::table) fn validate_contiguous_row_id(
-    row_id: i64,
-    expected_row_id: &mut i64,
-) -> Result<()> {
+fn validate_contiguous_row_id(row_id: i64, expected_row_id: &mut i64) -> Result<()> {
     if row_id != *expected_row_id {
         return Err(Error::DataInvalid {
             message: format!(

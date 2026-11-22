@@ -1229,10 +1229,10 @@ async fn evaluate_batch_vector_search_with_executor(
                     .remove(entry.index_file.file_name.as_str())
                     .unwrap_or_default();
                 let meta = entry.index_file.global_index_meta.as_ref().unwrap();
-                let is_centroid = !centroid_files.is_empty();
+                let prefilter_deleted = !centroid_files.is_empty() || list_scoring.is_some();
                 let deleted = deleted_row_index.as_ref();
-                // Deleted rows must not consume the routed candidate budget.
-                let live_rows = if is_centroid {
+                // Reserve centroid and MultiVector candidate budgets for live rows.
+                let live_rows = if prefilter_deleted {
                     deleted
                         .and_then(|deleted| {
                             local_live_row_ids(deleted, meta.row_range_start, meta.row_range_end)
@@ -1245,7 +1245,7 @@ async fn evaluate_batch_vector_search_with_executor(
                     index_search_limit,
                     meta.row_range_start,
                     meta.row_range_end,
-                    if is_centroid { None } else { deleted },
+                    if prefilter_deleted { None } else { deleted },
                 )
                 .min(i32::MAX as usize);
                 let mut searches = indexed_searches.to_vec();

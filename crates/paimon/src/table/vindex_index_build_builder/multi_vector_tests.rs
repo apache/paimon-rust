@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use crate::spec::VectorType;
+use crate::spec::{Datum, PredicateBuilder, VectorType};
 use crate::table::{SearchTask, SearchTaskExecutor, SearchTaskResult};
 use arrow_array::Array;
 
@@ -176,6 +176,122 @@ async fn multi_vector_indexes_rank_distinct_rows_and_rerank_the_full_candidate_u
             [5, 7, 1]
         );
     }
+}
+
+#[tokio::test]
+async fn multi_vector_post_filter_counts_only_live_candidate_rows() {
+    let path = "memory:/multivector_live_candidates";
+    let table = test_table_with_io(
+        FileIOBuilder::new("memory").build().unwrap(),
+        path,
+        list_schema(true),
+    )
+    .copy_with_options(HashMap::from([(
+        "deletion-vectors.enabled".into(),
+        "true".into(),
+    )]));
+    setup_dirs(table.file_io(), path).await;
+    append_lists(
+        &table,
+        0,
+        true,
+        &[
+            Some(vec![Some([1.0, 0.0]); 8]),
+            Some(vec![Some([0.8, 0.6])]),
+            Some(vec![Some([0.0, 1.0])]),
+        ],
+    )
+    .await;
+    table
+        .new_global_index_build_builder()
+        .with_index_column("chunks")
+        .with_index_type("ivf-flat")
+        .with_options(HashMap::from([("ivf-flat.nlist".into(), "1".into())]))
+        .execute()
+        .await
+        .unwrap();
+    let writer = table.new_write_builder();
+    let update = writer.new_update().unwrap();
+    writer
+        .new_commit()
+        .commit(update.delete_by_row_id(vec![0]).await.unwrap())
+        .await
+        .unwrap();
+
+    let mut search = table.new_vector_search_builder();
+    search
+        .with_vector_column("chunks")
+        .with_multi_vector(vec![vec![1.0, 0.0]])
+        .with_limit(1)
+        .with_filter(
+            PredicateBuilder::new(table.schema().fields())
+                .equal("id", Datum::Int(2))
+                .unwrap(),
+        )
+        .with_options(HashMap::from([
+            ("refine_factor".into(), "1".into()),
+            (
+                "vector-index.post-filter.candidates-factor".into(),
+                "2".into(),
+            ),
+        ]));
+    let plan = search.new_scan().unwrap().plan().await.unwrap();
+    let reader = search.new_read().unwrap();
+    let local = reader.read(plan.clone()).await.unwrap();
+    let scheduled = reader
+        .read_with_executor(plan, &Worker(&table))
+        .await
+        .unwrap();
+    for result in [local, scheduled] {
+        assert_eq!(result.row_ids().unwrap().row_ids, [2]);
+    }
+}
+
+#[tokio::test]
+async fn multi_vector_declared_index_uses_cosine_without_a_metric_override() {
+    let path = "memory:/multivector_declared_cosine";
+    let table = test_table_with_io(
+        FileIOBuilder::new("memory").build().unwrap(),
+        path,
+        list_schema(true),
+    )
+    .copy_with_options(HashMap::from([
+        ("write-only".into(), "false".into()),
+        (
+            "global-index.ivf-flat.index-columns".into(),
+            "chunks".into(),
+        ),
+        ("ivf-flat.nlist".into(), "1".into()),
+    ]));
+    setup_dirs(table.file_io(), path).await;
+    table
+        .new_global_index_build_builder()
+        .with_index_column("chunks")
+        .with_index_type("ivf-flat")
+        .plan()
+        .await
+        .unwrap();
+    append_lists(
+        &table,
+        0,
+        true,
+        &[Some(vec![Some([10.0, 10.0])]), Some(vec![Some([1.0, 0.0])])],
+    )
+    .await;
+    let result = table
+        .new_vector_search_builder()
+        .with_vector_column("chunks")
+        .with_multi_vector(vec![vec![1.0, 0.0]])
+        .with_limit(1)
+        .with_options(HashMap::from([(
+            "vector-index.search-mode".into(),
+            "fast".into(),
+        )]))
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(result.row_ids().unwrap().row_ids, [1]);
+    assert_eq!(result.row_ids().unwrap().scores, [1.0]);
 }
 
 #[tokio::test]

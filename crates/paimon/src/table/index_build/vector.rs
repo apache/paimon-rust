@@ -312,8 +312,7 @@ pub(in crate::table) async fn write_payload(
     range: RowRange,
     index_meta: Vec<u8>,
 ) -> Result<Option<IndexPayload>> {
-    let mut spill =
-        VectorSpill::new(range, options.dimension())?.with_multi_vector(options.multi_vector);
+    let mut spill = VectorSpill::new(range, options.dimension())?;
     while let Some(batch) = batches.try_next().await? {
         spill.push_batch(&batch, column, false).await?;
     }
