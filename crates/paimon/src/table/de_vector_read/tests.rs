@@ -890,8 +890,7 @@ fn test_collect_raw_batch_vector_batch_respects_fixed_size_list_offset() {
     assert_eq!(top_k.pop().unwrap().into_search_result().row_ids, vec![11]);
 }
 
-#[test]
-fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
+fn raw_batch_with_null_vector_element() -> RecordBatch {
     let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
     let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element_field);
     for vector in [
@@ -915,14 +914,19 @@ fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
         ),
         ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, true),
     ]));
-    let batch = RecordBatch::try_new(
+    RecordBatch::try_new(
         schema,
         vec![
             Arc::new(builder.finish()) as ArrayRef,
             Arc::new(Int64Array::from(vec![Some(10), Some(11), Some(12)])) as ArrayRef,
         ],
     )
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
+    let batch = raw_batch_with_null_vector_element();
     let shared_include: Arc<RoaringTreemap> = Arc::new(std::iter::once(12).collect());
     for (included, shared) in [([12, 12], true), ([12, 11], false)] {
         let searches = included
@@ -962,6 +966,35 @@ fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
             assert_eq!(result.row_ids, vec![row_id]);
             assert_eq!(result.scores.len(), 1);
         }
+    }
+}
+
+#[test]
+fn test_collect_raw_batch_vector_batch_rejects_selected_null_vector_element() {
+    let batch = raw_batch_with_null_vector_element();
+    let query = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+    let valid_row = query
+        .clone()
+        .with_include_row_ids(std::iter::once(12).collect());
+    let null_row = query
+        .clone()
+        .with_include_row_ids(std::iter::once(10).collect());
+    for other_query in [null_row, query] {
+        let searches = [valid_row.clone(), other_query];
+        let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
+        let mut top_k = [RawScoreTopK::new(2), RawScoreTopK::new(2)];
+        let error = collect_raw_batch_vector_batch(
+            &batch,
+            &searches,
+            RawVectorMetric::L2,
+            &scoring_plan,
+            &mut top_k,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, crate::Error::DataInvalid { message, .. } if message.contains("null vector element")),
+            "{error}"
+        );
     }
 }
 
