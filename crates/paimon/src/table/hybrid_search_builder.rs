@@ -36,12 +36,15 @@ use crate::table::pk_full_text_scan::PrimaryKeyFullTextScan;
 use crate::table::pk_search_position::PrimaryKeySearchPosition;
 use crate::table::pk_search_ranker::{self, Ranking};
 use crate::table::pk_vector_indexed_split_read::{PkVectorIndexedSplit, PkVectorIndexedSplitRead};
+use crate::table::pk_vector_orchestrator::build_indexed_splits;
 use crate::table::source::DataSplit;
 use crate::table::vector_search_common::{
-    collect_ranked_rows, ensure_no_reserved_read_columns, reorder_and_strip_position, RankedRow,
+    collect_ranked_rows, ensure_no_reserved_read_columns, reorder_and_strip_position,
+    take_only_result, RankedRow,
 };
 use crate::table::{ArrowRecordBatchStream, GlobalIndexResult, RowRange, Table};
 use crate::vector_search::ScoredRowIds;
+use crate::vindex::pkvector::metric::VectorSearchMetric;
 
 const RRF_K: f32 = 60.0;
 const MAX_ROUTE_WORKERS: usize = 4;
@@ -883,7 +886,7 @@ impl<'a> HybridSearchBuilder<'a> {
             .map(|snapshot| self.table.copy_with_pinned_snapshot(Some(&snapshot))))
     }
 
-    /// Consume the vector search's scored positions, retaining its source files
+    /// Consume the raw vector candidates, retaining their source files
     /// and pinned snapshot for fusion before materialization.
     async fn pk_vector_route(
         &self,
@@ -891,27 +894,34 @@ impl<'a> HybridSearchBuilder<'a> {
         route: &HybridSearchRoute,
     ) -> crate::Result<PkRoute> {
         let builder = self.vector_route_builder(table, route);
-        let result = builder.execute().await?;
-        let cosine_distances = result.primary_key_cosine_distances();
-        let positions = result
-            .positions()?
+        let (scan, read) = builder.new_scan_and_read()?;
+        let result = read.search_primary_key(scan.plan().await?).await?;
+        let candidates = take_only_result(result.candidates, "vector search")?;
+        let cosine_distance_scores = result.metric == VectorSearchMetric::Cosine;
+        let positions = candidates
             .iter()
-            .enumerate()
-            .map(|(index, position)| {
+            .map(|candidate| {
                 // Negation preserves distance order and ties for RRF and MRR.
                 // Min-max normalization also works on -distance because it
                 // cancels the constant in the public cosine score 1 - distance.
-                let score = cosine_distances.map_or(position.score, |distances| -distances[index]);
-                PrimaryKeySearchPosition::from_vector_position(position, score)
+                let score = if cosine_distance_scores {
+                    -candidate.distance
+                } else {
+                    result.metric.distance_to_score(candidate.distance)
+                };
+                PrimaryKeySearchPosition::from_vector_candidate(candidate, score)
             })
             .collect::<crate::Result<Vec<_>>>()?;
-        let source_splits = result.splits()?.to_vec();
+        let source_splits = build_indexed_splits(candidates, &result.source_splits, result.metric)?
+            .into_iter()
+            .map(|split| split.split)
+            .collect();
         Ok(PkRoute {
             positions,
             source_splits,
-            snapshot_id: result.snapshot_id().unwrap_or(0),
+            snapshot_id: result.snapshot_id,
             weight: route.weight as f64,
-            cosine_distance_scores: cosine_distances.is_some(),
+            cosine_distance_scores,
         })
     }
 

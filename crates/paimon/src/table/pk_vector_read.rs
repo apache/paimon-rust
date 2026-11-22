@@ -54,6 +54,13 @@ use futures::{stream, TryStreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+pub(super) struct PkVectorSearchBatch {
+    pub(super) candidates: Vec<Vec<PkVectorCandidate>>,
+    pub(super) source_splits: Vec<PkVectorSearchSplit>,
+    pub(super) snapshot_id: i64,
+    pub(super) metric: VectorSearchMetric,
+}
+
 pub(super) struct PkVectorRead {
     table: Table,
     options: HashMap<String, String>,
@@ -82,12 +89,12 @@ impl PkVectorRead {
             limit,
         }
     }
-}
 
-impl Read for PkVectorRead {
-    type Plan = PkVectorScanPlan;
-
-    async fn read(&self, plan: PkVectorScanPlan) -> crate::Result<Vec<GlobalIndexResult>> {
+    /// Search the pinned plan with distances and file references intact.
+    pub(super) async fn search(
+        &self,
+        plan: PkVectorScanPlan,
+    ) -> crate::Result<PkVectorSearchBatch> {
         let core = CoreOptions::new(self.table.schema().options());
         let queries: Vec<&[f32]> = self.queries.iter().map(Vec::as_slice).collect();
         let mut metadata_type = None;
@@ -147,16 +154,31 @@ impl Read for PkVectorRead {
             &params,
         )
         .await?;
+        Ok(PkVectorSearchBatch {
+            candidates,
+            source_splits: plan.splits,
+            snapshot_id: plan.snapshot_id,
+            metric: params.metric,
+        })
+    }
+}
+
+impl Read for PkVectorRead {
+    type Plan = PkVectorScanPlan;
+
+    async fn read(&self, plan: PkVectorScanPlan) -> crate::Result<Vec<GlobalIndexResult>> {
+        let result = self.search(plan).await?;
         let table = Arc::new(self.table.clone());
-        candidates
+        result
+            .candidates
             .into_iter()
             .map(|candidates| {
                 GlobalIndexResult::from_primary_key(
                     table.clone(),
-                    plan.snapshot_id,
+                    result.snapshot_id,
                     candidates,
-                    &plan.splits,
-                    params.metric,
+                    &result.source_splits,
+                    result.metric,
                 )
             })
             .collect()
