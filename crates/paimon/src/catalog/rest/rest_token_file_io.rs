@@ -199,6 +199,10 @@ impl FileIOProvider for RESTTokenFileIO {
         let (op, relative_path) = file_io.create_static(path)?;
         Ok((op, relative_path, Some(cache_namespace)))
     }
+
+    fn requires_parent_dir_for_write(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

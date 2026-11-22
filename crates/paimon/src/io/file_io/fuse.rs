@@ -65,6 +65,10 @@ impl FileIOProvider for FuseFileIO {
         }
         self.fallback.create_with_cache_namespace(path).await
     }
+
+    fn requires_parent_dir_for_write(&self) -> bool {
+        self.fallback.requires_parent_dir_for_write()
+    }
 }
 
 impl FuseFileIO {

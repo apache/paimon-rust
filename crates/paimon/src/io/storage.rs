@@ -555,6 +555,41 @@ impl Storage {
             super::s3_config_build(config, path)
         })
     }
+
+    /// Whether opening a file for writing requires calling `create_dir` on its
+    /// parent directory first.
+    ///
+    /// Built-in storage services either accept object keys directly without
+    /// directory markers or create missing parent directories in their write
+    /// path. `CustomFs` wraps an unclassified caller-supplied operator, so keep
+    /// parent directory creation enabled for compatibility.
+    pub(crate) fn requires_parent_dir_for_write(&self) -> bool {
+        match self {
+            Storage::CustomFs { .. } => true,
+            #[cfg(feature = "storage-memory")]
+            Storage::Memory { .. } => false,
+            #[cfg(feature = "storage-fs")]
+            Storage::LocalFs { .. } => false,
+            #[cfg(feature = "storage-oss")]
+            Storage::Oss { .. } => false,
+            #[cfg(feature = "storage-oss-cpp")]
+            Storage::OssCpp { .. } => false,
+            #[cfg(feature = "storage-jindo")]
+            Storage::Jindo { .. } => false,
+            #[cfg(feature = "storage-s3")]
+            Storage::S3 { .. } => false,
+            #[cfg(feature = "storage-cos")]
+            Storage::Cos { .. } => false,
+            #[cfg(feature = "storage-azdls")]
+            Storage::Azdls { .. } => false,
+            #[cfg(feature = "storage-obs")]
+            Storage::Obs { .. } => false,
+            #[cfg(feature = "storage-gcs")]
+            Storage::Gcs { .. } => false,
+            #[cfg(feature = "storage-hdfs")]
+            Storage::Hdfs { .. } => false,
+        }
+    }
 }
 
 #[cfg(test)]

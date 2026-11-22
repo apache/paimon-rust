@@ -110,6 +110,17 @@ pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
         let (op, relative_path) = self.create(path).await?;
         Ok((op, relative_path, None))
     }
+
+    /// Whether opening a file for writing requires calling `create_dir` on its
+    /// parent directory first.
+    ///
+    /// Defaults to `true` for compatibility with hierarchical backends that
+    /// require parent directories to exist before writing. Providers backed by
+    /// object stores or operators that create missing parent directories on
+    /// write may return `false` to avoid extra directory marker requests.
+    fn requires_parent_dir_for_write(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -542,6 +553,14 @@ impl FileIO {
         Ok((op, relative_path, cache_path))
     }
 
+    #[cfg(feature = "storage-fs")]
+    pub(crate) fn requires_parent_dir_for_write(&self) -> bool {
+        match &self.backend {
+            FileIOBackend::Storage(storage) => storage.requires_parent_dir_for_write(),
+            FileIOBackend::Provider(provider) => provider.requires_parent_dir_for_write(),
+        }
+    }
+
     fn file_source(&self, path: &str) -> crate::Result<FileSource> {
         match &self.backend {
             FileIOBackend::Provider(provider) => Ok(FileSource::Provider(provider.clone())),
@@ -552,15 +571,14 @@ impl FileIO {
                 #[cfg(feature = "storage-fs")]
                 let local_fs = matches!(storage.as_ref(), Storage::LocalFs { .. });
                 #[cfg(not(feature = "storage-fs"))]
-                let local_fs = {
-                    let _ = storage;
-                    false
-                };
+                let local_fs = false;
+                let requires_parent_dir = storage.requires_parent_dir_for_write();
                 Ok(FileSource::Static {
                     op,
                     relative_path,
                     cache_path,
                     local_fs,
+                    requires_parent_dir,
                 })
             }
         }
@@ -1747,6 +1765,7 @@ enum FileSource {
         relative_path: String,
         cache_path: String,
         local_fs: bool,
+        requires_parent_dir: bool,
     },
     Provider(Arc<dyn FileIOProvider>),
 }
@@ -1768,6 +1787,35 @@ impl FileSource {
                 ..
             } => Ok((op.clone(), relative_path.clone(), Some(cache_path.clone()))),
         }
+    }
+
+    async fn resolve_for_write(
+        &self,
+        path: &str,
+    ) -> crate::Result<(Operator, String, Option<String>)> {
+        let (op, relative_path, cache_path) = self.resolve(path).await?;
+        let requires_parent_dir = match self {
+            Self::Static {
+                requires_parent_dir,
+                ..
+            } => *requires_parent_dir,
+            Self::Provider(provider) => provider.requires_parent_dir_for_write(),
+        };
+        if requires_parent_dir && op.info().capability().create_dir {
+            let trimmed = relative_path.trim_end_matches('/');
+            if let Some((parent, _)) = trimmed.rsplit_once('/') {
+                if !parent.trim_matches('/').is_empty() {
+                    let dir_path = normalize_root(parent);
+                    op.create_dir(&dir_path).await.map_err(|error| {
+                        Error::from_opendal_with_context(
+                            error,
+                            format!("Failed to create parent directory for '{path}'"),
+                        )
+                    })?;
+                }
+            }
+        }
+        Ok((op, relative_path, cache_path))
     }
 }
 
@@ -1958,7 +2006,7 @@ impl OutputFile {
     }
 
     pub async fn writer(&self) -> crate::Result<Box<dyn FileWrite>> {
-        let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
+        let (op, relative_path, cache_path) = self.source.resolve_for_write(&self.path).await?;
         let writer: Box<dyn FileWrite> = Box::new(
             op.writer_with(&relative_path)
                 .chunk(8 * 1024 * 1024)
@@ -1971,7 +2019,7 @@ impl OutputFile {
     /// bulk output path unchanged; do not install OpenDAL's fixed-size chunk
     /// queue here because it cannot drain a partial chunk before close.
     pub(crate) async fn flushable_writer(&self) -> crate::Result<Box<dyn FileWrite>> {
-        let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
+        let (op, relative_path, cache_path) = self.source.resolve_for_write(&self.path).await?;
         let writer: Box<dyn FileWrite> =
             if matches!(self.source, FileSource::Static { local_fs: true, .. }) {
                 Box::new(LocalFileWriter::new(&op, &relative_path).await?)
@@ -2003,7 +2051,7 @@ impl OutputFile {
 
     /// Get an async streaming writer for format-level writes (e.g. parquet).
     pub(crate) async fn async_writer(&self) -> crate::Result<Box<dyn AsyncFileWrite>> {
-        let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
+        let (op, relative_path, cache_path) = self.source.resolve_for_write(&self.path).await?;
         let writer: Box<dyn AsyncFileWrite> = Box::new(
             op.writer_with(&relative_path)
                 .chunk(8 * 1024 * 1024)
