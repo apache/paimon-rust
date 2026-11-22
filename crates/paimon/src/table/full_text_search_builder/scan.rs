@@ -239,11 +239,6 @@ impl FullTextScan {
                 }
                 entries = selected;
             }
-            if self.context.filter.is_some() {
-                entries = crate::table::global_index_schema::GlobalIndexSchema::new(&table)
-                    .filter_entries(entries)
-                    .await;
-            }
             super::super::search_scan_split::global_search_splits(
                 &table,
                 &entries,

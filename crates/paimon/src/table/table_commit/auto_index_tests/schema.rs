@@ -584,6 +584,50 @@ async fn text_matches(table: &Table, query: &str, mode: &str) -> Vec<u64> {
     ids
 }
 
+#[tokio::test]
+async fn full_text_split_read_rechecks_scalar_index_schema() {
+    let original = evolve(
+        &analyzer_table().await,
+        vec![SchemaChange::set_option(
+            "global-index.btree.index-columns".into(),
+            "value".into(),
+        )],
+    )
+    .await;
+    TableCommit::new(original.clone(), "mixed-search-source".into())
+        .commit(text_messages(&original, 1, "sentinel").await)
+        .await
+        .unwrap();
+    let changed = evolve(
+        &original,
+        vec![
+            SchemaChange::UpdateColumnType {
+                field_names: vec!["value".into()],
+                new_data_type: DataType::Float(FloatType::new()),
+                keep_nullability: true,
+            },
+            SchemaChange::set_option("scalar-index.prefilter.search-mode".into(), "full".into()),
+        ],
+    )
+    .await;
+    let mut search = changed.new_full_text_search_builder();
+    search
+        .with_text_column("text")
+        .with_query_text("sentinel")
+        .with_limit(10);
+    let plan = search.new_scan().unwrap().scan().await.unwrap();
+    search.with_filter(
+        PredicateBuilder::new(changed.schema().fields())
+            .equal("value", Datum::Float(10.))
+            .unwrap(),
+    );
+
+    let direct = search.execute().await.unwrap();
+    assert_eq!(direct.row_ids().unwrap().row_ids, vec![0]);
+    let split_read = search.new_read().unwrap().read(plan).await.unwrap();
+    assert_eq!(split_read.row_ids().unwrap().row_ids, vec![0]);
+}
+
 async fn analyzer_table() -> Table {
     evolve(
         &table(Some(true), false).await,
