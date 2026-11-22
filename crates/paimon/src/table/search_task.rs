@@ -240,7 +240,7 @@ impl SearchTask {
             .copy_with_resolved_schema(self.schema.clone(), &self.branch)?
             .copy_with_pinned_snapshot(self.snapshot.as_ref());
         let payload = match self.kind.as_str() {
-            "vector-index" | "vector-index-filtered" | "vector-rows" => {
+            "vector-index" | "vector-index-filtered" | "vector-index-centroid" | "vector-rows" => {
                 super::de_vector_read::execute_search_task(&pinned, &self.kind, &self.payload)
                     .await?
             }

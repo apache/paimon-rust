@@ -17,6 +17,22 @@
 
 use super::*;
 use crate::table::centroid_index::{self, Descriptor, Role};
+use crate::table::{SearchTask, SearchTaskExecutor, SearchTaskResult};
+
+struct Worker<'a>(&'a Table);
+
+#[async_trait::async_trait]
+impl SearchTaskExecutor for Worker<'_> {
+    async fn execute(&self, tasks: Vec<SearchTask>) -> Result<Vec<SearchTaskResult>> {
+        let (context, frames) = SearchTask::serialize_batch(&tasks)?;
+        let mut results = Vec::with_capacity(frames.len());
+        for frame in frames {
+            let bytes = self.0.execute_search_task(&frame, &context).await?;
+            results.push(SearchTaskResult::deserialize(&bytes)?);
+        }
+        Ok(results)
+    }
+}
 
 async fn active_entries(table: &Table) -> Vec<crate::spec::IndexManifestEntry> {
     let manager = table.snapshot_manager();
@@ -203,7 +219,13 @@ async fn centroid_query_reads_java_model_and_native_shards_with_rebased_labels()
         .with_query_vector(vec![100., 0.])
         .with_limit(4)
         .with_options(HashMap::from([("centroid.nprobe".into(), "1".into())]));
-    let result = search.execute().await.unwrap();
+    let plan = search.new_scan().unwrap().plan().await.unwrap();
+    let result = search
+        .new_read()
+        .unwrap()
+        .read_with_executor(plan, &Worker(&table))
+        .await
+        .unwrap();
     assert_eq!(result.row_ids().unwrap().row_ids, [4, 5]);
 
     // Automatic routing searches both slots for this Top-K.
