@@ -17,8 +17,9 @@
 
 use super::*;
 use crate::spec::{Datum, PredicateBuilder, VectorType};
-use crate::table::{SearchTask, SearchTaskExecutor, SearchTaskResult};
+use crate::table::{DataSplit, SearchTask, SearchTaskExecutor, SearchTaskResult};
 use arrow_array::Array;
+use std::sync::Mutex;
 
 struct Worker<'a>(&'a Table);
 
@@ -32,6 +33,27 @@ impl SearchTaskExecutor for Worker<'_> {
             results.push(SearchTaskResult::deserialize(&result)?);
         }
         Ok(results)
+    }
+}
+
+struct RecordingWorker<'a> {
+    table: &'a Table,
+    list_reads: Mutex<Vec<serde_json::Value>>,
+}
+
+#[async_trait::async_trait]
+impl SearchTaskExecutor for RecordingWorker<'_> {
+    async fn execute(&self, tasks: Vec<SearchTask>) -> Result<Vec<SearchTaskResult>> {
+        for task in &tasks {
+            let work = serde_json::to_value(task).unwrap();
+            if work["kind"] == "vector-list-rows" {
+                self.list_reads
+                    .lock()
+                    .unwrap()
+                    .push(work["payload"].clone());
+            }
+        }
+        Worker(self.table).execute(tasks).await
     }
 }
 
@@ -295,6 +317,130 @@ async fn multi_vector_declared_index_uses_cosine_without_a_metric_override() {
 }
 
 #[tokio::test]
+async fn multi_vector_refinement_keeps_distinct_single_and_matrix_candidate_scopes() {
+    let path = "memory:/multivector_refine_scope";
+    let table = test_table_with_io(
+        FileIOBuilder::new("memory").build().unwrap(),
+        path,
+        list_schema(true),
+    );
+    setup_dirs(table.file_io(), path).await;
+    for (id, coordinates) in [[1., 0.], [0., 1.], [1., 1.]].into_iter().enumerate() {
+        append_lists(&table, id as i32, true, &[Some(vec![Some(coordinates)])]).await;
+    }
+    assert_eq!(
+        table
+            .new_global_index_build_builder()
+            .with_index_column("chunks")
+            .with_index_type("ivf-flat")
+            .with_options(HashMap::from([
+                ("ivf-flat.nlist".into(), "1".into()),
+                ("global-index.row-count-per-shard".into(), "1".into()),
+            ]))
+            .execute()
+            .await
+            .unwrap(),
+        3
+    );
+    let worker = RecordingWorker {
+        table: &table,
+        list_reads: Mutex::new(Vec::new()),
+    };
+    let options = HashMap::from([
+        ("refine_factor".into(), "1".into()),
+        ("vector-index.search-mode".into(), "fast".into()),
+    ]);
+    let mut search = table.new_batch_vector_search_builder();
+    search
+        .with_vector_column("chunks")
+        .with_query_vectors(vec![vec![1., 0.], vec![0., 1.]])
+        .with_limit(1)
+        .with_options(options.clone());
+    let plan = search.new_scan().unwrap().plan().await.unwrap();
+    let independent = search
+        .new_read()
+        .unwrap()
+        .read_with_executor(plan, &worker)
+        .await
+        .unwrap();
+    assert_eq!(independent[0].row_ids().unwrap().row_ids, [0]);
+    assert_eq!(independent[1].row_ids().unwrap().row_ids, [1]);
+    let selected_rows = |work: &[serde_json::Value]| {
+        let mut rows = std::collections::BTreeSet::new();
+        for payload in work {
+            let splits: Vec<DataSplit> = serde_json::from_value(payload["splits"].clone()).unwrap();
+            for split in splits {
+                for range in split.row_ranges().unwrap() {
+                    rows.extend(range.from()..=range.to());
+                }
+            }
+        }
+        rows.into_iter().collect::<Vec<_>>()
+    };
+    let work = std::mem::take(&mut *worker.list_reads.lock().unwrap());
+    assert_eq!(selected_rows(&work), [0, 1]);
+
+    let mut matrix = table.new_vector_search_builder();
+    matrix
+        .with_vector_column("chunks")
+        .with_multi_vector(vec![vec![1., 0.], vec![0., 1.]])
+        .with_limit(1)
+        .with_options(options);
+    let plan = matrix.new_scan().unwrap().plan().await.unwrap();
+    let read = matrix.new_read().unwrap();
+    let local = read.read(plan.clone()).await.unwrap();
+    let scheduled = read.read_with_executor(plan, &worker).await.unwrap();
+    assert_eq!(local.row_ids().unwrap().row_ids, [2]);
+    assert_eq!(scheduled.row_ids().unwrap().row_ids, [2]);
+    assert_eq!(
+        scheduled.row_ids().unwrap().scores,
+        local.row_ids().unwrap().scores
+    );
+    let work = worker.list_reads.lock().unwrap();
+    assert_eq!(selected_rows(&work), [0, 1, 2]);
+    assert!(work.iter().all(|payload| payload["queries"]["filters"]
+        .as_array()
+        .is_none_or(Vec::is_empty)));
+}
+
+#[tokio::test]
+async fn multi_vector_zero_scores_break_ties_by_row_id() {
+    let path = "memory:/multivector_zero_scores";
+    let table = test_table_with_io(
+        FileIOBuilder::new("memory").build().unwrap(),
+        path,
+        list_schema(true),
+    );
+    setup_dirs(table.file_io(), path).await;
+    append_lists(
+        &table,
+        0,
+        true,
+        &[Some(vec![Some([0., -1.])]), Some(vec![Some([0., 1.])])],
+    )
+    .await;
+    table
+        .new_global_index_build_builder()
+        .with_index_column("chunks")
+        .with_index_type("ivf-flat")
+        .with_options(HashMap::from([("ivf-flat.nlist".into(), "1".into())]))
+        .execute()
+        .await
+        .unwrap();
+    let result = table
+        .new_vector_search_builder()
+        .with_vector_column("chunks")
+        .with_multi_vector(vec![vec![-1., 0.], vec![-2., 0.]])
+        .with_limit(1)
+        .execute()
+        .await
+        .unwrap();
+    let scores = result.row_ids().unwrap();
+    assert_eq!(scores.row_ids, [0]);
+    assert_eq!(scores.scores[0].to_bits(), 0.0_f32.to_bits());
+}
+
+#[tokio::test]
 async fn multi_vector_build_and_query_reject_invalid_options_and_shapes() {
     let table = test_table_with_io(
         FileIOBuilder::new("memory").build().unwrap(),
@@ -342,4 +488,10 @@ async fn multi_vector_build_and_query_reject_invalid_options_and_shapes() {
         search.with_multi_vector(query);
         assert!(search.new_read().is_err());
     }
+    let mut batch = table.new_batch_vector_search_builder();
+    batch
+        .with_vector_column("chunks")
+        .with_limit(1)
+        .with_query_vectors(vec![vec![1.0], vec![1.0, 2.0]]);
+    assert!(batch.new_read().is_err());
 }

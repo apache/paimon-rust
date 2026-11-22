@@ -231,14 +231,7 @@ fn validate_list_queries(
             crate::spec::DataType::Vector(v) => Some(v.length() as usize),
             _ => None,
         };
-        if matrix {
-            validate_queries(queries, width)
-        } else {
-            for query in queries {
-                validate_queries(&[query], width)?;
-            }
-            Ok(())
-        }
+        validate_queries(queries, width)
     } else if matrix {
         Err(invalid("MaxSim queries require an embedding-list column"))
     } else {

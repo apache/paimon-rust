@@ -1366,11 +1366,12 @@ async fn evaluate_batch_vector_search_with_executor(
         };
         index_search = index_search_start.map_or(Duration::ZERO, |start| start.elapsed());
         let merge_start = timing_enabled.then(Instant::now);
-        for (per_entry, entry_timing) in &results {
+        for (per_entry, entry_timing) in results {
             permit_wait = permit_wait.saturating_add(entry_timing.permit_wait);
             file_reader_open = file_reader_open.saturating_add(entry_timing.file_reader_open);
-            for (query_index, result) in per_entry.iter().enumerate() {
-                merged[query_index] = merged[query_index].or(result);
+            for (merged, mut result) in merged.iter_mut().zip(per_entry) {
+                merged.row_ids.append(&mut result.row_ids);
+                merged.scores.append(&mut result.scores);
             }
         }
         merge = merge_start.map_or(Duration::ZERO, |start| start.elapsed());
@@ -1380,7 +1381,13 @@ async fn evaluate_batch_vector_search_with_executor(
         let refine_start = timing_enabled.then(Instant::now);
         let candidates = merged
             .into_iter()
-            .map(|result| result.without_deleted_row_ranges(deleted_row_index.as_ref()))
+            .map(|result| {
+                let result = result.without_deleted_row_ranges(deleted_row_index.as_ref())?;
+                Ok(match mode {
+                    ListScoring::Independent => result.top_k(index_search_limit),
+                    ListScoring::MaxSim => result,
+                })
+            })
             .collect::<crate::Result<Vec<_>>>()?;
         merged =
             rerank_list_candidates(evaluation, vector_searches, mode, candidates, executor).await?;
@@ -1784,13 +1791,17 @@ async fn rerank_list_candidates(
         crate::vindex::multi_vector::invalid("MultiVector reranking requires table context")
     })?;
     let mut searches = searches.to_vec();
-    let union = Arc::new(union);
     for (search, hits) in searches.iter_mut().zip(candidates) {
-        let include = match mode {
-            ListScoring::MaxSim => Arc::clone(&union),
-            ListScoring::Independent => Arc::new(hits.row_ids.into_iter().collect()),
-        };
-        search.set_shared_include_row_ids(include);
+        match mode {
+            ListScoring::Independent => {
+                search.set_shared_include_row_ids(Arc::new(hits.row_ids.into_iter().collect()));
+            }
+            ListScoring::MaxSim => {
+                // The read ranges already contain exactly the union of candidates.
+                search.include_row_ids = None;
+                search.shared_include_row_ids = None;
+            }
+        }
     }
     let (results, _) = read_raw_vector_scores(
         table,

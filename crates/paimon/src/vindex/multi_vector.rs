@@ -73,12 +73,9 @@ pub(crate) fn cosine(query: &[f32], query_norm: f64, vector: &[f32], vector_norm
     if denominator == 0.0 {
         return 0.0;
     }
-    vector
-        .iter()
-        .zip(query)
-        .map(|(&left, &right)| f64::from(left) * f64::from(right))
-        .sum::<f64>()
-        / denominator
+    vector.iter().zip(query).fold(0.0, |sum, (&left, &right)| {
+        sum + f64::from(left) * f64::from(right)
+    }) / denominator
 }
 
 enum Embeddings<'a> {

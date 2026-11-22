@@ -19,8 +19,8 @@ use crate::vector_search::{GlobalIndexIOMeta, VectorSearch};
 use crate::vindex::vector_search_timing_enabled;
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
-    IndexType, VectorIndexMetadata, VectorIndexReader as VIndexReader, VectorIndexReaderOptions,
-    VectorSearchParams,
+    IndexType, SearchWidth, VectorIndexMetadata, VectorIndexReader as VIndexReader,
+    VectorIndexReaderOptions, VectorSearchParams,
 };
 use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities};
 use std::collections::BinaryHeap;
@@ -315,10 +315,15 @@ impl VindexVectorGlobalIndexReader {
                     "MultiVector indexes require cosine similarity",
                 ));
             }
+            let prepared = prepare_batch_searches(metadata, &self.options, vector_searches, true)?;
             return vector_searches
                 .iter()
-                .map(|query| {
-                    search_distinct_rows(reader, metadata, &self.options, query, row_count)
+                .zip(prepared)
+                .map(|(query, prepared)| match prepared {
+                    Some(prepared) => {
+                        search_distinct_rows(reader, metadata, query, row_count, prepared)
+                    }
+                    None => Ok(None),
                 })
                 .collect();
         }
@@ -431,7 +436,7 @@ fn search_vindex(
     let Some(prepared) = prepare_search(metadata, options, vector_search)? else {
         return Ok(None);
     };
-    let (labels, distances) = execute_scalar_search(reader, vector_search, &prepared)?;
+    let (labels, distances) = execute_scalar_search(reader, &vector_search.vector, &prepared)?;
     let id_to_scores = collect_results(&labels, &distances, prepared.params.top_k, metadata.metric);
     if id_to_scores.is_empty() {
         return Ok(None);
@@ -465,7 +470,7 @@ fn prepare_search(
     options: &HashMap<String, String>,
     vector_search: &VectorSearch,
 ) -> crate::Result<Option<PreparedSearch>> {
-    prepare_search_with_shared_filter(metadata, options, vector_search, None)
+    prepare_search_with_shared_filter(metadata, options, vector_search, None, false)
 }
 
 fn prepare_search_with_shared_filter(
@@ -473,6 +478,7 @@ fn prepare_search_with_shared_filter(
     options: &HashMap<String, String>,
     vector_search: &VectorSearch,
     shared_filter_bytes: Option<&Arc<[u8]>>,
+    multi_vector: bool,
 ) -> crate::Result<Option<PreparedSearch>> {
     // Query options override the defaults of a reusable index reader.
     let mut merged_options;
@@ -499,10 +505,17 @@ fn prepare_search_with_shared_filter(
     if top_k == 0 {
         return Ok(None);
     }
-    let mut params = match (
+    let (nprobe, l_search) = (
         options.get(NPROBE_PARAMETER),
         options.get(L_SEARCH_PARAMETER),
-    ) {
+    );
+    // MultiVector uses the width for the shard's actual algorithm, as Java does.
+    let (nprobe, l_search) = match (multi_vector, metadata.index_type) {
+        (true, IndexType::DiskAnn) => (None, l_search),
+        (true, _) => (nprobe, None),
+        (false, _) => (nprobe, l_search),
+    };
+    let mut params = match (nprobe, l_search) {
         (Some(_), Some(_)) => {
             return Err(crate::Error::DataInvalid {
                 message: format!(
@@ -578,6 +591,7 @@ fn prepare_batch_searches(
     metadata: &VectorIndexMetadata,
     options: &HashMap<String, String>,
     vector_searches: &[VectorSearch],
+    multi_vector: bool,
 ) -> crate::Result<Vec<Option<PreparedSearch>>> {
     let shared_filter_bytes = shared_batch_include_row_ids(vector_searches)
         .filter(|include_row_ids| !include_row_ids.is_empty())
@@ -591,6 +605,7 @@ fn prepare_batch_searches(
                 options,
                 search,
                 shared_filter_bytes.as_ref(),
+                multi_vector,
             )
         })
         .collect()
@@ -598,59 +613,61 @@ fn prepare_batch_searches(
 
 fn execute_scalar_search(
     reader: &mut VIndexReader<impl SeekRead>,
-    vector_search: &VectorSearch,
+    vector: &[f32],
     prepared: &PreparedSearch,
 ) -> crate::Result<(Vec<i64>, Vec<f32>)> {
     let params = prepared.params;
     match &prepared.filter_bytes {
         Some(filter) => reader
-            .search_with_roaring_filter(&vector_search.vector, params, filter)
+            .search_with_roaring_filter(vector, params, filter)
             .map_err(|e| crate::Error::DataInvalid {
                 message: format!("paimon-vindex-core filtered search failed: {}", e),
                 source: Some(Box::new(e)),
             }),
-        None => {
-            reader
-                .search(&vector_search.vector, params)
-                .map_err(|e| crate::Error::DataInvalid {
-                    message: format!("paimon-vindex-core search failed: {}", e),
-                    source: Some(Box::new(e)),
-                })
-        }
+        None => reader
+            .search(vector, params)
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("paimon-vindex-core search failed: {}", e),
+                source: Some(Box::new(e)),
+            }),
     }
 }
 
-/// The native Top-K counts embeddings. Page through unseen row labels so
-/// several hits from one document cannot consume its neighbors' candidate slots.
+/// Some native algorithms return Top-K embeddings. Page through unseen row
+/// labels so several hits from one document cannot consume its neighbors' slots.
 fn search_distinct_rows(
     reader: &mut VIndexReader<impl SeekRead>,
     metadata: &VectorIndexMetadata,
-    options: &HashMap<String, String>,
     query: &VectorSearch,
     row_count: u64,
+    mut prepared: PreparedSearch,
 ) -> crate::Result<Option<HashMap<u64, f32>>> {
-    let Some(mut prepared) = prepare_search_with_shared_filter(metadata, options, query, None)?
-    else {
-        return Ok(None);
-    };
     super::multi_vector::validate_queries(&[&query.vector], Some(metadata.dimension))?;
     let limit = prepared.params.top_k;
     let vectors = usize::try_from(metadata.total_vectors).unwrap_or(0);
     let mut normalized = Vec::with_capacity(query.vector.len());
     super::multi_vector::normalize_into(&query.vector, &mut normalized);
-    let query = VectorSearch {
-        vector: normalized,
-        ..query.clone()
-    };
     let mut scores = HashMap::<u64, f32>::new();
-    let mut remaining = query.effective_include_row_ids().cloned();
+    let include = query.effective_include_row_ids();
+    let initial_params = prepared.params;
+    let graph_hits = if include.is_none() && metadata.index_type == IndexType::DiskAnn {
+        initial_params
+            .configured_diskann_l_search()
+            .unwrap_or_else(|| limit.saturating_mul(2).max(100))
+            .min(vectors)
+            .min(i32::MAX as usize)
+    } else {
+        0
+    };
+    let mut remaining = None;
     let mut requested = limit;
     loop {
         prepared.params.top_k = requested;
         let expected = remaining
             .as_ref()
+            .or(include)
             .map_or(requested, |ids| requested.min(ids.len() as usize));
-        let (ids, distances) = execute_scalar_search(reader, &query, &prepared)?;
+        let (ids, distances) = execute_scalar_search(reader, &normalized, &prepared)?;
         let previous_count = scores.len();
         let mut hits = 0;
         for (id, distance) in ids.into_iter().zip(distances) {
@@ -673,12 +690,21 @@ fn search_distinct_rows(
             }
         }
 
-        if scores.len() >= limit || hits < expected || hits == vectors {
+        let used_graph_retry = remaining.is_none() && requested == graph_hits && graph_hits > limit;
+        if scores.len() >= limit || (!used_graph_retry && hits < expected) || hits == vectors {
             break;
         }
 
+        let mut added = scores.len() - previous_count;
         if remaining.is_none() {
-            if row_count >> 16 > vectors as u64 {
+            // DiskANN treats an exclusion bitmap as a filtered scan. First try
+            // taking more embeddings from the configured graph frontier.
+            if requested < graph_hits {
+                requested = graph_hits;
+                prepared.params = VectorSearchParams::with_l_search(graph_hits, graph_hits);
+                continue;
+            }
+            if include.is_none() && row_count >> 16 > vectors as u64 {
                 // A filter spanning an exceptionally sparse range can cost
                 // more than widening the native search itself.
                 let next = requested
@@ -691,21 +717,36 @@ fn search_distinct_rows(
                 requested = next;
                 continue;
             }
-            let mut ids = roaring::RoaringTreemap::new();
-            ids.insert_range(0..row_count);
+            let mut ids = match include {
+                Some(ids) => ids.clone(),
+                None => {
+                    let mut ids = roaring::RoaringTreemap::new();
+                    ids.insert_range(0..row_count);
+                    ids
+                }
+            };
             for &id in scores.keys() {
                 ids.remove(id);
             }
+            added = scores.len();
             remaining = Some(ids);
+            prepared.params = initial_params;
+            if include.is_none()
+                && metadata.index_type != IndexType::DiskAnn
+                && prepared.params.search_width == SearchWidth::Auto
+            {
+                // Excluded labels are already collected. Their cardinality
+                // should not inflate the initial IVF probe count.
+                prepared.params = prepared.params.with_max_initial_filter_expansion_factor(1);
+            }
         }
         let remaining = remaining.as_ref().expect("remaining rows initialized");
-        let added = scores.len() - previous_count;
         let missing = (limit - scores.len()).min(remaining.len() as usize);
         if added == 0 || missing == 0 {
             break;
         }
         const MAX_RETRY_HITS: usize = 16_384;
-        requested = (missing as u128 * hits as u128)
+        requested = (missing as u128 * hits.max(added) as u128)
             .div_ceil(added as u128)
             .min(requested.saturating_mul(2) as u128)
             .min(vectors.min(limit.max(MAX_RETRY_HITS)) as u128) as usize;
@@ -732,7 +773,7 @@ fn search_batch_vindex(
         ..VindexBatchStats::default()
     });
 
-    for (index, prepared) in prepare_batch_searches(metadata, options, vector_searches)?
+    for (index, prepared) in prepare_batch_searches(metadata, options, vector_searches, false)?
         .into_iter()
         .enumerate()
     {
@@ -761,7 +802,7 @@ fn search_batch_vindex(
                 }
                 let index = indices[0];
                 let (labels, distances) =
-                    execute_scalar_search(reader, &vector_searches[index], &prepared)?;
+                    execute_scalar_search(reader, &vector_searches[index].vector, &prepared)?;
                 let map =
                     collect_results(&labels, &distances, prepared.params.top_k, metadata.metric);
                 if !map.is_empty() {
@@ -1044,6 +1085,7 @@ mod tests {
     use paimon_vindex_core::diskann_io::DiskAnnHeader;
     use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
     use paimon_vindex_core::io::{PosWriter, SeekReadCapabilities};
+    use paimon_vindex_core::ivfflat::IVFFlatIndex;
     use std::cell::Cell;
     use std::io::Cursor;
     use std::ops::Range;
@@ -1238,7 +1280,8 @@ mod tests {
         };
         let defaults = HashMap::from([(NPROBE_PARAMETER.into(), "1".into())]);
         let explicit = query().with_options(HashMap::from([(NPROBE_PARAMETER.into(), "7".into())]));
-        let prepared = prepare_batch_searches(&metadata, &defaults, &[explicit, query()]).unwrap();
+        let prepared =
+            prepare_batch_searches(&metadata, &defaults, &[explicit, query()], false).unwrap();
         assert_eq!(prepared[0].as_ref().unwrap().params.width, 7);
         assert_eq!(prepared[1].as_ref().unwrap().params.width, 1);
         let conflicting =
@@ -1373,7 +1416,8 @@ mod tests {
             search.set_shared_include_row_ids(Arc::clone(&shared_filter));
         }
 
-        let prepared = prepare_batch_searches(&metadata, &HashMap::new(), &searches).unwrap();
+        let prepared =
+            prepare_batch_searches(&metadata, &HashMap::new(), &searches, false).unwrap();
         let first = prepared[0]
             .as_ref()
             .and_then(|search| search.filter_bytes.as_ref())
@@ -1521,10 +1565,24 @@ mod tests {
             ("diskann.l_search".to_string(), "64".to_string()),
         ]);
         assert!(prepare_search(&metadata, &mixed_options, &query()).is_err());
+        let diskann = prepare_batch_searches(&metadata, &mixed_options, &[query()], true).unwrap();
+        assert_eq!(
+            diskann[0]
+                .as_ref()
+                .unwrap()
+                .params
+                .configured_diskann_l_search(),
+            Some(64)
+        );
 
         let mut ivf_metadata = metadata;
         ivf_metadata.index_type = IndexType::IvfFlat;
         assert!(prepare_search(&ivf_metadata, &mixed_options, &query()).is_err());
+        let ivf = prepare_batch_searches(&ivf_metadata, &mixed_options, &[query()], true).unwrap();
+        assert_eq!(
+            ivf[0].as_ref().unwrap().params.configured_ivf_nprobe(),
+            Some(4)
+        );
     }
 
     #[test]
@@ -1561,6 +1619,129 @@ mod tests {
             paimon_vindex_core::index::SearchWidth::IvfNProbe
         );
         assert_eq!(explicit.params.width, 32);
+    }
+
+    #[test]
+    fn multi_vector_diskann_keeps_duplicate_label_retry_on_the_graph() {
+        let dimension = 8;
+        let mut vectors = Vec::new();
+        let mut labels = Vec::new();
+        for id in 0..32 {
+            let angle = std::f32::consts::PI * id as f32 / 32.0;
+            let mut vector = [0.0; 8];
+            (vector[1], vector[0]) = angle.sin_cos();
+            for _ in 0..if id == 0 { 8 } else { 1 } {
+                vectors.extend_from_slice(&vector);
+                labels.push(id);
+            }
+        }
+        let config = VectorIndexConfig::DiskAnn {
+            dimension,
+            metric: MetricType::Cosine,
+            pq_m: 2,
+            pq_bits: 4,
+            build: DiskAnnBuildParams {
+                max_degree: 8,
+                build_search_list_size: 32,
+                ..DiskAnnBuildParams::default()
+            },
+            pq_train_max_points_per_centroid: 256,
+        };
+        let training = VectorIndexTrainer::train(config, &vectors, labels.len()).unwrap();
+        let mut writer = VectorIndexWriter::new(training);
+        writer.add_vectors(&labels, &vectors, labels.len()).unwrap();
+        let mut index = Vec::new();
+        writer.write(&mut PosWriter::new(&mut index)).unwrap();
+        let query =
+            VectorSearch::new(vectors[..dimension].to_vec(), 2, "embedding".into()).unwrap();
+
+        let mut reader = VIndexReader::open(Cursor::new(index)).unwrap();
+        let metadata = reader.metadata();
+        let params = VectorSearchParams::with_l_search(query.limit, 64);
+        assert_eq!(reader.search(&query.vector, params).unwrap().0, [0, 0]);
+
+        let prepared = PreparedSearch {
+            params,
+            filter_bytes: None,
+        };
+        let hits = search_distinct_rows(&mut reader, &metadata, &query, 32, prepared)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.contains_key(&0));
+        assert_eq!(
+            reader
+                .diskann_search_stats()
+                .unwrap()
+                .filtered_exhaustive_queries,
+            0
+        );
+    }
+
+    #[test]
+    fn multi_vector_ivf_continuation_does_not_inflate_automatic_probes() {
+        struct CountedInput<'a>(Cursor<Vec<u8>>, &'a AtomicUsize);
+
+        impl SeekRead for CountedInput<'_> {
+            fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+                self.1.fetch_add(
+                    ranges.iter().map(|range| range.buf.len()).sum(),
+                    Ordering::Relaxed,
+                );
+                self.0.pread(ranges)
+            }
+        }
+
+        let rows = 64;
+        let embeddings_per_row = 8;
+        let centroids = (0..rows)
+            .flat_map(|row| {
+                let (sin, cos) = (std::f32::consts::TAU * row as f32 / rows as f32).sin_cos();
+                [cos, sin]
+            })
+            .collect::<Vec<_>>();
+        let mut vectors = Vec::new();
+        let mut labels = Vec::new();
+        for (row, centroid) in centroids.chunks_exact(2).enumerate() {
+            for _ in 0..embeddings_per_row {
+                vectors.extend_from_slice(centroid);
+                labels.push(row as i64);
+            }
+        }
+        let mut writer = IVFFlatIndex::new(2, rows, MetricType::Cosine);
+        writer.set_quantizer_centroids(centroids);
+        let mut writer = VectorIndexWriter::IvfFlat(writer);
+        writer.add_vectors(&labels, &vectors, labels.len()).unwrap();
+        let mut index = Vec::new();
+        writer.write(&mut PosWriter::new(&mut index)).unwrap();
+        let bytes_read = AtomicUsize::new(0);
+        let mut reader = VIndexReader::open(CountedInput(Cursor::new(index), &bytes_read)).unwrap();
+        let metadata = reader.metadata();
+        let query = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".into()).unwrap();
+        let prepared = prepare_search(&metadata, &HashMap::new(), &query)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reader.search(&query.vector, prepared.params).unwrap().0,
+            [0, 0]
+        );
+        bytes_read.store(0, Ordering::Relaxed);
+        let params = prepared.params;
+        let hits = search_distinct_rows(&mut reader, &metadata, &query, rows as u64, prepared)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.contains_key(&0));
+        let capped_bytes = bytes_read.swap(0, Ordering::Relaxed);
+        let filter = serialize_row_id_filter(&(1..rows as u64).collect()).unwrap();
+        reader
+            .search_with_roaring_filter(&query.vector, params, &filter)
+            .unwrap();
+        let uncapped_bytes = bytes_read.load(Ordering::Relaxed);
+        assert!(
+            capped_bytes < uncapped_bytes,
+            "read {capped_bytes} vs {uncapped_bytes} bytes"
+        );
     }
 
     #[test]
