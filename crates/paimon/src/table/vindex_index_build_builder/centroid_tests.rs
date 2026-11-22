@@ -681,12 +681,39 @@ async fn centroid_bitmaps_prefilter_or_before_ranking_and_drop_with_the_vector_c
     assert_eq!(result.row_ids().unwrap().row_ids, [1, 2]);
     let buffered = std::thread::scope(|scope| {
         scope
-            .spawn(|| futures::executor::block_on(read.read(plan)))
+            .spawn(|| futures::executor::block_on(read.read(plan.clone())))
             .join()
             .unwrap()
     })
     .unwrap();
     assert_eq!(buffered.row_ids().unwrap().row_ids, [1, 2]);
+
+    let mut sources = plan.splits().to_vec();
+    sources.push(crate::table::SearchScanSplit::Raw {
+        row_ranges: vec![RowRange::new(3, 3)],
+        scalar_index_files: vec![],
+        index_type: Some("ivf-flat".into()),
+    });
+    let explicit = crate::table::VectorScanPlan::new(plan.snapshot().cloned(), sources).unwrap();
+    let explicit: crate::table::VectorScanPlan =
+        serde_json::from_value(serde_json::to_value(explicit).unwrap()).unwrap();
+    let read = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![0., 0.])
+        .with_limit(1)
+        .with_filter(predicate.equal("id", Datum::Int(3)).unwrap())
+        .with_options(HashMap::from([("centroid.nprobe".into(), "1".into())]))
+        .new_read()
+        .unwrap();
+    for result in [
+        read.read(explicit.clone()).await.unwrap(),
+        read.read_with_executor(explicit, &Worker(&table))
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(result.row_ids().unwrap().row_ids, [3]);
+    }
 
     options.insert("extra_fields".into(), r#"{"status":"bitmap"}"#.into());
     build.with_options(options);
@@ -783,23 +810,51 @@ async fn centroid_bitmaps_compare_numeric_literals_by_value() {
         .unwrap();
 
     let predicate = PredicateBuilder::new(table.schema().fields());
-    for (column, literal, expected) in [
-        ("ratio", Datum::Float(0.0), &[1][..]),
+    let (index, ratio) = table
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .find(|(_, field)| field.name() == "ratio")
+        .unwrap();
+    for (predicate, expected) in [
         (
-            "amount",
-            Datum::Decimal {
-                unscaled: 100,
-                precision: 4,
-                scale: 2,
+            predicate.equal("ratio", Datum::Float(0.0)).unwrap(),
+            &[1][..],
+        ),
+        (
+            crate::spec::Predicate::Leaf {
+                column: "ratio".into(),
+                index,
+                data_type: ratio.data_type().clone(),
+                op: crate::spec::PredicateOperator::Eq,
+                literals: vec![Datum::Double(0.0)],
             },
             &[1][..],
         ),
         (
-            "event_time",
-            Datum::Timestamp {
-                millis: 1000,
-                nanos: 500_000,
-            },
+            predicate
+                .equal(
+                    "amount",
+                    Datum::Decimal {
+                        unscaled: 100,
+                        precision: 4,
+                        scale: 2,
+                    },
+                )
+                .unwrap(),
+            &[1][..],
+        ),
+        (
+            predicate
+                .equal(
+                    "event_time",
+                    Datum::Timestamp {
+                        millis: 1000,
+                        nanos: 500_000,
+                    },
+                )
+                .unwrap(),
             &[][..],
         ),
     ] {
@@ -808,7 +863,7 @@ async fn centroid_bitmaps_compare_numeric_literals_by_value() {
             .with_vector_column("embedding")
             .with_query_vector(vec![0., 0.])
             .with_limit(1)
-            .with_filter(predicate.equal(column, literal).unwrap());
+            .with_filter(predicate.clone());
         let plan = search.new_scan().unwrap().plan().await.unwrap();
         let result = search
             .new_read()
@@ -816,7 +871,7 @@ async fn centroid_bitmaps_compare_numeric_literals_by_value() {
             .read_with_executor(plan, &Worker(&table))
             .await
             .unwrap();
-        assert_eq!(result.row_ids().unwrap().row_ids, expected, "{column}");
+        assert_eq!(result.row_ids().unwrap().row_ids, expected, "{predicate:?}");
     }
 }
 
@@ -942,4 +997,170 @@ async fn centroid_bitmaps_read_java_sparse_sections() {
         .await
         .unwrap();
     assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn centroid_bitmap_update_under_ignore_requires_dropping_the_generation() {
+    let path = "memory:/centroid_bitmap_update";
+    let table = vindex_e2e_table(path, "8");
+    setup_dirs(table.file_io(), path).await;
+    write_vectors(&table, vec![7, 8], vec![vec![0., 0.], vec![10., 0.]]).await;
+    let mut options = centroid_options();
+    options.insert("extra_fields".into(), r#"{"id":"bitmap"}"#.into());
+    let ignoring = table.copy_with_options(HashMap::from([(
+        "global-index.column-update-action".into(),
+        "IGNORE".into(),
+    )]));
+    let error = ignoring
+        .new_global_index_build_builder()
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat")
+        .with_options(options.clone())
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Centroid Bitmap fields require"));
+
+    table
+        .new_global_index_build_builder()
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat")
+        .with_options(options)
+        .execute()
+        .await
+        .unwrap();
+    table
+        .new_global_index_build_builder()
+        .with_index_column("id")
+        .with_index_type("btree")
+        .execute()
+        .await
+        .unwrap();
+    let before = active_entries(&table).await;
+    assert_eq!(centroid_index::group(&before).unwrap().len(), 1);
+
+    let update = RecordBatch::try_from_iter([
+        (
+            crate::spec::ROW_ID_FIELD_NAME,
+            Arc::new(arrow_array::Int64Array::from(vec![0])) as ArrayRef,
+        ),
+        ("id", Arc::new(Int32Array::from(vec![42])) as ArrayRef),
+    ])
+    .unwrap();
+    let commit_user = "centroid-bitmap-update";
+    let mut messages = crate::table::TableUpdate::new(&ignoring, commit_user.into())
+        .update_by_arrow_with_row_id(vec![update])
+        .await
+        .unwrap();
+    let commit = TableCommit::new(ignoring.clone(), commit_user.into());
+    let error = commit.commit(messages.clone()).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("active centroid index with Bitmap"));
+    assert_eq!(active_entries(&table).await, before);
+
+    let router = centroid_index::group(&before).unwrap()[0]
+        .router
+        .index_file
+        .clone();
+    let mut partial_drop = messages.clone();
+    partial_drop[0].deleted_index_files.push(router);
+    let error = commit.commit(partial_drop).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("active centroid index with Bitmap"));
+    assert_eq!(active_entries(&table).await, before);
+
+    let mut drop_index = ignoring.new_global_index_drop_builder();
+    drop_index
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat");
+    messages.extend(drop_index.build().await.unwrap());
+    commit.commit(messages).await.unwrap();
+    let remaining = active_entries(&table).await;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].index_file.index_type, "btree");
+}
+
+#[tokio::test]
+async fn centroid_bitmap_spill_preserves_sparse_source_labels() {
+    use crate::spec::PredicateOperator;
+    use crate::table::bitmap_global_index_reader::BitmapGlobalIndexReader;
+
+    let path = "memory:/centroid_bitmap_spill";
+    let table = vindex_e2e_table(path, "8");
+    setup_dirs(table.file_io(), path).await;
+    for (batch_no, (ids, present)) in [
+        ([7, 90, 8], [true, false, true]),
+        ([93, 94, 95], [false; 3]),
+        ([91, 7, 92], [false, true, false]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let template = build_vector_batch(ids.to_vec(), vec![vec![0., 0.]; 3]);
+        let mut vectors = ListBuilder::new(Float32Builder::new()).with_field(Arc::new(
+            ArrowField::new("element", ArrowDataType::Float32, true),
+        ));
+        for (row, present) in present.into_iter().enumerate() {
+            if present {
+                vectors.values().append_value(row as f32);
+                vectors.values().append_value(batch_no as f32);
+            }
+            vectors.append(present);
+        }
+        let batch = RecordBatch::try_new(
+            template.schema(),
+            vec![template.column(0).clone(), Arc::new(vectors.finish())],
+        )
+        .unwrap();
+        let commit_user = format!("centroid-bitmap-spill-{batch_no}");
+        let mut write = TableWrite::new(&table, commit_user.clone()).unwrap();
+        write.write_arrow_batch(&batch).await.unwrap();
+        TableCommit::new(table.clone(), commit_user)
+            .commit(write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+    }
+
+    let mut options = centroid_options();
+    options.insert("ivf-flat.centroid.nlist".into(), "1".into());
+    options.insert("extra_fields".into(), r#"{"id":"bitmap"}"#.into());
+    options.insert("write-buffer-size".into(), "80b".into());
+    options.insert("bitmap-index.dictionary-block-size".into(), "9b".into());
+    table
+        .new_global_index_build_builder()
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat")
+        .with_options(options)
+        .execute()
+        .await
+        .unwrap();
+    let entries = active_entries(&table).await;
+    let groups = centroid_index::group(&entries).unwrap();
+    assert_eq!(groups.len(), 1);
+    let bitmap = &groups[0].bitmaps[&0].index_file;
+    assert_eq!(bitmap.row_count, 3);
+    let input = table
+        .file_io()
+        .new_input(&format!("{path}/index/{}", bitmap.file_name))
+        .unwrap()
+        .reader()
+        .await
+        .unwrap();
+    let reader = BitmapGlobalIndexReader::open(Box::new(input), bitmap.file_size as u64)
+        .await
+        .unwrap();
+    let field = &table.schema().fields()[0];
+    for (op, literals, expected) in [
+        (PredicateOperator::Eq, vec![Datum::Int(7)], vec![0, 7]),
+        (PredicateOperator::Eq, vec![Datum::Int(8)], vec![2]),
+        (PredicateOperator::IsNotNull, vec![], vec![0, 2, 7]),
+    ] {
+        let matches = reader
+            .query(op, &literals, field.data_type())
+            .await
+            .unwrap();
+        assert_eq!(matches.into_iter().collect::<Vec<_>>(), expected);
+    }
 }

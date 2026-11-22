@@ -60,6 +60,15 @@ impl<'a> Descriptor<'a> {
             .is_some_and(|bytes| bytes.starts_with(META_MAGIC))
     }
 
+    pub(super) fn has_bitmaps(file: &IndexFileMeta) -> bool {
+        file.global_index_meta
+            .as_ref()
+            .and_then(|meta| meta.index_meta.as_deref())
+            .is_some_and(|bytes| {
+                bytes.starts_with(META_MAGIC) && bytes.get(META_MAGIC.len()) == Some(&2)
+            })
+    }
+
     pub(super) fn parse(file: &'a IndexFileMeta) -> Result<Option<Self>> {
         let Some(bytes) = file
             .global_index_meta
@@ -459,12 +468,7 @@ impl Router {
 /// A colocated Bitmap is part of its primary vector index's identity.
 pub(super) fn index_identity_extra_fields(file: &IndexFileMeta) -> Option<&[i32]> {
     let meta = file.global_index_meta.as_ref()?;
-    if Descriptor::is_wrapped(file)
-        && meta
-            .index_meta
-            .as_ref()
-            .is_some_and(|bytes| bytes.get(8) == Some(&2))
-    {
+    if Descriptor::has_bitmaps(file) {
         None
     } else {
         meta.extra_field_ids.as_deref()

@@ -230,6 +230,7 @@ impl DeVectorRead {
             timing,
             skip_search,
             source_splits,
+            scalar_prefilter_ranges,
         } = plan;
         let table = Arc::new(table);
         let make_results = |results: Vec<ScoredRowIds>| {
@@ -283,6 +284,7 @@ impl DeVectorRead {
                 &vector_searches,
                 executor,
                 source_splits.as_deref(),
+                &scalar_prefilter_ranges,
                 self.max_sim,
             )
             .await?
@@ -943,6 +945,7 @@ async fn evaluate_batch_vector_search(
         vector_searches,
         None,
         None,
+        &[],
         false,
     )
     .await
@@ -954,6 +957,7 @@ async fn evaluate_batch_vector_search_with_executor(
     vector_searches: &[VectorSearch],
     executor: Option<&dyn SearchTaskExecutor>,
     sources: Option<&[crate::table::SearchScanSplit]>,
+    scalar_prefilter_ranges: &[RowRange],
     max_sim: bool,
 ) -> crate::Result<Vec<ScoredRowIds>> {
     let timing_enabled = vector_search_timing_enabled();
@@ -1541,10 +1545,9 @@ async fn evaluate_batch_vector_search_with_executor(
             ranges
         };
         raw_ranges = merge_row_ranges(raw_ranges);
-        if sources.is_some() {
-            // A source plan can be reused with a different predicate. Only
-            // skip raw recovery for the Bitmap filters bound by this reader.
-            raw_ranges = super::source::exclude_row_ranges(&raw_ranges, &bitmap_ranges);
+        if !scalar_prefilter_ranges.is_empty() && !bitmap_ranges.is_empty() {
+            let covered = intersect_sorted_ranges(scalar_prefilter_ranges, &bitmap_ranges);
+            raw_ranges = super::source::exclude_row_ranges(&raw_ranges, &covered);
         }
         if !raw_ranges.is_empty() {
             let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {

@@ -196,6 +196,7 @@ pub(super) struct DeVectorScanPlan {
     pub(super) skip_search: bool,
     /// Source metadata supplied by a transportable public plan.
     pub(super) source_splits: Option<Vec<crate::table::SearchScanSplit>>,
+    pub(super) scalar_prefilter_ranges: Vec<crate::table::RowRange>,
 }
 
 impl DeVectorScanPlan {
@@ -209,6 +210,7 @@ impl DeVectorScanPlan {
             next_row_id: None,
             timing,
             source_splits: None,
+            scalar_prefilter_ranges: vec![],
         }
     }
 }

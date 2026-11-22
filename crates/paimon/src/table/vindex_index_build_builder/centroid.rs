@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::centroid_bitmap::BitmapBuild;
+use super::centroid_bitmap::{BitmapBuild, BitmapSpill, BitmapSpillReader};
 use super::extraction::data_split_for_shard;
 use super::validation::checked_training_vector_count;
 use super::VindexIndexBuildBuilder;
@@ -90,6 +90,17 @@ impl CentroidBuildOptions {
         if !table.schema().core_options().data_evolution_enabled() {
             return Err(centroid_index::invalid(
                 "Centroid sharding requires a Data Evolution table",
+            ));
+        }
+        if self.bitmap.is_some()
+            && table
+                .schema()
+                .core_options()
+                .global_index_column_update_action()?
+                == crate::spec::GlobalIndexColumnUpdateAction::Ignore
+        {
+            return Err(centroid_index::invalid(
+                "Centroid Bitmap fields require THROW_ERROR or DROP_PARTITION_INDEX",
             ));
         }
         Ok(())
@@ -178,7 +189,7 @@ impl VindexIndexBuildBuilder<'_> {
         column: &str,
         field_id: i32,
         options: &VindexVectorIndexOptions,
-        mut centroid: CentroidBuildOptions,
+        centroid: CentroidBuildOptions,
     ) -> Result<CommitMessage> {
         let mut read_builder = self.table.new_read_builder();
         let mut projection = vec![column, ROW_ID_FIELD_NAME];
@@ -192,12 +203,21 @@ impl VindexIndexBuildBuilder<'_> {
             RowRange::new(shard.row_range_start, shard.row_range_end),
             options.dimension(),
         )?;
+        let mut bitmap_spill = centroid
+            .bitmap
+            .as_ref()
+            .map(|_| BitmapSpill::new())
+            .transpose()?;
         while let Some(batch) = batches.try_next().await? {
             spill.push_batch(&batch, column, false).await?;
-            if let Some(bitmap) = &mut centroid.bitmap {
-                bitmap.record(&batch)?;
+            if let (Some(bitmap), Some(bitmap_spill)) = (&centroid.bitmap, &mut bitmap_spill) {
+                bitmap_spill.record(bitmap, &batch, column).await?;
             }
         }
+        let bitmap_spill = match bitmap_spill {
+            Some(spill) => Some(spill.finish().await?),
+            None => None,
+        };
 
         let model_id = uuid::Uuid::new_v4().to_string();
         let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);
@@ -208,6 +228,7 @@ impl VindexIndexBuildBuilder<'_> {
                 options,
                 centroid,
                 spill,
+                bitmap_spill,
                 &model_id,
                 &mut message.new_index_files,
             )
@@ -231,6 +252,7 @@ impl VindexIndexBuildBuilder<'_> {
         options: &VindexVectorIndexOptions,
         centroid: CentroidBuildOptions,
         spill: VectorSpill,
+        mut bitmap_spill: Option<BitmapSpillReader>,
         model_id: &str,
         files: &mut Vec<IndexFileMeta>,
     ) -> Result<()> {
@@ -258,19 +280,38 @@ impl VindexIndexBuildBuilder<'_> {
             .await
             .map_err(task_error)??;
             for id in 0..router.nlist() {
-                let has_bitmap = centroid.bitmap.is_some();
-                let (next_routed, rows, row_ids) = tokio::task::spawn_blocking(move || {
-                    let mut rows = routed.partition(id)?;
-                    let row_ids = rows
-                        .as_mut()
-                        .filter(|_| has_bitmap)
-                        .map(|rows| rows.read_local_row_ids())
-                        .transpose()?;
-                    Ok::<_, Error>((routed, rows, row_ids))
-                })
-                .await
-                .map_err(task_error)??;
+                let bitmap = centroid.bitmap.clone();
+                let (next_routed, next_bitmap_spill, rows, sorted) =
+                    tokio::task::spawn_blocking(move || {
+                        let mut rows = routed.partition(id)?;
+                        let sorted = match (rows.as_mut(), bitmap.as_ref(), bitmap_spill.as_mut()) {
+                            (Some(rows), Some(bitmap), Some(spill)) => {
+                                Some(spill.sort(bitmap, rows.local_row_ids()?)?)
+                            }
+                            _ => None,
+                        };
+                        Ok::<_, Error>((routed, bitmap_spill, rows, sorted))
+                    })
+                    .await
+                    .map_err(task_error)??;
                 routed = next_routed;
+                bitmap_spill = next_bitmap_spill;
+                if let (Some(bitmap), Some(sorted), Some(rows)) = (&centroid.bitmap, sorted, &rows)
+                {
+                    let row_count = rows.vector_count() as i64;
+                    let file = self
+                        .centroid_file_writer(shard, field_id, &extra_fields)
+                        .await?
+                        .write(self.table, |output| async move {
+                            bitmap
+                                .write(output, sorted, row_count, model_id, id)
+                                .await
+                                .map(Some)
+                        })
+                        .await?
+                        .expect("centroid bitmap always writes a payload");
+                    files.push(file);
+                }
                 let mut payload = HashMap::new();
                 let (count, index) = match rows {
                     Some(rows) => {
@@ -320,17 +361,6 @@ impl VindexIndexBuildBuilder<'_> {
                     )
                     .await?,
                 );
-                if let (Some(bitmap), Some(row_ids)) = (&centroid.bitmap, row_ids) {
-                    let file = self
-                        .centroid_file_writer(shard, field_id, &extra_fields)
-                        .await?
-                        .write(self.table, |output| async move {
-                            bitmap.write(output, &row_ids, model_id, id).await.map(Some)
-                        })
-                        .await?
-                        .expect("centroid bitmap always writes a payload");
-                    files.push(file);
-                }
             }
             (router.nlist(), router.encode(model_id)?)
         } else {

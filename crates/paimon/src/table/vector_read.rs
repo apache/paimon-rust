@@ -184,6 +184,7 @@ impl BatchVectorRead {
                     include_row_ids: self.context.include_row_ids.clone(),
                     timing: None,
                     source_splits: Some(plan.splits().to_vec()),
+                    scalar_prefilter_ranges: plan.scalar_prefilter_ranges().to_vec(),
                 };
                 reader.read_with_executor(work, executor).await
             }

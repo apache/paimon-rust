@@ -3020,6 +3020,8 @@ shard with no visible matches can skip its ANN file. Unsupported predicates
 and incompatible schema changes use the ordinary scalar filtering path.
 Rebuilding replaces the selected partitions' groups. Dropping the index on
 the vector column also drops its Bitmap files.
+Use `THROW_ERROR` or `DROP_PARTITION_INDEX` for
+`global-index.column-update-action` when building centroid Bitmap indexes.
 
 ### MultiVector MaxSim
 

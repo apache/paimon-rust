@@ -21,7 +21,10 @@ use super::bitmap_global_index_reader::BitmapGlobalIndexReader;
 use super::centroid_index::{self, Descriptor, Generation};
 use crate::btree::key_serde::normalize_key_literal;
 use crate::io::FileRead;
-use crate::spec::{DataField, DataType, Datum, IndexFileMeta, Predicate, PredicateOperator};
+use crate::spec::{
+    validate_datum_matches_type, DataField, DataType, Datum, IndexFileMeta, Predicate,
+    PredicateOperator,
+};
 use crate::table::{index_file_path::IndexFileLocation, Table};
 use crate::Result;
 use bytes::Bytes;
@@ -81,12 +84,14 @@ fn directory(file: &IndexFileMeta) -> Result<HashMap<i32, Range<u64>>> {
             return Err(invalid());
         }
         let length = u64::from_be_bytes(header[1..9].try_into().unwrap());
-        let meta_len = u32::from_be_bytes(header[9..13].try_into().unwrap()) as usize;
+        let meta_len = usize::try_from(i32::from_be_bytes(header[9..13].try_into().unwrap()))
+            .map_err(|_| invalid())?;
         let end = offset
             .checked_add(length)
             .filter(|&end| end > offset && end <= size)
             .ok_or_else(invalid)?;
-        input = input.get(SECTION_HEADER + meta_len..).ok_or_else(invalid)?;
+        let next = SECTION_HEADER.checked_add(meta_len).ok_or_else(invalid)?;
+        input = input.get(next..).ok_or_else(invalid)?;
         if sections.insert(field, offset..end).is_some() {
             return Err(invalid());
         }
@@ -295,7 +300,10 @@ fn equality_literals(data_type: &DataType, literals: &[Datum]) -> Option<Vec<Dat
             Datum::Double(value) => value.is_finite(),
             _ => true,
         };
-        if !finite || !normalize_key_literal(literal, data_type) {
+        if !finite
+            || validate_datum_matches_type(literal, data_type).is_err()
+            || !normalize_key_literal(literal, data_type)
+        {
             return None;
         }
     }

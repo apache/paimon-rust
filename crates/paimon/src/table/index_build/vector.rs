@@ -335,7 +335,7 @@ fn spill_error(error: std::io::Error) -> Error {
     }
 }
 
-fn temporary_vector_file(kind: &str) -> Result<tokio::fs::File> {
+pub(in crate::table) fn temporary_vector_file(kind: &str) -> Result<tokio::fs::File> {
     tempfile::tempfile()
         .map(tokio::fs::File::from_std)
         .map_err(|error| Error::UnexpectedError {
@@ -459,14 +459,14 @@ impl SpilledVectors {
         self.count
     }
 
-    pub fn read_local_row_ids(&mut self) -> Result<Vec<i64>> {
-        let mut buffer = MutableBuffer::new(checked_vector_bytes(self.count, 2)?);
-        buffer.resize(checked_vector_bytes(self.count, 2)?, 0);
+    pub fn local_row_ids(&mut self) -> Result<impl Iterator<Item = Result<i64>> + '_> {
         self.ids.seek(SeekFrom::Start(0)).map_err(spill_error)?;
-        self.ids
-            .read_exact(buffer.as_slice_mut())
-            .map_err(spill_error)?;
-        Ok(buffer.typed_data::<i64>().to_vec())
+        let mut reader = std::io::BufReader::new(&mut self.ids);
+        Ok((0..self.count).map(move |_| {
+            let mut bytes = [0; size_of::<i64>()];
+            reader.read_exact(&mut bytes).map_err(spill_error)?;
+            Ok(i64::from_ne_bytes(bytes))
+        }))
     }
 
     pub fn train_router(
