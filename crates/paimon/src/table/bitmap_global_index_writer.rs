@@ -35,6 +35,10 @@ pub(crate) struct BitmapWriteResult {
 
 pub(crate) struct BitmapGlobalIndexWriter<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> {
     writer: Box<dyn FileWrite>,
+    builder: BitmapIndexBuilder<F>,
+}
+
+pub(super) struct BitmapIndexBuilder<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> {
     dictionary_block_size: usize,
     compression_type: BlockCompressionType,
     compression_level: i32,
@@ -73,6 +77,48 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BitmapGlobalIndexWriter<F> 
     ) -> Self {
         Self {
             writer,
+            builder: BitmapIndexBuilder::new(
+                dictionary_block_size,
+                compression_type,
+                compression_level,
+                key_comparator,
+            ),
+        }
+    }
+
+    pub(crate) fn write(&mut self, key: Option<&[u8]>, relative_row_id: i64) -> io::Result<()> {
+        self.builder.write(key, relative_row_id)
+    }
+
+    pub(crate) fn write_posting(&mut self, key: &[u8], relative_row_id: i64) -> io::Result<()> {
+        self.builder.write_posting(key, relative_row_id)
+    }
+
+    pub(crate) async fn finish(self) -> io::Result<BitmapWriteResult> {
+        let row_count = self.builder.row_count;
+        self.finish_with_source_row_count(row_count).await
+    }
+
+    /// Finish a zero-to-many-key index with its physical source row count.
+    pub(crate) async fn finish_with_source_row_count(
+        mut self,
+        row_count: u64,
+    ) -> io::Result<BitmapWriteResult> {
+        let (bytes, result) = self.builder.encode_with_row_count(row_count)?;
+        self.writer.write(bytes).await.map_err(io::Error::other)?;
+        self.writer.close().await.map_err(io::Error::other)?;
+        Ok(result)
+    }
+}
+
+impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BitmapIndexBuilder<F> {
+    pub(super) fn new(
+        dictionary_block_size: usize,
+        compression_type: BlockCompressionType,
+        compression_level: i32,
+        key_comparator: F,
+    ) -> Self {
+        Self {
             dictionary_block_size,
             compression_type,
             compression_level,
@@ -124,21 +170,12 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BitmapGlobalIndexWriter<F> 
         Ok(())
     }
 
-    pub(crate) async fn finish(self) -> io::Result<BitmapWriteResult> {
+    pub(super) fn encode(self) -> io::Result<(Bytes, BitmapWriteResult)> {
         let row_count = self.row_count;
-        self.finish_with_row_count(row_count).await
+        self.encode_with_row_count(row_count)
     }
 
-    /// Finish a zero-to-many-key index while reporting the number of source
-    /// rows covered by the file rather than the number of emitted postings.
-    pub(crate) async fn finish_with_source_row_count(
-        self,
-        source_row_count: u64,
-    ) -> io::Result<BitmapWriteResult> {
-        self.finish_with_row_count(source_row_count).await
-    }
-
-    async fn finish_with_row_count(mut self, row_count: u64) -> io::Result<BitmapWriteResult> {
+    fn encode_with_row_count(mut self, row_count: u64) -> io::Result<(Bytes, BitmapWriteResult)> {
         let mut bitmaps = std::mem::take(&mut self.bitmaps)
             .into_iter()
             .collect::<Vec<_>>();
@@ -168,19 +205,17 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BitmapGlobalIndexWriter<F> 
             self.compression_type,
             self.compression_level,
         )?;
-        self.writer
-            .write(Bytes::from(bytes))
-            .await
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        self.writer
-            .close()
-            .await
-            .map_err(|error| io::Error::other(error.to_string()))?;
-
-        Ok(BitmapWriteResult {
-            meta: BTreeIndexMeta::new(self.first_key, self.last_key, !self.null_rows.is_empty()),
-            row_count,
-        })
+        Ok((
+            Bytes::from(bytes),
+            BitmapWriteResult {
+                meta: BTreeIndexMeta::new(
+                    self.first_key,
+                    self.last_key,
+                    !self.null_rows.is_empty(),
+                ),
+                row_count,
+            },
+        ))
     }
 
     fn update_min_max(&mut self, key: &[u8]) -> io::Result<()> {

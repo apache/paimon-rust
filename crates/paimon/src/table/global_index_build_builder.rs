@@ -246,6 +246,13 @@ impl<'a> GlobalIndexBuildBuilder<'a> {
                 message: format!("Unsupported global index type: '{}'", self.index_type),
             }
         })?;
+        if !crate::vindex::is_vindex_index_type(index_type)
+            && self.options.contains_key("extra_fields")
+        {
+            return Err(Error::ConfigInvalid {
+                message: "'extra_fields' is supported by centroid vector indexes".into(),
+            });
+        }
         let columns = self.columns.as_ref().ok_or_else(|| Error::DataInvalid {
             message: "Global index column is required".into(),
             source: None,

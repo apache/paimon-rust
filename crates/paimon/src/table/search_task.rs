@@ -243,6 +243,7 @@ impl SearchTask {
             "vector-index"
             | "vector-index-filtered"
             | "vector-index-centroid"
+            | "vector-index-centroid-bitmap"
             | "vector-index-multivector"
             | "vector-rows"
             | "vector-list-rows" => {

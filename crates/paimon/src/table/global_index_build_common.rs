@@ -295,7 +295,10 @@ pub(crate) fn indexed_row_ranges(
             continue;
         };
         if meta.index_field_id != index_field_id
-            || !same_extra_field_ids(meta.extra_field_ids.as_deref(), extra_field_ids)
+            || !same_extra_field_ids(
+                super::centroid_index::index_identity_extra_fields(&entry.index_file),
+                extra_field_ids,
+            )
         {
             continue;
         }
@@ -325,7 +328,10 @@ pub(crate) fn validate_existing_index_overlap(
             continue;
         };
         if meta.index_field_id != index_field_id
-            || !same_extra_field_ids(meta.extra_field_ids.as_deref(), extra_field_ids)
+            || !same_extra_field_ids(
+                super::centroid_index::index_identity_extra_fields(&entry.index_file),
+                extra_field_ids,
+            )
         {
             continue;
         }

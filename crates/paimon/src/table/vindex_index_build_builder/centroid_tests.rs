@@ -559,3 +559,196 @@ async fn centroid_query_reads_java_model_and_native_shards_with_rebased_labels()
         .unwrap_err();
     assert!(error.to_string().contains("outside its centroid shard"));
 }
+
+#[tokio::test]
+async fn centroid_bitmaps_prefilter_or_before_ranking_and_drop_with_the_vector_column() {
+    use crate::spec::{Datum, Predicate, PredicateBuilder};
+    let path = "memory:/centroid_bitmap_prefilter";
+    let schema = vindex_schema_builder(vindex_e2e_options("8"))
+        .column("status", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    let io = FileIOBuilder::new("memory").build().unwrap();
+    let table = test_table_with_io(io, path, schema);
+    setup_dirs(table.file_io(), path).await;
+    let mut batch = build_vector_batch(
+        (0..5).collect(),
+        vec![
+            vec![0., 0.],
+            vec![0.1, 0.],
+            vec![2., 0.],
+            vec![100., 0.],
+            vec![101., 0.],
+        ],
+    );
+    let (schema, mut columns, rows) = batch.into_parts();
+    columns.push(Arc::new(Int32Array::from(vec![
+        Some(0),
+        None,
+        Some(9),
+        Some(0),
+        Some(0),
+    ])));
+    let mut fields = schema.fields().to_vec();
+    fields.push(Arc::new(ArrowField::new(
+        "status",
+        ArrowDataType::Int32,
+        true,
+    )));
+    batch = RecordBatch::try_new_with_options(
+        Arc::new(ArrowSchema::new(fields)),
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(rows)),
+    )
+    .unwrap();
+    let mut write = TableWrite::new(&table, "centroid-bitmaps-data".into()).unwrap();
+    write.write_arrow_batch(&batch).await.unwrap();
+    TableCommit::new(table.clone(), "centroid-bitmaps-data".into())
+        .commit(write.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    let mut options = centroid_options();
+    options.insert(
+        "extra_fields".into(),
+        r#"{"id":"bitmap","status":"bitmap"}"#.into(),
+    );
+    let mut build = table.new_global_index_build_builder();
+    build
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat")
+        .with_options(options.clone());
+    assert_eq!(build.execute().await.unwrap(), 5);
+    let entries = active_entries(&table).await;
+    let groups = centroid_index::group(&entries).unwrap();
+    let group = &groups[0];
+    assert_eq!(group.bitmaps.len(), 2);
+
+    // A shard with no bitmap match must not open the ANN payload at all.
+    let field = table
+        .schema()
+        .fields()
+        .iter()
+        .find(|field| field.name() == "id")
+        .unwrap();
+    let all_ids = crate::table::centroid_bitmap::BitmapPredicate::Leaf(
+        field.id(),
+        field.data_type().clone(),
+        crate::spec::PredicateOperator::IsNotNull,
+        vec![],
+    );
+    let mut skipped = false;
+    for (&centroid, entry) in &group.bitmaps {
+        let matched = all_ids.matching(&table, &entry.index_file).await.unwrap();
+        if matched.contains(3) {
+            table
+                .file_io()
+                .delete_file(&format!(
+                    "{path}/index/{}",
+                    group.shards[&centroid].index_file.file_name
+                ))
+                .await
+                .unwrap();
+            skipped = true;
+        }
+    }
+    assert!(skipped);
+
+    let predicate = PredicateBuilder::new(table.schema().fields());
+    let filter = Predicate::or(vec![
+        predicate.equal("id", Datum::Int(2)).unwrap(),
+        predicate.is_null("status").unwrap(),
+    ]);
+    let mut search = table.new_vector_search_builder();
+    search
+        .with_vector_column("embedding")
+        .with_query_vector(vec![0., 0.])
+        .with_limit(2)
+        .with_filter(filter)
+        .with_options(HashMap::from([
+            ("centroid.nprobe".into(), "2".into()),
+            (
+                "vector-index.post-filter.candidates-factor".into(),
+                "1".into(),
+            ),
+        ]));
+    let plan = search.new_scan().unwrap().plan().await.unwrap();
+    let result = search
+        .new_read()
+        .unwrap()
+        .read_with_executor(plan, &Worker(&table))
+        .await
+        .unwrap();
+    assert_eq!(result.row_ids().unwrap().row_ids, [1, 2]);
+
+    options.insert("extra_fields".into(), r#"{"status":"bitmap"}"#.into());
+    build.with_options(options);
+    assert_eq!(build.execute().await.unwrap(), 5);
+    let rebuilt = active_entries(&table).await;
+    let rebuilt_groups = centroid_index::group(&rebuilt).unwrap();
+    assert_eq!(
+        rebuilt_groups[0]
+            .router
+            .index_file
+            .global_index_meta
+            .as_ref()
+            .unwrap()
+            .extra_field_ids
+            .as_ref()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(rebuilt.iter().all(|entry| !entries.contains(entry)));
+    let mut drop_index = table.new_global_index_drop_builder();
+    drop_index
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat");
+    assert_eq!(drop_index.execute().await.unwrap(), 5);
+}
+
+#[tokio::test]
+async fn centroid_bitmaps_read_java_sparse_sections() {
+    use crate::spec::{Datum, PredicateOperator};
+    use crate::table::centroid_bitmap::BitmapPredicate;
+    let path = "memory:/centroid_java_bitmap";
+    let table = vindex_e2e_table(path, "8");
+    let bytes = include_bytes!("../../../testdata/centroid/bitmap.index");
+    let metadata = include_bytes!("../../../testdata/centroid/bitmap.meta");
+    table
+        .file_io()
+        .new_output(&format!("{path}/index/bitmap.index"))
+        .unwrap()
+        .write(bytes::Bytes::from_static(bytes))
+        .await
+        .unwrap();
+    let file = IndexFileMeta {
+        index_type: "ivf-flat".into(),
+        file_name: "bitmap.index".into(),
+        file_size: bytes.len() as i64,
+        row_count: 2,
+        external_path: None,
+        deletion_vectors_ranges: None,
+        global_index_meta: Some(GlobalIndexMeta {
+            row_range_start: 10,
+            row_range_end: 14,
+            index_field_id: 1,
+            extra_field_ids: Some(vec![0, 2]),
+            index_meta: Some(metadata.to_vec()),
+            source_meta: None,
+        }),
+    };
+    let int = DataType::Int(IntType::new());
+    let tenant = BitmapPredicate::Leaf(0, int.clone(), PredicateOperator::Eq, vec![Datum::Int(7)]);
+    let status = BitmapPredicate::Leaf(2, int, PredicateOperator::In, vec![Datum::Int(1)]);
+    let result = BitmapPredicate::Or(vec![tenant.clone(), status.clone()])
+        .matching(&table, &file)
+        .await
+        .unwrap();
+    assert_eq!(result.into_iter().collect::<Vec<_>>(), [2, 4]);
+    let result = BitmapPredicate::And(vec![tenant, status])
+        .matching(&table, &file)
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+}

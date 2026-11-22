@@ -1130,11 +1130,34 @@ async fn evaluate_batch_vector_search_with_executor(
         .as_ref()
         .map(|_| effective_core.scalar_prefilter_search_mode())
         .transpose()?;
+    let mut bitmap_filters = HashMap::new();
+    if let (Some(table), Some(filter)) = (evaluation.table, &scalar_filter) {
+        for (&name, group) in &centroid_files {
+            if let Some(bound) =
+                super::centroid_bitmap::BitmapPredicate::for_generation(table, group, filter)
+                    .await?
+            {
+                bitmap_filters.insert(name, bound);
+            }
+        }
+    }
+    let bitmap_ranges = merge_row_ranges(
+        vector_search_entries
+            .iter()
+            .filter(|entry| bitmap_filters.contains_key(entry.index_file.file_name.as_str()))
+            .map(|entry| {
+                let meta = entry.index_file.global_index_meta.as_ref().unwrap();
+                RowRange::new(meta.row_range_start, meta.row_range_end)
+            })
+            .collect(),
+    );
+    let regular_ranges = super::source::exclude_row_ranges(&vector_ranges, &bitmap_ranges);
+    let before_scalar_filter = (!bitmap_filters.is_empty()).then(|| indexed_searches.clone());
     if let Some(filter) = scalar_filter
         .as_ref()
-        .filter(|_| !vector_entries.is_empty())
+        .filter(|_| !regular_ranges.is_empty())
     {
-        match scalar_matched_row_ids(evaluation, index_entries, &vector_ranges, filter).await? {
+        match scalar_matched_row_ids(evaluation, index_entries, &regular_ranges, filter).await? {
             Some(row_ids) => {
                 let row_ids = Arc::new(row_ids);
                 for search in indexed_searches.to_mut() {
@@ -1187,40 +1210,16 @@ async fn evaluate_batch_vector_search_with_executor(
     let index_search_limit = indexed_search_limit(max_limit, refine_factor)?;
 
     let vector_entry_count = vector_search_entries.len();
-    let vector_search_plans = if let Some(include_row_ids) =
-        shared_batch_include_row_ids(&indexed_searches)
-    {
-        let ranges = vector_search_entries
-            .iter()
-            .map(|entry| {
-                let meta = entry.index_file.global_index_meta.as_ref().ok_or_else(|| {
-                    crate::Error::DataInvalid {
-                        message: format!(
-                            "Vector index '{}' is missing global index metadata",
-                            entry.index_file.file_name
-                        ),
-                        source: None,
-                    }
-                })?;
-                Ok((meta.row_range_start, meta.row_range_end))
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-        vector_search_entries
-            .iter()
-            .copied()
-            .zip(localize_shared_include_row_ids(
-                include_row_ids.as_ref(),
-                &ranges,
-            )?)
-            .filter_map(|(entry, local_filter)| local_filter.map(|filter| (entry, Some(filter))))
-            .collect::<Vec<_>>()
-    } else {
-        vector_search_entries
-            .iter()
-            .copied()
-            .map(|entry| (entry, None))
-            .collect::<Vec<_>>()
-    };
+    let (bitmap_entries, regular_entries): (Vec<_>, Vec<_>) = vector_search_entries
+        .into_iter()
+        .partition(|entry| bitmap_filters.contains_key(entry.index_file.file_name.as_str()));
+    let mut vector_search_plans = localize_vector_plans(&regular_entries, &indexed_searches)?;
+    if let Some(before_scalar_filter) = &before_scalar_filter {
+        vector_search_plans.extend(localize_vector_plans(
+            &bitmap_entries,
+            before_scalar_filter,
+        )?);
+    }
     let requested_metric =
         resolved_vector_metric_override(&configuration.query_options, field_name, index_type)?;
     if list_scoring.is_some()
@@ -1262,14 +1261,26 @@ async fn evaluate_batch_vector_search_with_executor(
         let mut works = vector_search_plans
             .into_iter()
             .map(|(entry, shared_local_filter)| {
-                let centroid_files = centroid_files
-                    .remove(entry.index_file.file_name.as_str())
+                let name = entry.index_file.file_name.as_str();
+                let centroid_files: Vec<_> = centroid_files
+                    .remove(name)
+                    .map(|group| group.files.into_iter().cloned().collect())
                     .unwrap_or_default();
                 let meta = entry.index_file.global_index_meta.as_ref().unwrap();
                 let prefilter_deleted = !centroid_files.is_empty() || list_scoring.is_some();
                 let deleted = deleted_row_index.as_ref();
+                let bitmap = bitmap_filters
+                    .remove(name)
+                    .map(|predicate| centroid::BitmapWork {
+                        predicate,
+                        deleted: deleted
+                            .map(|index| {
+                                index.intersected_ranges(meta.row_range_start, meta.row_range_end)
+                            })
+                            .unwrap_or_default(),
+                    });
                 // Reserve centroid and MultiVector candidate budgets for live rows.
-                let live_rows = if prefilter_deleted {
+                let live_rows = if prefilter_deleted && bitmap.is_none() {
                     deleted
                         .and_then(|deleted| {
                             local_live_row_ids(deleted, meta.row_range_start, meta.row_range_end)
@@ -1278,14 +1289,27 @@ async fn evaluate_batch_vector_search_with_executor(
                 } else {
                     None
                 };
-                let index_limit = search_limit_with_deleted_rows(
-                    index_search_limit,
-                    meta.row_range_start,
-                    meta.row_range_end,
-                    if prefilter_deleted { None } else { deleted },
-                )
-                .min(i32::MAX as usize);
-                let mut searches = indexed_searches.to_vec();
+                let (searches, filter, index_limit) = if bitmap.is_some() {
+                    (
+                        before_scalar_filter.as_ref().unwrap().as_ref(),
+                        None,
+                        index_search_limit,
+                    )
+                } else {
+                    let limit = search_limit_with_deleted_rows(
+                        index_search_limit,
+                        meta.row_range_start,
+                        meta.row_range_end,
+                        if prefilter_deleted { None } else { deleted },
+                    );
+                    (
+                        indexed_searches.as_ref(),
+                        post_filter_predicate.clone(),
+                        limit,
+                    )
+                };
+                let index_limit = index_limit.min(i32::MAX as usize);
+                let mut searches = searches.to_vec();
                 let restrict_to_live = |rows| {
                     Arc::new(match &live_rows {
                         Some(live) => rows & live.as_ref(),
@@ -1317,14 +1341,15 @@ async fn evaluate_batch_vector_search_with_executor(
                 Ok::<_, crate::Error>(VectorIndexWork {
                     entry: entry.clone(),
                     centroid_files,
+                    bitmap,
                     queries: searches,
                     resolved: Some(configuration.resolved.clone()),
-                    filter: post_filter_predicate.clone(),
-                    top_ks: if post_filter_predicate.is_some() {
+                    top_ks: if filter.is_some() {
                         vector_searches.iter().map(|query| query.limit).collect()
                     } else {
                         Vec::new()
                     },
+                    filter,
                 })
             });
         let results = if let Some(executor) = executor {
@@ -1341,6 +1366,7 @@ async fn evaluate_batch_vector_search_with_executor(
                         let work = VectorIndexTask {
                             entry: work.entry,
                             centroid_files: work.centroid_files,
+                            bitmap: work.bitmap,
                             queries: TaskVectorQueries::capture(&work.queries)?,
                             resolved: work.resolved,
                             filter: work.filter,
@@ -1350,7 +1376,9 @@ async fn evaluate_batch_vector_search_with_executor(
                             table,
                             // Older workers must reject this work instead of
                             // ignoring an unfamiliar predicate payload.
-                            if !work.centroid_files.is_empty() {
+                            if work.bitmap.is_some() {
+                                "vector-index-centroid-bitmap"
+                            } else if !work.centroid_files.is_empty() {
                                 "vector-index-centroid"
                             } else if list_scoring.is_some() {
                                 "vector-index-multivector"
@@ -1505,7 +1533,10 @@ async fn evaluate_batch_vector_search_with_executor(
                 if search_mode == GlobalIndexSearchMode::Fast {
                     scalar_ranges = intersect_sorted_ranges(&scalar_ranges, &vector_ranges);
                 }
-                ranges.extend(scalar_ranges);
+                ranges.extend(super::source::exclude_row_ranges(
+                    &scalar_ranges,
+                    &bitmap_ranges,
+                ));
             }
             ranges
         };
@@ -2017,6 +2048,50 @@ fn prune_raw_ranges_by_include_row_ids(
             sorted_row_ids_to_row_ranges(union.iter())?
         };
     Ok(intersect_sorted_ranges(raw_ranges, &include_ranges))
+}
+
+type LocalizedVectorPlan<'a> = (&'a IndexManifestEntry, Option<RoaringTreemap>);
+
+fn localize_vector_plans<'a>(
+    entries: &[&'a IndexManifestEntry],
+    searches: &[VectorSearch],
+) -> crate::Result<Vec<LocalizedVectorPlan<'a>>> {
+    Ok(
+        if let Some(include_row_ids) = shared_batch_include_row_ids(searches) {
+            let ranges = entries
+                .iter()
+                .map(|entry| {
+                    let meta = entry.index_file.global_index_meta.as_ref().ok_or_else(|| {
+                        crate::Error::DataInvalid {
+                            message: format!(
+                                "Vector index '{}' is missing global index metadata",
+                                entry.index_file.file_name
+                            ),
+                            source: None,
+                        }
+                    })?;
+                    Ok((meta.row_range_start, meta.row_range_end))
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            entries
+                .iter()
+                .copied()
+                .zip(localize_shared_include_row_ids(
+                    include_row_ids.as_ref(),
+                    &ranges,
+                )?)
+                .filter_map(|(entry, local_filter)| {
+                    local_filter.map(|filter| (entry, Some(filter)))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            entries
+                .iter()
+                .copied()
+                .map(|entry| (entry, None))
+                .collect::<Vec<_>>()
+        },
+    )
 }
 
 fn local_live_row_ids(deleted: &RowRangeIndex, from: i64, to: i64) -> Option<RoaringTreemap> {
@@ -3300,6 +3375,8 @@ struct VectorIndexTask {
     entry: IndexManifestEntry,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     centroid_files: Vec<IndexManifestEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bitmap: Option<centroid::BitmapWork>,
     queries: TaskVectorQueries,
     #[serde(default)]
     resolved: Option<crate::spec::VectorIndexOptions>,
@@ -3311,6 +3388,7 @@ struct VectorIndexTask {
 struct VectorIndexWork {
     entry: IndexManifestEntry,
     centroid_files: Vec<IndexManifestEntry>,
+    bitmap: Option<centroid::BitmapWork>,
     queries: Vec<VectorSearch>,
     resolved: Option<crate::spec::VectorIndexOptions>,
     filter: Option<Predicate>,
@@ -3376,9 +3454,15 @@ pub(super) async fn execute_search_task(
         "vector-index"
         | "vector-index-filtered"
         | "vector-index-centroid"
+        | "vector-index-centroid-bitmap"
         | "vector-index-multivector" => {
             let work: VectorIndexTask = serde_json::from_value(payload.clone())
                 .map_err(|error| crate::table::search_task::invalid(error.to_string()))?;
+            if (kind == "vector-index-centroid-bitmap") != work.bitmap.is_some() {
+                return Err(crate::table::search_task::invalid(
+                    "Invalid centroid Bitmap work",
+                ));
+            }
             if kind == "vector-index-filtered" && work.filter.is_none() {
                 return Err(crate::table::search_task::invalid(
                     "Filtered vector task is missing its predicate",
@@ -3410,6 +3494,7 @@ pub(super) async fn execute_search_task(
                 VectorIndexWork {
                     entry: work.entry,
                     centroid_files: work.centroid_files,
+                    bitmap: work.bitmap,
                     queries: work.queries.restore()?,
                     resolved: work.resolved,
                     filter: work.filter,

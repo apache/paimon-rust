@@ -459,6 +459,16 @@ impl SpilledVectors {
         self.count
     }
 
+    pub fn read_local_row_ids(&mut self) -> Result<Vec<i64>> {
+        let mut buffer = MutableBuffer::new(checked_vector_bytes(self.count, 2)?);
+        buffer.resize(checked_vector_bytes(self.count, 2)?, 0);
+        self.ids.seek(SeekFrom::Start(0)).map_err(spill_error)?;
+        self.ids
+            .read_exact(buffer.as_slice_mut())
+            .map_err(spill_error)?;
+        Ok(buffer.typed_data::<i64>().to_vec())
+    }
+
     pub fn train_router(
         &mut self,
         config: VectorIndexConfig,
