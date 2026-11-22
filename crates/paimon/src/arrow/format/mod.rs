@@ -40,7 +40,7 @@ use super::ReadBudget;
 use super::RowFilterFactory;
 use crate::io::{FileIO, FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
-use crate::spec::{DataField, Predicate};
+use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::RecordBatch;
@@ -448,7 +448,8 @@ pub(crate) fn create_format_reader_with_budget(
     } else if lower.ends_with(".blob") {
         Box::new(
             blob::BlobFormatReader::new(path.to_string(), blob_as_descriptor)
-                .with_blob_parallelism(blob_parallelism),
+                .with_blob_parallelism(blob_parallelism)
+                .with_crc_verification(CoreOptions::new(table_options).blob_read_verify_crc()?),
         )
     } else if lower.ends_with(".video") {
         Box::new(video::VideoFormatReader::new(path.to_string()))

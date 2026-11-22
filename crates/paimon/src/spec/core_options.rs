@@ -189,6 +189,7 @@ const DEFAULT_GLOBAL_INDEX_FALLBACK_SCAN_MAX_SIZE: i64 = 256 * 1024 * 1024;
 const DEFAULT_BTREE_INDEX_CACHE_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO: f64 = 0.1;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
+const BLOB_READ_VERIFY_CRC_OPTION: &str = "blob.read.verify-crc";
 pub(crate) const BLOB_FIELD_OPTION: &str = "blob-field";
 pub(crate) const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
 pub(crate) const BLOB_DESCRIPTOR_FIELD_FALLBACK: &str = "blob.stored-descriptor-fields";
@@ -2141,6 +2142,20 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
+    /// Verify BLOB entry CRCs when reading payloads. Enabled by default.
+    pub fn blob_read_verify_crc(&self) -> crate::Result<bool> {
+        match self.options.get(BLOB_READ_VERIFY_CRC_OPTION) {
+            None => Ok(true),
+            Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+            Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+            Some(value) => Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "{BLOB_READ_VERIFY_CRC_OPTION} must be true or false, got '{value}'"
+                ),
+            }),
+        }
+    }
+
     /// Comma-separated BLOB field names stored in dedicated `.blob` files.
     ///
     /// Fields listed in `blob-descriptor-field` or `blob-view-field` are also
@@ -4058,6 +4073,20 @@ mod tests {
             assert_eq!(core.blob_inline_fields(), inline);
             assert_eq!(core.blob_fields(), inline);
         }
+    }
+
+    #[test]
+    fn blob_read_verify_crc_defaults_on_and_rejects_invalid_values() {
+        let mut options = HashMap::new();
+        assert!(CoreOptions::new(&options).blob_read_verify_crc().unwrap());
+        for value in ["true", "TRUE"] {
+            options.insert(BLOB_READ_VERIFY_CRC_OPTION.into(), value.into());
+            assert!(CoreOptions::new(&options).blob_read_verify_crc().unwrap());
+        }
+        options.insert(BLOB_READ_VERIFY_CRC_OPTION.into(), "false".into());
+        assert!(!CoreOptions::new(&options).blob_read_verify_crc().unwrap());
+        options.insert(BLOB_READ_VERIFY_CRC_OPTION.into(), "typo".into());
+        assert!(CoreOptions::new(&options).blob_read_verify_crc().is_err());
     }
 
     #[test]
