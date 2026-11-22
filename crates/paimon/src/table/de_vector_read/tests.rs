@@ -31,7 +31,7 @@ use crate::table::{find_field_id_by_name, RowRange};
 use crate::vector_search::{ScoredRowIds, VectorSearch};
 use crate::vindex::pkvector::metric::VectorSearchMetric;
 use crate::vindex::IVF_FLAT_IDENTIFIER;
-use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
 use arrow_array::{Array, ArrayRef, Float32Array, Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
@@ -318,29 +318,48 @@ fn test_raw_vector_score_matches_java_metric_semantics() {
 
 #[test]
 fn test_raw_vector_score_matrix_matches_scalar_metrics() {
-    let stored = vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0];
-    let queries = vec![1.0, 1.0, -1.0, 2.0];
-    let query_indices = vec![0, 1];
-    let query_l2_squared_norms = vec![2.0, 5.0];
+    let stored = [1.0, 2.0, 3.0, 4.0, 0.0, 0.0];
+    let queries = [[1.0, 1.0], [-1.0, 2.0], [0.0, 0.0]];
+    let query_indices = vec![0, 1, 2];
 
     for metric in [
         RawVectorMetric::L2,
         RawVectorMetric::Cosine,
         RawVectorMetric::InnerProduct,
     ] {
-        let matrix_scores = compute_raw_vector_score_matrix(
-            &stored,
-            3,
-            &queries,
-            2,
-            2,
-            &query_l2_squared_norms,
-            &query_indices,
-            metric,
-        )
+        let matrix_scores = if metric == RawVectorMetric::Cosine {
+            let stored = stored.map(f64::from);
+            let queries = queries.map(|query| query.map(f64::from));
+            let stored_norms: Vec<_> = stored
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|row| DenseCosineNorm::new(row))
+                .collect();
+            let query_norms = queries.map(|query| cosine_norm(&query));
+            compute_raw_cosine_score_matrix(
+                &stored,
+                &stored_norms,
+                queries.as_flattened(),
+                &query_norms,
+                &query_indices,
+                2,
+            )
+        } else {
+            compute_raw_vector_score_matrix(
+                &stored,
+                3,
+                queries.as_flattened(),
+                3,
+                2,
+                &RawVectorNorms::new(queries.iter().map(<[_; 2]>::as_slice), metric),
+                &query_indices,
+                metric,
+            )
+        }
         .unwrap();
         for (row_index, stored_vector) in stored.as_chunks::<2>().0.iter().enumerate() {
-            for (query_index, query) in queries.as_chunks::<2>().0.iter().enumerate() {
+            for (query_index, query) in queries.iter().enumerate() {
                 let expected = compute_raw_vector_score(query, stored_vector, metric);
                 let actual = matrix_scores[query_index * 3 + row_index];
                 assert!(
@@ -357,12 +376,148 @@ fn test_raw_vector_score_matrix_matches_scalar_metrics() {
         &[1.0, 0.0],
         1,
         2,
-        &[1.0],
+        &RawVectorNorms::new(std::iter::once(&[1.0, 0.0][..]), RawVectorMetric::L2),
         &[0],
         RawVectorMetric::L2,
     )
     .unwrap()[0];
     assert_eq!(non_finite_score, 0.0);
+}
+
+#[test]
+fn test_raw_cosine_matrix_refines_mixed_sign_rounding_bounds() {
+    let dimension = 256;
+    let epsilon = 2.0_f32.powi(-22);
+    let mut query = vec![epsilon; dimension];
+    query[..128].fill(1.0);
+    query[0] = 2.0;
+    let mut other_query = query.clone();
+    other_query[0] = 3.0;
+    let mut row = vec![epsilon; dimension];
+    row[128..192].fill(1.0);
+    row[192..].fill(-1.0);
+    let mut other_row = row.clone();
+    other_row[0] = -epsilon;
+    let queries = [&query, &other_query];
+    let query_norms = queries.map(|query| cosine_norm(query));
+    let norm_product = query_norms[0] * cosine_norm(&row);
+    let dot = 129.0 * f64::from(epsilon);
+    assert!(CosineOutput::Similarity
+        .try_round_from_dot(
+            CosineDot::Approximate {
+                value: dot,
+                absolute_sum_bound: norm_product,
+            },
+            norm_product,
+            dimension,
+        )
+        .is_err());
+    assert_eq!(
+        CosineOutput::Similarity.try_round_from_dot(
+            CosineDot::Approximate {
+                value: dot,
+                absolute_sum_bound: 257.0 * f64::from(epsilon),
+            },
+            norm_product,
+            dimension,
+        ),
+        Ok(cosine_similarity(&query, query_norms[0], &row))
+    );
+
+    // Exercise pairwise refinement, batched refinement, and partial blocks
+    // in both result dimensions.
+    let block_edge = RAW_COSINE_ABSOLUTE_BLOCK_VECTORS + 1;
+    for (query_count, row_count) in [(4, 2), (4, 32), (4, block_edge), (block_edge, 32)] {
+        let query_indices: Vec<_> = [1, 0].into_iter().cycle().take(query_count).collect();
+        let query_matrix: Vec<_> = query_indices
+            .iter()
+            .flat_map(|&index| queries[index].iter().copied().map(f64::from))
+            .collect();
+        let rows: Vec<_> = [&row, &other_row]
+            .into_iter()
+            .cycle()
+            .take(row_count)
+            .collect();
+        let stored: Vec<_> = rows
+            .iter()
+            .flat_map(|row| row.iter().copied().map(f64::from))
+            .collect();
+        let stored_norms: Vec<_> = stored
+            .chunks_exact(dimension)
+            .map(DenseCosineNorm::new)
+            .collect();
+        let scores = compute_raw_cosine_score_matrix(
+            &stored,
+            &stored_norms,
+            &query_matrix,
+            &query_norms,
+            &query_indices,
+            dimension,
+        )
+        .unwrap();
+        for (&query_index, scores) in query_indices.iter().zip(scores.chunks_exact(row_count)) {
+            for (row, &score) in rows.iter().zip(scores) {
+                assert_eq!(
+                    score,
+                    cosine_similarity(queries[query_index], query_norms[query_index], row)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_raw_cosine_matrix_certifies_orthogonal_integer_dots() {
+    let dimension = 256;
+    let hadamard = |row: usize| {
+        (0..dimension).map(move |column| {
+            if (row & column).count_ones().is_multiple_of(2) {
+                1.0
+            } else {
+                -1.0
+            }
+        })
+    };
+    for (query_scale, stored_scale) in [
+        (1.0, 1.0),
+        (1.0 / 16.0, 1.0 / 16.0),
+        (1.0 / 16.0, 1.0 / 32.0),
+    ] {
+        let queries: Vec<_> = (0..4).flat_map(hadamard).map(|v| v * query_scale).collect();
+        let stored: Vec<_> = (4..20)
+            .flat_map(hadamard)
+            .map(|v| v * stored_scale)
+            .collect();
+        let stored_norms: Vec<_> = stored
+            .chunks_exact(dimension)
+            .map(DenseCosineNorm::new)
+            .collect();
+        let query_norms = queries
+            .chunks_exact(dimension)
+            .map(cosine_norm)
+            .collect::<Vec<_>>();
+        assert!(integer_dot_is_exact(
+            scaled_integer_max(&queries),
+            scaled_integer_max(&stored),
+            dimension
+        ));
+        let scores = compute_raw_cosine_score_matrix(
+            &stored,
+            &stored_norms,
+            &queries,
+            &query_norms,
+            &[0, 1, 2, 3],
+            dimension,
+        )
+        .unwrap();
+        assert_eq!(scores, vec![0.0; 4 * 16]);
+    }
+    let large = 2.0_f64.powi(26);
+    assert!(!integer_dot_is_exact(Some(large), Some(large), dimension));
+    assert_eq!(scaled_integer_max(&[1.0, 0.25]), Some(4.0));
+    assert_eq!(scaled_integer_max(&[-0.375, 0.25, -0.0]), Some(3.0));
+    assert_eq!(scaled_integer_max(&[2.0_f64.powi(53), 1.0]), None);
+    assert_eq!(scaled_integer_max(&[1.0, f64::INFINITY]), None);
 }
 
 #[test]
@@ -374,8 +529,6 @@ fn test_raw_vector_score_matrix_l2_preserves_large_finite_distances() {
     let mut stored = query.clone();
     stored.extend_from_slice(&nearby);
     let queries = query.repeat(4);
-    let query_l2_squared_norm = query.iter().map(|value| value * value).sum::<f32>();
-    let query_l2_squared_norms = vec![query_l2_squared_norm; 4];
     let query_indices = vec![0, 1, 2, 3];
 
     let matrix_scores = compute_raw_vector_score_matrix(
@@ -384,7 +537,7 @@ fn test_raw_vector_score_matrix_l2_preserves_large_finite_distances() {
         &queries,
         4,
         dimension,
-        &query_l2_squared_norms,
+        &RawVectorNorms::new(queries.chunks_exact(dimension), RawVectorMetric::L2),
         &query_indices,
         RawVectorMetric::L2,
     )
@@ -401,13 +554,12 @@ fn test_raw_vector_score_matrix_l2_preserves_large_finite_distances() {
 
 #[test]
 fn test_raw_vector_cosine_avoids_squared_norm_product_overflow() {
-    let query = vec![1.0e15_f32, 0.0];
-    let query_l2_squared_norm = query.iter().map(|value| value * value).sum::<f32>();
-    assert!(query_l2_squared_norm.is_finite());
-    let values = Float32Array::from(query.clone());
+    let query = [1.0e15_f32, 0.0];
+    let query_norm = cosine_norm(&query);
+    let values = Float32Array::from(query.to_vec());
     let scalar_score = compute_raw_vector_score_from_values(
         &query,
-        query_l2_squared_norm,
+        Some(query_norm),
         &values,
         0,
         2,
@@ -415,21 +567,270 @@ fn test_raw_vector_cosine_avoids_squared_norm_product_overflow() {
     );
     assert!((scalar_score - 1.0).abs() < 1e-6);
 
+    let query = query.map(f64::from);
     let queries = query.repeat(4);
-    let matrix_scores = compute_raw_vector_score_matrix(
+    let matrix_scores = compute_raw_cosine_score_matrix(
         &query,
-        1,
+        &[DenseCosineNorm::new(&query)],
         &queries,
-        4,
-        2,
-        &[query_l2_squared_norm; 4],
+        &[query_norm; 4],
         &[0, 1, 2, 3],
-        RawVectorMetric::Cosine,
+        2,
     )
     .unwrap();
     assert!(matrix_scores
         .iter()
         .all(|score| (*score - 1.0).abs() < 1e-6));
+}
+
+#[test]
+fn test_raw_cosine_top_k_is_invariant_to_vector_scale() {
+    for scale in [1.0e20_f32, 1.0e-23_f32] {
+        assert_raw_cosine_top_one(
+            &[scale, 0.0],
+            &[&[-scale, 0.0], &[scale, 0.0], &[0.0, scale]],
+            11,
+            1.0,
+        );
+    }
+}
+
+#[test]
+fn test_raw_cosine_top_k_orders_near_parallel_with_underflowing_squares() {
+    let scale = 2.0_f32.powi(-63);
+    let mut query = [0.0; 257];
+    query[256] = scale;
+    let mut nearly_parallel = [scale * 2.0_f32.powi(-12); 257];
+    nearly_parallel[256] = scale;
+    assert_raw_cosine_top_one(&query, &[&nearly_parallel, &query], 11, 1.0);
+}
+
+#[test]
+fn test_raw_cosine_top_k_orders_near_orthogonal_with_underflowing_dot() {
+    let similarity = 2.0_f32.powi(-24);
+    for scale in [1.0, 2.0_f32.powi(-63)] {
+        assert_raw_cosine_top_one(
+            &[scale, 0.0],
+            &[&[0.0, scale], &[scale * similarity, scale]],
+            11,
+            similarity,
+        );
+    }
+}
+
+#[test]
+fn test_raw_cosine_top_k_orders_mixed_scale_candidates() {
+    let query = [3.0, 13.0];
+    let exact = [895.0 * query[0], 895.0 * query[1]];
+    for scale in [1.0, 2.0_f32.powi(64)] {
+        let nearby = [40.0 * scale, 173.0 * scale];
+        assert_raw_cosine_top_one(&query, &[&exact, &nearby], 10, 1.0);
+    }
+}
+
+#[test]
+fn test_raw_cosine_top_k_preserves_same_sign_terms_at_rounding_midpoint() {
+    let large = 2.0_f32.powi(32);
+    let small = 2.0_f32.powi(-12);
+    let tiny = 2.0_f32.powi(-27);
+    let query = [large, 0.0, 1.0, small, tiny, tiny, tiny, tiny];
+    let first = [0.0, large, 1.0, small, 0.0, 0.0, 0.0, 0.0];
+    let second = [0.0, large, 1.0, small, tiny, tiny, tiny, tiny];
+    let expected_score = 2.0_f32.powi(-64).next_up();
+    assert_raw_cosine_top_one(&query, &[&first, &second], 11, expected_score);
+}
+
+#[test]
+fn test_raw_cosine_top_k_preserves_small_norm_terms_in_either_order() {
+    let mut query = [0.0; 66];
+    query[0] = 1.0;
+    let mut nearby = [2.0_f32.powi(-27); 66];
+    nearby[0] = 1.0;
+    nearby[1] = 2.0_f32.powi(-12);
+    for _ in 0..2 {
+        assert_raw_cosine_top_one(&query, &[&nearby, &query], 11, 1.0);
+        query.reverse();
+        nearby.reverse();
+    }
+}
+
+#[test]
+fn test_raw_cosine_top_k_preserves_residual_after_dot_cancellation() {
+    let large = 2.0_f32.powi(64);
+    let small = 2.0_f32.powi(37);
+    let expected_score = 2.0_f32.powi(-55);
+    assert_raw_cosine_top_one(
+        &[large, small, large],
+        &[&[large, 0.0, -large], &[large, small, -large]],
+        11,
+        expected_score,
+    );
+    assert_raw_cosine_top_one(
+        &[large, large, small],
+        &[&[large, -large, 0.0], &[large, -large, small]],
+        11,
+        expected_score,
+    );
+}
+
+#[test]
+fn test_raw_cosine_top_k_preserves_residual_across_multiple_scales() {
+    let large = 2.0_f32.powi(64);
+    let medium = 2.0_f32.powi(37);
+    let small = 2.0_f32.powi(8);
+    assert_raw_cosine_top_one(
+        &[large, medium, small, large, medium],
+        &[
+            &[large, medium, 0.0, -large, -medium],
+            &[large, medium, small, -large, -medium],
+        ],
+        11,
+        2.0_f32.powi(-113),
+    );
+}
+
+#[test]
+fn test_raw_cosine_top_k_handles_many_product_scales() {
+    let mut query = (0..50)
+        .map(|i| 1.5 * 2.0_f32.powi(i * 17 % 240 - 120))
+        .collect::<Vec<_>>();
+    let mut nearby = (0..50)
+        .map(|i| 1.125 * 2.0_f32.powi(i * 29 % 240 - 120))
+        .collect::<Vec<_>>();
+    let mut orthogonal = vec![0.0; 50];
+    // The disjoint large coordinates make the positive dot product small
+    // relative to the norms. Mixed signs also exercise compensation in DGEMM.
+    query[0] = -query[0];
+    query.extend([f32::MAX, 0.0]);
+    nearby.extend([0.0, f32::MAX]);
+    orthogonal.extend([0.0, f32::MAX]);
+    let dot: f64 = query
+        .iter()
+        .zip(&nearby)
+        .map(|(&q, &s)| f64::from(q) * f64::from(s))
+        .sum();
+    let expected_score = (dot / (cosine_norm(&query) * cosine_norm(&nearby))) as f32;
+    assert_raw_cosine_top_one(&query, &[&orthogonal, &nearby], 11, expected_score);
+}
+
+fn assert_raw_cosine_top_one(
+    query: &[f32],
+    stored: &[&[f32]],
+    expected_row_id: u64,
+    expected_score: f32,
+) {
+    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), query.len() as i32);
+    for vector in stored {
+        builder.values().append_slice(vector);
+        builder.append(true);
+    }
+    let vectors = builder.finish();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("embedding", vectors.data_type().clone(), false),
+        ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, false),
+    ]));
+    let row_ids = Int64Array::from_iter_values(10..10 + stored.len() as i64);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(vectors), Arc::new(row_ids)]).unwrap();
+
+    for query_count in [1, RAW_SCORE_MATRIX_MIN_QUERY_COUNT] {
+        let searches = (0..query_count)
+            .map(|_| VectorSearch::new(query.to_vec(), 1, "embedding".to_string()).unwrap())
+            .collect::<Vec<_>>();
+        let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::Cosine);
+        let mut top_k = (0..query_count)
+            .map(|_| RawScoreTopK::new(1))
+            .collect::<Vec<_>>();
+        collect_raw_batch_vector_batch(
+            &batch,
+            &searches,
+            RawVectorMetric::Cosine,
+            &scoring_plan,
+            &mut top_k,
+        )
+        .unwrap();
+        for result in top_k.into_iter().map(RawScoreTopK::into_search_result) {
+            assert_eq!(
+                result.row_ids,
+                vec![expected_row_id],
+                "query count={query_count}"
+            );
+            assert_eq!(result.scores, vec![expected_score]);
+        }
+    }
+}
+
+fn score_single_embedding_lists(
+    rows: &[[f32; 3]],
+    queries: &[[f32; 3]],
+    mode: ListScoring,
+) -> Vec<ScoredRowIds> {
+    let mut builder = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), 3));
+    for row in rows {
+        builder.values().values().append_slice(row);
+        builder.values().append(true);
+        builder.append(true);
+    }
+    let vectors = builder.finish();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("embedding", vectors.data_type().clone(), false),
+        ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, false),
+    ]));
+    let row_ids = Int64Array::from_iter_values(10..10 + rows.len() as i64);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(vectors), Arc::new(row_ids)]).unwrap();
+    let searches = queries
+        .iter()
+        .map(|query| VectorSearch::new(query.to_vec(), 1, "embedding".to_string()).unwrap())
+        .collect::<Vec<_>>();
+    let scoring = RawBatchScoring::new(&searches, RawVectorMetric::Cosine, Some(mode)).unwrap();
+    let mut top_k = (0..mode.result_count(queries.len()))
+        .map(|_| RawScoreTopK::new(1))
+        .collect::<Vec<_>>();
+    scoring
+        .collect(&batch, &searches, RawVectorMetric::Cosine, &mut top_k)
+        .unwrap();
+    top_k
+        .into_iter()
+        .map(RawScoreTopK::into_search_result)
+        .collect()
+}
+
+#[test]
+fn test_list_cosine_top_k_matches_single_vectors_after_dot_cancellation() {
+    let tiny = 2.0_f32.powi(-27);
+    let query = [1.0, tiny, 1.0];
+    let rows = [[1.0, 0.0, -1.0], [1.0, tiny, -1.0]];
+    let expected_score = 2.0_f32.powi(-55);
+    assert_raw_cosine_top_one(&query, &[&rows[0], &rows[1]], 11, expected_score);
+
+    for (mode, count) in [
+        (ListScoring::Independent, 1),
+        (ListScoring::Independent, RAW_SCORE_MATRIX_MIN_QUERY_COUNT),
+        (ListScoring::MaxSim, 1),
+    ] {
+        let results = score_single_embedding_lists(&rows, &vec![query; count], mode);
+        assert_eq!(results.len(), count);
+        for result in results {
+            assert_eq!(result.row_ids, [11]);
+            assert_eq!(result.scores, [expected_score]);
+        }
+    }
+}
+
+#[test]
+fn test_list_cosine_top_k_max_sim_preserves_small_terms_between_opposite_scores() {
+    let tiny = 2.0_f32.powi(-27);
+    let rows = [[1.0, 0.0, -1.0], [1.0, tiny, -1.0]];
+    let positive = [1.0, 0.0, -1.0];
+    let negative = [-1.0, 0.0, 1.0];
+    let orthogonal = [1.0, tiny, 1.0];
+    for queries in [
+        [positive, orthogonal, negative],
+        [negative, orthogonal, positive],
+    ] {
+        let results = score_single_embedding_lists(&rows, &queries, ListScoring::MaxSim);
+        assert_eq!(results[0].row_ids, [11]);
+        assert_eq!(results[0].scores, [2.0_f32.powi(-55)]);
+    }
 }
 
 #[test]

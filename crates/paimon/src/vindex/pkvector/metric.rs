@@ -15,8 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::data_invalid;
 use std::cmp::Ordering;
+
+use num_bigint::{BigInt, BigUint, Sign};
+use num_traits::{FromPrimitive, ToPrimitive};
+
+use super::data_invalid;
+use crate::common::number::{accumulate_f64_partials, round_f64_partials};
 
 /// Order two distances the way Java `Float.compare` does: every NaN sorts after
 /// all numeric values (so a NaN distance is always ranked worst, never best),
@@ -41,8 +46,10 @@ pub(crate) fn normalize_metric(metric: &str) -> String {
     metric.to_ascii_lowercase().replace('-', "_")
 }
 
-/// Numeric semantics for a supported vector search metric. Mirrors Java
-/// `org.apache.paimon.globalindex.VectorSearchMetric`.
+/// Metric names and distance conventions follow Java
+/// `org.apache.paimon.globalindex.VectorSearchMetric`. Rust's exact cosine
+/// scorer rounds the distance after subtraction, so close matches can rank
+/// differently from Java.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VectorSearchMetric {
     L2,
@@ -84,13 +91,22 @@ impl VectorSearchMetric {
         }
     }
 
-    /// Lower-is-better distance for exact vector search.
-    pub(crate) fn compute_distance(&self, query: &[f32], stored: &[f32]) -> f32 {
-        match self {
-            Self::L2 => squared_l2(query, stored),
-            Self::Cosine => cosine_distance(cosine_similarity(query, stored)),
-            Self::InnerProduct => -inner_product(query, stored),
+    /// Prepare the query once for exact scoring against multiple rows.
+    pub(crate) fn prepare_query(self, query: &[f32]) -> PreparedVectorQuery<'_> {
+        PreparedVectorQuery {
+            metric: self,
+            query,
+            cosine_norm: if self == Self::Cosine {
+                cosine_norm(query)
+            } else {
+                0.0
+            },
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compute_distance(&self, query: &[f32], stored: &[f32]) -> f32 {
+        self.prepare_query(query).compute_distance(stored)
     }
 
     /// Convert a higher-is-better standardized index score to a lower-is-better
@@ -120,6 +136,30 @@ impl VectorSearchMetric {
     }
 }
 
+pub(crate) struct PreparedVectorQuery<'a> {
+    metric: VectorSearchMetric,
+    query: &'a [f32],
+    cosine_norm: f64,
+}
+
+impl PreparedVectorQuery<'_> {
+    /// Lower-is-better distance for exact vector search.
+    pub(crate) fn compute_distance(&self, stored: &[f32]) -> f32 {
+        match self.metric {
+            VectorSearchMetric::L2 => squared_l2(self.query, stored),
+            VectorSearchMetric::Cosine => cosine_score(
+                self.query,
+                self.cosine_norm,
+                stored,
+                None,
+                CosineOutput::Distance,
+                &mut Vec::new(),
+            ),
+            VectorSearchMetric::InnerProduct => -inner_product(self.query, stored),
+        }
+    }
+}
+
 fn squared_l2(query: &[f32], stored: &[f32]) -> f32 {
     let mut squared = 0.0f32;
     for i in 0..query.len() {
@@ -129,21 +169,357 @@ fn squared_l2(query: &[f32], stored: &[f32]) -> f32 {
     squared
 }
 
-fn cosine_similarity(query: &[f32], stored: &[f32]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut query_norm = 0.0f32;
-    let mut stored_norm = 0.0f32;
-    for i in 0..query.len() {
-        dot += query[i] * stored[i];
-        query_norm += query[i] * query[i];
-        stored_norm += stored[i] * stored[i];
+pub(crate) fn cosine_norm<T: Copy + Into<f64>>(vector: &[T]) -> f64 {
+    vector
+        .iter()
+        .map(|&value| {
+            let value = value.into();
+            value * value
+        })
+        .sum::<f64>()
+        .sqrt()
+}
+
+pub(crate) fn cosine_similarity(query: &[f32], query_norm: f64, stored: &[f32]) -> f32 {
+    cosine_score(
+        query,
+        query_norm,
+        stored,
+        None,
+        CosineOutput::Similarity,
+        &mut Vec::new(),
+    )
+}
+
+pub(crate) fn cosine_similarity_with_norms(
+    query: &[f32],
+    query_norm: f64,
+    stored: &[f32],
+    stored_norm: f64,
+    partials: &mut Vec<f64>,
+) -> f32 {
+    cosine_score(
+        query,
+        query_norm,
+        stored,
+        Some(stored_norm),
+        CosineOutput::Similarity,
+        partials,
+    )
+}
+
+/// Similarity for aggregation across queries, with the dot accumulated before
+/// normalization and rounding deferred to the final score.
+pub(crate) fn cosine_similarity_f64(
+    query: &[f32],
+    stored: &[f32],
+    norm_product: f64,
+    partials: &mut Vec<f64>,
+) -> f64 {
+    if norm_product == 0.0 {
+        return 0.0;
     }
-    let denominator = ((query_norm as f64).sqrt() * (stored_norm as f64).sqrt()) as f32;
-    if denominator == 0.0 {
-        0.0
-    } else {
-        dot / denominator
+    accumulate_dot_partials(query, stored, partials);
+    (round_f64_partials(partials) / norm_product).clamp(-1.0, 1.0)
+}
+
+#[inline]
+fn cosine_score(
+    query: &[f32],
+    query_norm: f64,
+    stored: &[f32],
+    stored_norm: Option<f64>,
+    output: CosineOutput,
+    partials: &mut Vec<f64>,
+) -> f32 {
+    let mut dot = 0.0_f64;
+    let mut absolute_dot = 0.0_f64;
+    let mut stored_squared_norm = 0.0_f64;
+    for (&query, &stored) in query.iter().zip(stored) {
+        let q = f64::from(query);
+        let s = f64::from(stored);
+        let product = q * s;
+        dot += product;
+        if matches!(output, CosineOutput::Similarity) {
+            absolute_dot += product.abs();
+        }
+        if stored_norm.is_none() {
+            stored_squared_norm += s * s;
+        }
     }
+    let stored_norm = stored_norm.unwrap_or_else(|| stored_squared_norm.sqrt());
+    let norm_product = query_norm * stored_norm;
+    let absolute_dot_bound = match output {
+        CosineOutput::Similarity => absolute_dot,
+        CosineOutput::Distance => norm_product,
+    };
+    let dot = CosineDot::Approximate {
+        value: dot,
+        absolute_sum_bound: absolute_dot_bound,
+    };
+    let mut bounds = match output.try_round_from_dot(dot, norm_product, query.len()) {
+        Ok(rounded) => return rounded,
+        Err(bounds) => bounds,
+    };
+    if matches!(output, CosineOutput::Distance) && bounds.1 <= 0.5 {
+        if bounds.0 == 0.0 && (query == stored || positively_proportional(query, stored)) {
+            return 0.0;
+        }
+        let (lower, upper) = normalized_distance_bounds(query, stored, query_norm, stored_norm);
+        bounds = (bounds.0.max(lower), bounds.1.min(upper));
+        if bounds.0 == bounds.1 {
+            return bounds.0;
+        }
+    }
+    output.round_exact(dot, norm_product, query, stored, bounds, partials)
+}
+
+fn positively_proportional(query: &[f32], stored: &[f32]) -> bool {
+    let Some((&query_pivot, &stored_pivot)) = query.iter().zip(stored).find(|(q, _)| **q != 0.0)
+    else {
+        return false;
+    };
+    let query_pivot = f64::from(query_pivot);
+    let stored_pivot = f64::from(stored_pivot);
+    // Both cross products are exact because the coordinates are finite f32.
+    query_pivot * stored_pivot > 0.0
+        && query
+            .iter()
+            .zip(stored)
+            .all(|(&q, &s)| f64::from(q) * stored_pivot == f64::from(s) * query_pivot)
+}
+
+/// Bound the cosine distance as half the squared difference of unit vectors.
+/// The distance interval narrows as the difference approaches zero.
+fn normalized_distance_bounds(
+    query: &[f32],
+    stored: &[f32],
+    query_norm: f64,
+    stored_norm: f64,
+) -> (f32, f32) {
+    let roundoff = (query.len() as f64 + 8.0) * f64::EPSILON;
+    if roundoff >= 0.5 {
+        return (0.0, 2.0);
+    }
+    let inverse_query_norm = query_norm.recip();
+    let inverse_stored_norm = stored_norm.recip();
+    let mut squared_length = 0.0_f64;
+    for (&q, &s) in query.iter().zip(stored) {
+        let difference = f64::from(q) * inverse_query_norm - f64::from(s) * inverse_stored_norm;
+        squared_length += difference * difference;
+    }
+    let length = squared_length.sqrt();
+    // Each input has unit length. Bound the normalization errors in both
+    // inputs and the relative error in the length of their difference.
+    let error = (1.0 + length) * roundoff / (1.0 - roundoff);
+    let lower = (length - error).max(0.0);
+    let upper = (length + error).min(2.0);
+    ((0.5 * lower * lower) as f32, (0.5 * upper * upper) as f32)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CosineDot {
+    Exact(f64),
+    Approximate { value: f64, absolute_sum_bound: f64 },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CosineOutput {
+    Similarity,
+    Distance,
+}
+
+impl CosineOutput {
+    fn value(self, similarity: f64) -> f64 {
+        match self {
+            Self::Similarity => similarity,
+            Self::Distance => 1.0 - similarity,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn round_from_dot<T: Copy + Into<f64>>(
+        self,
+        dot_product: CosineDot,
+        norm_product: f64,
+        query: &[T],
+        stored: &[T],
+        partials: &mut Vec<f64>,
+    ) -> f32 {
+        self.try_round_from_dot(dot_product, norm_product, query.len())
+            .unwrap_or_else(|bounds| {
+                self.round_exact(dot_product, norm_product, query, stored, bounds, partials)
+            })
+    }
+
+    #[inline]
+    pub(crate) fn try_round_from_dot(
+        self,
+        dot_product: CosineDot,
+        norm_product: f64,
+        dimension: usize,
+    ) -> Result<f32, (f32, f32)> {
+        let (dot, absolute_dot_bound) = match dot_product {
+            CosineDot::Exact(value) => (value, 0.0),
+            CosineDot::Approximate {
+                value,
+                absolute_sum_bound,
+            } => (value, absolute_sum_bound),
+        };
+        if norm_product == 0.0 {
+            return Ok(self.value(0.0) as f32);
+        }
+        if !norm_product.is_finite() {
+            return Ok(self.value(dot / norm_product) as f32);
+        }
+        let inverse_norm = norm_product.recip();
+        let estimate = self.value(dot * inverse_norm);
+        // The products of two f32 coordinates are exact in f64. Bound the
+        // accumulation error in the dot and both squared norms, then allow
+        // for the square roots, normalization, and distance subtraction.
+        let error = 8.0
+            * f64::EPSILON
+            * (dimension as f64 + 2.0)
+            * (absolute_dot_bound + dot.abs())
+            * inverse_norm
+            + f64::EPSILON * estimate.abs();
+        let lower = (estimate - error) as f32;
+        let upper = (estimate + error) as f32;
+        if lower.to_bits() == upper.to_bits() {
+            return Ok(lower);
+        }
+        let lower = self.clamp(lower);
+        let upper = self.clamp(upper);
+        if lower.to_bits() == upper.to_bits() {
+            return Ok(lower);
+        }
+        Err((lower, upper))
+    }
+
+    fn clamp(self, value: f32) -> f32 {
+        match self {
+            Self::Similarity => value.clamp(-1.0, 1.0),
+            Self::Distance => value.clamp(0.0, 2.0),
+        }
+    }
+
+    #[cold]
+    pub(crate) fn round_exact<T: Copy + Into<f64>>(
+        self,
+        dot_product: CosineDot,
+        norm_product: f64,
+        query: &[T],
+        stored: &[T],
+        mut bounds: (f32, f32),
+        partials: &mut Vec<f64>,
+    ) -> f32 {
+        let dot = match dot_product {
+            CosineDot::Exact(dot) => scale_f32_product(dot),
+            CosineDot::Approximate { .. } => exact_dot(query, stored, partials),
+        };
+        if dot.sign() == Sign::NoSign {
+            return self.value(0.0) as f32;
+        }
+        let recovered_dot = match (self, dot_product) {
+            (Self::Similarity, CosineDot::Approximate { .. }) => exact_dot_as_f64(&dot),
+            _ => None,
+        };
+        if let Some(dot) = recovered_dot {
+            // Cancellation error is gone. The approximate norms may already
+            // be sufficient to decide the rounded similarity.
+            match self.try_round_from_dot(CosineDot::Exact(dot), norm_product, query.len()) {
+                Ok(score) => return score,
+                Err((lower, upper)) => bounds = (bounds.0.max(lower), bounds.1.min(upper)),
+            }
+        }
+        let negative = dot.sign() == Sign::Minus;
+        let norms_squared = exact_dot(query, query, partials).into_parts().1
+            * exact_dot(stored, stored, partials).into_parts().1;
+        let dot_squared = dot.magnitude() * dot.magnitude();
+        if dot_squared == norms_squared {
+            return self.value(if negative { -1.0 } else { 1.0 }) as f32;
+        }
+
+        // Every midpoint between adjacent f32 results is a multiple of 2^-150.
+        // Compare the exact cosine with each midpoint by squaring both sides.
+        // For a distance midpoint m, compare the cosine with 1 - m, retaining
+        // the tiny difference from 1 as an integer even if f64 would lose it.
+        const MIDPOINT_SCALE_EXPONENT: usize = 150;
+        let scale = 2.0_f64.powi(MIDPOINT_SCALE_EXPONENT as i32);
+        let one = BigUint::from(1_u8) << MIDPOINT_SCALE_EXPONENT;
+        let scaled_dot_squared = dot_squared << (2 * MIDPOINT_SCALE_EXPONENT);
+        let compare_magnitude =
+            |threshold: &BigUint| scaled_dot_squared.cmp(&(&norms_squared * threshold * threshold));
+        let (lower, upper) = if matches!(self, Self::Similarity) && negative {
+            (-bounds.1, -bounds.0)
+        } else {
+            bounds
+        };
+        let mut first = lower.max(0.0).abs().to_bits();
+        let mut last = upper.max(0.0).abs().to_bits();
+        while first < last {
+            let bits = first + (last - first) / 2;
+            let lower = f32::from_bits(bits);
+            let midpoint = (f64::from(lower) + f64::from(lower.next_up())) * 0.5;
+            let threshold = BigUint::from_f64(midpoint * scale).expect("finite f32 midpoint");
+            let ordering = match self {
+                Self::Similarity => compare_magnitude(&threshold),
+                Self::Distance if !negative && threshold < one => {
+                    compare_magnitude(&(&one - &threshold)).reverse()
+                }
+                Self::Distance if negative && threshold > one => {
+                    compare_magnitude(&(&threshold - &one))
+                }
+                Self::Distance if negative => Ordering::Greater,
+                Self::Distance => Ordering::Less,
+            };
+            if ordering == Ordering::Greater || (ordering == Ordering::Equal && bits & 1 != 0) {
+                first = bits + 1;
+            } else {
+                last = bits;
+            }
+        }
+        let rounded = f32::from_bits(first);
+        if matches!(self, Self::Similarity) && negative {
+            -rounded
+        } else {
+            rounded
+        }
+    }
+}
+
+/// Sum the products exactly in units of 2^-298, the square of the smallest
+/// nonzero f32. Keep the floating-point residuals until conversion so the loop
+/// over coordinates does not need arbitrary-precision arithmetic.
+fn exact_dot<T: Copy + Into<f64>>(query: &[T], stored: &[T], partials: &mut Vec<f64>) -> BigInt {
+    accumulate_dot_partials(query, stored, partials);
+    partials.iter().copied().map(scale_f32_product).sum()
+}
+
+fn accumulate_dot_partials<T: Copy + Into<f64>>(
+    query: &[T],
+    stored: &[T],
+    partials: &mut Vec<f64>,
+) {
+    let products = query
+        .iter()
+        .zip(stored)
+        .map(|(&query, &stored)| query.into() * stored.into());
+    accumulate_f64_partials(products, partials);
+}
+
+fn scale_f32_product(value: f64) -> BigInt {
+    BigInt::from_f64(value * 2.0_f64.powi(298)).expect("finite f32 products")
+}
+
+fn exact_dot_as_f64(dot: &BigInt) -> Option<f64> {
+    // The remaining bits must fit the f64 significand after removing the
+    // common power of two. Dot products are in units of 2^-298.
+    let significant_bits = dot.bits() - dot.trailing_zeros().unwrap_or(0);
+    if significant_bits > u64::from(f64::MANTISSA_DIGITS) {
+        return None;
+    }
+    dot.to_f64().map(|scaled| scaled * 2.0_f64.powi(-298))
 }
 
 fn inner_product(query: &[f32], stored: &[f32]) -> f32 {
@@ -165,6 +541,39 @@ mod tests {
     /// A negative NaN (sign bit set): `f32::total_cmp` would order this *before*
     /// every finite value; `java_float_compare` must order it *after*.
     const NEGATIVE_NAN: f32 = f32::from_bits(0xffc00000);
+
+    #[test]
+    fn test_recovered_dot_resolves_cosine_with_approximate_norms() {
+        let tiny = 2.0_f32.powi(-40);
+        let query = [1.0, tiny, 1.0];
+        let query_norm = cosine_norm(&query);
+        let mut partials = Vec::new();
+        let similarity = CosineOutput::Similarity;
+        for sign in [1.0, -1.0] {
+            let stored = [1.0, sign * tiny, -1.0];
+            let norm_product = query_norm * cosine_norm(&stored);
+            assert!(similarity
+                .try_round_from_dot(
+                    CosineDot::Approximate {
+                        value: 0.0,
+                        absolute_sum_bound: 2.0,
+                    },
+                    norm_product,
+                    query.len(),
+                )
+                .is_err());
+            let dot = exact_dot_as_f64(&exact_dot(&query, &stored, &mut partials)).unwrap();
+            assert_eq!(dot, f64::from(sign) * 2.0_f64.powi(-80));
+            let expected = sign * 2.0_f32.powi(-81);
+            assert_eq!(
+                similarity.try_round_from_dot(CosineDot::Exact(dot), norm_product, query.len()),
+                Ok(expected)
+            );
+            assert_eq!(cosine_similarity(&query, query_norm, &stored), expected);
+        }
+        let inexact = exact_dot(&[1.0, tiny], &[1.0, tiny], &mut partials);
+        assert_eq!(exact_dot_as_f64(&inexact), None);
+    }
 
     #[test]
     fn java_float_compare_sorts_all_nan_after_finite() {
@@ -245,22 +654,169 @@ mod tests {
     }
 
     #[test]
+    fn test_cosine_zero_preserves_nonfinite_scores() {
+        assert_eq!(cosine_similarity(&[0.0, 0.0], 0.0, &[1.0, 2.0]), 0.0);
+        assert!(cosine_similarity(&[0.0, 0.0], 0.0, &[f32::INFINITY, 0.0]).is_nan());
+    }
+
+    #[test]
+    fn test_cosine_exact_distance_is_invariant_to_vector_scale() {
+        for scale in [1.0e20_f32, 1.0e-23_f32] {
+            let query = [scale, 0.0];
+            assert_eq!(
+                VectorSearchMetric::Cosine.compute_distance(&query, &query),
+                0.0
+            );
+            assert_eq!(
+                VectorSearchMetric::Cosine.compute_distance(&query, &[-scale, 0.0]),
+                2.0
+            );
+        }
+    }
+
+    #[test]
+    fn test_cosine_distance_orders_near_parallel_with_underflowing_squares() {
+        let scale = 2.0_f32.powi(-63);
+        let mut query = [0.0; 257];
+        query[256] = scale;
+        let mut nearly_parallel = [scale * 2.0_f32.powi(-12); 257];
+        nearly_parallel[256] = scale;
+
+        let metric = VectorSearchMetric::Cosine;
+        assert_eq!(metric.compute_distance(&query, &query), 0.0);
+        assert!(metric.compute_distance(&query, &nearly_parallel) > 0.0);
+    }
+
+    #[test]
+    fn test_cosine_distance_orders_near_orthogonal_with_underflowing_dot() {
+        let similarity = 2.0_f32.powi(-24);
+        let metric = VectorSearchMetric::Cosine;
+        for scale in [1.0, 2.0_f32.powi(-63)] {
+            let query = [scale, 0.0];
+            let orthogonal = [0.0, scale];
+            let nearly_orthogonal = [scale * similarity, scale];
+            assert_eq!(metric.compute_distance(&query, &orthogonal), 1.0);
+            assert_eq!(
+                metric.compute_distance(&query, &nearly_orthogonal),
+                1.0 - similarity
+            );
+        }
+    }
+
+    #[test]
+    fn test_cosine_distance_orders_mixed_scale_candidates() {
+        let query = [3.0, 13.0];
+        let exact = [895.0 * query[0], 895.0 * query[1]];
+        let metric = VectorSearchMetric::Cosine;
+        // The squared norm product exceeds the squared dot by one:
+        // (3 * 173 - 13 * 40)^2 == 1.
+        let denominator = (178.0_f64 * 31_529.0).sqrt();
+        let expected_distance = (1.0 / (denominator * (denominator + 2369.0))) as f32;
+        for scale in [1.0, 2.0_f32.powi(64)] {
+            let nearby = [40.0 * scale, 173.0 * scale];
+            let nearby_distance = metric.compute_distance(&query, &nearby);
+            assert_eq!(nearby_distance, expected_distance);
+            assert_eq!(metric.compute_distance(&query, &exact), 0.0);
+        }
+    }
+
+    #[test]
+    fn test_cosine_distance_preserves_angle_below_f64_similarity_precision() {
+        let tiny = 2.0_f32.powi(-50);
+        let distance = VectorSearchMetric::Cosine.compute_distance(&[1.0, 0.0], &[1.0, tiny]);
+        assert_eq!(distance, 2.0_f32.powi(-101));
+    }
+
+    #[test]
+    fn test_normalized_distance_resolves_near_parallel_rounding() {
+        let query = [1.0; 256];
+        let query_norm = cosine_norm(&query);
+        for k in 1..=13 {
+            let mut stored = query;
+            let delta = k as f32 * 2.0_f32.powi(-12);
+            stored[0] += delta;
+            let stored_norm = cosine_norm(&stored);
+
+            // For q = [1, ..., 1] and s = q + delta*e_0, the squared norm
+            // product minus the squared dot is (dimension - 1) * delta^2.
+            let delta = f64::from(delta);
+            let norm_product = query_norm * stored_norm;
+            let dot = 256.0 + delta;
+            let expected = (255.0 * delta * delta / (norm_product * (norm_product + dot))) as f32;
+            assert!(CosineOutput::Distance
+                .try_round_from_dot(
+                    CosineDot::Approximate {
+                        value: dot,
+                        absolute_sum_bound: norm_product,
+                    },
+                    norm_product,
+                    query.len(),
+                )
+                .is_err());
+            assert_eq!(
+                normalized_distance_bounds(&query, &stored, query_norm, stored_norm),
+                (expected, expected)
+            );
+            assert_eq!(
+                VectorSearchMetric::Cosine.compute_distance(&query, &stored),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_cosine_distance_for_exact_rescalings() {
+        let mut query: Vec<_> = (0..256).map(|i| ((31 * i % 27) - 13) as f32).collect();
+        query[0] = 0.0;
+        let prepared = VectorSearchMetric::Cosine.prepare_query(&query);
+        for scale in 2..=17 {
+            let stored: Vec<_> = query.iter().map(|&value| value * scale as f32).collect();
+            assert!(positively_proportional(&query, &stored));
+            assert_eq!(prepared.compute_distance(&stored), 0.0);
+            let opposite: Vec<_> = stored.iter().map(|&value| -value).collect();
+            assert!(!positively_proportional(&query, &opposite));
+            assert_eq!(prepared.compute_distance(&opposite), 2.0);
+        }
+        let mut nearby = query.clone();
+        nearby[0] = 2.0_f32.powi(-50);
+        assert!(!positively_proportional(&query, &nearby));
+        assert!(prepared.compute_distance(&nearby) > 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_rounds_signed_subnormal_midpoints_to_even() {
+        let tiny = 2.0_f32.powi(-75);
+        let mut query = vec![tiny];
+        let mut stored = vec![tiny];
+        // Pad each squared norm to exactly one using disjoint coordinates.
+        // The only shared product is 2^-150, the first f32 rounding midpoint.
+        for i in 1..=75 {
+            let value = 2.0_f32.powi(-i);
+            query.extend([value, value, value, 0.0, 0.0, 0.0]);
+            stored.extend([0.0, 0.0, 0.0, value, value, value]);
+        }
+        let norm = cosine_norm(&query);
+        assert_eq!(
+            cosine_similarity(&query, norm, &stored).to_bits(),
+            0.0_f32.to_bits()
+        );
+        stored[0] = -tiny;
+        assert_eq!(
+            cosine_similarity(&query, norm, &stored).to_bits(),
+            (-0.0_f32).to_bits()
+        );
+    }
+
+    #[test]
     fn test_cosine_non_perfect_square_norm_uses_f64_sqrt() {
-        // query [0,3] -> norm 9, stored [1,2] -> norm 5; sqrt(5) is irrational
-        // so the f32-sqrt path (each sqrt taken in f32, then widened) and the
-        // f64-sqrt path (widen first, sqrt in f64) produce different f32 bits:
-        // buggy similarity 0.8944271 vs correct 0.8944272. Encode the f64 contract
-        // in the expected value (dot / (sqrt(9.0f64) * sqrt(5.0f64)) as f32) rather
-        // than a magic literal, so this pins the Java-matching f64 arithmetic. The
-        // cosine distance is `1 - similarity`, so the sqrt path is exercised here.
+        // Taking the square roots in f32 can already lose a bit of the score.
         let q = [0.0f32, 3.0];
         let s = [1.0f32, 2.0];
-        let dot = 6.0f32;
-        let denominator = ((9.0f64).sqrt() * (5.0f64).sqrt()) as f32;
-        let expected_similarity = dot / denominator;
+        let denominator = (9.0_f64).sqrt() * (5.0_f64).sqrt();
+        let expected_distance = (1.0 - 6.0 / denominator) as f32;
         assert_eq!(
             VectorSearchMetric::Cosine.compute_distance(&q, &s),
-            1.0 - expected_similarity
+            expected_distance
         );
     }
 

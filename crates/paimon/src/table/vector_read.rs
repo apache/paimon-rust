@@ -19,7 +19,8 @@
 
 use crate::spec::{CoreOptions, Predicate};
 use crate::table::de_vector_read::DeVectorRead;
-use crate::table::pk_vector_read::PkVectorRead;
+use crate::table::pk_vector_read::{PkVectorRead, PkVectorSearchBatch};
+use crate::table::pk_vector_scan::{plan_from_search_splits, PkVectorScanPlan};
 use crate::table::pk_vector_search_params::PkVectorSearchParams;
 use crate::table::vector_scan::{PlanContext, VectorScanPlan};
 use crate::table::vector_search_common::{take_only_result, targets_primary_key_column};
@@ -60,6 +61,21 @@ impl VectorRead {
             self.batch.read_with_executor(plan, executor).await?,
             "vector search",
         )
+    }
+
+    pub(super) async fn search_primary_key(
+        &self,
+        plan: VectorScanPlan,
+    ) -> crate::Result<PkVectorSearchBatch> {
+        let table = self.batch.table_for_plan(&plan)?;
+        let VectorReadKind::PrimaryKey(reader) = &self.batch.reader else {
+            return Err(crate::Error::Unsupported {
+                message: "Primary-key vector search requires a primary-key vector reader".into(),
+            });
+        };
+        reader
+            .search(self.batch.primary_key_plan(&table, &plan)?)
+            .await
     }
 }
 
@@ -131,11 +147,7 @@ impl BatchVectorRead {
     ) -> crate::Result<Vec<GlobalIndexResult>> {
         self.read_impl(plan, Some(executor)).await
     }
-    async fn read_impl(
-        &self,
-        plan: VectorScanPlan,
-        executor: Option<&dyn SearchTaskExecutor>,
-    ) -> crate::Result<Vec<GlobalIndexResult>> {
+    fn table_for_plan(&self, plan: &VectorScanPlan) -> crate::Result<Table> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         if let Some(snapshot) = &self.context.prepared_snapshot {
             if snapshot.as_ref() != plan.snapshot() {
@@ -147,7 +159,29 @@ impl BatchVectorRead {
                 });
             }
         }
-        let table = self.table.copy_with_pinned_snapshot(plan.snapshot());
+        Ok(self.table.copy_with_pinned_snapshot(plan.snapshot()))
+    }
+
+    fn primary_key_plan(
+        &self,
+        table: &Table,
+        plan: &VectorScanPlan,
+    ) -> crate::Result<PkVectorScanPlan> {
+        plan_from_search_splits(
+            table,
+            &self.context.column,
+            self.context.filter.as_ref(),
+            plan.snapshot().cloned(),
+            plan.splits(),
+        )
+    }
+
+    async fn read_impl(
+        &self,
+        plan: VectorScanPlan,
+        executor: Option<&dyn SearchTaskExecutor>,
+    ) -> crate::Result<Vec<GlobalIndexResult>> {
+        let table = self.table_for_plan(&plan)?;
         match &self.reader {
             VectorReadKind::DataEvolution(reader) => {
                 for source in plan.splits() {
@@ -194,15 +228,7 @@ impl BatchVectorRead {
                         message: "Distributed primary-key vector search is not supported".into(),
                     });
                 }
-                reader
-                    .read(super::pk_vector_scan::plan_from_search_splits(
-                        &table,
-                        &self.context.column,
-                        self.context.filter.as_ref(),
-                        plan.snapshot().cloned(),
-                        plan.splits(),
-                    )?)
-                    .await
+                reader.read(self.primary_key_plan(&table, &plan)?).await
             }
         }
     }

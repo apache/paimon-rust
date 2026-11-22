@@ -111,15 +111,16 @@ impl PrimaryKeySearchPosition {
         )
     }
 
-    pub(crate) fn from_vector_position(
-        position: &crate::vector_search::PrimaryKeySearchPosition,
+    pub(crate) fn from_vector_candidate(
+        candidate: &super::pk_vector_orchestrator::PkVectorCandidate,
+        score: f32,
     ) -> crate::Result<Self> {
         Self::new(
-            position.partition.clone(),
-            position.bucket,
-            position.data_file_name.clone(),
-            position.row_position,
-            position.score,
+            candidate.partition.clone(),
+            candidate.bucket,
+            candidate.data_file_name.clone(),
+            candidate.row_position,
+            score,
         )
     }
 
@@ -209,31 +210,25 @@ mod tests {
         assert_eq!(set.len(), 2);
     }
 
-    fn vector_position(score: f32) -> crate::vector_search::PrimaryKeySearchPosition {
-        crate::vector_search::PrimaryKeySearchPosition {
+    #[test]
+    fn from_vector_candidate_uses_supplied_score_and_validates_position() {
+        let mut hit = super::super::pk_vector_orchestrator::PkVectorCandidate {
+            split_index: 0,
             partition: BinaryRow::new(0),
             bucket: 0,
             data_file_name: "f".to_string(),
             row_position: 0,
-            score,
-        }
-    }
-
-    #[test]
-    fn from_vector_position_preserves_score_and_validates_position() {
-        // GlobalIndexResult already converted distance to score; fusion must preserve it.
-        let mut hit = vector_position(0.5);
-        let position = PrimaryKeySearchPosition::from_vector_position(&hit).unwrap();
-        assert_eq!(position.score(), 0.5);
+            distance: 0.25,
+        };
+        let position = PrimaryKeySearchPosition::from_vector_candidate(&hit, -0.25).unwrap();
+        assert_eq!(position.score(), -0.25);
         assert_eq!(position.row_position(), 0);
         assert_eq!(position.data_file_name(), "f");
         for score in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            hit.score = score;
-            assert!(PrimaryKeySearchPosition::from_vector_position(&hit).is_err());
+            assert!(PrimaryKeySearchPosition::from_vector_candidate(&hit, score).is_err());
         }
-        hit.score = 0.5;
         hit.row_position = -1;
-        assert!(PrimaryKeySearchPosition::from_vector_position(&hit).is_err());
+        assert!(PrimaryKeySearchPosition::from_vector_candidate(&hit, -0.25).is_err());
     }
 
     #[test]
