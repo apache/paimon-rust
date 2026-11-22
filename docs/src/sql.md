@@ -3000,6 +3000,8 @@ embeddings have no score.
 ```sql
 SELECT id
 FROM vector_search('paimon.my_db.documents', 'chunks', '[[1.0, 0.0], [0.0, 1.0]]', 10);
+
+CALL sys.vector_search('my_db.documents', 'chunks', '[[1.0, 0.0], [0.0, 1.0]]', 10, 'id');
 ```
 
 For each query vector, MaxSim takes the best cosine similarity over a row's

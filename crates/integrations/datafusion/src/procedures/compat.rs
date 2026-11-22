@@ -44,7 +44,7 @@ use super::{
 };
 use crate::full_text_search::FullTextSearchFunction;
 use crate::sql_context::ok_result;
-use crate::vector_search::VectorSearchFunction;
+use crate::vector_search::{VectorQuery, VectorSearchFunction};
 use crate::SQLContext;
 
 async fn validate_write_target(
@@ -491,20 +491,31 @@ fn vector_json(query: &str) -> DFResult<String> {
     let query = query.trim();
     let invalid = || {
         DataFusionError::Plan(
-        "query_vector must be a non-empty JSON array or comma-separated list of finite FLOAT values"
+            "query_vector must be a non-empty JSON vector, rectangular JSON matrix, or comma-separated list of finite FLOAT values"
             .into(),
     )
     };
-    let values: Vec<f32> = if query.starts_with('[') {
-        serde_json::from_str(query).map_err(|_| invalid())?
+    let values = if query.starts_with('[') {
+        VectorQuery::parse(query).map_err(|_| invalid())?
     } else {
-        query
+        let values = query
             .split(',')
             .map(|value| value.trim().parse::<f32>())
             .collect::<Result<_, _>>()
-            .map_err(|_| invalid())?
+            .map_err(|_| invalid())?;
+        VectorQuery::Single(values)
     };
-    if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+    let vectors = match &values {
+        VectorQuery::Single(vector) => std::slice::from_ref(vector),
+        VectorQuery::Matrix(vectors) => vectors.as_slice(),
+    };
+    let Some(first) = vectors.first().filter(|vector| !vector.is_empty()) else {
+        return Err(invalid());
+    };
+    if vectors
+        .iter()
+        .any(|vector| vector.len() != first.len() || vector.iter().any(|value| !value.is_finite()))
+    {
         return Err(invalid());
     }
     serde_json::to_string(&values).map_err(|_| invalid())

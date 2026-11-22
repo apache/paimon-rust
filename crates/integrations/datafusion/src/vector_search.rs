@@ -118,14 +118,15 @@ impl VectorSearchFunction {
     }
 }
 
-#[derive(Debug, Clone)]
-enum VectorQuery {
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum VectorQuery {
     Single(Vec<f32>),
     Matrix(Vec<Vec<f32>>),
 }
 
 impl VectorQuery {
-    fn parse(json: &str) -> Result<Self, serde_json::Error> {
+    pub(crate) fn parse(json: &str) -> Result<Self, serde_json::Error> {
         // Parse directly into floats. Untagged enum buffering turns decimal
         // numbers into a private map with serde_json's arbitrary_precision.
         serde_json::from_str::<Vec<f32>>(json)
