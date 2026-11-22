@@ -18,6 +18,7 @@
 use super::*;
 use crate::io::{FileIO, FileIOBuilder};
 use crate::spec::{BinaryRow, FileKind, GlobalIndexMeta, IndexFileMeta, VectorIndexOptions};
+use crate::table::vector_search_test_utils::{vector_search_log_start, vector_search_logs_since};
 use crate::vector_search::GlobalIndexIOMeta;
 use paimon_vindex_core::io::PosWriter;
 use paimon_vindex_core::ivfflat::IVFFlatIndex;
@@ -129,10 +130,12 @@ async fn store(io: &FileIO, entry: &IndexManifestEntry, bytes: Vec<u8>) {
 async fn run(
     io: &FileIO,
     entries: &[IndexManifestEntry],
+    queries: &[f32],
     options: HashMap<String, String>,
 ) -> Vec<ScoredRowIds> {
-    let queries = [0.0, 70.0]
-        .into_iter()
+    let queries = queries
+        .iter()
+        .copied()
         .map(|value| VectorSearch::new(vec![value], 10, "embedding".into()).unwrap())
         .collect();
     let options = VectorIndexOptions {
@@ -211,8 +214,9 @@ async fn joint_routes_use_four_shards_with_or_without_manifest_geometry() {
         });
         entries.push(shard);
     }
-    let joint = run(&io, &entries, HashMap::new()).await;
-    let legacy_joint = run(&io, &legacy, HashMap::new()).await;
+    let queries = [0.0, 70.0];
+    let joint = run(&io, &entries, &queries, HashMap::new()).await;
+    let legacy_joint = run(&io, &legacy, &queries, HashMap::new()).await;
     assert_eq!(joint[0].row_ids.len(), 10);
     assert!(joint[0].row_ids.iter().all(|&id| id < (4 * ROWS) as u64));
     for (expected, actual) in joint.iter().zip(legacy_joint) {
@@ -223,6 +227,7 @@ async fn joint_routes_use_four_shards_with_or_without_manifest_geometry() {
     let standard = run(
         &io,
         &entries,
+        &queries,
         HashMap::from([("centroid.nprobe".into(), "8".into())]),
     )
     .await;
@@ -231,10 +236,49 @@ async fn joint_routes_use_four_shards_with_or_without_manifest_geometry() {
         .iter()
         .all(|&id| id >= (4 * ROWS) as u64));
 
+    // Shard 4 needs a layout check for the second query. It ranks fifth for
+    // the first query, whose four nearest shards already have known layouts.
+    let mut mixed = entries.clone();
+    mixed[5] = entry(
+        Role::Shard(4),
+        entries[5].index_file.file_size as usize,
+        ROWS,
+        None,
+    );
+    let mixed_queries = [0.0, 40.0];
+    let expected = run(&io, &entries, &mixed_queries, HashMap::new()).await;
+    let log_start = vector_search_log_start();
+    let timing = crate::vindex::enable_vector_search_timing_for_test();
+    let actual = run(&io, &mixed, &mixed_queries, HashMap::new()).await;
+    drop(timing);
+    for (expected, actual) in expected.iter().zip(actual) {
+        assert_eq!(expected.row_ids, actual.row_ids);
+        assert_eq!(expected.scores, actual.scores);
+    }
+    let logs = vector_search_logs_since(log_start);
+    let shard_logs: Vec<_> = logs
+        .iter()
+        .filter(|entry| entry.starts_with("event=paimon_vindex_reader file=shard-4 "))
+        .collect();
+    assert_eq!(shard_logs.len(), 2, "{shard_logs:?}");
+    assert!(
+        shard_logs[0].contains("nq=1 nprobe=auto "),
+        "{shard_logs:?}"
+    );
+    assert!(shard_logs[1].contains("nq=1 nprobe=16 "), "{shard_logs:?}");
+    assert!(
+        !shard_logs[0].contains("vindex_open_ms=0.000 "),
+        "{shard_logs:?}"
+    );
+    assert!(
+        shard_logs[1].contains("vindex_open_ms=0.000 "),
+        "{shard_logs:?}"
+    );
+
     let bytes = flat_shard(1, 100.0, 0, ROWS);
     legacy[1] = entry(Role::Shard(0), bytes.len(), ROWS, None);
     store(&io, &legacy[1], bytes).await;
-    let fallback = run(&io, &legacy, HashMap::new()).await;
+    let fallback = run(&io, &legacy, &queries, HashMap::new()).await;
     assert_eq!(standard[0].row_ids, fallback[0].row_ids);
     assert_eq!(standard[0].scores, fallback[0].scores);
 }

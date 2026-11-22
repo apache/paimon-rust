@@ -27,7 +27,9 @@ use crate::table::data_file_reader::DataFileReader;
 use crate::table::pk_vector_orchestrator::{PkVectorCandidate, PkVectorSearchSplit};
 use crate::table::source::DataSplitBuilder;
 use crate::table::vector_scan::Scan;
-use crate::table::vector_search_test_utils::{build_vindex_segment_bytes, pk_vector_table};
+use crate::table::vector_search_test_utils::{
+    build_vindex_segment_bytes, pk_vector_table, vector_search_log_start, vector_search_logs_since,
+};
 use crate::table::{Table, TableCommit, TableWrite};
 use crate::vindex::pkvector::metric::VectorSearchMetric;
 use crate::vindex::IVF_FLAT_IDENTIFIER;
@@ -37,39 +39,7 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as Arr
 use paimon_vindex_core::index::VectorIndexReader as VIndexReader;
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::{Arc, Mutex, Once};
-
-const VECTOR_SEARCH_LOG_TARGET: &str = "paimon::vector_search";
-
-static VECTOR_SEARCH_TEST_LOGGER: VectorSearchTestLogger = VectorSearchTestLogger;
-
-static VECTOR_SEARCH_TEST_LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-struct VectorSearchTestLogger;
-
-impl log::Log for VectorSearchTestLogger {
-    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.target() == VECTOR_SEARCH_LOG_TARGET && metadata.level() <= log::Level::Debug
-    }
-
-    fn log(&self, record: &log::Record<'_>) {
-        if self.enabled(record.metadata()) {
-            VECTOR_SEARCH_TEST_LOGS
-                .lock()
-                .unwrap()
-                .push(record.args().to_string());
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-fn reset_vector_search_test_logs() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| log::set_logger(&VECTOR_SEARCH_TEST_LOGGER).unwrap());
-    log::set_max_level(log::LevelFilter::Debug);
-    VECTOR_SEARCH_TEST_LOGS.lock().unwrap().clear();
-}
+use std::sync::Arc;
 
 fn pk_data_file(name: &str, row_count: i64, first_row_id: Option<i64>) -> DataFileMeta {
     DataFileMeta {
@@ -1092,7 +1062,7 @@ async fn reader_uses_planned_splits_after_index_manifest_is_removed() {
 
 #[tokio::test]
 async fn execute_returns_scored_positions_and_publishes_diagnostics() {
-    reset_vector_search_test_logs();
+    let log_start = vector_search_log_start();
     let _timing = crate::vindex::enable_vector_search_timing_for_test();
     // query [0,1]: squared-L2 distances pos1=0 < pos2=1 < pos0=2, so the
     // strict-gap top-2 is [pos1, pos2] (best-first, not physical order).
@@ -1135,7 +1105,7 @@ async fn execute_returns_scored_positions_and_publishes_diagnostics() {
         "positions must refer to their retained source split"
     );
 
-    let logs = VECTOR_SEARCH_TEST_LOGS.lock().unwrap();
+    let logs = vector_search_logs_since(log_start);
     assert!(
         logs.iter().any(|entry| {
             entry.contains("event=paimon_vindex_reader")

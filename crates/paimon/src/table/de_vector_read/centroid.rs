@@ -102,68 +102,60 @@ pub(super) fn search_file<S: SeekRead + 'static>(
     reader.load_validated(|_| Ok(source), validate)?;
     let metadata = reader.metadata()?;
     let compatible = metadata.nlist == SHARD_LISTS && metadata.metric == MetricType::L2;
-    let mut requests = Vec::with_capacity(searches.len());
-    let mut positions = Vec::with_capacity(searches.len());
+    let mut standard_queries = Vec::new();
+    let mut standard_indices = Vec::new();
+    let mut joint_queries = Vec::new();
+    let mut joint_indices = Vec::new();
     for (index, (query, probe)) in searches.iter().zip(probes).enumerate() {
         if *probe != Probe::Joint {
-            requests.push(query.clone());
-            positions.push((index, false));
+            standard_queries.push(query);
+            standard_indices.push(index);
         }
         if *probe == Probe::Joint || (*probe == Probe::CheckLayout && compatible) {
-            let mut query = query.clone();
-            query
-                .options
-                .insert("ivf.nprobe".into(), JOINT_INNER_PROBES.to_string());
-            requests.push(query);
-            positions.push((index, true));
+            joint_queries.push(query);
+            joint_indices.push(index);
         }
     }
 
     let mut results = vec![ProbeMatches::default(); searches.len()];
-    for ((index, joint), hits) in positions.into_iter().zip(search_loaded(reader, &requests)?) {
-        if joint {
-            results[index].joint = Some(hits);
-        } else {
+    if !standard_queries.is_empty() {
+        let hits = reader.search_loaded_batch(&standard_queries, None)?;
+        for (index, hits) in standard_indices.into_iter().zip(hits) {
             results[index].standard = hits;
         }
     }
+    if joint_queries.is_empty() {
+        return Ok(results);
+    }
+
     // Java retries an incomplete local joint probe at the ordinary width.
     // A legacy probe has already computed those results for the other policy.
+    let joint_hits = reader.search_loaded_batch(&joint_queries, Some(JOINT_INNER_PROBES))?;
     let mut retry = Vec::new();
-    for (index, hits) in results.iter_mut().enumerate() {
-        if hits
-            .joint
-            .as_ref()
-            .is_some_and(|hits| hits.as_ref().map_or(0, HashMap::len) < searches[index].limit)
-        {
+    for (index, hits) in joint_indices.into_iter().zip(joint_hits) {
+        if hits.as_ref().map_or(0, HashMap::len) < searches[index].limit {
             if probes[index] == Probe::CheckLayout {
-                hits.joint = Some(hits.standard.clone());
+                results[index].joint = Some(results[index].standard.clone());
             } else {
                 retry.push(index);
             }
+        } else {
+            results[index].joint = Some(hits);
         }
     }
     if !retry.is_empty() {
         let queries = retry
             .iter()
-            .map(|&index| searches[index].clone())
+            .map(|&index| &searches[index])
             .collect::<Vec<_>>();
-        for (index, hits) in retry.into_iter().zip(search_loaded(reader, &queries)?) {
+        for (index, hits) in retry
+            .into_iter()
+            .zip(reader.search_loaded_batch(&queries, None)?)
+        {
             results[index].joint = Some(hits);
         }
     }
     Ok(results)
-}
-
-fn search_loaded(
-    reader: &mut VindexVectorGlobalIndexReader,
-    searches: &[VectorSearch],
-) -> Result<Vec<NativeMatches>> {
-    reader.visit_batch_vector_search::<std::io::Cursor<Vec<u8>>>(searches, |_| {
-        Err(centroid_index::invalid(
-            "Centroid shard reader was not retained",
-        ))
-    })
 }
 
 struct Route {
@@ -563,7 +555,11 @@ impl RoutedSearch<'_> {
                 }
             }
             if route.joint {
-                legacy.extend(unknown);
+                if unknown.is_empty() {
+                    route.width = JOINT_OUTER_PROBES;
+                } else {
+                    legacy.extend(unknown);
+                }
             }
         }
 

@@ -2982,6 +2982,15 @@ explicitly with the build procedure. A Rust build plan also exposes
 `replacement_messages()` to publish with the completed shards in the same
 snapshot-guarded commit.
 
+For unfiltered L2 searches over centroid-sharded `ivf-flat` or `ivf-pq`,
+automatic probing can choose both widths together. With 64 outer centers,
+an automatic outer width of eight, and Top-K from 10 through 100, the joint
+policy starts with four shards and 16 local lists per shard. Each of those
+four shards must have 64 lists and at least 16 times Top-K vectors. Older
+descriptors use the native shard header to resolve the layout during the
+same index open. Explicit outer or inner widths and filter expansion
+settings use independent probe sizing.
+
 Set `centroid.nprobe` to choose the outer probe width. `ivf.nprobe` controls a
 selected shard's local IVF search, and `diskann.l_search` controls its DiskANN
 search. Automatic cosine and L2 routing can widen the search when necessary.
@@ -3011,15 +3020,6 @@ embedding lists. The default matrix candidate multiplier is four. A single
 query vector uses its best matching embedding and a default multiplier of
 one. Set `refine_factor` to override the multiplier. The Rust and Python
 single-search builders expose `with_multi_vector` for a query matrix.
-
-For unfiltered L2 searches over centroid-sharded `ivf-flat` or `ivf-pq`,
-automatic probing can choose both widths together. With 64 outer centers,
-an automatic outer width of eight, and Top-K from 10 through 100, the joint
-policy starts with four shards and 16 local lists per shard. Each of those
-four shards must have 64 lists and at least 16 times Top-K vectors. Older
-descriptors use the native shard header to resolve the layout during the
-same index open. Explicit outer or inner widths and filter expansion
-settings use independent probe sizing.
 
 ### Scalar Pre-Filters
 
