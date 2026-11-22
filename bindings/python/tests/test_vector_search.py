@@ -255,6 +255,35 @@ def test_scan_read_keeps_snapshot_and_is_reusable(table):
     assert rows.column('id').to_pylist() == [1]
 
 
+def test_centroid_bitmap_plan_keeps_scalar_coverage_when_pickled(table):
+    import pickle
+
+    table = table.copy({'vector-index.search-mode': 'fast',
+                        'scalar-index.prefilter.search-mode': 'full'})
+    pt0 = {'method': 'equal', 'field': 'pt', 'literals': [0]}
+    pt1 = {'method': 'equal', 'field': 'pt', 'literals': [1]}
+    ivf = {'ivf-flat.dimension': '2', 'ivf-flat.nlist': '1', 'ivf-flat.metric': 'l2'}
+    (table.new_global_index_build_builder().with_index_column('embedding')
+     .with_index_type('ivf-flat').with_partition_filter(pt0).with_options({
+         **ivf, 'ivf-flat.sharding': 'centroid', 'ivf-flat.centroid.nlist': '2',
+         'extra_fields': '{"id":"bitmap"}',
+     }).execute())
+    (table.new_global_index_build_builder().with_index_column('embedding')
+     .with_index_type('ivf-flat').with_partition_filter(pt1).with_options(ivf).execute())
+    (table.new_global_index_build_builder().with_index_column('id')
+     .with_index_type('btree').with_partition_filter(pt1).execute())
+
+    builder = (_single(table).with_limit(1).with_option('centroid.nprobe', '1')
+               .with_filter({'method': 'equal', 'field': 'id', 'literals': [2]}))
+    plan = builder.new_vector_search_scan().scan()
+    reader = builder.new_vector_search_read()
+    assert len(reader.read_plan(plan)) == 0
+    assert len(reader.read_plan(pickle.loads(pickle.dumps(plan)))) == 0
+
+    explicit = type(plan)(plan.splits(), plan.snapshot())
+    assert len(reader.read_plan(explicit)) == 1
+
+
 def test_batch_order_empty_results_and_scan_reuse(table):
     queries = [[1, 0], [0, 1], [1, 0]]
     builder = (table.new_batch_vector_search_builder().with_vector_column('embedding')
