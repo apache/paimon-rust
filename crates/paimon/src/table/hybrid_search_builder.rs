@@ -1355,18 +1355,25 @@ fn weighted_score(route_results: &[WeightedRouteResult], limit: usize) -> Scored
             min = min.min(*score);
             max = max.max(*score);
         }
-        let range = max - min;
-
         for (row_id, score) in ranked {
-            let normalized = if range > 0.0 {
-                (score - min) / range
-            } else {
-                1.0
-            };
+            let normalized = normalize_route_score(score, min, max);
             add_score(&mut scores, row_id, route_result.weight * normalized);
         }
     }
     top_k(scores, limit)
+}
+
+/// Min-max normalizes a route score. A route with no spread maps to one.
+pub(super) fn normalize_route_score(score: f32, min: f32, max: f32) -> f32 {
+    let range = max - min;
+    if range.is_infinite() && min.is_finite() && max.is_finite() {
+        return ((f64::from(score) - f64::from(min)) / (f64::from(max) - f64::from(min))) as f32;
+    }
+    if range > 0.0 {
+        (score - min) / range
+    } else {
+        1.0
+    }
 }
 
 fn ranked_row_ids(result: &ScoredRowIds) -> Vec<(u64, f32)> {
@@ -1457,6 +1464,21 @@ mod tests {
         assert!((scores[&1] - 3.0).abs() < 1e-6);
         assert!((scores[&2] - 1.5).abs() < 1e-6);
         assert!((scores[&3] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_weighted_score_handles_finite_scores_with_overflowing_range() {
+        let ranked = rank_results(
+            HybridSearchRanker::WeightedScore,
+            &[
+                route_result(vec![1, 2, 3], vec![-f32::MAX, 0.0, f32::MAX], 4.0),
+                route_result(vec![1, 2, 3], vec![1.0, 0.0, 0.0], 1.0),
+            ],
+            2,
+        );
+
+        assert_eq!(ranked.row_ids, vec![3, 2]);
+        assert_eq!(ranked.scores, vec![4.0, 2.0]);
     }
 
     #[test]
