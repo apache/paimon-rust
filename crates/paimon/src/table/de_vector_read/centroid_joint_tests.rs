@@ -19,6 +19,7 @@ use super::*;
 use crate::io::{FileIO, FileIOBuilder};
 use crate::spec::{BinaryRow, FileKind, GlobalIndexMeta, IndexFileMeta, VectorIndexOptions};
 use crate::vector_search::GlobalIndexIOMeta;
+use paimon_vindex_core::io::PosWriter;
 use paimon_vindex_core::ivfflat::IVFFlatIndex;
 use paimon_vindex_core::ivfflat_io::write_ivfflat_index;
 use std::io::Cursor;
@@ -41,9 +42,9 @@ fn flat_shard(nlist: usize, base: f32, first_id: usize, rows_per_list: usize) ->
         .map(|label| label as i64)
         .collect::<Vec<_>>();
     index.add(&data, &labels, data.len());
-    let mut bytes = Cursor::new(Vec::new());
-    write_ivfflat_index(&index, &mut bytes).unwrap();
-    bytes.into_inner()
+    let mut bytes = Vec::new();
+    write_ivfflat_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+    bytes
 }
 
 #[test]
