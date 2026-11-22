@@ -118,11 +118,20 @@ impl VectorSearchFunction {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 enum VectorQuery {
     Single(Vec<f32>),
     Matrix(Vec<Vec<f32>>),
+}
+
+impl VectorQuery {
+    fn parse(json: &str) -> Result<Self, serde_json::Error> {
+        // Parse directly into floats. Untagged enum buffering turns decimal
+        // numbers into a private map with serde_json's arbitrary_precision.
+        serde_json::from_str::<Vec<f32>>(json)
+            .map(Self::Single)
+            .or_else(|_| serde_json::from_str::<Vec<Vec<f32>>>(json).map(Self::Matrix))
+    }
 }
 
 impl TableFunctionImpl for VectorSearchFunction {
@@ -179,7 +188,7 @@ impl TableFunctionImpl for VectorSearchFunction {
                 Err(err) => return Err(err),
             };
 
-        let query_vector: VectorQuery = serde_json::from_str(&query_vector_json).map_err(|e| {
+        let query_vector = VectorQuery::parse(&query_vector_json).map_err(|e| {
             DataFusionError::Plan(format!(
                 "vector_search: query_vector_json must be a JSON vector or matrix of floats, got '{}': {}",
                 query_vector_json, e
@@ -657,6 +666,19 @@ mod tests {
 
     use super::*;
     use crate::SQLContext;
+
+    #[test]
+    fn vector_query_accepts_decimal_vectors_and_matrices() {
+        assert!(matches!(
+            VectorQuery::parse("[1.0, -2.5]").unwrap(),
+            VectorQuery::Single(vector) if vector == [1.0, -2.5]
+        ));
+        assert!(matches!(
+            VectorQuery::parse("[[1.0, -2.5], [0.0, 3e-1]]").unwrap(),
+            VectorQuery::Matrix(vectors) if vectors == [vec![1.0, -2.5], vec![0.0, 0.3]]
+        ));
+        assert!(VectorQuery::parse("[1.0, [2.5]]").is_err());
+    }
 
     #[test]
     fn unfiltered_snapshot_io_uses_runtime_bridge_when_polled_without_tokio() {
