@@ -255,6 +255,49 @@ async fn window_filters_physical_events_by_stored_values() {
 }
 
 #[tokio::test]
+async fn row_id_selection_preserves_both_updates_in_a_mixed_window() {
+    use paimon::table::{IncrementalScanMode, RowRange};
+
+    let path = "memory:/data_evolution_window/selected_updates";
+    let (io, table) = data_evolution_table(path);
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    write_batch(&table, &make_batch(vec![1, 2], vec![1, 2])).await;
+    write_batch(&table, &make_batch(vec![3, 4], vec![3, 4])).await;
+    compact(&table).await;
+    update_values(&table, vec![50; 4]).await;
+    update_values(&table, vec![60; 4]).await;
+
+    // The second insert makes these differently sized write events. Its rows
+    // fall outside the selection, but pruning it cannot turn the two updates
+    // into column slices of one event.
+    let mut builder = table.new_read_builder();
+    builder.with_row_ranges(vec![RowRange::new(0, 1)]);
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 1, 5)
+        .plan_combined()
+        .await
+        .unwrap();
+    let batches = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&batches),
+        vec![
+            (None, Some(50)),
+            (None, Some(50)),
+            (None, Some(60)),
+            (None, Some(60))
+        ]
+    );
+}
+
+#[tokio::test]
 async fn window_keeps_insert_payloads_with_their_rows_after_compaction() {
     use arrow_array::{cast::AsArray, types::Int32Type};
     use arrow_array::{ArrayRef, LargeBinaryArray};
@@ -298,7 +341,7 @@ async fn window_keeps_insert_payloads_with_their_rows_after_compaction() {
         )]))
         .await
         .unwrap();
-    for (filtered, chunked) in [(false, false), (true, false), (true, true)] {
+    for (filtered, chunked) in [(false, false), (true, false), (true, true), (false, true)] {
         let mut builder = window.new_read_builder();
         if filtered {
             builder.with_filter(
@@ -308,8 +351,8 @@ async fn window_keeps_insert_payloads_with_their_rows_after_compaction() {
             );
         }
         let scan = if chunked {
-            // The chunk carries multiple events for the same row ID. The
-            // filtered reader must fetch the BLOB from the matching event.
+            // Shuffle the complete window, then filter the planned chunks
+            // in the reader. Payloads must come from the matching write.
             window
                 .new_read_builder()
                 .new_scan()
@@ -319,6 +362,28 @@ async fn window_keeps_insert_payloads_with_their_rows_after_compaction() {
             builder.new_scan()
         };
         let plan = scan.plan().await.unwrap();
+        if chunked && !filtered {
+            assert_eq!(
+                plan.splits()
+                    .iter()
+                    .map(|s| s.merged_row_count())
+                    .collect::<Vec<_>>(),
+                vec![Some(4), Some(4)]
+            );
+            for index in 0..2 {
+                let shard = window
+                    .new_read_builder()
+                    .new_scan()
+                    .with_chunk_shuffle(42, 4)
+                    .unwrap()
+                    .with_shard(index, 2)
+                    .unwrap()
+                    .plan()
+                    .await
+                    .unwrap();
+                assert_eq!(shard.splits(), &plan.splits()[index..=index]);
+            }
+        }
         if !filtered {
             assert_eq!(
                 plan.splits()
@@ -328,10 +393,19 @@ async fn window_keeps_insert_payloads_with_their_rows_after_compaction() {
                 Some(8)
             );
         }
+        // Read the same cross-language split frame that Python workers receive.
+        let splits = plan
+            .splits()
+            .iter()
+            .map(|split| {
+                paimon::table::DataSplit::deserialize_split_v1(&split.serialize_split_v1().unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
         let batches: Vec<_> = builder
             .new_read()
             .unwrap()
-            .to_arrow(plan.splits())
+            .to_arrow(&splits)
             .unwrap()
             .try_collect()
             .await
@@ -357,4 +431,17 @@ async fn window_keeps_insert_payloads_with_their_rows_after_compaction() {
         expected.sort();
         assert_eq!(actual, expected);
     }
+    // Seven physical events cannot share one absolute row-ID selection:
+    // the same ID would have to select the insert and update independently.
+    let error = window
+        .new_read_builder()
+        .new_scan()
+        .with_chunk_shuffle(42, 7)
+        .unwrap()
+        .plan()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, paimon::Error::Unsupported { message } if message.contains("overlapping incremental events"))
+    );
 }

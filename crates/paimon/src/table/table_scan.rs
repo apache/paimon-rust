@@ -1330,6 +1330,8 @@ impl<'a> TableScan<'a> {
     /// keeps ordinary Rust integer calls ergonomic while allowing language
     /// bindings to preserve arbitrary-precision integer seeds.
     /// Only predicates on unmasked partition keys are supported.
+    /// In a data-evolution window, a chunk cannot combine distinct events
+    /// whose file ranges overlap: a split has one shared row-ID selection.
     pub fn with_chunk_shuffle(self, seed: impl ToString, chunk_size: u64) -> crate::Result<Self> {
         let config = ChunkShuffle::from_decimal_seed(&seed.to_string(), chunk_size)?;
         match self.0 {
@@ -2929,10 +2931,13 @@ impl<'a> PaimonTableScan<'a> {
             scan_stats.record_split_planning(0, false);
             return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         }
-        // Positional scans count all candidate row IDs. Pruning a preceding
-        // manifest or file here would renumber the surviving rows; intersect
-        // explicit/global-index ranges after assigning positions instead.
-        let row_range_index = if data_evolution_enabled && self.row_position_selection().is_none() {
+        // Positional scans need the preceding row IDs. Incremental evolution
+        // scans need the whole overlap group to distinguish column slices from
+        // separate writes. Apply their selections to the planned groups below.
+        let row_range_index = if data_evolution_enabled
+            && !self.is_streaming()
+            && self.row_position_selection().is_none()
+        {
             manifest_row_ranges.clone().map(RowRangeIndex::create)
         } else {
             None

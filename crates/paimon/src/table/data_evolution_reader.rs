@@ -115,14 +115,23 @@ pub(super) fn is_data_evolution_column_slice_group(files: &[DataFileMeta]) -> bo
 pub(super) fn incremental_event_groups(
     files: &[DataFileMeta],
 ) -> crate::Result<Option<Vec<Vec<DataFileMeta>>>> {
-    let mixed =
-        |group: &[DataFileMeta]| group.len() > 1 && !is_data_evolution_column_slice_group(group);
-    if !mixed(files) {
+    if files.len() <= 1 || is_data_evolution_column_slice_group(files) {
         return Ok(None);
     }
-    let groups = group_by_overlapping_row_id(files.to_vec());
+    let (groups, mixed) =
+        split_incremental_event_groups(group_by_overlapping_row_id(files.to_vec()))?;
+    Ok(mixed.then_some(groups))
+}
+
+/// Preserve the event boundaries in a window; report whether any overlapping
+/// row-ID group was split into distinct events.
+pub(super) fn split_incremental_event_groups(
+    groups: Vec<Vec<DataFileMeta>>,
+) -> crate::Result<(Vec<Vec<DataFileMeta>>, bool)> {
+    let mixed =
+        |group: &[DataFileMeta]| group.len() > 1 && !is_data_evolution_column_slice_group(group);
     if !groups.iter().any(|group| mixed(group)) {
-        return Ok(None);
+        return Ok((groups, false));
     }
     let mut events = Vec::new();
     for group in groups {
@@ -148,16 +157,16 @@ pub(super) fn incremental_event_groups(
             }
             for files in commits.into_values() {
                 for event in group_by_overlapping_row_id(files) {
-                    if event.len() > 1
-                        && (!is_data_evolution_column_slice_group(&event)
-                            || event
-                                .iter()
-                                .filter(|file| is_data_evolution_normal_file(file))
-                                .count()
-                                != 1
-                            || event
-                                .iter()
-                                .any(|file| file.min_sequence_number != file.max_sequence_number))
+                    let anchors = event
+                        .iter()
+                        .filter(|file| is_data_evolution_normal_file(file))
+                        .count();
+                    if anchors != 1
+                        || (event.len() > 1
+                            && (!is_data_evolution_column_slice_group(&event)
+                                || event.iter().any(|file| {
+                                    file.min_sequence_number != file.max_sequence_number
+                                })))
                     {
                         return Err(Error::Unsupported {
                             message: format!("Cannot identify dedicated-file companions at row ID {:?} in a mixed-range data-evolution window", event[0].first_row_id),
@@ -168,7 +177,7 @@ pub(super) fn incremental_event_groups(
             }
         }
     }
-    Ok(Some(events))
+    Ok((events, true))
 }
 
 /// Split a reader input into independently readable row-id groups.
@@ -4285,6 +4294,15 @@ mod tests {
         for file in &mut files {
             file.file_source = Some(0);
             file.min_sequence_number = file.max_sequence_number;
+        }
+        assert!(matches!(
+            incremental_event_groups(&files),
+            Err(Error::Unsupported { .. })
+        ));
+        // Giving each file a separate commit leaves the BLOB without an anchor.
+        for (sequence, file) in (1_i64..).zip(&mut files) {
+            file.min_sequence_number = sequence;
+            file.max_sequence_number = sequence;
         }
         assert!(matches!(
             incremental_event_groups(&files),
