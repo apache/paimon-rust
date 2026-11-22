@@ -3110,6 +3110,11 @@ impl<'a> PaimonTableScan<'a> {
             .index_file_in_data_file_dir();
 
         let mut data_file_field_ids_cache = DataFileFieldIdsCache::new();
+        let event_row_index = if data_evolution_enabled && self.is_streaming() {
+            effective_row_ranges.clone().map(RowRangeIndex::create)
+        } else {
+            None
+        };
         // Positional distribution precedes LIMIT. Building too few ordinary
         // append splits here could starve a later slice or shard.
         let can_push_down_limit = append_row_position_selection.is_none()
@@ -3337,9 +3342,17 @@ impl<'a> PaimonTableScan<'a> {
             };
             for group in file_groups {
                 let SplitGroup {
-                    files: file_group,
+                    files: mut file_group,
                     raw_convertible,
                 } = group;
+                if let Some(index) = &event_row_index {
+                    // The event boundaries are now fixed. Drop rolled BLOB or
+                    // vector files outside the selection before creating splits.
+                    file_group.retain(|file| data_file_overlaps_row_range_index(file, index));
+                    if file_group.is_empty() {
+                        continue;
+                    }
+                }
                 let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
                     file_group
                         .iter()
