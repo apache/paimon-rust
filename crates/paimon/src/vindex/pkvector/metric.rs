@@ -84,13 +84,22 @@ impl VectorSearchMetric {
         }
     }
 
-    /// Lower-is-better distance for exact vector search.
-    pub(crate) fn compute_distance(&self, query: &[f32], stored: &[f32]) -> f32 {
-        match self {
-            Self::L2 => squared_l2(query, stored),
-            Self::Cosine => cosine_distance(cosine_similarity(query, stored)),
-            Self::InnerProduct => -inner_product(query, stored),
+    /// Prepare the query once for exact scoring against multiple rows.
+    pub(crate) fn prepare_query(self, query: &[f32]) -> PreparedVectorQuery<'_> {
+        PreparedVectorQuery {
+            metric: self,
+            query,
+            cosine_norm: if self == Self::Cosine {
+                cosine_norm(query)
+            } else {
+                0.0
+            },
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compute_distance(&self, query: &[f32], stored: &[f32]) -> f32 {
+        self.prepare_query(query).compute_distance(stored)
     }
 
     /// Convert a higher-is-better standardized index score to a lower-is-better
@@ -120,6 +129,25 @@ impl VectorSearchMetric {
     }
 }
 
+pub(crate) struct PreparedVectorQuery<'a> {
+    metric: VectorSearchMetric,
+    query: &'a [f32],
+    cosine_norm: f64,
+}
+
+impl PreparedVectorQuery<'_> {
+    /// Lower-is-better distance for exact vector search.
+    pub(crate) fn compute_distance(&self, stored: &[f32]) -> f32 {
+        match self.metric {
+            VectorSearchMetric::L2 => squared_l2(self.query, stored),
+            VectorSearchMetric::Cosine => {
+                cosine_distance(cosine_similarity(self.query, self.cosine_norm, stored))
+            }
+            VectorSearchMetric::InnerProduct => -inner_product(self.query, stored),
+        }
+    }
+}
+
 fn squared_l2(query: &[f32], stored: &[f32]) -> f32 {
     let mut squared = 0.0f32;
     for i in 0..query.len() {
@@ -129,92 +157,90 @@ fn squared_l2(query: &[f32], stored: &[f32]) -> f32 {
     squared
 }
 
-fn cosine_similarity(query: &[f32], stored: &[f32]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut query_norm = CosineNorm::default();
-    let mut stored_norm = CosineNorm::default();
-    for i in 0..query.len() {
-        dot += query[i] * stored[i];
-        query_norm.add(query[i]);
-        stored_norm.add(stored[i]);
-    }
-    query_norm
-        .try_score(stored_norm, dot, |query, stored| {
-            ((query as f64).sqrt() * (stored as f64).sqrt()) as f32
+pub(crate) fn cosine_norm<T: Copy + Into<f64>>(vector: &[T]) -> f64 {
+    vector
+        .iter()
+        .map(|&value| {
+            let value = value.into();
+            value * value
         })
-        .unwrap_or_else(|| cosine_similarity_wide(query, stored))
+        .sum::<f64>()
+        .sqrt()
 }
 
-#[derive(Clone, Copy, Default)]
-pub(crate) struct CosineNorm {
-    squared: f32,
-    has_small_square: bool,
-    has_non_finite: bool,
-}
-
-impl CosineNorm {
-    pub(crate) fn from_vector(vector: &[f32]) -> Self {
-        let mut norm = Self::default();
-        for &value in vector {
-            norm.add(value);
-        }
-        norm
-    }
-
-    pub(crate) fn add(&mut self, value: f32) {
-        let square = value * value;
-        self.squared += square;
-        self.has_non_finite |= !value.is_finite();
-        // A normal total can hide underflow in a coordinate square or its dot product term.
-        self.has_small_square |= value != 0.0 && square < f32::MIN_POSITIVE;
-    }
-
-    fn is_zero(self) -> bool {
-        self.squared == 0.0 && !self.has_small_square
-    }
-
-    pub(crate) fn try_score(
-        self,
-        stored: Self,
-        dot: f32,
-        denominator: impl FnOnce(f32, f32) -> f32,
-    ) -> Option<f32> {
-        if (self.is_zero() && !stored.has_non_finite) || (stored.is_zero() && !self.has_non_finite)
-        {
-            return Some(0.0);
-        }
-        if self.has_small_square
-            || stored.has_small_square
-            || !self.squared.is_normal()
-            || !stored.squared.is_normal()
-            || !dot.is_finite()
-            || dot.is_subnormal()
-        {
-            return None;
-        }
-        let denominator = denominator(self.squared, stored.squared);
-        denominator.is_normal().then(|| dot / denominator)
-    }
-}
-
-/// Computes cosine when f32 arithmetic overflows or underflows.
-pub(crate) fn cosine_similarity_wide(query: &[f32], stored: &[f32]) -> f32 {
+pub(crate) fn cosine_similarity(query: &[f32], query_norm: f64, stored: &[f32]) -> f32 {
     let mut dot = 0.0_f64;
-    let mut query_norm = 0.0_f64;
-    let mut stored_norm = 0.0_f64;
+    let mut stored_squared_norm = 0.0_f64;
     for (&query, &stored) in query.iter().zip(stored) {
         let q = f64::from(query);
         let s = f64::from(stored);
         dot += q * s;
-        query_norm += q * q;
-        stored_norm += s * s;
+        stored_squared_norm += s * s;
     }
-    let denominator = query_norm.sqrt() * stored_norm.sqrt();
-    if denominator == 0.0 {
-        0.0
+    cosine_similarity_from_dot(
+        dot,
+        query_norm * stored_squared_norm.sqrt(),
+        query.len(),
+        || compensated_dot(query, stored, &mut Vec::new()),
+    )
+}
+
+pub(crate) fn cosine_similarity_from_dot(
+    dot: f64,
+    norm_product: f64,
+    dimension: usize,
+    compensated: impl FnOnce() -> f64,
+) -> f32 {
+    if norm_product == 0.0 {
+        return 0.0;
+    }
+    if !norm_product.is_finite() {
+        return (dot / norm_product) as f32;
+    }
+    // The f32 coordinates have exact f64 products. Their sum can still lose
+    // small terms when large products cancel. By Cauchy-Schwarz the norm
+    // product bounds the sum of absolute terms. Recompute when the rounding
+    // error could exceed the precision of the f32 score.
+    let bound =
+        (4.0 * f64::EPSILON / f64::from(f32::EPSILON)) * (dimension as f64 + 2.0) * norm_product;
+    let dot = if dot.abs() <= bound {
+        compensated()
     } else {
-        (dot / denominator) as f32
+        dot
+    };
+    (dot / norm_product).clamp(-1.0, 1.0) as f32
+}
+
+/// Retain the rounding residuals of the dot product at separate magnitudes.
+pub(crate) fn compensated_dot<T: Copy + Into<f64>>(
+    query: &[T],
+    stored: &[T],
+    partials: &mut Vec<f64>,
+) -> f64 {
+    partials.clear();
+    for (&query, &stored) in query.iter().zip(stored) {
+        let mut term = query.into() * stored.into();
+        let mut kept = 0;
+        for i in 0..partials.len() {
+            let mut part = partials[i];
+            if term.abs() < part.abs() {
+                std::mem::swap(&mut term, &mut part);
+            }
+            // With |term| >= |part|, FastTwoSum gives an exact residual.
+            let sum = term + part;
+            let residual = part - (sum - term);
+            if residual != 0.0 {
+                partials[kept] = residual;
+                kept += 1;
+            }
+            term = sum;
+        }
+        partials.truncate(kept);
+        if term != 0.0 {
+            partials.push(term);
+        }
     }
+    partials.iter().sum()
 }
 
 fn inner_product(query: &[f32], stored: &[f32]) -> f32 {
@@ -316,26 +342,12 @@ mod tests {
     }
 
     #[test]
-    fn test_cosine_zero_skips_wide_scoring_for_finite_vectors() {
-        let zero = CosineNorm::from_vector(&[0.0, -0.0]);
-        for magnitude in [0.0, f32::MIN_POSITIVE, 1.0, f32::MAX] {
-            let stored = CosineNorm::from_vector(&[magnitude, 0.0]);
-            assert_eq!(
-                zero.try_score(stored, 0.0, |_, _| unreachable!()),
-                Some(0.0)
-            );
-            assert_eq!(
-                stored.try_score(zero, 0.0, |_, _| unreachable!()),
-                Some(0.0)
-            );
-        }
-        let nonzero = CosineNorm::from_vector(&[f32::MIN_POSITIVE, 0.0]);
-        assert_eq!(nonzero.try_score(nonzero, 0.0, |_, _| unreachable!()), None);
-        let non_finite = CosineNorm::from_vector(&[f32::INFINITY, 0.0]);
+    fn test_cosine_zero_skips_compensated_scoring() {
         assert_eq!(
-            zero.try_score(non_finite, f32::NAN, |_, _| unreachable!()),
-            None
+            cosine_similarity_from_dot(0.0, 0.0, 2, || unreachable!()),
+            0.0
         );
+        assert!(cosine_similarity(&[0.0, 0.0], 0.0, &[f32::INFINITY, 0.0]).is_nan());
     }
 
     #[test]
@@ -383,19 +395,25 @@ mod tests {
     }
 
     #[test]
+    fn test_cosine_distance_orders_mixed_scale_candidates() {
+        let query = [3.0, 13.0];
+        let exact = [895.0 * query[0], 895.0 * query[1]];
+        let metric = VectorSearchMetric::Cosine;
+        for scale in [1.0, 2.0_f32.powi(64)] {
+            let nearby = [40.0 * scale, 173.0 * scale];
+            let nearby_distance = metric.compute_distance(&query, &nearby);
+            assert_eq!(nearby_distance, 2.0_f32.powi(-24));
+            assert_eq!(metric.compute_distance(&query, &exact), 0.0);
+        }
+    }
+
+    #[test]
     fn test_cosine_non_perfect_square_norm_uses_f64_sqrt() {
-        // query [0,3] -> norm 9, stored [1,2] -> norm 5; sqrt(5) is irrational
-        // so the f32-sqrt path (each sqrt taken in f32, then widened) and the
-        // f64-sqrt path (widen first, sqrt in f64) produce different f32 bits:
-        // buggy similarity 0.8944271 vs correct 0.8944272. Encode the f64 contract
-        // in the expected value (dot / (sqrt(9.0f64) * sqrt(5.0f64)) as f32) rather
-        // than a magic literal, so this pins the Java-matching f64 arithmetic. The
-        // cosine distance is `1 - similarity`, so the sqrt path is exercised here.
+        // Taking the square roots in f32 can already lose a bit of the score.
         let q = [0.0f32, 3.0];
         let s = [1.0f32, 2.0];
-        let dot = 6.0f32;
-        let denominator = ((9.0f64).sqrt() * (5.0f64).sqrt()) as f32;
-        let expected_similarity = dot / denominator;
+        let denominator = (9.0_f64).sqrt() * (5.0_f64).sqrt();
+        let expected_similarity = (6.0 / denominator) as f32;
         assert_eq!(
             VectorSearchMetric::Cosine.compute_distance(&q, &s),
             1.0 - expected_similarity

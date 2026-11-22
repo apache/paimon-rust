@@ -855,6 +855,7 @@ async fn rerank_indexed_positional(
     let indexed_splits = build_indexed_splits(indexed, plan_splits, metric)?;
 
     let dimension = query_vector.len();
+    let prepared_query = metric.prepare_query(query_vector);
     let mut reranked: Vec<PkVectorCandidate> = Vec::new();
     for split in indexed_splits {
         let data_split = split.split.clone();
@@ -918,7 +919,7 @@ async fn rerank_indexed_positional(
                     ),
                     source: None,
                 })?;
-                candidate.distance = metric.compute_distance(query_vector, vector);
+                candidate.distance = prepared_query.compute_distance(vector);
                 reranked.push(candidate);
             }
         }

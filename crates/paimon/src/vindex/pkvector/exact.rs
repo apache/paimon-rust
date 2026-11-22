@@ -143,6 +143,7 @@ pub(crate) fn exact_search(
         )));
     }
 
+    let query = metric.prepare_query(query);
     let mut reuse = vec![0.0f32; reader.dimension()];
     let mut heap: BinaryHeap<WorstFirst> = BinaryHeap::with_capacity(limit + 1);
     for position in 0..row_count {
@@ -153,7 +154,7 @@ pub(crate) fn exact_search(
         let candidate = PkVectorSearchResult {
             data_file_name: data_file_name.to_string(),
             row_position: position,
-            distance: metric.compute_distance(query, &reuse),
+            distance: query.compute_distance(&reuse),
         };
         push_bounded(&mut heap, candidate, limit);
     }

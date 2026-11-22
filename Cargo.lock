@@ -4945,6 +4945,7 @@ dependencies = [
  "lru 0.18.2",
  "lz4_flex 0.14.0",
  "lzokay-native",
+ "matrixmultiply",
  "md-5 0.10.6",
  "num-bigint 0.4.8",
  "num-traits",

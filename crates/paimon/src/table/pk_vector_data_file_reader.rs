@@ -123,6 +123,10 @@ impl DataFilePkVectorReaderFactory {
         for query in queries {
             validate_query(query, self.dimension)?;
         }
+        let prepared_queries: Vec<_> = queries
+            .iter()
+            .map(|query| metric.prepare_query(query))
+            .collect();
 
         let file_meta = self
             .data_split
@@ -201,11 +205,11 @@ impl DataFilePkVectorReaderFactory {
                 if is_excluded(pos) {
                     continue;
                 }
-                for (query, heap) in queries.iter().zip(heaps.iter_mut()) {
+                for (query, heap) in prepared_queries.iter().zip(heaps.iter_mut()) {
                     let candidate = PkVectorSearchResult {
                         data_file_name: file.file_name.clone(),
                         row_position: pos,
-                        distance: metric.compute_distance(query, vector),
+                        distance: query.compute_distance(vector),
                     };
                     push_bounded(heap, candidate, exact_limit);
                 }
