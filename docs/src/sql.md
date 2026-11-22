@@ -3570,14 +3570,18 @@ For `merge_map_with_keytime`, a newer key-time replaces the existing ROW for
 that map key. `CHAR`/`VARCHAR` key-times use unsigned UTF-8 byte
 lexicographical order (Java `BinaryString.compareTo`). `FLOAT`/`DOUBLE`
 compare as ordinary numbers with `+0.0` equal to `-0.0`; NaN key-times are
-rejected and never enter aggregation. `TIMESTAMP` / `TIMESTAMP_LTZ` compare
-by ticks under a unified time semantics (timezone metadata does not affect
-ordering). A NULL key-time ignores the incoming update and leaves any
-existing key unchanged. A NULL ROW value removes that key. Rust Native
-supports the key-time types listed above, including `FLOAT`/`DOUBLE`. The
-Python Native eligibility gate allows the same Rust-supported set (and
-falls back only for types Rust cannot compare). Java still rejects
-`FLOAT`/`DOUBLE` key-times.
+rejected on write and never enter aggregation. `TIMESTAMP` / `TIMESTAMP_LTZ`
+compare by ticks under a unified time semantics (timezone metadata does not
+affect ordering). A NULL key-time ignores the incoming update and leaves any
+existing key unchanged. Writing a NULL ROW map value is rejected for
+`merge_map_with_keytime` (key tombstones are unsupported on the write path).
+`overwrite-on-equal-ts=true` cannot be combined with a global
+`sequence.field`. Rust Native supports the key-time types listed above,
+including `FLOAT`/`DOUBLE`. The Python Native eligibility gate allows the
+same Rust-supported set (and falls back only for types Rust cannot compare).
+Java still rejects `FLOAT`/`DOUBLE` key-times. In the tested Java Paimon 2.2
+snapshot, `DECIMAL` key-times are also rejected (this is a verified result
+for that snapshot, not a claim about every Java release).
 
 `DELETE` / `UPDATE_BEFORE` rows are fed to each field aggregator's retract path
 (`AggregateMergeFunction`), except that

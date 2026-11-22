@@ -5340,6 +5340,55 @@ mod tests {
     }
 
     #[test]
+    fn test_ts_field_schema_evolution_rename_and_drop() {
+        let updates_type = DataType::Map(MapType::new(
+            DataType::VarChar(VarCharType::string_type()),
+            DataType::Row(RowType::new(vec![
+                DataField::new(3, "payload".into(), DataType::Int(IntType::new())),
+                DataField::new(4, "event_time".into(), DataType::Int(IntType::new())),
+                DataField::new(5, "ts".into(), DataType::Int(IntType::new())),
+            ])),
+        ));
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("updates", updates_type)
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option(
+                    "fields.updates.aggregate-function",
+                    "merge_map_with_keytime",
+                )
+                .option("fields.updates.ts-field", "event_time")
+                .build()
+                .unwrap(),
+        );
+
+        let renamed = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::rename_column(
+                "updates".to_string(),
+                "events".to_string(),
+            )])
+            .unwrap();
+        assert_eq!(
+            renamed
+                .options()
+                .get("fields.events.ts-field")
+                .map(String::as_str),
+            Some("event_time")
+        );
+        assert!(renamed.options().get("fields.updates.ts-field").is_none());
+
+        let dropped = renamed
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "events".to_string(),
+            )])
+            .unwrap();
+        assert!(dropped.options().get("fields.events.ts-field").is_none());
+    }
+
+    #[test]
     fn test_rename_column_rewrites_sequence_group_options() {
         let table_schema = TableSchema::new(
             0,

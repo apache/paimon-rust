@@ -21,6 +21,8 @@
 //! Character timestamps use unsigned UTF-8 byte lexicographical order (Java
 //! `BinaryString.compareTo`). FLOAT/DOUBLE keep ordinary numeric ordering with
 //! `+0.0 == -0.0`; NaN key-times are rejected and never enter aggregation.
+//! Write paths also reject NaN key-times and NULL ROW map values before a
+//! snapshot can be published.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -38,7 +40,7 @@ use arrow_select::concat::concat;
 
 use super::{unsupported_type_error, FieldAggregator};
 use crate::arrow::paimon_type_to_arrow;
-use crate::spec::DataType;
+use crate::spec::{DataType, SEQUENCE_FIELD_OPTION};
 use crate::Error;
 
 /// Timestamp-field physical kind resolved once at aggregator construction.
@@ -101,11 +103,8 @@ impl MergeMapAgg {
         data_type: &DataType,
         options: &HashMap<String, String>,
     ) -> crate::Result<Self> {
-        let (timestamp_index, keytime_kind) =
+        let (timestamp_index, keytime_kind, overwrite_on_equal_ts) =
             resolve_keytime_config(field_name, data_type, options)?;
-        let overwrite_on_equal_ts = options
-            .get(&format!("fields.{field_name}.overwrite-on-equal-ts"))
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
         let mut result = Self::new(field_name, data_type)?;
         result.timestamp_index = Some(timestamp_index);
         result.keytime_kind = Some(keytime_kind);
@@ -446,11 +445,87 @@ pub(crate) fn validate_merge_map_with_keytime(
     resolve_keytime_config(field_name, data_type, options).map(|_| ())
 }
 
+/// Reject NaN FLOAT/DOUBLE key-times and NULL ROW map values on the shared
+/// write/flush path (covers both singleton and multi-row key groups) so a
+/// snapshot cannot be published with these inputs.
+pub(crate) fn validate_merge_map_with_keytime_write_values(
+    field_name: &str,
+    data_type: &DataType,
+    options: &HashMap<String, String>,
+    array: &dyn Array,
+) -> crate::Result<()> {
+    let (timestamp_index, keytime_kind, _) =
+        resolve_keytime_config(field_name, data_type, options)?;
+    if array.is_empty() {
+        return Ok(());
+    }
+    let map = array
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!(
+                "merge_map_with_keytime field '{field_name}' requires Arrow Map, got {:?}",
+                array.data_type()
+            ),
+            source: None,
+        })?;
+    let values = map.entries().column(1);
+    for row_idx in 0..map.len() {
+        if map.is_null(row_idx) {
+            continue;
+        }
+        let start =
+            usize::try_from(map.value_offsets()[row_idx]).map_err(|_| Error::DataInvalid {
+                message: "Negative Arrow Map offset".into(),
+                source: None,
+            })?;
+        let end =
+            usize::try_from(map.value_offsets()[row_idx + 1]).map_err(|_| Error::DataInvalid {
+                message: "Negative Arrow Map offset".into(),
+                source: None,
+            })?;
+        if end > values.len() || start > end {
+            return Err(Error::DataInvalid {
+                message: "Arrow Map offsets exceed entries".into(),
+                source: None,
+            });
+        }
+        for entry_idx in start..end {
+            if values.is_null(entry_idx) {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "merge_map_with_keytime field '{field_name}' rejects NULL ROW map values \
+                         on write; key tombstones are not supported because a partially \
+                         aggregated delete can be lost across later merges"
+                    ),
+                    source: None,
+                });
+            }
+            let value = values.slice(entry_idx, 1);
+            let row = value
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!(
+                        "merge_map_with_keytime field '{field_name}' requires ROW values"
+                    ),
+                    source: None,
+                })?;
+            let ts = row.column(timestamp_index);
+            if ts.is_null(0) {
+                continue;
+            }
+            reject_nan_keytime_value(&keytime_kind, ts.as_ref(), field_name)?;
+        }
+    }
+    Ok(())
+}
+
 fn resolve_keytime_config(
     field_name: &str,
     data_type: &DataType,
     options: &HashMap<String, String>,
-) -> crate::Result<(usize, KeytimeKind)> {
+) -> crate::Result<(usize, KeytimeKind, bool)> {
     let DataType::Map(map_type) = data_type else {
         return Err(unsupported_type_error(
             "merge_map_with_keytime",
@@ -486,7 +561,38 @@ fn resolve_keytime_config(
     };
     let ts_field = &value_type.fields()[timestamp_index];
     let keytime_kind = keytime_kind_for_type(field_name, ts_field.name(), ts_field.data_type())?;
-    Ok((timestamp_index, keytime_kind))
+    let overwrite_on_equal_ts = parse_overwrite_on_equal_ts(field_name, options)?;
+    if overwrite_on_equal_ts
+        && options
+            .get(SEQUENCE_FIELD_OPTION)
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(Error::ConfigInvalid {
+            message: format!(
+                "fields.{field_name}.overwrite-on-equal-ts=true is unsupported with \
+                 {SEQUENCE_FIELD_OPTION} for merge_map_with_keytime: equal key-times can lose \
+                 sequence provenance and make merge results depend on flush grouping"
+            ),
+        });
+    }
+    Ok((timestamp_index, keytime_kind, overwrite_on_equal_ts))
+}
+
+fn parse_overwrite_on_equal_ts(
+    field_name: &str,
+    options: &HashMap<String, String>,
+) -> crate::Result<bool> {
+    let key = format!("fields.{field_name}.overwrite-on-equal-ts");
+    match options.get(&key).map(String::as_str) {
+        None => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Some(value) => Err(Error::ConfigInvalid {
+            message: format!(
+                "Invalid boolean value '{value}' for '{key}'; expected 'true' or 'false'"
+            ),
+        }),
+    }
 }
 
 fn keytime_kind_for_type(
@@ -1383,6 +1489,112 @@ mod tests {
                 on,
             ),
             2
+        );
+    }
+
+    #[test]
+    fn keytime_overwrite_on_equal_ts_rejects_non_boolean() {
+        let data_type = keytime_map_type(DataType::Int(IntType::new()));
+        let mut options = HashMap::new();
+        options.insert(
+            "fields.m.overwrite-on-equal-ts".to_string(),
+            "yes".to_string(),
+        );
+        let err = MergeMapAgg::new_with_keytime("m", &data_type, &options).unwrap_err();
+        match err {
+            Error::ConfigInvalid { message } => {
+                assert!(message.contains("overwrite-on-equal-ts"), "{message}");
+                assert!(message.contains("yes"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keytime_rejects_overwrite_on_equal_ts_with_sequence_field() {
+        let data_type = keytime_map_type(DataType::Int(IntType::new()));
+        let mut options = HashMap::new();
+        options.insert(
+            "fields.m.overwrite-on-equal-ts".to_string(),
+            "true".to_string(),
+        );
+        options.insert("sequence.field".to_string(), "seq".to_string());
+        let err = MergeMapAgg::new_with_keytime("m", &data_type, &options).unwrap_err();
+        match err {
+            Error::ConfigInvalid { message } => {
+                assert!(message.contains("overwrite-on-equal-ts=true"), "{message}");
+                assert!(message.contains("sequence.field"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        // overwrite=false remains allowed with sequence.field.
+        options.insert(
+            "fields.m.overwrite-on-equal-ts".to_string(),
+            "false".to_string(),
+        );
+        MergeMapAgg::new_with_keytime("m", &data_type, &options).unwrap();
+    }
+
+    #[test]
+    fn keytime_write_values_reject_nan_and_null_row() {
+        let ts = DataType::Float(FloatType::new());
+        let data_type = keytime_map_type(ts.clone());
+        let nan = keytime_map(&ts, vec![22], Arc::new(Float32Array::from(vec![f32::NAN])));
+        let err =
+            validate_merge_map_with_keytime_write_values("m", &data_type, &HashMap::new(), &nan)
+                .unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { ref message, .. } if message.contains("rejects NaN")),
+            "{err:?}"
+        );
+
+        let ArrowDataType::Map(entries_field, ordered) = paimon_type_to_arrow(&data_type).unwrap()
+        else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(entry_fields) = entries_field.data_type() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(value_fields) = entry_fields[1].data_type() else {
+            unreachable!()
+        };
+        let values = StructArray::try_new(
+            value_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![None::<i32>])),
+                Arc::new(Float32Array::from(vec![None::<f32>])),
+            ],
+            Some(vec![false].into()),
+        )
+        .unwrap();
+        let entries = StructArray::try_new(
+            entry_fields.clone(),
+            vec![Arc::new(StringArray::from(vec!["k"])), Arc::new(values)],
+            None,
+        )
+        .unwrap();
+        let tombstone = MapArray::try_new(
+            entries_field,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1])),
+            entries,
+            None,
+            ordered,
+        )
+        .unwrap();
+        let err = validate_merge_map_with_keytime_write_values(
+            "m",
+            &data_type,
+            &HashMap::new(),
+            &tombstone,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::DataInvalid { ref message, .. } if message.contains("rejects NULL ROW")
+            ),
+            "{err:?}"
         );
     }
 

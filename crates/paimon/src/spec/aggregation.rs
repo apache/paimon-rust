@@ -37,6 +37,7 @@ const NESTED_SEQUENCE_FIELD_SUFFIX: &str = ".nested-sequence-field";
 const NESTED_KEY_NULL_STRATEGY_SUFFIX: &str = ".nested-key-null-strategy";
 const COUNT_LIMIT_SUFFIX: &str = ".count-limit";
 const OVERWRITE_ON_EQUAL_TS_SUFFIX: &str = ".overwrite-on-equal-ts";
+const TS_FIELD_SUFFIX: &str = ".ts-field";
 const MAP_STORAGE_LAYOUT_SUFFIX: &str = ".map.storage-layout";
 const MAP_SHARED_SHREDDING_MAX_COLUMNS_SUFFIX: &str = ".map.shared-shredding.max-columns";
 const MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY_SUFFIX: &str =
@@ -180,9 +181,12 @@ impl<'a> AggregationConfig<'a> {
     ///   order (Java `AggregateMergeFunction#getAggFuncName`), so only the
     ///   function name is validated.
     ///
-    /// `fields.default-aggregate-function` only has its name validated;
-    /// per-column type compatibility for the default is deferred to runtime
-    /// because the default applies broadly across columns.
+    /// `fields.default-aggregate-function` has its name validated. When the
+    /// default is `merge_map_with_keytime`, MAP columns that fall through to
+    /// that default (no per-field aggregator; not PK / sequence) also run
+    /// [`validate_aggregator_for_type`] so field-scoped keytime options such as
+    /// `overwrite-on-equal-ts` cannot bypass create-time checks. Other default
+    /// functions still defer per-column type compatibility to runtime.
     fn validate_field_scoped_options(
         &self,
         fields: &[DataField],
@@ -233,6 +237,30 @@ impl<'a> AggregationConfig<'a> {
                     ),
                 });
             }
+            if canonical_aggregator_name(default) == "merge_map_with_keytime" {
+                let sequence_fields: std::collections::HashSet<&str> =
+                    CoreOptions::new(self.options)
+                        .sequence_fields()
+                        .into_iter()
+                        .collect();
+                for field in fields {
+                    let name = field.name();
+                    if primary_keys.iter().any(|pk| pk == name) || sequence_fields.contains(name) {
+                        continue;
+                    }
+                    // Per-field aggregate-function wins over the table default.
+                    if self.agg_function_for_field(name).is_some() {
+                        continue;
+                    }
+                    // Keep non-MAP type compatibility deferred to runtime for
+                    // the default aggregator; only MAP columns can carry
+                    // keytime options that must be checked at create.
+                    if !matches!(field.data_type(), DataType::Map(_)) {
+                        continue;
+                    }
+                    validate_aggregator_for_type(default, name, field.data_type(), self.options)?;
+                }
+            }
         }
 
         Ok(())
@@ -252,6 +280,7 @@ enum FieldScopedOptionKind {
     CountLimit,
     IgnoreRetract,
     OverwriteOnEqualTs,
+    TsField,
 }
 
 /// Parse the `<col>` segment and option kind out of a
@@ -284,6 +313,7 @@ fn parse_field_scoped_option_key(key: &str) -> Option<(&str, FieldScopedOptionKi
             OVERWRITE_ON_EQUAL_TS_SUFFIX,
             FieldScopedOptionKind::OverwriteOnEqualTs,
         ),
+        (TS_FIELD_SUFFIX, FieldScopedOptionKind::TsField),
     ] {
         if let Some(col) = inner.strip_suffix(suffix) {
             if col.is_empty() {
@@ -304,12 +334,13 @@ fn parse_field_scoped_option_key(key: &str) -> Option<(&str, FieldScopedOptionKi
 /// `SchemaManager.applyRenameColumnsToOptions` (Java's case-2 list; the
 /// aggregation/partial-update engines do not accept every entry at create
 /// time, but the keys can still arrive in Java-written metadata).
-const FIELD_SCOPED_RENAMEABLE_SUFFIXES: [&str; 8] = [
+const FIELD_SCOPED_RENAMEABLE_SUFFIXES: [&str; 9] = [
     AGG_FUNCTION_SUFFIX,
     IGNORE_RETRACT_SUFFIX,
     DISTINCT_SUFFIX,
     LIST_AGG_DELIMITER_SUFFIX,
     OVERWRITE_ON_EQUAL_TS_SUFFIX,
+    TS_FIELD_SUFFIX,
     MAP_STORAGE_LAYOUT_SUFFIX,
     MAP_SHARED_SHREDDING_MAX_COLUMNS_SUFFIX,
     MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY_SUFFIX,
@@ -1153,6 +1184,7 @@ mod tests {
             ("fields.a.distinct", "true"),
             ("fields.a.list-agg-delimiter", ";"),
             ("fields.a.overwrite-on-equal-ts", "true"),
+            ("fields.a.ts-field", "event_time"),
             ("fields.a.map.storage-layout", "shared-shredding"),
             ("fields.a.map.shared-shredding.max-columns", "64"),
             (
@@ -1174,6 +1206,7 @@ mod tests {
             ("distinct", "true"),
             ("list-agg-delimiter", ";"),
             ("overwrite-on-equal-ts", "true"),
+            ("ts-field", "event_time"),
             ("map.storage-layout", "shared-shredding"),
             ("map.shared-shredding.max-columns", "64"),
             ("map.shared-shredding.column-placement-policy", "even"),
