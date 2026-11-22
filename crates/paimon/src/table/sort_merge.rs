@@ -157,6 +157,9 @@ pub(crate) struct PickedRow {
     /// `_SEQUENCE_NUMBER` / `_VALUE_KIND` columns.
     columns: Vec<Option<(usize, usize)>>,
     sequence_number: i64,
+    /// One-row results of field aggregators, indexed by output column. Empty when
+    /// no column is aggregated.
+    values: Vec<Option<ArrayRef>>,
 }
 
 /// What [`MergeFunction::merge_picked`] returns.
@@ -1025,6 +1028,7 @@ impl PartialUpdateMergeFunction {
             return Ok(PickedMerge::Picked(PickedRow {
                 columns,
                 sequence_number: latest_row.sequence_number,
+                values: Vec::new(),
             }));
         }
 
@@ -1235,6 +1239,28 @@ impl AggregateMergeFunction {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<(RecordBatch, bool)> {
+        match self.merge_ordered_rows(
+            rows,
+            batch_buffer,
+            source_output_col_indices,
+            output_schema,
+            false,
+        )? {
+            PickedMerge::Result(MergeResult::MaterializedRow(batch)) => Ok((batch, false)),
+            PickedMerge::Result(MergeResult::MaterializedRetractRow(batch, _)) => Ok((batch, true)),
+            _ => unreachable!("aggregation materializes every row unless picks are requested"),
+        }
+    }
+
+    /// With `pick`, a live row is returned as its key row plus the aggregator results.
+    fn merge_ordered_rows(
+        &self,
+        rows: &[&MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+        pick: bool,
+    ) -> crate::Result<PickedMerge> {
         if rows.is_empty() {
             return Err(Error::UnexpectedError {
                 message: "merge called with empty rows".to_string(),
@@ -1285,6 +1311,57 @@ impl AggregateMergeFunction {
 
         // Java getResult uses the last KV for keys and record metadata.
         let pk_source = rows.last().unwrap();
+        let null_error = |field: &arrow_schema::Field, aggregator: Option<&dyn FieldAggregator>| {
+            let message = match aggregator {
+                Some(agg) => format!(
+                    "merge-engine=aggregation: aggregator '{}' produced NULL for \
+                     non-nullable field '{}'",
+                    agg.name(),
+                    field.name()
+                ),
+                None => format!(
+                    "merge-engine=aggregation: primary-key column '{}' contains NULL on a \
+                     source row; declare the column nullable or fix the upstream data",
+                    field.name()
+                ),
+            };
+            Error::DataInvalid {
+                message,
+                source: None,
+            }
+        };
+
+        if pick && !current_delete_row {
+            let mut columns = vec![None; output_schema.fields().len()];
+            let mut values = vec![None; output_schema.fields().len()];
+            for (col_idx, field) in output_schema.fields().iter().enumerate() {
+                if is_merged_metadata_field(field) {
+                    continue;
+                }
+                let is_null = match aggregators[col_idx].as_ref() {
+                    Some(agg) => {
+                        let value = agg.result()?;
+                        let is_null = value.is_null(0);
+                        values[col_idx] = Some(value);
+                        is_null
+                    }
+                    None => {
+                        columns[col_idx] = Some((pk_source.batch_idx, pk_source.row_idx));
+                        batch_buffer[pk_source.batch_idx]
+                            .column_for_output(col_idx, source_output_col_indices)
+                            .is_null(pk_source.row_idx)
+                    }
+                };
+                if is_null && !field.is_nullable() {
+                    return Err(null_error(field, aggregators[col_idx].as_deref()));
+                }
+            }
+            return Ok(PickedMerge::Picked(PickedRow {
+                columns,
+                sequence_number: pk_source.sequence_number,
+                values,
+            }));
+        }
 
         let output_columns: Vec<ArrayRef> = aggregators
             .iter()
@@ -1322,23 +1399,7 @@ impl AggregateMergeFunction {
         // upstream data.
         for (col_idx, field) in output_schema.fields().iter().enumerate() {
             if !field.is_nullable() && output_columns[col_idx].is_null(0) {
-                let message = match aggregators[col_idx].as_ref() {
-                    Some(agg) => format!(
-                        "merge-engine=aggregation: aggregator '{}' produced NULL for \
-                         non-nullable field '{}'",
-                        agg.name(),
-                        field.name()
-                    ),
-                    None => format!(
-                        "merge-engine=aggregation: primary-key column '{}' contains NULL on a \
-                         source row; declare the column nullable or fix the upstream data",
-                        field.name()
-                    ),
-                };
-                return Err(Error::DataInvalid {
-                    message,
-                    source: None,
-                });
+                return Err(null_error(field, aggregators[col_idx].as_deref()));
             }
         }
 
@@ -1349,7 +1410,11 @@ impl AggregateMergeFunction {
             }
         })?;
 
-        Ok((batch, current_delete_row))
+        Ok(PickedMerge::Result(if current_delete_row {
+            MergeResult::MaterializedRetractRow(batch, RowKind::Delete)
+        } else {
+            MergeResult::MaterializedRow(batch)
+        }))
     }
 }
 
@@ -1380,6 +1445,29 @@ impl MergeFunction for AggregateMergeFunction {
         } else {
             MergeResult::MaterializedRow(batch)
         })
+    }
+
+    fn merge_picked(
+        &self,
+        rows: &[MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<Option<PickedMerge>> {
+        // A lone version is already returned as a source row by `merge`.
+        if !self.reduce_singletons && rows.len() == 1 {
+            return Ok(None);
+        }
+        let mut ordered: Vec<_> = rows.iter().collect();
+        ordered.sort_by(|lhs, rhs| compare_sequence_order(lhs, rhs));
+        self.merge_ordered_rows(
+            &ordered,
+            batch_buffer,
+            source_output_col_indices,
+            output_schema,
+            true,
+        )
+        .map(Some)
     }
 }
 
@@ -2051,6 +2139,23 @@ fn build_output(
                         RowKind::Insert as i8;
                         picked_rows.len()
                     ]))
+                }
+                _ if picked_rows
+                    .iter()
+                    .any(|row| matches!(row.values.get(output_col_idx), Some(Some(_)))) =>
+                {
+                    let nulls = new_null_array(field.data_type(), 1);
+                    let parts: Vec<&dyn arrow_array::Array> = picked_rows
+                        .iter()
+                        .map(|row| match row.values.get(output_col_idx) {
+                            Some(Some(value)) => value.as_ref(),
+                            _ => nulls.as_ref(),
+                        })
+                        .collect();
+                    arrow_select::concat::concat(&parts).map_err(|e| Error::UnexpectedError {
+                        message: format!("Failed to concat merged column {output_col_idx}: {e}"),
+                        source: Some(Box::new(e)),
+                    })?
                 }
                 _ => new_null_array(field.data_type(), picked_rows.len()),
             };
@@ -4643,6 +4748,123 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    /// Picked aggregation rows read the same as materialized ones, across output
+    /// batches and next to lone versions, deleted keys and all-NULL aggregates.
+    #[tokio::test]
+    async fn test_aggregate_picked_rows_match_materialized_rows() {
+        struct Materializing(AggregateMergeFunction);
+        impl MergeFunction for Materializing {
+            fn merge(
+                &self,
+                rows: &[MergeRow],
+                batch_buffer: &[BufferedBatch],
+                source_output_col_indices: &[usize],
+                output_schema: &SchemaRef,
+            ) -> crate::Result<MergeResult> {
+                self.0
+                    .merge(rows, batch_buffer, source_output_col_indices, output_schema)
+            }
+        }
+
+        let schema = aggregation_schema();
+        let output_schema = aggregation_output_schema();
+        let streams = || {
+            let batch = |pk: Vec<i32>,
+                         seq: i64,
+                         kinds: Vec<i8>,
+                         amount: Vec<Option<i32>>,
+                         tag: Vec<Option<&str>>| {
+                let seqs = vec![seq; pk.len()];
+                stream_from_batches(vec![RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(pk)),
+                        Arc::new(Int64Array::from(seqs)),
+                        Arc::new(Int8Array::from(kinds)),
+                        Arc::new(Int32Array::from(amount)),
+                        Arc::new(StringArray::from(tag)),
+                    ],
+                )
+                .unwrap()])
+            };
+            vec![
+                batch(
+                    vec![1, 2, 3, 4],
+                    1,
+                    vec![0, 0, 0, 0],
+                    vec![Some(10), Some(20), None, Some(40)],
+                    vec![Some("a"), Some("x"), None, Some("d")],
+                ),
+                // Key 4 ends with a DELETE, which removes it.
+                batch(
+                    vec![1, 2, 4, 5],
+                    2,
+                    vec![0, 0, RowKind::Delete as i8, 0],
+                    vec![Some(5), None, None, Some(50)],
+                    vec![None, Some("y"), None, Some("e")],
+                ),
+                batch(
+                    vec![1, 3, 6],
+                    3,
+                    vec![0, 0, 0],
+                    vec![Some(1), None, Some(60)],
+                    vec![Some("c"), None, Some("f")],
+                ),
+            ]
+        };
+        let options = agg_options(&[
+            ("fields.amount.aggregate-function", "sum"),
+            ("fields.tag.aggregate-function", "last_non_null_value"),
+            ("aggregation.remove-record-on-delete", "true"),
+        ]);
+        let new_merge = || {
+            AggregateMergeFunction::new(
+                &options,
+                "test_table",
+                &aggregation_output_fields(),
+                &["pk".to_string()],
+                &[],
+            )
+            .unwrap()
+        };
+        let read = |merge: Box<dyn MergeFunction>| {
+            SortMergeReaderBuilder::new(
+                streams(),
+                schema.clone(),
+                vec![0],
+                1,
+                2,
+                vec![],
+                vec![3, 4],
+                output_schema.clone(),
+                merge,
+            )
+            .with_batch_size(2)
+            .build()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+        };
+        let picked = read(Box::new(new_merge())).await.unwrap();
+        let materialized = read(Box::new(Materializing(new_merge()))).await.unwrap();
+        assert_eq!(picked, materialized);
+
+        let picked = arrow_select::concat::concat_batches(&output_schema, &picked).unwrap();
+        assert_eq!(
+            picked.column(0).as_ref(),
+            &Int32Array::from(vec![1, 2, 3, 5, 6]) as &dyn arrow_array::Array
+        );
+        assert_eq!(
+            picked.column(1).as_ref(),
+            &Int32Array::from(vec![Some(16), Some(20), None, Some(50), Some(60)])
+                as &dyn arrow_array::Array
+        );
+        assert_eq!(
+            picked.column(2).as_ref(),
+            &StringArray::from(vec![Some("c"), Some("y"), None, Some("e"), Some("f")])
+                as &dyn arrow_array::Array
+        );
     }
 
     #[tokio::test]
