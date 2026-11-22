@@ -923,16 +923,23 @@ fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
         ],
     )
     .unwrap();
-    for included in [&[12][..], &[12, 11][..]] {
+    let shared_include: Arc<RoaringTreemap> = Arc::new(std::iter::once(12).collect());
+    for (included, shared) in [([12, 12], true), ([12, 11], false)] {
         let searches = included
             .iter()
             .map(|&row_id| {
-                VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string())
-                    .unwrap()
-                    .with_include_row_ids(std::iter::once(row_id).collect())
+                let mut search =
+                    VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+                if shared {
+                    search.set_shared_include_row_ids(Arc::clone(&shared_include));
+                    search
+                } else {
+                    search.with_include_row_ids(std::iter::once(row_id).collect())
+                }
             })
             .collect::<Vec<_>>();
         let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
+        assert_eq!(scoring_plan.shared_filter_groups.len(), usize::from(shared));
         let mut top_k = searches
             .iter()
             .map(|search| RawScoreTopK::new(search.limit))
@@ -947,7 +954,7 @@ fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
         )
         .unwrap();
 
-        for (result, &row_id) in top_k
+        for (result, row_id) in top_k
             .into_iter()
             .map(RawScoreTopK::into_search_result)
             .zip(included)
