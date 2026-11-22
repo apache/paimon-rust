@@ -195,6 +195,22 @@ mod tests {
     }
 
     #[test]
+    fn cosine_top_one_preserves_a_distance_below_the_similarity_precision() {
+        let mut reader = ArrayReader::new(2, vec![Some(vec![3.0015, 4.0]), Some(vec![3.0, 4.0])]);
+        let results = exact_search(
+            "data-file",
+            &mut reader,
+            &[3.0, 4.0],
+            VectorSearchMetric::Cosine,
+            1,
+            &no_exclusion(),
+        )
+        .unwrap();
+        assert_eq!(results[0].row_position, 1);
+        assert_eq!(results[0].distance, 0.0);
+    }
+
+    #[test]
     fn nan_distance_candidate_never_beats_finite_top1() {
         // Row 0's stored vector contains NaN → its inner-product distance is a
         // negative NaN (sign flipped by the metric's negation), which

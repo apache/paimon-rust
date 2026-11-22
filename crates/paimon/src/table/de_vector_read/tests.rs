@@ -493,6 +493,32 @@ fn test_raw_cosine_top_k_orders_mixed_scale_candidates() {
 }
 
 #[test]
+fn test_raw_cosine_top_k_preserves_same_sign_terms_at_rounding_midpoint() {
+    let large = 2.0_f32.powi(32);
+    let small = 2.0_f32.powi(-12);
+    let tiny = 2.0_f32.powi(-27);
+    let query = [large, 0.0, 1.0, small, tiny, tiny, tiny, tiny];
+    let first = [0.0, large, 1.0, small, 0.0, 0.0, 0.0, 0.0];
+    let second = [0.0, large, 1.0, small, tiny, tiny, tiny, tiny];
+    let expected_score = 2.0_f32.powi(-64).next_up();
+    assert_raw_cosine_top_one(&query, &[&first, &second], 11, expected_score);
+}
+
+#[test]
+fn test_raw_cosine_top_k_preserves_small_norm_terms_in_either_order() {
+    let mut query = [0.0; 66];
+    query[0] = 1.0;
+    let mut nearby = [2.0_f32.powi(-27); 66];
+    nearby[0] = 1.0;
+    nearby[1] = 2.0_f32.powi(-12);
+    for _ in 0..2 {
+        assert_raw_cosine_top_one(&query, &[&nearby, &query], 11, 1.0);
+        query.reverse();
+        nearby.reverse();
+    }
+}
+
+#[test]
 fn test_raw_cosine_top_k_preserves_residual_after_dot_cancellation() {
     let large = 2.0_f32.powi(64);
     let small = 2.0_f32.powi(37);

@@ -50,9 +50,7 @@ use crate::vindex::executor::{
     acquire_process_global_search_permit, drain_indexed_jobs,
     ensure_global_index_executor_capacity, execute_global_index_with_guard,
 };
-use crate::vindex::pkvector::metric::{
-    compensated_dot, cosine_norm, cosine_similarity, cosine_similarity_from_dot,
-};
+use crate::vindex::pkvector::metric::{cosine_norm, cosine_similarity, CosineDot, CosineOutput};
 use crate::vindex::range_reader::{RangeReadLimiter, VindexFileReader};
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use crate::vindex::{is_vindex_index_type, vector_search_timing_enabled};
@@ -3215,6 +3213,7 @@ fn compute_raw_vector_score_matrix(
 struct DenseCosineNorm {
     length: f64,
     mixed_signs: bool,
+    at_most_one_nonzero: bool,
 }
 
 impl DenseCosineNorm {
@@ -3222,12 +3221,21 @@ impl DenseCosineNorm {
         Self {
             length: cosine_norm(vector),
             mixed_signs: has_mixed_signs(vector),
+            at_most_one_nonzero: has_at_most_one_nonzero(vector),
         }
     }
 }
 
 fn has_mixed_signs(vector: &[f64]) -> bool {
     vector.iter().any(|&value| value < 0.0) && vector.iter().any(|&value| value > 0.0)
+}
+
+fn has_at_most_one_nonzero(vector: &[f64]) -> bool {
+    vector
+        .iter()
+        .filter(|&&value| value != 0.0)
+        .nth(1)
+        .is_none()
 }
 
 fn compute_raw_cosine_score_matrix(
@@ -3280,23 +3288,34 @@ fn compute_raw_cosine_score_matrix(
     {
         let query_norm = query_norms[query_index];
         let query_mixed_signs = has_mixed_signs(query);
+        let query_at_most_one_nonzero = has_at_most_one_nonzero(query);
         for ((stored, stored_norm), &dot) in stored_vectors
             .chunks_exact(dimension)
             .zip(stored_norms)
             .zip(query_dots)
         {
-            scores.push(cosine_similarity_from_dot(
-                dot,
-                query_norm * stored_norm.length,
-                dimension,
-                || {
-                    // Products of two single-sign vectors cannot cancel.
-                    if query_mixed_signs || stored_norm.mixed_signs {
-                        compensated_dot(query, stored, &mut partials)
+            let norm_product = query_norm * stored_norm.length;
+            // A single product is exact. For multiple products with uniform
+            // signs, estimate their absolute sum from the dot. Otherwise use
+            // the norm product (Cauchy-Schwarz).
+            let dot = if query_at_most_one_nonzero || stored_norm.at_most_one_nonzero {
+                CosineDot::Exact(dot)
+            } else {
+                CosineDot::Approximate {
+                    value: dot,
+                    absolute_sum_bound: if !query_mixed_signs && !stored_norm.mixed_signs {
+                        dot.abs()
                     } else {
-                        dot
-                    }
-                },
+                        norm_product
+                    },
+                }
+            };
+            scores.push(CosineOutput::Similarity.round_from_dot(
+                dot,
+                norm_product,
+                query,
+                stored,
+                &mut partials,
             ));
         }
     }
