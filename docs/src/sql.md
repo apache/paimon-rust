@@ -3156,6 +3156,14 @@ Larger refine factors may improve recall and ordering quality, but they also
 increase index result merging, raw-vector reads, and exact scoring work. Use the
 smallest factor that provides the desired recall.
 
+### Exact Cosine Distance on Primary-Key Tables
+
+Rust's exact scans and reranking on primary-key tables round the cosine distance
+(`1 - cosine`) to `f32`. The Java scorer rounds the similarity to `float` before
+subtracting it from one. Closely matched candidates can therefore have different
+distances or Top-K order across the two runtimes.
+[Java exact scorer](https://github.com/apache/paimon/blob/68dddca6ba335b17bbf8febb6444a121dcd8dcce/paimon-core/src/main/java/org/apache/paimon/globalindex/VectorSearchMetric.java#L87-L130)
+
 ### Lateral Joins
 
 Use `CROSS JOIN LATERAL` when query vectors come from another relation. In this mode, the third `vector_search` argument is a column reference from the left side of the join instead of a JSON literal:

@@ -45,8 +45,10 @@ pub(crate) fn normalize_metric(metric: &str) -> String {
     metric.to_ascii_lowercase().replace('-', "_")
 }
 
-/// Numeric semantics for a supported vector search metric. Mirrors Java
-/// `org.apache.paimon.globalindex.VectorSearchMetric`.
+/// Metric names and distance conventions follow Java
+/// `org.apache.paimon.globalindex.VectorSearchMetric`. Rust's exact cosine
+/// scorer rounds the distance after subtraction, so close matches can rank
+/// differently from Java.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VectorSearchMetric {
     L2,
@@ -191,23 +193,62 @@ fn cosine_score(query: &[f32], query_norm: f64, stored: &[f32], output: CosineOu
         }
         stored_squared_norm += s * s;
     }
-    let norm_product = query_norm * stored_squared_norm.sqrt();
+    let stored_norm = stored_squared_norm.sqrt();
+    let norm_product = query_norm * stored_norm;
     let absolute_dot_bound = match output {
         CosineOutput::Similarity => absolute_dot,
         CosineOutput::Distance => norm_product,
     };
-    output.round_from_dot(
-        CosineDot::Approximate {
-            value: dot,
-            absolute_sum_bound: absolute_dot_bound,
-        },
-        norm_product,
-        query,
-        stored,
-        &mut Vec::new(),
-    )
+    let dot = CosineDot::Approximate {
+        value: dot,
+        absolute_sum_bound: absolute_dot_bound,
+    };
+    let mut bounds = match output.try_round_from_dot(dot, norm_product, query.len()) {
+        Ok(rounded) => return rounded,
+        Err(bounds) => bounds,
+    };
+    if matches!(output, CosineOutput::Distance) && bounds.1 <= 0.5 {
+        if query == stored {
+            return 0.0;
+        }
+        let (lower, upper) = normalized_distance_bounds(query, stored, query_norm, stored_norm);
+        bounds = (bounds.0.max(lower), bounds.1.min(upper));
+        if bounds.0 == bounds.1 {
+            return bounds.0;
+        }
+    }
+    output.round_exact(dot, query, stored, bounds, &mut Vec::new())
 }
 
+/// Bound the cosine distance as half the squared difference of unit vectors.
+/// The distance interval narrows as the difference approaches zero.
+fn normalized_distance_bounds(
+    query: &[f32],
+    stored: &[f32],
+    query_norm: f64,
+    stored_norm: f64,
+) -> (f32, f32) {
+    let roundoff = (query.len() as f64 + 8.0) * f64::EPSILON;
+    if roundoff >= 0.5 {
+        return (0.0, 2.0);
+    }
+    let inverse_query_norm = query_norm.recip();
+    let inverse_stored_norm = stored_norm.recip();
+    let mut squared_length = 0.0_f64;
+    for (&q, &s) in query.iter().zip(stored) {
+        let difference = f64::from(q) * inverse_query_norm - f64::from(s) * inverse_stored_norm;
+        squared_length += difference * difference;
+    }
+    let length = squared_length.sqrt();
+    // Each input has unit length. Bound the normalization errors in both
+    // inputs and the relative error in the length of their difference.
+    let error = (1.0 + length) * roundoff / (1.0 - roundoff);
+    let lower = (length - error).max(0.0);
+    let upper = (length + error).min(2.0);
+    ((0.5 * lower * lower) as f32, (0.5 * upper * upper) as f32)
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum CosineDot {
     Exact(f64),
     Approximate { value: f64, absolute_sum_bound: f64 },
@@ -228,7 +269,7 @@ impl CosineOutput {
     }
 
     #[inline]
-    pub(crate) fn round_from_dot<T: Copy + Into<f64> + PartialEq>(
+    pub(crate) fn round_from_dot<T: Copy + Into<f64>>(
         self,
         dot_product: CosineDot,
         norm_product: f64,
@@ -236,6 +277,17 @@ impl CosineOutput {
         stored: &[T],
         partials: &mut Vec<f64>,
     ) -> f32 {
+        self.try_round_from_dot(dot_product, norm_product, query.len())
+            .unwrap_or_else(|bounds| self.round_exact(dot_product, query, stored, bounds, partials))
+    }
+
+    #[inline]
+    pub(crate) fn try_round_from_dot(
+        self,
+        dot_product: CosineDot,
+        norm_product: f64,
+        dimension: usize,
+    ) -> Result<f32, (f32, f32)> {
         let (dot, absolute_dot_bound) = match dot_product {
             CosineDot::Exact(value) => (value, 0.0),
             CosineDot::Approximate {
@@ -244,10 +296,10 @@ impl CosineOutput {
             } => (value, absolute_sum_bound),
         };
         if norm_product == 0.0 {
-            return self.value(0.0) as f32;
+            return Ok(self.value(0.0) as f32);
         }
         if !norm_product.is_finite() {
-            return self.value(dot / norm_product) as f32;
+            return Ok(self.value(dot / norm_product) as f32);
         }
         let inverse_norm = norm_product.recip();
         let estimate = self.value(dot * inverse_norm);
@@ -256,30 +308,21 @@ impl CosineOutput {
         // for the square roots, normalization, and distance subtraction.
         let error = 8.0
             * f64::EPSILON
-            * (query.len() as f64 + 2.0)
+            * (dimension as f64 + 2.0)
             * (absolute_dot_bound + dot.abs())
             * inverse_norm
             + f64::EPSILON * estimate.abs();
         let lower = (estimate - error) as f32;
         let upper = (estimate + error) as f32;
         if lower.to_bits() == upper.to_bits() {
-            return lower;
+            return Ok(lower);
         }
         let lower = self.clamp(lower);
         let upper = self.clamp(upper);
         if lower.to_bits() == upper.to_bits() {
-            return lower;
+            return Ok(lower);
         }
-        self.round_exact(
-            query,
-            stored,
-            (lower, upper),
-            match dot_product {
-                CosineDot::Exact(value) => Some(value),
-                CosineDot::Approximate { .. } => None,
-            },
-            partials,
-        )
+        Err((lower, upper))
     }
 
     fn clamp(self, value: f32) -> f32 {
@@ -290,21 +333,17 @@ impl CosineOutput {
     }
 
     #[cold]
-    fn round_exact<T: Copy + Into<f64> + PartialEq>(
+    pub(crate) fn round_exact<T: Copy + Into<f64>>(
         self,
+        dot_product: CosineDot,
         query: &[T],
         stored: &[T],
         bounds: (f32, f32),
-        known_dot: Option<f64>,
         partials: &mut Vec<f64>,
     ) -> f32 {
-        if matches!(self, Self::Distance) && query == stored {
-            return 0.0;
-        }
-
-        let dot = match known_dot {
-            Some(dot) => scale_f32_product(dot),
-            None => exact_dot(query, stored, partials),
+        let dot = match dot_product {
+            CosineDot::Exact(dot) => scale_f32_product(dot),
+            CosineDot::Approximate { .. } => exact_dot(query, stored, partials),
         };
         if dot.sign() == Sign::NoSign {
             return self.value(0.0) as f32;
@@ -569,6 +608,43 @@ mod tests {
         let tiny = 2.0_f32.powi(-50);
         let distance = VectorSearchMetric::Cosine.compute_distance(&[1.0, 0.0], &[1.0, tiny]);
         assert_eq!(distance, 2.0_f32.powi(-101));
+    }
+
+    #[test]
+    fn test_normalized_distance_resolves_near_parallel_rounding() {
+        let query = [1.0; 256];
+        let query_norm = cosine_norm(&query);
+        for k in 1..=13 {
+            let mut stored = query;
+            let delta = k as f32 * 2.0_f32.powi(-12);
+            stored[0] += delta;
+            let stored_norm = cosine_norm(&stored);
+
+            // For q = [1, ..., 1] and s = q + delta*e_0, the squared norm
+            // product minus the squared dot is (dimension - 1) * delta^2.
+            let delta = f64::from(delta);
+            let norm_product = query_norm * stored_norm;
+            let dot = 256.0 + delta;
+            let expected = (255.0 * delta * delta / (norm_product * (norm_product + dot))) as f32;
+            assert!(CosineOutput::Distance
+                .try_round_from_dot(
+                    CosineDot::Approximate {
+                        value: dot,
+                        absolute_sum_bound: norm_product,
+                    },
+                    norm_product,
+                    query.len(),
+                )
+                .is_err());
+            assert_eq!(
+                normalized_distance_bounds(&query, &stored, query_norm, stored_norm),
+                (expected, expected)
+            );
+            assert_eq!(
+                VectorSearchMetric::Cosine.compute_distance(&query, &stored),
+                expected
+            );
+        }
     }
 
     #[test]

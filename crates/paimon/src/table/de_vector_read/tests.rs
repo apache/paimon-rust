@@ -385,6 +385,86 @@ fn test_raw_vector_score_matrix_matches_scalar_metrics() {
 }
 
 #[test]
+fn test_raw_cosine_matrix_refines_mixed_sign_rounding_bounds() {
+    let dimension = 256;
+    let epsilon = 2.0_f32.powi(-22);
+    let mut query = vec![epsilon; dimension];
+    query[..128].fill(1.0);
+    query[0] = 2.0;
+    let mut other_query = query.clone();
+    other_query[0] = 3.0;
+    let mut row = vec![epsilon; dimension];
+    row[128..192].fill(1.0);
+    row[192..].fill(-1.0);
+    let mut other_row = row.clone();
+    other_row[0] = -epsilon;
+    let queries = [&query, &other_query];
+    let query_norms = queries.map(|query| cosine_norm(query));
+    let norm_product = query_norms[0] * cosine_norm(&row);
+    let dot = 129.0 * f64::from(epsilon);
+    assert!(CosineOutput::Similarity
+        .try_round_from_dot(
+            CosineDot::Approximate {
+                value: dot,
+                absolute_sum_bound: norm_product,
+            },
+            norm_product,
+            dimension,
+        )
+        .is_err());
+    assert_eq!(
+        CosineOutput::Similarity.try_round_from_dot(
+            CosineDot::Approximate {
+                value: dot,
+                absolute_sum_bound: 257.0 * f64::from(epsilon),
+            },
+            norm_product,
+            dimension,
+        ),
+        Ok(cosine_similarity(&query, query_norms[0], &row))
+    );
+
+    let query_indices = [1, 0, 1, 0];
+    let query_matrix: Vec<_> = query_indices
+        .iter()
+        .flat_map(|&index| queries[index].iter().copied().map(f64::from))
+        .collect();
+    // Exercise pairwise refinement and batched refinement.
+    for row_count in [2, 32] {
+        let rows: Vec<_> = [&row, &other_row]
+            .into_iter()
+            .cycle()
+            .take(row_count)
+            .collect();
+        let stored: Vec<_> = rows
+            .iter()
+            .flat_map(|row| row.iter().copied().map(f64::from))
+            .collect();
+        let stored_norms: Vec<_> = stored
+            .chunks_exact(dimension)
+            .map(DenseCosineNorm::new)
+            .collect();
+        let scores = compute_raw_cosine_score_matrix(
+            &stored,
+            &stored_norms,
+            &query_matrix,
+            &query_norms,
+            &query_indices,
+            dimension,
+        )
+        .unwrap();
+        for (&query_index, scores) in query_indices.iter().zip(scores.chunks_exact(row_count)) {
+            for (row, &score) in rows.iter().zip(scores) {
+                assert_eq!(
+                    score,
+                    cosine_similarity(queries[query_index], query_norms[query_index], row)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn test_raw_vector_score_matrix_l2_preserves_large_finite_distances() {
     let dimension = 128;
     let query = vec![1.0e10_f32; dimension];

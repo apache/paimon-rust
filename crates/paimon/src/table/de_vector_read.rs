@@ -3250,13 +3250,104 @@ fn compute_raw_cosine_score_matrix(
     let query_count = query_vectors.len() / dimension;
     debug_assert_eq!(stored_norms.len(), row_count);
     debug_assert_eq!(query_indices.len(), query_count);
-    let mut dots = vec![0.0; raw_score_matrix_size(row_count, query_count)?];
+    let dots = compute_raw_cosine_dot_matrix(query_vectors, stored_vectors, dimension)?;
     if dots.is_empty() {
         return Ok(Vec::new());
     }
 
-    // A single double-precision multiply keeps candidates comparable across
-    // coordinate scales. Queries index rows of the output, stored vectors columns.
+    let similarity = CosineOutput::Similarity;
+    let mut scores = Vec::with_capacity(dots.len());
+    let mut partials = Vec::new();
+    let mut needs_tighter_bound = Vec::new();
+    for ((query, &query_index), query_dots) in query_vectors
+        .chunks_exact(dimension)
+        .zip(query_indices)
+        .zip(dots.chunks_exact(row_count))
+    {
+        let query_norm = query_norms[query_index];
+        let query_mixed_signs = has_mixed_signs(query);
+        let query_at_most_one_nonzero = has_at_most_one_nonzero(query);
+        for ((stored, stored_norm), &dot) in stored_vectors
+            .chunks_exact(dimension)
+            .zip(stored_norms)
+            .zip(query_dots)
+        {
+            let norm_product = query_norm * stored_norm.length;
+            // A single product is exact. For multiple products with uniform
+            // signs, estimate their absolute sum from the dot. Otherwise use
+            // the norm product (Cauchy-Schwarz).
+            let exact = query_at_most_one_nonzero || stored_norm.at_most_one_nonzero;
+            let may_cancel = !exact && (query_mixed_signs || stored_norm.mixed_signs);
+            let dot = if exact {
+                CosineDot::Exact(dot)
+            } else {
+                CosineDot::Approximate {
+                    value: dot,
+                    absolute_sum_bound: if may_cancel { norm_product } else { dot.abs() },
+                }
+            };
+            let score = match similarity.try_round_from_dot(dot, norm_product, dimension) {
+                Ok(score) => score,
+                Err(_) if may_cancel => {
+                    needs_tighter_bound.push(scores.len());
+                    0.0
+                }
+                Err(bounds) => similarity.round_exact(dot, query, stored, bounds, &mut partials),
+            };
+            scores.push(score);
+        }
+    }
+
+    // Refine a few uncertain pairs directly. A second multiply amortizes the
+    // coordinate scans when many mixed-sign pairs need the absolute-product sum.
+    let absolute_dots = if needs_tighter_bound.len() >= dots.len().div_ceil(8).max(32) {
+        let absolute_queries: Vec<_> = query_vectors.iter().map(|value| value.abs()).collect();
+        let absolute_rows: Vec<_> = stored_vectors.iter().map(|value| value.abs()).collect();
+        Some(compute_raw_cosine_dot_matrix(
+            &absolute_queries,
+            &absolute_rows,
+            dimension,
+        )?)
+    } else {
+        None
+    };
+    for position in needs_tighter_bound {
+        let query_index = position / row_count;
+        let row_index = position % row_count;
+        let query = &query_vectors[query_index * dimension..][..dimension];
+        let stored = &stored_vectors[row_index * dimension..][..dimension];
+        let absolute_sum_bound = absolute_dots.as_ref().map_or_else(
+            || query.iter().zip(stored).map(|(q, s)| (q * s).abs()).sum(),
+            |absolute_dots| absolute_dots[position],
+        );
+        let norm_product = query_norms[query_indices[query_index]] * stored_norms[row_index].length;
+        scores[position] = similarity.round_from_dot(
+            CosineDot::Approximate {
+                value: dots[position],
+                absolute_sum_bound,
+            },
+            norm_product,
+            query,
+            stored,
+            &mut partials,
+        );
+    }
+    Ok(scores)
+}
+
+fn compute_raw_cosine_dot_matrix(
+    query_vectors: &[f64],
+    stored_vectors: &[f64],
+    dimension: usize,
+) -> crate::Result<Vec<f64>> {
+    let row_count = stored_vectors.len() / dimension;
+    let query_count = query_vectors.len() / dimension;
+    let mut dots = vec![0.0; raw_score_matrix_size(row_count, query_count)?];
+    if dots.is_empty() {
+        return Ok(dots);
+    }
+
+    // Queries index rows of the output and stored vectors index columns.
     // SAFETY: Each dimension is derived from the backing slices, so the input
     // strides stay within the respective buffers and the output strides are
     // disjoint within the checked query_count * row_count allocation.
@@ -3278,48 +3369,7 @@ fn compute_raw_cosine_score_matrix(
             1,
         );
     }
-
-    let mut scores = Vec::with_capacity(dots.len());
-    let mut partials = Vec::new();
-    for ((query, &query_index), query_dots) in query_vectors
-        .chunks_exact(dimension)
-        .zip(query_indices)
-        .zip(dots.chunks_exact(row_count))
-    {
-        let query_norm = query_norms[query_index];
-        let query_mixed_signs = has_mixed_signs(query);
-        let query_at_most_one_nonzero = has_at_most_one_nonzero(query);
-        for ((stored, stored_norm), &dot) in stored_vectors
-            .chunks_exact(dimension)
-            .zip(stored_norms)
-            .zip(query_dots)
-        {
-            let norm_product = query_norm * stored_norm.length;
-            // A single product is exact. For multiple products with uniform
-            // signs, estimate their absolute sum from the dot. Otherwise use
-            // the norm product (Cauchy-Schwarz).
-            let dot = if query_at_most_one_nonzero || stored_norm.at_most_one_nonzero {
-                CosineDot::Exact(dot)
-            } else {
-                CosineDot::Approximate {
-                    value: dot,
-                    absolute_sum_bound: if !query_mixed_signs && !stored_norm.mixed_signs {
-                        dot.abs()
-                    } else {
-                        norm_product
-                    },
-                }
-            };
-            scores.push(CosineOutput::Similarity.round_from_dot(
-                dot,
-                norm_product,
-                query,
-                stored,
-                &mut partials,
-            ));
-        }
-    }
-    Ok(scores)
+    Ok(dots)
 }
 
 fn raw_score_matrix_size(row_count: usize, query_count: usize) -> crate::Result<usize> {
