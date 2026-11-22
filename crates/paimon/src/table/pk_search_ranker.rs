@@ -31,6 +31,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+use crate::table::hybrid_search_builder::normalize_route_score;
 use crate::table::pk_search_position::PrimaryKeySearchPosition;
 
 /// Reciprocal-rank-fusion smoothing constant. Matches Java's
@@ -170,13 +171,8 @@ pub(crate) fn weighted_score(
             min = min.min(position.score());
             max = max.max(position.score());
         }
-        let range = max - min;
         for position in ranking.positions() {
-            let normalized: f64 = if range > 0.0 {
-                ((position.score() - min) / range) as f64
-            } else {
-                1.0
-            };
+            let normalized = f64::from(normalize_route_score(position.score(), min, max));
             *fused_scores.entry(position.clone()).or_insert(0.0) += ranking.weight() * normalized;
         }
     }
@@ -359,6 +355,26 @@ mod tests {
         assert_eq!(file_names(&fused), vec!["a", "b", "c"]);
         let scores: Vec<f32> = fused.iter().map(|p| p.score()).collect();
         assert_eq!(scores, vec![2.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn weighted_score_handles_finite_scores_with_overflowing_range() {
+        let ranked = weighted_score(
+            &[ranking(
+                vec![
+                    position("a", 0, -f32::MAX),
+                    position("b", 0, 0.0),
+                    position("c", 0, f32::MAX),
+                ],
+                4.0,
+            )],
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(file_names(&ranked), vec!["c", "b"]);
+        assert_eq!(ranked[0].score(), 4.0);
+        assert_eq!(ranked[1].score(), 2.0);
     }
 
     #[test]

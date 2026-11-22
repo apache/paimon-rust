@@ -523,3 +523,12 @@ pub struct paimon_postpone_fixed_bucket_table_commit {
 pub struct paimon_postpone_fixed_bucket_commit_messages {
     pub inner: *mut c_void,
 }
+
+/// Opaque handle to a Paimon bucket router.
+///
+/// Concurrent routing is supported. Setting a plan or freeing the router
+/// requires exclusive access. Free it with `paimon_bucket_router_free`.
+#[repr(C)]
+pub struct paimon_bucket_router {
+    pub inner: *mut c_void,
+}

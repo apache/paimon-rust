@@ -17,7 +17,7 @@
 
 //! Utilities for casting [`DataType`], mirroring Java `DataTypeCasts`.
 //!
-//! Like Java, the rules are defined at type-root granularity: two types with
+//! Except for geospatial types, the rules are defined at type-root granularity: two types with
 //! the same root (e.g. two `DECIMAL`s with different precision) are always
 //! implicitly castable, and parameters of the target type are not inspected.
 
@@ -45,6 +45,29 @@ pub(crate) fn supports_cast(source: &DataType, target: &DataType, allow_explicit
         (Ok(s), Ok(t)) if s == t => return true,
         (Err(_), _) | (_, Err(_)) => return false,
         _ => {}
+    }
+    if source.contains_geospatial() || target.contains_geospatial() {
+        // The read path evolves collection elements and matching ROW field IDs.
+        // A compatible Arrow storage type alone cannot change the meaning of WKB.
+        let compatible = |from, to| supports_cast(from, to, allow_explicit);
+        return match (source, target) {
+            (DataType::Array(a), DataType::Array(b)) => {
+                compatible(a.element_type(), b.element_type())
+            }
+            (DataType::Multiset(a), DataType::Multiset(b)) => {
+                compatible(a.element_type(), b.element_type())
+            }
+            (DataType::Map(a), DataType::Map(b)) => {
+                compatible(a.key_type(), b.key_type()) && compatible(a.value_type(), b.value_type())
+            }
+            (DataType::Row(a), DataType::Row(b)) => b.fields().iter().all(|field| {
+                a.fields()
+                    .iter()
+                    .find(|old| old.id() == field.id())
+                    .is_none_or(|old| compatible(old.data_type(), field.data_type()))
+            }),
+            _ => false,
+        };
     }
     if implicit_cast_supported(source, target) {
         return true;
@@ -162,6 +185,8 @@ fn explicit_cast_supported(source: &DataType, target: &DataType) -> bool {
             is_datetime(source) || is_character_string(source) || is_numeric(source)
         }
         DataType::Blob(_)
+        | DataType::Geometry(_)
+        | DataType::Geography(_)
         | DataType::Variant(_)
         | DataType::Array(_)
         | DataType::Map(_)

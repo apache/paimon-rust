@@ -45,7 +45,7 @@ use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
-use crate::table::write_batch_normalize::{normalize_blob_write_field, normalize_write_array};
+use crate::table::write_batch_normalize::{normalize_blob_write_field, normalize_write_field};
 use crate::table::{Snapshot, Table, TableScan};
 use crate::Result;
 use arrow_array::{Array, ArrayRef, Int8Array, RecordBatch};
@@ -1117,7 +1117,7 @@ impl TableWrite {
             let normalized = if blob_maps.contains(expected_field.name().as_str()) {
                 normalize_blob_write_field(batch.column(index), expected_field)
             } else {
-                normalize_write_array(batch.column(index), expected_field.data_type())
+                normalize_write_field(batch.column(index), expected_field, None)
                     .map(|column| (expected_field.as_ref().clone(), column))
             };
             let (field, column) = normalized
@@ -2441,6 +2441,68 @@ pub(in crate::table) mod tests {
                 "<missing>",
             ],
         );
+    }
+
+    #[test]
+    fn geospatial_write_normalizes_wkb_layouts() {
+        use crate::spec::{ArrayType, GeometryType};
+        use arrow_array::{BinaryViewArray, LargeBinaryArray, ListArray};
+        use arrow_buffer::OffsetBuffer;
+
+        let geom = DataType::Geometry(GeometryType::new("EPSG:4326").unwrap());
+        let schema = Schema::builder()
+            .column("g", DataType::Array(ArrayType::new(geom.clone())))
+            .build()
+            .unwrap();
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "geo"),
+            "memory:/geo".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let writer = TableWrite::new(&table, "writer".into()).unwrap();
+        let make_batch = |ty: &DataType, values: ArrayRef| {
+            let child = crate::arrow::paimon_type_to_arrow_field("item", ty)
+                .unwrap()
+                .with_data_type(values.data_type().clone());
+            let list = ListArray::new(
+                Arc::new(child),
+                OffsetBuffer::from_lengths([values.len()]),
+                values,
+                None,
+            );
+            RecordBatch::try_from_iter([("g", Arc::new(list) as ArrayRef)]).unwrap()
+        };
+        let point: &[u8] = &[
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64,
+        ];
+        let large = Arc::new(LargeBinaryArray::from(vec![Some(point), None])) as ArrayRef;
+        let other = DataType::Geometry(GeometryType::new("EPSG:3857").unwrap());
+        for values in [
+            large,
+            Arc::new(BinaryViewArray::from_iter([Some(point), None])) as ArrayRef,
+        ] {
+            let batch = writer
+                .validate_write_batch_schema(&make_batch(&other, values))
+                .unwrap();
+            let list = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let binary = list
+                .values()
+                .as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+                .unwrap();
+            assert_eq!(binary.value(0), point);
+            assert!(binary.is_null(1));
+            assert_eq!(
+                crate::arrow::arrow_field_to_paimon_type(batch.schema().field(0)).unwrap(),
+                DataType::Array(ArrayType::new(geom.clone()))
+            );
+        }
     }
 
     #[tokio::test]

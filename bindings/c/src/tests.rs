@@ -706,6 +706,35 @@ fn test_file_io_external_cache_short_hit_fails_open_to_storage() {
 }
 
 #[test]
+fn test_table_from_schema_json_accepts_legacy_defaults() {
+    let path = CString::new("memory:/test_legacy_schema").unwrap();
+    let database = CString::new("default").unwrap();
+    let table_name = CString::new("test").unwrap();
+    let mut json = serde_json::to_value(simple_table_schema()).unwrap();
+    json.as_object_mut().unwrap().remove("version");
+    let schema_json = CString::new(serde_json::to_string(&json).unwrap()).unwrap();
+
+    unsafe {
+        let result = paimon_table_from_schema_json(
+            path.as_ptr(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+        );
+        assert!(result.error.is_null());
+        assert!(!result.table.is_null());
+        let schema = table_ref(result.table).schema();
+        assert_eq!(schema.version(), 1);
+        assert_eq!(schema.core_options().bucket(), 1);
+        assert_eq!(schema.core_options().file_format(), "orc");
+        paimon_table_free(result.table);
+    }
+}
+
+#[test]
 fn test_table_from_schema_json_preserves_resolved_schema_and_branch() {
     let path = CString::new("memory:/test_resolved_branch").unwrap();
     let database = CString::new("default").unwrap();
@@ -2026,6 +2055,103 @@ fn test_write_commit_read_roundtrip() {
         paimon_table_commit_free(tc);
         paimon_table_write_free(tw);
         paimon_write_builder_free(wb);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn route_with_postpone_bucket_plan() {
+    use crate::bucket_router::*;
+
+    let json =
+        CString::new(serde_json::to_string(&partitioned_postpone_table_schema()).unwrap()).unwrap();
+    unsafe {
+        let router = paimon_bucket_router_new_from_schema_json(json.as_ptr());
+        assert!(router.error.is_null());
+        let plan = make_postpone_bucket_plan_batch(vec!["a", "b"], vec![1, 3]);
+        let (mut array, mut schema) = export_batch_to_ffi(plan);
+        assert!(paimon_bucket_router_with_bucket_plan(
+            router.router,
+            (&mut **array as *mut FFI_ArrowArray).cast(),
+            (&mut **schema as *mut FFI_ArrowSchema).cast(),
+        )
+        .is_null());
+
+        let batch = make_partitioned_write_batch(vec!["a", "b"], vec![5, 5], vec!["x", "x"]);
+        let (mut array, mut schema) = export_batch_to_ffi(batch);
+        let mut buckets = [-1; 2];
+        assert!(paimon_bucket_router_route_arrow(
+            router.router,
+            (&mut **array as *mut FFI_ArrowArray).cast(),
+            (&mut **schema as *mut FFI_ArrowSchema).cast(),
+            buckets.as_mut_ptr(),
+            buckets.len(),
+        )
+        .is_null());
+        assert_eq!(buckets, [0, 2]);
+        paimon_bucket_router_free(router.router);
+    }
+}
+
+#[test]
+fn route_and_write_with_precomputed_bucket() {
+    use crate::bucket_router::*;
+
+    let schema = TableSchema::new(
+        0,
+        &Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "100")
+            .build()
+            .unwrap(),
+    );
+    let json = CString::new(serde_json::to_string(&schema).unwrap()).unwrap();
+    let path = "memory:/routed_write";
+    let io = memory_file_io();
+    setup_table_dirs(&io, path);
+    let table = Table::new(io, Identifier::new("db", "test"), path.into(), schema, None);
+    let batch = make_batch(vec![5], vec!["a"]);
+    unsafe {
+        let router = paimon_bucket_router_new_from_schema_json(json.as_ptr());
+        assert!(router.error.is_null());
+        let (mut array, mut schema) = export_batch_to_ffi(batch.project(&[0]).unwrap());
+        let mut bucket = -1;
+        assert!(paimon_bucket_router_route_arrow(
+            router.router,
+            (&mut **array as *mut FFI_ArrowArray).cast(),
+            (&mut **schema as *mut FFI_ArrowSchema).cast(),
+            &mut bucket,
+            1
+        )
+        .is_null());
+        assert_eq!(bucket, 96);
+        paimon_bucket_router_free(router.router);
+
+        let handle = wrap_table(table);
+        let builder = paimon_table_new_write_builder(handle);
+        assert!(builder.error.is_null());
+        let writer = paimon_write_builder_new_write(builder.write_builder);
+        assert!(writer.error.is_null());
+        let (mut array, mut schema) = export_batch_to_ffi(batch);
+        assert!(paimon_table_write_write_arrow_batch_with_bucket(
+            writer.write,
+            (&mut **array as *mut FFI_ArrowArray).cast(),
+            (&mut **schema as *mut FFI_ArrowSchema).cast(),
+            bucket
+        )
+        .is_null());
+        let prepared = paimon_table_write_prepare_commit(writer.write);
+        assert!(prepared.error.is_null());
+        let commit = paimon_write_builder_new_commit(builder.write_builder);
+        assert!(commit.error.is_null());
+        assert!(paimon_table_commit_commit(commit.commit, prepared.messages).is_null());
+        assert_eq!(read_rows_ffi(handle), vec![(5, "a".into())]);
+        paimon_commit_messages_free(prepared.messages);
+        paimon_table_commit_free(commit.commit);
+        paimon_table_write_free(writer.write);
+        paimon_write_builder_free(builder.write_builder);
         unwrap_table(handle);
     }
 }

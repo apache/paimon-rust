@@ -70,6 +70,11 @@ pub(super) fn definitions(schema: &TableSchema) -> Result<Vec<Definition>> {
         let mut merged = options.clone();
         merged.extend(configured.clone());
         match family {
+            "rtree" => {
+                return Err(Error::Unsupported {
+                    message: "R-tree indexes require an append table with row tracking".into(),
+                })
+            }
             "vector" => {
                 match field.data_type() {
                     DataType::Vector(_) => {}

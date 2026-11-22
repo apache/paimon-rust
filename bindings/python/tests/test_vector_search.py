@@ -114,6 +114,27 @@ def test_vector_build_echoed_schema_retains_source_semantics(table, kind):
     assert sorted(_single(configured).execute().row_ids().values()) == pytest.approx([0, 1, 1])
 
 
+def test_distributed_centroid_build_replaces_range_indexes(table):
+    import pickle
+    options = {'ivf-flat.dimension': '2', 'ivf-flat.nlist': '1', 'ivf-flat.metric': 'cosine'}
+    builder = (table.new_global_index_build_builder().with_index_column('embedding')
+               .with_index_type('ivf-flat').with_options(options))
+    assert builder.execute() == 2
+
+    builder.with_options({**options, 'ivf-flat.sharding': 'centroid', 'ivf-flat.centroid.nlist': '2'})
+    plan = pickle.loads(pickle.dumps(builder.plan()))
+    messages = plan.replacement_messages()
+    assert len(messages) == 2
+    for shard in plan.shards():
+        messages.extend(builder.build_shard(shard))
+    commit = table.new_batch_write_builder().new_commit()
+    try:
+        commit.commit(messages)
+    finally:
+        commit.close()
+    assert sorted(_single(table).execute().row_ids().values()) == pytest.approx([0, 1, 1])
+
+
 @pytest.mark.parametrize('shared_json', [False, True, 'aliases'])
 @pytest.mark.parametrize('declared', [False, True])
 def test_full_text_json_encoded_lists_keep_raw_and_indexed_semantics(tmp_path, shared_json, declared):

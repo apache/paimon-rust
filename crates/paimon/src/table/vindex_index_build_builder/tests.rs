@@ -115,15 +115,16 @@ fn echoed_schema_keeps_table_semantics_and_procedure_overrides() {
             (format!("{kind}.dimension"), "2".into()),
             (format!("{kind}.metric"), "cosine".into()),
             ("nlist".into(), "ignored table property".into()),
+            ("sharding".into(), "ignored table property".into()),
             ("index.type".into(), "ignored table property".into()),
             ("vindex.build.granule.enabled".into(), "true".into()),
         ]));
         let table = test_table(options.clone());
         let field = find_index_field(&table, "embedding").unwrap();
         let mut builder = super::VindexIndexBuildBuilder::new(&table, kind);
-        let (_, expected) = builder.configured_options("embedding", field).unwrap();
+        let (_, expected, _) = builder.configured_options("embedding", field).unwrap();
         builder.with_options(options.clone());
-        let (_, actual) = builder.configured_options("embedding", field).unwrap();
+        let (_, actual, _) = builder.configured_options("embedding", field).unwrap();
         assert_eq!(actual.native_options, expected.native_options);
         assert!(!actual.native_options.contains_key("nlist"));
         assert_eq!(actual.native_options["metric"], "cosine");
@@ -143,7 +144,7 @@ fn echoed_schema_keeps_table_semantics_and_procedure_overrides() {
         );
         options.insert(format!("{kind}.metric"), "l2".into());
         builder.with_options(options);
-        let (_, actual) = builder.configured_options("embedding", field).unwrap();
+        let (_, actual, _) = builder.configured_options("embedding", field).unwrap();
         assert_eq!(actual.native_options["metric"], "l2");
         assert!(!actual.native_options.contains_key("nlist"));
         // Direct SDK calls keep native aliases, including values equal to schema properties.
@@ -1648,3 +1649,6 @@ fn vindex_plan_incremental_prefix_leaves_suffix() {
 
 #[path = "sparse_tests.rs"]
 mod sparse_tests;
+
+#[path = "centroid_tests.rs"]
+mod centroid_tests;

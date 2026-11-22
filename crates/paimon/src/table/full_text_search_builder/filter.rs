@@ -117,7 +117,7 @@ pub(super) async fn matching_indexed_rows(
     filter: &Predicate,
 ) -> crate::Result<RoaringTreemap> {
     let core = CoreOptions::new(evaluation.table_options);
-    let mode = core.scalar_index_search_mode()?;
+    let mode = core.scalar_prefilter_search_mode()?;
     let covered_ranges = full_text_entries
         .iter()
         .map(|entry| {

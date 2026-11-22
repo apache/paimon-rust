@@ -17,6 +17,7 @@
 
 mod glob;
 mod options;
+mod parquet;
 mod projection;
 mod raw;
 mod scoped;
@@ -29,13 +30,13 @@ use datafusion::arrow::array::StructArray;
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl};
 use datafusion::common::{DFSchema, ScalarValue};
-use datafusion::datasource::file_format::{parquet::ParquetFormat, FileFormat};
+use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use datafusion::execution::session_state::SessionState;
 use datafusion::logical_expr::planner::{
     PlannedRelation, RelationPlanner, RelationPlannerContext, RelationPlanning,
 };
@@ -402,29 +403,13 @@ async fn build(
         };
         return raw::provider(&ctx, store, files, options, format, Some(schema)).await;
     }
-    let file_format: Arc<dyn FileFormat> = match format {
-        Format::Parquet => Arc::new(ParquetFormat::default()),
+    let file_format = match format {
+        Format::Parquet => ParquetFormat::default(),
         _ => unreachable!(),
     };
     let schema = match schema {
         Some(schema) => schema,
-        None => {
-            let runtime =
-                scoped::runtime(state.runtime_env(), files[0].url.clone(), store.clone())?;
-            let state = SessionStateBuilder::new_from_existing(state.clone())
-                .with_runtime_env(runtime)
-                .build();
-            file_format
-                .infer_schema(
-                    &state,
-                    &store,
-                    &files
-                        .iter()
-                        .map(|file| file.meta.clone())
-                        .collect::<Vec<_>>(),
-                )
-                .await?
-        }
+        None => parquet::infer_schema(state, &store, &files, &file_format).await?,
     };
     // A real field can carry metadata from an earlier export. Provenance tags
     // belong to this source binding and must never hide persisted user columns.
@@ -440,7 +425,7 @@ async fn build(
             .collect::<Vec<_>>(),
         schema.metadata().clone(),
     ));
-    let listing_options = ListingOptions::new(file_format).with_file_extension("");
+    let listing_options = ListingOptions::new(Arc::new(file_format)).with_file_extension("");
     let has_source_metadata = schema
         .fields()
         .iter()

@@ -47,6 +47,7 @@ pub(crate) fn bind_view_query(
     let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
     let mut statements = crate::vector_type::parse_sql(parseable.as_ref())
         .map_err(|error| DataFusionError::Plan(format!("Invalid view SQL: {error}")))?;
+    crate::geospatial::quote_cast_types(&mut statements);
     if statements.len() != 1 || !matches!(statements.first(), Some(Statement::Query(_))) {
         return Err(DataFusionError::Plan(
             "View SQL must contain one query".into(),
@@ -425,6 +426,7 @@ async fn expand_sql_internal(
     let parseable = crate::lateral_views::parseable_sql(regex_sql.as_ref())?;
     let mut statements = crate::vector_type::parse_sql(parseable.as_ref())
         .map_err(|error| DataFusionError::Plan(format!("Invalid REST SQL: {error}")))?;
+    crate::geospatial::quote_cast_types(&mut statements);
     if statements.len() != 1 {
         return Err(DataFusionError::Plan(format!(
             "REST SQL must contain exactly one statement, found {}",
@@ -820,6 +822,7 @@ fn expand_call(
     let mut body = crate::vector_type::parse_expr(parseable.as_ref()).map_err(|error| {
         DataFusionError::Plan(format!("Invalid SQL function definition: {error}"))
     })?;
+    crate::geospatial::quote_cast_types(&mut body);
     let metadata_read = visit_expressions(&body, |expr| {
         if let SqlExpr::Function(call) = expr {
             if crate::partition_functions::is_max_pt(call, state) {
@@ -900,12 +903,15 @@ fn expand_call(
             function.full_name()
         ))
     })?;
-    crate::vector_type::parse_expr(&format!("CAST(({body}) AS {sql_type})")).map_err(|error| {
-        DataFusionError::Plan(format!(
-            "Invalid return type for REST SQL function '{}': {error}",
-            function.full_name()
-        ))
-    })
+    let mut expr = crate::vector_type::parse_expr(&format!("CAST(({body}) AS {sql_type})"))
+        .map_err(|error| {
+            DataFusionError::Plan(format!(
+                "Invalid return type for REST SQL function '{}': {error}",
+                function.full_name()
+            ))
+        })?;
+    crate::geospatial::quote_cast_types(&mut expr);
+    Ok(expr)
 }
 
 fn bare_function_name(function: &datafusion::sql::sqlparser::ast::Function) -> Option<Ident> {

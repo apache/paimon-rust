@@ -23,6 +23,7 @@ use crate::vindex::{
 pub(crate) const BTREE_GLOBAL_INDEX_TYPE: &str = "btree";
 pub(crate) const BITMAP_GLOBAL_INDEX_TYPE: &str = "bitmap";
 pub(crate) const MULTIVALUE_GLOBAL_INDEX_TYPE: &str = "multivalue";
+pub(crate) const RTREE_GLOBAL_INDEX_TYPE: &str = "rtree";
 pub(crate) const FM_GLOBAL_INDEX_TYPE: &str = "fm";
 /// Java `NativeFullTextGlobalIndexerFactory.IDENTIFIER`.
 pub(crate) const FULL_TEXT_GLOBAL_INDEX_TYPE: &str = "full-text";
@@ -40,18 +41,24 @@ pub(crate) fn normalize_sorted_global_index_type(index_type: &str) -> Option<&'s
 }
 
 pub(crate) fn normalize_queryable_global_index_type(index_type: &str) -> Option<&'static str> {
-    normalize_sorted_global_index_type(index_type).or_else(|| {
-        index_type
-            .eq_ignore_ascii_case(FM_GLOBAL_INDEX_TYPE)
-            .then_some(FM_GLOBAL_INDEX_TYPE)
-    })
+    normalize_sorted_global_index_type(index_type)
+        .or_else(|| {
+            index_type
+                .eq_ignore_ascii_case(RTREE_GLOBAL_INDEX_TYPE)
+                .then_some(RTREE_GLOBAL_INDEX_TYPE)
+        })
+        .or_else(|| {
+            index_type
+                .eq_ignore_ascii_case(FM_GLOBAL_INDEX_TYPE)
+                .then_some(FM_GLOBAL_INDEX_TYPE)
+        })
 }
 
 /// Human-readable list of the global index types the Rust drop path accepts.
 /// Used verbatim in the unsupported-type error of both the builder and the
 /// DataFusion procedure so the two messages stay in sync.
 pub const SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP: &str =
-    "btree, bitmap, multivalue, fm, full-text, ivf-flat, ivf-pq, ivf-sq, ivf-rq, diskann";
+    "btree, bitmap, multivalue, fm, rtree, full-text, ivf-flat, ivf-pq, ivf-sq, ivf-rq, diskann";
 
 /// Canonicalize any supported global index type to a stable `&'static str`, or
 /// `None` if unsupported. Case-insensitive and shared by build and drop.

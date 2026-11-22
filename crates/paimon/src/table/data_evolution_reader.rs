@@ -4986,6 +4986,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_table_read_merges_parquet_and_java_rolling_blob_files() {
+        check_rolling_blob_files(1).await;
+        check_rolling_blob_files(2).await;
+    }
+
+    async fn check_rolling_blob_files(second_sequence: i64) {
         let tempdir = tempdir().unwrap();
         let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
@@ -5045,7 +5050,7 @@ mod tests {
                     "blob-part-2.blob",
                     2,
                     2,
-                    1,
+                    second_sequence,
                     blob_part2_path.metadata().unwrap().len() as i64,
                     Some(vec!["payload"]),
                 ),
@@ -5055,7 +5060,7 @@ mod tests {
 
         let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
         let batches = read
-            .to_arrow(&[split])
+            .to_arrow(std::slice::from_ref(&split))
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -5071,6 +5076,37 @@ mod tests {
                 Some(Vec::new()),
             ]
         );
+
+        let descriptor_table = table.copy_with_options(HashMap::from([(
+            "blob-as-descriptor".to_string(),
+            "true".to_string(),
+        )]));
+        let descriptor_read = TableRead::new(
+            &descriptor_table,
+            descriptor_table.schema().fields().to_vec(),
+            Vec::new(),
+        );
+        let batches = descriptor_read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_int_values(&batches, "id"), vec![1, 2, 3, 4]);
+        let descriptors = collect_binary_values(&batches, "payload");
+        assert!(descriptors[1].is_none());
+        for (index, file) in [
+            (0, "blob-part-1.blob"),
+            (2, "blob-part-2.blob"),
+            (3, "blob-part-2.blob"),
+        ] {
+            assert!(
+                BlobDescriptor::deserialize(descriptors[index].as_deref().unwrap())
+                    .unwrap()
+                    .uri()
+                    .ends_with(file)
+            );
+        }
     }
 
     #[tokio::test]

@@ -157,6 +157,9 @@ pub(crate) struct PickedRow {
     /// `_SEQUENCE_NUMBER` / `_VALUE_KIND` columns.
     columns: Vec<Option<(usize, usize)>>,
     sequence_number: i64,
+    /// One-row results of field aggregators, indexed by output column. Empty when
+    /// no column is aggregated.
+    values: Vec<Option<ArrayRef>>,
 }
 
 /// What [`MergeFunction::merge_picked`] returns.
@@ -206,8 +209,8 @@ pub(crate) trait MergeFunction: Send + Sync {
     ) -> crate::Result<MergeResult>;
 
     /// Emit at most one key's changelog alongside its merged state. The reader
-    /// drains it before advancing to the next key, keeping memory bounded even
-    /// when all data rows are deleted.
+    /// hands changelog on in batches of up to its batch size, keeping memory
+    /// bounded even when all data rows are deleted.
     fn merge_with_changelog(
         &self,
         rows: &[MergeRow],
@@ -1025,6 +1028,7 @@ impl PartialUpdateMergeFunction {
             return Ok(PickedMerge::Picked(PickedRow {
                 columns,
                 sequence_number: latest_row.sequence_number,
+                values: Vec::new(),
             }));
         }
 
@@ -1235,6 +1239,28 @@ impl AggregateMergeFunction {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<(RecordBatch, bool)> {
+        match self.merge_ordered_rows(
+            rows,
+            batch_buffer,
+            source_output_col_indices,
+            output_schema,
+            false,
+        )? {
+            PickedMerge::Result(MergeResult::MaterializedRow(batch)) => Ok((batch, false)),
+            PickedMerge::Result(MergeResult::MaterializedRetractRow(batch, _)) => Ok((batch, true)),
+            _ => unreachable!("aggregation materializes every row unless picks are requested"),
+        }
+    }
+
+    /// With `pick`, a live row is returned as its key row plus the aggregator results.
+    fn merge_ordered_rows(
+        &self,
+        rows: &[&MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+        pick: bool,
+    ) -> crate::Result<PickedMerge> {
         if rows.is_empty() {
             return Err(Error::UnexpectedError {
                 message: "merge called with empty rows".to_string(),
@@ -1285,6 +1311,57 @@ impl AggregateMergeFunction {
 
         // Java getResult uses the last KV for keys and record metadata.
         let pk_source = rows.last().unwrap();
+        let null_error = |field: &arrow_schema::Field, aggregator: Option<&dyn FieldAggregator>| {
+            let message = match aggregator {
+                Some(agg) => format!(
+                    "merge-engine=aggregation: aggregator '{}' produced NULL for \
+                     non-nullable field '{}'",
+                    agg.name(),
+                    field.name()
+                ),
+                None => format!(
+                    "merge-engine=aggregation: primary-key column '{}' contains NULL on a \
+                     source row; declare the column nullable or fix the upstream data",
+                    field.name()
+                ),
+            };
+            Error::DataInvalid {
+                message,
+                source: None,
+            }
+        };
+
+        if pick && !current_delete_row {
+            let mut columns = vec![None; output_schema.fields().len()];
+            let mut values = vec![None; output_schema.fields().len()];
+            for (col_idx, field) in output_schema.fields().iter().enumerate() {
+                if is_merged_metadata_field(field) {
+                    continue;
+                }
+                let is_null = match aggregators[col_idx].as_ref() {
+                    Some(agg) => {
+                        let value = agg.result()?;
+                        let is_null = value.is_null(0);
+                        values[col_idx] = Some(value);
+                        is_null
+                    }
+                    None => {
+                        columns[col_idx] = Some((pk_source.batch_idx, pk_source.row_idx));
+                        batch_buffer[pk_source.batch_idx]
+                            .column_for_output(col_idx, source_output_col_indices)
+                            .is_null(pk_source.row_idx)
+                    }
+                };
+                if is_null && !field.is_nullable() {
+                    return Err(null_error(field, aggregators[col_idx].as_deref()));
+                }
+            }
+            return Ok(PickedMerge::Picked(PickedRow {
+                columns,
+                sequence_number: pk_source.sequence_number,
+                values,
+            }));
+        }
 
         let output_columns: Vec<ArrayRef> = aggregators
             .iter()
@@ -1322,23 +1399,7 @@ impl AggregateMergeFunction {
         // upstream data.
         for (col_idx, field) in output_schema.fields().iter().enumerate() {
             if !field.is_nullable() && output_columns[col_idx].is_null(0) {
-                let message = match aggregators[col_idx].as_ref() {
-                    Some(agg) => format!(
-                        "merge-engine=aggregation: aggregator '{}' produced NULL for \
-                         non-nullable field '{}'",
-                        agg.name(),
-                        field.name()
-                    ),
-                    None => format!(
-                        "merge-engine=aggregation: primary-key column '{}' contains NULL on a \
-                         source row; declare the column nullable or fix the upstream data",
-                        field.name()
-                    ),
-                };
-                return Err(Error::DataInvalid {
-                    message,
-                    source: None,
-                });
+                return Err(null_error(field, aggregators[col_idx].as_deref()));
             }
         }
 
@@ -1349,7 +1410,11 @@ impl AggregateMergeFunction {
             }
         })?;
 
-        Ok((batch, current_delete_row))
+        Ok(PickedMerge::Result(if current_delete_row {
+            MergeResult::MaterializedRetractRow(batch, RowKind::Delete)
+        } else {
+            MergeResult::MaterializedRow(batch)
+        }))
     }
 }
 
@@ -1380,6 +1445,29 @@ impl MergeFunction for AggregateMergeFunction {
         } else {
             MergeResult::MaterializedRow(batch)
         })
+    }
+
+    fn merge_picked(
+        &self,
+        rows: &[MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<Option<PickedMerge>> {
+        // A lone version is already returned as a source row by `merge`.
+        if !self.reduce_singletons && rows.len() == 1 {
+            return Ok(None);
+        }
+        let mut ordered: Vec<_> = rows.iter().collect();
+        ordered.sort_by(|lhs, rhs| compare_sequence_order(lhs, rhs));
+        self.merge_ordered_rows(
+            &ordered,
+            batch_buffer,
+            source_output_col_indices,
+            output_schema,
+            true,
+        )
+        .map(Some)
     }
 }
 
@@ -1797,6 +1885,14 @@ fn sort_merge_stream(
         let mut output_indices: Vec<(usize, usize)> = Vec::with_capacity(batch_size);
         // Output rows at `(PICKED_ROW, i)` are `picked_rows[i]`.
         let mut picked_rows: Vec<PickedRow> = Vec::new();
+        // Changelog rows not yet handed on, and the schema that marks them.
+        let mut pending_changelog: Vec<RecordBatch> = Vec::new();
+        let mut changelog_rows = 0;
+        let changelog_schema = {
+            let mut metadata = output_schema.metadata().clone();
+            metadata.insert(CHANGELOG_BATCH_METADATA_KEY.into(), "true".into());
+            Arc::new(output_schema.as_ref().clone().with_metadata(metadata))
+        };
         // Reused for every key, so grouping allocates nothing per key.
         let mut winner_key: Vec<u8> = Vec::new();
         let mut same_key_rows: Vec<MergeRow> = Vec::new();
@@ -1942,14 +2038,21 @@ fn sort_merge_stream(
             }
 
             if let Some(changelog) = changelog {
-                if changelog.schema().as_ref() != output_schema.as_ref() {
+                if !Arc::ptr_eq(&changelog.schema(), &output_schema)
+                    && changelog.schema().as_ref() != output_schema.as_ref()
+                {
                     Err(Error::UnexpectedError { message: "Changelog merge result schema does not match merge output schema".into(), source: None })?;
                 }
-                let mut metadata = output_schema.metadata().clone();
-                metadata.insert(CHANGELOG_BATCH_METADATA_KEY.into(), "true".into());
-                yield RecordBatch::try_new(
-                    Arc::new(output_schema.as_ref().clone().with_metadata(metadata)), changelog.columns().to_vec(),
-                ).map_err(|error| Error::DataInvalid { message: format!("Invalid changelog batch: {error}"), source: Some(Box::new(error)) })?;
+                changelog_rows += changelog.num_rows();
+                pending_changelog.push(changelog);
+                // Changelog comes one key at a time; hand it on in batches so the
+                // writer does not handle a one-row batch per key. The buffer stays
+                // bounded by the batch size even when every data row is deleted.
+                if changelog_rows >= batch_size {
+                    yield changelog_batch(&changelog_schema, &pending_changelog)?;
+                    pending_changelog.clear();
+                    changelog_rows = 0;
+                }
             }
             if output_indices.is_empty() {
                 compact_batch_buffer(&mut batch_buffer, &mut stream_batch_idx, &cursors);
@@ -1979,6 +2082,10 @@ fn sort_merge_stream(
             }
         }
 
+        if !pending_changelog.is_empty() {
+            yield changelog_batch(&changelog_schema, &pending_changelog)?;
+        }
+
         // Yield remaining rows.
         if !output_indices.is_empty() {
             let batch = build_output(
@@ -1992,6 +2099,14 @@ fn sort_merge_stream(
         }
     }
     .boxed())
+}
+
+/// Concatenates per-key changelog batches into one changelog batch.
+fn changelog_batch(schema: &SchemaRef, batches: &[RecordBatch]) -> crate::Result<RecordBatch> {
+    arrow_select::concat::concat_batches(schema, batches).map_err(|error| Error::DataInvalid {
+        message: format!("Invalid changelog batch: {error}"),
+        source: Some(Box::new(error)),
+    })
 }
 
 /// Batch index marking an output row as a [`PickedRow`].
@@ -2024,6 +2139,23 @@ fn build_output(
                         RowKind::Insert as i8;
                         picked_rows.len()
                     ]))
+                }
+                _ if picked_rows
+                    .iter()
+                    .any(|row| matches!(row.values.get(output_col_idx), Some(Some(_)))) =>
+                {
+                    let nulls = new_null_array(field.data_type(), 1);
+                    let parts: Vec<&dyn arrow_array::Array> = picked_rows
+                        .iter()
+                        .map(|row| match row.values.get(output_col_idx) {
+                            Some(Some(value)) => value.as_ref(),
+                            _ => nulls.as_ref(),
+                        })
+                        .collect();
+                    arrow_select::concat::concat(&parts).map_err(|e| Error::UnexpectedError {
+                        message: format!("Failed to concat merged column {output_col_idx}: {e}"),
+                        source: Some(Box::new(e)),
+                    })?
                 }
                 _ => new_null_array(field.data_type(), picked_rows.len()),
             };
@@ -3288,6 +3420,111 @@ mod tests {
         );
     }
 
+    /// Changelog from consecutive keys is handed on in key order, in batches of up
+    /// to the batch size rather than one batch per key.
+    #[tokio::test]
+    async fn test_changelog_is_emitted_in_batches() {
+        struct EveryKeyChangelog;
+        impl MergeFunction for EveryKeyChangelog {
+            fn merge(
+                &self,
+                rows: &[MergeRow],
+                batch_buffer: &[BufferedBatch],
+                source_output_col_indices: &[usize],
+                output_schema: &SchemaRef,
+            ) -> crate::Result<MergeResult> {
+                DeduplicateMergeFunction.merge(
+                    rows,
+                    batch_buffer,
+                    source_output_col_indices,
+                    output_schema,
+                )
+            }
+
+            fn merge_with_changelog(
+                &self,
+                rows: &[MergeRow],
+                batches: &[BufferedBatch],
+                columns: &[usize],
+                schema: &SchemaRef,
+            ) -> crate::Result<(MergeResult, Option<RecordBatch>)> {
+                let last = rows.last().unwrap();
+                let changelog = build_output_interleave(
+                    schema,
+                    batches,
+                    columns,
+                    &[(last.batch_idx, last.row_idx)],
+                )?;
+                Ok((self.merge(rows, batches, columns, schema)?, Some(changelog)))
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let stream = |pk: Vec<i32>, seq: i64| {
+            let n = pk.len();
+            stream_from_batches(vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(pk.clone())),
+                    Arc::new(Int64Array::from(vec![seq; n])),
+                    Arc::new(Int8Array::from(vec![0; n])),
+                    Arc::new(Int32Array::from_iter_values(pk.iter().map(|k| k * 10))),
+                ],
+            )
+            .unwrap()])
+        };
+        let batches = SortMergeReaderBuilder::new(
+            vec![stream(vec![1, 2, 4], 1), stream(vec![2, 3, 5], 2)],
+            schema.clone(),
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema.clone(),
+            Box::new(EveryKeyChangelog),
+        )
+        .with_batch_size(2)
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let pks = |batch: &RecordBatch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        let (changelog, data): (Vec<_>, Vec<_>) = batches.iter().partition(|batch| {
+            batch
+                .schema()
+                .metadata()
+                .contains_key(CHANGELOG_BATCH_METADATA_KEY)
+        });
+        assert_eq!(
+            changelog.iter().map(|batch| pks(batch)).collect::<Vec<_>>(),
+            vec![vec![1, 2], vec![3, 4], vec![5]]
+        );
+        assert_eq!(
+            data.iter().flat_map(|batch| pks(batch)).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+    }
+
     #[tokio::test]
     async fn test_partial_update_merge_keeps_latest_non_null_values() {
         let schema = Arc::new(Schema::new(vec![
@@ -4511,6 +4748,123 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    /// Picked aggregation rows read the same as materialized ones, across output
+    /// batches and next to lone versions, deleted keys and all-NULL aggregates.
+    #[tokio::test]
+    async fn test_aggregate_picked_rows_match_materialized_rows() {
+        struct Materializing(AggregateMergeFunction);
+        impl MergeFunction for Materializing {
+            fn merge(
+                &self,
+                rows: &[MergeRow],
+                batch_buffer: &[BufferedBatch],
+                source_output_col_indices: &[usize],
+                output_schema: &SchemaRef,
+            ) -> crate::Result<MergeResult> {
+                self.0
+                    .merge(rows, batch_buffer, source_output_col_indices, output_schema)
+            }
+        }
+
+        let schema = aggregation_schema();
+        let output_schema = aggregation_output_schema();
+        let streams = || {
+            let batch = |pk: Vec<i32>,
+                         seq: i64,
+                         kinds: Vec<i8>,
+                         amount: Vec<Option<i32>>,
+                         tag: Vec<Option<&str>>| {
+                let seqs = vec![seq; pk.len()];
+                stream_from_batches(vec![RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(pk)),
+                        Arc::new(Int64Array::from(seqs)),
+                        Arc::new(Int8Array::from(kinds)),
+                        Arc::new(Int32Array::from(amount)),
+                        Arc::new(StringArray::from(tag)),
+                    ],
+                )
+                .unwrap()])
+            };
+            vec![
+                batch(
+                    vec![1, 2, 3, 4],
+                    1,
+                    vec![0, 0, 0, 0],
+                    vec![Some(10), Some(20), None, Some(40)],
+                    vec![Some("a"), Some("x"), None, Some("d")],
+                ),
+                // Key 4 ends with a DELETE, which removes it.
+                batch(
+                    vec![1, 2, 4, 5],
+                    2,
+                    vec![0, 0, RowKind::Delete as i8, 0],
+                    vec![Some(5), None, None, Some(50)],
+                    vec![None, Some("y"), None, Some("e")],
+                ),
+                batch(
+                    vec![1, 3, 6],
+                    3,
+                    vec![0, 0, 0],
+                    vec![Some(1), None, Some(60)],
+                    vec![Some("c"), None, Some("f")],
+                ),
+            ]
+        };
+        let options = agg_options(&[
+            ("fields.amount.aggregate-function", "sum"),
+            ("fields.tag.aggregate-function", "last_non_null_value"),
+            ("aggregation.remove-record-on-delete", "true"),
+        ]);
+        let new_merge = || {
+            AggregateMergeFunction::new(
+                &options,
+                "test_table",
+                &aggregation_output_fields(),
+                &["pk".to_string()],
+                &[],
+            )
+            .unwrap()
+        };
+        let read = |merge: Box<dyn MergeFunction>| {
+            SortMergeReaderBuilder::new(
+                streams(),
+                schema.clone(),
+                vec![0],
+                1,
+                2,
+                vec![],
+                vec![3, 4],
+                output_schema.clone(),
+                merge,
+            )
+            .with_batch_size(2)
+            .build()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+        };
+        let picked = read(Box::new(new_merge())).await.unwrap();
+        let materialized = read(Box::new(Materializing(new_merge()))).await.unwrap();
+        assert_eq!(picked, materialized);
+
+        let picked = arrow_select::concat::concat_batches(&output_schema, &picked).unwrap();
+        assert_eq!(
+            picked.column(0).as_ref(),
+            &Int32Array::from(vec![1, 2, 3, 5, 6]) as &dyn arrow_array::Array
+        );
+        assert_eq!(
+            picked.column(1).as_ref(),
+            &Int32Array::from(vec![Some(16), Some(20), None, Some(50), Some(60)])
+                as &dyn arrow_array::Array
+        );
+        assert_eq!(
+            picked.column(2).as_ref(),
+            &StringArray::from(vec![Some("c"), Some("y"), None, Some("e"), Some("f")])
+                as &dyn arrow_array::Array
+        );
     }
 
     #[tokio::test]

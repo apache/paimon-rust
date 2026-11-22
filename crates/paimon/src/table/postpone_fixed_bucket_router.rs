@@ -16,8 +16,9 @@
 // under the License.
 
 use crate::spec::{CoreOptions, TableSchema, POSTPONE_BUCKET};
+use crate::table::bucket_router::PostponeBucketRouter;
 use crate::table::table_write::take_rows;
-use crate::table::{BucketRouter, PostponeBucketPlan, Table};
+use crate::table::{PostponeBucketPlan, Table};
 use crate::Result;
 use arrow_array::RecordBatch;
 use std::collections::HashMap;
@@ -30,7 +31,7 @@ pub(crate) struct PostponeBucketBatch {
 }
 
 pub(crate) struct PostponeFixedBucketRouter {
-    router: BucketRouter,
+    router: PostponeBucketRouter,
 }
 
 impl PostponeFixedBucketRouter {
@@ -41,7 +42,7 @@ impl PostponeFixedBucketRouter {
     pub(crate) fn new(table: &Table, plan: PostponeBucketPlan) -> Result<Self> {
         validate_postpone_fixed_bucket_table(table)?;
         Ok(Self {
-            router: BucketRouter::new(table.schema())?.with_bucket_plan(plan)?,
+            router: PostponeBucketRouter::new(table.schema())?.with_bucket_plan(plan),
         })
     }
 

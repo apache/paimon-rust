@@ -138,6 +138,9 @@ let options = std::collections::HashMap::from([
 ]);
 ```
 
+Append and Data Evolution tables also support `global-index.rtree.index-columns`
+for planar `GEOMETRY` columns.
+
 Maintenance reuses the global-index builders and their table, column-type,
 and native writer restrictions. Tables must have row tracking enabled, no
 primary key, and `bucket=-1`. Data evolution and the query-side

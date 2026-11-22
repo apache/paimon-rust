@@ -17,7 +17,9 @@
 
 //! Plans global-index vector searches against one snapshot and resolves scalar pre-filters.
 
-use crate::spec::{CoreOptions, IndexManifest, IndexManifestEntry, Predicate};
+use crate::spec::{
+    CoreOptions, GlobalIndexSearchMode, IndexManifest, IndexManifestEntry, Predicate,
+};
 use crate::table::bucket_filter::split_partition_and_data_predicates;
 use crate::table::global_index_search_filter::matching_row_ids_for_filter;
 use crate::table::partition_filter::PartitionFilter;
@@ -25,6 +27,7 @@ use crate::table::vector_scan::Scan;
 use crate::table::Table;
 use crate::vindex::vector_search_timing_enabled;
 use roaring::RoaringTreemap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -129,7 +132,8 @@ impl Table {
         &self,
         filter: Predicate,
     ) -> crate::Result<PreparedVectorSearchFilter> {
-        CoreOptions::new(self.schema().options()).ensure_read_authorized()?;
+        let options = CoreOptions::new(self.schema().options());
+        options.ensure_read_authorized()?;
         let Some(snapshot) = crate::table::time_travel::resolve_snapshot(self).await? else {
             return Ok(PreparedVectorSearchFilter {
                 table: self.copy_with_pinned_snapshot(None),
@@ -137,7 +141,18 @@ impl Table {
             });
         };
         let table = self.copy_with_pinned_snapshot(Some(&snapshot));
-        let include_row_ids = matching_row_ids_for_filter(&table, &filter, None).await?;
+        // The candidate scan uses the prefilter policy, while the captured table
+        // retains its own options for subsequent reads.
+        let mode = match options.scalar_prefilter_search_mode()? {
+            GlobalIndexSearchMode::Fast => "fast",
+            GlobalIndexSearchMode::Full => "full",
+            GlobalIndexSearchMode::Detail => "detail",
+        };
+        let filter_table = table.copy_with_options(HashMap::from([(
+            "scalar-index.search-mode".into(),
+            mode.into(),
+        )]));
+        let include_row_ids = matching_row_ids_for_filter(&filter_table, &filter, None).await?;
         Ok(PreparedVectorSearchFilter {
             table,
             include_row_ids: Arc::new(include_row_ids),

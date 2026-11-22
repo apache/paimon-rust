@@ -27,7 +27,10 @@ fn normalize_metric(value: &str) -> String {
 }
 
 fn vector(kind: &str) -> bool {
-    !matches!(kind, "btree" | "bitmap" | "multivalue" | "fm" | "full-text")
+    !matches!(
+        kind,
+        "btree" | "bitmap" | "multivalue" | "fm" | "rtree" | "full-text"
+    )
 }
 
 fn columns(raw: Option<&String>) -> Vec<String> {

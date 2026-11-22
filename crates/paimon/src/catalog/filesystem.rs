@@ -2268,6 +2268,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_legacy_schema_reset_format_survives_reload_and_write() {
+        use arrow_array::{Int32Array, RecordBatch};
+        use futures::TryStreamExt;
+
+        async fn append(table: &Table, value: i32) {
+            let builder = table.new_write_builder();
+            let mut write = builder.new_write().unwrap();
+            let batch = RecordBatch::try_new(
+                crate::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+                vec![Arc::new(Int32Array::from(vec![value]))],
+            )
+            .unwrap();
+            write.write_arrow_batch(&batch).await.unwrap();
+            let messages = write.prepare_commit().await.unwrap();
+            builder.new_commit().commit(messages).await.unwrap();
+        }
+
+        for version in [1, 2] {
+            let (temp_dir, catalog) = create_test_catalog();
+            let identifier = setup_table(&catalog, testing_schema()).await;
+            let created = catalog.get_table(&identifier).await.unwrap();
+            let schema_path = created.schema_manager().schema_path(0);
+            let mut stored = serde_json::to_value(created.schema()).unwrap();
+            stored["version"] = serde_json::json!(version);
+            stored["options"]["file.format"] = serde_json::json!("parquet");
+            if version == 1 {
+                // The legacy default is a fixed bucket, which needs a routing key.
+                stored["options"]["bucket-key"] = serde_json::json!("id");
+            }
+            let legacy_json = serde_json::to_vec(&stored).unwrap();
+            catalog
+                .file_io()
+                .new_output(&schema_path)
+                .unwrap()
+                .write(Bytes::from(legacy_json.clone()))
+                .await
+                .unwrap();
+
+            let legacy = catalog.get_table(&identifier).await.unwrap();
+            assert_eq!(legacy.schema().version(), version);
+            append(&legacy, 1).await;
+            catalog
+                .alter_table(
+                    &identifier,
+                    vec![SchemaChange::remove_option("file.format".into())],
+                    false,
+                )
+                .await
+                .unwrap();
+
+            // A new catalog must read the persisted definition, not an in-memory copy.
+            let mut options = Options::new();
+            options.set(CatalogOptions::WAREHOUSE, temp_dir.path().to_string_lossy());
+            let fresh = FileSystemCatalog::new(options).unwrap();
+            let reloaded = fresh.get_table(&identifier).await.unwrap();
+            assert_eq!(reloaded.schema().core_options().file_format(), "parquet");
+            append(&reloaded, 2).await;
+
+            let builder = reloaded.new_read_builder();
+            let plan = builder.new_scan().plan().await.unwrap();
+            let batches = builder
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut values: Vec<i32> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            values.sort_unstable();
+            assert_eq!(values, vec![1, 2]);
+            assert_eq!(reloaded.schema().id(), 1);
+            assert_eq!(reloaded.schema().version(), TableSchema::CURRENT_VERSION);
+            assert!(!reloaded.schema().options().contains_key("file.format"));
+            assert_eq!(
+                reloaded.schema().core_options().bucket(),
+                legacy.schema().core_options().bucket()
+            );
+            // Evolution must not rewrite historical schema files or handles.
+            assert_eq!(legacy.schema().version(), version);
+            assert_eq!(
+                fresh
+                    .file_io()
+                    .new_input(&schema_path)
+                    .unwrap()
+                    .read()
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                legacy_json.as_slice()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_alter_table_column_changes() {
         let (_tmp, catalog) = create_test_catalog();
         let id = setup_table(&catalog, two_column_schema()).await;

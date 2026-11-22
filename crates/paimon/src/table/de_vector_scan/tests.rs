@@ -908,6 +908,36 @@ async fn scalar_coverage_gaps_follow_scalar_and_vector_modes() {
             .await
             .unwrap()
             .is_none());
+        if vector_covers_tail {
+            for (legacy, prefilter, expected) in [
+                (None, None, vec![]),
+                (Some("full"), Some("fast"), vec![]),
+                (Some("fast"), Some("full"), vec![3]),
+            ] {
+                let options = [
+                    ("scalar-index.search-mode", legacy),
+                    ("scalar-index.prefilter.search-mode", prefilter),
+                ]
+                .into_iter()
+                .filter_map(|(key, value)| value.map(|value| (key.into(), value.into())))
+                .collect();
+                let table = table.copy_with_options(options);
+                let prepared = table
+                    .prepare_vector_search_filter(exact.clone())
+                    .await
+                    .unwrap();
+                let results = table
+                    .new_batch_vector_search_builder()
+                    .with_vector_column("embedding")
+                    .with_query_vectors(vec![vec![0.0, 0.0]])
+                    .with_limit(10)
+                    .with_prepared_filter(prepared)
+                    .execute()
+                    .await
+                    .unwrap();
+                assert_eq!(results[0].row_ids().unwrap().row_ids, expected);
+            }
+        }
         let filters = [
             exact.clone(),
             Predicate::and(vec![
@@ -926,7 +956,12 @@ async fn scalar_coverage_gaps_follow_scalar_and_vector_modes() {
                                 vector_mode.to_string(),
                             ),
                             (
-                                "scalar-index.search-mode".to_string(),
+                                if builder_options {
+                                    "scalar-index.prefilter.search-mode"
+                                } else {
+                                    "scalar-index.search-mode"
+                                }
+                                .to_string(),
                                 scalar_mode.to_string(),
                             ),
                         ]);

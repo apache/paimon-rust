@@ -890,13 +890,17 @@ fn test_collect_raw_batch_vector_batch_respects_fixed_size_list_offset() {
     assert_eq!(top_k.pop().unwrap().into_search_result().row_ids, vec![11]);
 }
 
-#[test]
-fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
+fn raw_batch_with_null_vector_element() -> RecordBatch {
     let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
     let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element_field);
-    for vector in [[1.0, 0.0], [0.0, 1.0], [0.8, 0.2]] {
-        builder.values().append_value(vector[0]);
-        builder.values().append_value(vector[1]);
+    for vector in [
+        [None, Some(0.0)],
+        [Some(0.0), Some(1.0)],
+        [Some(0.8), Some(0.2)],
+    ] {
+        for coordinate in vector {
+            builder.values().append_option(coordinate);
+        }
         builder.append(true);
     }
     let schema = Arc::new(ArrowSchema::new(vec![
@@ -910,42 +914,88 @@ fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
         ),
         ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, true),
     ]));
-    let batch = RecordBatch::try_new(
+    RecordBatch::try_new(
         schema,
         vec![
             Arc::new(builder.finish()) as ArrayRef,
             Arc::new(Int64Array::from(vec![Some(10), Some(11), Some(12)])) as ArrayRef,
         ],
     )
-    .unwrap();
-    let mut include_row_ids = RoaringTreemap::new();
-    include_row_ids.insert(12);
-    let searches = vec![
-        VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string())
-            .unwrap()
-            .with_include_row_ids(include_row_ids),
-    ];
-    let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
-    let mut top_k = searches
-        .iter()
-        .map(|search| RawScoreTopK::new(search.limit))
-        .collect::<Vec<_>>();
+    .unwrap()
+}
 
-    collect_raw_batch_vector_batch(
-        &batch,
-        &searches,
-        RawVectorMetric::L2,
-        &scoring_plan,
-        &mut top_k,
-    )
-    .unwrap();
-    let results = top_k
-        .into_iter()
-        .map(RawScoreTopK::into_search_result)
-        .collect::<Vec<_>>();
+#[test]
+fn test_collect_raw_batch_vector_batch_scores_only_include_row_ids() {
+    let batch = raw_batch_with_null_vector_element();
+    let shared_include: Arc<RoaringTreemap> = Arc::new(std::iter::once(12).collect());
+    for (included, shared) in [([12, 12], true), ([12, 11], false)] {
+        let searches = included
+            .iter()
+            .map(|&row_id| {
+                let mut search =
+                    VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+                if shared {
+                    search.set_shared_include_row_ids(Arc::clone(&shared_include));
+                    search
+                } else {
+                    search.with_include_row_ids(std::iter::once(row_id).collect())
+                }
+            })
+            .collect::<Vec<_>>();
+        let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
+        assert_eq!(scoring_plan.shared_filter_groups.len(), usize::from(shared));
+        let mut top_k = searches
+            .iter()
+            .map(|search| RawScoreTopK::new(search.limit))
+            .collect::<Vec<_>>();
 
-    assert_eq!(results[0].row_ids, vec![12]);
-    assert_eq!(results[0].scores.len(), 1);
+        collect_raw_batch_vector_batch(
+            &batch,
+            &searches,
+            RawVectorMetric::L2,
+            &scoring_plan,
+            &mut top_k,
+        )
+        .unwrap();
+
+        for (result, row_id) in top_k
+            .into_iter()
+            .map(RawScoreTopK::into_search_result)
+            .zip(included)
+        {
+            assert_eq!(result.row_ids, vec![row_id]);
+            assert_eq!(result.scores.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn test_collect_raw_batch_vector_batch_rejects_selected_null_vector_element() {
+    let batch = raw_batch_with_null_vector_element();
+    let query = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+    let valid_row = query
+        .clone()
+        .with_include_row_ids(std::iter::once(12).collect());
+    let null_row = query
+        .clone()
+        .with_include_row_ids(std::iter::once(10).collect());
+    for other_query in [null_row, query] {
+        let searches = [valid_row.clone(), other_query];
+        let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::L2);
+        let mut top_k = [RawScoreTopK::new(2), RawScoreTopK::new(2)];
+        let error = collect_raw_batch_vector_batch(
+            &batch,
+            &searches,
+            RawVectorMetric::L2,
+            &scoring_plan,
+            &mut top_k,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, crate::Error::DataInvalid { message, .. } if message.contains("null vector element")),
+            "{error}"
+        );
+    }
 }
 
 #[tokio::test]

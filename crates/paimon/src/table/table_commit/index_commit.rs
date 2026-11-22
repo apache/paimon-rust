@@ -230,6 +230,15 @@ impl TableCommit {
             }
         }
 
+        if domain == IndexDomain::GlobalRowIds
+            && new_index_entries.iter().any(|entry| {
+                entry.kind == FileKind::Delete
+                    && crate::table::centroid_index::Descriptor::is_wrapped(&entry.index_file)
+            })
+        {
+            crate::table::centroid_index::group(all.iter())?;
+        }
+
         let additions = new_index_entries
             .iter()
             .filter(|entry| entry.kind == FileKind::Add)
@@ -333,6 +342,15 @@ impl TableCommit {
     pub(super) fn validate_added_global_index_overlap(
         added_entries: &[IndexManifestEntry],
     ) -> Result<()> {
+        let mut added_entries = crate::table::rtree_manifest::logical_additions(added_entries)?;
+        let routers = crate::table::centroid_index::group(added_entries.iter().copied())?
+            .into_iter()
+            .map(|generation| generation.router)
+            .collect::<Vec<_>>();
+        added_entries.retain(|entry| {
+            !crate::table::centroid_index::Descriptor::is_wrapped(&entry.index_file)
+        });
+        added_entries.extend(routers);
         for (left_index, left) in added_entries.iter().enumerate() {
             if left.kind == FileKind::Delete {
                 continue;

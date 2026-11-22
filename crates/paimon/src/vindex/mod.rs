@@ -107,7 +107,7 @@ pub(crate) fn native_index_type(index_type: &str) -> Option<&'static str> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct VindexVectorIndexOptions {
     dimension: usize,
     pub native_options: HashMap<String, String>,

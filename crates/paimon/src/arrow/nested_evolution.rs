@@ -486,12 +486,7 @@ fn evolve_struct(
     let mut fields: Vec<Arc<ArrowField>> = Vec::with_capacity(target_row.fields().len());
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(target_row.fields().len());
     for target_field in target_row.fields() {
-        let target_arrow = paimon_type_to_arrow_for_read(target_field.data_type())?;
-        fields.push(Arc::new(ArrowField::new(
-            target_field.name(),
-            target_arrow.clone(),
-            true,
-        )));
+        let field = super::paimon_arrow_field(target_field.name(), target_field.data_type(), true)?;
 
         // Pair by id (Java: `createIndexMapping` over the ROW's fields).
         let source_field = source_row
@@ -502,7 +497,7 @@ fn evolve_struct(
         match source_field {
             // Not in the data file's schema: the column was added to the ROW
             // after this file was written.
-            None => arrays.push(new_null_array(&target_arrow, source_struct.len())),
+            None => arrays.push(new_null_array(field.data_type(), source_struct.len())),
             Some(source_field) => {
                 // In the file's schema, so the decoder must have produced it —
                 // under the source field's own name, which is what the file
@@ -528,6 +523,7 @@ fn evolve_struct(
                 )?)
             }
         }
+        fields.push(Arc::new(field));
     }
 
     let evolved = StructArray::try_new(fields.into(), arrays, source_struct.nulls().cloned())
@@ -549,11 +545,7 @@ fn evolve_list(
     let list = visible_list(source)?;
 
     let values = evolve_column(list.values(), source_element, target_element)?;
-    let element_field = Arc::new(ArrowField::new(
-        "element",
-        paimon_type_to_arrow_for_read(target_element)?,
-        true,
-    ));
+    let element_field = Arc::new(super::paimon_arrow_field("element", target_element, true)?);
     let evolved = ListArray::try_new(
         element_field,
         list.offsets().clone(),
@@ -745,16 +737,8 @@ fn evolve_map(
         &map,
         keys,
         values,
-        ArrowField::new(
-            "key",
-            paimon_type_to_arrow_for_read(target_map.key_type())?,
-            false,
-        ),
-        ArrowField::new(
-            "value",
-            paimon_type_to_arrow_for_read(target_map.value_type())?,
-            true,
-        ),
+        super::paimon_arrow_field("key", target_map.key_type(), true)?.with_nullable(false),
+        super::paimon_arrow_field("value", target_map.value_type(), true)?,
     )
 }
 
@@ -779,7 +763,7 @@ fn evolve_multiset(
         &map,
         elements,
         counts,
-        ArrowField::new("key", paimon_type_to_arrow_for_read(target_element)?, false),
+        super::paimon_arrow_field("key", target_element, true)?.with_nullable(false),
         ArrowField::new("value", ArrowDataType::Int32, false),
     )
 }

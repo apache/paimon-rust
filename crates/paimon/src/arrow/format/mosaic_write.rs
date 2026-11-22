@@ -276,6 +276,8 @@ fn validate_paimon_type(data_type: &DataType) -> Result<()> {
             validate_paimon_type(map.value_type())
         }
         DataType::Variant(_)
+        | DataType::Geometry(_)
+        | DataType::Geography(_)
         | DataType::Blob(_)
         | DataType::Vector(_)
         | DataType::Multiset(_)

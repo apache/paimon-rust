@@ -111,7 +111,7 @@ impl Drop for QueryIoProbeGuard<'_> {
 ///
 /// The scanner filters index manifest entries for global index files,
 /// uses type-specific metadata for file-level pruning, then reads matching
-/// BTree, bitmap, multivalue, or FM files to evaluate predicates and collect row IDs.
+/// BTree, bitmap, multivalue, FM, or R-tree files to evaluate predicates and collect row IDs.
 /// Opened BTreeIndexReaders are cached for reuse across evaluations.
 pub(crate) struct GlobalIndexScanner {
     file_io: FileIO,
@@ -125,6 +125,7 @@ pub(crate) struct GlobalIndexScanner {
     bitmap_fallback_scan_max_size: i64,
     fm_read_options: FMReadOptions,
     fm_read_context: Arc<FMReadContext>,
+    rtree: Arc<crate::rtree::RTreeReadContext>,
     field_read_options: HashMap<String, Arc<FieldReadOptions>>,
     /// Global index entries grouped by field_id.
     entries_by_field: Vec<(i32, Vec<GlobalIndexEntry>)>,
@@ -145,6 +146,7 @@ pub(crate) struct GlobalIndexScanner {
 }
 
 struct FieldReadOptions {
+    rtree: Option<Arc<crate::rtree::RTreeReadContext>>,
     btree_fallback: i64,
     bitmap_fallback: i64,
     btree_cache: Arc<BTreeDataBlockCache>,
@@ -247,10 +249,14 @@ impl GlobalIndexScanner {
                 BTREE_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::BTree,
                 BITMAP_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Bitmap,
                 MULTIVALUE_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Multivalue,
+                "rtree" => GlobalIndexFileKind::RTree,
                 FM_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::FM,
                 _ => unreachable!("normalized queryable global index type"),
             };
-            let parsed_meta = if kind == GlobalIndexFileKind::FM {
+            let parsed_meta = if kind == GlobalIndexFileKind::RTree {
+                let (meta, header) = super::rtree_manifest::file_metadata(&entry.index_file)?;
+                GlobalIndexEntryMeta::RTree(meta, header)
+            } else if kind == GlobalIndexFileKind::FM {
                 let (first_row_id, row_count) =
                     manifest_row_range(index_meta).map_err(|error| Error::DataInvalid {
                         message: format!(
@@ -304,23 +310,6 @@ impl GlobalIndexScanner {
                 meta: parsed_meta,
             };
 
-            #[cfg(test)]
-            let row_range = RowRange::new(global_meta.row_range_start, global_meta.row_range_end);
-            #[cfg(test)]
-            coverage_by_field
-                .entry(global_meta.index_field_id)
-                .or_default()
-                .push(row_range.clone());
-            #[cfg(test)]
-            if let Some(extra_field_ids) = global_meta.extra_field_ids.as_ref() {
-                for extra_field_id in extra_field_ids {
-                    coverage_by_field
-                        .entry(*extra_field_id)
-                        .or_default()
-                        .push(row_range.clone());
-                }
-            }
-
             if kind == GlobalIndexFileKind::BTree
                 && global_meta
                     .extra_field_ids
@@ -331,6 +320,14 @@ impl GlobalIndexScanner {
                 ids.extend(global_meta.extra_field_ids.as_ref().unwrap());
                 composite_entries.entry(ids).or_default().push(resolved);
             } else {
+                #[cfg(test)]
+                coverage_by_field
+                    .entry(global_meta.index_field_id)
+                    .or_default()
+                    .push(RowRange::new(
+                        global_meta.row_range_start,
+                        global_meta.row_range_end,
+                    ));
                 entries_by_field
                     .entry(global_meta.index_field_id)
                     .or_default()
@@ -355,6 +352,7 @@ impl GlobalIndexScanner {
             bitmap_fallback_scan_max_size,
             fm_read_options,
             fm_read_context: Arc::new(FMReadContext::new(fm_read_options.cache_size)),
+            rtree: Arc::new(crate::rtree::RTreeReadContext::default()),
             field_read_options: HashMap::new(),
             entries_by_field: entries_by_field.into_iter().collect(),
             composite_entries: composite_entries.into_iter().collect(),
@@ -471,6 +469,11 @@ impl GlobalIndexScanner {
                         self.fm_read_options
                     };
                     let settings = Arc::new(FieldReadOptions {
+                        rtree: (kind == "rtree")
+                            .then(|| {
+                                crate::rtree::RTreeReadContext::from_options(&map).map(Arc::new)
+                            })
+                            .transpose()?,
                         btree_fallback: if kind == "btree" {
                             core.btree_index_fallback_scan_max_size()?
                         } else {

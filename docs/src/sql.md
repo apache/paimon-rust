@@ -437,6 +437,8 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `BINARY(n)` | BinaryType | Fixed-length; defaults to `BINARY(1)` when `n` is omitted |
 | `VARIANT` | VariantType | Semi-structured value encoded as value + metadata binary buffers |
 | `BLOB` | BlobType | Binary large object |
+| `GEOMETRY`, `GEOMETRY('crs')` | GeometryType | Planar WKB with a default CRS of `OGC:CRS84` |
+| `GEOGRAPHY`, `GEOGRAPHY('crs'[, algorithm])` | GeographyType | WKB with a default CRS of `OGC:CRS84`. Edge algorithms are `spherical` (default), `vincenty`, `thomas`, `andoyer`, and `karney`. |
 | `DATE` | DateType | |
 | `TIMESTAMP[(p)]` | TimestampType | Precision p: 0/3/6/9, default 3 |
 | `TIMESTAMP WITH TIME ZONE` | LocalZonedTimestampType | |
@@ -445,6 +447,16 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `VECTOR<element, n>` | VectorType | Fixed-size vector; `n` is between 1 and 2147483647 |
 | `MAP(key, value)` | MapType | e.g. `MAP(STRING, INT)` |
 | `STRUCT<field TYPE, ...>` | RowType | e.g. `STRUCT<city STRING, zip INT>` |
+
+Supply WKB bytes in the column's declared CRS on insert. Direct projections
+return Arrow binary fields with the `geoarrow.wkb` extension, CRS, and geography
+edge algorithm. Assignments copy the WKB bytes. The target column supplies the
+CRS and edge algorithm, so reproject the coordinates before inserting if needed.
+Equality compares WKB bytes, even across different CRSs. Spatial functions
+such as `ST_Intersects` require a separate spatial function provider.
+Use Parquet when exchanging geospatial data with Java Paimon. The Rust Row
+format also accepts WKB, but the Java Row reader and writer do not handle these types.
+For an array of WKB literals, use `INSERT INTO shapes VALUES ([decode('0101000000000000000000F03F0000000000000040', 'hex')])`.
 
 `VECTOR<element, n>` follows Paimon's logical vector type. Elements must be
 `BOOLEAN`, `TINYINT`, `SMALLINT`, `INT` / `INTEGER`, `BIGINT`, `FLOAT` / `REAL`,
@@ -1491,6 +1503,73 @@ anything is deleted.
 
 Use `CALL` to invoke built-in procedures. All procedures are under the `sys` namespace.
 
+### Compatibility procedures
+
+These procedures accept named arguments and positional
+arguments in the order shown. Other procedures continue to use named arguments.
+When qualifying one of these procedures, use `sys` or `catalog.sys`.
+Unquoted procedure names follow the session's identifier normalization setting.
+An explicit catalog qualifier checks the exact registered name first, then
+applies that setting if the name is unquoted and no exact match exists.
+
+| Procedure | Arguments in positional order | Result |
+|---|---|---|
+| `rollback` | `table, version, snapshot, tag` | `previous_snapshot_id` and `current_snapshot_id` as BIGINT |
+| `drop_partition` | `table, partitions...` | `OK` after committing the partition drop |
+| `create_function` | `function, inputParams, returnParams, deterministic, comment, options` | Boolean `result` |
+| `drop_function` | `function` | Boolean `result` |
+| `vector_search` | `table, vector_column, query_vector, top_k, projection` | Rows from the existing vector search table function |
+| `full_text_search` | `table, column, query, top_k, projection` | Rows from the existing full-text search table function |
+
+`rollback` takes exactly one of `version`, `snapshot`, or `tag`. A version
+containing only digits means a snapshot ID. Use `tag` for a numeric tag name.
+For a REST catalog, `rollback` first tries the resolved snapshot ID. A catalog
+that only supports restoring an expired snapshot by tag receives a tag rollback
+after the client checks the tag still points to that snapshot. The client verifies
+the resulting head before reporting success. A failed verification can follow an
+applied rollback, so inspect the table state before retrying.
+For a filesystem catalog, stop concurrent writes before calling `rollback`.
+For `drop_partition`, specify every partition key in each `key=value` list.
+Each positional argument represents one partition and can contain a semicolon
+in a partition value. Use semicolons to separate specifications in the named
+`partitions` argument. Whitespace after `=` is significant for string and binary
+values. Use `ALTER TABLE ... DROP PARTITION` for values containing commas.
+The procedure operates on Paimon FileStore tables.
+
+```sql
+CALL sys.rollback('my_db.events', 'release_1');
+CALL sys.drop_partition('my_db.events', 'dt=2026-10-01', 'dt=2026-10-02');
+```
+
+`create_function` registers Catalog metadata on catalogs that support
+persistent functions. Both parameter lists are JSON arrays of Paimon data
+fields. Omit IDs from an entire list to assign distinct IDs starting at zero,
+including nested fields. Function names inside string arguments preserve case.
+Quote a name component to include a dot. The optional
+`deterministic` argument defaults to true and `options` takes comma-separated
+`key=value` pairs. Use [CREATE FUNCTION](#rest-catalog-views-and-sql-functions)
+to register an executable SQL definition.
+
+```sql
+CALL sys.create_function(
+    'my_db.f',
+    '[{"name":"x","type":"BIGINT"}]',
+    '[{"name":"result","type":"BIGINT"}]'
+);
+CALL sys.drop_function('my_db.f');
+```
+
+The search procedures accept `top_k` between 1 and 10000 and an optional
+comma-separated `projection`. `vector_search` accepts a JSON array or a
+comma-separated vector. Both return typed table rows and honor session time-travel
+options such as `paimon.scan.version`. Per-call search options,
+filters and Flink's JSON score output are unsupported by these adapters.
+
+```sql
+CALL sys.vector_search('my_db.items', 'embedding', '1.0, 0.0', 10, 'id');
+CALL sys.full_text_search('my_db.docs', 'content', 'paimon', 10, 'id, title');
+```
+
 ### reset_consumer
 
 Create or overwrite a consumer's next snapshot to consume:
@@ -1891,6 +1970,14 @@ CALL sys.create_global_index(
 );
 
 CALL sys.create_global_index(
+  table => 'paimon.my_db.places',
+  index_column => 'shape',
+  index_type => 'rtree'
+);
+
+SELECT id FROM paimon.my_db.places WHERE bbox_intersects(shape, 10, 20, 30, 40);
+
+CALL sys.create_global_index(
   table => 'paimon.my_db.my_table',
   index_column => 'message',
   index_type => 'fm',
@@ -2013,6 +2100,17 @@ Build options are
 `fm-index.locate-cost-ratio`. When locating a dense result would cost more than
 the configured ratio, the FM index safely declines evaluation and the normal
 source scan applies the predicate.
+
+An R-tree indexes one planar `GEOMETRY` column. The arguments to
+`bbox_intersects(shape, min_x, min_y, max_x, max_y)` define a closed rectangle in
+the column's coordinate system. Touching envelopes match. Empty geometries have
+no envelope but still match `IS NOT NULL`. SQL returns null for a null argument.
+The reader and writer use the [Apache Paimon R-tree V1 file format](https://github.com/apache/paimon/blob/79b8ec4788e2cd8ed87b1745d5ca54aa8db0e293/docs/docs/multimodal-table/global-index/rtree.mdx#file-format-version-1). Exact shape intersection
+requires a separate geometry predicate.
+
+A bbox lookup in `fast` mode returns matches from indexed ranges. In `full` and
+`detail`, the scan also checks original geometries in uncovered ranges. A covered
+range with zero matches needs no additional scan.
 
 Full-text global indexes support character-string columns and serve the
 [`full_text_search`](#full-text-search) function. The build splits the table's
@@ -2189,7 +2287,7 @@ CALL sys.drop_global_index(
 ```
 
 `index_type` accepts every type the create procedures build: `btree`, `bitmap`,
-`multivalue`, `fm`, `full-text`, and the vindex types
+`multivalue`, `fm`, `rtree`, `full-text`, and the vindex types
 `ivf-flat`, `ivf-pq`, `ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is
 case-insensitive and surrounding whitespace is ignored.
 
@@ -2372,7 +2470,7 @@ CALL sys.list_policies(database => 'sales', table => 'orders');
 
 ### Constant procedure arguments
 
-CALL arguments still use named `name => expression` syntax. In addition to
+All CALL procedures accept named `name => expression` syntax. In addition to
 literals, SQLContext accepts immutable scalar constant expressions such as
 casts, arithmetic, string functions, CASE and boolean predicates.
 
@@ -2863,6 +2961,34 @@ The function performs ANN search across all matching vector index files for the
 target column, merges results, and returns the top-k rows ordered by relevance
 score. If no matching index is found, an empty result is returned.
 
+### Centroid Sharding
+
+For a row-tracked Data Evolution append table, set `<index-type>.sharding=centroid`
+when calling `sys.create_global_index`. For example:
+
+```sql
+CALL sys.create_global_index(
+    table => 'my_db.items',
+    index_column => 'embedding',
+    index_type => 'ivf-flat',
+    options => 'ivf-flat.sharding=centroid,ivf-flat.dimension=4,ivf-flat.centroid.nlist=64'
+);
+```
+
+Each maximal contiguous row-ID range in a partition has a routing model and one
+local index per populated centroid. The build replaces the previous indexes of the
+same type on the column in the selected partitions. Refresh routed indexes
+explicitly with the build procedure. A Rust build plan also exposes
+`replacement_messages()` to publish with the completed shards in the same
+snapshot-guarded commit.
+
+Set `centroid.nprobe` to choose the outer probe width. `ivf.nprobe` controls a
+selected shard's local IVF search, and `diskann.l_search` controls its DiskANN
+search. Automatic cosine and L2 routing can widen the search when necessary.
+Automatic inner-product routing searches all centroids. The layout is stored
+in the index manifest and is available when searching Java-built indexes.
+The current native DiskANN reader supports up to 1,024 dimensions.
+
 ### Scalar Pre-Filters
 
 Add a `WHERE` clause to restrict the rows returned by vector Top-K:
@@ -2890,6 +3016,8 @@ capped by shard size and the backend limit (`2147483647`). The required limit
 includes reranking/deletion slack; neither that slack nor batch size multiplies
 the factor. For example, Top-K 10 requests 100 candidates with the default
 factor unless a larger required allowance applies.
+With centroid sharding, the budget applies to the merged candidates for each
+routed row-ID range.
 
 Every returned row satisfies the predicate, but filtering may leave fewer than
 Top-K rows, including no rows even when matches exist outside the candidates.
@@ -3968,12 +4096,12 @@ optimization may be disabled. Full-text builds reject deletion-vector tables.
 | `row-tracking.enabled` | `false` | Enables stable row ids required by global index files. |
 | `data-evolution.enabled` | `false` | Enables row-id-aware table evolution and partial-column writes. |
 | `global-index.enabled` | `true` | Enables global index metadata and global-index-aware reads. |
-| `global-index.<family>.index-columns` | unset | Comma-separated columns maintained automatically with `write-only=false`. Families: `btree`, `bitmap`, `multivalue`, `fm`, `full-text`, `vector`. Each column owns one index. |
+| `global-index.<family>.index-columns` | unset | Comma-separated columns maintained automatically with `write-only=false`. Families: `btree`, `bitmap`, `multivalue`, `fm`, `rtree`, `full-text`, `vector`. Each column owns one index. |
 | `fields.<column>.global-index.<family>.index-options` | unset | Per-column JSON object of native writer options, following primary-key index option resolution. |
 | `fields.<column>.global-index.vector.index-type` | required for declared vector columns | Vector algorithm, such as `diskann` or `ivf-flat`. Changes replace incompatible payloads atomically during maintenance. |
 | `fields.<column>.global-index.vector.distance-metric` | `inner_product` | Vector distance metric for builds and FULL/DETAIL raw fallback: `inner_product`, `cosine`, or `l2`. Changes replace incompatible payloads atomically during maintenance. |
 | `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
-| `sorted-index.records-per-range` | `100000` | Maximum row count per BTree, bitmap, multivalue, or FM global-index file range; falls back to legacy `btree-index.records-per-range`. |
+| `sorted-index.records-per-range` | `100000` | Maximum row count per BTree, bitmap, multivalue, FM, or R-tree global-index shard; falls back to legacy `btree-index.records-per-range`. |
 | `btree-index.block-size` | `64kb` | Target BTree data-block size. |
 | `btree-index.file-version` | `1` | BTree file version to write: `1` or `2`. V2 uses adaptive postings and requires V2-capable readers. |
 | `btree-index.bloom-filter.enabled` | `false` | Writes a Bloom filter used to avoid BTree data-block reads for missing equality and `IN` keys. |
@@ -3985,6 +4113,11 @@ optimization may be disabled. Full-text builds reject deletion-vector tables.
 | `multivalue-index.dictionary-block-size` | `16kb` | Target multivalue dictionary-block size. |
 | `multivalue-index.compression` | `none` | Multivalue dictionary/index block compression: `none`, `zstd`, `lz4`, or `lzo`. |
 | `multivalue-index.compression-level` | `1` | Multivalue compression level (used by codecs that support levels). |
+| `rtree-index.page-size` | `256` | Entries per packed page (2 to 4096). |
+| `rtree-index.partition-row-count` | `65536` | Source rows per physical R-tree file (1 to 1048576). |
+| `rtree-index.read-cache-size` | `8 MiB` | Shared page-cache budget. Zero disables caching. |
+| `rtree-index.read-batch-size` | `1 MiB` | Maximum bytes per coalesced read (4 KiB to 16 MiB, with at least one page per read). |
+| `rtree-index.read-file-concurrency` | `4` | Maximum concurrent file traversals sharing an index read context. |
 | `fm-index.partition-size` | `16mb` | Maximum encoded symbol count targeted by each FM partition. A single encoded value must be smaller than this limit. |
 | `fm-index.partition-row-count` | `100000` | Maximum row count per FM partition. |
 | `fm-index.sa-sample-rate` | `32` | Power-of-two suffix-array sampling rate used by FM locate operations. |
@@ -3995,7 +4128,11 @@ optimization may be disabled. Full-text builds reject deletion-vector tables.
 | `fm-index.locate-cost-ratio` | `0.001` | Maximum estimated locate work as a fraction of indexed text; denser matches fall back to the source scan. |
 | `btree-index.fallback-scan-max-size` | `256mb` | Maximum total size of BTree global-index files requiring fallback scans for range/between and suffix/contains/complex LIKE predicates; files proven to match completely by metadata need no scan and are excluded. `0` disables BTree fallback index scans. |
 | `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected bitmap global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
-| `global-index.search-mode` | `fast` | Global index coverage mode for reads: `fast`, `full`, or `detail`. |
+| `global-index.search-mode` | unset | Legacy fallback for the scalar, vector, and full-text search modes. |
+| `scalar-index.search-mode` | `full` | Coverage mode for ordinary Data Evolution scalar batch scans. An explicit setting also serves as a fallback for scalar prefilters. |
+| `scalar-index.prefilter.search-mode` | `fast` | Coverage mode for scalar prefilters in vector and full-text search. Falls back to explicit `scalar-index.search-mode` and `global-index.search-mode` in that order. |
+| `vector-index.search-mode` | `fast` | Coverage mode for vector search. |
+| `full-text-index.search-mode` | `fast` | Coverage mode for full-text search. |
 | `vector-index.post-filter.candidates-factor` | `10` | Multiplier of each query's original Top-K for one ANN query followed by exact scalar post-filtering. At least the required reranking/deletion allowance, capped by shard size and the backend limit. Positive integer no greater than `2147483647`. Short results are returned without retry. |
 | `global-index.thread-num` | `32` | Number of concurrent global-index search tasks; must be greater than 0 and must not exceed the runtime's task limit. This does not limit Vindex file range reads. |
 | `global-index.vindex.read-thread-num` | `64` | Maximum number of concurrent Vindex file range reads shared by one search operation; must be greater than 0 and must not exceed the runtime semaphore limit. |

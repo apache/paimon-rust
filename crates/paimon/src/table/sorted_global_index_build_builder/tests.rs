@@ -1290,6 +1290,193 @@ async fn benchmark_btree_data_evolution_read() {
 }
 
 #[tokio::test]
+async fn rtree_build_scan_and_drop_use_native_geometry() {
+    use crate::spec::GeometryType;
+    use arrow_array::BinaryArray;
+
+    let location = "memory:/rtree-scan";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "geom",
+            DataType::Geometry(GeometryType::new("EPSG:3857").unwrap()),
+        )
+        .options(table_options("4"))
+        .option("rtree-index.partition-row-count", "2")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "spatial"),
+        location.into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    setup_dirs(&table).await;
+
+    let append = |table: &Table, first: i32, xs: Vec<Option<f64>>| {
+        let table = table.clone();
+        async move {
+            let wkb: Vec<_> = xs
+                .into_iter()
+                .map(|x| {
+                    x.map(|x| {
+                        let mut wkb = vec![1, 1, 0, 0, 0];
+                        wkb.extend(x.to_le_bytes());
+                        wkb.extend(x.to_le_bytes());
+                        wkb
+                    })
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                crate::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(
+                        first..first + wkb.len() as i32,
+                    )),
+                    Arc::new(BinaryArray::from_iter(wkb.iter().map(|v| v.as_deref()))),
+                ],
+            )
+            .unwrap();
+            let mut write = TableWrite::new(&table, "spatial".into()).unwrap();
+            write.write_arrow_batch(&batch).await.unwrap();
+            TableCommit::new(table, "spatial".into())
+                .commit(write.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+        }
+    };
+    append(
+        &table,
+        0,
+        vec![
+            Some(0.),
+            Some(8.),
+            None,
+            Some(f64::NAN),
+            Some(1.),
+            Some(5.),
+            Some(2.),
+        ],
+    )
+    .await;
+    let predicates = PredicateBuilder::new(table.schema().fields());
+    let bounds = predicates.bbox_intersects("geom", 0., 0., 2., 2.).unwrap();
+    assert_eq!(
+        Predicate::from_rest_json(
+            &bounds.to_rest_json().unwrap().to_string(),
+            table.schema().fields()
+        )
+        .unwrap(),
+        bounds
+    );
+    assert!(predicates.bbox_intersects("id", 0., 0., 2., 2.).is_err());
+    assert!(predicates.bbox_intersects("geom", 2., 2., 1., 1.).is_err());
+    let mut build = table.new_global_index_build_builder();
+    build.with_index_type("rtree").with_index_column("geom");
+    build.execute().await.unwrap();
+    assert_eq!(build.execute().await.unwrap(), 0);
+    let snap = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let entries = IndexManifest::read(
+        table.file_io(),
+        &format!("{location}/manifest/{}", snap.index_manifest().unwrap()),
+    )
+    .await
+    .unwrap();
+    let mut files: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            let f = &e.index_file;
+            let m = f.global_index_meta.as_ref().unwrap();
+            assert_eq!(m.index_meta.as_ref().unwrap().len(), 80);
+            assert_eq!(f.index_type, "rtree");
+            (m.row_range_start, m.row_range_end, f.row_count)
+        })
+        .collect();
+    files.sort();
+    assert_eq!(files, vec![(0, 3, 2), (0, 3, 2), (4, 6, 1), (4, 6, 2)]);
+    use crate::table::rtree_manifest::{file_metadata, logical_additions};
+    assert_eq!(logical_additions(&entries).unwrap().len(), 2);
+    assert!(logical_additions(&[entries[0].clone(), entries[0].clone()])
+        .unwrap_err()
+        .to_string()
+        .contains("Overlapping physical R-tree files"));
+    let mut file = entries[0].index_file.clone();
+    let rows = file.row_count;
+    file.row_count = -1;
+    assert_eq!(file_metadata(&file).unwrap().0.row_count as i64, rows);
+    file.row_count = rows + 1;
+    assert!(file_metadata(&file).is_err());
+
+    assert_eq!(
+        scan_ids(&table, predicates.is_null("geom").unwrap()).await,
+        vec![2]
+    );
+    assert_eq!(
+        scan_ids(&table, predicates.is_not_null("geom").unwrap()).await,
+        vec![0, 1, 3, 4, 5, 6]
+    );
+    append(&table, 7, vec![Some(1.), Some(100.)]).await;
+    for (mode, expected) in [
+        ("fast", vec![0, 4, 6]),
+        ("full", vec![0, 4, 6, 7]),
+        ("detail", vec![0, 4, 6, 7]),
+    ] {
+        let view = table.copy_with_options(HashMap::from([(
+            "scalar-index.search-mode".into(),
+            mode.into(),
+        )]));
+        assert_eq!(scan_ids(&view, bounds.clone()).await, expected, "{mode}");
+    }
+    table
+        .new_global_index_drop_builder()
+        .with_index_type("rtree")
+        .with_index_column("geom")
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(scan_ids(&table, bounds.clone()).await, vec![0, 4, 6, 7]);
+
+    // Automatic maintenance must keep sibling files in the same shard together.
+    let mut options = table.schema().options().clone();
+    options.insert("global-index.rtree.index-columns".into(), "geom".into());
+    options.insert("write-only".into(), "false".into());
+    let auto = Table::new(
+        table.file_io().clone(),
+        Identifier::new("default", "auto_spatial"),
+        "memory:/auto-spatial".into(),
+        table.schema().copy_with_replaced_options(options),
+        None,
+    );
+    setup_dirs(&auto).await;
+    append(&auto, 0, vec![Some(0.), Some(20.), Some(1.), None]).await;
+    append(&auto, 4, vec![Some(2.), Some(100.)]).await;
+    let latest = auto
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let indexes = IndexManifest::read(
+        auto.file_io(),
+        &format!(
+            "{}/manifest/{}",
+            auto.location(),
+            latest.index_manifest().unwrap()
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(indexes.len(), 3);
+    assert_eq!(scan_ids(&auto, bounds).await, vec![0, 2, 4]);
+}
+
+#[tokio::test]
 async fn test_execute_writes_and_queries_fm_index() {
     let table_path = "memory:/test_fm_global_index_builder_e2e";
     let mut options = table_options("10");
@@ -1512,12 +1699,10 @@ async fn test_global_index_prunes_during_manifest_read() {
 }
 
 #[tokio::test]
-async fn test_scalar_full_search_includes_unindexed_rows() {
-    let mut options = table_options("2");
-    options.insert("scalar-index.search-mode".to_string(), "full".to_string());
+async fn test_scalar_scan_includes_unindexed_rows_by_default() {
     let table = test_table_with_path(
-        "memory:/test_scalar_full_search_includes_unindexed_rows",
-        options,
+        "memory:/test_scalar_scan_includes_unindexed_rows_by_default",
+        table_options("2"),
     );
     setup_dirs(&table).await;
 
@@ -1551,7 +1736,7 @@ async fn test_scalar_full_search_includes_unindexed_rows() {
         .equal("name", crate::spec::Datum::String("alice".to_string()))
         .unwrap();
     let mut read_builder = table.new_read_builder();
-    read_builder.with_filter(predicate);
+    read_builder.with_filter(predicate.clone());
     let plan = read_builder.new_scan().plan().await.unwrap();
     let planned_ranges = merge_row_ranges(
         plan.splits()
@@ -1565,16 +1750,18 @@ async fn test_scalar_full_search_includes_unindexed_rows() {
         planned_ranges,
         vec![RowRange::new(0, 0), RowRange::new(2, 3)]
     );
-    assert_eq!(
-        scan_ids(
-            &table,
-            PredicateBuilder::new(table.schema().fields())
-                .equal("name", crate::spec::Datum::String("alice".to_string()))
-                .unwrap(),
-        )
-        .await,
-        vec![1, 3]
-    );
+    assert_eq!(scan_ids(&table, predicate.clone()).await, vec![1, 3]);
+
+    let fast = table.copy_with_options(HashMap::from([(
+        "global-index.search-mode".to_string(),
+        "fast".to_string(),
+    )]));
+    assert_eq!(scan_ids(&fast, predicate.clone()).await, vec![1]);
+    let full = fast.copy_with_options(HashMap::from([(
+        "scalar-index.search-mode".to_string(),
+        "full".to_string(),
+    )]));
+    assert_eq!(scan_ids(&full, predicate).await, vec![1, 3]);
 }
 
 #[tokio::test]
