@@ -324,6 +324,28 @@ async fn execute_vector_file_work(
     batch_index_parallelism: usize,
     allow_buffered_read: bool,
 ) -> crate::Result<(Vec<ScoredRowIds>, IndexSearchTiming)> {
+    let (hits, timing) = execute_vector_file_probes(
+        evaluation,
+        work,
+        metric_check,
+        range_read_limiter,
+        batch_index_parallelism,
+        vec![],
+        allow_buffered_read,
+    )
+    .await?;
+    Ok((hits.into_iter().map(|hits| hits.standard).collect(), timing))
+}
+
+async fn execute_vector_file_probes(
+    evaluation: VectorSearchEvaluation<'_>,
+    work: VectorIndexWork,
+    metric_check: VectorMetricCheck,
+    range_read_limiter: RangeReadLimiter,
+    batch_index_parallelism: usize,
+    probes: Vec<centroid::Probe>,
+    allow_buffered_read: bool,
+) -> crate::Result<(Vec<centroid::ProbeMatches<ScoredRowIds>>, IndexSearchTiming)> {
     let timing_enabled = vector_search_timing_enabled();
     let concurrency = CoreOptions::new(evaluation.table_options).global_index_thread_num()?;
     let global_meta = work
@@ -435,7 +457,7 @@ async fn execute_vector_file_work(
             .is_some_and(|row_ids| row_ids.is_empty())
     }) {
         return Ok((
-            vec![ScoredRowIds::empty(); vector_searches.len()],
+            vec![centroid::ProbeMatches::standard(ScoredRowIds::empty()); vector_searches.len()],
             IndexSearchTiming::default(),
         ));
     }
@@ -481,6 +503,7 @@ async fn execute_vector_file_work(
                     list_row_count,
                     metrics: metric_check,
                     post_filter,
+                    probes,
                 },
                 permit,
             )
@@ -510,6 +533,7 @@ async fn execute_vector_file_work(
                     list_row_count,
                     metrics: metric_check,
                     post_filter,
+                    probes,
                 },
                 permit,
             )
@@ -544,20 +568,26 @@ async fn execute_vector_file_work(
         });
     }
 
+    let convert = |result: centroid::NativeMatches| match result {
+        Some(scored_map) => {
+            if max_centroid_label
+                .is_some_and(|max_label| scored_map.keys().any(|&id| id > max_label))
+            {
+                return Err(super::centroid_index::invalid(format!(
+                    "Vector candidate in '{file_name}' lies outside its centroid shard"
+                )));
+            }
+            Ok(ScoredRowIds::from_scored_map(scored_map).offset(row_range_start))
+        }
+        None => Ok(ScoredRowIds::empty()),
+    };
     let results = results
         .into_iter()
-        .map(|result| match result {
-            Some(scored_map) => {
-                if max_centroid_label
-                    .is_some_and(|max_label| scored_map.keys().any(|&id| id > max_label))
-                {
-                    return Err(super::centroid_index::invalid(format!(
-                        "Vector candidate in '{file_name}' lies outside its centroid shard"
-                    )));
-                }
-                Ok(ScoredRowIds::from_scored_map(scored_map).offset(row_range_start))
-            }
-            None => Ok(ScoredRowIds::empty()),
+        .map(|hits| {
+            Ok(centroid::ProbeMatches {
+                standard: convert(hits.standard)?,
+                joint: hits.joint.map(&convert).transpose()?,
+            })
         })
         .collect::<crate::Result<Vec<_>>>()?;
     Ok::<_, crate::Error>((
@@ -583,7 +613,7 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
     file_name: String,
     context: VectorIndexSearchContext,
     guard: G,
-) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
+) -> crate::Result<Vec<centroid::ProbeMatches<centroid::NativeMatches>>> {
     if context.post_filter.is_some() {
         return execute_post_filter_vindex_searches(
             io_meta,
@@ -593,7 +623,12 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
             context,
             guard,
         )
-        .await;
+        .await
+        .map(|hits| {
+            hits.into_iter()
+                .map(centroid::ProbeMatches::standard)
+                .collect()
+        });
     }
     let panic_context = if vector_searches.len() > 1 {
         "vindex global-index batch search task failed"
@@ -604,20 +639,21 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
         let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options)
             .with_batch_index_parallelism(context.parallelism)
             .with_list_row_count(context.list_row_count);
-        reader
-            .visit_batch_vector_search_validated(
-                &vector_searches,
-                |_| Ok(source),
-                |metadata| {
-                    context
-                        .metrics
-                        .check(RawVectorMetric::from_vindex(metadata.metric))
-                },
-            )
-            .map_err(|e| crate::Error::DataInvalid {
-                message: format!("Failed to read vindex index file '{}': {}", file_name, e),
-                source: Some(Box::new(e)),
-            })
+        centroid::search_file(
+            &mut reader,
+            &vector_searches,
+            &context.probes,
+            source,
+            |metadata| {
+                context
+                    .metrics
+                    .check(RawVectorMetric::from_vindex(metadata.metric))
+            },
+        )
+        .map_err(|e| crate::Error::DataInvalid {
+            message: format!("Failed to read vindex index file '{}': {}", file_name, e),
+            source: Some(Box::new(e)),
+        })
     })
     .await
 }
@@ -756,6 +792,7 @@ impl VectorMetricCheck {
 struct VectorIndexSearchContext {
     parallelism: usize,
     list_row_count: Option<u64>,
+    probes: Vec<centroid::Probe>,
     metrics: VectorMetricCheck,
     post_filter: Option<VectorIndexPostFilter>,
 }

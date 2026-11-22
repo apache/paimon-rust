@@ -23,8 +23,8 @@ use paimon_vindex_core::index::{
     VectorIndexReaderOptions, VectorSearchParams,
 };
 use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities};
-use std::collections::BinaryHeap;
-use std::collections::HashMap;
+use std::borrow::Borrow;
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -98,6 +98,7 @@ fn native_batch_memory_reservation(index_parallelism: usize) -> usize {
 
 #[derive(Clone, Copy, Default)]
 struct VindexLoadTiming {
+    total: Duration,
     vindex_open: Duration,
     metadata: Duration,
     optimize: Duration,
@@ -105,6 +106,7 @@ struct VindexLoadTiming {
 
 #[derive(Default)]
 struct VindexBatchStats {
+    nprobes: BTreeSet<Option<usize>>,
     native_chunk_queries: Vec<usize>,
     scalar_chunk_count: usize,
     max_chunk_size: usize,
@@ -225,32 +227,39 @@ impl VindexVectorGlobalIndexReader {
         S: SeekRead + 'static,
         F: FnOnce(&VectorIndexMetadata) -> crate::Result<()>,
     {
-        let total_start = self.timing_enabled.then(Instant::now);
         self.ensure_loaded(stream_fn, validate)?;
+        self.search_loaded_batch(vector_searches, None)
+    }
+
+    pub(crate) fn search_loaded_batch(
+        &mut self,
+        vector_searches: &[impl Borrow<VectorSearch>],
+        nprobe_override: Option<usize>,
+    ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
         let search_start = self.timing_enabled.then(Instant::now);
-        let results = self.search_batch(vector_searches)?;
-        if let (Some(total_start), Some(search_start), Some(stats)) =
-            (total_start, search_start, self.batch_stats.as_ref())
-        {
-            let total = total_start.elapsed();
+        let results = self.search_batch(vector_searches, nprobe_override)?;
+        // A preloaded reader reports its loading cost with its first search only.
+        let load_timing = std::mem::take(&mut self.load_timing);
+        if let (Some(search_start), Some(stats)) = (search_start, self.batch_stats.as_ref()) {
             let native_search = search_start.elapsed();
-            let load = self
-                .load_timing
+            let total = load_timing.total.saturating_add(native_search);
+            let load = load_timing
                 .vindex_open
-                .saturating_add(self.load_timing.metadata)
-                .saturating_add(self.load_timing.optimize);
-            let unattributed = total.saturating_sub(load.saturating_add(native_search));
+                .saturating_add(load_timing.metadata)
+                .saturating_add(load_timing.optimize);
+            let unattributed = load_timing.total.saturating_sub(load);
             let chunk_queries = stats
                 .native_chunk_queries
                 .iter()
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            let nprobe = self
-                .options
-                .get(NPROBE_PARAMETER)
-                .cloned()
-                .unwrap_or_else(|| "auto".to_string());
+            let nprobe = stats
+                .nprobes
+                .iter()
+                .map(|width| width.map_or_else(|| "auto".to_string(), |width| width.to_string()))
+                .collect::<Vec<_>>()
+                .join(",");
             log::debug!(
                 target: "paimon::vector_search",
                 "event=paimon_vindex_reader file={} nq={} nprobe={} batch_index_parallelism={} memory_budget_bytes={} max_chunk_size={} native_chunk_count={} native_chunk_queries={} scalar_chunk_count={} total_ms={:.3} vindex_open_ms={:.3} metadata_ms={:.3} optimize_ms={:.3} native_search_wall_ms={:.3} unattributed_ms={:.3}",
@@ -264,9 +273,9 @@ impl VindexVectorGlobalIndexReader {
                 chunk_queries,
                 stats.scalar_chunk_count,
                 total.as_secs_f64() * 1000.0,
-                self.load_timing.vindex_open.as_secs_f64() * 1000.0,
-                self.load_timing.metadata.as_secs_f64() * 1000.0,
-                self.load_timing.optimize.as_secs_f64() * 1000.0,
+                load_timing.vindex_open.as_secs_f64() * 1000.0,
+                load_timing.metadata.as_secs_f64() * 1000.0,
+                load_timing.optimize.as_secs_f64() * 1000.0,
                 native_search.as_secs_f64() * 1000.0,
                 unattributed.as_secs_f64() * 1000.0,
             );
@@ -282,6 +291,14 @@ impl VindexVectorGlobalIndexReader {
         self.ensure_loaded(stream_fn, |_| Ok(()))
     }
 
+    pub(crate) fn load_validated<S: SeekRead + 'static>(
+        &mut self,
+        stream_fn: impl FnOnce(&str) -> crate::Result<S>,
+        validate: impl FnOnce(&VectorIndexMetadata) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        self.ensure_loaded(stream_fn, validate)
+    }
+
     pub fn metadata(&self) -> crate::Result<&VectorIndexMetadata> {
         self.metadata
             .as_ref()
@@ -293,7 +310,8 @@ impl VindexVectorGlobalIndexReader {
 
     fn search_batch(
         &mut self,
-        vector_searches: &[VectorSearch],
+        vector_searches: &[impl Borrow<VectorSearch>],
+        nprobe_override: Option<usize>,
     ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
         let reader = self
             .reader
@@ -315,13 +333,14 @@ impl VindexVectorGlobalIndexReader {
                     "MultiVector indexes require cosine similarity",
                 ));
             }
-            let prepared = prepare_batch_searches(metadata, &self.options, vector_searches, true)?;
+            let prepared =
+                prepare_batch_searches(metadata, &self.options, vector_searches, true, None)?;
             return vector_searches
                 .iter()
                 .zip(prepared)
                 .map(|(query, prepared)| match prepared {
                     Some(prepared) => {
-                        search_distinct_rows(reader, metadata, query, row_count, prepared)
+                        search_distinct_rows(reader, metadata, query.borrow(), row_count, prepared)
                     }
                     None => Ok(None),
                 })
@@ -332,6 +351,7 @@ impl VindexVectorGlobalIndexReader {
             metadata,
             &self.options,
             vector_searches,
+            nprobe_override,
             self.batch_index_parallelism,
             self.timing_enabled,
         )?;
@@ -390,7 +410,6 @@ impl VindexVectorGlobalIndexReader {
         O: FnOnce(&mut VIndexReader<VindexInput>) -> crate::Result<()>,
     {
         if self.reader.is_some() {
-            self.load_timing = VindexLoadTiming::default();
             return validate(self.metadata()?);
         }
 
@@ -418,6 +437,7 @@ impl VindexVectorGlobalIndexReader {
         self.reader = Some(reader);
         self.metadata = Some(metadata);
         self.load_timing = VindexLoadTiming {
+            total: open_start.map_or(Duration::ZERO, |start| start.elapsed()),
             vindex_open,
             metadata: metadata_elapsed,
             optimize: optimize_elapsed,
@@ -470,7 +490,7 @@ fn prepare_search(
     options: &HashMap<String, String>,
     vector_search: &VectorSearch,
 ) -> crate::Result<Option<PreparedSearch>> {
-    prepare_search_with_shared_filter(metadata, options, vector_search, None, false)
+    prepare_search_with_shared_filter(metadata, options, vector_search, None, false, None)
 }
 
 fn prepare_search_with_shared_filter(
@@ -479,6 +499,7 @@ fn prepare_search_with_shared_filter(
     vector_search: &VectorSearch,
     shared_filter_bytes: Option<&Arc<[u8]>>,
     multi_vector: bool,
+    nprobe_override: Option<usize>,
 ) -> crate::Result<Option<PreparedSearch>> {
     // Query options override the defaults of a reusable index reader.
     let mut merged_options;
@@ -515,6 +536,9 @@ fn prepare_search_with_shared_filter(
         (true, _) => (nprobe, None),
         (false, _) => (nprobe, l_search),
     };
+    let nprobe = nprobe_override
+        .map(Ok)
+        .or_else(|| nprobe.map(|value| parse_search_width(NPROBE_PARAMETER, value)));
     let mut params = match (nprobe, l_search) {
         (Some(_), Some(_)) => {
             return Err(crate::Error::DataInvalid {
@@ -524,9 +548,7 @@ fn prepare_search_with_shared_filter(
                 source: None,
             });
         }
-        (Some(value), None) => {
-            VectorSearchParams::new(top_k, parse_search_width(NPROBE_PARAMETER, value)?)
-        }
+        (Some(value), None) => VectorSearchParams::new(top_k, value?),
         (None, Some(value)) => {
             let l_search = parse_search_width(L_SEARCH_PARAMETER, value)?;
             if l_search == 0 {
@@ -572,14 +594,19 @@ fn serialize_row_id_filter(include_ids: &roaring::RoaringTreemap) -> crate::Resu
 }
 
 fn shared_batch_include_row_ids(
-    vector_searches: &[VectorSearch],
+    vector_searches: &[impl Borrow<VectorSearch>],
 ) -> Option<&Arc<roaring::RoaringTreemap>> {
-    let first = vector_searches.first()?.shared_include_row_ids.as_ref()?;
+    let first = vector_searches
+        .first()?
+        .borrow()
+        .shared_include_row_ids
+        .as_ref()?;
     vector_searches
         .iter()
         .skip(1)
         .all(|search| {
             search
+                .borrow()
                 .shared_include_row_ids
                 .as_ref()
                 .is_some_and(|include_row_ids| Arc::ptr_eq(first, include_row_ids))
@@ -590,8 +617,9 @@ fn shared_batch_include_row_ids(
 fn prepare_batch_searches(
     metadata: &VectorIndexMetadata,
     options: &HashMap<String, String>,
-    vector_searches: &[VectorSearch],
+    vector_searches: &[impl Borrow<VectorSearch>],
     multi_vector: bool,
+    nprobe_override: Option<usize>,
 ) -> crate::Result<Vec<Option<PreparedSearch>>> {
     let shared_filter_bytes = shared_batch_include_row_ids(vector_searches)
         .filter(|include_row_ids| !include_row_ids.is_empty())
@@ -603,9 +631,10 @@ fn prepare_batch_searches(
             prepare_search_with_shared_filter(
                 metadata,
                 options,
-                search,
+                search.borrow(),
                 shared_filter_bytes.as_ref(),
                 multi_vector,
+                nprobe_override,
             )
         })
         .collect()
@@ -760,7 +789,8 @@ fn search_batch_vindex(
     reader: &mut VIndexReader<impl SeekRead>,
     metadata: &VectorIndexMetadata,
     options: &HashMap<String, String>,
-    vector_searches: &[VectorSearch],
+    vector_searches: &[impl Borrow<VectorSearch>],
+    nprobe_override: Option<usize>,
     index_parallelism: usize,
     timing_enabled: bool,
 ) -> crate::Result<VindexBatchSearchResult> {
@@ -773,9 +803,10 @@ fn search_batch_vindex(
         ..VindexBatchStats::default()
     });
 
-    for (index, prepared) in prepare_batch_searches(metadata, options, vector_searches, false)?
-        .into_iter()
-        .enumerate()
+    for (index, prepared) in
+        prepare_batch_searches(metadata, options, vector_searches, false, nprobe_override)?
+            .into_iter()
+            .enumerate()
     {
         let Some(prepared) = prepared else {
             continue;
@@ -794,6 +825,12 @@ fn search_batch_vindex(
         let chunk_size = native_batch_chunk_size(metadata, &prepared, index_parallelism);
         if let Some(stats) = &mut batch_stats {
             stats.max_chunk_size = stats.max_chunk_size.max(chunk_size);
+            stats.nprobes.insert(
+                prepared
+                    .params
+                    .configured_ivf_nprobe()
+                    .map(|width| width.min(metadata.nlist)),
+            );
         }
         for indices in indices.chunks(chunk_size) {
             if indices.len() == 1 {
@@ -801,8 +838,11 @@ fn search_batch_vindex(
                     stats.scalar_chunk_count += 1;
                 }
                 let index = indices[0];
-                let (labels, distances) =
-                    execute_scalar_search(reader, &vector_searches[index].vector, &prepared)?;
+                let (labels, distances) = execute_scalar_search(
+                    reader,
+                    &vector_searches[index].borrow().vector,
+                    &prepared,
+                )?;
                 let map =
                     collect_results(&labels, &distances, prepared.params.top_k, metadata.metric);
                 if !map.is_empty() {
@@ -820,7 +860,7 @@ fn search_batch_vindex(
             let _memory_permit = acquire_native_batch_memory(reservation);
             let mut queries = Vec::with_capacity(indices.len() * metadata.dimension);
             for &index in indices {
-                queries.extend_from_slice(&vector_searches[index].vector);
+                queries.extend_from_slice(&vector_searches[index].borrow().vector);
             }
             let params = prepared.params;
             let (labels, distances) = match &prepared.filter_bytes {
@@ -1281,7 +1321,8 @@ mod tests {
         let defaults = HashMap::from([(NPROBE_PARAMETER.into(), "1".into())]);
         let explicit = query().with_options(HashMap::from([(NPROBE_PARAMETER.into(), "7".into())]));
         let prepared =
-            prepare_batch_searches(&metadata, &defaults, &[explicit, query()], false).unwrap();
+            prepare_batch_searches(&metadata, &defaults, &[explicit, query()], false, None)
+                .unwrap();
         assert_eq!(prepared[0].as_ref().unwrap().params.width, 7);
         assert_eq!(prepared[1].as_ref().unwrap().params.width, 1);
         let conflicting =
@@ -1417,7 +1458,7 @@ mod tests {
         }
 
         let prepared =
-            prepare_batch_searches(&metadata, &HashMap::new(), &searches, false).unwrap();
+            prepare_batch_searches(&metadata, &HashMap::new(), &searches, false, None).unwrap();
         let first = prepared[0]
             .as_ref()
             .and_then(|search| search.filter_bytes.as_ref())
@@ -1565,7 +1606,8 @@ mod tests {
             ("diskann.l_search".to_string(), "64".to_string()),
         ]);
         assert!(prepare_search(&metadata, &mixed_options, &query()).is_err());
-        let diskann = prepare_batch_searches(&metadata, &mixed_options, &[query()], true).unwrap();
+        let diskann =
+            prepare_batch_searches(&metadata, &mixed_options, &[query()], true, None).unwrap();
         assert_eq!(
             diskann[0]
                 .as_ref()
@@ -1578,7 +1620,8 @@ mod tests {
         let mut ivf_metadata = metadata;
         ivf_metadata.index_type = IndexType::IvfFlat;
         assert!(prepare_search(&ivf_metadata, &mixed_options, &query()).is_err());
-        let ivf = prepare_batch_searches(&ivf_metadata, &mixed_options, &[query()], true).unwrap();
+        let ivf =
+            prepare_batch_searches(&ivf_metadata, &mixed_options, &[query()], true, None).unwrap();
         assert_eq!(
             ivf[0].as_ref().unwrap().params.configured_ivf_nprobe(),
             Some(4)
