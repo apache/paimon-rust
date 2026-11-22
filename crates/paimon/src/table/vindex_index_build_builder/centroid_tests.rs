@@ -623,6 +623,22 @@ async fn centroid_bitmaps_prefilter_or_before_ranking_and_drop_with_the_vector_c
     let groups = centroid_index::group(&entries).unwrap();
     let group = &groups[0];
     assert_eq!(group.bitmaps.len(), 2);
+    assert_eq!(
+        group.router.index_file.file_name,
+        format!(
+            "vector-ivf-flat-global-index-training-model-{}.index",
+            group.descriptor.model_id
+        )
+    );
+    for entry in group.bitmaps.values() {
+        let id = entry
+            .index_file
+            .file_name
+            .strip_prefix("centroid-bitmap-global-index-")
+            .and_then(|name| name.strip_suffix(".index"))
+            .unwrap();
+        assert!(uuid::Uuid::parse_str(id).is_ok());
+    }
 
     // A shard with no bitmap match must not open the ANN payload at all.
     let field = table

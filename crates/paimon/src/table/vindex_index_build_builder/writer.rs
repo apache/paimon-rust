@@ -35,7 +35,7 @@ use crate::table::index_build::{
     vector::{serialize_writer, TrainedVectors, VectorSpill},
     IndexFileWriter, IndexPayload,
 };
-use crate::table::index_file_path::IndexFileLocation;
+use crate::table::index_file_path::{new_global_index_file_name, IndexFileLocation};
 use crate::table::RowRange;
 
 pub(super) struct BuiltIndexFile {
@@ -241,11 +241,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         index_meta: Vec<u8>,
         row_count: i64,
     ) -> Result<IndexFileMeta> {
-        let file_name = format!(
-            "vector-{}-global-index-{}.index",
-            self.index_type,
-            uuid::Uuid::new_v4()
-        );
+        let file_name = new_global_index_file_name(&format!("vector-{}", self.index_type));
         let meta = GlobalIndexMeta {
             row_range_start: shard.row_range_start,
             row_range_end: shard.row_range_end,

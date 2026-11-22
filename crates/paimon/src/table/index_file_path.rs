@@ -38,8 +38,8 @@ use crate::spec::{DataEvolutionIndexSourceMeta, IndexFileMeta};
 
 const INDEX_DIR: &str = "index";
 
-pub(super) fn new_global_index_file_name(index_type: &str) -> String {
-    format!("{index_type}-global-index-{}.index", uuid::Uuid::new_v4())
+pub(super) fn new_global_index_file_name(prefix: &str) -> String {
+    format!("{prefix}-global-index-{}.index", uuid::Uuid::new_v4())
 }
 
 /// How to resolve an index file that carries no explicit external path.
