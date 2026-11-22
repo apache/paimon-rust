@@ -131,26 +131,73 @@ fn squared_l2(query: &[f32], stored: &[f32]) -> f32 {
 
 fn cosine_similarity(query: &[f32], stored: &[f32]) -> f32 {
     let mut dot = 0.0f32;
-    let mut query_norm = 0.0f32;
-    let mut stored_norm = 0.0f32;
+    let mut query_norm = CosineNorm::default();
+    let mut stored_norm = CosineNorm::default();
     for i in 0..query.len() {
         dot += query[i] * stored[i];
-        query_norm += query[i] * query[i];
-        stored_norm += stored[i] * stored[i];
+        query_norm.add(query[i]);
+        stored_norm.add(stored[i]);
     }
-    let denominator = ((query_norm as f64).sqrt() * (stored_norm as f64).sqrt()) as f32;
-    if query_norm.is_normal()
-        && stored_norm.is_normal()
-        && denominator.is_normal()
-        && dot.is_finite()
-    {
-        dot / denominator
-    } else {
-        cosine_similarity_wide(query, stored)
+    query_norm
+        .try_score(stored_norm, dot, |query, stored| {
+            ((query as f64).sqrt() * (stored as f64).sqrt()) as f32
+        })
+        .unwrap_or_else(|| cosine_similarity_wide(query, stored))
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CosineNorm {
+    squared: f32,
+    has_small_square: bool,
+    has_non_finite: bool,
+}
+
+impl CosineNorm {
+    pub(crate) fn from_vector(vector: &[f32]) -> Self {
+        let mut norm = Self::default();
+        for &value in vector {
+            norm.add(value);
+        }
+        norm
+    }
+
+    pub(crate) fn add(&mut self, value: f32) {
+        let square = value * value;
+        self.squared += square;
+        self.has_non_finite |= !value.is_finite();
+        // A normal total can hide underflow in a coordinate square or its dot product term.
+        self.has_small_square |= value != 0.0 && square < f32::MIN_POSITIVE;
+    }
+
+    fn is_zero(self) -> bool {
+        self.squared == 0.0 && !self.has_small_square
+    }
+
+    pub(crate) fn try_score(
+        self,
+        stored: Self,
+        dot: f32,
+        denominator: impl FnOnce(f32, f32) -> f32,
+    ) -> Option<f32> {
+        if (self.is_zero() && !stored.has_non_finite) || (stored.is_zero() && !self.has_non_finite)
+        {
+            return Some(0.0);
+        }
+        if self.has_small_square
+            || stored.has_small_square
+            || !self.squared.is_normal()
+            || !stored.squared.is_normal()
+            || !dot.is_finite()
+            || dot.is_subnormal()
+        {
+            return None;
+        }
+        let denominator = denominator(self.squared, stored.squared);
+        denominator.is_normal().then(|| dot / denominator)
     }
 }
 
-/// Computes cosine when squaring float coordinates would overflow or lose the norm.
+/// Computes cosine when f32 arithmetic overflows or underflows.
 pub(crate) fn cosine_similarity_wide(query: &[f32], stored: &[f32]) -> f32 {
     let mut dot = 0.0_f64;
     let mut query_norm = 0.0_f64;
@@ -269,6 +316,29 @@ mod tests {
     }
 
     #[test]
+    fn test_cosine_zero_skips_wide_scoring_for_finite_vectors() {
+        let zero = CosineNorm::from_vector(&[0.0, -0.0]);
+        for magnitude in [0.0, f32::MIN_POSITIVE, 1.0, f32::MAX] {
+            let stored = CosineNorm::from_vector(&[magnitude, 0.0]);
+            assert_eq!(
+                zero.try_score(stored, 0.0, |_, _| unreachable!()),
+                Some(0.0)
+            );
+            assert_eq!(
+                stored.try_score(zero, 0.0, |_, _| unreachable!()),
+                Some(0.0)
+            );
+        }
+        let nonzero = CosineNorm::from_vector(&[f32::MIN_POSITIVE, 0.0]);
+        assert_eq!(nonzero.try_score(nonzero, 0.0, |_, _| unreachable!()), None);
+        let non_finite = CosineNorm::from_vector(&[f32::INFINITY, 0.0]);
+        assert_eq!(
+            zero.try_score(non_finite, f32::NAN, |_, _| unreachable!()),
+            None
+        );
+    }
+
+    #[test]
     fn test_cosine_exact_distance_is_invariant_to_vector_scale() {
         for scale in [1.0e20_f32, 1.0e-23_f32] {
             let query = [scale, 0.0];
@@ -279,6 +349,35 @@ mod tests {
             assert_eq!(
                 VectorSearchMetric::Cosine.compute_distance(&query, &[-scale, 0.0]),
                 2.0
+            );
+        }
+    }
+
+    #[test]
+    fn test_cosine_distance_orders_near_parallel_with_underflowing_squares() {
+        let scale = 2.0_f32.powi(-63);
+        let mut query = [0.0; 257];
+        query[256] = scale;
+        let mut nearly_parallel = [scale * 2.0_f32.powi(-12); 257];
+        nearly_parallel[256] = scale;
+
+        let metric = VectorSearchMetric::Cosine;
+        assert_eq!(metric.compute_distance(&query, &query), 0.0);
+        assert!(metric.compute_distance(&query, &nearly_parallel) > 0.0);
+    }
+
+    #[test]
+    fn test_cosine_distance_orders_near_orthogonal_with_underflowing_dot() {
+        let similarity = 2.0_f32.powi(-24);
+        let metric = VectorSearchMetric::Cosine;
+        for scale in [1.0, 2.0_f32.powi(-63)] {
+            let query = [scale, 0.0];
+            let orthogonal = [0.0, scale];
+            let nearly_orthogonal = [scale * similarity, scale];
+            assert_eq!(metric.compute_distance(&query, &orthogonal), 1.0);
+            assert_eq!(
+                metric.compute_distance(&query, &nearly_orthogonal),
+                1.0 - similarity
             );
         }
     }

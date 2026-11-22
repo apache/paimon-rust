@@ -50,7 +50,7 @@ use crate::vindex::executor::{
     acquire_process_global_search_permit, drain_indexed_jobs,
     ensure_global_index_executor_capacity, execute_global_index_with_guard,
 };
-use crate::vindex::pkvector::metric::cosine_similarity_wide;
+use crate::vindex::pkvector::metric::{cosine_similarity_wide, CosineNorm};
 use crate::vindex::range_reader::{RangeReadLimiter, VindexFileReader};
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use crate::vindex::{is_vindex_index_type, vector_search_timing_enabled};
@@ -2678,7 +2678,7 @@ struct RawScoringPlan {
     all_query_indices: Vec<usize>,
     shared_filter_groups: Vec<SharedRawFilterGroup>,
     candidate_query_indices: HashMap<u64, Vec<usize>>,
-    query_l2_squared_norms: Vec<f32>,
+    query_norms: RawVectorNorms,
     dense_query_dimension: Option<usize>,
     dense_query_matrix: Option<Vec<f32>>,
 }
@@ -2688,22 +2688,41 @@ struct SharedRawFilterGroup {
     query_indices: Vec<usize>,
 }
 
+#[derive(Default)]
+struct RawVectorNorms {
+    l2_squared: Vec<f32>,
+    cosine: Vec<CosineNorm>,
+}
+
+impl RawVectorNorms {
+    fn new<'a>(vectors: impl Iterator<Item = &'a [f32]>, metric: RawVectorMetric) -> Self {
+        let mut norms = Self::default();
+        match metric {
+            RawVectorMetric::L2 => {
+                norms.l2_squared = vectors
+                    .map(|vector| vector.iter().map(|value| value * value).sum())
+                    .collect();
+            }
+            RawVectorMetric::Cosine => {
+                norms.cosine = vectors.map(CosineNorm::from_vector).collect();
+            }
+            RawVectorMetric::InnerProduct => {}
+        }
+        norms
+    }
+}
+
 impl RawScoringPlan {
     fn new(vector_searches: &[VectorSearch], metric: RawVectorMetric) -> Self {
         let mut all_query_indices = Vec::new();
         let mut shared_filter_groups = Vec::new();
         let mut candidate_query_indices: HashMap<u64, Vec<usize>> = HashMap::new();
-        let query_l2_squared_norms = vector_searches
-            .iter()
-            .map(|vector_search| match metric {
-                RawVectorMetric::L2 | RawVectorMetric::Cosine => vector_search
-                    .vector
-                    .iter()
-                    .map(|value| value * value)
-                    .sum::<f32>(),
-                RawVectorMetric::InnerProduct => 0.0,
-            })
-            .collect();
+        let query_norms = RawVectorNorms::new(
+            vector_searches
+                .iter()
+                .map(|search| search.vector.as_slice()),
+            metric,
+        );
 
         if let Some(include_row_ids) = shared_batch_include_row_ids(vector_searches) {
             shared_filter_groups.push(SharedRawFilterGroup {
@@ -2746,7 +2765,7 @@ impl RawScoringPlan {
             all_query_indices,
             shared_filter_groups,
             candidate_query_indices,
-            query_l2_squared_norms,
+            query_norms,
             dense_query_dimension,
             dense_query_matrix,
         }
@@ -3051,7 +3070,7 @@ fn collect_raw_batch_vector_batch(
                 &query_matrix[query_start..query_end],
                 query_indices.len(),
                 dimension,
-                &scoring_plan.query_l2_squared_norms,
+                &scoring_plan.query_norms,
                 query_indices,
                 metric,
             )?;
@@ -3091,7 +3110,7 @@ fn compute_raw_vector_score_matrix(
     query_vectors: &[f32],
     query_count: usize,
     dimension: usize,
-    query_l2_squared_norms: &[f32],
+    query_norms: &RawVectorNorms,
     query_indices: &[usize],
     metric: RawVectorMetric,
 ) -> crate::Result<Vec<f32>> {
@@ -3123,16 +3142,14 @@ fn compute_raw_vector_score_matrix(
         return Ok(scores);
     }
 
-    let stored_l2_squared_norms = stored_vectors
-        .chunks_exact(dimension)
-        .map(|vector| vector.iter().map(|value| value * value).sum::<f32>())
-        .collect::<Vec<_>>();
+    let stored_norms = RawVectorNorms::new(stored_vectors.chunks_exact(dimension), metric);
     for (matrix_query_index, &query_index) in query_indices.iter().enumerate() {
-        for (row_index, &stored_l2_squared_norm) in stored_l2_squared_norms.iter().enumerate() {
+        for row_index in 0..row_count {
             let score = &mut scores[matrix_query_index * row_count + row_index];
-            let query_l2_squared_norm = query_l2_squared_norms[query_index];
             *score = match metric {
                 RawVectorMetric::L2 => {
+                    let stored_l2_squared_norm = stored_norms.l2_squared[row_index];
+                    let query_l2_squared_norm = query_norms.l2_squared[query_index];
                     let squared_distance =
                         stored_l2_squared_norm + query_l2_squared_norm - 2.0 * *score;
                     // The norm/dot reconstruction loses the low-order difference when two
@@ -3154,22 +3171,17 @@ fn compute_raw_vector_score_matrix(
                         1.0 / (1.0 + squared_distance)
                     }
                 }
-                RawVectorMetric::Cosine => {
-                    let denominator = stored_l2_squared_norm.sqrt() * query_l2_squared_norm.sqrt();
-                    if stored_l2_squared_norm.is_normal()
-                        && query_l2_squared_norm.is_normal()
-                        && denominator.is_normal()
-                        && score.is_finite()
-                    {
-                        *score / denominator
-                    } else {
+                RawVectorMetric::Cosine => query_norms.cosine[query_index]
+                    .try_score(stored_norms.cosine[row_index], *score, |query, stored| {
+                        query.sqrt() * stored.sqrt()
+                    })
+                    .unwrap_or_else(|| {
                         let stored =
                             &stored_vectors[row_index * dimension..(row_index + 1) * dimension];
                         let query = &query_vectors
                             [matrix_query_index * dimension..(matrix_query_index + 1) * dimension];
                         cosine_similarity_wide(query, stored)
-                    }
-                }
+                    }),
                 RawVectorMetric::InnerProduct => unreachable!(),
             };
         }
@@ -3217,7 +3229,7 @@ fn offer_raw_vector_score(
     ensure_raw_vector_dimension(stored_len, vector_search.vector.len())?;
     let score = compute_raw_vector_score_from_values(
         &vector_search.vector,
-        scoring_plan.query_l2_squared_norms[query_index],
+        scoring_plan.query_norms.cosine.get(query_index).copied(),
         row.values,
         row.start,
         row.end,
@@ -3229,7 +3241,7 @@ fn offer_raw_vector_score(
 
 fn compute_raw_vector_score_from_values(
     query: &[f32],
-    query_l2_squared_norm: f32,
+    query_cosine_norm: Option<CosineNorm>,
     values: &Float32Array,
     start: usize,
     end: usize,
@@ -3240,22 +3252,18 @@ fn compute_raw_vector_score_from_values(
         RawVectorMetric::L2 => compute_raw_vector_l2_score(query, &values.values()[start..end]),
         RawVectorMetric::Cosine => {
             let mut dot = 0.0;
-            let mut norm_b = 0.0;
-            for (q, value_index) in query.iter().zip(start..end) {
-                let stored = values.value(value_index);
+            let mut stored_norm = CosineNorm::default();
+            let stored = &values.values()[start..end];
+            for (q, &stored) in query.iter().zip(stored) {
                 dot += q * stored;
-                norm_b += stored * stored;
+                stored_norm.add(stored);
             }
-            let denominator = query_l2_squared_norm.sqrt() * norm_b.sqrt();
-            if query_l2_squared_norm.is_normal()
-                && norm_b.is_normal()
-                && denominator.is_normal()
-                && dot.is_finite()
-            {
-                dot / denominator
-            } else {
-                cosine_similarity_wide(query, &values.values()[start..end])
-            }
+            query_cosine_norm
+                .expect("cosine searches have a query norm")
+                .try_score(stored_norm, dot, |query, stored| {
+                    query.sqrt() * stored.sqrt()
+                })
+                .unwrap_or_else(|| cosine_similarity_wide(query, stored))
         }
         RawVectorMetric::InnerProduct => query
             .iter()

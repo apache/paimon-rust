@@ -319,9 +319,8 @@ fn test_raw_vector_score_matches_java_metric_semantics() {
 #[test]
 fn test_raw_vector_score_matrix_matches_scalar_metrics() {
     let stored = vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0];
-    let queries = vec![1.0, 1.0, -1.0, 2.0];
-    let query_indices = vec![0, 1];
-    let query_l2_squared_norms = vec![2.0, 5.0];
+    let queries = vec![1.0, 1.0, -1.0, 2.0, 0.0, 0.0];
+    let query_indices = vec![0, 1, 2];
 
     for metric in [
         RawVectorMetric::L2,
@@ -332,9 +331,9 @@ fn test_raw_vector_score_matrix_matches_scalar_metrics() {
             &stored,
             3,
             &queries,
+            3,
             2,
-            2,
-            &query_l2_squared_norms,
+            &RawVectorNorms::new(queries.chunks_exact(2), metric),
             &query_indices,
             metric,
         )
@@ -357,7 +356,7 @@ fn test_raw_vector_score_matrix_matches_scalar_metrics() {
         &[1.0, 0.0],
         1,
         2,
-        &[1.0],
+        &RawVectorNorms::new(std::iter::once(&[1.0, 0.0][..]), RawVectorMetric::L2),
         &[0],
         RawVectorMetric::L2,
     )
@@ -374,8 +373,6 @@ fn test_raw_vector_score_matrix_l2_preserves_large_finite_distances() {
     let mut stored = query.clone();
     stored.extend_from_slice(&nearby);
     let queries = query.repeat(4);
-    let query_l2_squared_norm = query.iter().map(|value| value * value).sum::<f32>();
-    let query_l2_squared_norms = vec![query_l2_squared_norm; 4];
     let query_indices = vec![0, 1, 2, 3];
 
     let matrix_scores = compute_raw_vector_score_matrix(
@@ -384,7 +381,7 @@ fn test_raw_vector_score_matrix_l2_preserves_large_finite_distances() {
         &queries,
         4,
         dimension,
-        &query_l2_squared_norms,
+        &RawVectorNorms::new(queries.chunks_exact(dimension), RawVectorMetric::L2),
         &query_indices,
         RawVectorMetric::L2,
     )
@@ -402,12 +399,10 @@ fn test_raw_vector_score_matrix_l2_preserves_large_finite_distances() {
 #[test]
 fn test_raw_vector_cosine_avoids_squared_norm_product_overflow() {
     let query = vec![1.0e15_f32, 0.0];
-    let query_l2_squared_norm = query.iter().map(|value| value * value).sum::<f32>();
-    assert!(query_l2_squared_norm.is_finite());
     let values = Float32Array::from(query.clone());
     let scalar_score = compute_raw_vector_score_from_values(
         &query,
-        query_l2_squared_norm,
+        Some(CosineNorm::from_vector(&query)),
         &values,
         0,
         2,
@@ -422,7 +417,7 @@ fn test_raw_vector_cosine_avoids_squared_norm_product_overflow() {
         &queries,
         4,
         2,
-        &[query_l2_squared_norm; 4],
+        &RawVectorNorms::new(queries.chunks_exact(2), RawVectorMetric::Cosine),
         &[0, 1, 2, 3],
         RawVectorMetric::Cosine,
     )
@@ -435,49 +430,69 @@ fn test_raw_vector_cosine_avoids_squared_norm_product_overflow() {
 #[test]
 fn test_raw_cosine_top_k_is_invariant_to_vector_scale() {
     for scale in [1.0e20_f32, 1.0e-23_f32] {
-        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2);
-        for vector in [[-scale, 0.0], [scale, 0.0], [0.0, scale]] {
-            builder.values().append_slice(&vector);
-            builder.append(true);
-        }
-        let vectors = builder.finish();
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("embedding", vectors.data_type().clone(), false),
-            ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(vectors),
-                Arc::new(Int64Array::from(vec![10, 11, 12])),
-            ],
+        assert_raw_cosine_top_one(
+            &[scale, 0.0],
+            &[&[-scale, 0.0], &[scale, 0.0], &[0.0, scale]],
+            1.0,
+        );
+    }
+}
+
+#[test]
+fn test_raw_cosine_top_k_orders_near_parallel_with_underflowing_squares() {
+    let scale = 2.0_f32.powi(-63);
+    let mut query = [0.0; 257];
+    query[256] = scale;
+    let mut nearly_parallel = [scale * 2.0_f32.powi(-12); 257];
+    nearly_parallel[256] = scale;
+    assert_raw_cosine_top_one(&query, &[&nearly_parallel, &query], 1.0);
+}
+
+#[test]
+fn test_raw_cosine_top_k_orders_near_orthogonal_with_underflowing_dot() {
+    let similarity = 2.0_f32.powi(-24);
+    for scale in [1.0, 2.0_f32.powi(-63)] {
+        assert_raw_cosine_top_one(
+            &[scale, 0.0],
+            &[&[0.0, scale], &[scale * similarity, scale]],
+            similarity,
+        );
+    }
+}
+
+fn assert_raw_cosine_top_one(query: &[f32], stored: &[&[f32]], expected_score: f32) {
+    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), query.len() as i32);
+    for vector in stored {
+        builder.values().append_slice(vector);
+        builder.append(true);
+    }
+    let vectors = builder.finish();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("embedding", vectors.data_type().clone(), false),
+        ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, false),
+    ]));
+    let row_ids = Int64Array::from_iter_values(10..10 + stored.len() as i64);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(vectors), Arc::new(row_ids)]).unwrap();
+
+    for query_count in [1, RAW_SCORE_MATRIX_MIN_QUERY_COUNT] {
+        let searches = (0..query_count)
+            .map(|_| VectorSearch::new(query.to_vec(), 1, "embedding".to_string()).unwrap())
+            .collect::<Vec<_>>();
+        let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::Cosine);
+        let mut top_k = (0..query_count)
+            .map(|_| RawScoreTopK::new(1))
+            .collect::<Vec<_>>();
+        collect_raw_batch_vector_batch(
+            &batch,
+            &searches,
+            RawVectorMetric::Cosine,
+            &scoring_plan,
+            &mut top_k,
         )
         .unwrap();
-
-        for query_count in [1, RAW_SCORE_MATRIX_MIN_QUERY_COUNT] {
-            let searches = (0..query_count)
-                .map(|_| VectorSearch::new(vec![scale, 0.0], 1, "embedding".to_string()).unwrap())
-                .collect::<Vec<_>>();
-            let scoring_plan = RawScoringPlan::new(&searches, RawVectorMetric::Cosine);
-            let mut top_k = (0..query_count)
-                .map(|_| RawScoreTopK::new(1))
-                .collect::<Vec<_>>();
-            collect_raw_batch_vector_batch(
-                &batch,
-                &searches,
-                RawVectorMetric::Cosine,
-                &scoring_plan,
-                &mut top_k,
-            )
-            .unwrap();
-            for result in top_k.into_iter().map(RawScoreTopK::into_search_result) {
-                assert_eq!(
-                    result.row_ids,
-                    vec![11],
-                    "scale={scale}, query count={query_count}"
-                );
-                assert_eq!(result.scores, vec![1.0]);
-            }
+        for result in top_k.into_iter().map(RawScoreTopK::into_search_result) {
+            assert_eq!(result.row_ids, vec![11], "query count={query_count}");
+            assert_eq!(result.scores, vec![expected_score]);
         }
     }
 }
