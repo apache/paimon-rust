@@ -144,7 +144,7 @@ pub(super) struct Generation<'a> {
     pub(super) descriptor: Descriptor<'a>,
     pub(super) shards: BTreeMap<usize, &'a IndexManifestEntry>,
     pub(super) bitmaps: BTreeMap<usize, &'a IndexManifestEntry>,
-    pub(super) bitmap_schema: Option<i64>,
+    pub(super) bitmap_schema_id: Option<i64>,
     pub(super) vector_count: u64,
     pub(super) files: Vec<&'a IndexManifestEntry>,
 }
@@ -183,7 +183,7 @@ pub(super) fn group<'a>(
             let router = *router;
             let mut shards = BTreeMap::new();
             let mut bitmaps = BTreeMap::new();
-            let mut bitmap_schema = None;
+            let mut bitmap_schema_id = None;
             let mut vector_count = 0u64;
             let mut router_count = 0;
             let Role::Router(nlist) = descriptor.role else {
@@ -255,7 +255,7 @@ pub(super) fn group<'a>(
                         }
                         let schema_id =
                             super::centroid_bitmap::schema_id(desc.payload.ok_or_else(invalid)?)?;
-                        if bitmap_schema
+                        if bitmap_schema_id
                             .replace(schema_id)
                             .is_some_and(|previous| previous != schema_id)
                         {
@@ -285,7 +285,7 @@ pub(super) fn group<'a>(
                 descriptor: Descriptor::parse(&router.index_file)?.unwrap(),
                 shards,
                 bitmaps,
-                bitmap_schema,
+                bitmap_schema_id,
                 vector_count,
                 files: files.into_iter().map(|(entry, _)| entry).collect(),
             })

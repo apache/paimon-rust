@@ -23,14 +23,14 @@ use crate::btree::key_serde::normalize_key_literal;
 use crate::io::FileRead;
 use crate::spec::{
     validate_datum_matches_type, DataField, DataType, Datum, IndexFileMeta, Predicate,
-    PredicateOperator,
+    PredicateOperator, TableSchema,
 };
 use crate::table::{index_file_path::IndexFileLocation, Table};
-use crate::Result;
+use crate::{Error, Result};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use roaring::RoaringTreemap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -111,12 +111,7 @@ pub(super) enum BitmapPredicate {
 }
 
 impl BitmapPredicate {
-    fn bind(
-        predicate: &Predicate,
-        fields: &[DataField],
-        allowed: &[i32],
-        selected: &mut HashSet<i32>,
-    ) -> Option<Self> {
+    fn bind(predicate: &Predicate, fields: &[DataField], allowed: &[i32]) -> Option<Self> {
         match predicate {
             Predicate::Leaf {
                 column,
@@ -144,7 +139,6 @@ impl BitmapPredicate {
                     PredicateOperator::In => equality_literals(data_type, literals)?,
                     _ => return None,
                 };
-                selected.insert(field.id());
                 Some(Self::Leaf(
                     field.id(),
                     field.data_type().clone(),
@@ -155,7 +149,7 @@ impl BitmapPredicate {
             Predicate::And(children) | Predicate::Or(children) if !children.is_empty() => {
                 let bound = children
                     .iter()
-                    .map(|child| Self::bind(child, fields, allowed, selected))
+                    .map(|child| Self::bind(child, fields, allowed))
                     .collect::<Option<Vec<_>>>()?;
                 Some(if matches!(predicate, Predicate::And(_)) {
                     Self::And(bound)
@@ -167,12 +161,65 @@ impl BitmapPredicate {
         }
     }
 
+    fn matches_build_fields(&self, fields: &[DataField]) -> bool {
+        match self {
+            Self::Leaf(id, data_type, ..) => fields.iter().any(|field| {
+                field.id() == *id && field.data_type().equals_ignore_nullable(data_type)
+            }),
+            Self::And(children) | Self::Or(children) => children
+                .iter()
+                .all(|child| child.matches_build_fields(fields)),
+        }
+    }
+
+    async fn matches_build_schema(
+        &self,
+        table: &Table,
+        schema_id: i64,
+        catalog_schema: &mut Option<TableSchema>,
+    ) -> Result<bool> {
+        let error = match table.schema_manager().schema(schema_id).await {
+            Ok(schema) => {
+                return Ok(schema.id() == schema_id && self.matches_build_fields(schema.fields()));
+            }
+            Err(error) => error,
+        };
+        let Some(env) = table.rest_env() else {
+            return Err(error);
+        };
+        if !matches!(&error, Error::IoUnexpected { source, .. } if source.kind() == opendal::ErrorKind::NotFound)
+        {
+            return Err(error);
+        }
+        // The REST catalog can serve the latest schema without a schema file.
+        if env.identifier().parsed_object_name()?.branch_or_default() != table.branch() {
+            return Ok(false);
+        }
+        let schema = match catalog_schema {
+            Some(schema) => schema,
+            None => {
+                let response = env.current_table_identity_checked().await?;
+                let (Some(id), Some(schema)) = (response.schema_id, response.schema) else {
+                    return Err(centroid_index::invalid(
+                        "REST table response is missing schema or schema ID",
+                    ));
+                };
+                let schema = TableSchema::new(id, &schema);
+                schema.validate_resolved_structure()?;
+                table.schema_manager().cache_resolved_schema(schema.clone());
+                catalog_schema.insert(schema)
+            }
+        };
+        Ok(schema.id() == schema_id && self.matches_build_fields(schema.fields()))
+    }
+
     pub(super) async fn for_generation(
         table: &Table,
         group: &Generation<'_>,
         predicate: &Predicate,
+        catalog_schema: &mut Option<TableSchema>,
     ) -> Result<Option<Self>> {
-        let Some(schema_id) = group.bitmap_schema else {
+        let Some(schema_id) = group.bitmap_schema_id else {
             return Ok(None);
         };
         let allowed = group
@@ -184,26 +231,15 @@ impl BitmapPredicate {
             .extra_field_ids
             .as_deref()
             .unwrap_or_default();
-        let fields = table.schema().fields();
-        let mut selected = HashSet::new();
-        let Some(bound) = Self::bind(predicate, fields, allowed, &mut selected) else {
+        let Some(bound) = Self::bind(predicate, table.schema().fields(), allowed) else {
             return Ok(None);
         };
-        if schema_id != table.schema().id() {
-            let Ok(schema) = table.schema_manager().schema(schema_id).await else {
-                return Ok(None);
-            };
-            if selected.iter().any(|id| {
-                let current = fields.iter().find(|field| field.id() == *id).unwrap();
-                !schema.fields().iter().any(|field| {
-                    field.id() == *id
-                        && field
-                            .data_type()
-                            .equals_ignore_nullable(current.data_type())
-                })
-            }) {
-                return Ok(None);
-            }
+        if schema_id != table.schema().id()
+            && !bound
+                .matches_build_schema(table, schema_id, catalog_schema)
+                .await?
+        {
+            return Ok(None);
         }
         Ok(Some(bound))
     }
@@ -333,5 +369,65 @@ fn bitmap_error(error: std::io::Error) -> crate::Error {
     crate::Error::DataInvalid {
         message: format!("Cannot read centroid bitmap: {error}"),
         source: Some(Box::new(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::Identifier;
+    use crate::spec::{IntType, Schema};
+    use axum::{routing::get, Json, Router};
+
+    #[tokio::test]
+    async fn centroid_bitmap_accepts_only_the_requested_catalog_schema() {
+        let data_type = DataType::Int(IntType::new());
+        let schema = Schema::builder()
+            .column("key", data_type.clone())
+            .build()
+            .unwrap();
+        let response = serde_json::json!({
+            "database": "db", "name": "t", "id": "table-uuid", "schemaId": 0,
+            "path": "memory:/catalog-bitmap-schema",
+            "isExternal": false, "schema": schema,
+        });
+        let mut current = response.clone();
+        current["schemaId"] = 1.into();
+        let app = Router::new().route(
+            "/v1/databases/db/tables/t",
+            get(move || async move { Json(current) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut options = crate::Options::new();
+        options.set("uri", format!("http://{}", listener.local_addr().unwrap()));
+        options.set("warehouse", "test");
+        options.set("token.provider", "bear");
+        options.set("token", "test-token");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let predicate =
+            BitmapPredicate::Leaf(0, data_type, PredicateOperator::Eq, vec![Datum::Int(1)]);
+        // A loaded handle can be older after evolution or newer after rollback.
+        for loaded_id in [0, 2] {
+            let mut loaded = response.clone();
+            loaded["schemaId"] = loaded_id.into();
+            let table = Table::from_rest_response(
+                Identifier::new("db", "t"),
+                serde_json::from_value(loaded).unwrap(),
+                options.clone(),
+            )
+            .await
+            .unwrap();
+            let mut catalog_schema = None;
+            assert!(predicate
+                .matches_build_schema(&table, 1, &mut catalog_schema)
+                .await
+                .unwrap());
+            assert_eq!(table.schema_manager().cached_schema(1).unwrap().id(), 1);
+            assert!(!predicate
+                .matches_build_schema(&table, 3, &mut catalog_schema)
+                .await
+                .unwrap());
+        }
+        server.abort();
     }
 }

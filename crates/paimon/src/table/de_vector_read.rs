@@ -1136,10 +1136,15 @@ async fn evaluate_batch_vector_search_with_executor(
         .transpose()?;
     let mut bitmap_filters = HashMap::new();
     if let (Some(table), Some(filter)) = (evaluation.table, &scalar_filter) {
+        let mut catalog_schema = None;
         for (&name, group) in &centroid_files {
-            if let Some(bound) =
-                super::centroid_bitmap::BitmapPredicate::for_generation(table, group, filter)
-                    .await?
+            if let Some(bound) = super::centroid_bitmap::BitmapPredicate::for_generation(
+                table,
+                group,
+                filter,
+                &mut catalog_schema,
+            )
+            .await?
             {
                 bitmap_filters.insert(name, bound);
             }

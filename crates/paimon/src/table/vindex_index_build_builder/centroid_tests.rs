@@ -954,6 +954,95 @@ async fn centroid_bitmaps_allow_reusing_a_plan_with_a_different_filter() {
 }
 
 #[tokio::test]
+async fn centroid_bitmaps_check_referenced_fields_after_schema_changes() {
+    use crate::spec::{BigIntType, SchemaChange};
+
+    let path = "memory:/centroid_bitmap_schema_id";
+    let table = vindex_e2e_table(path, "4");
+    setup_dirs(table.file_io(), path).await;
+    write_vectors(&table, vec![10, 11], vec![vec![0., 0.], vec![1., 0.]]).await;
+    let mut options = centroid_options();
+    options.insert("ivf-flat.centroid.nlist".into(), "1".into());
+    options.insert("extra_fields".into(), r#"{"id":"bitmap"}"#.into());
+    table
+        .new_global_index_build_builder()
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat")
+        .with_options(options)
+        .execute()
+        .await
+        .unwrap();
+
+    let entries = active_entries(&table).await;
+    let groups = centroid_index::group(&entries).unwrap();
+    let group = &groups[0];
+    assert_eq!(group.bitmap_schema_id, Some(table.schema().id()));
+    table
+        .file_io()
+        .new_output(&table.schema_manager().schema_path(table.schema().id()))
+        .unwrap()
+        .write(serde_json::to_vec(table.schema()).unwrap().into())
+        .await
+        .unwrap();
+    let compatible_schema = table
+        .schema()
+        .apply_changes(vec![SchemaChange::rename_column("id".into(), "key".into())])
+        .unwrap();
+    let compatible = table
+        .copy_with_resolved_schema(compatible_schema, table.branch())
+        .unwrap();
+    let filter = PredicateBuilder::new(compatible.schema().fields())
+        .equal("key", Datum::Int(11))
+        .unwrap();
+    let result = compatible
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![0., 0.])
+        .with_limit(1)
+        .with_options(HashMap::from([(
+            "vector-index.post-filter.candidates-factor".into(),
+            "1".into(),
+        )]))
+        .with_filter(filter)
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(result.row_ids().unwrap().row_ids, [1]);
+
+    let changed_schema = compatible
+        .schema()
+        .apply_changes(vec![SchemaChange::update_column_type(
+            "key".into(),
+            DataType::BigInt(BigIntType::new()),
+        )])
+        .unwrap();
+    let changed = table
+        .copy_with_resolved_schema(changed_schema, table.branch())
+        .unwrap();
+    // The type change uses row filtering without opening the old Bitmap files.
+    for entry in group.bitmaps.values() {
+        table
+            .file_io()
+            .delete_file(&format!("{path}/index/{}", entry.index_file.file_name))
+            .await
+            .unwrap();
+    }
+    let filter = PredicateBuilder::new(changed.schema().fields())
+        .equal("key", Datum::Long(11))
+        .unwrap();
+    let result = changed
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![0., 0.])
+        .with_limit(1)
+        .with_filter(filter)
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(result.row_ids().unwrap().row_ids, [1]);
+}
+
+#[tokio::test]
 async fn centroid_bitmaps_read_java_sparse_sections() {
     use crate::spec::{Datum, PredicateOperator};
     use crate::table::centroid_bitmap::BitmapPredicate;
@@ -984,6 +1073,11 @@ async fn centroid_bitmaps_read_java_sparse_sections() {
             source_meta: None,
         }),
     };
+    let descriptor = Descriptor::parse(&file).unwrap().unwrap();
+    assert_eq!(
+        crate::table::centroid_bitmap::schema_id(descriptor.payload.unwrap()).unwrap(),
+        0
+    );
     let int = DataType::Int(IntType::new());
     let tenant = BitmapPredicate::Leaf(0, int.clone(), PredicateOperator::Eq, vec![Datum::Int(7)]);
     let status = BitmapPredicate::Leaf(2, int, PredicateOperator::In, vec![Datum::Int(1)]);
