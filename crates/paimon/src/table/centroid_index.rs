@@ -359,8 +359,11 @@ impl Router {
         }
         let metric = MetricType::from_code(read_u32(payload, 16, false)).ok_or_else(invalid)?;
         let centers = payload[ROUTER_HEADER..]
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(f32::from_le_bytes)
             .collect();
         Self::new(metric, dimension, centers)
     }
