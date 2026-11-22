@@ -146,7 +146,7 @@ public class VerifyRustSketchBitmapCompat {
         double rustAsJava = HllSketch.heapify(rustUnion).getEstimate();
         check("hll rust-bytes via Java heapify", Math.abs(rustAsJava - expected) < 1e-6);
 
-        double rustThenJava = hllUnionEstimate(rustUnion, javaA);
+        double rustThenJava = hllUnionEstimate(rustUnion, javaB);
         check("hll rust∪java estimate stable", Math.abs(rustThenJava - expected) < 1.0);
 
         byte[] empty = Files.readAllBytes(goldens.resolve("compat_hll_empty.bin"));
