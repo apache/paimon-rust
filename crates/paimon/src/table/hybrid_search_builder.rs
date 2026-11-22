@@ -892,19 +892,15 @@ impl<'a> HybridSearchBuilder<'a> {
     ) -> crate::Result<PkRoute> {
         let builder = self.vector_route_builder(table, route);
         let result = builder.execute().await?;
-        let cosine_distances = match self.ranker {
-            HybridSearchRanker::Rrf | HybridSearchRanker::Mrr => {
-                result.primary_key_cosine_distances()
-            }
-            HybridSearchRanker::WeightedScore => None,
-        };
+        let cosine_distances = result.primary_key_cosine_distances();
         let positions = result
             .positions()?
             .iter()
             .enumerate()
             .map(|(index, position)| {
-                // Rank-based fusion uses this key only for local order and ties.
-                // Negation preserves all distance distinctions, including near 0.
+                // Negation preserves distance order and ties for RRF and MRR.
+                // Min-max normalization also works on -distance because it
+                // cancels the constant in the public cosine score 1 - distance.
                 let score = cosine_distances.map_or(position.score, |distances| -distances[index]);
                 PrimaryKeySearchPosition::from_vector_position(position, score)
             })
@@ -1991,15 +1987,19 @@ mod pk_hybrid_tests {
         let query = [3.0, 4.0, 0.0, 0.0];
         let table = build_hybrid_table(
             "memory:/pk_hybrid_cosine_order",
-            &[0, 1],
-            &[[3.0015, 4.0, 0.0, 0.0], query],
-            &["nearby", "exact"],
+            &[0, 1, 2],
+            &[[3.0015, 4.0, 0.0, 0.0], query, [4.0, -3.0, 0.0, 0.0]],
+            &["nearby", "exact", "orthogonal"],
             &[("fields.embedding.pk-vector.distance.metric", "cosine")],
         )
         .await;
 
-        for ranker in [HybridSearchRanker::Rrf, HybridSearchRanker::Mrr] {
-            for route_limit in [1, 2] {
+        for ranker in [
+            HybridSearchRanker::Rrf,
+            HybridSearchRanker::Mrr,
+            HybridSearchRanker::WeightedScore,
+        ] {
+            for route_limit in [1, 2, 3] {
                 let mut builder = table.new_hybrid_search_builder();
                 builder
                     .add_vector_route(

@@ -18,7 +18,7 @@
 use std::cmp::Ordering;
 
 use num_bigint::{BigInt, BigUint, Sign};
-use num_traits::FromPrimitive;
+use num_traits::{FromPrimitive, ToPrimitive};
 
 use super::data_invalid;
 
@@ -217,7 +217,7 @@ fn cosine_score(query: &[f32], query_norm: f64, stored: &[f32], output: CosineOu
             return bounds.0;
         }
     }
-    output.round_exact(dot, query, stored, bounds, &mut Vec::new())
+    output.round_exact(dot, norm_product, query, stored, bounds, &mut Vec::new())
 }
 
 fn positively_proportional(query: &[f32], stored: &[f32]) -> bool {
@@ -293,7 +293,9 @@ impl CosineOutput {
         partials: &mut Vec<f64>,
     ) -> f32 {
         self.try_round_from_dot(dot_product, norm_product, query.len())
-            .unwrap_or_else(|bounds| self.round_exact(dot_product, query, stored, bounds, partials))
+            .unwrap_or_else(|bounds| {
+                self.round_exact(dot_product, norm_product, query, stored, bounds, partials)
+            })
     }
 
     #[inline]
@@ -351,9 +353,10 @@ impl CosineOutput {
     pub(crate) fn round_exact<T: Copy + Into<f64>>(
         self,
         dot_product: CosineDot,
+        norm_product: f64,
         query: &[T],
         stored: &[T],
-        bounds: (f32, f32),
+        mut bounds: (f32, f32),
         partials: &mut Vec<f64>,
     ) -> f32 {
         let dot = match dot_product {
@@ -362,6 +365,18 @@ impl CosineOutput {
         };
         if dot.sign() == Sign::NoSign {
             return self.value(0.0) as f32;
+        }
+        let recovered_dot = match (self, dot_product) {
+            (Self::Similarity, CosineDot::Approximate { .. }) => exact_dot_as_f64(&dot),
+            _ => None,
+        };
+        if let Some(dot) = recovered_dot {
+            // Cancellation error is gone. The approximate norms may already
+            // be sufficient to decide the rounded similarity.
+            match self.try_round_from_dot(CosineDot::Exact(dot), norm_product, query.len()) {
+                Ok(score) => return score,
+                Err((lower, upper)) => bounds = (bounds.0.max(lower), bounds.1.min(upper)),
+            }
         }
         let negative = dot.sign() == Sign::Minus;
         let norms_squared = exact_dot(query, query, partials).into_parts().1
@@ -453,6 +468,16 @@ fn scale_f32_product(value: f64) -> BigInt {
     BigInt::from_f64(value * 2.0_f64.powi(298)).expect("finite f32 products")
 }
 
+fn exact_dot_as_f64(dot: &BigInt) -> Option<f64> {
+    // The remaining bits must fit the f64 significand after removing the
+    // common power of two. Dot products are in units of 2^-298.
+    let significant_bits = dot.bits() - dot.trailing_zeros().unwrap_or(0);
+    if significant_bits > u64::from(f64::MANTISSA_DIGITS) {
+        return None;
+    }
+    dot.to_f64().map(|scaled| scaled * 2.0_f64.powi(-298))
+}
+
 fn inner_product(query: &[f32], stored: &[f32]) -> f32 {
     let mut dot = 0.0f32;
     for i in 0..query.len() {
@@ -472,6 +497,39 @@ mod tests {
     /// A negative NaN (sign bit set): `f32::total_cmp` would order this *before*
     /// every finite value; `java_float_compare` must order it *after*.
     const NEGATIVE_NAN: f32 = f32::from_bits(0xffc00000);
+
+    #[test]
+    fn test_recovered_dot_resolves_cosine_with_approximate_norms() {
+        let tiny = 2.0_f32.powi(-40);
+        let query = [1.0, tiny, 1.0];
+        let query_norm = cosine_norm(&query);
+        let mut partials = Vec::new();
+        let similarity = CosineOutput::Similarity;
+        for sign in [1.0, -1.0] {
+            let stored = [1.0, sign * tiny, -1.0];
+            let norm_product = query_norm * cosine_norm(&stored);
+            assert!(similarity
+                .try_round_from_dot(
+                    CosineDot::Approximate {
+                        value: 0.0,
+                        absolute_sum_bound: 2.0,
+                    },
+                    norm_product,
+                    query.len(),
+                )
+                .is_err());
+            let dot = exact_dot_as_f64(&exact_dot(&query, &stored, &mut partials)).unwrap();
+            assert_eq!(dot, f64::from(sign) * 2.0_f64.powi(-80));
+            let expected = sign * 2.0_f32.powi(-81);
+            assert_eq!(
+                similarity.try_round_from_dot(CosineDot::Exact(dot), norm_product, query.len()),
+                Ok(expected)
+            );
+            assert_eq!(cosine_similarity(&query, query_norm, &stored), expected);
+        }
+        let inexact = exact_dot(&[1.0, tiny], &[1.0, tiny], &mut partials);
+        assert_eq!(exact_dot_as_f64(&inexact), None);
+    }
 
     #[test]
     fn java_float_compare_sorts_all_nan_after_finite() {

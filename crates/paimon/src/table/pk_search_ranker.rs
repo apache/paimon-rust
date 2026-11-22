@@ -149,8 +149,9 @@ pub(crate) fn weighted_rrf(
     top_k(fused_scores, limit)
 }
 
-/// Fuses heterogeneous route scores after independently normalizing each route
-/// to `[0, 1]`. Mirrors Java `weightedScore`.
+/// Fuses heterogeneous route scores by normalizing each route to `[0, 1]`
+/// as in Java `weightedScore`. A single route keeps its input score order
+/// after normalization, including when distinct scores round to a tie.
 pub(crate) fn weighted_score(
     rankings: &[Ranking],
     limit: usize,
@@ -175,6 +176,17 @@ pub(crate) fn weighted_score(
             let normalized = f64::from(normalize_route_score(position.score(), min, max));
             *fused_scores.entry(position.clone()).or_insert(0.0) += ranking.weight() * normalized;
         }
+    }
+    if rankings.len() == 1 {
+        // Min-max normalization is monotone within one route. Use its input
+        // scores for ordering before the normalized scores round to f32.
+        let mut ranked: Vec<_> = fused_scores.into_iter().collect();
+        ranked.sort_by(|(left, _), (right, _)| best_first(left, right));
+        ranked.truncate(limit);
+        return ranked
+            .into_iter()
+            .map(|(position, score)| position.with_score(score as f32))
+            .collect();
     }
     top_k(fused_scores, limit)
 }

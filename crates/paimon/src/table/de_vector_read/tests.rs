@@ -478,36 +478,46 @@ fn test_raw_cosine_matrix_certifies_orthogonal_integer_dots() {
             }
         })
     };
-    let queries: Vec<_> = (0..4).flat_map(hadamard).collect();
-    let stored: Vec<_> = (4..20).flat_map(hadamard).collect();
-    let stored_norms: Vec<_> = stored
-        .chunks_exact(dimension)
-        .map(DenseCosineNorm::new)
-        .collect();
-    let query_norms = queries
-        .chunks_exact(dimension)
-        .map(cosine_norm)
-        .collect::<Vec<_>>();
-    assert!(integer_dot_is_exact(
-        max_abs_integer(&queries),
-        stored_norms[0].max_abs_integer,
-        dimension
-    ));
+    for (query_scale, stored_scale) in [
+        (1.0, 1.0),
+        (1.0 / 16.0, 1.0 / 16.0),
+        (1.0 / 16.0, 1.0 / 32.0),
+    ] {
+        let queries: Vec<_> = (0..4).flat_map(hadamard).map(|v| v * query_scale).collect();
+        let stored: Vec<_> = (4..20)
+            .flat_map(hadamard)
+            .map(|v| v * stored_scale)
+            .collect();
+        let stored_norms: Vec<_> = stored
+            .chunks_exact(dimension)
+            .map(DenseCosineNorm::new)
+            .collect();
+        let query_norms = queries
+            .chunks_exact(dimension)
+            .map(cosine_norm)
+            .collect::<Vec<_>>();
+        assert!(integer_dot_is_exact(
+            scaled_integer_max(&queries),
+            scaled_integer_max(&stored),
+            dimension
+        ));
+        let scores = compute_raw_cosine_score_matrix(
+            &stored,
+            &stored_norms,
+            &queries,
+            &query_norms,
+            &[0, 1, 2, 3],
+            dimension,
+        )
+        .unwrap();
+        assert_eq!(scores, vec![0.0; 4 * 16]);
+    }
     let large = 2.0_f64.powi(26);
     assert!(!integer_dot_is_exact(Some(large), Some(large), dimension));
-    assert_eq!(max_abs_integer(&[1.0, 0.25]), None);
-    assert_eq!(max_abs_integer(&[1.0, f64::INFINITY]), None);
-
-    let scores = compute_raw_cosine_score_matrix(
-        &stored,
-        &stored_norms,
-        &queries,
-        &query_norms,
-        &[0, 1, 2, 3],
-        dimension,
-    )
-    .unwrap();
-    assert_eq!(scores, vec![0.0; 4 * 16]);
+    assert_eq!(scaled_integer_max(&[1.0, 0.25]), Some(4.0));
+    assert_eq!(scaled_integer_max(&[-0.375, 0.25, -0.0]), Some(3.0));
+    assert_eq!(scaled_integer_max(&[2.0_f64.powi(53), 1.0]), None);
+    assert_eq!(scaled_integer_max(&[1.0, f64::INFINITY]), None);
 }
 
 #[test]

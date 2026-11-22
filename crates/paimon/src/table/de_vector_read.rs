@@ -63,6 +63,7 @@ use paimon_vindex_core::io::SeekRead;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
@@ -3216,7 +3217,7 @@ struct DenseCosineNorm {
     length: f64,
     mixed_signs: bool,
     at_most_one_nonzero: bool,
-    max_abs_integer: Option<f64>,
+    scaled_integer_max: OnceCell<Option<f64>>,
 }
 
 impl DenseCosineNorm {
@@ -3225,7 +3226,7 @@ impl DenseCosineNorm {
             length: cosine_norm(vector),
             mixed_signs: has_mixed_signs(vector),
             at_most_one_nonzero: has_at_most_one_nonzero(vector),
-            max_abs_integer: max_abs_integer(vector),
+            scaled_integer_max: OnceCell::new(),
         }
     }
 }
@@ -3242,20 +3243,44 @@ fn has_at_most_one_nonzero(vector: &[f64]) -> bool {
         .is_none()
 }
 
-fn max_abs_integer(vector: &[f64]) -> Option<f64> {
-    let mut maximum = 0.0_f64;
+/// Largest absolute coefficient after dividing a vector by the common power
+/// of two at its least significant set bit.
+fn scaled_integer_max(vector: &[f64]) -> Option<f64> {
+    const FRACTION_BITS: u32 = f64::MANTISSA_DIGITS - 1;
+    const FRACTION_MASK: u64 = (1 << FRACTION_BITS) - 1;
+    const EXPONENT_BIAS: i32 = 1023;
+    let mut maximum = 0_u64;
+    let mut least_exponent = i32::MAX;
     for &value in vector {
-        if value.fract() != 0.0 {
+        let magnitude = value.abs().to_bits();
+        if magnitude == 0 {
+            continue;
+        }
+        let exponent = (magnitude >> FRACTION_BITS) as i32;
+        // Nonzero finite f32 coordinates are normal after widening to f64.
+        if exponent == 0 || exponent == 0x7ff {
             return None;
         }
-        maximum = maximum.max(value.abs());
+        let low_bit = magnitude.trailing_zeros().min(FRACTION_BITS);
+        least_exponent =
+            least_exponent.min(exponent - EXPONENT_BIAS - (FRACTION_BITS - low_bit) as i32);
+        maximum = maximum.max(magnitude);
     }
-    Some(maximum)
+    if maximum == 0 {
+        return Some(0.0);
+    }
+    let scaled_exponent = (maximum >> FRACTION_BITS) as i32 - least_exponent;
+    if scaled_exponent >= EXPONENT_BIAS + f64::MANTISSA_DIGITS as i32 {
+        return None;
+    }
+    Some(f64::from_bits(
+        ((scaled_exponent as u64) << FRACTION_BITS) | (maximum & FRACTION_MASK),
+    ))
 }
 
 fn integer_dot_is_exact(query_max: Option<f64>, stored_max: Option<f64>, dimension: usize) -> bool {
-    // Every partial sum of the integer products fits in the f64 significand
-    // when the sum of their absolute magnitudes is below 2^53.
+    // All products share a power-of-two scale. Every partial sum of their
+    // integer coefficients fits in f64 when the absolute sum is below 2^53.
     const F64_INTEGER_LIMIT: f64 = (1_u64 << f64::MANTISSA_DIGITS) as f64;
     query_max
         .zip(stored_max)
@@ -3291,25 +3316,19 @@ fn compute_raw_cosine_score_matrix(
         let query_norm = query_norms[query_index];
         let query_mixed_signs = has_mixed_signs(query);
         let query_at_most_one_nonzero = has_at_most_one_nonzero(query);
-        let query_max_abs_integer = max_abs_integer(query);
+        let query_scaled_integer_max = OnceCell::new();
         for ((stored, stored_norm), &dot) in stored_vectors
             .chunks_exact(dimension)
             .zip(stored_norms)
             .zip(query_dots)
         {
             let norm_product = query_norm * stored_norm.length;
-            // A single product or a sufficiently small integer sum is exact.
+            // A single product is exact.
             // With uniform product signs, estimate the absolute sum from the
             // dot. Otherwise use the norm product (Cauchy-Schwarz).
-            let exact = query_at_most_one_nonzero
-                || stored_norm.at_most_one_nonzero
-                || integer_dot_is_exact(
-                    query_max_abs_integer,
-                    stored_norm.max_abs_integer,
-                    dimension,
-                );
+            let exact = query_at_most_one_nonzero || stored_norm.at_most_one_nonzero;
             let may_cancel = !exact && (query_mixed_signs || stored_norm.mixed_signs);
-            let dot = if exact {
+            let dot_product = if exact {
                 CosineDot::Exact(dot)
             } else {
                 CosineDot::Approximate {
@@ -3317,13 +3336,38 @@ fn compute_raw_cosine_score_matrix(
                     absolute_sum_bound: if may_cancel { norm_product } else { dot.abs() },
                 }
             };
-            let score = match similarity.try_round_from_dot(dot, norm_product, dimension) {
+            let score = match similarity.try_round_from_dot(dot_product, norm_product, dimension) {
                 Ok(score) => score,
+                Err(_)
+                    if !exact
+                        && integer_dot_is_exact(
+                            *query_scaled_integer_max.get_or_init(|| scaled_integer_max(query)),
+                            *stored_norm
+                                .scaled_integer_max
+                                .get_or_init(|| scaled_integer_max(stored)),
+                            dimension,
+                        ) =>
+                {
+                    similarity.round_from_dot(
+                        CosineDot::Exact(dot),
+                        norm_product,
+                        query,
+                        stored,
+                        &mut partials,
+                    )
+                }
                 Err(_) if may_cancel => {
                     needs_tighter_bound.push(scores.len());
                     0.0
                 }
-                Err(bounds) => similarity.round_exact(dot, query, stored, bounds, &mut partials),
+                Err(bounds) => similarity.round_exact(
+                    dot_product,
+                    norm_product,
+                    query,
+                    stored,
+                    bounds,
+                    &mut partials,
+                ),
             };
             scores.push(score);
         }
