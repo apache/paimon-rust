@@ -2998,6 +2998,29 @@ Automatic inner-product routing searches all centroids. The layout is stored
 in the index manifest and is available when searching Java-built indexes.
 The current native DiskANN reader supports up to 1,024 dimensions.
 
+### Bitmap Filters in Centroid Shards
+
+Supply a JSON object named `extra_fields` when building a centroid index to
+index scalar columns alongside each populated vector shard:
+
+```sql
+CALL sys.create_global_index(
+    table => 'my_db.items',
+    index_column => 'embedding',
+    index_type => 'ivf-flat',
+    options => 'ivf-flat.sharding=centroid,ivf-flat.dimension=4',
+    extra_fields => '{"tenant_id":"bitmap","status":"bitmap"}'
+);
+```
+
+In Rust, pass the same JSON as the `extra_fields` build option.
+A search can prefilter exactly with equality, `IN`, `IS NULL`, `IS NOT NULL`,
+and `AND` or `OR` over those predicates, including across columns. An eligible
+shard with no visible matches can skip its ANN file. Unsupported predicates
+and incompatible schema changes use the ordinary scalar filtering path.
+Rebuilding replaces the selected partitions' groups. Dropping the index on
+the vector column also drops its Bitmap files.
+
 ### MultiVector MaxSim
 
 On Data Evolution append tables, a range-sharded cosine index can search an
@@ -3020,29 +3043,6 @@ embedding lists. The default matrix candidate multiplier is four. A single
 query vector uses its best matching embedding and a default multiplier of
 one. Set `refine_factor` to override the multiplier. The Rust and Python
 single-search builders expose `with_multi_vector` for a query matrix.
-
-### Bitmap Filters in Centroid Shards
-
-Supply a JSON object named `extra_fields` when building a centroid index to
-index scalar columns alongside each populated vector shard:
-
-```sql
-CALL sys.create_global_index(
-    table => 'my_db.items',
-    index_column => 'embedding',
-    index_type => 'ivf-flat',
-    options => 'ivf-flat.sharding=centroid,ivf-flat.dimension=4',
-    extra_fields => '{"tenant_id":"bitmap","status":"bitmap"}'
-);
-```
-
-The Rust build builder accepts the same JSON through the `extra_fields` option.
-A search can prefilter exactly with equality, `IN`, `IS NULL`, `IS NOT NULL`,
-and `AND` or `OR` over those predicates, including across columns. An eligible
-shard with no visible matches can skip its ANN file. Unsupported predicates
-and incompatible schema changes use the ordinary scalar filtering path.
-Rebuilding replaces the selected partitions' groups. Dropping the index on
-the vector column also drops its Bitmap files.
 
 ### Scalar Pre-Filters
 

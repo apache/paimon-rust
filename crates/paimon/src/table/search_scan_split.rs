@@ -118,7 +118,7 @@ pub(super) async fn global_search_splits(
         .cloned()
         .collect::<Vec<_>>();
     let mut grouped = BTreeMap::<(i64, i64), Vec<IndexFileMeta>>::new();
-    for entry in &selected {
+    for entry in selected {
         let meta = entry.index_file.global_index_meta.as_ref().unwrap();
         grouped
             .entry((meta.row_range_start, meta.row_range_end))
@@ -198,35 +198,6 @@ pub(super) async fn global_search_splits(
                         .collect(),
                 );
                 scalar_ranges = intersect_sorted_ranges(&scalar_ranges, &indexed);
-            }
-            if !scalar_ranges.is_empty()
-                && selected
-                    .iter()
-                    .any(|entry| super::centroid_index::Descriptor::is_wrapped(&entry.index_file))
-            {
-                let mut bitmap_ranges = vec![];
-                for generation in super::centroid_index::group(selected.iter().copied())? {
-                    if super::centroid_bitmap::BitmapPredicate::for_generation(
-                        table,
-                        &generation,
-                        filter,
-                    )
-                    .await?
-                    .is_some()
-                    {
-                        let meta = generation
-                            .router
-                            .index_file
-                            .global_index_meta
-                            .as_ref()
-                            .unwrap();
-                        bitmap_ranges.push(RowRange::new(meta.row_range_start, meta.row_range_end));
-                    }
-                }
-                scalar_ranges = super::source::exclude_row_ranges(
-                    &scalar_ranges,
-                    &merge_row_ranges(bitmap_ranges),
-                );
             }
             raw_ranges.extend(scalar_ranges);
         }

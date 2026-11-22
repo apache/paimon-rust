@@ -19,6 +19,7 @@
 
 use super::bitmap_global_index_reader::BitmapGlobalIndexReader;
 use super::centroid_index::{self, Descriptor, Generation};
+use crate::btree::key_serde::normalize_key_literal;
 use crate::io::FileRead;
 use crate::spec::{DataField, DataType, Datum, IndexFileMeta, Predicate, PredicateOperator};
 use crate::table::{index_file_path::IndexFileLocation, Table};
@@ -126,23 +127,23 @@ impl BitmapPredicate {
                 {
                     return None;
                 }
-                let (operator, values) = match op {
+                let values = match op {
                     PredicateOperator::IsNull | PredicateOperator::IsNotNull
                         if literals.is_empty() =>
                     {
-                        (*op, vec![])
+                        vec![]
                     }
                     PredicateOperator::Eq if literals.len() == 1 => {
-                        equality_literals(*op, data_type, literals)?
+                        equality_literals(data_type, literals)?
                     }
-                    PredicateOperator::In => equality_literals(*op, data_type, literals)?,
+                    PredicateOperator::In => equality_literals(data_type, literals)?,
                     _ => return None,
                 };
                 selected.insert(field.id());
                 Some(Self::Leaf(
                     field.id(),
                     field.data_type().clone(),
-                    operator,
+                    *op,
                     values,
                 ))
             }
@@ -284,34 +285,21 @@ impl BitmapPredicate {
     }
 }
 
-fn equality_literals(
-    op: PredicateOperator,
-    data_type: &DataType,
-    literals: &[Datum],
-) -> Option<(PredicateOperator, Vec<Datum>)> {
-    if !matches!(data_type, DataType::Float(_) | DataType::Double(_)) {
-        return Some((op, literals.to_vec()));
-    }
-    // Rust row equality treats signed zeros as equal and NaN as unequal.
-    // Java's Bitmap dictionary keeps the two zeros in separate postings.
-    let mut normalized = Vec::new();
-    for literal in literals {
-        match literal {
-            Datum::Float(value) if value.is_nan() => {}
-            Datum::Double(value) if value.is_nan() => {}
-            Datum::Float(value) if *value == 0.0 => {
-                normalized.extend([Datum::Float(0.0), Datum::Float(-0.0)])
-            }
-            Datum::Double(value) if *value == 0.0 => {
-                normalized.extend([Datum::Double(0.0), Datum::Double(-0.0)])
-            }
-            // Task JSON cannot preserve a non-finite literal.
-            Datum::Float(value) if !value.is_finite() => return None,
-            Datum::Double(value) if !value.is_finite() => return None,
-            _ => normalized.push(literal.clone()),
+fn equality_literals(data_type: &DataType, literals: &[Datum]) -> Option<Vec<Datum>> {
+    let mut normalized = literals.to_vec();
+    for literal in &mut normalized {
+        // Preserve signed zero for Arrow's value comparison. Non-finite
+        // literals can have a different dictionary representation.
+        let finite = match literal {
+            Datum::Float(value) => value.is_finite(),
+            Datum::Double(value) => value.is_finite(),
+            _ => true,
+        };
+        if !finite || !normalize_key_literal(literal, data_type) {
+            return None;
         }
     }
-    Some((PredicateOperator::In, normalized))
+    Some(normalized)
 }
 
 struct SectionRead {

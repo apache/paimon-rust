@@ -1541,6 +1541,11 @@ async fn evaluate_batch_vector_search_with_executor(
             ranges
         };
         raw_ranges = merge_row_ranges(raw_ranges);
+        if sources.is_some() {
+            // A source plan can be reused with a different predicate. Only
+            // skip raw recovery for the Bitmap filters bound by this reader.
+            raw_ranges = super::source::exclude_row_ranges(&raw_ranges, &bitmap_ranges);
+        }
         if !raw_ranges.is_empty() {
             let table = evaluation.table.ok_or_else(|| crate::Error::DataInvalid {
                 message: "Vector raw search requires table context".to_string(),

@@ -181,7 +181,8 @@ pub(super) async fn execute_work(
     range_read_limiter: RangeReadLimiter,
     batch_parallelism: usize,
 ) -> Result<(Vec<ScoredRowIds>, IndexSearchTiming)> {
-    let allow_buffered_read = work.queries.len() > 1 || work.filter.is_some();
+    let allow_buffered_read =
+        work.queries.len() > 1 || work.filter.is_some() || work.bitmap.is_some();
     if work.centroid_files.is_empty() {
         if Descriptor::is_wrapped(&work.entry.index_file) || work.bitmap.is_some() {
             return Err(centroid_index::invalid(

@@ -673,13 +673,20 @@ async fn centroid_bitmaps_prefilter_or_before_ranking_and_drop_with_the_vector_c
             ),
         ]));
     let plan = search.new_scan().unwrap().plan().await.unwrap();
-    let result = search
-        .new_read()
-        .unwrap()
-        .read_with_executor(plan, &Worker(&table))
+    let read = search.new_read().unwrap();
+    let result = read
+        .read_with_executor(plan.clone(), &Worker(&table))
         .await
         .unwrap();
     assert_eq!(result.row_ids().unwrap().row_ids, [1, 2]);
+    let buffered = std::thread::scope(|scope| {
+        scope
+            .spawn(|| futures::executor::block_on(read.read(plan)))
+            .join()
+            .unwrap()
+    })
+    .unwrap();
+    assert_eq!(buffered.row_ids().unwrap().row_ids, [1, 2]);
 
     options.insert("extra_fields".into(), r#"{"status":"bitmap"}"#.into());
     build.with_options(options);
@@ -705,6 +712,190 @@ async fn centroid_bitmaps_prefilter_or_before_ranking_and_drop_with_the_vector_c
         .with_index_column("embedding")
         .with_index_type("ivf-flat");
     assert_eq!(drop_index.execute().await.unwrap(), 5);
+}
+
+#[tokio::test]
+async fn centroid_bitmaps_compare_numeric_literals_by_value() {
+    use crate::spec::{DecimalType, FloatType, TimestampType};
+    use arrow_array::{Decimal128Array, Float32Array, TimestampMillisecondArray};
+
+    let path = "memory:/centroid_bitmap_numeric_keys";
+    let schema = vindex_schema_builder(vindex_e2e_options("8"))
+        .column("ratio", DataType::Float(FloatType::new()))
+        .column("amount", DataType::Decimal(DecimalType::new(4, 1).unwrap()))
+        .column(
+            "event_time",
+            DataType::Timestamp(TimestampType::new(3).unwrap()),
+        )
+        .build()
+        .unwrap();
+    let table = test_table_with_io(FileIOBuilder::new("memory").build().unwrap(), path, schema);
+    setup_dirs(table.file_io(), path).await;
+    let vectors = build_vector_batch(vec![0, 1], vec![vec![0., 0.], vec![1., 0.]]);
+    let mut fields = vectors.schema().fields().to_vec();
+    let mut columns = vectors.columns().to_vec();
+    for (name, column) in [
+        (
+            "ratio",
+            Arc::new(Float32Array::from(vec![-0.0, 0.0])) as ArrayRef,
+        ),
+        (
+            "amount",
+            Arc::new(
+                Decimal128Array::from(vec![100, 10])
+                    .with_precision_and_scale(4, 1)
+                    .unwrap(),
+            ),
+        ),
+        (
+            "event_time",
+            Arc::new(TimestampMillisecondArray::from(vec![1000, 2000])),
+        ),
+    ] {
+        fields.push(Arc::new(ArrowField::new(
+            name,
+            column.data_type().clone(),
+            true,
+        )));
+        columns.push(column);
+    }
+    let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap();
+    let mut write = TableWrite::new(&table, "centroid-numeric-data".into()).unwrap();
+    write.write_arrow_batch(&batch).await.unwrap();
+    TableCommit::new(table.clone(), "centroid-numeric-data".into())
+        .commit(write.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    let mut options = centroid_options();
+    options.insert("ivf-flat.centroid.nlist".into(), "1".into());
+    options.insert(
+        "extra_fields".into(),
+        r#"{"ratio":"bitmap","amount":"bitmap","event_time":"bitmap"}"#.into(),
+    );
+    table
+        .new_global_index_build_builder()
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat")
+        .with_options(options)
+        .execute()
+        .await
+        .unwrap();
+
+    let predicate = PredicateBuilder::new(table.schema().fields());
+    for (column, literal, expected) in [
+        ("ratio", Datum::Float(0.0), &[1][..]),
+        (
+            "amount",
+            Datum::Decimal {
+                unscaled: 100,
+                precision: 4,
+                scale: 2,
+            },
+            &[1][..],
+        ),
+        (
+            "event_time",
+            Datum::Timestamp {
+                millis: 1000,
+                nanos: 500_000,
+            },
+            &[][..],
+        ),
+    ] {
+        let mut search = table.new_vector_search_builder();
+        search
+            .with_vector_column("embedding")
+            .with_query_vector(vec![0., 0.])
+            .with_limit(1)
+            .with_filter(predicate.equal(column, literal).unwrap());
+        let plan = search.new_scan().unwrap().plan().await.unwrap();
+        let result = search
+            .new_read()
+            .unwrap()
+            .read_with_executor(plan, &Worker(&table))
+            .await
+            .unwrap();
+        assert_eq!(result.row_ids().unwrap().row_ids, expected, "{column}");
+    }
+}
+
+#[tokio::test]
+async fn centroid_bitmaps_allow_reusing_a_plan_with_a_different_filter() {
+    let path = "memory:/centroid_bitmap_reused_plan";
+    let mut options = vindex_e2e_options("8");
+    options.insert("vector-index.search-mode".into(), "fast".into());
+    options.insert("scalar-index.prefilter.search-mode".into(), "full".into());
+    let schema = vindex_schema_builder(options)
+        .column("pt", DataType::Int(IntType::new()))
+        .partition_keys(["pt"])
+        .build()
+        .unwrap();
+    let table = test_table_with_io(FileIOBuilder::new("memory").build().unwrap(), path, schema);
+    setup_dirs(table.file_io(), path).await;
+    for (pt, id, coordinate) in [(0, 10, 0.0), (1, 20, 100.0)] {
+        let vectors = build_vector_batch(
+            vec![id, id + 1],
+            vec![vec![coordinate, 0.], vec![coordinate + 1., 0.]],
+        );
+        let mut fields = vectors.schema().fields().to_vec();
+        fields.push(Arc::new(ArrowField::new("pt", ArrowDataType::Int32, true)));
+        let mut columns = vectors.columns().to_vec();
+        columns.push(Arc::new(Int32Array::from(vec![pt; 2])));
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap();
+        let mut write = TableWrite::new(&table, "centroid-bitmap-partitions".into()).unwrap();
+        write.write_arrow_batch(&batch).await.unwrap();
+        TableCommit::new(table.clone(), "centroid-bitmap-partitions".into())
+            .commit(write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+    }
+    let predicate = PredicateBuilder::new(table.schema().fields());
+    let mut options = centroid_options();
+    options.insert("extra_fields".into(), r#"{"id":"bitmap"}"#.into());
+    for (column, kind, pt, options) in [
+        ("embedding", "ivf-flat", 0, options),
+        (
+            "embedding",
+            "ivf-flat",
+            1,
+            HashMap::from([("ivf-flat.metric".into(), "l2".into())]),
+        ),
+        ("id", "btree", 1, HashMap::new()),
+    ] {
+        table
+            .new_global_index_build_builder()
+            .with_index_column(column)
+            .with_index_type(kind)
+            .with_options(options)
+            .with_partition_filter(predicate.equal("pt", Datum::Int(pt)).unwrap())
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+    }
+
+    let plan = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_filter(predicate.equal("id", Datum::Int(10)).unwrap())
+        .new_scan()
+        .unwrap()
+        .plan()
+        .await
+        .unwrap();
+    let result = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![0., 0.])
+        .with_limit(1)
+        .with_filter(predicate.greater_than("id", Datum::Int(9)).unwrap())
+        .new_read()
+        .unwrap()
+        .read(plan)
+        .await
+        .unwrap();
+    assert_eq!(result.row_ids().unwrap().row_ids, [0]);
 }
 
 #[tokio::test]
