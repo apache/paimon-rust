@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::centroid_bitmap::{BitmapBuild, BitmapSpill, BitmapSpillReader};
 use super::extraction::data_split_for_shard;
 use super::validation::checked_training_vector_count;
 use super::VindexIndexBuildBuilder;
@@ -40,6 +41,7 @@ use std::collections::HashMap;
 pub(in crate::table) struct CentroidBuildOptions {
     nlist: String,
     max_points_per_centroid: Option<String>,
+    pub(super) bitmap: Option<BitmapBuild>,
 }
 
 impl CentroidBuildOptions {
@@ -75,6 +77,7 @@ impl CentroidBuildOptions {
                 Ok(Some(Self {
                     nlist: nlist.into(),
                     max_points_per_centroid,
+                    bitmap: None,
                 }))
             }
             Some(value) => Err(centroid_index::invalid(format!(
@@ -87,6 +90,17 @@ impl CentroidBuildOptions {
         if !table.schema().core_options().data_evolution_enabled() {
             return Err(centroid_index::invalid(
                 "Centroid sharding requires a Data Evolution table",
+            ));
+        }
+        if self.bitmap.is_some()
+            && table
+                .schema()
+                .core_options()
+                .global_index_column_update_action()?
+                == crate::spec::GlobalIndexColumnUpdateAction::Ignore
+        {
+            return Err(centroid_index::invalid(
+                "Centroid Bitmap fields require THROW_ERROR or DROP_PARTITION_INDEX",
             ));
         }
         Ok(())
@@ -178,16 +192,32 @@ impl VindexIndexBuildBuilder<'_> {
         centroid: CentroidBuildOptions,
     ) -> Result<CommitMessage> {
         let mut read_builder = self.table.new_read_builder();
-        read_builder.with_projection(&[column, ROW_ID_FIELD_NAME])?;
+        let mut projection = vec![column, ROW_ID_FIELD_NAME];
+        if let Some(bitmap) = &centroid.bitmap {
+            projection.extend(bitmap.fields().map(|field| field.name()));
+        }
+        read_builder.with_projection(&projection)?;
         let read = read_builder.new_read()?;
         let mut batches = read.to_arrow(&[data_split_for_shard(shard)?])?;
         let mut spill = VectorSpill::new(
             RowRange::new(shard.row_range_start, shard.row_range_end),
             options.dimension(),
         )?;
+        let mut bitmap_spill = centroid
+            .bitmap
+            .as_ref()
+            .map(|_| BitmapSpill::new())
+            .transpose()?;
         while let Some(batch) = batches.try_next().await? {
             spill.push_batch(&batch, column, false).await?;
+            if let (Some(bitmap), Some(bitmap_spill)) = (&centroid.bitmap, &mut bitmap_spill) {
+                bitmap_spill.record(bitmap, &batch, column).await?;
+            }
         }
+        let bitmap_spill = match bitmap_spill {
+            Some(spill) => Some(spill.finish().await?),
+            None => None,
+        };
 
         let model_id = uuid::Uuid::new_v4().to_string();
         let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);
@@ -198,6 +228,7 @@ impl VindexIndexBuildBuilder<'_> {
                 options,
                 centroid,
                 spill,
+                bitmap_spill,
                 &model_id,
                 &mut message.new_index_files,
             )
@@ -221,9 +252,16 @@ impl VindexIndexBuildBuilder<'_> {
         options: &VindexVectorIndexOptions,
         centroid: CentroidBuildOptions,
         spill: VectorSpill,
+        mut bitmap_spill: Option<BitmapSpillReader>,
         model_id: &str,
         files: &mut Vec<IndexFileMeta>,
     ) -> Result<()> {
+        let version = if centroid.bitmap.is_some() { 2 } else { 1 };
+        let extra_fields = centroid
+            .bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.fields().map(|field| field.id()).collect::<Vec<_>>())
+            .unwrap_or_default();
         let metric = &options.native_options["metric"];
         let router_meta = json_options(&options.native_options)?;
         let (nlist, model_file) = if let Some(mut spill) = spill.finish().await? {
@@ -242,13 +280,38 @@ impl VindexIndexBuildBuilder<'_> {
             .await
             .map_err(task_error)??;
             for id in 0..router.nlist() {
-                let (next_routed, rows) = tokio::task::spawn_blocking(move || {
-                    let rows = routed.partition(id)?;
-                    Ok::<_, Error>((routed, rows))
-                })
-                .await
-                .map_err(task_error)??;
+                let bitmap = centroid.bitmap.clone();
+                let (next_routed, next_bitmap_spill, rows, sorted) =
+                    tokio::task::spawn_blocking(move || {
+                        let mut rows = routed.partition(id)?;
+                        let sorted = match (rows.as_mut(), bitmap.as_ref(), bitmap_spill.as_mut()) {
+                            (Some(rows), Some(bitmap), Some(spill)) => {
+                                Some(spill.sort(bitmap, rows.local_row_ids()?)?)
+                            }
+                            _ => None,
+                        };
+                        Ok::<_, Error>((routed, bitmap_spill, rows, sorted))
+                    })
+                    .await
+                    .map_err(task_error)??;
                 routed = next_routed;
+                bitmap_spill = next_bitmap_spill;
+                if let (Some(bitmap), Some(sorted), Some(rows)) = (&centroid.bitmap, sorted, &rows)
+                {
+                    let row_count = rows.vector_count() as i64;
+                    let file = self
+                        .centroid_file_writer(shard, field_id, &extra_fields)
+                        .await?
+                        .write(self.table, |output| async move {
+                            bitmap
+                                .write(output, sorted, row_count, model_id, id)
+                                .await
+                                .map(Some)
+                        })
+                        .await?
+                        .expect("centroid bitmap always writes a payload");
+                    files.push(file);
+                }
                 let mut payload = HashMap::new();
                 let (count, index) = match rows {
                     Some(rows) => {
@@ -285,9 +348,10 @@ impl VindexIndexBuildBuilder<'_> {
                     self.write_centroid_file(
                         shard,
                         field_id,
+                        &extra_fields,
                         Descriptor {
                             model_id,
-                            version: 1,
+                            version,
                             role: Role::Shard(id),
                             payload: Some(&metadata),
                         },
@@ -306,9 +370,10 @@ impl VindexIndexBuildBuilder<'_> {
             self.write_centroid_file(
                 shard,
                 field_id,
+                &extra_fields,
                 Descriptor {
                     model_id,
-                    version: 1,
+                    version,
                     role: Role::Router(nlist),
                     payload: Some(&router_meta),
                 },
@@ -326,11 +391,34 @@ impl VindexIndexBuildBuilder<'_> {
         &self,
         shard: &VectorIndexShard,
         field_id: i32,
+        extra_fields: &[i32],
         descriptor: Descriptor<'_>,
         row_count: i64,
         writer: Option<VectorIndexWriter>,
         bytes: Vec<u8>,
     ) -> Result<IndexFileMeta> {
+        let index_meta = descriptor.encode()?;
+        self.centroid_file_writer(shard, field_id, extra_fields)
+            .await?
+            .write(self.table, |output| async move {
+                match writer {
+                    Some(writer) => serialize_writer(writer, output).await?,
+                    None => output.write(bytes.into()).await?,
+                }
+                Ok(Some(IndexPayload {
+                    row_count,
+                    index_meta,
+                }))
+            })
+            .await
+            .map(|result| result.expect("centroid index always writes a payload"))
+    }
+    async fn centroid_file_writer(
+        &self,
+        shard: &VectorIndexShard,
+        field_id: i32,
+        extra_fields: &[i32],
+    ) -> Result<IndexFileWriter> {
         let file_name = format!(
             "vector-{}-global-index-{}.index",
             self.index_type,
@@ -340,11 +428,10 @@ impl VindexIndexBuildBuilder<'_> {
             row_range_start: shard.row_range_start,
             row_range_end: shard.row_range_end,
             index_field_id: field_id,
-            extra_field_ids: None,
+            extra_field_ids: (!extra_fields.is_empty()).then(|| extra_fields.to_vec()),
             source_meta: Some(DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize()),
             index_meta: None,
         };
-        let index_meta = descriptor.encode()?;
         IndexFileWriter::new(
             self.table,
             &self.index_type,
@@ -355,19 +442,7 @@ impl VindexIndexBuildBuilder<'_> {
             "",
             meta,
         )
-        .await?
-        .write(self.table, |output| async move {
-            match writer {
-                Some(writer) => serialize_writer(writer, output).await?,
-                None => output.write(bytes.into()).await?,
-            }
-            Ok(Some(IndexPayload {
-                row_count,
-                index_meta,
-            }))
-        })
         .await
-        .map(|result| result.expect("centroid index always writes a payload"))
     }
 }
 

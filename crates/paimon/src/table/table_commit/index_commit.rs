@@ -317,8 +317,12 @@ impl TableCommit {
                 if retained_meta.index_field_id == added_meta.index_field_id
                     && retained.index_file.index_type == added.index_file.index_type
                     && same_extra_field_ids(
-                        retained_meta.extra_field_ids.as_deref(),
-                        added_meta.extra_field_ids.as_deref(),
+                        crate::table::centroid_index::index_identity_extra_fields(
+                            &retained.index_file,
+                        ),
+                        crate::table::centroid_index::index_identity_extra_fields(
+                            &added.index_file,
+                        ),
                     )
                     && ranges_overlap(
                         retained_meta.row_range_start,
@@ -368,8 +372,10 @@ impl TableCommit {
                 if left_meta.index_field_id == right_meta.index_field_id
                     && left.index_file.index_type == right.index_file.index_type
                     && same_extra_field_ids(
-                        left_meta.extra_field_ids.as_deref(),
-                        right_meta.extra_field_ids.as_deref(),
+                        crate::table::centroid_index::index_identity_extra_fields(&left.index_file),
+                        crate::table::centroid_index::index_identity_extra_fields(
+                            &right.index_file,
+                        ),
                     )
                     && ranges_overlap(
                         left_meta.row_range_start,

@@ -60,6 +60,15 @@ impl<'a> Descriptor<'a> {
             .is_some_and(|bytes| bytes.starts_with(META_MAGIC))
     }
 
+    pub(super) fn has_bitmaps(file: &IndexFileMeta) -> bool {
+        file.global_index_meta
+            .as_ref()
+            .and_then(|meta| meta.index_meta.as_deref())
+            .is_some_and(|bytes| {
+                bytes.starts_with(META_MAGIC) && bytes.get(META_MAGIC.len()) == Some(&2)
+            })
+    }
+
     pub(super) fn parse(file: &'a IndexFileMeta) -> Result<Option<Self>> {
         let Some(bytes) = file
             .global_index_meta
@@ -134,6 +143,8 @@ pub(super) struct Generation<'a> {
     pub(super) router: &'a IndexManifestEntry,
     pub(super) descriptor: Descriptor<'a>,
     pub(super) shards: BTreeMap<usize, &'a IndexManifestEntry>,
+    pub(super) bitmaps: BTreeMap<usize, &'a IndexManifestEntry>,
+    pub(super) bitmap_schema_id: Option<i64>,
     pub(super) vector_count: u64,
     pub(super) files: Vec<&'a IndexManifestEntry>,
 }
@@ -171,6 +182,8 @@ pub(super) fn group<'a>(
                 .ok_or_else(|| invalid("Centroid generation has no routing model"))?;
             let router = *router;
             let mut shards = BTreeMap::new();
+            let mut bitmaps = BTreeMap::new();
+            let mut bitmap_schema_id = None;
             let mut vector_count = 0u64;
             let mut router_count = 0;
             let Role::Router(nlist) = descriptor.role else {
@@ -189,6 +202,16 @@ pub(super) fn group<'a>(
                     descriptor.model_id
                 ))
             };
+            let extra = meta.extra_field_ids.as_deref().unwrap_or_default();
+            if (descriptor.version == 2) == extra.is_empty()
+                || extra.contains(&meta.index_field_id)
+                || extra
+                    .iter()
+                    .enumerate()
+                    .any(|(i, field)| extra[..i].contains(field))
+            {
+                return Err(invalid());
+            }
             for (entry, desc) in &files {
                 if desc.model_id != descriptor.model_id
                     || desc.version != descriptor.version
@@ -226,7 +249,19 @@ pub(super) fn group<'a>(
                             .checked_add(entry.index_file.row_count as u64)
                             .ok_or_else(invalid)?;
                     }
-                    Role::Bitmap(_) => {}
+                    Role::Bitmap(id) => {
+                        if id >= nlist || bitmaps.insert(id, *entry).is_some() {
+                            return Err(invalid());
+                        }
+                        let schema_id =
+                            super::centroid_bitmap::schema_id(desc.payload.ok_or_else(invalid)?)?;
+                        if bitmap_schema_id
+                            .replace(schema_id)
+                            .is_some_and(|previous| previous != schema_id)
+                        {
+                            return Err(invalid());
+                        }
+                    }
                 }
             }
             if router_count != 1
@@ -236,10 +271,21 @@ pub(super) fn group<'a>(
             {
                 return Err(invalid());
             }
+            if descriptor.version == 2
+                && shards.iter().any(|(id, shard)| {
+                    let count = shard.index_file.row_count;
+                    bitmaps.get(id).map(|entry| entry.index_file.row_count)
+                        != (count > 0).then_some(count)
+                })
+            {
+                return Err(invalid());
+            }
             Ok(Generation {
                 router,
                 descriptor: Descriptor::parse(&router.index_file)?.unwrap(),
                 shards,
+                bitmaps,
+                bitmap_schema_id,
                 vector_count,
                 files: files.into_iter().map(|(entry, _)| entry).collect(),
             })
@@ -416,6 +462,16 @@ impl Router {
             }
         }
         Ok(nearest.0)
+    }
+}
+
+/// A colocated Bitmap is part of its primary vector index's identity.
+pub(super) fn index_identity_extra_fields(file: &IndexFileMeta) -> Option<&[i32]> {
+    let meta = file.global_index_meta.as_ref()?;
+    if Descriptor::has_bitmaps(file) {
+        None
+    } else {
+        meta.extra_field_ids.as_deref()
     }
 }
 

@@ -21,7 +21,9 @@ use super::{
     VectorIndexWork, VectorMetricCheck, VectorSearchEvaluation,
 };
 use crate::spec::{IndexManifestEntry, VectorIndexOptions};
+use crate::table::centroid_bitmap::BitmapPredicate;
 use crate::table::centroid_index::{self, Descriptor, Generation, Role, Router};
+use crate::table::RowRange;
 use crate::vector_search::{ScoredRowIds, VectorSearch};
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use crate::{Error, Result};
@@ -30,8 +32,9 @@ use paimon_vindex_core::index::VectorIndexMetadata;
 use paimon_vindex_core::io::SeekRead;
 use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
-type CentroidFiles<'a> = HashMap<&'a str, Vec<IndexManifestEntry>>;
+type CentroidFiles<'a> = HashMap<&'a str, Generation<'a>>;
 
 pub(super) fn plan<'a>(
     entries: &[&'a IndexManifestEntry],
@@ -45,10 +48,7 @@ pub(super) fn plan<'a>(
     for group in centroid_index::group(entries.iter().copied())? {
         if group.vector_count != 0 {
             plans.push(group.router);
-            files.insert(
-                group.router.index_file.file_name.as_str(),
-                group.files.into_iter().cloned().collect(),
-            );
+            files.insert(group.router.index_file.file_name.as_str(), group);
         }
     }
     Ok((plans, files))
@@ -158,6 +158,12 @@ pub(super) fn search_file<S: SeekRead + 'static>(
     Ok(results)
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct BitmapWork {
+    pub(super) predicate: BitmapPredicate,
+    pub(super) deleted: Vec<RowRange>,
+}
+
 struct Route {
     nearest: Vec<usize>,
     visited: usize,
@@ -175,9 +181,10 @@ pub(super) async fn execute_work(
     range_read_limiter: RangeReadLimiter,
     batch_parallelism: usize,
 ) -> Result<(Vec<ScoredRowIds>, IndexSearchTiming)> {
-    let allow_buffered_read = work.queries.len() > 1 || work.filter.is_some();
+    let allow_buffered_read =
+        work.queries.len() > 1 || work.filter.is_some() || work.bitmap.is_some();
     if work.centroid_files.is_empty() {
-        if Descriptor::is_wrapped(&work.entry.index_file) {
+        if Descriptor::is_wrapped(&work.entry.index_file) || work.bitmap.is_some() {
             return Err(centroid_index::invalid(
                 "Expected a complete centroid generation",
             ));
@@ -269,6 +276,7 @@ pub(super) async fn execute_work(
         && nlist == ROUTER_LISTS
         && router.metric == MetricType::L2
         && work.filter.is_none()
+        && work.bitmap.is_none()
         && matches!(
             work.entry.index_file.index_type.as_str(),
             "ivf-flat" | "ivf-pq"
@@ -291,6 +299,7 @@ pub(super) async fn execute_work(
         batch_parallelism,
         allow_buffered_read,
         joint_enabled,
+        bitmap: work.bitmap.as_ref(),
     };
     let Some(predicate) = work.filter else {
         let mut timing = IndexSearchTiming::default();
@@ -357,6 +366,7 @@ struct RoutedSearch<'a> {
     batch_parallelism: usize,
     allow_buffered_read: bool,
     joint_enabled: bool,
+    bitmap: Option<&'a BitmapWork>,
 }
 
 impl RoutedSearch<'_> {
@@ -436,9 +446,47 @@ impl RoutedSearch<'_> {
             }
             for (centroid, pending) in queries_by_centroid {
                 let (indices, probes): (Vec<_>, Vec<_>) = pending.into_iter().unzip();
+                let mut shard = self.shard_work(queries, centroid, &indices);
+                if let Some(bitmap) = self.bitmap {
+                    let table = self.evaluation.table.ok_or_else(|| {
+                        centroid_index::invalid("Centroid Bitmap search requires table context")
+                    })?;
+                    let file = &group
+                        .bitmaps
+                        .get(&centroid)
+                        .ok_or_else(|| centroid_index::invalid("Missing centroid Bitmap file"))?
+                        .index_file;
+                    let source = file.global_index_meta.as_ref().unwrap();
+                    let mut filter = bitmap.predicate.matching(table, file).await?;
+                    for range in &bitmap.deleted {
+                        if range.from() < source.row_range_start
+                            || range.to() > source.row_range_end
+                            || range.from() > range.to()
+                        {
+                            return Err(centroid_index::invalid(
+                                "Invalid deletion range for centroid Bitmap task",
+                            ));
+                        }
+                        filter.remove_range(
+                            (range.from() - source.row_range_start) as u64
+                                ..=(range.to() - source.row_range_start) as u64,
+                        );
+                    }
+                    if filter.is_empty() {
+                        continue;
+                    }
+                    let filter = Arc::new(filter);
+                    for query in &mut shard.queries {
+                        let eligible = query.effective_include_row_ids().map_or_else(
+                            || Arc::clone(&filter),
+                            |include| Arc::new(include & filter.as_ref()),
+                        );
+                        query.set_shared_include_row_ids(eligible);
+                    }
+                }
                 let (results, stats) = execute_vector_file_probes(
                     self.evaluation,
-                    self.shard_work(queries, centroid, &indices),
+                    shard,
                     self.metric_check.clone(),
                     self.range_read_limiter.clone(),
                     self.batch_parallelism,
@@ -487,6 +535,7 @@ impl RoutedSearch<'_> {
         VectorIndexWork {
             entry: self.group.shards[&id].clone(),
             centroid_files: vec![],
+            bitmap: None,
             queries: indices
                 .iter()
                 .map(|&index| queries[index].clone())

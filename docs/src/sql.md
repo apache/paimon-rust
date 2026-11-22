@@ -2998,6 +2998,33 @@ Automatic inner-product routing searches all centroids. The layout is stored
 in the index manifest and is available when searching Java-built indexes.
 The current native DiskANN reader supports up to 1,024 dimensions.
 
+### Bitmap Filters in Centroid Shards
+
+Supply a JSON object named `extra_fields` when building a centroid index to
+index scalar columns alongside each populated vector shard:
+
+```sql
+CALL sys.create_global_index(
+    table => 'my_db.items',
+    index_column => 'embedding',
+    index_type => 'ivf-flat',
+    options => 'ivf-flat.sharding=centroid,ivf-flat.dimension=4',
+    extra_fields => '{"tenant_id":"bitmap","status":"bitmap"}'
+);
+```
+
+In Rust, pass the same JSON as the `extra_fields` build option.
+A search can prefilter exactly with equality, `IN`, `IS NULL`, `IS NOT NULL`,
+and `AND` or `OR` over those predicates, including across columns. An eligible
+shard with no visible matches can skip its ANN file. After a schema change,
+the Bitmap remains usable when each field referenced by the predicate has the
+same ID and type in the build schema, ignoring nullability. Unsupported
+predicates and incompatible field changes use ordinary scalar filtering.
+Rebuilding replaces the selected partitions' groups. Dropping the index on
+the vector column also drops its Bitmap files.
+Use `THROW_ERROR` or `DROP_PARTITION_INDEX` for
+`global-index.column-update-action` when building centroid Bitmap indexes.
+
 ### MultiVector MaxSim
 
 On Data Evolution append tables, a range-sharded cosine index can search an

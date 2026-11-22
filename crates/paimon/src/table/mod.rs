@@ -41,6 +41,7 @@ mod bucket_assigner_fixed;
 mod bucket_filter;
 mod bucket_function;
 mod bucket_router;
+mod centroid_bitmap;
 mod centroid_index;
 mod chunk_shuffle;
 mod commit_callback;

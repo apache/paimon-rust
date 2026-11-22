@@ -26,3 +26,9 @@ two IVF-FLAT shards. The router training input is four two-dimensional L2
 vectors, `[0, 0]`, `[1, 0]`, `[100, 0]`, and `[101, 0]`, with two outer
 centers and one local IVF list in each shard. Native labels are 0 through 3.
 The Rust test publishes the files at row range [2, 5] to verify label rebasing.
+
+The Java `CentroidBitmapIndex.Writer` produced `bitmap.index` and
+`CentroidIndexMeta.scalarIndex` wrapped its directory in `bitmap.meta`.
+It contains a `tenant` section (field ID 0) with values `7` and `9` and a
+`status` section (field ID 2) with values NULL and `1`. The two labels
+are 2 and 4 relative to the common source range.

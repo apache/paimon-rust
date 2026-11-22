@@ -18,6 +18,7 @@
 //! Read-only source work retained by a vector or full-text search plan.
 
 use super::bucket_filter::split_partition_and_data_predicates;
+use super::centroid_index::Descriptor;
 use super::global_index_scanner::unindexed_ranges_for_global_index_entries;
 use super::global_index_types::normalize_queryable_global_index_type;
 use super::row_id_predicate::intersect_sorted_ranges;
@@ -60,7 +61,7 @@ pub(super) async fn global_search_splits(
     filter: Option<&Predicate>,
     options: &HashMap<String, String>,
     full_text: bool,
-) -> crate::Result<Vec<SearchScanSplit>> {
+) -> crate::Result<(Vec<SearchScanSplit>, Vec<RowRange>)> {
     let field_id = find_field_id_by_name(table.schema().fields(), column).ok_or_else(|| {
         crate::Error::ConfigInvalid {
             message: format!("Search column '{column}' does not exist"),
@@ -97,7 +98,7 @@ pub(super) async fn global_search_splits(
             "full-text",
         )
     {
-        return Ok(vec![]);
+        return Ok((vec![], vec![]));
     }
     let row_filter = filter.and_then(|filter| {
         let (_, data) = split_partition_and_data_predicates(
@@ -172,6 +173,7 @@ pub(super) async fn global_search_splits(
         &detail_ranges,
         belongs,
     );
+    let mut scalar_prefilter_ranges = vec![];
     if !full_text {
         if let (Some(filter), Some(scalar_mode)) = (&row_filter, scalar_mode) {
             let mut scalar_ranges = super::de_vector_read::scalar_unindexed_ranges(
@@ -198,6 +200,12 @@ pub(super) async fn global_search_splits(
                         .collect(),
                 );
                 scalar_ranges = intersect_sorted_ranges(&scalar_ranges, &indexed);
+            }
+            if grouped.values().flatten().any(Descriptor::has_bitmaps) {
+                scalar_prefilter_ranges = super::source::exclude_row_ranges(
+                    &merge_row_ranges(scalar_ranges.clone()),
+                    &merge_row_ranges(raw_ranges.clone()),
+                );
             }
             raw_ranges.extend(scalar_ranges);
         }
@@ -232,7 +240,7 @@ pub(super) async fn global_search_splits(
             index_type,
         });
     }
-    Ok(result)
+    Ok((result, scalar_prefilter_ranges))
 }
 
 fn invalid_source(message: impl Into<String>) -> crate::Error {

@@ -255,6 +255,7 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
             "index_type",
             "partitions",
             "options",
+            "extra_fields",
         ],
         "drop_global_index" => &[
             "table",
@@ -1399,9 +1400,15 @@ async fn proc_create_global_index(
     builder
         .with_index_column(index_column)
         .with_index_type(index_type_arg);
-    if let Some(options) = args.get("options") {
-        builder.with_options(parse_key_value_options(options)?);
+    let mut options = args
+        .get("options")
+        .map(|value| parse_key_value_options(value))
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(fields) = args.get("extra_fields") {
+        options.insert("extra_fields".into(), fields.clone());
     }
+    builder.with_options(options);
     if let Some(partitions) = args.get("partitions") {
         builder
             .with_partition_filter(parse_partitions(&table, partitions)?)

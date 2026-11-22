@@ -157,6 +157,7 @@ async fn run(
         VectorIndexWork {
             entry: entries[0].clone(),
             centroid_files: entries.to_vec(),
+            bitmap: None,
             queries,
             resolved: Some(options),
             filter: None,

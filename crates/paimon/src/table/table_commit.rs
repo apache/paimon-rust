@@ -2392,7 +2392,23 @@ impl TableCommit {
         }
         let action =
             CoreOptions::new(self.table.schema().options()).global_index_column_update_action()?;
-        if action == GlobalIndexColumnUpdateAction::Ignore {
+        let ignore = action == GlobalIndexColumnUpdateAction::Ignore;
+        let retained_bitmaps = if ignore {
+            previous_entries
+                .iter()
+                .filter(|entry| {
+                    entry.kind == FileKind::Add
+                        && super::centroid_index::Descriptor::has_bitmaps(&entry.index_file)
+                        && !new_index_entries.iter().any(|deleted| {
+                            deleted.kind == FileKind::Delete
+                                && same_index_file_entry(entry, deleted)
+                        })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        if ignore && retained_bitmaps.is_empty() {
             return Ok(vec![]);
         }
         let mut updated_cols = HashSet::new();
@@ -2414,6 +2430,29 @@ impl TableCommit {
             {
                 continue;
             }
+            let overlapping_bitmaps = if ignore {
+                // Unlike the partition-wide drop policy, IGNORE protects only
+                // retained Bitmap generations covering the updated row IDs.
+                let Some((start, end)) = file.row_id_range() else {
+                    continue;
+                };
+                let overlapping = retained_bitmaps
+                    .iter()
+                    .filter_map(|index| {
+                        let meta = index.index_file.global_index_meta.as_ref()?;
+                        (index.bucket == entry.bucket()
+                            && same_index_partition(&index.partition, entry.partition())
+                            && ranges_overlap(start, end, meta.row_range_start, meta.row_range_end))
+                        .then_some(meta)
+                    })
+                    .collect::<Vec<_>>();
+                if overlapping.is_empty() {
+                    continue;
+                }
+                overlapping
+            } else {
+                vec![]
+            };
             // Partial files retain their writer's schema, including historical
             // names. Index metadata identifies fields by ID; comparing against
             // today's names would miss renames and confuse dropped/readded names.
@@ -2438,6 +2477,19 @@ impl TableCommit {
                 // normal file which excludes dedicated Blob/vector columns.
                 None => schema.data_file_fields(None),
             };
+            if ignore {
+                if overlapping_bitmaps.iter().any(|meta| {
+                    std::iter::once(&meta.index_field_id)
+                        .chain(meta.extra_field_ids.iter().flatten())
+                        .any(|id| fields.iter().any(|field| field.id() == *id))
+                }) {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Update affects an active centroid index with Bitmap fields. Drop the index or use DROP_PARTITION_INDEX before updating.".into(),
+                        source: None,
+                    });
+                }
+                continue;
+            }
             for field in fields {
                 updated_field_ids.insert(field.id());
                 updated_cols.insert(field.name().to_string());

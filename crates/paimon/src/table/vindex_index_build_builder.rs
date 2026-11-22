@@ -16,6 +16,7 @@
 // under the License.
 
 pub(super) mod centroid;
+mod centroid_bitmap;
 mod extraction;
 mod pipeline;
 mod planning;
@@ -93,7 +94,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         )?;
         let user =
             super::global_index_options::build_options(&procedure, column, &self.index_type)?;
-        let centroid = centroid::CentroidBuildOptions::resolve(
+        let mut centroid = centroid::CentroidBuildOptions::resolve(
             &effective,
             &defaults,
             &user,
@@ -136,6 +137,15 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         )?;
         effective.extend(defaults);
         effective.extend(user);
+        if let Some(bitmap) = centroid_bitmap::BitmapBuild::resolve(self.table, column, &effective)?
+        {
+            let centroid = centroid.as_mut().ok_or_else(|| {
+                crate::table::centroid_index::invalid(
+                    "Vector Bitmap extra fields require centroid sharding",
+                )
+            })?;
+            centroid.bitmap = Some(bitmap);
+        }
         Ok((effective, native, centroid))
     }
 
