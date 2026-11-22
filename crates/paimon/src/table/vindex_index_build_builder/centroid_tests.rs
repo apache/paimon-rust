@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::spec::{Datum, PredicateBuilder};
 use crate::table::centroid_index::{self, Descriptor, Role};
 use crate::table::{SearchTask, SearchTaskExecutor, SearchTaskResult};
 
@@ -82,7 +83,10 @@ async fn centroid_build_replaces_selected_range_files_and_is_queryable() {
     assert_eq!(builder.execute().await.unwrap(), 2);
     let initial = active_entries(&table).await;
 
-    builder.with_options(centroid_options());
+    let mut options = centroid_options();
+    options.insert("ivf-flat.nlist".into(), "8".into());
+    options.insert("ivf-flat.train.sample-ratio".into(), "0.5".into());
+    builder.with_options(options);
     let plan = builder.plan().await.unwrap();
     assert_eq!(plan.shards().len(), 2);
     assert_eq!(plan.replacement_messages()[0].deleted_index_files.len(), 2);
@@ -104,6 +108,11 @@ async fn centroid_build_replaces_selected_range_files_and_is_queryable() {
     assert!(groups
         .iter()
         .all(|group| group.shards.len() == 2 && group.vector_count == 4));
+    for shard in groups.iter().flat_map(|group| group.shards.values()) {
+        let descriptor = Descriptor::parse(&shard.index_file).unwrap().unwrap();
+        let local = centroid_index::payload_options(&descriptor).unwrap();
+        assert_eq!(local["localNlist"], "1");
+    }
     assert!(initial.iter().all(|old| !indexed.contains(old)));
 
     let mut search = table.new_batch_vector_search_builder();
@@ -122,6 +131,84 @@ async fn centroid_build_replaces_selected_range_files_and_is_queryable() {
     let replaced = active_entries(&table).await;
     assert_eq!(replaced.len(), indexed.len());
     assert!(replaced.iter().all(|entry| !indexed.contains(entry)));
+}
+
+#[tokio::test]
+async fn centroid_partition_replacement_requires_valid_matching_partitions() {
+    let path = "memory:/centroid_partition_replace";
+    let schema = vindex_schema_builder(vindex_e2e_options("8"))
+        .column("pt", DataType::Int(IntType::new()))
+        .partition_keys(["pt"])
+        .build()
+        .unwrap();
+    let table = test_table_with_io(FileIOBuilder::new("memory").build().unwrap(), path, schema);
+    setup_dirs(table.file_io(), path).await;
+    let vectors = build_vector_batch(vec![0, 1, 2, 3], vec![vec![1., 0.]; 4]);
+    let mut fields = vectors.schema().fields().to_vec();
+    fields.push(Arc::new(ArrowField::new("pt", ArrowDataType::Int32, true)));
+    let mut columns = vectors.columns().to_vec();
+    columns.push(Arc::new(Int32Array::from(vec![0, 0, 1, 1])));
+    let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap();
+    let mut writer = TableWrite::new(&table, "centroid-partitions".into()).unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    TableCommit::new(table.clone(), "centroid-partitions".into())
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    let mut builder = table.new_global_index_build_builder();
+    builder
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat");
+    assert_eq!(builder.execute().await.unwrap(), 2);
+    let initial = active_entries(&table).await;
+    let untouched = initial
+        .iter()
+        .find(|entry| {
+            BinaryRow::from_serialized_bytes(&entry.partition)
+                .unwrap()
+                .get_int(0)
+                .unwrap()
+                == 0
+        })
+        .unwrap();
+    let filter = PredicateBuilder::new(table.schema().fields())
+        .greater_than("pt", Datum::Int(0))
+        .unwrap();
+    builder
+        .with_options(centroid_options())
+        .with_partition_filter(filter)
+        .unwrap();
+    let plan = builder.plan().await.unwrap();
+    assert_eq!(plan.shards().len(), 1);
+    let replacements = plan.replacement_messages();
+    assert_eq!(replacements.len(), 1);
+    assert_eq!(replacements[0].deleted_index_files.len(), 1);
+    assert_ne!(replacements[0].partition, untouched.partition);
+    assert_eq!(builder.execute().await.unwrap(), 3);
+    let mut indexed = active_entries(&table).await;
+    assert!(indexed.contains(untouched));
+    assert_eq!(centroid_index::group(&indexed).unwrap().len(), 1);
+
+    // An undecodable partition cannot be scheduled for a filtered deletion.
+    indexed
+        .iter_mut()
+        .find(|entry| entry.index_file.file_name == untouched.index_file.file_name)
+        .unwrap()
+        .partition = vec![0xff, 0x00];
+    let manager = table.snapshot_manager();
+    let snapshot = manager.get_latest_snapshot().await.unwrap().unwrap();
+    IndexManifest::write(
+        table.file_io(),
+        &manager.manifest_path(snapshot.index_manifest().unwrap()),
+        &indexed,
+    )
+    .await
+    .unwrap();
+    let error = builder.plan().await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Invalid index partition for filtered removal"));
 }
 
 #[tokio::test]

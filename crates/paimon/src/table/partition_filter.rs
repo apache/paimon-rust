@@ -176,6 +176,35 @@ impl PartitionFilter {
         }
     }
 
+    /// Match a partition for index removal, where an uncertain match is unsafe.
+    pub(super) fn matches_entry_for_removal(
+        &self,
+        serialized_partition: &[u8],
+        partition_arity: usize,
+    ) -> crate::Result<bool> {
+        match self {
+            PartitionFilter::PartitionSet { partitions, .. } => {
+                Ok(partitions.contains(serialized_partition))
+            }
+            PartitionFilter::Predicate(predicate) => {
+                let row =
+                    BinaryRow::from_serialized_bytes(serialized_partition).map_err(|error| {
+                        crate::Error::DataInvalid {
+                            message: "Invalid index partition for filtered removal".into(),
+                            source: Some(Box::new(error)),
+                        }
+                    })?;
+                if row.arity() as usize != partition_arity {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Index partition row arity does not match partition keys".into(),
+                        source: None,
+                    });
+                }
+                eval_row(predicate, &row)
+            }
+        }
+    }
+
     pub(super) fn matches_manifest(
         &self,
         meta: &ManifestFileMeta,

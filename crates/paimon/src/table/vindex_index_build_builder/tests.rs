@@ -115,6 +115,7 @@ fn echoed_schema_keeps_table_semantics_and_procedure_overrides() {
             (format!("{kind}.dimension"), "2".into()),
             (format!("{kind}.metric"), "cosine".into()),
             ("nlist".into(), "ignored table property".into()),
+            ("sharding".into(), "ignored table property".into()),
             ("index.type".into(), "ignored table property".into()),
             ("vindex.build.granule.enabled".into(), "true".into()),
         ]));

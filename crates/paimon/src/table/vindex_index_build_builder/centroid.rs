@@ -16,6 +16,7 @@
 // under the License.
 
 use super::extraction::data_split_for_shard;
+use super::validation::checked_training_vector_count;
 use super::VindexIndexBuildBuilder;
 use crate::spec::{
     DataEvolutionIndexSourceMeta, FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry,
@@ -50,12 +51,16 @@ impl CentroidBuildOptions {
         column: &str,
     ) -> Result<Option<Self>> {
         let option = |key: &str| {
-            [user, defaults, table].iter().find_map(|source| {
-                source
-                    .get(&format!("fields.{column}.{key}"))
-                    .or_else(|| source.get(&format!("{kind}.{key}")))
-                    .or_else(|| source.get(key))
-            })
+            let field_key = format!("fields.{column}.{key}");
+            let type_key = format!("{kind}.{key}");
+            [(user, Some(key)), (defaults, Some(key)), (table, None)]
+                .into_iter()
+                .find_map(|(source, bare_key)| {
+                    source
+                        .get(&field_key)
+                        .or_else(|| source.get(&type_key))
+                        .or_else(|| bare_key.and_then(|key| source.get(key)))
+                })
         };
         match option("sharding").map(|value| value.trim()) {
             None | Some("range") => Ok(None),
@@ -152,7 +157,10 @@ impl VindexIndexBuildBuilder<'_> {
                 continue;
             }
             if let Some(filter) = &partition_filter {
-                if !filter.matches_entry(&entry.partition)? {
+                if !filter.matches_entry_for_removal(
+                    &entry.partition,
+                    self.table.schema().partition_keys().len(),
+                )? {
                     continue;
                 }
             }
@@ -216,8 +224,6 @@ impl VindexIndexBuildBuilder<'_> {
         model_id: &str,
         files: &mut Vec<IndexFileMeta>,
     ) -> Result<()> {
-        let mut local = options.clone();
-        local.native_options.remove("expected-vector-count");
         let metric = &options.native_options["metric"];
         let router_meta = json_options(&options.native_options)?;
         let (nlist, model_file) = if let Some(mut spill) = spill.finish().await? {
@@ -246,7 +252,18 @@ impl VindexIndexBuildBuilder<'_> {
                 let mut payload = HashMap::new();
                 let (count, index) = match rows {
                     Some(rows) => {
-                        let count = rows.vector_count() as i64;
+                        let count = rows.vector_count();
+                        let mut local = options.clone();
+                        local
+                            .native_options
+                            .insert("expected-vector-count".into(), count.to_string());
+                        if let Some(nlist) = local.native_options.get_mut("nlist") {
+                            if let Ok(requested) = nlist.trim().parse::<usize>() {
+                                let samples =
+                                    checked_training_vector_count(count, local.train_sample_ratio)?;
+                                *nlist = requested.min(samples).to_string();
+                            }
+                        }
                         let writer = rows.train(&local, false).await?.writer;
                         let nlist = match &writer {
                             VectorIndexWriter::IvfFlat(index) => Some(index.nlist),
@@ -259,7 +276,7 @@ impl VindexIndexBuildBuilder<'_> {
                         if let Some(nlist) = nlist {
                             payload.insert("localNlist".into(), nlist.to_string());
                         }
-                        (count, Some(writer))
+                        (count as i64, Some(writer))
                     }
                     None => (0, None),
                 };

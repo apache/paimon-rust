@@ -104,6 +104,14 @@ build_plan_pickle!(PyGlobalIndexBuildPlan, {
             .map(|inner| PyGlobalIndexBuildShard { inner })
             .collect()
     }
+
+    fn replacement_messages(&self) -> Vec<PyCommitMessage> {
+        self.inner
+            .replacement_messages()
+            .into_iter()
+            .map(PyCommitMessage::new)
+            .collect()
+    }
 });
 
 build_plan_pickle!(PyGlobalIndexBuildShard, {
