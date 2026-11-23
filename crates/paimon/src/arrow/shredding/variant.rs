@@ -806,12 +806,13 @@ pub(crate) fn assemble_shredded_variant_array(array: &dyn Array) -> Result<Array
                         message: "Shredded Variant row is null".to_string(),
                         source: None,
                     })?;
-            let (metadata, _) = variant_metadata_at(input, row)?;
+            let (metadata, dictionary_key) = variant_metadata_at(input, row)?;
             variants.push(Some(rebuild_shredded_with_borrowed_metadata(
                 &shredded,
                 &schema,
                 &mut metadata_cache,
                 metadata,
+                dictionary_key,
             )?));
         }
     }
@@ -1464,7 +1465,8 @@ fn is_variant_storage_array(array: &dyn Array) -> bool {
             .any(|field| field.name() == name && field.data_type() == &ArrowDataType::Binary)
     };
     (has_binary(VARIANT_VALUE_FIELD_NAME) || is_shredded_variant_array(array))
-        && has_binary(VARIANT_METADATA_FIELD_NAME)
+        && (has_binary(VARIANT_METADATA_FIELD_NAME)
+            || fields.iter().any(|field| is_dictionary_metadata(field)))
         && (!is_variant_arrow_fields(fields) || is_shredded_variant_array(array))
 }
 

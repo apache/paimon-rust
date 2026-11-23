@@ -932,7 +932,7 @@ fn variant_metadata_child(children: &arrow_schema::Fields) -> Option<usize> {
     })
 }
 
-/// File schema with `metadata: Dictionary(Int32, Binary)` for Variant columns read for extraction.
+/// Keep Variant metadata dictionary-encoded for extraction and shredded full reads.
 fn dictionary_variant_metadata_schema(
     schema: &arrow_schema::SchemaRef,
     read_fields: &[DataField],
@@ -942,12 +942,15 @@ fn dictionary_variant_metadata_schema(
         .fields()
         .iter()
         .map(|field| {
-            let extraction = read_fields.iter().any(|read| {
+            let dictionary_metadata = read_fields.iter().any(|read| {
                 read.name() == field.name()
-                    && crate::spec::is_variant_extraction_row_type(read.data_type())
+                    && (crate::spec::is_variant_extraction_row_type(read.data_type())
+                        || (matches!(read.data_type(), DataType::Variant(_))
+                            && matches!(field.data_type(), arrow_schema::DataType::Struct(children)
+                                if children.iter().any(|child| child.name() == "typed_value"))))
             });
             match field.data_type() {
-                arrow_schema::DataType::Struct(children) if extraction => {
+                arrow_schema::DataType::Struct(children) if dictionary_metadata => {
                     let Some(metadata) = variant_metadata_child(children) else {
                         return Arc::clone(field);
                     };
@@ -1026,7 +1029,7 @@ impl FormatFileReader for ParquetFormatReader {
             arrow_options.clone(),
         )
         .await?;
-        // Variant columns read only for extraction keep their metadata dictionary-encoded.
+        // Extraction and shredded full reads keep Variant metadata dictionary-encoded.
         let variant_schema =
             dictionary_variant_metadata_schema(batch_stream_builder.schema(), read_fields);
         if let Some(schema) = variant_schema.clone() {
@@ -3532,9 +3535,10 @@ mod tests {
     use crate::table::RowRange;
     use crate::variant::GenericVariant;
     use crate::Error;
+    use arrow_array::types::Int32Type;
     use arrow_array::{
-        Array, BinaryArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray,
-        StructArray, TimestampMillisecondArray, TimestampSecondArray,
+        Array, BinaryArray, DictionaryArray, Int32Array, Int64Array, MapArray, RecordBatch,
+        StringArray, StructArray, TimestampMillisecondArray, TimestampSecondArray,
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
@@ -9135,6 +9139,176 @@ mod tests {
             crate::arrow::shredding::variant::assemble_variant_extraction_array(read, &row_type)
                 .unwrap();
         assert_eq!(actual.as_ref(), expected.as_ref());
+
+        let full_batches = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(data.clone())),
+                data.len() as u64,
+                &fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let full_read = full_batches[0]
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(matches!(
+            full_read.column_by_name("metadata").unwrap().data_type(),
+            ArrowDataType::Dictionary(key, value)
+                if key.as_ref() == &ArrowDataType::Int32 && value.as_ref() == &ArrowDataType::Binary
+        ));
+        let restored =
+            crate::arrow::shredding::variant::assemble_shredded_variant_array(full_read).unwrap();
+        let restored = restored.as_any().downcast_ref::<StructArray>().unwrap();
+        let values = restored
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let metadata = restored
+            .column_by_name("metadata")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        for (row, expected) in variants.iter().enumerate() {
+            let actual = GenericVariant::from_parts(
+                values.value(row).to_vec(),
+                metadata.value(row).to_vec(),
+            )
+            .unwrap();
+            assert_eq!(actual.to_json().unwrap(), expected.to_json().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn shredded_variant_full_read_preserves_wide_metadata_dictionary() {
+        let fields = vec![DataField::new(
+            0,
+            "v".to_string(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let options = HashMap::from([(
+            "variant.shreddingSchema".to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"age","type":"BIGINT"}]}}]}"#.to_string(),
+        )]);
+        let small = GenericVariant::parse_json(r#"{"age":27}"#).unwrap();
+        let dictionaries = (0..18)
+            .map(|suffix| {
+                let extra = (0..5362)
+                    .map(|key| format!(r#", "unused_{suffix}_{key:04}_field":0"#))
+                    .collect::<String>();
+                GenericVariant::parse_json(&format!(r#"{{"age":27{extra}}}"#))
+                    .unwrap()
+                    .metadata()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert!(dictionaries.iter().map(Vec::len).sum::<usize>() > 2 * 1024 * 1024);
+        let variants = (0..512)
+            .map(|row| {
+                GenericVariant::from_parts(
+                    small.value().to_vec(),
+                    dictionaries[row % dictionaries.len()].clone(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let ArrowDataType::Struct(variant_fields) = variant_arrow_type() else {
+            unreachable!()
+        };
+        let column = StructArray::new(
+            variant_fields,
+            vec![
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.value()),
+                )),
+                Arc::new(BinaryArray::from_iter_values(
+                    variants.iter().map(|v| v.metadata()),
+                )),
+            ],
+            None,
+        );
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(column)]).unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = format!("memory:/wide_variant_{}.parquet", uuid::Uuid::new_v4());
+        let mut writer = create_format_writer(
+            &file_io.new_output(&path).unwrap(),
+            schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+        let data = file_io.new_input(&path).unwrap().read().await.unwrap();
+        let batches = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(data.clone())),
+                data.len() as u64,
+                &fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let physical = batches[0]
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let dictionary = physical
+            .column_by_name("metadata")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let distinct_keys = (0..dictionary.len())
+            .map(|row| dictionary.keys().value(row))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(distinct_keys.len(), dictionaries.len());
+        let restored =
+            crate::arrow::shredding::variant::assemble_shredded_variant_array(physical).unwrap();
+        let restored = restored.as_any().downcast_ref::<StructArray>().unwrap();
+        let values = restored
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let metadata = restored
+            .column_by_name("metadata")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        for row in 0..variants.len() {
+            let actual = GenericVariant::from_parts(
+                values.value(row).to_vec(),
+                metadata.value(row).to_vec(),
+            )
+            .unwrap();
+            assert_eq!(actual.to_json().unwrap(), small.to_json().unwrap());
+        }
     }
 
     #[tokio::test]

@@ -1463,10 +1463,22 @@ pub(crate) struct RebuildMetadataCache<'a> {
     validated_bytes: usize,
     validated_borrowed: HashSet<&'a [u8]>,
     validated_borrowed_addresses: HashSet<(usize, usize)>,
+    validated_dictionary_keys: HashSet<i32>,
 }
 
 impl<'a> RebuildMetadataCache<'a> {
-    fn validate_compact_metadata_borrowed(&mut self, bytes: &'a [u8]) -> Result<()> {
+    fn validate_compact_metadata_borrowed(
+        &mut self,
+        bytes: &'a [u8],
+        dictionary_key: Option<i32>,
+    ) -> Result<()> {
+        if let Some(key) = dictionary_key {
+            if !self.validated_dictionary_keys.contains(&key) {
+                validate_metadata(bytes)?;
+                self.validated_dictionary_keys.insert(key);
+            }
+            return Ok(());
+        }
         // The source Arrow array is immutable throughout this cache's lifetime.
         // Check its slice address first so repeated dictionary values are O(1).
         let address = (bytes.as_ptr() as usize, bytes.len());
@@ -3010,21 +3022,22 @@ pub(crate) fn rebuild_shredded_with_borrowed_metadata<'a>(
     schema: &VariantSchema,
     cache: &mut RebuildMetadataCache<'a>,
     metadata: &'a [u8],
+    dictionary_key: Option<i32>,
 ) -> Result<GenericVariant> {
-    rebuild_shredded_with_metadata(row, schema, cache, Some(metadata))
+    rebuild_shredded_with_metadata(row, schema, cache, Some((metadata, dictionary_key)))
 }
 
 fn rebuild_shredded_with_metadata<'a>(
     row: &ShreddedRow,
     schema: &VariantSchema,
     cache: &mut RebuildMetadataCache<'a>,
-    borrowed_metadata: Option<&'a [u8]>,
+    borrowed_metadata: Option<(&'a [u8], Option<i32>)>,
 ) -> Result<GenericVariant> {
     let Some(metadata_idx) = schema.top_level_metadata_idx else {
         return data_invalid("Malformed shredded Variant: missing top-level metadata field");
     };
     let metadata = match borrowed_metadata {
-        Some(bytes) => bytes,
+        Some((bytes, _)) => bytes,
         None => match row.field(metadata_idx) {
             Some(ShreddedValue::Binary(bytes)) => bytes.as_slice(),
             _ => return data_invalid("Malformed shredded Variant: missing metadata"),
@@ -3061,8 +3074,8 @@ fn rebuild_shredded_with_metadata<'a>(
         if metadata.len() > SIZE_LIMIT {
             return data_invalid("Variant value or metadata exceeds constructor size limit");
         }
-        if let Some(bytes) = borrowed_metadata {
-            cache.validate_compact_metadata_borrowed(bytes)?;
+        if let Some((bytes, dictionary_key)) = borrowed_metadata {
+            cache.validate_compact_metadata_borrowed(bytes, dictionary_key)?;
         } else {
             cache.validate_compact_metadata(metadata)?;
         }
@@ -4896,6 +4909,7 @@ mod tests {
                 &schema,
                 &mut cache,
                 &dictionaries[i % dictionaries.len()],
+                None,
             )
             .unwrap();
             if i >= dictionaries.len() {
@@ -4907,11 +4921,34 @@ mod tests {
         assert_eq!(cache.validated_borrowed.len(), dictionaries.len());
         let duplicate = dictionaries[0].clone();
         VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
-        rebuild_shredded_with_borrowed_metadata(&row, &schema, &mut cache, &duplicate).unwrap();
+        rebuild_shredded_with_borrowed_metadata(&row, &schema, &mut cache, &duplicate, None)
+            .unwrap();
         // A different Arrow slice with the same bytes must reuse validation too.
         VALIDATED_METADATA.with(|cached| assert!(cached.borrow().is_empty()));
         assert_eq!(cache.validated_borrowed.len(), dictionaries.len());
         assert!(cache.validated.is_empty());
+
+        let mut dictionary_cache = RebuildMetadataCache::default();
+        for i in 0..512 {
+            VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
+            let key = (i % dictionaries.len()) as i32;
+            rebuild_shredded_with_borrowed_metadata(
+                &row,
+                &schema,
+                &mut dictionary_cache,
+                &dictionaries[key as usize],
+                Some(key),
+            )
+            .unwrap();
+            if i >= dictionaries.len() {
+                VALIDATED_METADATA.with(|cached| assert!(cached.borrow().is_empty()));
+            }
+        }
+        assert_eq!(
+            dictionary_cache.validated_dictionary_keys.len(),
+            dictionaries.len()
+        );
+        assert!(dictionary_cache.validated_borrowed.is_empty());
     }
 
     #[test]
