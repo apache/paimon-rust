@@ -25,23 +25,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+#[path = "../testdata/centroid/mod.rs"]
+mod java_fixture;
+
 fn catalog(warehouse: &Path) -> FileSystemCatalog {
     let mut options = Options::new();
     options.set("warehouse", warehouse.to_str().unwrap());
     FileSystemCatalog::new(options).unwrap()
-}
-
-fn copy_dir(source: &Path, dest: &Path) {
-    std::fs::create_dir_all(dest).unwrap();
-    for entry in std::fs::read_dir(source).unwrap() {
-        let entry = entry.unwrap();
-        let target = dest.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), target).unwrap();
-        }
-    }
 }
 
 async fn index_files(table: &Table, column: &str) -> Vec<IndexFileMeta> {
@@ -119,17 +109,10 @@ async fn search(
         .clone()
 }
 
-fn java_warehouse() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/centroid/warehouse");
-    copy_dir(&source, dir.path());
-    dir
-}
-
 #[tokio::test]
 async fn reads_java_centroid_manifest_and_single_bitmap_across_schema_evolution() {
-    let warehouse = java_warehouse();
-    let catalog = catalog(warehouse.path());
+    let fixture = java_fixture::unpack();
+    let catalog = catalog(&fixture.path().join("warehouse"));
     let identifier = Identifier::new("test", "centroid_bitmap");
     let table = catalog.get_table(&identifier).await.unwrap();
     let files = index_files(&table, "v").await;
@@ -222,8 +205,8 @@ async fn reads_java_centroid_manifest_and_single_bitmap_across_schema_evolution(
 
 #[tokio::test]
 async fn reads_java_centroid_metrics_and_ivf_pq_geometry() {
-    let warehouse = java_warehouse();
-    let table = catalog(warehouse.path())
+    let fixture = java_fixture::unpack();
+    let table = catalog(&fixture.path().join("warehouse"))
         .get_table(&Identifier::new("test", "centroid_metrics"))
         .await
         .unwrap();

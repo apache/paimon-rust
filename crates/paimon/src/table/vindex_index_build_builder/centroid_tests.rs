@@ -20,6 +20,10 @@ use crate::spec::{Datum, PredicateBuilder};
 use crate::table::centroid_index::{self, Descriptor, Role};
 use crate::table::{SearchTask, SearchTaskExecutor, SearchTaskResult};
 use paimon_vindex_core::distance::MetricType;
+use std::fs;
+
+#[path = "../../../testdata/centroid/mod.rs"]
+mod java_fixture;
 
 struct Worker<'a>(&'a Table);
 
@@ -380,26 +384,8 @@ async fn centroid_query_reads_java_model_and_native_shards_with_rebased_labels()
     let path = "memory:/centroid_java_fixture";
     let table = vindex_e2e_table(path, "8");
     setup_dirs(table.file_io(), path).await;
-    let files: [(&str, &[u8], &[u8], i64); 3] = [
-        (
-            "router.index",
-            include_bytes!("../../../testdata/centroid/router.index"),
-            include_bytes!("../../../testdata/centroid/router.meta"),
-            0,
-        ),
-        (
-            "shard-0.index",
-            include_bytes!("../../../testdata/centroid/shard-0.index"),
-            include_bytes!("../../../testdata/centroid/shard-0.meta"),
-            2,
-        ),
-        (
-            "shard-1.index",
-            include_bytes!("../../../testdata/centroid/shard-1.index"),
-            include_bytes!("../../../testdata/centroid/shard-1.meta"),
-            2,
-        ),
-    ];
+    let fixture = java_fixture::unpack();
+    let source_meta = fs::read(fixture.path().join("source.meta")).unwrap();
     write_vectors(
         &table,
         (0..6).collect(),
@@ -414,18 +400,22 @@ async fn centroid_query_reads_java_model_and_native_shards_with_rebased_labels()
     )
     .await;
     let mut message = CommitMessage::new(BinaryRow::new(0).to_serialized_bytes(), 0, vec![]);
-    for (name, bytes, meta, row_count) in files {
+    for (stem, row_count) in [("router", 0), ("shard-0", 2), ("shard-1", 2)] {
+        let name = format!("{stem}.index");
+        let bytes = fs::read(fixture.path().join(&name)).unwrap();
+        let file_size = bytes.len() as i64;
+        let meta = fs::read(fixture.path().join(format!("{stem}.meta"))).unwrap();
         table
             .file_io()
             .new_output(&format!("{path}/index/{name}"))
             .unwrap()
-            .write(bytes::Bytes::from_static(bytes))
+            .write(bytes.into())
             .await
             .unwrap();
         message.new_index_files.push(IndexFileMeta {
             index_type: "ivf-flat".into(),
-            file_name: name.into(),
-            file_size: bytes.len() as i64,
+            file_name: name,
+            file_size,
             row_count,
             external_path: None,
             deletion_vectors_ranges: None,
@@ -434,10 +424,8 @@ async fn centroid_query_reads_java_model_and_native_shards_with_rebased_labels()
                 row_range_end: 5,
                 index_field_id: find_index_field(&table, "embedding").unwrap().id(),
                 extra_field_ids: None,
-                index_meta: Some(meta.to_vec()),
-                source_meta: Some(
-                    include_bytes!("../../../testdata/centroid/source.meta").to_vec(),
-                ),
+                index_meta: Some(meta),
+                source_meta: Some(source_meta.clone()),
             }),
         });
     }
@@ -1086,19 +1074,21 @@ async fn centroid_bitmaps_read_java_sparse_sections() {
     use crate::table::centroid_bitmap::BitmapPredicate;
     let path = "memory:/centroid_java_bitmap";
     let table = vindex_e2e_table(path, "8");
-    let bytes = include_bytes!("../../../testdata/centroid/bitmap.index");
-    let metadata = include_bytes!("../../../testdata/centroid/bitmap.meta");
+    let fixture = java_fixture::unpack();
+    let bytes = fs::read(fixture.path().join("bitmap.index")).unwrap();
+    let file_size = bytes.len() as i64;
+    let metadata = fs::read(fixture.path().join("bitmap.meta")).unwrap();
     table
         .file_io()
         .new_output(&format!("{path}/index/bitmap.index"))
         .unwrap()
-        .write(bytes::Bytes::from_static(bytes))
+        .write(bytes.into())
         .await
         .unwrap();
     let file = IndexFileMeta {
         index_type: "ivf-flat".into(),
         file_name: "bitmap.index".into(),
-        file_size: bytes.len() as i64,
+        file_size,
         row_count: 2,
         external_path: None,
         deletion_vectors_ranges: None,
@@ -1107,8 +1097,8 @@ async fn centroid_bitmaps_read_java_sparse_sections() {
             row_range_end: 14,
             index_field_id: 1,
             extra_field_ids: Some(vec![0, 2]),
-            index_meta: Some(metadata.to_vec()),
-            source_meta: Some(include_bytes!("../../../testdata/centroid/source.meta").to_vec()),
+            index_meta: Some(metadata),
+            source_meta: Some(fs::read(fixture.path().join("source.meta")).unwrap()),
         }),
     };
     let source_meta = file

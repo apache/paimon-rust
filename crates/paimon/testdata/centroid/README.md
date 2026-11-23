@@ -19,6 +19,10 @@ under the License.
 
 # Java centroid index fixture
 
+`centroid-java.tar.gz` contains the Java-written index payloads and descriptors
+at its root and the exported tables under `warehouse/test.db`. Rust tests unpack
+the archive into temporary directories.
+
 The Java implementation in [apache/paimon#11350](https://github.com/apache/paimon/pull/11350)
 wrote the router and shard files with the paimon-vector-index 0.7.0-SNAPSHOT JNI
 trainer and writer, and wrapped the descriptors with `CentroidIndexMeta`. The
@@ -43,16 +47,18 @@ range with an empty shard, and an all-null range. Spark builds this table
 with U+00A0 around `l2`. `centroid_metrics` has L2 IVF-PQ with 64 local lists,
 cosine IVF-FLAT, and inner product IVF-FLAT.
 
-To regenerate the Java tables, run the Spark suite in the Java checkout
-and copy the exported `test.db` into this directory's `warehouse`.
-Set the exported schema files' `options.owner` to `paimon-test` for a
-fixture independent of the Spark runner account.
+To regenerate the Java tables, run the Spark suite in the Java checkout.
 
 ```sh
 PAIMON_JAVA_CENTROID_FIXTURE=/absolute/path/to/empty/warehouse \
   mvn -pl paimon-spark/paimon-spark-ut -am -Pspark3 -DfailIfNoTests=false \
   -DwildcardSuites=org.apache.paimon.spark.sql.CentroidVectorIndexTest -Dtest=none test
 ```
+
+Extract `centroid-java.tar.gz` into a temporary directory and replace its
+`warehouse/test.db` with the exported `test.db`. Set the exported schema files'
+`options.owner` to `paimon-test` for a fixture independent of the Spark runner
+account. Repack the directory contents into `centroid-java.tar.gz`.
 
 To regenerate the corresponding Rust tables, run the Rust fixture writer.
 Zip the resulting `test.db` directory as `centroid-rust-warehouse.zip` at the
