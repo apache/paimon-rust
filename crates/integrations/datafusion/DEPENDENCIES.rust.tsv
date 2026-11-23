@@ -194,7 +194,7 @@ form_urlencoded@1.2.3		X									X
 fs-set-times@0.20.3		X	X								X							
 fs4@0.13.1		X									X							
 fs_extra@1.3.0											X							
-fsst-rs@0.6.0		X																
+fsst-rs@0.7.0		X																
 funty@2.0.0											X							
 futures@0.3.33		X									X							
 futures-channel@0.3.33		X									X							
@@ -277,7 +277,6 @@ jni-sys@0.4.1		X									X
 jni-sys-macros@0.4.1		X									X							
 jobserver@0.1.35		X									X							
 js-sys@0.3.103		X									X							
-kanal@0.1.1											X							
 lasso@0.7.3		X									X							
 lazy_static@1.5.0		X									X							
 lending-iterator@0.1.7		X									X					X		
@@ -347,7 +346,7 @@ object@0.37.3		X									X
 object_store@0.13.2		X									X							
 once_cell@1.21.4		X									X							
 oneshot@0.1.13		X									X							
-onpair@0.2.1		X																
+onpair@0.3.0		X																
 opendal-core@0.59.5		X																
 opendal-http-transport-reqwest@0.59.5		X																
 opendal-layer-retry@0.59.5		X																
@@ -413,7 +412,7 @@ quote@1.0.47		X									X
 r-efi@5.3.0		X								X	X							
 r-efi@6.0.0		X								X	X							
 radium@0.7.0											X							
-rand@0.10.2		X									X							
+rand@0.10.4		X									X							
 rand@0.8.7		X									X							
 rand@0.9.5		X									X							
 rand_chacha@0.3.1		X									X							
@@ -561,41 +560,41 @@ utf8_iter@1.0.4		X									X
 uuid@1.24.0		X									X							
 vcpkg@0.2.15		X									X							
 version_check@0.9.5		X									X							
-vortex@0.90.0		X																
-vortex-alp@0.90.0		X																
-vortex-array@0.90.0		X																
-vortex-array-macros@0.90.0		X																
-vortex-arrow@0.90.0		X																
-vortex-btrblocks@0.90.0		X																
-vortex-buffer@0.90.0		X																
-vortex-bytebool@0.90.0		X																
-vortex-compressor@0.90.0		X																
-vortex-compute@0.90.0		X																
-vortex-datetime-parts@0.90.0		X																
-vortex-decimal-byte-parts@0.90.0		X																
-vortex-edition@0.90.0		X																
-vortex-error@0.90.0		X																
-vortex-fastlanes@0.90.0		X																
-vortex-file@0.90.0		X																
-vortex-fsst@0.90.0		X																
-vortex-io@0.90.0		X																
-vortex-ipc@0.90.0		X																
-vortex-json@0.90.0		X																
-vortex-layout@0.90.0		X																
-vortex-mask@0.90.0		X																
-vortex-metrics@0.90.0		X																
-vortex-onpair@0.90.0		X																
-vortex-parquet-variant@0.90.0		X																
-vortex-pco@0.90.0		X																
-vortex-runend@0.90.0		X																
-vortex-scan@0.90.0		X																
-vortex-sequence@0.90.0		X																
-vortex-session@0.90.0		X																
-vortex-sparse@0.90.0		X																
-vortex-utils@0.90.0		X																
-vortex-uuid@0.90.0		X																
-vortex-zigzag@0.90.0		X																
-vortex-zstd@0.90.0		X																
+vortex@0.93.0		X																
+vortex-alp@0.93.0		X																
+vortex-array@0.93.0		X																
+vortex-array-macros@0.93.0		X																
+vortex-arrow@0.93.0		X																
+vortex-btrblocks@0.93.0		X																
+vortex-buffer@0.93.0		X																
+vortex-bytebool@0.93.0		X																
+vortex-compressor@0.93.0		X																
+vortex-compute@0.93.0		X																
+vortex-datetime-parts@0.93.0		X																
+vortex-decimal-byte-parts@0.93.0		X																
+vortex-edition@0.93.0		X																
+vortex-error@0.93.0		X																
+vortex-expr@0.93.0		X																
+vortex-fastlanes@0.93.0		X																
+vortex-file@0.93.0		X																
+vortex-fsst@0.93.0		X																
+vortex-io@0.93.0		X																
+vortex-ipc@0.93.0		X																
+vortex-json@0.93.0		X																
+vortex-layout@0.93.0		X																
+vortex-mask@0.93.0		X																
+vortex-metrics@0.93.0		X																
+vortex-onpair@0.93.0		X																
+vortex-parquet-variant@0.93.0		X																
+vortex-pco@0.93.0		X																
+vortex-scan@0.93.0		X																
+vortex-sequence@0.93.0		X																
+vortex-session@0.93.0		X																
+vortex-sparse@0.93.0		X																
+vortex-utils@0.93.0		X																
+vortex-uuid@0.93.0		X																
+vortex-zigzag@0.93.0		X																
+vortex-zstd@0.93.0		X																
 walkdir@2.5.0											X				X			
 want@0.3.1											X							
 wasi@0.11.1+wasi-snapshot-preview1		X	X								X							

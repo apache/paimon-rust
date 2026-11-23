@@ -163,7 +163,7 @@ tempfile = "3"
 paimon-vindex-core = "0.6.0"
 # Also used by paimon-vindex-core for the single-precision matrix multiply.
 matrixmultiply = "0.3.11"
-vortex = { version = "0.90.0", features = ["tokio"], optional = true }
+vortex = { version = "0.93.0", features = ["tokio"], optional = true }
 libloading = "0.9"
 log = "0.4"
 # Keep CI on the dependency set that passed before unicode-segmentation 1.13.3.
