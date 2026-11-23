@@ -17,7 +17,7 @@
 
 use super::*;
 use arrow_array::ArrayRef;
-use paimon::spec::CommitKind;
+use paimon::spec::{CommitKind, IndexManifest};
 use paimon::table::CommitMessage;
 
 fn schema(evolved: bool) -> Schema {
@@ -172,6 +172,11 @@ async fn rest_auto_compaction_preserves_outputs_after_unexpected_commit_response
             Some(serde_json::json!({"success": false})),
             "10",
         ),
+        (
+            StatusCode::OK,
+            Some(serde_json::json!({"success": false})),
+            "0",
+        ),
     ] {
         let ctx = setup_catalog(vec!["default"]).await;
         let temp = tempfile::tempdir().unwrap();
@@ -199,6 +204,21 @@ async fn rest_auto_compaction_preserves_outputs_after_unexpected_commit_response
         ctx.server.set_compact_commit_response(status, body);
         let messages = stage(&table, 2, true).await;
         let result = commit.commit_with_identifier(messages.clone(), 2).await;
+        let snapshots = table.snapshot_manager();
+        let published = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(
+            (published.id(), published.commit_kind()),
+            (3, &CommitKind::COMPACT)
+        );
+        commit
+            .filter_and_commit_with_identifier(messages, 2)
+            .await
+            .unwrap();
+        assert_eq!(snapshots.get_latest_snapshot_id().await.unwrap(), Some(3));
+        assert_eq!(
+            read_rows(&table).await,
+            vec![(1, 10, Some(100)), (2, 20, Some(200))]
+        );
         if retries == "0" {
             let error = result.unwrap_err();
             assert!(
@@ -208,22 +228,80 @@ async fn rest_auto_compaction_preserves_outputs_after_unexpected_commit_response
         } else {
             result.unwrap();
         }
-        let snapshots = table.snapshot_manager();
-        let published = snapshots.get_latest_snapshot().await.unwrap().unwrap();
-        assert_eq!(
-            (published.id(), published.commit_kind()),
-            (3, &CommitKind::COMPACT)
-        );
-        assert_eq!(
-            read_rows(&table).await,
-            vec![(1, 10, Some(100)), (2, 20, Some(200))]
-        );
-        commit
-            .filter_and_commit_with_identifier(messages, 2)
-            .await
-            .unwrap();
-        assert_eq!(snapshots.get_latest_snapshot_id().await.unwrap(), Some(3));
     }
+}
+
+#[tokio::test]
+async fn rest_auto_compaction_preserves_dv_after_published_false_response() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let name = "rest_auto_compact_dv_response";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .column("extra", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("write-only", "false")
+        .option("deletion-vectors.enabled", "true")
+        .option("deletion-vectors.merge-on-read", "false")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", name, schema, temp.path().to_str().unwrap());
+    let table = ctx
+        .catalog
+        .get_table(&Identifier::new("default", name))
+        .await
+        .unwrap();
+    let batch = RecordBatch::try_from_iter(["id", "value", "extra"].map(|name| {
+        (
+            name,
+            Arc::new(Int32Array::from_iter_values(0..1000)) as ArrayRef,
+        )
+    }))
+    .unwrap();
+    write_batch(&table, batch, "seed").await;
+    let snapshots = table.snapshot_manager();
+    let seed = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+    assert_eq!((seed.id(), seed.commit_kind()), (2, &CommitKind::COMPACT));
+
+    ctx.server
+        .set_compact_commit_response(StatusCode::OK, Some(serde_json::json!({"success": false})));
+    let commit = table.new_write_builder().new_commit();
+    let messages = stage(&table, 42, true).await;
+    commit
+        .commit_with_identifier(messages.clone(), 7)
+        .await
+        .unwrap();
+    let published = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+    assert_eq!(
+        (published.id(), published.commit_kind()),
+        (4, &CommitKind::COMPACT)
+    );
+    let indexes = IndexManifest::read(
+        table.file_io(),
+        &snapshots.manifest_path(published.index_manifest().unwrap()),
+    )
+    .await
+    .unwrap();
+    let dv = indexes
+        .iter()
+        .find(|entry| entry.index_file.index_type == "DELETION_VECTORS")
+        .unwrap();
+    let dv_path = format!("{}/index/{}", table.location(), dv.index_file.file_name);
+    assert!(
+        table.file_io().exists(&dv_path).await.unwrap(),
+        "missing published DV: {dv_path}"
+    );
+    commit
+        .filter_and_commit_with_identifier(messages, 7)
+        .await
+        .unwrap();
+    assert_eq!(snapshots.get_latest_snapshot_id().await.unwrap(), Some(4));
+    let mut expected: Vec<_> = (0..1000).map(|id| (id, id, Some(id))).collect();
+    expected[42] = (42, 420, Some(4200));
+    assert_eq!(read_rows(&table).await, expected);
 }
 
 #[tokio::test]

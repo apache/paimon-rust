@@ -1464,18 +1464,24 @@ impl TableCommit {
                 &statistics,
             )
             .await;
-        // A file-store rejection may be a replay of a successful conditional
-        // write. Only a different snapshot can prove that cleanup is safe.
-        // For REST, only an explicit false in the commit response is a rejection.
+        // A publisher can report rejection after storing the snapshot. Require
+        // a different attempt at this snapshot ID before cleaning any outputs.
         let publication = match publication {
-            Ok(false) if automatic_outputs_published.is_some() && self.table.rest_env.is_none() => {
-                match self
-                    .snapshot_manager
-                    .get_snapshot_uncached(snapshot.id())
-                    .await
-                {
-                    Ok(current)
-                        if current.uuid() != snapshot.uuid()
+            Ok(false) if automatic_outputs_published.is_some() => {
+                let current = if self.table.rest_env.is_some() {
+                    // The catalog exposes only its head. A different snapshot
+                    // ID cannot establish who published the attempted ID.
+                    self.snapshot_manager.get_latest_snapshot().await
+                } else {
+                    self.snapshot_manager
+                        .get_snapshot_uncached(snapshot.id())
+                        .await
+                        .map(Some)
+                };
+                match current {
+                    Ok(Some(current))
+                        if current.id() == snapshot.id()
+                            && current.uuid() != snapshot.uuid()
                             && current.delta_manifest_list() != snapshot.delta_manifest_list() =>
                     {
                         Ok(false)

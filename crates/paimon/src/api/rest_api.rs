@@ -1246,8 +1246,8 @@ impl RESTApi {
     // ==================== Commit Operations ====================
 
     /// Commit a snapshot for a table.
-    /// Only an explicit `success: false` confirms rejection. An invalid
-    /// response leaves the publication outcome unknown.
+    /// Returns the server's reported `success`. An invalid response leaves
+    /// the publication outcome unknown.
     ///
     /// Corresponds to Python `RESTApi.commit_snapshot`.
     pub async fn commit_snapshot(
