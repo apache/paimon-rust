@@ -151,11 +151,21 @@ pub struct VariantRef<'a> {
 pub(crate) struct VariantMetadataValidation<'a> {
     bytes: &'a [u8],
     validated: bool,
+    // Keep an immutable borrow: an address alone could be reused after a row is dropped.
+    extracted_residual: Option<VariantRef<'a>>,
+    #[cfg(test)]
+    extraction_validations: usize,
 }
 
 impl<'a> VariantMetadataValidation<'a> {
     pub(crate) fn new(bytes: &'a [u8], validated: bool) -> Self {
-        Self { bytes, validated }
+        Self {
+            bytes,
+            validated,
+            extracted_residual: None,
+            #[cfg(test)]
+            extraction_validations: 0,
+        }
     }
 
     pub(crate) fn is_validated(&self) -> bool {
@@ -191,6 +201,27 @@ impl<'a> VariantRef<'a> {
             return data_invalid("Malformed Variant root size");
         }
         Self::new_at(value, metadata.bytes, pos)
+    }
+
+    /// Multiple requested paths often share the same wide residual. Reuse its
+    /// validated root within this row, without hashing or copying the payload.
+    /// A different slice (including a different length) must still be validated.
+    fn for_extraction(
+        value: &'a [u8],
+        metadata: &mut VariantMetadataValidation<'a>,
+    ) -> Result<Self> {
+        if let Some(cached) = metadata.extracted_residual {
+            if std::ptr::eq(cached.value, value) {
+                return Ok(cached);
+            }
+        }
+        #[cfg(test)]
+        {
+            metadata.extraction_validations += 1;
+        }
+        let root = Self::new_with_cached_metadata(value, 0, metadata)?;
+        metadata.extracted_residual = Some(root);
+        Ok(root)
     }
 
     fn new_at(value: &'a [u8], metadata: &'a [u8], pos: usize) -> Result<Self> {
@@ -3123,7 +3154,7 @@ fn extract_shredded_segments_cast<'a>(
             let residual = optional_binary_field(row, schema.variant_idx)?;
             match (typed, residual) {
                 (None, Some(value)) => {
-                    let variant = VariantRef::new_with_cached_metadata(value, 0, metadata)?;
+                    let variant = VariantRef::for_extraction(value, metadata)?;
                     return cast_variant_to_shredded_value(variant, data_type, fail_on_error);
                 }
                 (None, None) => return Ok(None),
@@ -3177,7 +3208,7 @@ fn extract_shredded_segments_cast<'a>(
     }
     match optional_binary_field(row, schema.variant_idx)? {
         Some(value) => {
-            let variant = VariantRef::new_with_cached_metadata(value, 0, metadata)?;
+            let variant = VariantRef::for_extraction(value, metadata)?;
             variant
                 .get_path_segments(segments)?
                 .map(|selected| cast_variant_to_shredded_value(selected, data_type, fail_on_error))
@@ -4171,6 +4202,61 @@ mod tests {
                 assert_eq!(actual, expected, "{json} {path}");
             }
         }
+    }
+
+    #[test]
+    fn cold_paths_share_residual_validation_within_one_row() {
+        let schema = simple_object_shredding_schema();
+        let target = DataType::Float(FloatType::new());
+        for row_value in [1, 2] {
+            let fields = (0..64)
+                .map(|i| format!("\"cold_{i}\":{}", i + row_value))
+                .collect::<Vec<_>>()
+                .join(",");
+            let variant = GenericVariant::parse_json(&format!("{{\"age\":7,{fields}}}")).unwrap();
+            let shredded = cast_shredded(&variant, &schema).unwrap();
+            // Even a previously validated metadata dictionary must not supply
+            // a residual-validation result for a different row.
+            let mut validation = VariantMetadataValidation::new(variant.metadata(), true);
+            for i in 0..64 {
+                let value = extract_shredded_path_cast(
+                    &shredded,
+                    &schema,
+                    &mut validation,
+                    &format!("$.cold_{i}"),
+                    &target,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(value, Some(ShreddedValue::Float32((i + row_value) as f32)));
+            }
+            assert_eq!(validation.extraction_validations, 1);
+        }
+    }
+
+    #[test]
+    fn extraction_cache_revalidates_distinct_and_truncated_residuals() {
+        let variant = GenericVariant::parse_json(r#"{"a":1,"b":2}"#).unwrap();
+        let value = variant.value();
+        let copy = value.to_vec();
+        let mut invalid = value.to_vec();
+        invalid[0] = 0xff;
+        let mut validation = VariantMetadataValidation::new(variant.metadata(), false);
+        for _ in 0..2 {
+            assert!(VariantRef::for_extraction(value, &mut validation).is_ok());
+        }
+        assert_eq!(validation.extraction_validations, 1);
+        assert!(VariantRef::for_extraction(&copy, &mut validation).is_ok());
+        assert_eq!(validation.extraction_validations, 2);
+        // Same address as the cached slice, but a different length.
+        assert!(VariantRef::for_extraction(&copy[..copy.len() - 1], &mut validation).is_err());
+        // Failure must not populate the cache or poison the last valid entry.
+        for _ in 0..2 {
+            assert!(VariantRef::for_extraction(&invalid, &mut validation).is_err());
+        }
+        assert_eq!(validation.extraction_validations, 5);
+        assert!(VariantRef::for_extraction(&copy, &mut validation).is_ok());
+        assert_eq!(validation.extraction_validations, 5);
     }
 
     #[test]
