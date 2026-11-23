@@ -1797,8 +1797,12 @@ fn sort_merge_stream(
         let mut output_indices: Vec<(usize, usize)> = Vec::with_capacity(batch_size);
         // Output rows at `(PICKED_ROW, i)` are `picked_rows[i]`.
         let mut picked_rows: Vec<PickedRow> = Vec::new();
-        // Changelog rows not yet handed on, and the schema that marks them.
+        // Changelog rows not yet handed on, and the schema that marks them. A
+        // row taken from a source batch is a zero-copy slice that keeps the
+        // whole batch alive, so `pending_changelog` is copied into
+        // `changelog_chunks` whenever source batches are released.
         let mut pending_changelog: Vec<RecordBatch> = Vec::new();
+        let mut changelog_chunks: Vec<RecordBatch> = Vec::new();
         let mut changelog_rows = 0;
         let changelog_schema = {
             let mut metadata = output_schema.metadata().clone();
@@ -1961,13 +1965,18 @@ fn sort_merge_stream(
                 // writer does not handle a one-row batch per key. The buffer stays
                 // bounded by the batch size even when every data row is deleted.
                 if changelog_rows >= batch_size {
-                    yield changelog_batch(&changelog_schema, &pending_changelog)?;
-                    pending_changelog.clear();
+                    yield changelog_batch(
+                        &changelog_schema,
+                        &mut changelog_chunks,
+                        &mut pending_changelog,
+                    )?;
                     changelog_rows = 0;
                 }
             }
-            if output_indices.is_empty() {
-                compact_batch_buffer(&mut batch_buffer, &mut stream_batch_idx, &cursors);
+            if output_indices.is_empty()
+                && compact_batch_buffer(&mut batch_buffer, &mut stream_batch_idx, &cursors)
+            {
+                detach_changelog(&mut changelog_chunks, &mut pending_changelog)?;
             }
 
             // Yield a batch when we've accumulated enough rows.
@@ -1985,17 +1994,15 @@ fn sort_merge_stream(
                 // materialized. Source batches still referenced by cursors stay
                 // alive; materialized batches can be dropped here because they
                 // are referenced only by the flushed output_indices above.
-                compact_batch_buffer(
-                    &mut batch_buffer,
-                    &mut stream_batch_idx,
-                    &cursors,
-                );
+                if compact_batch_buffer(&mut batch_buffer, &mut stream_batch_idx, &cursors) {
+                    detach_changelog(&mut changelog_chunks, &mut pending_changelog)?;
+                }
                 yield batch;
             }
         }
 
-        if !pending_changelog.is_empty() {
-            yield changelog_batch(&changelog_schema, &pending_changelog)?;
+        if !pending_changelog.is_empty() || !changelog_chunks.is_empty() {
+            yield changelog_batch(&changelog_schema, &mut changelog_chunks, &mut pending_changelog)?;
         }
 
         // Yield remaining rows.
@@ -2013,9 +2020,49 @@ fn sort_merge_stream(
     .boxed())
 }
 
-/// Concatenates per-key changelog batches into one changelog batch.
-fn changelog_batch(schema: &SchemaRef, batches: &[RecordBatch]) -> crate::Result<RecordBatch> {
-    arrow_select::concat::concat_batches(schema, batches).map_err(|error| Error::DataInvalid {
+/// Copies the pending per-key changelog rows into one chunk that owns its
+/// buffers. A row sliced from a source batch keeps that whole batch alive and
+/// is charged in full by the format writer.
+fn detach_changelog(
+    chunks: &mut Vec<RecordBatch>,
+    pending: &mut Vec<RecordBatch>,
+) -> crate::Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let batches = pending.iter().collect::<Vec<_>>();
+    let indices = pending
+        .iter()
+        .enumerate()
+        .flat_map(|(batch, rows)| (0..rows.num_rows()).map(move |row| (batch, row)))
+        .collect::<Vec<_>>();
+    let chunk =
+        arrow_select::interleave::interleave_record_batch(&batches, &indices).map_err(|error| {
+            Error::DataInvalid {
+                message: format!("Invalid changelog batch: {error}"),
+                source: Some(Box::new(error)),
+            }
+        })?;
+    chunks.push(chunk);
+    pending.clear();
+    Ok(())
+}
+
+/// Hands on the changelog gathered so far as one batch that owns its rows.
+fn changelog_batch(
+    schema: &SchemaRef,
+    chunks: &mut Vec<RecordBatch>,
+    pending: &mut Vec<RecordBatch>,
+) -> crate::Result<RecordBatch> {
+    detach_changelog(chunks, pending)?;
+    let batch = if chunks.len() == 1 {
+        chunks.pop().unwrap().with_schema(schema.clone())
+    } else {
+        let batch = arrow_select::concat::concat_batches(schema, chunks.iter());
+        chunks.clear();
+        batch
+    };
+    batch.map_err(|error| Error::DataInvalid {
         message: format!("Invalid changelog batch: {error}"),
         source: Some(Box::new(error)),
     })
@@ -2111,11 +2158,12 @@ fn build_output_interleave(
 
 /// Compact the batch buffer by removing batches no longer referenced by any
 /// cursor, and updating indices accordingly.
+/// Returns whether any batch was released.
 fn compact_batch_buffer(
     batch_buffer: &mut Vec<BufferedBatch>,
     stream_batch_idx: &mut [Option<usize>],
     cursors: &[Option<SortMergeCursor>],
-) {
+) -> bool {
     // Collect which buffer indices are still alive (referenced by a cursor).
     let mut alive: Vec<bool> = vec![false; batch_buffer.len()];
     for (i, cursor) in cursors.iter().enumerate() {
@@ -2136,6 +2184,7 @@ fn compact_batch_buffer(
         }
     }
 
+    let released = new_buffer.len() < batch_buffer.len();
     *batch_buffer = new_buffer;
 
     // Remap stream_batch_idx.
@@ -2148,6 +2197,7 @@ fn compact_batch_buffer(
             stream_batch_idx[i] = None;
         }
     }
+    released
 }
 
 // ---------------------------------------------------------------------------
@@ -2157,7 +2207,8 @@ fn compact_batch_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Array, Int32Array, Int64Array, Int8Array, StringArray};
+    use arrow_array::cast::AsArray;
+    use arrow_array::{Array, BinaryArray, Int32Array, Int64Array, Int8Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use std::collections::HashMap;
@@ -3418,6 +3469,140 @@ mod tests {
             data.iter().flat_map(|batch| pks(batch)).collect::<Vec<_>>(),
             vec![1, 2, 3, 4, 5]
         );
+    }
+
+    /// A changelog row sliced from a source batch must not keep that batch
+    /// alive after the reader releases it, nor be handed on still sharing it.
+    #[tokio::test]
+    async fn test_changelog_rows_do_not_keep_released_source_batches() {
+        // Emits the first row of every input batch as a zero-copy slice.
+        struct SlicedChangelog;
+        impl MergeFunction for SlicedChangelog {
+            fn merge(
+                &self,
+                rows: &[MergeRow],
+                batch_buffer: &[BufferedBatch],
+                source_output_col_indices: &[usize],
+                output_schema: &SchemaRef,
+            ) -> crate::Result<MergeResult> {
+                DeduplicateMergeFunction.merge(
+                    rows,
+                    batch_buffer,
+                    source_output_col_indices,
+                    output_schema,
+                )
+            }
+
+            fn merge_with_changelog(
+                &self,
+                rows: &[MergeRow],
+                batches: &[BufferedBatch],
+                columns: &[usize],
+                schema: &SchemaRef,
+            ) -> crate::Result<(MergeResult, Option<RecordBatch>)> {
+                let last = rows.last().unwrap();
+                let changelog = (last.row_idx == 0).then(|| {
+                    let values = (0..schema.fields().len())
+                        .map(|index| {
+                            batches[last.batch_idx]
+                                .column_for_output(index, columns)
+                                .slice(last.row_idx, 1)
+                        })
+                        .collect();
+                    RecordBatch::try_new(schema.clone(), values).unwrap()
+                });
+                Ok((self.merge(rows, batches, columns, schema)?, changelog))
+            }
+        }
+
+        const ROWS: usize = 8;
+        const VALUE: usize = 4096;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("value", DataType::Binary, false),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("value", DataType::Binary, false),
+        ]));
+        let batch = |pks: Vec<i32>| {
+            let n = pks.len();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(pks)),
+                    Arc::new(Int64Array::from(vec![1; n])),
+                    Arc::new(Int8Array::from(vec![0; n])),
+                    Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
+                        [7u8; VALUE],
+                        n,
+                    ))),
+                ],
+            )
+            .unwrap()
+        };
+        // 17 input batches: the last changelog batch holds a lone row.
+        let inputs = (0..17)
+            .map(|b| batch((b * ROWS as i32..(b + 1) * ROWS as i32).collect()))
+            .collect::<Vec<_>>();
+        let payloads = inputs
+            .iter()
+            .map(|batch| batch.column(3).as_binary::<i32>().values().clone())
+            .collect::<Vec<_>>();
+        let mut stream = SortMergeReaderBuilder::new(
+            vec![
+                stream_from_batches(inputs),
+                stream_from_batches(vec![batch(vec![1000])]),
+            ],
+            schema.clone(),
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema.clone(),
+            Box::new(SlicedChangelog),
+        )
+        .with_batch_size(ROWS)
+        .build()
+        .unwrap();
+
+        let mut data_batches = 0usize;
+        let mut stale = 0;
+        let mut changelog_pks = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            if batch
+                .schema()
+                .metadata()
+                .contains_key(CHANGELOG_BATCH_METADATA_KEY)
+            {
+                assert!(
+                    batch.get_array_memory_size() < (batch.num_rows() + 1) * VALUE,
+                    "a {}-row changelog batch holds {} bytes",
+                    batch.num_rows(),
+                    batch.get_array_memory_size()
+                );
+                let pks = batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int32Type>();
+                changelog_pks.extend(pks.values().iter().copied());
+            } else {
+                // The input batches before the previous one are fully merged.
+                data_batches += 1;
+                let merged = &payloads[..data_batches.saturating_sub(1).min(payloads.len())];
+                stale = stale.max(merged.iter().filter(|p| p.strong_count() > 1).count());
+            }
+        }
+        assert_eq!(
+            changelog_pks,
+            (0..17)
+                .map(|b| b * ROWS as i32)
+                .chain([1000])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(stale, 0, "merged source batches were kept alive");
     }
 
     #[tokio::test]

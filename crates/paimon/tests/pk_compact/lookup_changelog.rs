@@ -951,3 +951,125 @@ async fn lookup_compaction_selects_the_lowest_positive_level_as_materialized_his
         assert_eq!(rows(&table).await, vec![(1, expected_value)]);
     }
 }
+
+async fn compact_with_memory_limit(table: &Table, limit: Option<usize>) -> i64 {
+    let builder = table.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let mut executor = table.new_compact_builder();
+    if let Some(limit) = limit {
+        executor = executor.with_resources(
+            paimon::resource::ResourceContext::builder()
+                .memory_limit(limit)
+                .build()
+                .unwrap(),
+        );
+    }
+    let executor = executor.new_executor().unwrap();
+    let mut results = Vec::new();
+    for task in plan.tasks() {
+        results.push(executor.execute(task).await.unwrap());
+    }
+    builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap();
+    table
+        .snapshot_manager()
+        .get_latest_snapshot_id()
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// A lone changelog row taken from a read batch of large values is handed to
+/// the changelog writer on its own, not charged for the whole batch.
+#[tokio::test]
+async fn lookup_changelog_charges_a_lone_row_for_its_own_value() {
+    for format in ["parquet", "orc"] {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("file.format", format)
+            .option("file.compression", "none")
+            .option("changelog-producer", "lookup")
+            .option("changelog-producer.row-deduplicate", "true")
+            .option("read.batch-size", "128")
+            .build()
+            .unwrap();
+        let table = table_with_schema(TableSchema::new(0, &schema)).await;
+        let large = "x".repeat(4096);
+        let write = |ids: Vec<i32>, values: Vec<String>| {
+            RecordBatch::try_from_iter([
+                (
+                    "id",
+                    std::sync::Arc::new(Int32Array::from(ids)) as arrow_array::ArrayRef,
+                ),
+                ("value", std::sync::Arc::new(StringArray::from(values)) as _),
+            ])
+            .unwrap()
+        };
+        let small = || vec!["s".to_string(); 127];
+        write_batch(&table, &write((1..=127).collect(), small())).await;
+        let published = compact_with_memory_limit(&table, None).await;
+        // Large values for keys 1..=127 are superseded by the next write, which
+        // matches the published values, so the new key 128 emits the only
+        // changelog row of the compaction, out of a read batch of large values.
+        let mut values = vec![large; 127];
+        values.push("y".into());
+        write_batch(&table, &write((1..=128).collect(), values)).await;
+        write_batch(&table, &write((1..=127).collect(), small())).await;
+        let compacted = compact_with_memory_limit(&table, Some(64 * 1024)).await;
+
+        let plan = table
+            .new_read_builder()
+            .new_incremental_scan(IncrementalScanMode::Auto, published + 1, compacted)
+            .plan_combined()
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = table
+            .new_read_builder()
+            .new_read()
+            .unwrap()
+            .to_arrow_with_row_kind(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        for batch in batches {
+            let kinds = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let values = batch
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            events.extend((0..batch.num_rows()).map(|row| {
+                (
+                    kinds.value(row).to_string(),
+                    ids.value(row),
+                    values.value(row).to_string(),
+                )
+            }));
+        }
+        assert_eq!(
+            events,
+            vec![("+I".to_string(), 128, "y".to_string())],
+            "{format}"
+        );
+    }
+}
