@@ -27,12 +27,16 @@ use crate::spec::{
 use crate::table::index_build::full_text::native_full_text_options;
 use crate::table::index_file_path::IndexFileLocation;
 use crate::table::pk_index_options::{definitions, Definition};
-use crate::table::vector_search_common::read_vector_index_header;
+use crate::table::vector_search_common::{
+    read_retained_vector_index_header, read_vector_index_header,
+};
 use crate::table::Table;
 use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
 use crate::{Error, Result};
 use futures::future::try_join_all;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::OnceLock;
+use tokio::sync::Semaphore;
 
 type Unit = (Vec<u8>, i32, i32, i32);
 type Levels = BTreeMap<i32, Vec<DataFileMeta>>;
@@ -148,13 +152,15 @@ async fn compatible(
     table: &Table,
     entry: &IndexManifestEntry,
     definition: &Definition,
+    retained_header_reads: Option<&Semaphore>,
 ) -> Result<bool> {
     let file = &entry.index_file;
     if file.index_type != definition.index_type {
         return Ok(false);
     }
     if is_vindex_index_type(&definition.index_type) {
-        if file.row_count == 0 && file.file_size == 0 {
+        let empty = file.row_count == 0 && file.file_size == 0;
+        if empty && retained_header_reads.is_some() {
             return Ok(true);
         }
         let expected = VindexVectorIndexOptions::new(
@@ -175,9 +181,45 @@ async fn compatible(
             index_file_in_data_file_dir: in_data_dir,
         }
         .resolve(&file.file_name, file.external_path.as_deref());
-        let persisted =
-            read_vector_index_header(table.file_io(), &path, file.file_size.max(0) as u64).await?;
-        return Ok(persisted.matches_options(&expected));
+        let file_size = file.file_size.max(0) as u64;
+        let persisted = if let Some(limit) = retained_header_reads {
+            // All buckets in one automatic round share this limit, including
+            // any length checks needed after an ambiguous storage failure.
+            let _permit = limit
+                .acquire()
+                .await
+                .expect("the compaction header read semaphore is never closed");
+            let Some(persisted) =
+                read_retained_vector_index_header(table.file_io(), &path, file_size).await?
+            else {
+                return Ok(false);
+            };
+            persisted
+        } else {
+            let status = table.file_io().new_input(&path)?.metadata().await?;
+            if status.is_dir {
+                return Err(invalid(&format!(
+                    "PK vector index output '{path}' is a directory"
+                )));
+            }
+            if status.size != file_size {
+                return Err(invalid(&format!(
+                    "PK vector index output '{path}' has size {}, expected {file_size}",
+                    status.size
+                )));
+            }
+            if empty {
+                return Ok(true);
+            }
+            read_vector_index_header(table.file_io(), &path, file_size).await?
+        };
+        let matches_nlist = expected.native_options.get("nlist").is_none_or(|value| {
+            let value = value.trim();
+            value == "auto" || value.parse::<usize>().ok() == Some(persisted.nlist)
+        });
+        return Ok(persisted.matches_options(&expected)
+            && matches_nlist
+            && persisted.total_vectors == file.row_count);
     }
     if definition.index_type == "full-text" {
         let mut options = table.schema().options().clone();
@@ -236,9 +278,10 @@ pub(super) async fn plan<'a>(
     levels: &Levels,
     defs: &'a [Definition],
     unsupported: &HashSet<(i32, i32)>,
-    partition: &[u8],
-    bucket: i32,
+    bucket_key: (&[u8], i32),
+    header_reads: &OnceLock<Semaphore>,
 ) -> Result<Maintenance<'a>> {
+    let (partition, bucket) = bucket_key;
     let mut existing = BTreeMap::<(i32, i32), Vec<&IndexManifestEntry>>::new();
     for entry in indexes
         .iter()
@@ -261,6 +304,7 @@ pub(super) async fn plan<'a>(
     let mut deletes = Vec::new();
     let mut builds = Vec::new();
     let parallelism = compatibility_parallelism(table, defs)?;
+    let header_reads = header_reads.get_or_init(|| Semaphore::new(parallelism));
     let existing_entries = existing.iter().collect::<Vec<_>>();
     for batch in existing_entries.chunks(parallelism) {
         let mut checks = Vec::with_capacity(batch.len());
@@ -276,7 +320,7 @@ pub(super) async fn plan<'a>(
                     && match definition {
                         Some(d) => {
                             !unsupported.contains(&(*level, *field))
-                                && compatible(table, entries[0], d).await?
+                                && compatible(table, entries[0], d, Some(header_reads)).await?
                         }
                         None => true,
                     };
@@ -352,6 +396,7 @@ pub(super) async fn validate(
     let mut required_deletes = Vec::new();
     let mut required_builds = HashSet::new();
     let mut after_levels = BTreeMap::new();
+    let header_reads = OnceLock::new();
     for (partition, bucket) in &buckets {
         let after = levels(active, changes, partition, *bucket);
         let unsupported = unsupported_scalar_units(table, &after, &defs).await;
@@ -361,8 +406,8 @@ pub(super) async fn validate(
             &after,
             &defs,
             &unsupported,
-            partition,
-            *bucket,
+            (partition, *bucket),
+            &header_reads,
         )
         .await?;
         required_deletes.extend(maintenance.deletes);
@@ -459,7 +504,7 @@ pub(super) async fn validate(
     for batch in outputs.chunks(compatibility_parallelism(table, &defs)?) {
         let mut checks = Vec::with_capacity(batch.len());
         for &(entry, definition) in batch {
-            checks.push(compatible(table, entry, definition));
+            checks.push(compatible(table, entry, definition, None));
         }
         if try_join_all(checks).await?.contains(&false) {
             return Err(invalid(

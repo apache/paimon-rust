@@ -17,7 +17,7 @@
 
 //! Shared vector-search option validation, index I/O helpers, and result ordering.
 
-use crate::io::{FileIO, FileRead};
+use crate::io::{FileIO, FileRead, InputFile};
 use crate::spec::{
     CoreOptions, DataField, FileKind, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
 };
@@ -30,21 +30,26 @@ use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_select::interleave::interleave_record_batch;
 use bytes::{Buf, Bytes};
-use paimon_vindex_core::diskann_io::DISKANN_HEADER_SIZE;
+use paimon_vindex_core::diskann_io::{DISKANN_HEADER_SIZE, DISKANN_MAGIC, DISKANN_VERSION};
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{IndexType, VectorIndexReader as VIndexReader};
+use paimon_vindex_core::io::{MAGIC as IVF_PQ_MAGIC, VERSION as IVF_PQ_VERSION};
+use paimon_vindex_core::ivfflat_io::{IVFFLAT_MAGIC, IVFFLAT_VERSION};
+use paimon_vindex_core::ivfrq_io::{IVF_RQ_MAGIC, IVF_RQ_VERSION};
 use paimon_vindex_core::ivfsq_io::{IVF_SQ_BITS, IVF_SQ_HEADER_SIZE, IVF_SQ_MAGIC, IVF_SQ_VERSION};
 use std::collections::HashMap;
 use std::io::{self, Cursor};
 
 pub(super) use super::partition_filter::validate_partition_filter;
 
-/// Persisted vector properties which must agree across all runs of one column.
+/// Persisted properties available from the native vector file header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct IndexVectorSemantics {
     pub index_type: IndexType,
     pub metric: MetricType,
     pub dimension: usize,
+    pub nlist: usize,
+    pub total_vectors: i64,
 }
 
 impl IndexVectorSemantics {
@@ -118,42 +123,157 @@ pub(super) async fn read_vector_index_header(
     file_size: u64,
 ) -> crate::Result<IndexVectorSemantics> {
     let input = file_io.new_input(path)?;
-    let read_error = |e| crate::Error::DataInvalid {
-        message: format!(
-            "Failed to read vindex index file '{}' for vector metric: {}",
-            path, e
-        ),
-        source: Some(Box::new(e)),
+    load_vector_index_header(&input, file_size)
+        .await
+        .map_err(|error| error.with_path(path))
+}
+
+/// A missing or malformed retained payload can be rebuilt from its live sources.
+pub(super) async fn read_retained_vector_index_header(
+    file_io: &FileIO,
+    path: &str,
+    file_size: u64,
+) -> crate::Result<Option<IndexVectorSemantics>> {
+    let input = file_io.new_input(path)?;
+    let error = match load_vector_index_header(&input, file_size).await {
+        Ok(header) => return Ok(Some(header)),
+        Err(error) => error,
     };
+    let check_size = match &error {
+        VectorHeaderError::Format(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            return Ok(None);
+        }
+        VectorHeaderError::Storage(crate::Error::IoUnexpected { source, .. })
+            if !source.is_temporary() =>
+        {
+            if source.is_permanent() && source.kind() == opendal::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            // Retry layers mark terminal errors as persistent, including 404s.
+            // Confirm a persistent missing or short object with a stat.
+            matches!(
+                source.kind(),
+                opendal::ErrorKind::NotFound
+                    | opendal::ErrorKind::RangeNotSatisfied
+                    | opendal::ErrorKind::Unexpected
+            )
+        }
+        // A cached reader can report a short source block as DataInvalid.
+        VectorHeaderError::Storage(crate::Error::DataInvalid { .. }) => true,
+        _ => false,
+    };
+    if check_size {
+        match input.metadata().await {
+            Ok(status) if status.size < file_size => return Ok(None),
+            Err(crate::Error::IoUnexpected { source, .. })
+                if !source.is_temporary() && source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            _ => {}
+        }
+    }
+    Err(error.with_path(path))
+}
+
+enum VectorHeaderError {
+    Storage(crate::Error),
+    Format(io::Error),
+}
+
+impl VectorHeaderError {
+    fn with_path(self, path: &str) -> crate::Error {
+        match self {
+            Self::Storage(error) => crate::Error::DataInvalid {
+                message: format!(
+                    "Failed to read vindex index file '{path}' for vector metric: {error}"
+                ),
+                source: Some(Box::new(error)),
+            },
+            Self::Format(error) => crate::Error::DataInvalid {
+                message: format!(
+                    "Failed to read native vector index metadata for '{path}': {error}"
+                ),
+                source: Some(Box::new(error)),
+            },
+        }
+    }
+}
+
+async fn load_vector_index_header(
+    input: &InputFile,
+    file_size: u64,
+) -> Result<IndexVectorSemantics, VectorHeaderError> {
     let file_size = if file_size > 0 {
         file_size
     } else {
-        input.metadata().await.map_err(&read_error)?.size
+        input
+            .metadata()
+            .await
+            .map_err(VectorHeaderError::Storage)?
+            .size
     };
     let header_size = file_size.min(DISKANN_HEADER_SIZE as u64);
     let file_reader = input
         .reader_with_size(file_size)
         .await
-        .map_err(&read_error)?;
-    let bytes = file_reader.read(0..header_size).await.map_err(read_error)?;
-    parse_vector_index_header(bytes, file_size).map_err(|e| crate::Error::DataInvalid {
-        message: format!(
-            "Failed to read native vector index metadata for '{}': {}",
-            path, e
-        ),
-        source: Some(Box::new(e)),
-    })
+        .map_err(VectorHeaderError::Storage)?;
+    let bytes = file_reader
+        .read(0..header_size)
+        .await
+        .map_err(VectorHeaderError::Storage)?;
+    if bytes.len() < header_size as usize {
+        return Err(VectorHeaderError::Storage(crate::Error::DataInvalid {
+            message: format!(
+                "Short vector index header read, expected {header_size} bytes, received {}",
+                bytes.len()
+            ),
+            source: None,
+        }));
+    }
+    parse_vector_index_header(bytes, file_size).map_err(VectorHeaderError::Format)
 }
 
 fn parse_vector_index_header(bytes: Bytes, file_size: u64) -> io::Result<IndexVectorSemantics> {
+    let mut prefix = bytes.get(..8).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Truncated vector index header",
+        )
+    })?;
+    let magic = prefix.get_u32_le();
+    let version = prefix.get_u32_le();
+    let supported_version = match magic {
+        IVFFLAT_MAGIC => IVFFLAT_VERSION,
+        IVF_PQ_MAGIC => IVF_PQ_VERSION,
+        IVF_RQ_MAGIC => IVF_RQ_VERSION,
+        IVF_SQ_MAGIC => IVF_SQ_VERSION,
+        DISKANN_MAGIC => DISKANN_VERSION,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unknown vector index magic: {magic:#010x}"),
+            ));
+        }
+    };
+    if version != supported_version {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("Unsupported vector index version {version} for magic {magic:#010x}"),
+        ));
+    }
     // Opening an IVF-SQ reader also loads its quantizer sections. The fixed
     // header carries the index properties needed for scoring and maintenance.
-    if bytes.starts_with(&IVF_SQ_MAGIC.to_le_bytes()) {
+    if magic == IVF_SQ_MAGIC {
         let header = bytes.get(..IVF_SQ_HEADER_SIZE).ok_or_else(|| {
             io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated IVF-SQ header")
         })?;
-        let mut fields = &header[4..36];
-        let version = fields.get_u32_le();
+        let mut fields = &header[8..36];
         let dimension = fields.get_i32_le();
         let nlist = fields.get_i32_le();
         let code = fields.get_u32_le();
@@ -161,8 +281,7 @@ fn parse_vector_index_header(bytes: Bytes, file_size: u64) -> io::Result<IndexVe
         let bits = fields.get_u32_le();
         let flags = fields.get_u32_le();
         // IVF-SQ v1 requires delta IDs and blocked codes.
-        if version != IVF_SQ_VERSION
-            || dimension <= 0
+        if dimension <= 0
             || nlist <= 0
             || total_vectors < 0
             || bits != IVF_SQ_BITS
@@ -197,6 +316,8 @@ fn parse_vector_index_header(bytes: Bytes, file_size: u64) -> io::Result<IndexVe
             index_type: IndexType::IvfSq,
             metric,
             dimension: dimension as usize,
+            nlist: nlist as usize,
+            total_vectors,
         });
     }
     let metadata = VIndexReader::open(Cursor::new(bytes))?.metadata();
@@ -204,6 +325,8 @@ fn parse_vector_index_header(bytes: Bytes, file_size: u64) -> io::Result<IndexVe
         index_type: metadata.index_type,
         metric: metadata.metric,
         dimension: metadata.dimension,
+        nlist: metadata.nlist,
+        total_vectors: metadata.total_vectors,
     })
 }
 
@@ -867,9 +990,104 @@ mod tests {
                     index_type: IndexType::IvfFlat,
                     metric: MetricType::L2,
                     dimension: 2,
+                    nlist: 1,
+                    total_vectors: 3,
                 })
             );
         }
+    }
+
+    #[tokio::test]
+    async fn retained_vector_header_propagates_access_errors_and_unsupported_versions() {
+        #[derive(Debug)]
+        struct FailingProvider(opendal::ErrorKind, bool);
+
+        #[async_trait::async_trait]
+        impl crate::io::FileIOProvider for FailingProvider {
+            async fn create(&self, _path: &str) -> crate::Result<(opendal::Operator, String)> {
+                let mut error = opendal::Error::new(self.0, "Injected storage error");
+                if self.1 {
+                    error = error.set_temporary();
+                }
+                Err(error.into())
+            }
+        }
+
+        let path = "memory:/retained-vector-header/index";
+        for (kind, temporary) in [
+            (opendal::ErrorKind::PermissionDenied, false),
+            (opendal::ErrorKind::NotFound, true),
+            (opendal::ErrorKind::Unexpected, true),
+        ] {
+            let file_io = FileIOBuilder::new("memory")
+                .with_provider(std::sync::Arc::new(FailingProvider(kind, temporary)))
+                .build()
+                .unwrap();
+            let error = read_retained_vector_index_header(&file_io, path, 256)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Injected storage error"),
+                "{error}"
+            );
+        }
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let mut payload = crate::table::vector_search_test_utils::build_vindex_segment_bytes("l2");
+        payload[4..8].copy_from_slice(&(IVFFLAT_VERSION + 1).to_le_bytes());
+        let size = payload.len() as u64;
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(payload.into())
+            .await
+            .unwrap();
+        let error = read_retained_vector_index_header(&file_io, path, size)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Unsupported vector index version"),
+            "{error}"
+        );
+    }
+
+    #[cfg(all(
+        feature = "storage-memory",
+        any(feature = "storage-oss", feature = "storage-s3")
+    ))]
+    #[tokio::test]
+    async fn retained_vector_header_confirms_missing_after_storage_retries() {
+        #[derive(Debug)]
+        struct RetriedMemory(opendal::Operator);
+
+        #[async_trait::async_trait]
+        impl crate::io::FileIOProvider for RetriedMemory {
+            async fn create(&self, path: &str) -> crate::Result<(opendal::Operator, String)> {
+                Ok((
+                    self.0.clone(),
+                    path.strip_prefix("memory:/").unwrap().into(),
+                ))
+            }
+        }
+
+        let operator = opendal::Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .layer(opendal_layer_retry::RetryLayer::default());
+        let missing = operator.stat("missing.index").await.unwrap_err();
+        assert!(missing.is_persistent());
+        assert_eq!(missing.kind(), opendal::ErrorKind::NotFound);
+        let file_io = FileIOBuilder::new("memory")
+            .with_provider(std::sync::Arc::new(RetriedMemory(operator)))
+            .build()
+            .unwrap();
+        let path = "memory:/missing.index";
+        assert!(read_retained_vector_index_header(&file_io, path, 256)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(read_vector_index_header(&file_io, path, 256).await.is_err());
     }
 
     #[test]
@@ -886,7 +1104,12 @@ mod tests {
             header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
         let minimum_size = 2640;
-        assert!(parse_vector_index_header(Bytes::from(header.clone()), minimum_size).is_ok());
+        assert_eq!(
+            parse_vector_index_header(Bytes::from(header.clone()), minimum_size)
+                .unwrap()
+                .nlist,
+            1
+        );
         assert_eq!(
             parse_vector_index_header(Bytes::from(header.clone()), minimum_size - 1)
                 .unwrap_err()

@@ -26,11 +26,12 @@ pub(super) mod primary_key;
 use deletion_vectors::DeletionVectorUpdate;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 use super::data_file_index_writer::FileIndexOptions;
 use super::data_file_writer::DataFileWriter;
@@ -418,6 +419,7 @@ struct CompactInputs {
     snapshot: Snapshot,
     data: HashMap<(Vec<u8>, i32), Vec<ManifestEntry>>,
     indexes: HashMap<(Vec<u8>, i32), Vec<IndexManifestEntry>>,
+    pk_index_header_reads: OnceLock<Semaphore>,
 }
 
 /// Prepared data, changelog and index files owned by the caller until submitted
@@ -551,6 +553,7 @@ impl CompactExecutor {
             snapshot,
             data,
             indexes: by_bucket,
+            pk_index_header_reads: OnceLock::new(),
         })
     }
 
@@ -685,6 +688,7 @@ impl CompactExecutor {
                 &files,
                 &deletion_vector_updates,
                 self.resources.clone(),
+                &inputs.pk_index_header_reads,
             )
             .await
             {

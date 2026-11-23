@@ -30,7 +30,8 @@ use crate::table::pk_index_options::definitions;
 use crate::table::{CommitMessage, DataSplit, Table, TableCommit};
 use crate::Result;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Semaphore;
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::table::compact) async fn prepare(
@@ -42,6 +43,7 @@ pub(in crate::table::compact) async fn prepare(
     files: &[DataFileMeta],
     deletion_updates: &[super::super::deletion_vectors::DeletionVectorUpdate],
     resources: Option<ResourceContext>,
+    header_reads: &OnceLock<Semaphore>,
 ) -> Result<Vec<IndexManifestEntry>> {
     let defs = definitions(table.schema())?;
     let changes = task
@@ -76,8 +78,8 @@ pub(in crate::table::compact) async fn prepare(
         &after,
         &defs,
         &unsupported,
-        &task.partition,
-        task.bucket,
+        (&task.partition, task.bucket),
+        header_reads,
     )
     .await?;
     let vector_levels = maintenance
