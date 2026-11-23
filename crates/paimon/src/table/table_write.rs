@@ -161,6 +161,7 @@ pub struct TableWrite {
     branch_schema_checked: bool,
     write_schema: Arc<arrow_schema::Schema>,
     write_fields: Vec<DataField>,
+    column_defaults: super::column_defaults::ColumnDefaults,
     written: bool,
     partition_writers: HashMap<PartitionBucketKey, FileWriter>,
     append_write_configs: HashMap<PartitionBucketKey, AppendWriteConfig>,
@@ -232,6 +233,7 @@ impl TableWrite {
             branch_schema_checked: table.is_main_branch() || table.rest_env.is_some(),
             write_schema: build_target_arrow_schema(schema.fields())?,
             write_fields: schema.fields().to_vec(),
+            column_defaults: Default::default(),
             written: false,
             partition_writers: HashMap::new(),
             append_write_configs: HashMap::new(),
@@ -297,6 +299,8 @@ impl TableWrite {
         )?;
         crate::spec::map_shredding::validate(schema.fields(), schema.options())?;
         let write_schema = build_target_arrow_schema(schema.fields())?;
+        let column_defaults =
+            super::column_defaults::ColumnDefaults::new(schema.fields(), &write_schema, false)?;
         let core_options = CoreOptions::new(schema.options());
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
         let blob_view_fields = core_options.blob_view_fields();
@@ -528,6 +532,7 @@ impl TableWrite {
             branch_schema_checked: table.is_main_branch() || table.rest_env.is_some(),
             write_schema,
             write_fields: fields.to_vec(),
+            column_defaults,
             written: false,
             partition_writers: HashMap::new(),
             append_write_configs: HashMap::new(),
@@ -638,6 +643,11 @@ impl TableWrite {
     pub fn with_overwrite(mut self) -> Self {
         self.is_overwrite = true;
         self.bucket_assigner.set_overwrite(true);
+        self
+    }
+
+    pub(super) fn without_column_defaults(mut self) -> Self {
+        self.column_defaults = Default::default();
         self
     }
 
@@ -843,6 +853,21 @@ impl TableWrite {
         if batch.num_rows() == 0 {
             return Ok(None);
         }
+        let batch = if self.primary_key_indices.is_empty() {
+            self.column_defaults.apply(&batch)?
+        } else {
+            let kinds = batch
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap();
+            // Changelog updates and retractions already identify a row. Applying
+            // a default to a NULL key here could change which row they affect.
+            self.column_defaults.apply_to_rows(&batch, |row| {
+                kinds.is_null(row) || kinds.value(row) == RowKind::Insert.to_value()
+            })?
+        };
         if !self.primary_key_indices.is_empty() {
             super::inline_blob::validate_inline_blob_columns(
                 &batch,
@@ -908,7 +933,10 @@ impl TableWrite {
         // Empty arrays check equivalent layouts without examining row values.
         self.validate_write_batch_schema(&RecordBatch::new_empty(batch.schema()))?;
         let kinds = if let Some(generator) = &self.row_kind_generator {
-            generator.generate_batch(batch)?
+            generator.generate_batch(
+                batch,
+                self.column_defaults.string_value(generator.field_name()),
+            )?
         } else if let Some(column) = batch.column_by_name(VALUE_KIND_FIELD_NAME) {
             column
                 .as_any()
@@ -1340,7 +1368,10 @@ impl TableWrite {
         }
 
         let kinds = generator
-            .generate_batch(batch)?
+            .generate_batch(
+                batch,
+                self.column_defaults.string_value(generator.field_name()),
+            )?
             .into_iter()
             .map(|kind| kind.to_value())
             .collect();
@@ -2648,6 +2679,51 @@ pub(in crate::table) mod tests {
     }
 
     #[tokio::test]
+    async fn primary_key_defaults_apply_only_to_insert_rows_in_a_mixed_batch() {
+        let int = DataType::Int(IntType::new());
+        let schema = Schema::builder()
+            .field(DataField::new(0, "id".into(), int).with_default_value(Some("42".into())))
+            .primary_key(["id"])
+            .option("primary-key.nullable", "true")
+            .option("bucket", "1")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "mixed_default_rows"),
+            "memory:/mixed_default_rows".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let input = RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(vec![None; 5])) as ArrayRef),
+            (
+                VALUE_KIND_FIELD_NAME,
+                Arc::new(Int8Array::from(vec![
+                    Some(RowKind::Insert.to_value()),
+                    Some(RowKind::UpdateBefore.to_value()),
+                    Some(RowKind::UpdateAfter.to_value()),
+                    Some(RowKind::Delete.to_value()),
+                    None,
+                ])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let writer = table.new_write_builder().new_write().unwrap();
+        let actual = writer.normalize_write_batch(&input).unwrap().unwrap();
+        let keys = actual
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            keys,
+            &Int32Array::from(vec![Some(42), None, None, None, Some(42)])
+        );
+        assert_eq!(actual.column(1), input.column(1));
+    }
+
+    #[tokio::test]
     async fn test_rowkind_field_accepts_table_schema_and_rejects_caller_value_kind() {
         let file_io = test_file_io();
         let table_path = "memory:/test_rowkind_schema_validation";
@@ -2655,7 +2731,14 @@ pub(in crate::table) mod tests {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
-            .column("op", DataType::VarChar(VarCharType::string_type()))
+            .field(
+                DataField::new(
+                    2,
+                    "op".into(),
+                    DataType::VarChar(VarCharType::string_type()),
+                )
+                .with_default_value(Some("'+I'".into())),
+            )
             .primary_key(["id"])
             .option("bucket", "1")
             .option("rowkind.field", "op")
@@ -2703,12 +2786,12 @@ pub(in crate::table) mod tests {
             Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("id", ArrowDataType::Int32, false),
                 ArrowField::new("value", ArrowDataType::Int32, false),
-                ArrowField::new("op", ArrowDataType::Utf8, false),
+                ArrowField::new("op", ArrowDataType::Utf8, true),
             ])),
             vec![
                 Arc::new(Int32Array::from(vec![1])),
                 Arc::new(Int32Array::from(vec![10])),
-                Arc::new(StringArray::from(vec!["+I"])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
             ],
         )
         .unwrap();

@@ -2495,7 +2495,7 @@ mod tests {
             (&string, &double, "'0x1.8p1'", true),
             (&string, &double, "'inf'", false),
             (&string, &timestamp, "'2026-01-02T00:00:00+08:00'", false),
-            (&string, &time, "'00:00:00.0005'", false),
+            (&string, &time, "'00:00:00.0005'", true),
             (&string, &time, "'00:00:00.001'", true),
         ] {
             let catalog = create_memory_catalog();
@@ -2553,6 +2553,126 @@ mod tests {
                 assert_eq!(current.schema(), original.schema());
             }
             current.new_write_builder().new_write().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn writers_apply_java_defaults_after_alter() {
+        use arrow_array::{Int32Array, RecordBatch, Time32MillisecondArray};
+        use futures::TryStreamExt;
+
+        let int = DataType::Int(IntType::new());
+        let time = DataType::Time(crate::spec::TimeType::new(3).unwrap());
+        for (table_type, source, target, literal, input, expected) in [
+            (
+                "table",
+                DataType::BigInt(crate::spec::BigIntType::new()),
+                int,
+                "42",
+                Arc::new(Int32Array::from(vec![None, Some(7)])) as arrow_array::ArrayRef,
+                Arc::new(Int32Array::from(vec![42, 7])) as arrow_array::ArrayRef,
+            ),
+            (
+                "format-table",
+                DataType::VarChar(VarCharType::string_type()),
+                time,
+                "'00:00:00.0005'",
+                Arc::new(Time32MillisecondArray::from(vec![None, Some(7)])),
+                Arc::new(Time32MillisecondArray::from(vec![1, 7])),
+            ),
+        ] {
+            let catalog = create_memory_catalog();
+            let creation = Schema::builder()
+                .field(
+                    DataField::new(0, "value".into(), source)
+                        .with_default_value(Some(literal.into())),
+                )
+                .option("type", table_type)
+                .option("file.format", "parquet")
+                .option("write-only", "true")
+                .build()
+                .unwrap();
+            let id = setup_table(&catalog, creation).await;
+            catalog
+                .alter_table(
+                    &id,
+                    vec![SchemaChange::update_column_type("value".into(), target)],
+                    false,
+                )
+                .await
+                .unwrap();
+            let table = catalog.get_table(&id).await.unwrap();
+            assert_eq!(table.schema().id(), 1);
+            assert_eq!(table.schema().fields()[0].default_value(), Some(literal));
+            let batch = RecordBatch::try_new(
+                crate::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+                vec![input],
+            )
+            .unwrap();
+            let builder = table.new_write_builder();
+            let mut writer = builder.new_write().unwrap();
+            writer.write_arrow_batch(&batch).await.unwrap();
+            let messages = writer.prepare_commit().await.unwrap();
+            builder.new_commit().commit(messages).await.unwrap();
+            writer.close().await;
+
+            let reader = table.new_read_builder();
+            let plan = reader.new_scan().plan().await.unwrap();
+            let batches = reader
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].column(0).as_ref(), expected.as_ref());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_defaults_route_projected_writes_to_the_default_partition() {
+        use arrow_array::{Int32Array, RecordBatch};
+
+        let catalog = create_memory_catalog();
+        let int = DataType::Int(IntType::new());
+        let schema = Schema::builder()
+            .column("id", int.clone())
+            .field(DataField::new(1, "pt".into(), int).with_default_value(Some("42".into())))
+            .partition_keys(["pt"])
+            .option("bucket", "1")
+            .option("bucket-key", "id")
+            .build()
+            .unwrap();
+        let id = setup_table(&catalog, schema).await;
+        let table = catalog.get_table(&id).await.unwrap();
+        let schema = crate::arrow::build_target_arrow_schema(table.schema().fields()).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![None])),
+            ],
+        )
+        .unwrap();
+        for bucket in [None, Some(0)] {
+            let builder = table.new_write_builder();
+            let mut writer = builder.new_write().unwrap();
+            writer.with_write_type(vec!["id".into()]).unwrap();
+            writer
+                .write_arrow(std::slice::from_ref(&batch), bucket)
+                .await
+                .unwrap();
+            let messages = writer.prepare_commit().await.unwrap();
+            assert_eq!(messages.len(), 1);
+            let partition =
+                crate::spec::BinaryRow::from_serialized_bytes(&messages[0].partition).unwrap();
+            assert_eq!(partition.get_int(0).unwrap(), 42);
+            assert_eq!(messages[0].bucket, 0);
+            assert_eq!(messages[0].new_files[0].write_cols, Some(vec!["id".into()]));
+            builder.new_commit().commit(messages).await.unwrap();
+            writer.close().await;
         }
     }
 

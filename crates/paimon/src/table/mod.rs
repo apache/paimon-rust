@@ -44,6 +44,7 @@ mod bucket_router;
 mod centroid_bitmap;
 mod centroid_index;
 mod chunk_shuffle;
+mod column_defaults;
 mod commit_callback;
 mod commit_message;
 mod compact;
@@ -71,7 +72,6 @@ mod format_partition_stats;
 mod format_partition_truncate;
 mod format_read_builder;
 mod format_table_commit;
-mod format_table_defaults;
 mod format_table_read;
 mod format_table_scan;
 #[cfg(test)]
@@ -217,6 +217,7 @@ pub use batch_vector_search_builder::BatchVectorSearchBuilder;
 pub use blob_resolver::{BlobReader, BlobStream};
 pub use branch_manager::BranchManager;
 pub use bucket_router::BucketRouter;
+pub(crate) use column_defaults::validate_default_value;
 pub use commit_callback::{CommitCallback, CommitCallbackContext};
 pub use commit_message::{CommitMessage, COMMIT_MESSAGE_SERIALIZER_VERSION};
 pub use compact::{
@@ -236,7 +237,6 @@ pub use format_partition::{
 };
 pub use format_partition_stats::FormatTablePartitionStatsCollector;
 pub use format_partition_truncate::FormatTableTruncator;
-pub(crate) use format_table_defaults::validate_default_value;
 pub use full_text_search_builder::{
     FullTextRead, FullTextScan, FullTextScanPlan, FullTextSearchBuilder,
 };
