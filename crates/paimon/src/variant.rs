@@ -1454,16 +1454,33 @@ impl RebuildMetadata {
 }
 
 /// Bound parsed dictionaries and compact validation results to one assembly call.
-/// Exact bytes, not a hash or address, determine whether results can be reused.
+/// Arrow batches can also borrow validated metadata without copying its bytes.
 #[derive(Default)]
-pub(crate) struct RebuildMetadataCache {
+pub(crate) struct RebuildMetadataCache<'a> {
     entries: VecDeque<Arc<RebuildMetadata>>,
     bytes: usize,
     validated: VecDeque<Box<[u8]>>,
     validated_bytes: usize,
+    validated_borrowed: HashSet<&'a [u8]>,
+    validated_borrowed_addresses: HashSet<(usize, usize)>,
 }
 
-impl RebuildMetadataCache {
+impl<'a> RebuildMetadataCache<'a> {
+    fn validate_compact_metadata_borrowed(&mut self, bytes: &'a [u8]) -> Result<()> {
+        // The source Arrow array is immutable throughout this cache's lifetime.
+        // Check its slice address first so repeated dictionary values are O(1).
+        let address = (bytes.as_ptr() as usize, bytes.len());
+        if self.validated_borrowed_addresses.contains(&address) {
+            return Ok(());
+        }
+        if !self.validated_borrowed.contains(bytes) {
+            validate_metadata(bytes)?;
+            self.validated_borrowed.insert(bytes);
+        }
+        self.validated_borrowed_addresses.insert(address);
+        Ok(())
+    }
+
     fn validate_compact_metadata(&mut self, bytes: &[u8]) -> Result<()> {
         if let Some(index) = self
             .validated
@@ -2982,14 +2999,36 @@ pub(crate) fn rebuild_shredded(
 pub(crate) fn rebuild_shredded_with_cache(
     row: &ShreddedRow,
     schema: &VariantSchema,
-    cache: &mut RebuildMetadataCache,
+    cache: &mut RebuildMetadataCache<'_>,
+) -> Result<GenericVariant> {
+    rebuild_shredded_with_metadata(row, schema, cache, None)
+}
+
+/// Borrow metadata from the immutable Arrow batch for the whole assembly call.
+pub(crate) fn rebuild_shredded_with_borrowed_metadata<'a>(
+    row: &ShreddedRow,
+    schema: &VariantSchema,
+    cache: &mut RebuildMetadataCache<'a>,
+    metadata: &'a [u8],
+) -> Result<GenericVariant> {
+    rebuild_shredded_with_metadata(row, schema, cache, Some(metadata))
+}
+
+fn rebuild_shredded_with_metadata<'a>(
+    row: &ShreddedRow,
+    schema: &VariantSchema,
+    cache: &mut RebuildMetadataCache<'a>,
+    borrowed_metadata: Option<&'a [u8]>,
 ) -> Result<GenericVariant> {
     let Some(metadata_idx) = schema.top_level_metadata_idx else {
         return data_invalid("Malformed shredded Variant: missing top-level metadata field");
     };
-    let metadata = match row.field(metadata_idx) {
-        Some(ShreddedValue::Binary(bytes)) => bytes.as_slice(),
-        _ => return data_invalid("Malformed shredded Variant: missing metadata"),
+    let metadata = match borrowed_metadata {
+        Some(bytes) => bytes,
+        None => match row.field(metadata_idx) {
+            Some(ShreddedValue::Binary(bytes)) => bytes.as_slice(),
+            _ => return data_invalid("Malformed shredded Variant: missing metadata"),
+        },
     };
     if schema.is_unshredded() {
         let value = binary_field(row, schema.variant_idx)?;
@@ -3022,7 +3061,11 @@ pub(crate) fn rebuild_shredded_with_cache(
         if metadata.len() > SIZE_LIMIT {
             return data_invalid("Variant value or metadata exceeds constructor size limit");
         }
-        cache.validate_compact_metadata(metadata)?;
+        if let Some(bytes) = borrowed_metadata {
+            cache.validate_compact_metadata_borrowed(bytes)?;
+        } else {
+            cache.validate_compact_metadata(metadata)?;
+        }
         VariantBuilder::new()
     } else {
         VariantBuilder::with_source_metadata(cache.get_or_parse(metadata)?)
@@ -4825,6 +4868,50 @@ mod tests {
         assert!(cache.entries.is_empty());
         assert_eq!(cache.validated.len(), 17);
         assert_eq!(cache.validated_bytes, total);
+    }
+
+    #[test]
+    fn compact_rebuild_reuses_borrowed_validation_beyond_byte_limit() {
+        let schema = simple_object_shredding_schema();
+        let small = GenericVariant::parse_json(r#"{"age":27}"#).unwrap();
+        let mut row = cast_shredded(&small, &schema).unwrap();
+        row.fields[schema.top_level_metadata_idx.unwrap()] = None;
+        let dictionaries = (0..18)
+            .map(|suffix| {
+                let extra = (0..5362)
+                    .map(|key| format!(r#", "unused_{suffix}_{key:04}_field":0"#))
+                    .collect::<String>();
+                GenericVariant::parse_json(&format!(r#"{{"age":27{extra}}}"#))
+                    .unwrap()
+                    .metadata()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert!(dictionaries.iter().map(Vec::len).sum::<usize>() > MAX_COMPACT_METADATA_BYTES);
+        let mut cache = RebuildMetadataCache::default();
+        for i in 0..512 {
+            VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
+            let rebuilt = rebuild_shredded_with_borrowed_metadata(
+                &row,
+                &schema,
+                &mut cache,
+                &dictionaries[i % dictionaries.len()],
+            )
+            .unwrap();
+            if i >= dictionaries.len() {
+                // A miss would validate and populate the thread-local cache.
+                VALIDATED_METADATA.with(|cached| assert!(cached.borrow().is_empty()));
+            }
+            assert_eq!(rebuilt.to_json().unwrap(), small.to_json().unwrap());
+        }
+        assert_eq!(cache.validated_borrowed.len(), dictionaries.len());
+        let duplicate = dictionaries[0].clone();
+        VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
+        rebuild_shredded_with_borrowed_metadata(&row, &schema, &mut cache, &duplicate).unwrap();
+        // A different Arrow slice with the same bytes must reuse validation too.
+        VALIDATED_METADATA.with(|cached| assert!(cached.borrow().is_empty()));
+        assert_eq!(cache.validated_borrowed.len(), dictionaries.len());
+        assert!(cache.validated.is_empty());
     }
 
     #[test]

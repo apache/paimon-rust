@@ -28,7 +28,7 @@ use crate::spec::{
 };
 use crate::variant::{
     build_variant_schema, cast_shredded, cast_variant_to_shredded_value,
-    infer_variant_shredding_schema, rebuild_shredded, rebuild_shredded_with_cache,
+    infer_variant_shredding_schema, rebuild_shredded, rebuild_shredded_with_borrowed_metadata,
     top_level_path_key, variant_shredding_type, GenericVariant, RebuildMetadataCache, ShreddedRow,
     ShreddedValue, VariantShreddingInferConfig, VariantShreddingInferenceSession,
     VARIANT_METADATA_FIELD_NAME, VARIANT_TYPED_VALUE_FIELD_NAME, VARIANT_VALUE_FIELD_NAME,
@@ -801,14 +801,17 @@ pub(crate) fn assemble_shredded_variant_array(array: &dyn Array) -> Result<Array
             variants.push(None);
         } else {
             let shredded =
-                struct_row_at(input, row, &row_type)?.ok_or_else(|| Error::DataInvalid {
-                    message: "Shredded Variant row is null".to_string(),
-                    source: None,
-                })?;
-            variants.push(Some(rebuild_shredded_with_cache(
+                struct_row_at_skipping(input, row, &row_type, schema.top_level_metadata_idx)?
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: "Shredded Variant row is null".to_string(),
+                        source: None,
+                    })?;
+            let (metadata, _) = variant_metadata_at(input, row)?;
+            variants.push(Some(rebuild_shredded_with_borrowed_metadata(
                 &shredded,
                 &schema,
                 &mut metadata_cache,
+                metadata,
             )?));
         }
     }
