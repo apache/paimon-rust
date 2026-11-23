@@ -932,8 +932,10 @@ fn variant_metadata_child(children: &arrow_schema::Fields) -> Option<usize> {
     })
 }
 
-/// Keep Variant metadata dictionary-encoded for extraction and shredded full reads,
-/// including Variant fields inside logical ROW columns.
+/// Keep Variant metadata dictionary-encoded for extraction, including nested
+/// Variant fields inside logical ROW columns. Full reads use Binary because
+/// Parquet may spill dictionary values into PLAIN pages; asking Arrow to build
+/// a dictionary for those pages adds work to every row.
 fn dictionary_variant_metadata_field(
     field: &arrow_schema::FieldRef,
     read_type: &DataType,
@@ -941,9 +943,7 @@ fn dictionary_variant_metadata_field(
     let arrow_schema::DataType::Struct(children) = field.data_type() else {
         return None;
     };
-    let variant = crate::spec::is_variant_extraction_row_type(read_type)
-        || (matches!(read_type, DataType::Variant(_))
-            && children.iter().any(|child| child.name() == "typed_value"));
+    let variant = crate::spec::is_variant_extraction_row_type(read_type);
     if variant {
         let metadata = variant_metadata_child(children)?;
         let mut children = children
@@ -1064,7 +1064,7 @@ impl FormatFileReader for ParquetFormatReader {
             arrow_options.clone(),
         )
         .await?;
-        // Extraction and shredded full reads keep Variant metadata dictionary-encoded.
+        // Only extraction reads keep Variant metadata dictionary-encoded.
         let variant_schema =
             dictionary_variant_metadata_schema(batch_stream_builder.schema(), read_fields);
         if let Some(schema) = variant_schema.clone() {
@@ -3570,10 +3570,9 @@ mod tests {
     use crate::table::RowRange;
     use crate::variant::GenericVariant;
     use crate::Error;
-    use arrow_array::types::Int32Type;
     use arrow_array::{
-        Array, BinaryArray, DictionaryArray, Int32Array, Int64Array, MapArray, RecordBatch,
-        StringArray, StructArray, TimestampMillisecondArray, TimestampSecondArray,
+        Array, BinaryArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray,
+        StructArray, TimestampMillisecondArray, TimestampSecondArray,
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
@@ -9195,11 +9194,10 @@ mod tests {
             .as_any()
             .downcast_ref::<StructArray>()
             .unwrap();
-        assert!(matches!(
+        assert_eq!(
             full_read.column_by_name("metadata").unwrap().data_type(),
-            ArrowDataType::Dictionary(key, value)
-                if key.as_ref() == &ArrowDataType::Int32 && value.as_ref() == &ArrowDataType::Binary
-        ));
+            &ArrowDataType::Binary
+        );
         let restored =
             crate::arrow::shredding::variant::assemble_shredded_variant_array(full_read).unwrap();
         let restored = restored.as_any().downcast_ref::<StructArray>().unwrap();
@@ -9226,7 +9224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shredded_variant_full_read_preserves_wide_metadata_dictionary() {
+    async fn shredded_variant_full_read_decodes_wide_metadata_as_binary() {
         let fields = vec![DataField::new(
             0,
             "v".to_string(),
@@ -9311,16 +9309,16 @@ mod tests {
             .as_any()
             .downcast_ref::<StructArray>()
             .unwrap();
-        let dictionary = physical
+        let metadata_column = physical
             .column_by_name("metadata")
             .unwrap()
             .as_any()
-            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .downcast_ref::<BinaryArray>()
             .unwrap();
-        let distinct_keys = (0..dictionary.len())
-            .map(|row| dictionary.keys().value(row))
+        let distinct_values = (0..metadata_column.len())
+            .map(|row| metadata_column.value(row))
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(distinct_keys.len(), dictionaries.len());
+        assert_eq!(distinct_values.len(), dictionaries.len());
         let restored =
             crate::arrow::shredding::variant::assemble_shredded_variant_array(physical).unwrap();
         let restored = restored.as_any().downcast_ref::<StructArray>().unwrap();
@@ -9430,15 +9428,15 @@ mod tests {
             .as_any()
             .downcast_ref::<StructArray>()
             .unwrap();
-        let dictionary = physical
+        let metadata_column = physical
             .column_by_name("metadata")
             .unwrap()
             .as_any()
-            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .downcast_ref::<BinaryArray>()
             .unwrap();
         assert_eq!(
-            (0..dictionary.len())
-                .map(|row| dictionary.keys().value(row))
+            (0..metadata_column.len())
+                .map(|row| metadata_column.value(row))
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
             dictionaries.len()
