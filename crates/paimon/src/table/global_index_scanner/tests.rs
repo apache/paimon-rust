@@ -892,6 +892,7 @@ async fn test_btree_all_match_without_index_io() {
     entry.index_file.file_size = i64::MAX;
     for (op, values) in [
         (PredicateOperator::Eq, vec![7]),
+        (PredicateOperator::In, vec![6, 7, 9]),
         (PredicateOperator::Lt, vec![8]),
         (PredicateOperator::LtEq, vec![7]),
         (PredicateOperator::Gt, vec![6]),
@@ -959,6 +960,37 @@ async fn test_btree_all_match_without_index_io() {
         .await
         .is_err());
     }
+}
+
+#[tokio::test]
+async fn test_batched_or_all_match_without_index_io() {
+    let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+    let fields = two_field_schema_fields();
+    let meta = BTreeIndexMeta::new(Some(le_int_key(7)), Some(le_int_key(7)), false);
+    let mut entry = make_global_index_entry("absent.index", 1, 100, 109, &meta);
+    entry.index_file.row_count = 10;
+    let predicate = Predicate::or(
+        [6, 7, 9]
+            .map(|value| Predicate::and(vec![int_eq("id", 0, value), int_eq("value", 1, value)]))
+            .to_vec(),
+    );
+    let scanner = GlobalIndexScanner::create(
+        &io,
+        "memory:/absent",
+        4,
+        i64::MAX,
+        i64::MAX,
+        std::slice::from_ref(&entry),
+        &fields,
+    )
+    .unwrap()
+    .unwrap();
+    let result = scanner.evaluate(&predicate).await.unwrap().unwrap();
+    assert_eq!(result.row_ranges, vec![RowRange::new(100, 109)]);
+    assert!(
+        !result.fully_evaluated,
+        "unindexed residuals still require filtering"
+    );
 }
 
 #[tokio::test]
