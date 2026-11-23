@@ -22,7 +22,7 @@ use crate::DataSplit;
 use arrow_array::RecordBatch;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
@@ -215,11 +215,17 @@ fn merge_streams_bounded(
         }
         let mut ready = BTreeMap::new();
         let mut ready_errors = BTreeMap::new();
+        let mut completed = BTreeSet::new();
         let mut current = 0;
         let mut remaining = limit;
         while remaining != Some(0) && current < count {
             let next = if ordered {
                 loop {
+                    if completed.remove(&current) {
+                        current += 1;
+                        if current == count { break Ok(None); }
+                        continue;
+                    }
                     if let Some(error) = ready_errors.remove(&current) { break Err(error); }
                     if let Some(next) = ready.remove(&current) { break Ok(Some(next)); }
                     let next = match pending.join_next_with_id().await {
@@ -236,6 +242,20 @@ fn merge_streams_bounded(
                         Some(Err(error)) => break Err(worker_error(error)),
                         None => break Ok(None),
                     };
+                    if next.1.is_none() {
+                        // An empty later split frees its worker slot immediately.
+                        // Keep only its completion marker until ordered output
+                        // reaches it, and start the next split now.
+                        completed.insert(next.0);
+                        drop(next.2);
+                        if let Some((index, stream)) = unscheduled.pop_front() {
+                            let task = pending.spawn_on(next_batch(index, stream), &handle);
+                            if limit.is_some() {
+                                task_indices.insert(task.id(), index);
+                            }
+                        }
+                        continue;
+                    }
                     // A finite ordered LIMIT may finish before a later split
                     // is needed, so defer speculative failures in that case.
                     if next.0 == current || (limit.is_none() && next.1.as_ref().is_some_and(Result::is_err)) {
@@ -287,15 +307,6 @@ fn merge_streams_bounded(
                     let task = pending.spawn_on(next_batch(index, stream), &handle);
                     if ordered && limit.is_some() {
                         task_indices.insert(task.id(), index);
-                    }
-                }
-                None if ordered => {
-                    current += 1;
-                    if let Some((index, stream)) = unscheduled.pop_front() {
-                        let task = pending.spawn_on(next_batch(index, stream), &handle);
-                        if limit.is_some() {
-                            task_indices.insert(task.id(), index);
-                        }
                     }
                 }
                 None => {},
@@ -477,6 +488,33 @@ mod tests {
         assert_eq!(values, vec![0, 1, 2, 3]);
         assert!(reads.iter().all(|count| count.load(Ordering::SeqCst) == 1));
         assert_eq!(drops.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn ordered_split_window_replaces_empty_later_split_before_first_finishes() {
+        for limit in [None, Some(1)] {
+            let (release, wait) = oneshot::channel();
+            let reads = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let streams = vec![
+                controlled_stream(vec![], Some(wait), reads.clone(), drops.clone()),
+                controlled_stream(vec![], None, reads.clone(), drops.clone()),
+                controlled_stream(vec![2], None, reads.clone(), drops.clone()),
+            ];
+            let output = merge_streams_bounded(streams, true, limit, 2);
+            let result = tokio::spawn(async move {
+                output
+                    .map_ok(|batch| value(&batch))
+                    .try_collect::<Vec<_>>()
+                    .await
+            });
+            // Split 1 is empty. Its EOF must open split 2 while split 0 is
+            // still blocked, rather than waiting for split 0 to finish.
+            wait_for_count(&reads, 1).await;
+            release.send(()).unwrap();
+            assert_eq!(result.await.unwrap().unwrap(), vec![2]);
+            assert_eq!(drops.load(Ordering::SeqCst), 3);
+        }
     }
 
     #[tokio::test]
