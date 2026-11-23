@@ -2594,8 +2594,7 @@ fn variant_shredding_row_type(
                     let child =
                         DataType::Row(variant_shredding_row_type(field.data_type(), false, true)?)
                             .copy_with_nullable(false)?;
-                    Ok(DataField::new(field.id(), field.name().to_string(), child)
-                        .with_description(field.description().map(ToString::to_string)))
+                    Ok(field.clone().with_data_type(child))
                 })
                 .collect::<Result<Vec<_>>>()?;
             fields.push(DataField::new(

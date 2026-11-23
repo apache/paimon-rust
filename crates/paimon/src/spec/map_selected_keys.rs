@@ -104,17 +104,14 @@ pub fn map_selected_keys_field(field: &DataField, keys: &[String]) -> Result<Dat
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(DataField::new(
-        field.id(),
-        field.name().into(),
-        DataType::Row(RowType::with_nullable(
+    Ok(field
+        .clone()
+        .with_data_type(DataType::Row(RowType::with_nullable(
             field.data_type().is_nullable(),
             children,
-        )),
-    )
-    .with_description(Some(format!(
-        "{MAP_SELECTED_KEYS_METADATA_KEY}{}",
-        keys.join(";")
-    )))
-    .with_default_value(field.default_value().map(str::to_string)))
+        )))
+        .with_description(Some(format!(
+            "{MAP_SELECTED_KEYS_METADATA_KEY}{}",
+            keys.join(";")
+        ))))
 }

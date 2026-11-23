@@ -84,16 +84,12 @@ fn project_nested_field(
                         .unwrap_or_else(|| full_name.to_string())
                 ))
             })?;
-            Ok(DataField::new(
-                field.id(),
-                field.name().to_string(),
-                DataType::Row(RowType::with_nullable(
+            Ok(field
+                .clone()
+                .with_data_type(DataType::Row(RowType::with_nullable(
                     field.data_type().is_nullable(),
                     children,
-                )),
-            )
-            .with_description(field.description().map(str::to_string))
-            .with_default_value(field.default_value().map(str::to_string)))
+                ))))
         }
         DataType::Map(_) if tails.iter().all(|tail| tail.len() == 1) => {
             let mut keys = Vec::new();
@@ -171,7 +167,8 @@ mod tests {
                 "profile".into(),
                 DataType::Row(RowType::new(vec![
                     DataField::new(11, "score".into(), DataType::Int(IntType::new()))
-                        .with_default_value(Some("7".into())),
+                        .with_default_value(Some("7".into()))
+                        .with_generation_expression(Some("id".into())),
                     DataField::new(
                         12,
                         "attrs".into(),
@@ -179,10 +176,12 @@ mod tests {
                             DataType::VarChar(VarCharType::string_type()),
                             DataType::Int(IntType::new()),
                         )),
-                    ),
+                    )
+                    .with_generation_expression(Some("future_map(id)".into())),
                 ])),
             )
-            .with_description(Some("profile description".into())),
+            .with_description(Some("profile description".into()))
+            .with_generation_expression(Some("future_row(id)".into())),
             DataField::new(20, "id".into(), DataType::Int(IntType::new())),
         ]
     }
@@ -206,16 +205,22 @@ mod tests {
         .unwrap();
         assert_eq!(read[0].id(), 10);
         assert_eq!(read[0].description(), Some("profile description"));
+        assert_eq!(read[0].generation_expression(), Some("future_row(id)"));
         let DataType::Row(row) = read[0].data_type() else {
             panic!()
         };
         assert_eq!(row.fields()[0].id(), 12);
+        assert_eq!(
+            row.fields()[0].generation_expression(),
+            Some("future_map(id)")
+        );
         assert_eq!(
             crate::spec::map_selected_keys(&row.fields()[0]).unwrap(),
             Some(vec!["".into(), "missing".into()])
         );
         assert_eq!(row.fields()[1].id(), 11);
         assert_eq!(row.fields()[1].default_value(), Some("7"));
+        assert_eq!(row.fields()[1].generation_expression(), Some("id"));
         assert_eq!(read[1].id(), 20);
     }
 

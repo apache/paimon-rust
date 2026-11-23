@@ -615,8 +615,7 @@ async fn test_multiple_databases_with_tables() {
 async fn test_create_table() {
     let ctx = setup_test_server(vec!["default"]).await;
 
-    // Create a simple schema using builder
-    use paimon::spec::{DataType, Schema};
+    use paimon::spec::{DataField, DataType, IntType, Schema};
     let schema = Schema::builder()
         .column("id", DataType::BigInt(paimon::spec::BigIntType::new()))
         .column(
@@ -632,11 +631,27 @@ async fn test_create_table() {
         .await;
     assert!(result.is_ok(), "failed to create table: {result:?}");
 
-    // Verify table exists
-    let tables = ctx.api.list_tables("default").await.unwrap();
-    assert!(tables.contains(&"new_table".to_string()));
+    let invalid = Schema::builder()
+        .field(
+            DataField::new(0, "value".into(), DataType::Int(IntType::new()))
+                .with_default_value(Some("2147483648".into())),
+        )
+        .build()
+        .unwrap();
+    assert!(matches!(
+        ctx.api.create_table(&Identifier::new("default", "invalid"), invalid).await,
+        Err(paimon::Error::DataInvalid { message, .. }) if message.contains("column 'value' of type INT")
+    ));
+    let generated =
+        serde_json::from_str(include_str!("fixtures/generated_column_schema.json")).unwrap();
+    assert!(matches!(
+        ctx.api.create_table(&Identifier::new("default", "generated"), generated).await,
+        Err(paimon::Error::Unsupported { message }) if message.contains("event_year")
+    ));
 
-    // Get the table
+    let tables = ctx.api.list_tables("default").await.unwrap();
+    assert_eq!(tables, ["new_table"]);
+
     let table_resp = ctx
         .api
         .get_table(&Identifier::new("default", "new_table"))

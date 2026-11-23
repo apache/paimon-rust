@@ -231,6 +231,12 @@ pub(crate) fn build_table_definition(table: &Table) -> DFResult<String> {
     );
 
     for (i, field) in schema.fields().iter().enumerate() {
+        if field.generation_expression().is_some() {
+            return Err(DataFusionError::NotImplemented(format!(
+                "SHOW CREATE TABLE cannot reproduce generated column '{}' in Paimon SQL",
+                field.name()
+            )));
+        }
         if i > 0 {
             ddl.push_str(", ");
         }

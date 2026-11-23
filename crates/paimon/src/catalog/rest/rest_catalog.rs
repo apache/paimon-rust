@@ -347,9 +347,28 @@ impl Catalog for RESTCatalog {
         creation: Schema,
         ignore_if_exists: bool,
     ) -> Result<()> {
+        let request = match RESTApi::prepare_create_table(identifier, creation) {
+            Ok(request) => request,
+            Err(error) if ignore_if_exists => {
+                // IF NOT EXISTS can succeed without publishing the unchecked definition.
+                return match self.api.get_table(identifier).await {
+                    Ok(_) => Ok(()),
+                    Err(Error::RestApi {
+                        source: RestError::NoSuchResource { resource_type, .. },
+                    }) if resource_type
+                        .as_deref()
+                        .is_none_or(|kind| kind.eq_ignore_ascii_case("table")) =>
+                    {
+                        Err(error)
+                    }
+                    Err(other) => Err(other),
+                };
+            }
+            Err(error) => return Err(error),
+        };
         let result = self
             .api
-            .create_table(identifier, creation)
+            .send_create_table(&request)
             .await
             .map_err(|e| map_rest_error_for_table(e, identifier));
         ignore_error_if(result, |e| {

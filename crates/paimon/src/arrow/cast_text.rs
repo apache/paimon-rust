@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! BinaryStringUtils date/timestamp text and DateTimeUtils DATE formatting.
+//! Java temporal string conversions from BinaryStringUtils and DateTimeUtils.
 
 use crate::common::date_time::{
     java_date_parts, local_to_utc_seconds, ymd_to_epoch_day, ymd_to_java_date,
@@ -82,17 +82,65 @@ pub(super) fn parse_date(text: &str) -> crate::Result<i32> {
     }
     let mut parsed = [0, 1, 1];
     for (index, component) in components.iter().enumerate() {
-        let component = component.trim_matches(|ch| ch <= ' ');
-        if component.is_empty() || !component.bytes().all(|ch| ch.is_ascii_digit()) {
-            return Err(invalid(text));
-        }
-        parsed[index] = component.parse::<i32>().map_err(|_| invalid(text))?;
+        parsed[index] = unsigned_component(component).ok_or_else(|| invalid(text))?;
     }
     let [year, month, day] = parsed;
     if !(0..=9999).contains(&year) || day < 1 || day > days_in_month(year, month) {
         return Err(invalid(text));
     }
     Ok(ymd_to_java_date(year, month, day))
+}
+
+fn unsigned_component(text: &str) -> Option<i32> {
+    let text = text.trim_matches(|ch| ch <= ' ');
+    if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+pub(crate) fn parse_time(text: &str) -> crate::Result<i32> {
+    if numeric(text) {
+        return parse_java_integer(text, i64::from(i32::MIN), i64::from(i32::MAX))
+            .map(|v| v as i32);
+    }
+    let component = |part: &str| {
+        unsigned_component(part)
+            .map(i64::from)
+            .ok_or_else(|| invalid(text))
+    };
+    let mut clock = text;
+    let mut offset_minutes = 0;
+    if let Some(index) = text.find('-').or_else(|| text.find('+')) {
+        clock = &text[..index];
+        let offset = &text[index + 1..];
+        let (hours, minutes) = match offset.split_once(':') {
+            Some(parts) if clock.matches(':').nth(1).is_some() => parts,
+            Some(_) => return Err(invalid(text)),
+            None => (offset, "0"),
+        };
+        offset_minutes = component(hours)? * 60 + component(minutes)?;
+        if text.as_bytes()[index] == b'-' {
+            offset_minutes = -offset_minutes;
+        }
+    }
+    let mut parts = clock.splitn(3, ':');
+    let hours = component(parts.next().unwrap_or_default())?;
+    let minutes = component(parts.next().unwrap_or("0"))?;
+    let seconds = parts.next().unwrap_or("0");
+    let (seconds, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
+    let total_seconds = (hours * 60 + minutes + offset_minutes) * 60 + component(seconds)?;
+
+    // DateTimeUtils.parseFraction rounds milliseconds using the fourth UTF-16 character.
+    let mut fraction = fraction.trim_matches(|ch| ch <= ' ').encode_utf16();
+    let mut millis = total_seconds * 1000;
+    for (ch, scale) in fraction.by_ref().take(3).zip([100, 10, 1]) {
+        if (u16::from(b'0')..=u16::from(b'9')).contains(&ch) {
+            millis += i64::from(ch - u16::from(b'0')) * scale;
+        }
+    }
+    millis += i64::from(fraction.next().is_some_and(|ch| ch >= u16::from(b'5')));
+    Ok(millis as i32)
 }
 
 // DateTimeFormatter's consecutive optional patterns [MM][M], [dd][d],

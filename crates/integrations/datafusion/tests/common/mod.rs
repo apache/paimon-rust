@@ -49,6 +49,20 @@ pub fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
 }
 
 #[allow(dead_code)]
+pub fn set_stored_generation_expression(path: &std::path::Path, column: &str, expression: &str) {
+    let mut schema: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let field = schema["fields"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|field| field["name"] == column)
+        .unwrap();
+    field["generationExpression"] = expression.into();
+    std::fs::write(path, serde_json::to_vec(&schema).unwrap()).unwrap();
+}
+
+#[allow(dead_code)]
 pub fn files_under(path: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
     let mut files = std::collections::BTreeSet::new();
     for entry in std::fs::read_dir(path).unwrap() {

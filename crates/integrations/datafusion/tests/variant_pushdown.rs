@@ -89,7 +89,12 @@ async fn setup_data_evolution_shredded_variant_table_with_rows() -> (tempfile::T
 
 #[tokio::test]
 async fn variant_get_projection_pushes_extractions_into_scan() {
-    let (_tmp, sql_context) = setup_shredded_variant_table_with_rows().await;
+    let (tmp, sql_context) = setup_shredded_variant_table_with_rows().await;
+    common::set_stored_generation_expression(
+        &tmp.path().join("test_db.db/t/schema/schema-0"),
+        "payload",
+        "future_variant(id)",
+    );
     let sql = r#"
         SELECT
             id,
@@ -104,6 +109,23 @@ async fn variant_get_projection_pushes_extractions_into_scan() {
     assert!(
         plan_text.contains("PushedVariants=[payload=[$.age,$.city]]"),
         "plan should push variant extractions, got:\n{plan_text}"
+    );
+    let mut nodes = vec![&plan];
+    let scan = loop {
+        let node = nodes.pop().expect("Paimon scan in the physical plan");
+        if node.name() == "PaimonTableScan" {
+            break node;
+        }
+        nodes.extend(node.children());
+    };
+    assert_eq!(
+        scan.schema()
+            .field_with_name("payload")
+            .unwrap()
+            .metadata()
+            .get("paimon:generationExpression")
+            .map(String::as_str),
+        Some("future_variant(id)")
     );
 
     let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();

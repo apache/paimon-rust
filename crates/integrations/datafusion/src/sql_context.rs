@@ -1329,8 +1329,7 @@ impl SQLContext {
                 .columns
                 .iter()
                 .map(|col| {
-                    let paimon_type =
-                        sql_data_type_to_paimon_type(&col.data_type, column_def_nullable(col))?;
+                    let paimon_type = column_def_to_paimon_type(col)?;
                     paimon::arrow::paimon_type_to_arrow_field(&col.name.value, &paimon_type)
                         .map_err(to_datafusion_error)
                 })
@@ -2444,7 +2443,10 @@ impl SQLContext {
                 *field = field.clone().with_name(name);
             }
             let fields = paimon::arrow::arrow_fields_to_paimon(&arrow_fields)
-                .map_err(to_datafusion_error)?;
+                .map_err(to_datafusion_error)?
+                .into_iter()
+                .map(|field| field.with_generation_expression(None))
+                .collect();
             let schema = paimon::catalog::ViewSchema::new(
                 fields,
                 query_sql.clone(),
@@ -3665,6 +3667,20 @@ fn alter_column_to_schema_change(
 }
 
 fn column_def_to_paimon_type(col: &ColumnDef) -> DFResult<PaimonDataType> {
+    if col.options.iter().any(|option| {
+        matches!(
+            option.option,
+            ColumnOption::Generated {
+                generation_expr: Some(_),
+                ..
+            }
+        )
+    }) {
+        return Err(DataFusionError::NotImplemented(format!(
+            "Defining generated column '{}' in SQL is unsupported",
+            col.name
+        )));
+    }
     sql_data_type_to_paimon_type(&col.data_type, column_def_nullable(col))
 }
 
@@ -7041,7 +7057,7 @@ mod tests {
 
         ctx.sql(
             "CREATE VIEW paimon.default.named_view (renamed) \
-             AS SELECT CAST(42 AS BIGINT) AS answer",
+             AS SELECT with_metadata(42, 'paimon:generationExpression', 'YEAR(event_time)') AS event_year",
         )
         .await
         .unwrap();
@@ -7050,7 +7066,9 @@ mod tests {
             .get_view(&Identifier::new("default", "named_view"))
             .await
             .unwrap();
-        assert_eq!(view.schema().fields()[0].name(), "renamed");
+        let field = &view.schema().fields()[0];
+        assert_eq!(field.name(), "renamed");
+        assert_eq!(field.generation_expression(), None);
     }
 
     #[tokio::test]

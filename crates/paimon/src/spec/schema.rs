@@ -726,8 +726,16 @@ impl TableSchema {
                             ),
                         });
                     }
-                    fields[idx] = DataField::new(old.id(), old.name().to_string(), target)
-                        .with_description(old.description().map(|s| s.to_string()));
+                    let updated = old.clone().with_data_type(target);
+                    if updated.default_value().is_some()
+                        && !old.data_type().equals_ignore_nullable(updated.data_type())
+                    {
+                        crate::table::validate_default_value(
+                            &updated,
+                            self.core_options().is_format_table(),
+                        )?;
+                    }
+                    fields[idx] = updated;
                 }
                 SchemaChange::UpdateColumnNullability {
                     field_names,
@@ -753,10 +761,8 @@ impl TableSchema {
                         name,
                         disable_null_to_not_null,
                     )?;
-                    let nt = old.data_type().copy_with_nullable(new_nullability)?;
-                    let mut field = old.clone();
-                    field.typ = nt;
-                    fields[idx] = field;
+                    let target = old.data_type().copy_with_nullable(new_nullability)?;
+                    fields[idx] = old.clone().with_data_type(target);
                 }
                 SchemaChange::UpdateColumnComment {
                     field_names,
@@ -786,6 +792,8 @@ impl TableSchema {
         new_schema.fields = fields;
         new_schema.highest_field_id =
             highest_field_id.max(Self::current_highest_field_id(&new_schema.fields));
+
+        super::generated_column::validate_evolution(&self.fields, &new_schema.fields)?;
 
         if PartialUpdateConfig::new(&new_schema.options).is_enabled()
             && self.core_options().ignore_delete()
@@ -1060,8 +1068,7 @@ fn reassign_field_ids(data_type: DataType, next_id: &mut i32) -> DataType {
                 .map(|f| {
                     let typ = reassign_field_ids(f.data_type().clone(), next_id);
                     *next_id += 1;
-                    DataField::new(*next_id, f.name().to_string(), typ)
-                        .with_description(f.description().map(|s| s.to_string()))
+                    f.clone().with_id(*next_id).with_data_type(typ)
                 })
                 .collect();
             DataType::Row(RowType::with_nullable(nullable, fields))
@@ -1324,9 +1331,7 @@ pub(crate) fn is_row_tracking_column(name: &str) -> bool {
 /// Must match Java Paimon's `SpecialFields.ROW_KIND` (Integer.MAX_VALUE - 4).
 pub const ROW_KIND_FIELD_ID: i32 = i32::MAX - 4;
 
-/// Data field for paimon table.
-///
-/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataField.java#L40>
+/// A field in a Paimon table schema.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize, Serialize)]
 pub struct DataField {
@@ -1338,6 +1343,11 @@ pub struct DataField {
     description: Option<String>,
     #[serde(rename = "defaultValue", skip_serializing_if = "Option::is_none")]
     default_value: Option<String>,
+    #[serde(
+        rename = "generationExpression",
+        skip_serializing_if = "Option::is_none"
+    )]
+    generation_expression: Option<String>,
 }
 
 impl DataField {
@@ -1348,6 +1358,7 @@ impl DataField {
             typ,
             description: None,
             default_value: None,
+            generation_expression: None,
         }
     }
 
@@ -1371,6 +1382,11 @@ impl DataField {
         self.default_value.as_deref()
     }
 
+    /// The stored expression for a generated physical column. Callers supply its value on write.
+    pub fn generation_expression(&self) -> Option<&str> {
+        self.generation_expression.as_deref()
+    }
+
     pub fn with_id(mut self, new_id: i32) -> Self {
         self.id = new_id;
         self
@@ -1381,6 +1397,11 @@ impl DataField {
         self
     }
 
+    pub fn with_data_type(mut self, data_type: DataType) -> Self {
+        self.typ = data_type;
+        self
+    }
+
     pub fn with_description(mut self, new_description: Option<String>) -> Self {
         self.description = new_description;
         self
@@ -1388,6 +1409,11 @@ impl DataField {
 
     pub fn with_default_value(mut self, default_value: Option<String>) -> Self {
         self.default_value = default_value;
+        self
+    }
+
+    pub fn with_generation_expression(mut self, expression: Option<String>) -> Self {
+        self.generation_expression = expression;
         self
     }
 }
@@ -1447,6 +1473,23 @@ impl Schema {
         })
     }
 
+    pub(crate) fn validate_fields_for_create(&self) -> crate::Result<()> {
+        let is_format_table = CoreOptions::new(self.options()).is_format_table();
+        for field in self.fields() {
+            if field.generation_expression().is_some() {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "Cannot create generated column '{}': Rust cannot type-check its generation expression.",
+                        field.name()
+                    ),
+                });
+            }
+            super::generated_column::validate_no_nested_generated_columns(field.data_type())?;
+            crate::table::validate_default_value(field, is_format_table)?;
+        }
+        Ok(())
+    }
+
     fn validate_final_schema(
         fields: &[DataField],
         partition_keys: &[String],
@@ -1463,6 +1506,7 @@ impl Schema {
             });
         }
         validate_no_reserved_field_names(fields)?;
+        super::generated_column::validate_schema(fields, options)?;
         Self::validate_key_field_types(fields, partition_keys, primary_keys, options)?;
         Self::validate_bucket_count(options)?;
         Self::validate_row_tracking(primary_keys, options)?;
@@ -2662,17 +2706,21 @@ impl SchemaBuilder {
 
     /// Add a column with optional description.
     pub fn column_with_description(
-        mut self,
+        self,
         column_name: impl Into<String>,
         data_type: DataType,
         description: Option<String>,
     ) -> Self {
-        let name = column_name.into();
-        let id = self.next_field_id;
+        self.field(DataField::new(0, column_name.into(), data_type).with_description(description))
+    }
+
+    /// Add a field with its metadata, assigning fresh IDs to it and its nested fields.
+    /// A generation expression describes an existing column. Rust catalogs reject it on CREATE.
+    pub fn field(mut self, mut field: DataField) -> Self {
+        field.id = self.next_field_id;
         self.next_field_id += 1;
-        let data_type = Self::assign_nested_field_ids(data_type, &mut self.next_field_id);
-        self.columns
-            .push(DataField::new(id, name, data_type).with_description(description));
+        field.typ = Self::assign_nested_field_ids(field.typ, &mut self.next_field_id);
+        self.columns.push(field);
         self
     }
 
@@ -2730,7 +2778,7 @@ impl SchemaBuilder {
                         let id = *next_id;
                         *next_id += 1;
                         let typ = Self::assign_nested_field_ids(f.data_type().clone(), next_id);
-                        DataField::new(id, f.name().to_string(), typ)
+                        f.clone().with_id(id).with_data_type(typ)
                     })
                     .collect();
                 DataType::Row(RowType::with_nullable(nullable, fields))
@@ -3039,6 +3087,36 @@ mod tests {
         assert_eq!(data_field.name(), name);
         assert_eq!(data_field.data_type(), &typ);
         assert_eq!(data_field.description(), Some(description).as_deref());
+        assert_eq!(data_field.default_value(), None);
+        assert_eq!(data_field.generation_expression(), None);
+    }
+
+    #[test]
+    fn generated_column_schema_json_roundtrip() {
+        let mut json: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/generated_column_schema.json"
+        ))
+        .unwrap();
+        let schema: TableSchema = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(schema.fields()[0].generation_expression(), None);
+        assert_eq!(
+            schema.fields()[1].generation_expression(),
+            Some("YEAR(event_time)")
+        );
+        assert_eq!(schema.fields()[2].generation_expression(), None);
+        json["fields"][2]
+            .as_object_mut()
+            .unwrap()
+            .remove("generationExpression");
+        assert_eq!(serde_json::to_value(&schema).unwrap(), json);
+        for expression in ["", "  future_function(`event_time`)  "] {
+            let field = schema.fields()[1]
+                .clone()
+                .with_generation_expression(Some(expression.into()));
+            let decoded: DataField =
+                serde_json::from_str(&serde_json::to_string(&field).unwrap()).unwrap();
+            assert_eq!(decoded, field);
+        }
     }
 
     #[test]
@@ -3061,38 +3139,62 @@ mod tests {
     }
 
     #[test]
-    fn test_new_id() {
-        let d_type = DataType::Int(IntType::new());
-        let new_data_field = DataField::new(1, "field1".to_string(), d_type.clone()).with_id(2);
-
-        assert_eq!(new_data_field.id(), 2);
-        assert_eq!(new_data_field.name(), "field1");
-        assert_eq!(new_data_field.data_type(), &d_type);
-        assert_eq!(new_data_field.description(), None);
-    }
-
-    #[test]
-    fn test_new_name() {
-        let d_type = DataType::Int(IntType::new());
-        let new_data_field =
-            DataField::new(1, "field1".to_string(), d_type.clone()).with_name("field2".to_string());
-
-        assert_eq!(new_data_field.id(), 1);
-        assert_eq!(new_data_field.name(), "field2");
-        assert_eq!(new_data_field.data_type(), &d_type);
-        assert_eq!(new_data_field.description(), None);
-    }
-
-    #[test]
-    fn test_new_description() {
-        let d_type = DataType::Int(IntType::new());
-        let new_data_field = DataField::new(1, "field1".to_string(), d_type.clone())
-            .with_description(Some("new description".to_string()));
-
-        assert_eq!(new_data_field.id(), 1);
-        assert_eq!(new_data_field.name(), "field1");
-        assert_eq!(new_data_field.data_type(), &d_type);
-        assert_eq!(new_data_field.description(), Some("new description"));
+    fn test_data_field_copies_preserve_metadata() {
+        let field = DataField::new(1, "event_year".into(), DataType::Int(IntType::new()))
+            .with_description(Some("stored year".into()))
+            .with_default_value(Some("0".into()))
+            .with_generation_expression(Some("YEAR(event_time)".into()));
+        let original_json = serde_json::to_value(&field).unwrap();
+        for (copied, property, value) in [
+            (field.clone().with_id(5), "id", serde_json::json!(5)),
+            (
+                field.clone().with_name("renamed".into()),
+                "name",
+                serde_json::json!("renamed"),
+            ),
+            (
+                field
+                    .clone()
+                    .with_data_type(DataType::BigInt(crate::spec::BigIntType::new())),
+                "type",
+                serde_json::json!("BIGINT"),
+            ),
+            (
+                field.clone().with_description(Some("updated".into())),
+                "description",
+                serde_json::json!("updated"),
+            ),
+            (
+                field.clone().with_default_value(Some("1".into())),
+                "defaultValue",
+                serde_json::json!("1"),
+            ),
+            (
+                field
+                    .clone()
+                    .with_generation_expression(Some("MONTH(event_time)".into())),
+                "generationExpression",
+                serde_json::json!("MONTH(event_time)"),
+            ),
+            (
+                field.clone().with_generation_expression(None),
+                "generationExpression",
+                serde_json::Value::Null,
+            ),
+        ] {
+            let mut expected = original_json.clone();
+            if value.is_null() {
+                expected.as_object_mut().unwrap().remove(property);
+            } else {
+                expected[property] = value;
+            }
+            assert_eq!(
+                serde_json::to_value(copied).unwrap(),
+                expected,
+                "{property}"
+            );
+        }
+        assert_eq!(serde_json::to_value(field).unwrap(), original_json);
     }
 
     #[test]
@@ -3164,40 +3266,43 @@ mod tests {
 
     #[test]
     fn primary_key_normalization_preserves_field_metadata() {
-        for nullable in [false, true] {
-            let fields = vec![
-                DataField::new(
-                    7,
-                    "id".into(),
-                    DataType::Int(IntType::with_nullable(!nullable)),
+        for (default, expression) in [(Some("42"), None), (None, Some("CAST(value AS INT)"))] {
+            for nullable in [false, true] {
+                let fields = vec![
+                    DataField::new(
+                        7,
+                        "id".into(),
+                        DataType::Int(IntType::with_nullable(!nullable)),
+                    )
+                    .with_description(Some("identifier".into()))
+                    .with_default_value(default.map(str::to_string))
+                    .with_generation_expression(expression.map(str::to_string)),
+                    DataField::new(11, "value".into(), DataType::Int(IntType::new()))
+                        .with_default_value(Some("1".into())),
+                ];
+                let schema = Schema::new(
+                    fields.clone(),
+                    vec![],
+                    vec!["id".into()],
+                    HashMap::from([(PRIMARY_KEY_NULLABLE_OPTION.into(), nullable.to_string())]),
+                    None,
                 )
-                .with_description(Some("identifier".into()))
-                .with_default_value(Some("42".into())),
-                DataField::new(11, "value".into(), DataType::Int(IntType::new()))
-                    .with_default_value(Some("1".into())),
-            ];
-            let schema = Schema::new(
-                fields.clone(),
-                vec![],
-                vec!["id".into()],
-                HashMap::from([(PRIMARY_KEY_NULLABLE_OPTION.into(), nullable.to_string())]),
-                None,
-            )
-            .unwrap();
-            let mut expected = fields;
-            expected[0].typ = DataType::Int(IntType::with_nullable(nullable));
-            assert_eq!(schema.fields(), expected.as_slice());
-            let stored = TableSchema::new(0, &schema).copy_with_options(HashMap::from([(
-                "alter-column-null-to-not-null.disabled".into(),
-                "false".into(),
-            )]));
-            let changed = stored
-                .apply_changes(vec![crate::spec::SchemaChange::UpdateColumnNullability {
-                    field_names: vec!["id".into()],
-                    new_nullability: false,
-                }])
                 .unwrap();
-            assert_eq!(changed.fields(), expected.as_slice());
+                let mut expected = fields;
+                expected[0].typ = DataType::Int(IntType::with_nullable(nullable));
+                assert_eq!(schema.fields(), expected.as_slice());
+                let stored = TableSchema::new(0, &schema).copy_with_options(HashMap::from([(
+                    "alter-column-null-to-not-null.disabled".into(),
+                    "false".into(),
+                )]));
+                let changed = stored
+                    .apply_changes(vec![crate::spec::SchemaChange::UpdateColumnNullability {
+                        field_names: vec!["id".into()],
+                        new_nullability: false,
+                    }])
+                    .unwrap();
+                assert_eq!(changed.fields(), expected.as_slice());
+            }
         }
     }
 
@@ -4656,7 +4761,11 @@ mod tests {
 
     #[test]
     fn test_apply_changes_update_column_type_cast_compatibility() {
-        let table_schema = cast_test_schema(&[]);
+        let mut table_schema = cast_test_schema(&[]);
+        table_schema.fields[0] = table_schema.fields[0]
+            .clone()
+            .with_description(Some("stored value".into()))
+            .with_default_value(Some("7".into()));
 
         // Implicit widening.
         let new_schema = table_schema
@@ -4669,6 +4778,8 @@ mod tests {
             new_schema.fields()[0].data_type(),
             DataType::BigInt(_)
         ));
+        assert_eq!(new_schema.fields()[0].description(), Some("stored value"));
+        assert_eq!(new_schema.fields()[0].default_value(), Some("7"));
 
         // Narrowing is an explicit cast, allowed by default.
         let new_schema = table_schema
@@ -6916,27 +7027,145 @@ mod tests {
 
     #[test]
     fn test_schema_builder_column_row_type() {
-        let row_type = RowType::new(vec![DataField::new(
-            0,
-            "nested".into(),
-            DataType::Int(IntType::new()),
-        )]);
+        let nested = DataField::new(42, "nested".into(), DataType::Int(IntType::new()))
+            .with_description(Some("nested description".into()))
+            .with_default_value(Some("7".into()));
+        let row_type = RowType::new(vec![nested.clone()]);
+        let payload = DataField::new(43, "payload".into(), DataType::Row(row_type))
+            .with_description(Some("payload description".into()))
+            .with_generation_expression(Some("future_row(id)".into()));
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
-            .column("payload", DataType::Row(row_type))
+            .field(payload.clone())
             .build()
             .unwrap();
 
         assert_eq!(schema.fields().len(), 2);
-        // id gets field_id=0, payload gets field_id=1, nested gets field_id=2
         assert_eq!(schema.fields()[0].id(), 0);
         assert_eq!(schema.fields()[1].id(), 1);
+        assert_eq!(
+            schema.fields()[1].description(),
+            Some("payload description")
+        );
+        assert_eq!(
+            schema.fields()[1].generation_expression(),
+            Some("future_row(id)")
+        );
         if let DataType::Row(row) = schema.fields()[1].data_type() {
-            assert_eq!(row.fields().len(), 1);
-            assert_eq!(row.fields()[0].id(), 2);
-            assert_eq!(row.fields()[0].name(), "nested");
+            assert_eq!(row.fields(), &[nested.clone().with_id(2)]);
         } else {
             panic!("expected Row type");
+        }
+
+        let changed = TableSchema::new(0, &schema)
+            .apply_changes(vec![crate::spec::SchemaChange::add_column(
+                "added".into(),
+                payload.data_type().clone(),
+            )])
+            .unwrap();
+        assert_eq!(changed.fields()[2].id(), 3);
+        assert_eq!(changed.highest_field_id(), 4);
+        if let DataType::Row(row) = changed.fields()[2].data_type() {
+            assert_eq!(row.fields(), &[nested.with_id(4)]);
+        } else {
+            panic!("expected Row type");
+        }
+    }
+
+    #[test]
+    fn generated_column_schema_rejects_defaults_and_rowkind() {
+        let generated = DataField::new(
+            1,
+            "generated".into(),
+            DataType::VarChar(VarCharType::string_type()),
+        )
+        .with_generation_expression(Some("UPPER(source)".into()));
+        let builder = |field| {
+            Schema::builder()
+                .column("source", DataType::VarChar(VarCharType::string_type()))
+                .field(field)
+        };
+        for default in ["'value'", ""] {
+            assert_config_invalid(
+                builder(generated.clone().with_default_value(Some(default.into()))).build(),
+                "cannot have a default value",
+            );
+        }
+        assert_config_invalid(
+            builder(generated.clone())
+                .option("rowkind.field", "generated")
+                .build(),
+            "cannot be used as rowkind.field",
+        );
+
+        let stored = TableSchema::new(0, &builder(generated).build().unwrap());
+        assert_config_invalid(
+            stored.apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "rowkind.field".into(),
+                "generated".into(),
+            )]),
+            "cannot be used as rowkind.field",
+        );
+        let changed = stored
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "rowkind.field".into(),
+                "source".into(),
+            )])
+            .unwrap();
+        assert_eq!(changed.fields(), stored.fields());
+        assert_eq!(changed.core_options().rowkind_field(), Some("source"));
+    }
+
+    #[test]
+    fn generated_column_schema_rejects_nested_fields() {
+        let nested = DataType::Row(RowType::new(vec![DataField::new(
+            1,
+            "generated".into(),
+            DataType::Int(IntType::new()),
+        )
+        .with_generation_expression(Some("CAST(id AS INT)".into()))]));
+        let string = DataType::VarChar(VarCharType::string_type());
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let stored = TableSchema::new(0, &schema);
+        for data_type in [
+            nested.clone(),
+            DataType::Array(ArrayType::new(nested.clone())),
+            DataType::Multiset(MultisetType::new(nested.clone())),
+            DataType::Map(MapType::new(nested.clone(), string.clone())),
+            DataType::Map(MapType::new(string.clone(), nested.clone())),
+            DataType::Row(RowType::new(vec![DataField::new(
+                2,
+                "container".into(),
+                DataType::Array(ArrayType::new(DataType::Map(MapType::new(
+                    string,
+                    DataType::Multiset(MultisetType::new(nested)),
+                )))),
+            )])),
+        ] {
+            assert_config_invalid(
+                Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("nested", data_type.clone())
+                    .build(),
+                "Generated columns must be top-level columns",
+            );
+            let mut json = serde_json::to_value(&schema).unwrap();
+            json["fields"][0]["type"] = serde_json::to_value(&data_type).unwrap();
+            let decoded: Schema = serde_json::from_value(json).unwrap();
+            assert_config_invalid(
+                decoded.validate_fields_for_create(),
+                "Generated columns must be top-level columns",
+            );
+            assert_config_invalid(
+                stored.apply_changes(vec![crate::spec::SchemaChange::add_column(
+                    "nested".into(),
+                    data_type,
+                )]),
+                "Generated columns must be top-level columns",
+            );
         }
     }
 
