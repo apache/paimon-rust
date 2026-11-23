@@ -147,18 +147,6 @@ impl<'a> WriteBuilder<'a> {
         }
     }
 
-    /// Create a native writer for rows whose keys and values were already
-    /// resolved by an internal table mutation.
-    #[doc(hidden)]
-    pub fn new_write_for_row_mutation(&self) -> crate::Result<TableWrite> {
-        match &self.0 {
-            WriteBuilderKind::Paimon(builder) => Ok(builder.new_write()?.without_column_defaults()),
-            WriteBuilderKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "Row mutation writes require a Paimon table".into(),
-            }),
-        }
-    }
-
     /// Create a configured table update object, as in PyPaimon.
     pub fn new_update(&self) -> crate::Result<TableUpdate> {
         match &self.0 {

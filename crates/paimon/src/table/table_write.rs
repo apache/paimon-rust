@@ -847,13 +847,27 @@ impl TableWrite {
 
     fn normalize_filtered_write_batch(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
         let batch = self.validate_write_batch_schema(batch)?;
-        let batch = self.column_defaults.apply(&batch)?;
         // Filtering already precedes value normalization. Generate the system
         // column now so every surviving PK batch has the same buffer schema.
         let batch = self.generate_rowkind_batch(&batch)?;
         if batch.num_rows() == 0 {
             return Ok(None);
         }
+        let batch = if self.primary_key_indices.is_empty() {
+            self.column_defaults.apply(&batch)?
+        } else {
+            let kinds = batch
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap();
+            // Changelog updates and retractions already identify a row. Applying
+            // a default to a NULL key here could change which row they affect.
+            self.column_defaults.apply_to_rows(&batch, |row| {
+                kinds.is_null(row) || kinds.value(row) == RowKind::Insert.to_value()
+            })?
+        };
         if !self.primary_key_indices.is_empty() {
             super::inline_blob::validate_inline_blob_columns(
                 &batch,
@@ -1354,7 +1368,10 @@ impl TableWrite {
         }
 
         let kinds = generator
-            .generate_batch(batch, None)?
+            .generate_batch(
+                batch,
+                self.column_defaults.string_value(generator.field_name()),
+            )?
             .into_iter()
             .map(|kind| kind.to_value())
             .collect();
@@ -2659,6 +2676,51 @@ pub(in crate::table) mod tests {
                 VALUE_KIND_FIELD_NAME,
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn primary_key_defaults_apply_only_to_insert_rows_in_a_mixed_batch() {
+        let int = DataType::Int(IntType::new());
+        let schema = Schema::builder()
+            .field(DataField::new(0, "id".into(), int).with_default_value(Some("42".into())))
+            .primary_key(["id"])
+            .option("primary-key.nullable", "true")
+            .option("bucket", "1")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "mixed_default_rows"),
+            "memory:/mixed_default_rows".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let input = RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(vec![None; 5])) as ArrayRef),
+            (
+                VALUE_KIND_FIELD_NAME,
+                Arc::new(Int8Array::from(vec![
+                    Some(RowKind::Insert.to_value()),
+                    Some(RowKind::UpdateBefore.to_value()),
+                    Some(RowKind::UpdateAfter.to_value()),
+                    Some(RowKind::Delete.to_value()),
+                    None,
+                ])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let writer = table.new_write_builder().new_write().unwrap();
+        let actual = writer.normalize_write_batch(&input).unwrap().unwrap();
+        let keys = actual
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            keys,
+            &Int32Array::from(vec![Some(42), None, None, None, Some(42)])
+        );
+        assert_eq!(actual.column(1), input.column(1));
     }
 
     #[tokio::test]

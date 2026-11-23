@@ -553,11 +553,14 @@ impl TableUpsert {
                 messages.extend(update.prepare_commit().await?);
             }
             for group in append_groups {
+                // The upsert already matched the supplied keys, including NULL.
+                // Preserve those values even when the row is written as an insert.
                 let mut append = self
                     .table
                     .new_write_builder()
                     .with_commit_user(self.commit_user.clone())?
-                    .new_write_for_row_mutation()?;
+                    .new_write()?
+                    .without_column_defaults();
                 append.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone())?;
                 append.with_write_type(
                     group[0]

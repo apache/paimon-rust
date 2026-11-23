@@ -74,9 +74,7 @@ pub(crate) async fn write_rows(
     let commit = write_builder
         .try_new_commit()
         .map_err(to_datafusion_error)?;
-    let mut writer = write_builder
-        .new_write_for_row_mutation()
-        .map_err(to_datafusion_error)?;
+    let mut writer = write_builder.new_write().map_err(to_datafusion_error)?;
 
     let staged = async {
         let mut stream = input.execute_stream().await?;

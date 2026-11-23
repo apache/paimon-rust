@@ -101,6 +101,14 @@ impl ColumnDefaults {
     }
 
     pub(super) fn apply(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        self.apply_to_rows(batch, |_| true)
+    }
+
+    pub(super) fn apply_to_rows(
+        &self,
+        batch: &RecordBatch,
+        should_fill: impl Fn(usize) -> bool,
+    ) -> Result<RecordBatch> {
         let fields = batch.schema_ref().fields();
         if self.values.is_empty()
             || !fields.iter().zip(batch.columns()).any(|(field, input)| {
@@ -120,6 +128,12 @@ impl ColumnDefaults {
                 if input.null_count() == 0 {
                     return Ok(input.clone());
                 }
+                let present = arrow_array::BooleanArray::from_iter(
+                    (0..input.len()).map(|row| Some(!input.is_null(row) || !should_fill(row))),
+                );
+                if present.false_count() == 0 {
+                    return Ok(input.clone());
+                }
                 let positions = arrow_array::UInt32Array::from(vec![0_u32; batch.num_rows()]);
                 let repeated = arrow_select::take::take(value.as_ref(), &positions, None).map_err(
                     |source| Error::DataInvalid {
@@ -127,9 +141,6 @@ impl ColumnDefaults {
                         source: Some(Box::new(source)),
                     },
                 )?;
-                let present = arrow_array::BooleanArray::from_iter(
-                    (0..input.len()).map(|row| Some(!input.is_null(row))),
-                );
                 arrow_select::zip::zip(&present, input, &repeated).map_err(|source| {
                     Error::DataInvalid {
                         message: format!("Cannot apply default for column '{}'", field.name()),
