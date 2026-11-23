@@ -113,39 +113,38 @@ pub(super) fn execute(
     limit: Option<usize>,
     read: SplitReader,
 ) -> ArrowRecordBatchStream {
-    // Ordered output needs a sliding window of individual splits. Grouping
-    // several splits into one stream leaves the later splits in each group
-    // unopened until every earlier split in that group has been emitted.
-    let groups = if ordered && parallelism > 1 {
-        splits.into_iter().map(|split| vec![split]).collect()
-    } else {
-        split_groups(splits, parallelism)
-    };
-    let streams = groups
-        .into_iter()
-        .map(|group| {
-            let read = Arc::clone(&read);
-            Box::pin(async_stream::try_stream! {
-                let mut remaining = limit;
-                for split in group {
-                    if remaining == Some(0) { break; }
-                    // Open later splits only on demand, with the remaining quota.
-                    let mut stream = read(std::slice::from_ref(&split), remaining)?;
-                    while remaining != Some(0) {
-                        let Some(batch) = stream.next().await else { break; };
-                        let batch = batch?;
-                        if batch.num_rows() == 0 { continue; }
-                        yield take_limited_batch(batch, &mut remaining);
-                    }
-                }
-            }) as ArrowRecordBatchStream
-        })
-        .collect();
     if ordered && parallelism > 1 {
-        merge_streams_bounded(streams, ordered, limit, parallelism)
-    } else {
-        merge_streams(streams, ordered, limit)
+        // Keep unscheduled splits as data; create a stream only when a slot opens.
+        return merge_items_bounded(splits, true, limit, parallelism, move |split| {
+            read_group(vec![split], Arc::clone(&read), limit)
+        });
     }
+    let streams = split_groups(splits, parallelism)
+        .into_iter()
+        .map(|group| read_group(group, Arc::clone(&read), limit))
+        .collect();
+    merge_streams(streams, ordered, limit)
+}
+
+fn read_group(
+    group: Vec<DataSplit>,
+    read: SplitReader,
+    limit: Option<usize>,
+) -> ArrowRecordBatchStream {
+    Box::pin(async_stream::try_stream! {
+        let mut remaining = limit;
+        for split in group {
+            if remaining == Some(0) { break; }
+            // Open later splits only on demand, with the remaining quota.
+            let mut stream = read(std::slice::from_ref(&split), remaining)?;
+            while remaining != Some(0) {
+                let Some(batch) = stream.next().await else { break; };
+                let batch = batch?;
+                if batch.num_rows() == 0 { continue; }
+                yield take_limited_batch(batch, &mut remaining);
+            }
+        }
+    })
 }
 
 fn next_batch(index: usize, mut stream: ArrowRecordBatchStream) -> BoxFuture<'static, NextBatch> {
@@ -169,20 +168,35 @@ fn merge_streams(
 }
 
 fn merge_streams_bounded(
-    mut streams: Vec<ArrowRecordBatchStream>,
+    streams: Vec<ArrowRecordBatchStream>,
     ordered: bool,
     limit: Option<usize>,
     parallelism: usize,
 ) -> ArrowRecordBatchStream {
+    merge_items_bounded(streams, ordered, limit, parallelism, |stream| stream)
+}
+
+fn merge_items_bounded<T, F>(
+    mut items: Vec<T>,
+    ordered: bool,
+    limit: Option<usize>,
+    parallelism: usize,
+    make_stream: F,
+) -> ArrowRecordBatchStream
+where
+    T: Send + 'static,
+    F: Fn(T) -> ArrowRecordBatchStream + Send + 'static,
+{
     if limit == Some(0) {
         return Box::pin(futures::stream::empty());
     }
     // Ordinary one-worker reads retain the original executor context and avoid
     // requiring a Tokio runtime just to advance a stream.
-    if streams.len() <= 1 {
+    if items.len() <= 1 {
         return limit_single_stream(
-            streams
+            items
                 .pop()
+                .map(make_stream)
                 .unwrap_or_else(|| Box::pin(futures::stream::empty())),
             limit,
         );
@@ -191,7 +205,7 @@ fn merge_streams_bounded(
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(handle) => handle,
             Err(error) => {
-                drop(streams);
+                drop(items);
                 Err(crate::Error::UnexpectedError {
                     message: "Parallel table reads require a Tokio runtime".into(),
                     source: Some(Box::new(error)),
@@ -199,15 +213,18 @@ fn merge_streams_bounded(
                 return;
             }
         };
-        let count = streams.len();
-        let mut unscheduled = streams.into_iter().enumerate().collect::<VecDeque<_>>();
+        let count = items.len();
+        let mut unscheduled = VecDeque::from(items);
+        let mut next_index = 0;
         let mut pending = JoinSet::new();
         // A worker panic has no returned stream index. Keep its task ID so a
         // finite ordered read can defer the failure until that split is needed.
         let mut task_indices = HashMap::new();
         for _ in 0..parallelism.min(count) {
-            if let Some((index, stream)) = unscheduled.pop_front() {
-                let task = pending.spawn_on(next_batch(index, stream), &handle);
+            if let Some(item) = unscheduled.pop_front() {
+                let index = next_index;
+                next_index += 1;
+                let task = pending.spawn_on(next_batch(index, make_stream(item)), &handle);
                 if ordered && limit.is_some() {
                     task_indices.insert(task.id(), index);
                 }
@@ -248,8 +265,10 @@ fn merge_streams_bounded(
                         // reaches it, and start the next split now.
                         completed.insert(next.0);
                         drop(next.2);
-                        if let Some((index, stream)) = unscheduled.pop_front() {
-                            let task = pending.spawn_on(next_batch(index, stream), &handle);
+                        if let Some(item) = unscheduled.pop_front() {
+                            let index = next_index;
+                            next_index += 1;
+                            let task = pending.spawn_on(next_batch(index, make_stream(item)), &handle);
                             if limit.is_some() {
                                 task_indices.insert(task.id(), index);
                             }
@@ -537,6 +556,21 @@ mod tests {
             .iter()
             .all(|count| count.load(Ordering::SeqCst) == 0));
         assert_eq!(drops.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn ordered_limit_creates_streams_only_for_scheduled_splits() {
+        let created = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&created);
+        let mut output =
+            merge_items_bounded((0..50_000).collect(), true, Some(1), 2, move |index| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(futures::stream::once(async move { Ok(batch(index)) }))
+            });
+        assert_eq!(created.load(Ordering::SeqCst), 0);
+        assert_eq!(value(&output.next().await.unwrap().unwrap()), 0);
+        assert!(output.next().await.is_none());
+        assert_eq!(created.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
