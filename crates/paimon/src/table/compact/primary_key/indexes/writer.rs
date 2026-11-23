@@ -212,7 +212,6 @@ pub(super) async fn build(
                     definition.field.name(),
                     &native,
                     range,
-                    index_build::serialize_options(&native.native_options)?,
                 )
                 .await?;
                 let payload = match payload {

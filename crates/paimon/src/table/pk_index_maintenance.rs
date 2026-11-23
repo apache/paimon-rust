@@ -24,10 +24,19 @@ use crate::spec::{
     should_read_pk_index_source, DataFileMeta, FileKind, IndexManifest, IndexManifestEntry,
     ManifestEntry, PrimaryKeyIndexSourceFile, PrimaryKeyIndexSourceMeta, Snapshot,
 };
-use crate::table::pk_index_options::{definitions, native_options, Definition};
+use crate::table::index_build::full_text::native_full_text_options;
+use crate::table::index_file_path::IndexFileLocation;
+use crate::table::pk_index_options::{definitions, Definition};
+use crate::table::vector_search_common::{
+    read_retained_vector_index_header, read_vector_index_header, stat_retained_vector_index_size,
+};
 use crate::table::Table;
+use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
 use crate::{Error, Result};
-use std::collections::{BTreeMap, HashSet};
+use futures::future::try_join_all;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::OnceLock;
+use tokio::sync::Semaphore;
 
 type Unit = (Vec<u8>, i32, i32, i32);
 type Levels = BTreeMap<i32, Vec<DataFileMeta>>;
@@ -139,29 +148,117 @@ pub(super) fn row_count(files: &[DataFileMeta]) -> Result<i64> {
     })
 }
 
-fn compatible(table: &Table, entry: &IndexManifestEntry, definition: &Definition) -> Result<bool> {
-    if entry.index_file.index_type != definition.index_type {
+async fn compatible(
+    table: &Table,
+    entry: &IndexManifestEntry,
+    definition: &Definition,
+    retained_header_reads: Option<&Semaphore>,
+) -> Result<bool> {
+    let file = &entry.index_file;
+    if file.index_type != definition.index_type {
         return Ok(false);
     }
-    if crate::vindex::is_vindex_index_type(&definition.index_type)
-        && entry.index_file.row_count == 0
-        && entry.index_file.file_size == 0
-    {
-        return Ok(true);
+    if is_vindex_index_type(&definition.index_type) {
+        let empty = file.row_count == 0 && file.file_size == 0;
+        let in_data_dir = table.schema().core_options().index_file_in_data_file_dir();
+        let bucket_path = if in_data_dir && file.external_path.is_none() {
+            table.data_file_bucket_path(&entry.partition, entry.bucket)?
+        } else {
+            String::new()
+        };
+        let path = IndexFileLocation::BucketLocal {
+            table_path: table.location().trim_end_matches('/'),
+            bucket_path: &bucket_path,
+            index_file_in_data_file_dir: in_data_dir,
+        }
+        .resolve(&file.file_name, file.external_path.as_deref());
+        let file_size = file.file_size.max(0) as u64;
+        let persisted = if let Some(limit) = retained_header_reads {
+            // All buckets in one automatic round share the limit for header
+            // reads and storage metadata checks.
+            let _permit = limit
+                .acquire()
+                .await
+                .expect("the compaction header read semaphore is never closed");
+            if empty {
+                let input = table.file_io().new_input(&path)?;
+                return Ok(stat_retained_vector_index_size(&input).await? == Some(0));
+            }
+            let Some(persisted) =
+                read_retained_vector_index_header(table.file_io(), &path, file_size).await?
+            else {
+                return Ok(false);
+            };
+            persisted
+        } else {
+            let status = table.file_io().new_input(&path)?.metadata().await?;
+            if status.is_dir {
+                return Err(invalid(&format!(
+                    "PK vector index output '{path}' is a directory"
+                )));
+            }
+            if status.size != file_size {
+                return Err(invalid(&format!(
+                    "PK vector index output '{path}' has size {}, expected {file_size}",
+                    status.size
+                )));
+            }
+            if empty {
+                return Ok(true);
+            }
+            read_vector_index_header(table.file_io(), &path, file_size).await?
+        };
+        let expected = VindexVectorIndexOptions::new(
+            table.schema().options(),
+            &definition.options,
+            &definition.index_type,
+            &definition.field,
+        )?;
+        // Build parameters apply to new segments. Readers use each retained segment's layout.
+        let matches_geometry = retained_header_reads.is_some()
+            || [
+                ("nlist", Some(persisted.nlist)),
+                ("rq.bits", persisted.rq_bits),
+                ("pq.m", persisted.pq_m),
+            ]
+            .into_iter()
+            .all(|(key, actual)| {
+                expected.native_options.get(key).is_none_or(|value| {
+                    let value = value.trim();
+                    (key == "nlist" && value == "auto")
+                        || actual.is_some_and(|actual| value.parse() == Ok(actual))
+                })
+            });
+        return Ok(persisted.matches_options(&expected)
+            && matches_geometry
+            && persisted.total_vectors == file.row_count);
     }
-    if definition.index_type == "full-text"
-        || crate::vindex::is_vindex_index_type(&definition.index_type)
-    {
-        let expected = native_options(table, definition)?;
-        let recorded = entry
-            .index_file
+    if definition.index_type == "full-text" {
+        let mut options = table.schema().options().clone();
+        options.extend(definition.options.clone());
+        let expected = native_full_text_options(&options);
+        let recorded = file
             .global_index_meta
             .as_ref()
             .and_then(|m| m.index_meta.as_deref())
-            .and_then(|bytes| serde_json::from_slice::<BTreeMap<String, String>>(bytes).ok());
+            .and_then(|bytes| serde_json::from_slice::<HashMap<String, String>>(bytes).ok());
         return Ok(recorded.as_ref() == Some(&expected));
     }
     Ok(true)
+}
+
+fn compatibility_parallelism(table: &Table, defs: &[Definition]) -> Result<usize> {
+    if defs.iter().any(|def| is_vindex_index_type(&def.index_type)) {
+        table.schema().core_options().global_index_thread_num()
+    } else {
+        Ok(1)
+    }
+}
+
+/// Shares the retained vector-index I/O limit across buckets in one PK compaction round.
+#[derive(Default)]
+pub(super) struct MaintenanceRound {
+    header_reads: OnceLock<Semaphore>,
 }
 
 pub(super) struct Maintenance<'a> {
@@ -193,15 +290,16 @@ pub(super) async fn unsupported_scalar_units(
     unsupported
 }
 
-pub(super) fn plan<'a>(
+pub(super) async fn plan<'a>(
     table: &Table,
     indexes: &[IndexManifestEntry],
     levels: &Levels,
     defs: &'a [Definition],
     unsupported: &HashSet<(i32, i32)>,
-    partition: &[u8],
-    bucket: i32,
+    bucket_key: (&[u8], i32),
+    round: &MaintenanceRound,
 ) -> Result<Maintenance<'a>> {
+    let (partition, bucket) = bucket_key;
     let mut existing = BTreeMap::<(i32, i32), Vec<&IndexManifestEntry>>::new();
     for entry in indexes
         .iter()
@@ -223,25 +321,39 @@ pub(super) fn plan<'a>(
     }
     let mut deletes = Vec::new();
     let mut builds = Vec::new();
-    for ((level, field), entries) in &existing {
-        let expected = levels
-            .get(level)
-            .map(|files| source_meta(*level, files))
-            .transpose()?;
-        let definition = defs.iter().find(|d| d.field.id() == *field);
-        let valid = entries.len() == 1
-            && expected.as_ref() == Some(&source(entries[0])?)
-            && match definition {
-                Some(d) => {
-                    !unsupported.contains(&(*level, *field)) && compatible(table, entries[0], d)?
+    let parallelism = compatibility_parallelism(table, defs)?;
+    let header_reads = round
+        .header_reads
+        .get_or_init(|| Semaphore::new(parallelism));
+    let existing_entries = existing.iter().collect::<Vec<_>>();
+    for batch in existing_entries.chunks(parallelism) {
+        let mut checks = Vec::with_capacity(batch.len());
+        for &((level, field), entries) in batch {
+            checks.push(async move {
+                let expected = levels
+                    .get(level)
+                    .map(|files| source_meta(*level, files))
+                    .transpose()?;
+                let definition = defs.iter().find(|d| d.field.id() == *field);
+                let valid = entries.len() == 1
+                    && expected.as_ref() == Some(&source(entries[0])?)
+                    && match definition {
+                        Some(d) => {
+                            !unsupported.contains(&(*level, *field))
+                                && compatible(table, entries[0], d, Some(header_reads)).await?
+                        }
+                        None => true,
+                    };
+                Ok::<_, Error>((entries, valid))
+            });
+        }
+        for (entries, valid) in try_join_all(checks).await? {
+            if !valid {
+                for entry in entries {
+                    let mut deleted = (*entry).clone();
+                    deleted.kind = FileKind::Delete;
+                    deletes.push(deleted);
                 }
-                None => true,
-            };
-        if !valid {
-            for entry in entries {
-                let mut deleted = (*entry).clone();
-                deleted.kind = FileKind::Delete;
-                deletes.push(deleted);
             }
         }
     }
@@ -304,6 +416,7 @@ pub(super) async fn validate(
     let mut required_deletes = Vec::new();
     let mut required_builds = HashSet::new();
     let mut after_levels = BTreeMap::new();
+    let round = MaintenanceRound::default();
     for (partition, bucket) in &buckets {
         let after = levels(active, changes, partition, *bucket);
         let unsupported = unsupported_scalar_units(table, &after, &defs).await;
@@ -313,9 +426,10 @@ pub(super) async fn validate(
             &after,
             &defs,
             &unsupported,
-            partition,
-            *bucket,
-        )?;
+            (partition, *bucket),
+            &round,
+        )
+        .await?;
         required_deletes.extend(maintenance.deletes);
         for (level, definition) in maintenance.builds {
             required_builds.insert((partition.clone(), *bucket, level, definition.field.id()));
@@ -357,6 +471,7 @@ pub(super) async fn validate(
     }
     let mut names = HashSet::new();
     let mut vector_sources = HashSet::new();
+    let mut outputs = Vec::new();
     for entry in prepared.iter().filter(|e| e.kind == FileKind::Add) {
         if !names.insert(entry.index_file.file_name.as_str())
             || current
@@ -390,12 +505,12 @@ pub(super) async fn validate(
             || meta.row_range_end != count - 1
             || !valid_count
             || entry.index_file.file_size < 0
-            || !compatible(table, entry, definition)?
         {
             return Err(invalid(
                 "PK index output does not match complete compacted level",
             ));
         }
+        outputs.push((entry, definition));
         if crate::vindex::is_vindex_index_type(&definition.index_type) {
             vector_sources.extend(sources.source_files().iter().map(|file| {
                 (
@@ -404,6 +519,17 @@ pub(super) async fn validate(
                     file.file_name().into(),
                 )
             }));
+        }
+    }
+    for batch in outputs.chunks(compatibility_parallelism(table, &defs)?) {
+        let mut checks = Vec::with_capacity(batch.len());
+        for &(entry, definition) in batch {
+            checks.push(compatible(table, entry, definition, None));
+        }
+        if try_join_all(checks).await?.contains(&false) {
+            return Err(invalid(
+                "PK index output does not match complete compacted level",
+            ));
         }
     }
     if !required_builds.is_empty() {

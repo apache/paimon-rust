@@ -18,14 +18,11 @@
 use super::*;
 use crate::io::{FileIO, FileIOBuilder};
 use crate::spec::{BinaryRow, FileKind, GlobalIndexMeta, IndexFileMeta, VectorIndexOptions};
-use crate::table::vector_search_test_utils::{vector_search_log_start, vector_search_logs_since};
 use crate::vector_search::GlobalIndexIOMeta;
-use paimon_vindex_core::index::{CentroidRouter, VectorIndexConfig, VectorIndexTrainer};
 use paimon_vindex_core::io::PosWriter;
 use paimon_vindex_core::ivfflat::IVFFlatIndex;
 use paimon_vindex_core::ivfflat_io::write_ivfflat_index;
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
 
 const ROOT: &str = "memory:/centroid-joint";
 const ROWS: usize = 192;
@@ -65,18 +62,16 @@ fn joint_probe_uses_sixteen_lists_and_retries_an_incomplete_shard() {
             .unwrap()
             .with_options(HashMap::from([("ivf.nprobe".into(), "64".into())])),
     ];
-    let probes = [Probe::CheckLayout, Probe::CheckLayout, Probe::Joint];
+    let probes = [Probe::Joint, Probe::Standard, Probe::Joint];
     let result = search_file(&mut reader, &queries, &probes, Cursor::new(bytes), |_| {
         Ok(())
     })
     .unwrap();
-    assert_eq!(result[0].standard.as_ref().unwrap().len(), 1);
-    let joint = result[0].joint.as_ref().unwrap().as_ref().unwrap();
+    let joint = result[0].as_ref().unwrap();
     assert_eq!(joint.len(), 16);
     assert!((0..16).all(|id| joint.contains_key(&id)));
-    assert_eq!(result[1].joint.as_ref(), Some(&result[1].standard));
-    assert_eq!(result[1].standard.as_ref().unwrap().len(), 1);
-    let retried = result[2].joint.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(result[1].as_ref().unwrap().len(), 1);
+    let retried = result[2].as_ref().unwrap();
     assert_eq!(retried.len(), 20);
     assert!((0..20).all(|id| retried.contains_key(&id)));
 }
@@ -104,16 +99,7 @@ fn entry(role: Role, size: usize, rows: usize, payload: Option<&[u8]>) -> IndexM
                 row_range_end: (8 * ROWS - 1) as i64,
                 index_field_id: 0,
                 extra_field_ids: None,
-                index_meta: Some(
-                    Descriptor {
-                        model_id: "test-router",
-                        version: 1,
-                        role,
-                        payload,
-                    }
-                    .encode()
-                    .unwrap(),
-                ),
+                index_meta: Some(Descriptor { role, payload }.encode().unwrap()),
                 source_meta: None,
             }),
         },
@@ -165,7 +151,7 @@ async fn run(
             top_ks: vec![],
         },
         VectorMetricCheck {
-            persisted: Arc::new(Mutex::new(None)),
+            state: Default::default(),
             requested: None,
         },
         RangeReadLimiter::new(2),
@@ -177,24 +163,19 @@ async fn run(
 }
 
 #[tokio::test]
-async fn joint_routes_use_four_shards_with_or_without_manifest_geometry() {
+async fn joint_routes_use_four_shards_only_with_matching_local_nlists() {
     let io = FileIOBuilder::new("memory").build().unwrap();
-    let config = VectorIndexConfig::from_options(&HashMap::from([
-        ("index.type".into(), "ivf_flat".into()),
-        ("dimension".into(), "1".into()),
-        ("metric".into(), "l2".into()),
-        ("nlist".into(), "64".into()),
-    ]))
-    .unwrap();
-    let centers = (0..64).map(|i| i as f32 * 10.0).collect::<Vec<_>>();
-    let training = VectorIndexTrainer::train(config, &centers, centers.len()).unwrap();
-    let router = CentroidRouter::from_training(training).unwrap();
-    let mut bytes = centroid_index::encode_router_envelope("test-router").unwrap();
-    bytes.extend(router.serialize());
-    let router_entry = entry(Role::Router(64), bytes.len(), 0, None);
+    // Keep center IDs in the same order as the handcrafted shards.
+    let mut bytes = b"PVROUT01".to_vec();
+    for word in [1, 64, MetricType::L2 as u32] {
+        bytes.extend(word.to_le_bytes());
+    }
+    for id in 0..64 {
+        bytes.extend((id as f32 * 10.0).to_le_bytes());
+    }
+    let router_entry = entry(Role::Router(64), bytes.len(), 0, Some(b"l2"));
     store(&io, &router_entry, bytes).await;
     let mut entries = vec![router_entry];
-    let mut legacy = entries.clone();
     for id in 0..64 {
         let base = if id < 4 { 100.0 + id as f32 } else { 0.0 };
         let (bytes, count) = if id < 8 {
@@ -202,34 +183,20 @@ async fn joint_routes_use_four_shards_with_or_without_manifest_geometry() {
         } else {
             (centroid_index::EMPTY_SHARD.to_vec(), 0)
         };
+        let payload = 64i32.to_be_bytes();
         let shard = entry(
             Role::Shard(id),
             bytes.len(),
             count,
-            Some(br#"{"localNlist":"64","metric":"l2"}"#),
+            (count != 0).then_some(&payload),
         );
         store(&io, &shard, bytes).await;
-        legacy.push(if id == 0 {
-            entry(
-                Role::Shard(id),
-                shard.index_file.file_size as usize,
-                count,
-                None,
-            )
-        } else {
-            shard.clone()
-        });
         entries.push(shard);
     }
     let queries = [0.0, 70.0];
     let joint = run(&io, &entries, &queries, HashMap::new()).await;
-    let legacy_joint = run(&io, &legacy, &queries, HashMap::new()).await;
     assert_eq!(joint[0].row_ids.len(), 10);
     assert!(joint[0].row_ids.iter().all(|&id| id < (4 * ROWS) as u64));
-    for (expected, actual) in joint.iter().zip(legacy_joint) {
-        assert_eq!(expected.row_ids, actual.row_ids);
-        assert_eq!(expected.scores, actual.scores);
-    }
 
     let standard = run(
         &io,
@@ -243,49 +210,22 @@ async fn joint_routes_use_four_shards_with_or_without_manifest_geometry() {
         .iter()
         .all(|&id| id >= (4 * ROWS) as u64));
 
-    // Shard 4 needs a layout check for the second query. It ranks fifth for
-    // the first query, whose four nearest shards already have known layouts.
-    let mut mixed = entries.clone();
-    mixed[5] = entry(
-        Role::Shard(4),
-        entries[5].index_file.file_size as usize,
-        ROWS,
-        None,
-    );
     let mixed_queries = [0.0, 40.0];
-    let expected = run(&io, &entries, &mixed_queries, HashMap::new()).await;
-    let log_start = vector_search_log_start();
-    let timing = crate::vindex::enable_vector_search_timing_for_test();
-    let actual = run(&io, &mixed, &mixed_queries, HashMap::new()).await;
-    drop(timing);
-    for (expected, actual) in expected.iter().zip(actual) {
-        assert_eq!(expected.row_ids, actual.row_ids);
-        assert_eq!(expected.scores, actual.scores);
-    }
-    let logs = vector_search_logs_since(log_start);
-    let shard_logs: Vec<_> = logs
-        .iter()
-        .filter(|entry| entry.starts_with("event=paimon_vindex_reader file=shard-4 "))
-        .collect();
-    assert_eq!(shard_logs.len(), 2, "{shard_logs:?}");
-    assert!(
-        shard_logs[0].contains("nq=1 nprobe=auto "),
-        "{shard_logs:?}"
-    );
-    assert!(shard_logs[1].contains("nq=1 nprobe=16 "), "{shard_logs:?}");
-    assert!(
-        !shard_logs[0].contains("vindex_open_ms=0.000 "),
-        "{shard_logs:?}"
-    );
-    assert!(
-        shard_logs[1].contains("vindex_open_ms=0.000 "),
-        "{shard_logs:?}"
-    );
-
-    let bytes = flat_shard(1, 100.0, 0, ROWS);
-    legacy[1] = entry(Role::Shard(0), bytes.len(), ROWS, None);
-    store(&io, &legacy[1], bytes).await;
-    let fallback = run(&io, &legacy, &queries, HashMap::new()).await;
-    assert_eq!(standard[0].row_ids, fallback[0].row_ids);
-    assert_eq!(standard[0].scores, fallback[0].scores);
+    // Changing shard 4's local list count disqualifies only the second query.
+    let bytes = flat_shard(8, 0.0, 4 * ROWS, ROWS / 8);
+    let smaller = entry(Role::Shard(4), bytes.len(), ROWS, Some(&8i32.to_be_bytes()));
+    store(&io, &smaller, bytes).await;
+    entries[5] = smaller;
+    let actual = run(&io, &entries, &mixed_queries, HashMap::new()).await;
+    let fallback = run(
+        &io,
+        &entries,
+        &mixed_queries,
+        HashMap::from([("centroid.nprobe".into(), "8".into())]),
+    )
+    .await;
+    assert_eq!(actual[0].row_ids, joint[0].row_ids);
+    assert_eq!(actual[0].scores, joint[0].scores);
+    assert_eq!(actual[1].row_ids, fallback[1].row_ids);
+    assert_eq!(actual[1].scores, fallback[1].scores);
 }

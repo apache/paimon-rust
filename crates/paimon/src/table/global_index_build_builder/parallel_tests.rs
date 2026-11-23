@@ -179,6 +179,9 @@ async fn parallel_native_writers_match_serial_shards_and_incremental_coverage() 
                 assert_eq!(file.row_count, reference.row_count);
                 let mut actual_meta = file.global_index_meta.clone().unwrap();
                 let mut expected_meta = reference.global_index_meta.clone().unwrap();
+                if kind != "full-text" {
+                    assert_eq!(actual_meta.index_meta.as_deref(), Some(b"{}".as_slice()));
+                }
                 let actual_options: serde_json::Value =
                     serde_json::from_slice(&actual_meta.index_meta.take().unwrap()).unwrap();
                 let expected_options: serde_json::Value =

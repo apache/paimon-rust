@@ -285,20 +285,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             options.dimension() as u64,
             "vindex dimension is too large for Rust builder",
         )?;
-        let index_meta =
-            serde_json::to_vec(&options.native_options).map_err(|error| Error::DataInvalid {
-                message: format!("Failed to serialize vindex options metadata: {error}"),
-                source: Some(Box::new(error)),
-            })?;
         let built = self
-            .build_index_file(
-                shard,
-                index_column,
-                dimension,
-                index_field.id(),
-                &options,
-                index_meta,
-            )
+            .build_index_file(shard, index_column, dimension, index_field.id(), &options)
             .await?;
         Ok(built.map(|built| {
             let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);

@@ -598,6 +598,11 @@ async fn hybrid_configuration_is_per_column_and_captured_with_each_route() {
 
 #[tokio::test]
 async fn raw_build_map_preserves_json_precedence_and_serialized_shards() {
+    use crate::table::index_file_path::IndexFileLocation;
+    use paimon_vindex_core::distance::MetricType;
+    use paimon_vindex_core::index::VectorIndexReader;
+    use std::io::Cursor;
+
     let table = raw_table().await;
     let mut options = table.schema().options().clone();
     options.extend(declaration("ivf-flat", "embedding"));
@@ -631,18 +636,22 @@ async fn raw_build_map_preserves_json_precedence_and_serialized_shards() {
             .unwrap();
         assert!(!messages.is_empty());
         for file in messages.iter().flat_map(|message| &message.new_index_files) {
-            let meta: HashMap<String, String> = serde_json::from_slice(
-                file.global_index_meta
-                    .as_ref()
-                    .unwrap()
-                    .index_meta
-                    .as_ref()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(meta["dimension"], "2");
-            assert_eq!(meta["nlist"], "1");
-            assert_eq!(meta["metric"], "cosine");
+            let path = IndexFileLocation::Global {
+                table_path: table.location(),
+            }
+            .resolve(&file.file_name, file.external_path.as_deref());
+            let payload = worker
+                .file_io()
+                .new_input(&path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let reader = VectorIndexReader::open(Cursor::new(payload)).unwrap();
+            let native = reader.metadata();
+            assert_eq!(native.dimension, 2);
+            assert_eq!(native.nlist, 1);
+            assert_eq!(native.metric, MetricType::Cosine);
         }
     }
     // Opaque procedure parameters are ignored, while known invalid values fail.

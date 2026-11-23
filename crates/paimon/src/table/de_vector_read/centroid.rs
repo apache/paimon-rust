@@ -31,7 +31,7 @@ use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::VectorIndexMetadata;
 use paimon_vindex_core::io::SeekRead;
 use roaring::RoaringTreemap;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 type CentroidFiles<'a> = HashMap<&'a str, Generation<'a>>;
@@ -64,23 +64,6 @@ const SHARD_LISTS: usize = 64;
 pub(super) enum Probe {
     Standard,
     Joint,
-    CheckLayout,
-}
-
-#[derive(Clone, Default)]
-pub(super) struct ProbeMatches<T> {
-    pub(super) standard: T,
-    // A legacy shard reports Some only when its native layout supports joint probing.
-    pub(super) joint: Option<T>,
-}
-
-impl<T> ProbeMatches<T> {
-    pub(super) fn standard(standard: T) -> Self {
-        Self {
-            standard,
-            joint: None,
-        }
-    }
 }
 
 pub(super) type NativeMatches = Option<HashMap<u64, f32>>;
@@ -91,37 +74,35 @@ pub(super) fn search_file<S: SeekRead + 'static>(
     probes: &[Probe],
     source: S,
     validate: impl FnOnce(&VectorIndexMetadata) -> Result<()>,
-) -> Result<Vec<ProbeMatches<NativeMatches>>> {
+) -> Result<Vec<NativeMatches>> {
     if probes.is_empty() {
-        return reader
-            .visit_batch_vector_search_validated(searches, |_| Ok(source), validate)
-            .map(|hits| hits.into_iter().map(ProbeMatches::standard).collect());
+        return reader.visit_batch_vector_search_validated(searches, |_| Ok(source), validate);
     }
 
     debug_assert_eq!(searches.len(), probes.len());
     reader.load_validated(|_| Ok(source), validate)?;
-    let metadata = reader.metadata()?;
-    let compatible = metadata.nlist == SHARD_LISTS && metadata.metric == MetricType::L2;
     let mut standard_queries = Vec::new();
     let mut standard_indices = Vec::new();
     let mut joint_queries = Vec::new();
     let mut joint_indices = Vec::new();
     for (index, (query, probe)) in searches.iter().zip(probes).enumerate() {
-        if *probe != Probe::Joint {
-            standard_queries.push(query);
-            standard_indices.push(index);
-        }
-        if *probe == Probe::Joint || (*probe == Probe::CheckLayout && compatible) {
-            joint_queries.push(query);
-            joint_indices.push(index);
+        match probe {
+            Probe::Standard => {
+                standard_queries.push(query);
+                standard_indices.push(index);
+            }
+            Probe::Joint => {
+                joint_queries.push(query);
+                joint_indices.push(index);
+            }
         }
     }
 
-    let mut results = vec![ProbeMatches::default(); searches.len()];
+    let mut results = vec![None; searches.len()];
     if !standard_queries.is_empty() {
         let hits = reader.search_loaded_batch(&standard_queries, None)?;
         for (index, hits) in standard_indices.into_iter().zip(hits) {
-            results[index].standard = hits;
+            results[index] = hits;
         }
     }
     if joint_queries.is_empty() {
@@ -129,18 +110,13 @@ pub(super) fn search_file<S: SeekRead + 'static>(
     }
 
     // Java retries an incomplete local joint probe at the ordinary width.
-    // A legacy probe has already computed those results for the other policy.
     let joint_hits = reader.search_loaded_batch(&joint_queries, Some(JOINT_INNER_PROBES))?;
     let mut retry = Vec::new();
     for (index, hits) in joint_indices.into_iter().zip(joint_hits) {
         if hits.as_ref().map_or(0, HashMap::len) < searches[index].limit {
-            if probes[index] == Probe::CheckLayout {
-                results[index].joint = Some(results[index].standard.clone());
-            } else {
-                retry.push(index);
-            }
+            retry.push(index);
         } else {
-            results[index].joint = Some(hits);
+            results[index] = hits;
         }
     }
     if !retry.is_empty() {
@@ -152,7 +128,7 @@ pub(super) fn search_file<S: SeekRead + 'static>(
             .into_iter()
             .zip(reader.search_loaded_batch(&queries, None)?)
         {
-            results[index].joint = Some(hits);
+            results[index] = hits;
         }
     }
     Ok(results)
@@ -171,7 +147,6 @@ struct Route {
     limit: usize,
     hits: ScoredRowIds,
     joint: bool,
-    legacy_joint_hits: ScoredRowIds,
 }
 
 pub(super) async fn execute_work(
@@ -260,7 +235,10 @@ pub(super) async fn execute_work(
         &group.descriptor,
     )
     .await?;
-    metric_check.check(RawVectorMetric::from_vindex(router.metric))?;
+    metric_check.check(
+        VectorMetricCheck::file_key(&group.router.index_file),
+        RawVectorMetric::from_vindex(router.metric),
+    )?;
     if work
         .queries
         .iter()
@@ -416,24 +394,18 @@ impl RoutedSearch<'_> {
                 limit,
                 hits: ScoredRowIds::empty(),
                 joint: false,
-                legacy_joint_hits: ScoredRowIds::empty(),
             });
         }
 
-        let legacy_probed = if self.joint_enabled {
-            self.resolve_joint_routes(queries, &mut routes, timing)
-                .await?
-        } else {
-            BTreeSet::new()
-        };
+        if self.joint_enabled {
+            self.resolve_joint_routes(queries, &mut routes);
+        }
 
         loop {
             let mut queries_by_centroid = BTreeMap::<_, Vec<_>>::new();
             for (index, route) in routes.iter_mut().enumerate() {
                 for &centroid in &route.nearest[route.visited..route.width] {
-                    if group.shards[&centroid].index_file.row_count > 0
-                        && !(route.visited == 0 && legacy_probed.contains(&centroid))
-                    {
+                    if group.shards[&centroid].index_file.row_count > 0 {
                         let probe = if route.joint {
                             Probe::Joint
                         } else {
@@ -502,9 +474,8 @@ impl RoutedSearch<'_> {
                 )
                 .await?;
                 add_timing(timing, stats);
-                for (index, result) in indices.into_iter().zip(results) {
+                for (index, hits) in indices.into_iter().zip(results) {
                     let route = &mut routes[index];
-                    let hits = result.joint.unwrap_or(result.standard);
                     route.hits = route.hits.or(&hits).top_k(route.limit);
                 }
             }
@@ -549,15 +520,7 @@ impl RoutedSearch<'_> {
         }
     }
 
-    async fn resolve_joint_routes(
-        &self,
-        queries: &[VectorSearch],
-        routes: &mut [Route],
-        timing: &mut IndexSearchTiming,
-    ) -> Result<BTreeSet<usize>> {
-        let group = self.group;
-        let mut layouts = HashMap::new();
-        let mut legacy = BTreeSet::new();
+    fn resolve_joint_routes(&self, queries: &[VectorSearch], routes: &mut [Route]) {
         for (route, query) in routes.iter_mut().zip(queries) {
             if route.width != AUTOMATIC_WIDTH
                 || !(10..=100).contains(&query.limit)
@@ -565,106 +528,16 @@ impl RoutedSearch<'_> {
             {
                 continue;
             }
-            let mut unknown = Vec::new();
-            route.joint = true;
-            for &id in &route.nearest[..JOINT_OUTER_PROBES] {
-                let file = &group.shards[&id].index_file;
-                if file.row_count < (JOINT_INNER_PROBES * query.limit) as i64 {
-                    route.joint = false;
-                    break;
-                }
-                let layout = match layouts.entry(id) {
-                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        let desc = Descriptor::parse(file)?.expect("validated centroid shard");
-                        let options = centroid_index::payload_options(&desc)?;
-                        let layout = options
-                            .get("localNlist")
-                            .map(|count| {
-                                count
-                                    .parse::<usize>()
-                                    .map(|n| {
-                                        n == SHARD_LISTS
-                                            && options
-                                                .get("metric")
-                                                .is_some_and(|value| value == "l2")
-                                    })
-                                    .map_err(|_| {
-                                        centroid_index::invalid("Invalid centroid shard localNlist")
-                                    })
-                            })
-                            .transpose()?;
-                        *entry.insert(layout)
-                    }
-                };
-                match layout {
-                    Some(false) => {
-                        route.joint = false;
-                        break;
-                    }
-                    None => unknown.push(id),
-                    Some(true) => {}
-                }
-            }
-            if route.joint {
-                if unknown.is_empty() {
-                    route.width = JOINT_OUTER_PROBES;
-                } else {
-                    legacy.extend(unknown);
-                }
-            }
-        }
-
-        // Evaluate both policies while each legacy shard's native reader is open.
-        // Only the winning policy's bounded top-K survives layout resolution.
-        for &id in &legacy {
-            let (indices, probes): (Vec<_>, Vec<_>) = routes
-                .iter()
-                .enumerate()
-                .filter_map(|(index, route)| {
-                    let rank = route.nearest[..route.width]
-                        .iter()
-                        .position(|&candidate| candidate == id)?;
-                    let probe = if route.joint && rank < JOINT_OUTER_PROBES {
-                        Probe::CheckLayout
-                    } else {
-                        Probe::Standard
-                    };
-                    Some((index, probe))
-                })
-                .unzip();
-            let (hits, stats) = execute_vector_file_probes(
-                self.evaluation,
-                self.shard_work(queries, id, &indices),
-                self.metric_check.clone(),
-                self.range_read_limiter.clone(),
-                self.batch_parallelism,
-                probes.clone(),
-                self.allow_buffered_read,
-            )
-            .await?;
-            add_timing(timing, stats);
-            for ((index, probe), hits) in indices.into_iter().zip(probes).zip(hits) {
-                let route = &mut routes[index];
-                route.hits = route.hits.or(&hits.standard).top_k(route.limit);
-                if probe == Probe::CheckLayout {
-                    if let Some(joint) = hits.joint {
-                        route.legacy_joint_hits =
-                            route.legacy_joint_hits.or(&joint).top_k(route.limit);
-                    } else {
-                        route.joint = false;
-                    }
-                }
-            }
-        }
-        for route in routes {
-            if route.joint {
+            let compatible = route.nearest[..JOINT_OUTER_PROBES].iter().all(|id| {
+                self.group.shards[id].index_file.row_count
+                    >= (JOINT_INNER_PROBES * query.limit) as i64
+                    && self.group.local_nlists.get(id) == Some(&SHARD_LISTS)
+            });
+            if compatible {
                 route.width = JOINT_OUTER_PROBES;
-                std::mem::swap(&mut route.hits, &mut route.legacy_joint_hits);
+                route.joint = true;
             }
-            route.legacy_joint_hits = ScoredRowIds::empty();
         }
-        Ok(legacy)
     }
 }
 

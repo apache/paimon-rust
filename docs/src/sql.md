@@ -2982,14 +2982,15 @@ explicitly with the build procedure. A Rust build plan also exposes
 `replacement_messages()` to publish with the completed shards in the same
 snapshot-guarded commit.
 
+Before upgrading, use the previous version to drop all indexes written in an
+earlier Centroid development format. Rebuild those indexes after upgrading.
+
 For unfiltered L2 searches over centroid-sharded `ivf-flat` or `ivf-pq`,
 automatic probing can choose both widths together. With 64 outer centers,
 an automatic outer width of eight, and Top-K from 10 through 100, the joint
 policy starts with four shards and 16 local lists per shard. Each of those
-four shards must have 64 lists and at least 16 times Top-K vectors. Older
-descriptors use the native shard header to resolve the layout during the
-same index open. Explicit outer or inner widths and filter expansion
-settings use independent probe sizing.
+four shards must have 64 lists and at least 16 times Top-K vectors. Explicit
+outer or inner widths and filter expansion settings use independent probe sizing.
 
 Set `centroid.nprobe` to choose the outer probe width. `ivf.nprobe` controls a
 selected shard's local IVF search, and `diskann.l_search` controls its DiskANN
@@ -4206,14 +4207,14 @@ optimization may be disabled. Full-text builds reject deletion-vector tables.
 | `vector-index.search-mode` | `fast` | Coverage mode for vector search. |
 | `full-text-index.search-mode` | `fast` | Coverage mode for full-text search. |
 | `vector-index.post-filter.candidates-factor` | `10` | Multiplier of each query's original Top-K for one ANN query followed by exact scalar post-filtering. At least the required reranking/deletion allowance, capped by shard size and the backend limit. Positive integer no greater than `2147483647`. Short results are returned without retry. |
-| `global-index.thread-num` | `32` | Number of concurrent global-index search tasks; must be greater than 0 and must not exceed the runtime's task limit. This does not limit Vindex file range reads. |
+| `global-index.thread-num` | `32` | Maximum number of concurrent global-index search tasks. Also limits concurrent retained vector index checks across all buckets in one automatic primary-key compaction round, including header reads and storage metadata checks. Must be greater than 0 and must not exceed the runtime's task limit. |
 | `global-index.vindex.read-thread-num` | `64` | Maximum number of concurrent Vindex file range reads shared by one search operation; must be greater than 0 and must not exceed the runtime semaphore limit. |
 | `global-index.column-update-action` | `THROW_ERROR` | What a commit does when it updates an indexed column: `THROW_ERROR` rejects the commit, `DROP_PARTITION_INDEX` drops the affected partition index instead. |
 
 `global-index.vindex.read-thread-num` is independent of `global-index.thread-num`.
-When upgrading a table that sets `global-index.thread-num`, set the new option
-explicitly to the same value if Vindex range reads should keep the previous limit;
-otherwise they use the new default of `64`.
+When upgrading a table that sets `global-index.thread-num`, set
+`global-index.vindex.read-thread-num` to the same value to preserve the previous
+limit for Vindex range reads during search. The new option defaults to `64`.
 
 ### Variant Shredding Options
 

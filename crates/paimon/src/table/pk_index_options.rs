@@ -18,11 +18,8 @@
 //! Java-compatible declarations for source-backed primary-key indexes.
 
 use crate::spec::{CoreOptions, DataField, DataType, TableSchema};
-use crate::table::index_build::full_text;
-use crate::table::Table;
-use crate::vindex::VindexVectorIndexOptions;
 use crate::{Error, Result};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 pub(super) struct Definition {
     pub field: DataField,
@@ -116,28 +113,4 @@ pub(super) fn definitions(schema: &TableSchema) -> Result<Vec<Definition>> {
         });
     }
     Ok(result)
-}
-
-/// Canonical persisted options used to validate PK payload compatibility.
-pub(super) fn native_options(
-    table: &Table,
-    definition: &Definition,
-) -> Result<BTreeMap<String, String>> {
-    if crate::vindex::is_vindex_index_type(&definition.index_type) {
-        Ok(VindexVectorIndexOptions::new(
-            table.schema().options(),
-            &definition.options,
-            &definition.index_type,
-            &definition.field,
-        )?
-        .native_options
-        .into_iter()
-        .collect())
-    } else {
-        let mut options = table.schema().options().clone();
-        options.extend(definition.options.clone());
-        Ok(full_text::native_full_text_options(&options)
-            .into_iter()
-            .collect())
-    }
 }

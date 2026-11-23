@@ -220,7 +220,6 @@ impl VindexIndexBuildBuilder<'_> {
             None => None,
         };
 
-        let model_id = uuid::Uuid::new_v4().to_string();
         let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);
         let outcome = self
             .write_centroid_generation(
@@ -230,7 +229,6 @@ impl VindexIndexBuildBuilder<'_> {
                 centroid,
                 spill,
                 bitmap_spill,
-                &model_id,
                 &mut message.new_index_files,
             )
             .await;
@@ -254,20 +252,18 @@ impl VindexIndexBuildBuilder<'_> {
         centroid: CentroidBuildOptions,
         spill: VectorSpill,
         mut bitmap_spill: Option<BitmapSpillReader>,
-        model_id: &str,
         files: &mut Vec<IndexFileMeta>,
     ) -> Result<()> {
-        let version = if centroid.bitmap.is_some() { 2 } else { 1 };
         let extra_fields = centroid
             .bitmap
             .as_ref()
             .map(|bitmap| bitmap.fields().map(|field| field.id()).collect::<Vec<_>>())
             .unwrap_or_default();
-        let metric = &options.native_options["metric"];
-        let router_meta = json_options(&options.native_options)?;
-        let mut model_file = vec![centroid_index::encode_router_envelope(model_id)?.into()];
-        let nlist = if let Some(mut spill) = spill.finish().await? {
+        let metric = options.native_options["metric"].as_bytes();
+        let (nlist, model_file) = if let Some(mut spill) = spill.finish().await? {
             let config = centroid.router_config(options, spill.vector_count())?;
+            let stores_local_nlist =
+                centroid_index::stores_local_nlist(&self.index_type, config.resolved().metric);
             let ratio = options.train_sample_ratio;
             let (router, mut routed) = tokio::task::spawn_blocking(move || {
                 let router = CentroidRouter::from_training(spill.train_router(config, ratio)?)
@@ -310,17 +306,13 @@ impl VindexIndexBuildBuilder<'_> {
                         )
                         .await?
                         .write(self.table, |output| async move {
-                            bitmap
-                                .write(output, sorted, row_count, model_id, id)
-                                .await
-                                .map(Some)
+                            bitmap.write(output, sorted, row_count, id).await.map(Some)
                         })
                         .await?
                         .expect("centroid bitmap always writes a payload");
                     files.push(file);
                 }
-                let mut payload = HashMap::new();
-                let (count, index) = match rows {
+                let (count, index, local_nlist) = match rows {
                     Some(rows) => {
                         let count = rows.vector_count();
                         let mut local = options.clone();
@@ -335,44 +327,47 @@ impl VindexIndexBuildBuilder<'_> {
                             }
                         }
                         let writer = rows.train(&local, false).await?.writer;
-                        let nlist = match &writer {
-                            VectorIndexWriter::IvfFlat(index) => Some(index.nlist),
-                            VectorIndexWriter::IvfPq(index) => Some(index.nlist),
-                            VectorIndexWriter::IvfSq(index) => Some(index.nlist),
-                            VectorIndexWriter::IvfRq(index) => Some(index.nlist),
-                            VectorIndexWriter::DiskAnn(_) => None,
+                        let local_nlist = if stores_local_nlist {
+                            let nlist = match &writer {
+                                VectorIndexWriter::IvfFlat(index) => index.nlist,
+                                VectorIndexWriter::IvfPq(index) => index.nlist,
+                                _ => unreachable!(
+                                    "local nlist is stored only for IVF-FLAT and IVF-PQ"
+                                ),
+                            };
+                            Some(
+                                i32::try_from(nlist)
+                                    .map_err(|_| {
+                                        centroid_index::invalid("Centroid shard nlist is too large")
+                                    })?
+                                    .to_be_bytes(),
+                            )
+                        } else {
+                            None
                         };
-                        payload.insert("metric".into(), metric.clone());
-                        if let Some(nlist) = nlist {
-                            payload.insert("localNlist".into(), nlist.to_string());
-                        }
-                        (count as i64, Some(writer))
+                        (count as i64, Some(writer), local_nlist)
                     }
-                    None => (0, None),
+                    None => (0, None, None),
                 };
-                let metadata = json_options(&payload)?;
                 files.push(
                     self.write_centroid_file(
                         shard,
                         field_id,
                         &extra_fields,
                         Descriptor {
-                            model_id,
-                            version,
                             role: Role::Shard(id),
-                            payload: Some(&metadata),
+                            payload: local_nlist.as_ref().map(|bytes| bytes.as_slice()),
                         },
                         count,
                         index,
-                        vec![Bytes::from_static(EMPTY_SHARD)],
+                        Bytes::from_static(EMPTY_SHARD),
                     )
                     .await?,
                 );
             }
-            model_file.push(router.serialize().into());
-            router.nlist()
+            (router.nlist(), Bytes::from(router.serialize()))
         } else {
-            0
+            (0, Bytes::new())
         };
         files.push(
             self.write_centroid_file(
@@ -380,10 +375,8 @@ impl VindexIndexBuildBuilder<'_> {
                 field_id,
                 &extra_fields,
                 Descriptor {
-                    model_id,
-                    version,
                     role: Role::Router(nlist),
-                    payload: Some(&router_meta),
+                    payload: Some(metric),
                 },
                 0,
                 None,
@@ -403,13 +396,13 @@ impl VindexIndexBuildBuilder<'_> {
         descriptor: Descriptor<'_>,
         row_count: i64,
         writer: Option<VectorIndexWriter>,
-        parts: Vec<Bytes>,
+        bytes: Bytes,
     ) -> Result<IndexFileMeta> {
         let prefix = format!("vector-{}", self.index_type);
         let file_name = if matches!(descriptor.role, Role::Router(_)) {
             format!(
                 "{prefix}-global-index-training-model-{}.index",
-                descriptor.model_id
+                uuid::Uuid::new_v4()
             )
         } else {
             new_global_index_file_name(&prefix)
@@ -420,13 +413,7 @@ impl VindexIndexBuildBuilder<'_> {
             .write(self.table, |output| async move {
                 match writer {
                     Some(writer) => serialize_writer(writer, output).await?,
-                    None => {
-                        let mut output = output.writer().await?;
-                        for part in parts {
-                            output.write(part).await?;
-                        }
-                        output.close().await?;
-                    }
+                    None => output.write(bytes).await?,
                 }
                 Ok(Some(IndexPayload {
                     row_count,
@@ -469,10 +456,6 @@ impl VindexIndexBuildBuilder<'_> {
         )
         .await
     }
-}
-
-fn json_options(options: &HashMap<String, String>) -> Result<Vec<u8>> {
-    serde_json::to_vec(options).map_err(|error| centroid_index::invalid(error.to_string()))
 }
 
 fn task_error(error: tokio::task::JoinError) -> Error {

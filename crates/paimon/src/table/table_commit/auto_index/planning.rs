@@ -27,7 +27,9 @@ use crate::table::global_index_schema::GlobalIndexSchema;
 use crate::table::index_build::full_text::{full_text_config, native_full_text_options};
 use crate::table::source::exclude_row_ranges;
 use crate::table::universal_compaction::{Run, UniversalCompaction};
+use crate::table::vector_search_common::read_index_vector_semantics;
 use crate::table::{merge_row_ranges, RowRange};
+use futures::future::try_join_all;
 use std::collections::BTreeMap;
 
 #[cfg(test)]
@@ -134,7 +136,7 @@ async fn plan_impl(
         &definition.index_type,
     )?;
     let field_id = fields[0].id();
-    let vector_semantics = if crate::vindex::is_vindex_index_type(&definition.index_type) {
+    let vector_options = if crate::vindex::is_vindex_index_type(&definition.index_type) {
         let routed =
             crate::table::vindex_index_build_builder::centroid::CentroidBuildOptions::resolve(
                 table.schema().options(),
@@ -170,12 +172,10 @@ async fn plan_impl(
             &definition.index_type,
             fields[0],
         )?;
-        Some((
-            crate::vindex::pkvector::metric::VectorSearchMetric::parse(
-                &options.native_options["metric"],
-            )?,
-            options.dimension(),
-        ))
+        crate::vindex::pkvector::metric::VectorSearchMetric::parse(
+            &options.native_options["metric"],
+        )?;
+        Some(options)
     } else {
         None
     };
@@ -219,7 +219,7 @@ async fn plan_impl(
         .filter(|entry| {
             entry.kind == FileKind::Add
                 && (entry.index_file.index_type == definition.index_type
-                    || vector_semantics.is_some()
+                    || vector_options.is_some()
                         && crate::vindex::is_vindex_index_type(&entry.index_file.index_type))
                 && entry
                     .index_file
@@ -234,6 +234,7 @@ async fn plan_impl(
     let mut current: HashMap<UnitKey, Vec<&IndexManifestEntry>> = HashMap::new();
     let mut replaced = HashSet::new();
     let mut index_schema = GlobalIndexSchema::new(table);
+    let mut vector_candidates = Vec::new();
     for entry in selected.iter().copied() {
         let meta = entry.index_file.global_index_meta.as_ref().unwrap();
         if !index_schema.compatible(&entry.index_file).await {
@@ -253,26 +254,9 @@ async fn plan_impl(
                 continue;
             }
         }
-        if let Some((metric, dimension)) = vector_semantics {
-            // A vector column owns one algorithm, metric and dimension across all shards.
-            // Coverage equality cannot make a previous definition compatible.
-            let compatible = entry.index_file.index_type == definition.index_type
-                && crate::table::vector_search_common::read_index_vector_semantics(
-                    table.file_io(),
-                    table.location(),
-                    entry,
-                )
-                .await?
-                .is_some_and(|persisted| {
-                    crate::vindex::pkvector::metric::VectorSearchMetric::from_vindex(
-                        persisted.metric,
-                    ) == metric
-                        && persisted.dimension == dimension
-                });
-            if !compatible {
-                replaced.insert(index_file_key(entry));
-                continue;
-            }
+        if vector_options.is_some() && entry.index_file.index_type != definition.index_type {
+            replaced.insert(index_file_key(entry));
+            continue;
         }
         if meta.row_range_start < 0 || meta.row_range_end < meta.row_range_start {
             return Err(crate::Error::DataInvalid {
@@ -290,8 +274,32 @@ async fn plan_impl(
         if shard != meta.row_range_end / width || !contained {
             // Row removal or shard-boundary changes cannot leave stale coverage.
             replaced.insert(index_file_key(entry));
+        } else if vector_options.is_some() {
+            vector_candidates.push((key, entry));
         } else {
             current.entry(key).or_default().push(entry);
+        }
+    }
+    if let Some(options) = &vector_options {
+        // Only files that could be retained need a native definition check.
+        for batch in vector_candidates.chunks(core.global_index_thread_num()?) {
+            let mut checks = Vec::with_capacity(batch.len());
+            for (key, entry) in batch {
+                checks.push(async move {
+                    let compatible =
+                        read_index_vector_semantics(table.file_io(), table.location(), entry)
+                            .await?
+                            .is_some_and(|persisted| persisted.matches_options(options));
+                    Ok::<_, crate::Error>((key, *entry, compatible))
+                });
+            }
+            for (key, entry, compatible) in try_join_all(checks).await? {
+                if compatible {
+                    current.entry(key.clone()).or_default().push(entry);
+                } else {
+                    replaced.insert(index_file_key(entry));
+                }
+            }
         }
     }
     for files in current.values_mut() {
@@ -364,7 +372,7 @@ async fn plan_impl(
             if pending.is_empty() {
                 continue;
             }
-            if pending.as_slice() != std::slice::from_ref(&group) && vector_semantics.is_some() {
+            if pending.as_slice() != std::slice::from_ref(&group) && vector_options.is_some() {
                 training_groups.push(group.clone());
                 if force_training_merge {
                     replaced.extend(existing.iter().map(|entry| index_file_key(entry)));

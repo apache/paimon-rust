@@ -16,10 +16,11 @@
 // under the License.
 
 use super::*;
-use crate::spec::{DataType, IntType, Schema, TableSchema};
+use crate::spec::{ArrayType, DataType, FloatType, IndexManifest, IntType, Schema, TableSchema};
 use crate::table::maintenance_test_utils::{source_manifests, table};
-use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+use arrow_array::{types::Float32Type, ArrayRef, Int32Array, ListArray, RecordBatch};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[tokio::test]
 async fn automatic_tasks_read_captured_metadata_once_and_keep_bucket_indexes() {
@@ -147,5 +148,127 @@ async fn automatic_tasks_read_captured_metadata_once_and_keep_bucket_indexes() {
             error.to_string().contains("snapshot was replaced"),
             "{error}"
         );
+    }
+}
+
+#[tokio::test]
+async fn automatic_pk_vector_header_reads_and_empty_stats_share_a_limit_across_buckets() {
+    async fn append(table: &Table, ids: std::ops::Range<i32>, empty_first_bucket: bool) {
+        let count = ids.len();
+        let ids = (0..2).flat_map(|_| ids.clone()).collect::<Vec<_>>();
+        let vectors = ListArray::from_iter_primitive::<Float32Type, _, _>(
+            ids.iter().enumerate().map(|(position, id)| {
+                (!empty_first_bucket || position >= count).then_some([Some(*id as f32), Some(0.)])
+            }),
+        );
+        let batch = RecordBatch::try_from_iter([
+            (
+                "p",
+                Arc::new(Int32Array::from_iter_values(
+                    (0..2).flat_map(|partition| std::iter::repeat_n(partition, count)),
+                )) as ArrayRef,
+            ),
+            ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
+            ("embedding", Arc::new(vectors) as ArrayRef),
+        ])
+        .unwrap();
+        let write = table.new_write_builder();
+        let mut writer = write.new_write().unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        write
+            .new_commit()
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+    }
+
+    let schema = Schema::builder()
+        .column("p", DataType::Int(IntType::new()))
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "embedding",
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        )
+        .partition_keys(["p"])
+        .primary_key(["p", "id"])
+        .option("bucket", "1")
+        .option("write-only", "true")
+        .option("deletion-vectors.enabled", "true")
+        .option("deletion-vectors.merge-on-read", "false")
+        .option("global-index.ivf-flat.index-columns", "embedding")
+        .option("ivf-flat.dimension", "2")
+        .option("ivf-flat.nlist", "1")
+        .option("global-index.thread-num", "1")
+        .option("index-file-in-data-file-dir", "false")
+        .build()
+        .unwrap();
+    let (table, counter) = table(TableSchema::new(0, &schema)).await;
+    let builder = table.new_compact_builder();
+    let executor = builder.new_auto_executor().unwrap();
+    append(&table, 0..1000, true).await;
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    assert_eq!(plan.tasks().len(), 2);
+    let mut results = Vec::new();
+    for task in plan.tasks() {
+        results.push(executor.execute(task).await.unwrap());
+    }
+    builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap();
+    let snapshots = table.snapshot_manager();
+    let snapshot = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+    let indexes = IndexManifest::read(
+        table.file_io(),
+        &snapshots.manifest_path(snapshot.index_manifest().unwrap()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        indexes
+            .iter()
+            .filter(|entry| entry.index_file.file_size == 0)
+            .count(),
+        1
+    );
+    let paths = indexes
+        .iter()
+        .map(|entry| format!("{}/index/{}", table.location(), entry.index_file.file_name))
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), 2);
+
+    append(&table, 1000..1004, false).await;
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    assert_eq!(plan.tasks().len(), 2);
+    // Overlapping rounds using the same executor each get one permit.
+    for rounds in [1, 2] {
+        counter.watch(paths.clone());
+        let gate = counter.pause_watched_reads();
+        let check_limit = async {
+            gate.started.acquire_many(rounds).await.unwrap().forget();
+            let excess = tokio::time::timeout(Duration::from_millis(250), gate.started.acquire())
+                .await
+                .is_ok();
+            gate.release.add_permits(2 * rounds as usize);
+            assert!(
+                !excess,
+                "retained header reads and empty-segment stats exceeded one permit per round"
+            );
+        };
+        let executions = (0..rounds).map(|_| execute_auto_plan(&table, &plan, &executor, 2));
+        let (prepared, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(futures::future::join_all(executions), check_limit)
+        })
+        .await
+        .expect("each round must start an index check while the other rounds are paused");
+        for result in prepared {
+            assert_eq!(result.unwrap().index_entries.unwrap().len(), 2);
+        }
+        assert!(counter
+            .counts()
+            .values()
+            .all(|&count| count == rounds as usize));
     }
 }

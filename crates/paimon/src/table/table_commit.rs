@@ -24,11 +24,11 @@ use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::FileKind;
 use crate::spec::{
-    bucket_path, bucket_path_under, extract_datum, java_cmp, merge_active_entries, BinaryRow,
-    BinaryRowBuilder, CommitKind, CoreOptions, DataFileMeta, DataType, Datum,
-    GlobalIndexColumnUpdateAction, IndexManifest, IndexManifestEntry, Manifest, ManifestEntry,
-    ManifestFileMeta, ManifestList, PartitionComputer, PartitionStatistics, Predicate, Snapshot,
-    EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA, POSTPONE_BUCKET,
+    extract_datum, java_cmp, merge_active_entries, BinaryRow, BinaryRowBuilder, CommitKind,
+    CoreOptions, DataFileMeta, DataType, Datum, GlobalIndexColumnUpdateAction, IndexManifest,
+    IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta, ManifestList, PartitionComputer,
+    PartitionStatistics, Predicate, Snapshot, EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA,
+    POSTPONE_BUCKET,
 };
 use crate::table::commit_callback::{CommitCallback, CommitCallbackContext};
 use crate::table::commit_message::CommitMessage;
@@ -1161,30 +1161,7 @@ impl TableCommit {
     }
 
     fn bucket_path(&self, partition: &[u8], bucket: i32) -> Result<String> {
-        let partition_keys = self.table.schema().partition_keys();
-        if partition_keys.is_empty() {
-            // An unpartitioned table's buckets sit directly under the table path,
-            // so the partition blob is never decoded — callers are free to pass an
-            // empty one.
-            return Ok(bucket_path_under(
-                &self.table.data_file_location(),
-                "",
-                bucket,
-            ));
-        }
-        let core_options = CoreOptions::new(self.table.schema().options());
-        let computer = PartitionComputer::new(
-            partition_keys,
-            self.table.schema().fields(),
-            core_options.partition_default_name(),
-            core_options.legacy_partition_name(),
-        )?;
-        bucket_path(
-            &self.table.data_file_location(),
-            Some(&computer),
-            &BinaryRow::from_serialized_bytes(partition)?,
-            bucket,
-        )
+        self.table.data_file_bucket_path(partition, bucket)
     }
 
     /// Try to commit with retries.

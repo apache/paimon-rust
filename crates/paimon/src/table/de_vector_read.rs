@@ -56,7 +56,7 @@ use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use crate::vindex::{is_vindex_index_type, vector_search_timing_enabled};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
 use arrow_select::interleave::interleave_record_batch;
-use futures::{stream, TryStreamExt};
+use futures::{future::try_join_all, stream, TryStreamExt};
 use paimon_vindex_core::blas::sgemm_a_bt;
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::io::SeekRead;
@@ -328,7 +328,7 @@ async fn execute_vector_file_work(
     batch_index_parallelism: usize,
     allow_buffered_read: bool,
 ) -> crate::Result<(Vec<ScoredRowIds>, IndexSearchTiming)> {
-    let (hits, timing) = execute_vector_file_probes(
+    execute_vector_file_probes(
         evaluation,
         work,
         metric_check,
@@ -337,8 +337,7 @@ async fn execute_vector_file_work(
         vec![],
         allow_buffered_read,
     )
-    .await?;
-    Ok((hits.into_iter().map(|hits| hits.standard).collect(), timing))
+    .await
 }
 
 async fn execute_vector_file_probes(
@@ -349,7 +348,7 @@ async fn execute_vector_file_probes(
     batch_index_parallelism: usize,
     probes: Vec<centroid::Probe>,
     allow_buffered_read: bool,
-) -> crate::Result<(Vec<centroid::ProbeMatches<ScoredRowIds>>, IndexSearchTiming)> {
+) -> crate::Result<(Vec<ScoredRowIds>, IndexSearchTiming)> {
     let timing_enabled = vector_search_timing_enabled();
     let concurrency = CoreOptions::new(evaluation.table_options).global_index_thread_num()?;
     let global_meta = work
@@ -388,12 +387,9 @@ async fn execute_vector_file_probes(
         work.entry.index_file.external_path.as_deref(),
     );
     let file_name = work.entry.index_file.file_name.clone();
+    let metric_file = VectorMetricCheck::file_key(&work.entry.index_file).to_owned();
     let file_size = work.entry.index_file.file_size as u64;
     let descriptor = super::centroid_index::Descriptor::parse(&work.entry.index_file)?;
-    let index_meta_bytes = match &descriptor {
-        Some(descriptor) => descriptor.payload.unwrap_or_default().to_vec(),
-        None => global_meta.index_meta.clone().unwrap_or_default(),
-    };
     let row_range_start = global_meta.row_range_start;
     let max_centroid_label = descriptor
         .is_some()
@@ -461,7 +457,7 @@ async fn execute_vector_file_probes(
             .is_some_and(|row_ids| row_ids.is_empty())
     }) {
         return Ok((
-            vec![centroid::ProbeMatches::standard(ScoredRowIds::empty()); vector_searches.len()],
+            vec![ScoredRowIds::empty(); vector_searches.len()],
             IndexSearchTiming::default(),
         ));
     }
@@ -472,7 +468,7 @@ async fn execute_vector_file_probes(
     let query_count = vector_searches.len();
     let mut file_reader_open = Duration::ZERO;
     let mut full_file_read = None;
-    let io_meta = GlobalIndexIOMeta::new(file_name.clone(), file_size, index_meta_bytes);
+    let io_meta = GlobalIndexIOMeta::new(file_name.clone(), file_size, Vec::new());
     let results = match tokio::runtime::Handle::try_current() {
         Ok(runtime) => {
             let file_reader_open_start = timing_enabled.then(Instant::now);
@@ -506,6 +502,7 @@ async fn execute_vector_file_probes(
                     parallelism: batch_index_parallelism,
                     list_row_count,
                     metrics: metric_check,
+                    metric_file,
                     post_filter,
                     probes,
                 },
@@ -536,6 +533,7 @@ async fn execute_vector_file_probes(
                     parallelism: batch_index_parallelism,
                     list_row_count,
                     metrics: metric_check,
+                    metric_file,
                     post_filter,
                     probes,
                 },
@@ -587,12 +585,7 @@ async fn execute_vector_file_probes(
     };
     let results = results
         .into_iter()
-        .map(|hits| {
-            Ok(centroid::ProbeMatches {
-                standard: convert(hits.standard)?,
-                joint: hits.joint.map(&convert).transpose()?,
-            })
-        })
+        .map(convert)
         .collect::<crate::Result<Vec<_>>>()?;
     Ok::<_, crate::Error>((
         results,
@@ -619,7 +612,7 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
     file_name: String,
     context: VectorIndexSearchContext,
     guard: G,
-) -> crate::Result<Vec<centroid::ProbeMatches<centroid::NativeMatches>>> {
+) -> crate::Result<Vec<centroid::NativeMatches>> {
     if context.post_filter.is_some() {
         return execute_post_filter_vindex_searches(
             io_meta,
@@ -629,12 +622,7 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
             context,
             guard,
         )
-        .await
-        .map(|hits| {
-            hits.into_iter()
-                .map(centroid::ProbeMatches::standard)
-                .collect()
-        });
+        .await;
     }
     let panic_context = if vector_searches.len() > 1 {
         "vindex global-index batch search task failed"
@@ -651,9 +639,10 @@ async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
             &context.probes,
             source,
             |metadata| {
-                context
-                    .metrics
-                    .check(RawVectorMetric::from_vindex(metadata.metric))
+                context.metrics.check(
+                    &context.metric_file,
+                    RawVectorMetric::from_vindex(metadata.metric),
+                )
             },
         )
         .map_err(|e| crate::Error::DataInvalid {
@@ -689,6 +678,7 @@ async fn execute_post_filter_vindex_searches<S: SeekRead + 'static, G: Send + 's
         }
         let source = source.take();
         let metrics = context.metrics.clone();
+        let metric_file = context.metric_file.clone();
         let task = move || {
             let rows = reader.visit_batch_vector_search_validated(
                 &batch,
@@ -697,7 +687,9 @@ async fn execute_post_filter_vindex_searches<S: SeekRead + 'static, G: Send + 's
                         crate::table::search_task::invalid("Vector reader was not retained")
                     })
                 },
-                |metadata| metrics.check(RawVectorMetric::from_vindex(metadata.metric)),
+                |metadata| {
+                    metrics.check(&metric_file, RawVectorMetric::from_vindex(metadata.metric))
+                },
             )?;
             Ok((rows, reader))
         };
@@ -761,14 +753,34 @@ pub(super) struct VectorSearchEvaluation<'a> {
     pub(super) filter: Option<&'a Predicate>,
 }
 
+#[derive(Default)]
+struct VectorMetricState {
+    persisted: Option<RawVectorMetric>,
+    validated_files: HashSet<String>,
+    resolved: Option<RawVectorMetric>,
+}
+
 #[derive(Clone)]
 struct VectorMetricCheck {
-    persisted: Arc<std::sync::Mutex<Option<RawVectorMetric>>>,
+    state: Arc<std::sync::Mutex<VectorMetricState>>,
     requested: Option<RawVectorMetric>,
 }
 
 impl VectorMetricCheck {
-    fn check(&self, metric: RawVectorMetric) -> crate::Result<()> {
+    fn file_key(file: &IndexFileMeta) -> &str {
+        file.external_path.as_deref().unwrap_or(&file.file_name)
+    }
+
+    fn lock_state(&self) -> crate::Result<std::sync::MutexGuard<'_, VectorMetricState>> {
+        self.state
+            .lock()
+            .map_err(|error| crate::Error::UnexpectedError {
+                message: format!("Vector metric validation lock poisoned: {error}"),
+                source: None,
+            })
+    }
+
+    fn check(&self, file: &str, metric: RawVectorMetric) -> crate::Result<()> {
         if self.requested.is_some_and(|requested| requested != metric) {
             return Err(crate::Error::ConfigInvalid {
                 message: format!(
@@ -777,20 +789,17 @@ impl VectorMetricCheck {
                 ),
             });
         }
-        let mut persisted =
-            self.persisted
-                .lock()
-                .map_err(|error| crate::Error::UnexpectedError {
-                    message: format!("Vector metric validation lock poisoned: {error}"),
-                    source: None,
-                })?;
-        if persisted.is_some_and(|previous| previous != metric) {
+        let mut state = self.lock_state()?;
+        if state.persisted.is_some_and(|previous| previous != metric) {
             return Err(crate::Error::DataInvalid {
                 message: "Cannot merge vector indexes with different metrics".to_string(),
                 source: None,
             });
         }
-        *persisted = Some(metric);
+        state.persisted = Some(metric);
+        if !state.validated_files.contains(file) {
+            state.validated_files.insert(file.to_owned());
+        }
         Ok(())
     }
 }
@@ -800,6 +809,7 @@ struct VectorIndexSearchContext {
     list_row_count: Option<u64>,
     probes: Vec<centroid::Probe>,
     metrics: VectorMetricCheck,
+    metric_file: String,
     post_filter: Option<VectorIndexPostFilter>,
 }
 
@@ -970,7 +980,6 @@ async fn evaluate_batch_vector_search_with_executor(
         return Ok(Vec::new());
     }
 
-    let table_path = evaluation.table_path.trim_end_matches('/');
     let core_options = CoreOptions::new(evaluation.table_options);
     let field_name = &vector_searches[0].field_name;
     if vector_searches
@@ -1243,7 +1252,7 @@ async fn evaluate_batch_vector_search_with_executor(
         ));
     }
     let metric_check = VectorMetricCheck {
-        persisted: Arc::new(std::sync::Mutex::new(None)),
+        state: Default::default(),
         requested: list_scoring
             .map(|_| RawVectorMetric::Cosine)
             .or(requested_metric),
@@ -1371,49 +1380,52 @@ async fn evaluate_batch_vector_search_with_executor(
             })?;
             let mut results = Vec::new();
             loop {
-                let tasks = works
-                    .by_ref()
-                    .take(SEARCH_TASK_WINDOW)
-                    .map(|work| {
-                        let work = work?;
-                        let work = VectorIndexTask {
-                            entry: work.entry,
-                            centroid_files: work.centroid_files,
-                            bitmap: work.bitmap,
-                            queries: TaskVectorQueries::capture(&work.queries)?,
-                            resolved: work.resolved,
-                            filter: work.filter,
-                            top_ks: work.top_ks,
-                        };
-                        SearchTask::new(
-                            table,
-                            // Older workers must reject this work instead of
-                            // ignoring an unfamiliar predicate payload.
-                            if work.bitmap.is_some() {
-                                "vector-index-centroid-bitmap"
-                            } else if !work.centroid_files.is_empty() {
-                                "vector-index-centroid"
-                            } else if list_scoring.is_some() {
-                                "vector-index-multivector"
-                            } else if work.filter.is_some() {
-                                "vector-index-filtered"
-                            } else {
-                                "vector-index"
-                            },
-                            serde_json::to_value(work).map_err(|error| {
-                                crate::table::search_task::invalid(error.to_string())
-                            })?,
-                        )
-                    })
-                    .collect::<crate::Result<Vec<_>>>()?;
+                let mut tasks = Vec::new();
+                let mut metric_files = Vec::new();
+                for work in works.by_ref().take(SEARCH_TASK_WINDOW) {
+                    let work = work?;
+                    metric_files
+                        .push(VectorMetricCheck::file_key(&work.entry.index_file).to_owned());
+                    let work = VectorIndexTask {
+                        entry: work.entry,
+                        centroid_files: work.centroid_files,
+                        bitmap: work.bitmap,
+                        queries: TaskVectorQueries::capture(&work.queries)?,
+                        resolved: work.resolved,
+                        filter: work.filter,
+                        top_ks: work.top_ks,
+                    };
+                    tasks.push(SearchTask::new(
+                        table,
+                        // Older workers must reject this work instead of
+                        // ignoring an unfamiliar predicate payload.
+                        if work.bitmap.is_some() {
+                            "vector-index-centroid-bitmap"
+                        } else if !work.centroid_files.is_empty() {
+                            "vector-index-centroid"
+                        } else if list_scoring.is_some() {
+                            "vector-index-multivector"
+                        } else if work.filter.is_some() {
+                            "vector-index-filtered"
+                        } else {
+                            "vector-index"
+                        },
+                        serde_json::to_value(work).map_err(|error| {
+                            crate::table::search_task::invalid(error.to_string())
+                        })?,
+                    )?);
+                }
                 if tasks.is_empty() {
                     break;
                 }
-                for value in execute_tasks(executor, tasks).await? {
+                for (file, value) in metric_files
+                    .iter()
+                    .zip(execute_tasks(executor, tasks).await?)
+                {
                     let result: VectorTaskScores = serde_json::from_value(value)
                         .map_err(|error| crate::table::search_task::invalid(error.to_string()))?;
                     if let Some(metric) = result.metric {
-                        metric_check.check(metric)?;
+                        metric_check.check(file, metric)?;
                     }
                     let rows = result.restore()?;
                     if rows.len() != vector_searches.len() {
@@ -1568,18 +1580,16 @@ async fn evaluate_batch_vector_search_with_executor(
                 RawVectorMetric::Cosine
             } else {
                 resolve_raw_vector_metric_resolved(
-                    evaluation.file_io,
-                    table_path,
-                    evaluation.table_options,
+                    evaluation,
                     &configuration,
                     index_entries,
                     field_id,
                     field_name,
+                    &metric_check,
                 )
                 .await?
             };
             let metric_resolve = metric_start.map_or(Duration::ZERO, |start| start.elapsed());
-            metric_check.check(metric)?;
             let (raw_results, raw_timing) = read_raw_vector_scores(
                 table,
                 vector_searches,
@@ -1948,16 +1958,14 @@ async fn maybe_rerank_indexed_batch_results(
     let metric_start = timing_enabled.then(Instant::now);
     let field_name = &vector_searches[0].field_name;
     let metric = resolve_raw_vector_metric_resolved(
-        evaluation.file_io,
-        evaluation.table_path.trim_end_matches('/'),
-        evaluation.table_options,
+        evaluation,
         configuration,
         index_entries,
         field_id,
         field_name,
+        metric_check,
     )
     .await?;
-    metric_check.check(metric)?;
     let metric_resolve = metric_start.map_or(Duration::ZERO, |start| start.elapsed());
 
     let (results, raw_timing) = read_raw_batch_vector_search_with_executor(
@@ -2270,68 +2278,100 @@ async fn resolve_raw_vector_metric(
         persisted_type.or(source_index_type),
         false,
     )?;
-    resolve_raw_vector_metric_resolved(
+    let check = VectorMetricCheck {
+        state: Default::default(),
+        requested: resolved_vector_metric_override(
+            &configuration.query_options,
+            field_name,
+            configuration.resolved.index_type.as_deref(),
+        )?,
+    };
+    let evaluation = VectorSearchEvaluation {
+        table: None,
         file_io,
         table_path,
         table_options,
+        schema_fields: &[],
+        next_row_id: None,
+        filter: None,
+    };
+    resolve_raw_vector_metric_resolved(
+        evaluation,
         &configuration,
         index_entries,
         field_id,
         field_name,
+        &check,
     )
     .await
 }
 
 async fn resolve_raw_vector_metric_resolved(
-    file_io: &FileIO,
-    table_path: &str,
-    table_options: &HashMap<String, String>,
+    evaluation: VectorSearchEvaluation<'_>,
     configuration: &super::vector_search_common::VectorSearchOptions,
     index_entries: &[IndexManifestEntry],
     field_id: i32,
     field_name: &str,
+    check: &VectorMetricCheck,
 ) -> crate::Result<RawVectorMetric> {
-    let index_type = configuration.resolved.index_type.as_deref();
-    let check = VectorMetricCheck {
-        persisted: Arc::new(std::sync::Mutex::new(None)),
-        requested: resolved_vector_metric_override(
-            &configuration.query_options,
-            field_name,
-            index_type,
-        )?,
+    let unchecked = {
+        let state = check.lock_state()?;
+        if let Some(metric) = state.resolved {
+            return Ok(metric);
+        }
+        // Filtered ANN work can skip shards whose metric must still agree.
+        index_entries
+            .iter()
+            .filter(|entry| {
+                entry.kind == FileKind::Add
+                    && is_vindex_index_type(&entry.index_file.index_type)
+                    && entry
+                        .index_file
+                        .global_index_meta
+                        .as_ref()
+                        .is_some_and(|meta| meta.index_field_id == field_id)
+                    && !state
+                        .validated_files
+                        .contains(VectorMetricCheck::file_key(&entry.index_file))
+            })
+            .collect::<Vec<_>>()
     };
-    let mut persisted = None;
-    for entry in index_entries {
-        if entry.kind != FileKind::Add
-            || entry
-                .index_file
-                .global_index_meta
-                .as_ref()
-                .is_none_or(|meta| meta.index_field_id != field_id)
-        {
-            continue;
+    if !unchecked.is_empty() {
+        let options = CoreOptions::new(evaluation.table_options);
+        let concurrency = options
+            .global_index_thread_num()?
+            .min(options.global_index_vindex_read_thread_num()?);
+        let table_path = evaluation.table_path.trim_end_matches('/');
+        for batch in unchecked.chunks(concurrency) {
+            let mut reads = Vec::with_capacity(batch.len());
+            for entry in batch {
+                reads.push(read_index_vector_metric(
+                    evaluation.file_io,
+                    table_path,
+                    entry,
+                ));
+            }
+            for (entry, metric) in batch.iter().zip(try_join_all(reads).await?) {
+                if let Some(metric) = metric {
+                    check.check(
+                        VectorMetricCheck::file_key(&entry.index_file),
+                        RawVectorMetric::from_vindex(metric),
+                    )?;
+                }
+            }
         }
-        if let Some(metric) = read_index_vector_metric(file_io, table_path, entry).await? {
-            let metric = RawVectorMetric::from_vindex(metric);
-            check.check(metric)?;
-            persisted = Some(metric);
-        }
     }
-    if let Some(metric) = persisted {
-        return Ok(metric);
-    }
-    if let Some(metric) = check.requested {
-        return Ok(metric);
-    }
-    if index_type.is_some() {
-        return RawVectorMetric::parse(&configuration.resolved.metric);
-    }
-    let table_metric = resolved_vector_metric_override(table_options, field_name, None)?;
-    if let Some(metric) = table_metric {
-        return Ok(metric);
-    }
-    // Preserve the historical untyped raw-search default.
-    Ok(RawVectorMetric::L2)
+    let mut state = check.lock_state()?;
+    let metric = if let Some(metric) = state.persisted.or(check.requested) {
+        metric
+    } else if configuration.resolved.index_type.is_some() {
+        RawVectorMetric::parse(&configuration.resolved.metric)?
+    } else {
+        resolved_vector_metric_override(evaluation.table_options, field_name, None)?
+            .unwrap_or(RawVectorMetric::L2)
+    };
+    state.resolved = Some(metric);
+    Ok(metric)
 }
 
 fn resolved_vector_metric_override(
@@ -3789,7 +3829,7 @@ pub(super) async fn execute_search_task(
                 ));
             }
             let metric_check = VectorMetricCheck {
-                persisted: Arc::new(std::sync::Mutex::new(None)),
+                state: Default::default(),
                 requested: None,
             };
             let evaluation = VectorSearchEvaluation {
@@ -3820,10 +3860,7 @@ pub(super) async fn execute_search_task(
                 parallelism,
             )
             .await?;
-            let metric = *metric_check
-                .persisted
-                .lock()
-                .map_err(|_| crate::table::search_task::invalid("Vector metric lock poisoned"))?;
+            let metric = metric_check.lock_state()?.persisted;
             VectorTaskScores::capture(results, metric)
         }
         "vector-rows" | "vector-list-rows" => {

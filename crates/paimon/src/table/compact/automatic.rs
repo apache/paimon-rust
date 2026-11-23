@@ -20,7 +20,7 @@ use std::future::Future;
 
 use futures::stream::{FuturesUnordered, StreamExt};
 
-use super::{prepare_results, CompactExecutor, CompactPlan, PreparedCompact};
+use super::{prepare_results, CompactExecutor, CompactPlan, CompactRound, PreparedCompact};
 use crate::table::{Table, TableCommit};
 use crate::{Error, Result};
 #[cfg(test)]
@@ -41,12 +41,16 @@ pub(in crate::table) async fn execute_auto_plan(
             .or_default()
             .push(task);
     }
-    let inputs = match plan.tasks().first() {
-        Some(task) => Some(executor.capture_inputs(task).await?),
+    let captured = match plan.tasks().first() {
+        Some(task) => Some((
+            executor.capture_inputs(task).await?,
+            CompactRound::for_task(task),
+        )),
         None => None,
     };
     let (results, error) = run_buckets(buckets.into_values(), parallelism, |task| {
-        executor.execute_captured(task, inputs.as_ref().expect("nonempty task plan"))
+        let (inputs, round) = captured.as_ref().expect("nonempty task plan");
+        executor.execute_captured(task, inputs, round)
     })
     .await;
     let prepared = match error {

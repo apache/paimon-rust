@@ -1045,39 +1045,7 @@ async fn indexed_vector_metric_ignores_unrelated_column_options() {
 }
 
 #[tokio::test]
-async fn test_resolve_raw_vector_metric_uses_vindex_manifest_metadata() {
-    let file_io = FileIOBuilder::new("memory").build().unwrap();
-    let mut entry = make_vector_entry("missing.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
-    let index_meta = serde_json::to_vec(&HashMap::from([(
-        "metric".to_string(),
-        "cosine".to_string(),
-    )]))
-    .unwrap();
-    entry
-        .index_file
-        .global_index_meta
-        .as_mut()
-        .unwrap()
-        .index_meta = Some(index_meta);
-
-    let metric = resolve_raw_vector_metric(
-        &file_io,
-        "memory:///test_table",
-        &HashMap::new(),
-        &HashMap::new(),
-        &[entry],
-        2,
-        "embedding",
-        None,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(metric, RawVectorMetric::Cosine);
-}
-
-#[tokio::test]
-async fn test_resolve_raw_vector_metric_falls_back_to_vindex_header() {
+async fn test_resolve_raw_vector_metric_uses_vindex_header_for_range_index() {
     let file_io = FileIOBuilder::new("memory").build().unwrap();
     let index = build_vindex_segment_bytes("inner_product");
     file_io
@@ -1087,7 +1055,7 @@ async fn test_resolve_raw_vector_metric_falls_back_to_vindex_header() {
         .await
         .unwrap();
     for (file_size, index_meta) in [
-        (index.len() as i64, br#"{"metric":"euclidean"}"#.to_vec()),
+        (index.len() as i64, br#"{"metric":"cosine"}"#.to_vec()),
         (0, b"{}".to_vec()),
         (-1, b"{}".to_vec()),
     ] {

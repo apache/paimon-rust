@@ -4972,6 +4972,7 @@ dependencies = [
  "sha2 0.10.9",
  "snafu 0.9.1",
  "snap",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-util",

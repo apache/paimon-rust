@@ -38,7 +38,7 @@ use crate::table::source::DataSplit;
 use crate::table::vector_read::Read;
 use crate::table::vector_search_common::{
     collect_ranked_rows, current_tokio_runtime_handle, log_vindex_range_io_stats,
-    read_vector_index_metric, reorder_and_strip_position, vindex_concurrency_limits, RankedRow,
+    read_vector_index_header, reorder_and_strip_position, vindex_concurrency_limits, RankedRow,
 };
 use crate::table::{ArrowRecordBatchStream, RowRange, Table};
 use crate::vector_search::{GlobalIndexIOMeta, GlobalIndexResult, VectorSearch};
@@ -132,13 +132,9 @@ impl PkVectorRead {
             .find(|segment| segment.row_count > 0)
         {
             let metric = VectorSearchMetric::from_vindex(
-                read_vector_index_metric(
-                    self.table.file_io(),
-                    &segment.path,
-                    segment.file_size,
-                    Some(&segment.index_meta),
-                )
-                .await?,
+                read_vector_index_header(self.table.file_io(), &segment.path, segment.file_size)
+                    .await?
+                    .metric,
             );
             params.metric = metric;
             params.vector_options.metric = metric.as_str().into();
@@ -401,11 +397,8 @@ async fn search_pk_raw_candidates_batch_with_plan(
 
     let scorer: crate::vindex::pkvector::ann::SourceBatchScorer = Box::new(
         move |segment: &BucketAnnSegment, source: AnnSegmentSource, searches: &[VectorSearch]| {
-            let io_meta = GlobalIndexIOMeta::new(
-                segment.path.clone(),
-                segment.file_size,
-                segment.index_meta.clone(),
-            );
+            let io_meta =
+                GlobalIndexIOMeta::new(segment.path.clone(), segment.file_size, Vec::new());
             match source {
                 AnnSegmentSource::Vindex(source) => {
                     let range_io_stats = source.range_io_stats();
