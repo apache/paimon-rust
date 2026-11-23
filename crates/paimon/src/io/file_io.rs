@@ -1793,29 +1793,40 @@ impl FileSource {
         &self,
         path: &str,
     ) -> crate::Result<(Operator, String, Option<String>)> {
-        let (op, relative_path, cache_path) = self.resolve(path).await?;
-        let requires_parent_dir = match self {
+        let parent = match self {
             Self::Static {
-                requires_parent_dir,
+                op,
+                relative_path,
+                requires_parent_dir: true,
                 ..
-            } => *requires_parent_dir,
-            Self::Provider(provider) => provider.requires_parent_dir_for_write(),
+            } => relative_path
+                .trim_end_matches('/')
+                .rsplit_once('/')
+                .map(|(parent, _)| (op.clone(), parent.to_string())),
+            Self::Provider(provider) if provider.requires_parent_dir_for_write() => {
+                let path = path.trim_end_matches('/');
+                match path.rsplit_once('/') {
+                    Some((parent, _)) if !parent.is_empty() && !parent.ends_with(":/") => {
+                        Some(resolve_provider(provider.as_ref(), &format!("{parent}/")).await?)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
         };
-        if requires_parent_dir && op.info().capability().create_dir {
-            let trimmed = relative_path.trim_end_matches('/');
-            if let Some((parent, _)) = trimmed.rsplit_once('/') {
-                if !parent.trim_matches('/').is_empty() {
-                    let dir_path = normalize_root(parent);
-                    op.create_dir(&dir_path).await.map_err(|error| {
+        if let Some((op, parent)) = parent {
+            if !parent.trim_matches('/').is_empty() && op.info().capability().create_dir {
+                op.create_dir(&normalize_root(&parent))
+                    .await
+                    .map_err(|error| {
                         Error::from_opendal_with_context(
                             error,
                             format!("Failed to create parent directory for '{path}'"),
                         )
                     })?;
-                }
             }
         }
-        Ok((op, relative_path, cache_path))
+        self.resolve(path).await
     }
 }
 
@@ -1969,6 +1980,8 @@ impl InputFile {
     }
 }
 
+/// A file to write. Opening a writer creates its parent directory when the
+/// storage backend requires it.
 #[derive(Debug, Clone)]
 pub struct OutputFile {
     source: FileSource,

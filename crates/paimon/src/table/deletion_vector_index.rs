@@ -328,8 +328,6 @@ pub(super) async fn write_bucket(
     let path = layout
         .location()
         .resolve(&file_name, external_path.as_deref());
-    let directory = path.rsplit_once('/').expect("index file has a parent").0;
-    table.file_io().mkdirs(directory).await?;
 
     let mut bytes = vec![DELETION_VECTORS_INDEX_VERSION_V1];
     let mut ranges = IndexMap::new();

@@ -280,7 +280,6 @@ impl PostponeFileWriter {
         );
         let location = self.paths.new_path(&file_name)?;
         let bucket_dir = location.parent();
-        self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
         let physical_schema = build_physical_schema(&user_schema);
         let file_path = location.path.clone();
         self.created_paths.push(file_path.clone());

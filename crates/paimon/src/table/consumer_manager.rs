@@ -91,7 +91,6 @@ impl ConsumerManager {
             });
         }
         let directory = format!("{}/{}", self.table_path, CONSUMER_DIR);
-        self.file_io.mkdirs(&directory).await?;
         let path = format!("{directory}/{CONSUMER_PREFIX}{consumer_id}");
         let bytes = serde_json::to_vec(&Consumer { next_snapshot }).map_err(|error| {
             crate::Error::DataInvalid {

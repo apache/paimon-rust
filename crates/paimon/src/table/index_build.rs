@@ -98,9 +98,6 @@ impl IndexFileWriter {
             &file_name,
         )?;
         let path = location.resolve(&file_name, external_path.as_deref());
-        if let Some((directory, _)) = path.rsplit_once('/') {
-            table.file_io().mkdirs(directory).await?;
-        }
         Ok(Self {
             path,
             meta: IndexFileMeta {

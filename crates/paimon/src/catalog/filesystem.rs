@@ -161,11 +161,6 @@ impl FileSystemCatalog {
         )
     }
 
-    /// Path to the schema directory under a table path.
-    fn schema_dir_path(&self, table_path: &str) -> String {
-        make_path(table_path, SCHEMA_DIR)
-    }
-
     /// Get the schema file path for a given version (table_path/schema/schema-{version}).
     fn schema_file_path(&self, table_path: &str, schema_id: i64) -> String {
         make_path(
@@ -255,8 +250,6 @@ impl FileSystemCatalog {
 
     /// Save a table schema to a file.
     async fn save_table_schema(&self, table_path: &str, schema: &TableSchema) -> Result<()> {
-        let schema_dir = self.schema_dir_path(table_path);
-        self.file_io.mkdirs(&schema_dir).await?;
         let schema_path = self.schema_file_path(table_path, schema.id());
         let output_file = self.file_io.new_output(&schema_path)?;
         let content =

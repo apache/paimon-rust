@@ -385,10 +385,6 @@ impl FormatTableWriter {
         );
         let target_path = format!("{}/{file_name}", partition.directory);
         let staged_path = format!("{}/{}", self.staging_root, file_name);
-        self.table
-            .file_io()
-            .mkdirs(&format!("{}/", self.staging_root))
-            .await?;
         self.owned_staging.insert(staged_path.clone());
         let output = self.table.file_io().new_output(&staged_path)?;
         let writer = create_format_writer(

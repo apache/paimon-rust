@@ -355,7 +355,6 @@ impl TagManager {
             serde_json::to_string(snapshot)
         }
         .map_err(serialize_error)?;
-        self.file_io.mkdirs(&self.tag_directory()).await?;
         let output = self.file_io.new_output(&path)?;
         output.write(bytes::Bytes::from(json)).await
     }

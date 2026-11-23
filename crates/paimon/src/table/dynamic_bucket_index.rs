@@ -131,7 +131,6 @@ impl HashIndexFile {
         location: DataFilePath,
         hashes: &[i32],
     ) -> Result<IndexFileMeta> {
-        file_io.mkdirs(location.parent()).await?;
         let mut buf = Vec::with_capacity(hashes.len() * 4);
         for &h in hashes {
             buf.extend_from_slice(&h.to_be_bytes());
