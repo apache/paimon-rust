@@ -932,7 +932,66 @@ fn variant_metadata_child(children: &arrow_schema::Fields) -> Option<usize> {
     })
 }
 
-/// Keep Variant metadata dictionary-encoded for extraction and shredded full reads.
+/// Keep Variant metadata dictionary-encoded for extraction and shredded full reads,
+/// including Variant fields inside logical ROW columns.
+fn dictionary_variant_metadata_field(
+    field: &arrow_schema::FieldRef,
+    read_type: &DataType,
+) -> Option<arrow_schema::FieldRef> {
+    let arrow_schema::DataType::Struct(children) = field.data_type() else {
+        return None;
+    };
+    let variant = crate::spec::is_variant_extraction_row_type(read_type)
+        || (matches!(read_type, DataType::Variant(_))
+            && children.iter().any(|child| child.name() == "typed_value"));
+    if variant {
+        let metadata = variant_metadata_child(children)?;
+        let mut children = children
+            .iter()
+            .map(|child| child.as_ref().clone())
+            .collect::<Vec<_>>();
+        children[metadata] =
+            children[metadata]
+                .clone()
+                .with_data_type(arrow_schema::DataType::Dictionary(
+                    Box::new(arrow_schema::DataType::Int32),
+                    Box::new(arrow_schema::DataType::Binary),
+                ));
+        return Some(Arc::new(
+            field
+                .as_ref()
+                .clone()
+                .with_data_type(arrow_schema::DataType::Struct(children.into())),
+        ));
+    }
+    let DataType::Row(row) = read_type else {
+        return None;
+    };
+    let mut changed = false;
+    let children = children
+        .iter()
+        .map(|child| {
+            let replacement = row
+                .fields()
+                .iter()
+                .find(|read| read.name() == child.name())
+                .and_then(|read| dictionary_variant_metadata_field(child, read.data_type()));
+            if replacement.is_some() {
+                changed = true;
+            }
+            replacement.unwrap_or_else(|| Arc::clone(child))
+        })
+        .collect::<Vec<_>>();
+    changed.then(|| {
+        Arc::new(
+            field
+                .as_ref()
+                .clone()
+                .with_data_type(arrow_schema::DataType::Struct(children.into())),
+        )
+    })
+}
+
 fn dictionary_variant_metadata_schema(
     schema: &arrow_schema::SchemaRef,
     read_fields: &[DataField],
@@ -942,38 +1001,14 @@ fn dictionary_variant_metadata_schema(
         .fields()
         .iter()
         .map(|field| {
-            let dictionary_metadata = read_fields.iter().any(|read| {
-                read.name() == field.name()
-                    && (crate::spec::is_variant_extraction_row_type(read.data_type())
-                        || (matches!(read.data_type(), DataType::Variant(_))
-                            && matches!(field.data_type(), arrow_schema::DataType::Struct(children)
-                                if children.iter().any(|child| child.name() == "typed_value"))))
-            });
-            match field.data_type() {
-                arrow_schema::DataType::Struct(children) if dictionary_metadata => {
-                    let Some(metadata) = variant_metadata_child(children) else {
-                        return Arc::clone(field);
-                    };
-                    changed = true;
-                    let mut children = children
-                        .iter()
-                        .map(|child| child.as_ref().clone())
-                        .collect::<Vec<_>>();
-                    children[metadata] = children[metadata].clone().with_data_type(
-                        arrow_schema::DataType::Dictionary(
-                            Box::new(arrow_schema::DataType::Int32),
-                            Box::new(arrow_schema::DataType::Binary),
-                        ),
-                    );
-                    Arc::new(
-                        field
-                            .as_ref()
-                            .clone()
-                            .with_data_type(arrow_schema::DataType::Struct(children.into())),
-                    )
-                }
-                _ => Arc::clone(field),
+            let replacement = read_fields
+                .iter()
+                .find(|read| read.name() == field.name())
+                .and_then(|read| dictionary_variant_metadata_field(field, read.data_type()));
+            if replacement.is_some() {
+                changed = true;
             }
+            replacement.unwrap_or_else(|| Arc::clone(field))
         })
         .collect::<Vec<_>>();
     changed.then(|| {
@@ -9289,6 +9324,148 @@ mod tests {
         let restored =
             crate::arrow::shredding::variant::assemble_shredded_variant_array(physical).unwrap();
         let restored = restored.as_any().downcast_ref::<StructArray>().unwrap();
+        let values = restored
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let metadata = restored
+            .column_by_name("metadata")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        for row in 0..variants.len() {
+            let actual = GenericVariant::from_parts(
+                values.value(row).to_vec(),
+                metadata.value(row).to_vec(),
+            )
+            .unwrap();
+            assert_eq!(actual.to_json().unwrap(), small.to_json().unwrap());
+        }
+
+        // The same wide dictionaries must remain encoded inside nested ROWs.
+        use crate::spec::RowType;
+        let nested_fields = vec![DataField::new(
+            0,
+            "outer".to_string(),
+            DataType::Row(RowType::new(vec![DataField::new(
+                1,
+                "inner".to_string(),
+                DataType::Row(RowType::new(vec![DataField::new(
+                    2,
+                    "v".to_string(),
+                    DataType::Variant(VariantType::new()),
+                )])),
+            )])),
+        )];
+        let nested_schema = build_target_arrow_schema(&nested_fields).unwrap();
+        let ArrowDataType::Struct(outer_fields) = nested_schema.field(0).data_type() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(inner_fields) = outer_fields[0].data_type() else {
+            unreachable!()
+        };
+        let inner = StructArray::new(inner_fields.clone(), vec![batch.column(0).clone()], None);
+        let outer = StructArray::new(outer_fields.clone(), vec![Arc::new(inner)], None);
+        let nested_batch =
+            RecordBatch::try_new(nested_schema.clone(), vec![Arc::new(outer)]).unwrap();
+        let nested_options = HashMap::from([(
+            "variant.inferShreddingSchema".to_string(),
+            "true".to_string(),
+        )]);
+        let nested_path = format!(
+            "memory:/wide_nested_variant_{}.parquet",
+            uuid::Uuid::new_v4()
+        );
+        let mut writer = create_format_writer(
+            &file_io.new_output(&nested_path).unwrap(),
+            nested_schema,
+            "zstd",
+            1,
+            None,
+            Some(&nested_fields),
+            Some(&nested_options),
+        )
+        .await
+        .unwrap();
+        writer.write(&nested_batch).await.unwrap();
+        writer.close().await.unwrap();
+        let nested_data = file_io
+            .new_input(&nested_path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let nested_batches = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(nested_data.clone())),
+                nested_data.len() as u64,
+                &nested_fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let outer = nested_batches[0]
+            .column_by_name("outer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let inner = outer
+            .column_by_name("inner")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let physical = inner
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let dictionary = physical
+            .column_by_name("metadata")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        assert_eq!(
+            (0..dictionary.len())
+                .map(|row| dictionary.keys().value(row))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            dictionaries.len()
+        );
+        let assembled = crate::arrow::shredding::variant::assemble_shredded_variant_batch(
+            nested_batches[0].clone(),
+            &nested_fields,
+        )
+        .unwrap();
+        let outer = assembled
+            .column_by_name("outer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let inner = outer
+            .column_by_name("inner")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let restored = inner
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
         let values = restored
             .column_by_name("value")
             .unwrap()
