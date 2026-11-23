@@ -405,7 +405,7 @@ quick-xml@0.42.0												X
 quote@1.0.47		X										X							
 r-efi@5.3.0		X									X	X							
 r-efi@6.0.0		X									X	X							
-rand@0.10.2		X										X							
+rand@0.10.4		X										X							
 rand@0.8.7		X										X							
 rand@0.9.5		X										X							
 rand_chacha@0.3.1		X										X							
