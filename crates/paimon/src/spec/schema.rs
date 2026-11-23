@@ -730,10 +730,7 @@ impl TableSchema {
                     if updated.default_value().is_some()
                         && !old.data_type().equals_ignore_nullable(updated.data_type())
                     {
-                        crate::table::validate_default_value(
-                            &updated,
-                            self.core_options().is_format_table(),
-                        )?;
+                        crate::table::validate_default_value(&updated)?;
                     }
                     fields[idx] = updated;
                 }
@@ -1474,7 +1471,6 @@ impl Schema {
     }
 
     pub(crate) fn validate_fields_for_create(&self) -> crate::Result<()> {
-        let is_format_table = CoreOptions::new(self.options()).is_format_table();
         for field in self.fields() {
             if field.generation_expression().is_some() {
                 return Err(crate::Error::Unsupported {
@@ -1485,7 +1481,7 @@ impl Schema {
                 });
             }
             super::generated_column::validate_no_nested_generated_columns(field.data_type())?;
-            crate::table::validate_default_value(field, is_format_table)?;
+            crate::table::validate_default_value(field)?;
         }
         Ok(())
     }

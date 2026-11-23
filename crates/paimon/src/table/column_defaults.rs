@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Apply schema defaults to nullable Format Table input columns. Java's
-//! `DefaultValueRow` wraps the row after nullability validation and before
-//! partition extraction, so partition and file columns share this behavior.
+//! Parse and apply column defaults using Java's `DefaultValueRow` rules.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -36,23 +35,23 @@ use crate::{Error, Result};
 
 #[derive(Clone, Copy)]
 enum DefaultParsing {
-    Stored,
-    NewDefinition,
+    Legacy,
+    Java,
 }
 
 impl DefaultParsing {
     fn trim(self, text: &str) -> &str {
         match self {
-            Self::Stored => text.trim(),
-            Self::NewDefinition => text.trim_matches(|ch| ch <= ' '),
+            Self::Legacy => text.trim(),
+            Self::Java => text.trim_matches(|ch| ch <= ' '),
         }
     }
 
     fn is_token_whitespace(self, ch: char) -> bool {
         match self {
-            Self::Stored => ch.is_whitespace(),
+            Self::Legacy => ch.is_whitespace(),
             // Java TokenSplitter uses Character.isWhitespace, which preserves nonbreaking spaces.
-            Self::NewDefinition => {
+            Self::Java => {
                 matches!(ch, '\u{001c}'..='\u{001f}')
                     || ch.is_whitespace()
                         && !matches!(ch, '\u{0085}' | '\u{00a0}' | '\u{2007}' | '\u{202f}')
@@ -61,42 +60,61 @@ impl DefaultParsing {
     }
 }
 
-pub(super) struct FormatTableDefaults {
-    values: Vec<Option<ArrayRef>>,
+#[derive(Default)]
+pub(super) struct ColumnDefaults {
+    values: HashMap<String, ArrayRef>,
 }
 
-impl FormatTableDefaults {
-    pub(super) fn new(fields: &[DataField], schema: &ArrowSchema) -> Result<Self> {
-        let values = fields
-            .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                field
-                    .default_value()
-                    .map(|text| {
-                        parse_default(field, text, schema.field(index), DefaultParsing::Stored)
-                    })
-                    .transpose()
-            })
-            .collect::<Result<Vec<_>>>()?;
+impl ColumnDefaults {
+    pub(super) fn new(
+        fields: &[DataField],
+        schema: &ArrowSchema,
+        is_format_table: bool,
+    ) -> Result<Self> {
+        let mut values = HashMap::new();
+        for (index, field) in fields.iter().enumerate() {
+            let Some(text) = field.default_value() else {
+                continue;
+            };
+            let arrow_field = schema.field(index);
+            let value = match parse_default(field, text, arrow_field, DefaultParsing::Java) {
+                Ok(value) => value,
+                // Older Rust Format Tables may already use literals that Java rejects.
+                Err(_) if is_format_table => {
+                    parse_default(field, text, arrow_field, DefaultParsing::Legacy)?
+                }
+                // Older Rust native writers ignored defaults. An invalid stored
+                // literal must not prevent those tables from accepting writes.
+                Err(_) => continue,
+            };
+            values.insert(field.name().to_owned(), value);
+        }
         Ok(Self { values })
     }
 
+    pub(super) fn string_value(&self, name: &str) -> Option<&str> {
+        self.values
+            .get(name)?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|value| value.value(0))
+    }
+
     pub(super) fn apply(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        if !self
-            .values
-            .iter()
-            .enumerate()
-            .any(|(index, value)| value.is_some() && batch.column(index).null_count() > 0)
+        let fields = batch.schema_ref().fields();
+        if self.values.is_empty()
+            || !fields.iter().zip(batch.columns()).any(|(field, input)| {
+                input.null_count() > 0 && self.values.contains_key(field.name())
+            })
         {
             return Ok(batch.clone());
         }
         let columns = batch
             .columns()
             .iter()
-            .enumerate()
-            .map(|(index, input)| {
-                let Some(value) = &self.values[index] else {
+            .zip(fields)
+            .map(|(input, field)| {
+                let Some(value) = self.values.get(field.name()) else {
                     return Ok(input.clone());
                 };
                 if input.null_count() == 0 {
@@ -105,7 +123,7 @@ impl FormatTableDefaults {
                 let positions = arrow_array::UInt32Array::from(vec![0_u32; batch.num_rows()]);
                 let repeated = arrow_select::take::take(value.as_ref(), &positions, None).map_err(
                     |source| Error::DataInvalid {
-                        message: format!("Cannot repeat Format Table default for column {index}"),
+                        message: format!("Cannot repeat default for column '{}'", field.name()),
                         source: Some(Box::new(source)),
                     },
                 )?;
@@ -114,7 +132,7 @@ impl FormatTableDefaults {
                 );
                 arrow_select::zip::zip(&present, input, &repeated).map_err(|source| {
                     Error::DataInvalid {
-                        message: format!("Cannot apply Format Table default for column {index}"),
+                        message: format!("Cannot apply default for column '{}'", field.name()),
                         source: Some(Box::new(source)),
                     }
                 })
@@ -122,33 +140,19 @@ impl FormatTableDefaults {
             .collect::<Result<Vec<_>>>()?;
         RecordBatch::try_new(Arc::clone(&batch.schema()), columns).map_err(|source| {
             Error::DataInvalid {
-                message: "Cannot assemble Format Table row with defaults".into(),
+                message: "Cannot assemble batch with column defaults".into(),
                 source: Some(Box::new(source)),
             }
         })
     }
 }
 
-pub(crate) fn validate_default_value(field: &DataField, is_format_table: bool) -> Result<()> {
+pub(crate) fn validate_default_value(field: &DataField) -> Result<()> {
     let Some(text) = field.default_value() else {
         return Ok(());
     };
     let arrow_field = crate::arrow::paimon_type_to_arrow_field(field.name(), field.data_type())?;
-    let java_value = parse_default(field, text, &arrow_field, DefaultParsing::NewDefinition)?;
-    if is_format_table {
-        let writer_value = parse_default(field, text, &arrow_field, DefaultParsing::Stored)?;
-        if java_value.to_data() != writer_value.to_data() {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "Unsupported default value '{text}' for column '{}' of type {}: Java and Rust Format Table writers interpret it differently",
-                    field.name(),
-                    field.data_type()
-                ),
-                source: None,
-            });
-        }
-    }
-    Ok(())
+    parse_default(field, text, &arrow_field, DefaultParsing::Java).map(|_| ())
 }
 
 fn parse_default(
@@ -165,7 +169,7 @@ fn parse_default(
         ),
         source,
     };
-    if matches!(parsing, DefaultParsing::NewDefinition)
+    if matches!(parsing, DefaultParsing::Java)
         && (text == "'" || !supports_string_default(data_type))
     {
         return Err(invalid(None));
@@ -292,12 +296,19 @@ fn cast_default(
             };
             let mut keys: Vec<ArrayRef> = Vec::with_capacity(pairs.len());
             let mut values: Vec<ArrayRef> = Vec::with_capacity(pairs.len());
+            // Java's HashMap compares byte[] keys by reference, even when a
+            // cast produces identical bytes for multiple input keys.
+            let preserve_binary_keys = matches!(parsing, DefaultParsing::Java)
+                && matches!(typ.key_type(), DataType::Binary(_) | DataType::VarBinary(_));
             for (key_token, value_token) in &pairs {
                 let key = cast_token(typ.key_type(), key_token, &entry_fields[0], parsing)?;
                 let value = cast_token(typ.value_type(), value_token, &entry_fields[1], parsing)?;
-                // Java builds a HashMap, so a later entry replaces an earlier
-                // value with the same cast key.
-                if let Some(index) = keys.iter().position(|old| old.to_data() == key.to_data()) {
+                let existing = if preserve_binary_keys {
+                    None
+                } else {
+                    keys.iter().position(|old| old.to_data() == key.to_data())
+                };
+                if let Some(index) = existing {
                     values[index] = value;
                 } else {
                     keys.push(key);
@@ -331,9 +342,8 @@ fn cast_scalar_default(
     arrow_type: &ArrowDataType,
     parsing: DefaultParsing,
 ) -> std::result::Result<ArrayRef, ArrowError> {
-    if matches!(parsing, DefaultParsing::Stored) {
-        // Schema files carry no parser version. Preserve the original result
-        // when available and use the Java parser when legacy parsing fails.
+    if matches!(parsing, DefaultParsing::Legacy) {
+        // Reproduce the historical Rust result for literals Java rejects.
         let legacy = match data_type {
             DataType::Timestamp(typ) => cast_legacy_timestamp(text, typ.precision(), arrow_type),
             DataType::LocalZonedTimestamp(typ) => {
@@ -501,8 +511,8 @@ fn literal_content<'a>(
                 return None;
             }
             let tail = match parsing {
-                DefaultParsing::Stored => tail.trim_start(),
-                DefaultParsing::NewDefinition => {
+                DefaultParsing::Legacy => tail.trim_start(),
+                DefaultParsing::Java => {
                     tail.trim_start_matches(|ch| matches!(ch, '\t'..='\r' | ' '))
                 }
             };
@@ -510,7 +520,7 @@ fn literal_content<'a>(
         })
         // Java's collection cast rules match the body with a non-DOTALL regex.
         .filter(|body| {
-            matches!(parsing, DefaultParsing::Stored)
+            matches!(parsing, DefaultParsing::Legacy)
                 || !body.contains(['\n', '\r', '\u{0085}', '\u{2028}', '\u{2029}'])
         })
         .ok_or_else(|| cast_error(format!("Invalid {function} default: {text}")))?;
@@ -695,7 +705,7 @@ mod tests {
     fn replaces_only_nulls_in_partition_and_data_columns() {
         let fields = fields();
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let defaults = ColumnDefaults::new(&fields, &schema, true).unwrap();
         let input = RecordBatch::try_new(
             schema,
             vec![
@@ -745,7 +755,7 @@ mod tests {
             .clone()
             .with_default_value(Some("'not a number'".into()));
         let schema = build_target_arrow_schema(&fields).unwrap();
-        assert!(FormatTableDefaults::new(&fields, &schema)
+        assert!(ColumnDefaults::new(&fields, &schema, true)
             .err()
             .unwrap()
             .to_string()
@@ -768,7 +778,7 @@ mod tests {
                 .with_default_value(Some("-9223372036854775808.9".into())),
         ];
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let defaults = ColumnDefaults::new(&fields, &schema, true).unwrap();
         let input = RecordBatch::try_new(
             schema.clone(),
             schema
@@ -833,7 +843,7 @@ mod tests {
                     .with_default_value(Some(text.into()))];
             let schema = build_target_arrow_schema(&fields).unwrap();
             assert!(
-                FormatTableDefaults::new(&fields, &schema).is_err(),
+                ColumnDefaults::new(&fields, &schema, true).is_err(),
                 "{text}"
             );
         }
@@ -843,7 +853,7 @@ mod tests {
     fn no_nulls_passes_input_through() {
         let fields = fields();
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let defaults = ColumnDefaults::new(&fields, &schema, true).unwrap();
         let input = RecordBatch::try_new(
             schema,
             vec![
@@ -876,7 +886,7 @@ mod tests {
                 .with_default_value(Some("'00:01:02.9995+01:30'".into())),
         ];
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let defaults = ColumnDefaults::new(&fields, &schema, true).unwrap();
         let amount = Decimal128Array::from(vec![None])
             .with_precision_and_scale(10, 2)
             .unwrap();
@@ -922,18 +932,13 @@ mod tests {
         ] {
             let field = fields[3].clone().with_default_value(Some(literal.into()));
             assert_eq!(
-                validate_default_value(&field, false).is_ok(),
+                validate_default_value(&field).is_ok(),
                 java_millis.is_some(),
                 "{literal}"
             );
-            assert_eq!(
-                validate_default_value(&field, true).is_ok(),
-                java_millis == Some(stored_millis),
-                "{literal}"
-            );
             for (parsing, expected) in [
-                (DefaultParsing::Stored, Some(stored_millis)),
-                (DefaultParsing::NewDefinition, java_millis),
+                (DefaultParsing::Legacy, Some(stored_millis)),
+                (DefaultParsing::Java, java_millis),
             ] {
                 let millis = parse_default(&field, literal, input.schema_ref().field(3), parsing)
                     .ok()
@@ -980,7 +985,7 @@ mod tests {
             .with_default_value(Some("'猫'".into())),
         ];
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let defaults = ColumnDefaults::new(&fields, &schema, true).unwrap();
         let input = RecordBatch::try_new(
             schema,
             vec![
@@ -1030,12 +1035,12 @@ mod tests {
         );
 
         let apostrophe = fields[1].clone().with_default_value(Some("'".into()));
-        assert!(validate_default_value(&apostrophe, true).is_err());
+        assert!(validate_default_value(&apostrophe).is_err());
         let stored = parse_default(
             &apostrophe,
             "'",
             actual.schema().field(1),
-            DefaultParsing::Stored,
+            DefaultParsing::Legacy,
         )
         .unwrap();
         assert_eq!(
@@ -1070,7 +1075,7 @@ mod tests {
             .with_default_value(Some("-123456".into())),
         ];
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let defaults = ColumnDefaults::new(&fields, &schema, true).unwrap();
         let input = RecordBatch::try_new(
             schema,
             vec![
@@ -1146,7 +1151,7 @@ mod tests {
             let field = DataField::new(0, "value".into(), data_type)
                 .with_default_value(Some(default.into()));
             assert!(
-                validate_default_value(&field, true).is_err(),
+                validate_default_value(&field).is_err(),
                 "{}",
                 field.data_type()
             );
@@ -1164,7 +1169,7 @@ mod tests {
         )
         .with_default_value(Some("'2025-01-02 03:04:05.123456'".into()))];
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let defaults = ColumnDefaults::new(&fields, &schema, true).unwrap();
         let input = RecordBatch::try_new(
             schema,
             vec![Arc::new(
@@ -1205,7 +1210,7 @@ mod tests {
         )
         .with_default_value(Some("'[1,2]'".into()))];
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let defaults = ColumnDefaults::new(&fields, &schema, true).unwrap();
         let empty = arrow_array::new_null_array(schema.field(0).data_type(), 1);
         let input = RecordBatch::try_new(schema, vec![empty]).unwrap();
         let actual = defaults.apply(&input).unwrap();
@@ -1230,7 +1235,7 @@ mod tests {
         )
         .with_default_value(Some("'1970-01-01 00:00:00.123456'".into()))];
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let defaults = ColumnDefaults::new(&fields, &schema, true).unwrap();
         let input = RecordBatch::try_new(
             schema,
             vec![Arc::new(TimestampMillisecondArray::from(vec![None]))],
@@ -1269,7 +1274,7 @@ mod tests {
                 field.data_type(),
                 "1970-01-01 00:00:00.123456789",
                 schema.field(0),
-                DefaultParsing::Stored,
+                DefaultParsing::Legacy,
             )
             .unwrap();
             let actual = match precision {
@@ -1313,13 +1318,11 @@ mod tests {
                 DataType::VarChar(VarCharType::string_type()),
             )),
         )
-        .with_default_value(Some("'[null, \"null\", \"a,b\"]'".into()));
+        .with_default_value(Some("'[null, \"null\", \"a,b\", \u{00a0}c]'".into()));
         let fields = [nested, labels];
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
-        let nested = defaults.values[0]
-            .as_ref()
-            .unwrap()
+        let defaults = ColumnDefaults::new(&fields, &schema, true).unwrap();
+        let nested = defaults.values["nested"]
             .as_any()
             .downcast_ref::<ListArray>()
             .unwrap();
@@ -1345,9 +1348,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(3), None]
         );
-        let labels = defaults.values[1]
-            .as_ref()
-            .unwrap()
+        let labels = defaults.values["labels"]
             .as_any()
             .downcast_ref::<ListArray>()
             .unwrap();
@@ -1355,7 +1356,7 @@ mod tests {
         let values = values.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(
             values.iter().collect::<Vec<_>>(),
-            vec![None, Some("null"), Some("a,b")]
+            vec![None, Some("null"), Some("a,b"), Some("\u{00a0}c")]
         );
     }
 
@@ -1393,7 +1394,7 @@ mod tests {
             .with_default_value(Some("'STRUCT(\"a,b\", [1,2])'".into())),
         ];
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let defaults = ColumnDefaults::new(&fields, &schema, true).unwrap();
         let input = RecordBatch::try_new(
             schema.clone(),
             schema
@@ -1456,7 +1457,7 @@ mod tests {
             fields[0].data_type(),
             "MAP(a, 1, a, 2)",
             schema.field(0),
-            DefaultParsing::NewDefinition,
+            DefaultParsing::Java,
         )
         .unwrap();
         let map = value.as_any().downcast_ref::<MapArray>().unwrap();
@@ -1472,7 +1473,45 @@ mod tests {
     }
 
     #[test]
-    fn collection_defaults_validate_java_syntax_and_preserve_stored_values() {
+    fn binary_map_defaults_keep_all_java_entries() {
+        use crate::spec::{IntType, MapType, VarBinaryType};
+        use arrow_array::{BinaryArray, Int32Array};
+
+        let fields = [DataField::new(
+            0,
+            "lookup".into(),
+            DataType::Map(MapType::new(
+                DataType::VarBinary(VarBinaryType::new(8).unwrap()),
+                DataType::Int(IntType::new()),
+            )),
+        )
+        .with_default_value(Some("'{key -> 1, key -> 2}'".into()))];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let defaults = ColumnDefaults::new(&fields, &schema, true).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![arrow_array::new_null_array(schema.field(0).data_type(), 1)],
+        )
+        .unwrap();
+        let filled = defaults.apply(&batch).unwrap();
+        let map = filled
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        let keys = map.keys().as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(
+            keys.iter().collect::<Vec<_>>(),
+            vec![Some(b"key".as_slice()); 2]
+        );
+        let values = map.values().as_any().downcast_ref::<Int32Array>().unwrap();
+        let mut values = values.values().to_vec();
+        values.sort_unstable();
+        assert_eq!(values, vec![1, 2]);
+    }
+
+    #[test]
+    fn collection_defaults_validate_java_syntax_and_keep_legacy_fallback() {
         use crate::spec::{ArrayType, IntType, MapType, RowType};
 
         let int = DataType::Int(IntType::new());
@@ -1481,31 +1520,26 @@ mod tests {
         let labels = DataType::Array(ArrayType::new(string.clone()));
         let lookup = DataType::Map(MapType::new(string, int.clone()));
         let row = DataType::Row(RowType::new(vec![DataField::new(1, "id".into(), int)]));
-        for (data_type, literal, writable, valid_in_java, valid_for_format_table) in [
-            (&numbers, "'[1, bad]'", false, false, false),
-            (&numbers, "'[1,\n2]'", true, false, false),
-            (&lookup, "'MAP(a,\n1)'", true, false, false),
-            (&row, "'STRUCT(\n1)'", true, false, false),
-            (&numbers, "'ARRAY\n(1, 2)'", true, true, true),
-            (&labels, "'[a, \u{00a0}b]'", true, true, false),
-            (&lookup, "'{a -> 1, \u{00a0}b -> 2}'", true, true, false),
+        for (data_type, literal, writable, valid_in_java) in [
+            (&numbers, "'[1, bad]'", false, false),
+            (&numbers, "'[1,\n2]'", true, false),
+            (&lookup, "'MAP(a,\n1)'", true, false),
+            (&row, "'STRUCT(\n1)'", true, false),
+            (&numbers, "'ARRAY\n(1, 2)'", true, true),
+            (&labels, "'[a, \u{00a0}b]'", true, true),
+            (&lookup, "'{a -> 1, \u{00a0}b -> 2}'", true, true),
         ] {
             let fields = [DataField::new(0, "value".into(), data_type.clone())
                 .with_default_value(Some(literal.into()))];
             let schema = build_target_arrow_schema(&fields).unwrap();
             assert_eq!(
-                FormatTableDefaults::new(&fields, &schema).is_ok(),
+                ColumnDefaults::new(&fields, &schema, true).is_ok(),
                 writable,
                 "{literal:?}"
             );
             assert_eq!(
-                validate_default_value(&fields[0], false).is_ok(),
+                validate_default_value(&fields[0]).is_ok(),
                 valid_in_java,
-                "{literal:?}"
-            );
-            assert_eq!(
-                validate_default_value(&fields[0], true).is_ok(),
-                valid_for_format_table,
                 "{literal:?}"
             );
         }

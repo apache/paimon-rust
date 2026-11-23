@@ -25,9 +25,9 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema as ArrowSchema};
 
+use super::column_defaults::ColumnDefaults;
 use super::commit_message::{CommitMessage, FormatFileCommit};
 use super::format_partition::FormatTablePartitionPaths;
-use super::format_table_defaults::FormatTableDefaults;
 use super::format_table_scan::supported_format_table_extension;
 use super::table_write::take_rows;
 use super::Table;
@@ -58,7 +58,7 @@ struct PartitionWriter {
 pub(crate) struct FormatTableWriter {
     table: Table,
     full_schema: Arc<ArrowSchema>,
-    defaults: FormatTableDefaults,
+    defaults: ColumnDefaults,
     file_schema: Arc<ArrowSchema>,
     file_fields: Vec<DataField>,
     partition_indices: Vec<usize>,
@@ -106,7 +106,7 @@ impl FormatTableWriter {
             }
         }
         let full_schema = build_target_arrow_schema(schema.fields())?;
-        let defaults = FormatTableDefaults::new(schema.fields(), &full_schema)?;
+        let defaults = ColumnDefaults::new(schema.fields(), &full_schema, true)?;
         let partition_indices = schema
             .partition_keys()
             .iter()

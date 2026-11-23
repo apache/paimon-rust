@@ -161,6 +161,7 @@ pub struct TableWrite {
     branch_schema_checked: bool,
     write_schema: Arc<arrow_schema::Schema>,
     write_fields: Vec<DataField>,
+    column_defaults: super::column_defaults::ColumnDefaults,
     written: bool,
     partition_writers: HashMap<PartitionBucketKey, FileWriter>,
     append_write_configs: HashMap<PartitionBucketKey, AppendWriteConfig>,
@@ -232,6 +233,7 @@ impl TableWrite {
             branch_schema_checked: table.is_main_branch() || table.rest_env.is_some(),
             write_schema: build_target_arrow_schema(schema.fields())?,
             write_fields: schema.fields().to_vec(),
+            column_defaults: Default::default(),
             written: false,
             partition_writers: HashMap::new(),
             append_write_configs: HashMap::new(),
@@ -297,6 +299,8 @@ impl TableWrite {
         )?;
         crate::spec::map_shredding::validate(schema.fields(), schema.options())?;
         let write_schema = build_target_arrow_schema(schema.fields())?;
+        let column_defaults =
+            super::column_defaults::ColumnDefaults::new(schema.fields(), &write_schema, false)?;
         let core_options = CoreOptions::new(schema.options());
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
         let blob_view_fields = core_options.blob_view_fields();
@@ -528,6 +532,7 @@ impl TableWrite {
             branch_schema_checked: table.is_main_branch() || table.rest_env.is_some(),
             write_schema,
             write_fields: fields.to_vec(),
+            column_defaults,
             written: false,
             partition_writers: HashMap::new(),
             append_write_configs: HashMap::new(),
@@ -638,6 +643,11 @@ impl TableWrite {
     pub fn with_overwrite(mut self) -> Self {
         self.is_overwrite = true;
         self.bucket_assigner.set_overwrite(true);
+        self
+    }
+
+    pub(super) fn without_column_defaults(mut self) -> Self {
+        self.column_defaults = Default::default();
         self
     }
 
@@ -837,6 +847,7 @@ impl TableWrite {
 
     fn normalize_filtered_write_batch(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
         let batch = self.validate_write_batch_schema(batch)?;
+        let batch = self.column_defaults.apply(&batch)?;
         // Filtering already precedes value normalization. Generate the system
         // column now so every surviving PK batch has the same buffer schema.
         let batch = self.generate_rowkind_batch(&batch)?;
@@ -908,7 +919,10 @@ impl TableWrite {
         // Empty arrays check equivalent layouts without examining row values.
         self.validate_write_batch_schema(&RecordBatch::new_empty(batch.schema()))?;
         let kinds = if let Some(generator) = &self.row_kind_generator {
-            generator.generate_batch(batch)?
+            generator.generate_batch(
+                batch,
+                self.column_defaults.string_value(generator.field_name()),
+            )?
         } else if let Some(column) = batch.column_by_name(VALUE_KIND_FIELD_NAME) {
             column
                 .as_any()
@@ -1340,7 +1354,7 @@ impl TableWrite {
         }
 
         let kinds = generator
-            .generate_batch(batch)?
+            .generate_batch(batch, None)?
             .into_iter()
             .map(|kind| kind.to_value())
             .collect();
@@ -2655,7 +2669,14 @@ pub(in crate::table) mod tests {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
-            .column("op", DataType::VarChar(VarCharType::string_type()))
+            .field(
+                DataField::new(
+                    2,
+                    "op".into(),
+                    DataType::VarChar(VarCharType::string_type()),
+                )
+                .with_default_value(Some("'+I'".into())),
+            )
             .primary_key(["id"])
             .option("bucket", "1")
             .option("rowkind.field", "op")
@@ -2703,12 +2724,12 @@ pub(in crate::table) mod tests {
             Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("id", ArrowDataType::Int32, false),
                 ArrowField::new("value", ArrowDataType::Int32, false),
-                ArrowField::new("op", ArrowDataType::Utf8, false),
+                ArrowField::new("op", ArrowDataType::Utf8, true),
             ])),
             vec![
                 Arc::new(Int32Array::from(vec![1])),
                 Arc::new(Int32Array::from(vec![10])),
-                Arc::new(StringArray::from(vec!["+I"])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
             ],
         )
         .unwrap();

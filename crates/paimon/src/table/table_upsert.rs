@@ -557,7 +557,7 @@ impl TableUpsert {
                     .table
                     .new_write_builder()
                     .with_commit_user(self.commit_user.clone())?
-                    .new_write()?;
+                    .new_write_for_row_mutation()?;
                 append.with_blob_uri_reader_factory(self.blob_uri_reader_factory.clone())?;
                 append.with_write_type(
                     group[0]
@@ -593,7 +593,7 @@ mod tests {
         BinaryRow, DataEvolutionIndexSourceMeta, DataType as PaimonType, IndexManifest,
         TimestampType, VarCharType,
     };
-    use crate::spec::{IntType, Schema as PaimonSchema, TableSchema};
+    use crate::spec::{DataField, IntType, Schema as PaimonSchema, TableSchema};
     use crate::table::TableCommit;
     use arrow_array::{Array, Int32Array, StringArray};
 
@@ -1467,6 +1467,36 @@ mod tests {
             commit_upsert(&table, vec![source], vec!["key".into()]).await;
         }
         assert_eq!(values_by_row_id(&table).await, vec![(0, 42)]);
+    }
+
+    #[tokio::test]
+    async fn upsert_keeps_null_keys_when_the_column_has_a_default() {
+        let int = PaimonType::Int(IntType::new());
+        let schema = PaimonSchema::builder()
+            .field(
+                DataField::new(0, "key".into(), int.clone()).with_default_value(Some("42".into())),
+            )
+            .column("value", int)
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("db", "upsert_null_key"),
+            "memory:/upsert_null_key".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        for value in [1, 2] {
+            let source = RecordBatch::try_from_iter([
+                ("key", Arc::new(Int32Array::from(vec![None])) as ArrayRef),
+                ("value", Arc::new(Int32Array::from(vec![value])) as ArrayRef),
+            ])
+            .unwrap();
+            commit_upsert(&table, vec![source], vec!["key".into()]).await;
+        }
+        assert_eq!(values_by_row_id(&table).await, vec![(0, 2)]);
     }
 
     #[tokio::test]

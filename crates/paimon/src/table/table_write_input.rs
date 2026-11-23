@@ -156,6 +156,7 @@ impl TableWrite {
                 .collect::<Vec<_>>(),
         ));
         let batch = self.normalize_batch_schema(&batch, &schema)?;
+        let batch = self.column_defaults.apply(&batch)?;
         Ok(RoutingInput { batch, fields })
     }
 

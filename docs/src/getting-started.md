@@ -585,10 +585,13 @@ validation. For example, changing `BIGINT DEFAULT 2147483648` to `INT` fails
 before a Rust catalog publishes a new schema. Java's collection literal syntax
 requires the contents inside the delimiters to fit on one line.
 
-For Format Tables, Rust also rejects defaults such as
-`TIME(3) DEFAULT '00:00:00.0005'` when Java and Rust writers interpret them
-differently. Rust Format Table writers preserve the original interpretation of
-persisted defaults, including timestamp literals with an explicit offset.
+Rust applies column defaults to NULL values in native and Format Table writes
+before partition and bucket routing. The writer uses Java's interpretation
+for valid defaults. For example, `TIME(3) DEFAULT '00:00:00.0005'` writes
+`00:00:00.001`, including on an existing table with that default. A Format
+Table with a persisted default that Java rejects still uses Rust's legacy
+parser. This includes timestamp literals with an explicit offset. Row-level
+mutations use the keys and values resolved by the mutation.
 
 ## Reading a Table
 

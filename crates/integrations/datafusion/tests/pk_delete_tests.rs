@@ -457,6 +457,49 @@ async fn primary_key_delete_preserves_partition_and_composite_key() {
 }
 
 #[tokio::test]
+async fn primary_key_delete_does_not_apply_a_default_to_a_stored_null_key() {
+    use datafusion::arrow::array::{Int32Array, RecordBatch};
+    use paimon::spec::{DataField, DataType, IntType, Schema};
+
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(Arc::clone(&catalog)).await;
+    exec(&ctx, "CREATE SCHEMA paimon.test_db").await;
+    let id = Identifier::new("test_db", "t");
+    let int = DataType::Int(IntType::new());
+    let schema = Schema::builder()
+        .field(DataField::new(0, "id".into(), int.clone()).with_default_value(Some("42".into())))
+        .column("v", int)
+        .primary_key(["id"])
+        .option("primary-key.nullable", "true")
+        .option("bucket", "2")
+        .option("write-only", "true")
+        .build()
+        .unwrap();
+    catalog.create_table(&id, schema, false).await.unwrap();
+    let table = catalog.get_table(&id).await.unwrap();
+    let batch = RecordBatch::try_new(
+        paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+        vec![
+            Arc::new(Int32Array::from(vec![None, Some(42)])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+        ],
+    )
+    .unwrap();
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write_for_row_mutation().unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    builder.new_commit().commit(messages).await.unwrap();
+    writer.close().await;
+
+    assert_eq!(
+        dml_count(&ctx, "DELETE FROM paimon.test_db.t WHERE id IS NULL").await,
+        1
+    );
+    assert_eq!(rows(&ctx).await, vec![(42, Some(2))]);
+}
+
+#[tokio::test]
 async fn primary_key_delete_preserves_sequence_fields_and_allows_later_upserts() {
     for (order, older, newer) in [("ascending", 99, 101), ("descending", 101, 99)] {
         let (_tmp, _catalog, ctx) = setup(&format!(

@@ -45,7 +45,15 @@ impl RowKindGenerator {
         })
     }
 
-    pub fn generate_batch(&self, batch: &RecordBatch) -> crate::Result<Vec<RowKind>> {
+    pub(super) fn field_name(&self) -> &str {
+        &self.field_name
+    }
+
+    pub fn generate_batch(
+        &self,
+        batch: &RecordBatch,
+        default: Option<&str>,
+    ) -> crate::Result<Vec<RowKind>> {
         // with_write_type may reorder the physical columns. Resolve once for
         // the batch, then parse values without a per-row field-name search.
         let col =
@@ -60,6 +68,7 @@ impl RowKindGenerator {
                 })?;
         let parse = |value: Option<&str>| {
             value
+                .or(default)
                 .ok_or_else(|| crate::Error::DataInvalid {
                     message: "Row kind cannot be null.".into(),
                     source: None,
@@ -110,14 +119,18 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![
                 Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
-                Arc::new(ArrowField::new("op", ArrowDataType::Utf8, false)),
+                Arc::new(ArrowField::new("op", ArrowDataType::Utf8, true)),
             ])),
             vec![
-                Arc::new(arrow_array::Int32Array::from(vec![1])),
-                Arc::new(StringArray::from(vec!["-D"])),
+                Arc::new(arrow_array::Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("-D"), None])),
             ],
         )
         .unwrap();
-        assert_eq!(gen.generate_batch(&batch).unwrap(), vec![RowKind::Delete]);
+        assert!(gen.generate_batch(&batch, None).is_err());
+        assert_eq!(
+            gen.generate_batch(&batch, Some("+I")).unwrap(),
+            vec![RowKind::Delete, RowKind::Insert]
+        );
     }
 }
