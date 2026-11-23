@@ -102,6 +102,95 @@ where
 }
 
 impl GlobalIndexScanner {
+    /// Coalesce OR arms that differ only in an indexed BTree equality. The
+    /// unindexed conjuncts remain in the table reader's residual predicate.
+    fn batched_or_btree_eq(&self, children: &[Predicate]) -> Result<Option<Predicate>> {
+        if children.len() < 2 || !self.composite_entries.is_empty() {
+            return Ok(None);
+        }
+
+        let mut first_equality: Option<Predicate> = None;
+        let mut values = Vec::with_capacity(children.len());
+        for child in children {
+            let Predicate::And(conjuncts) = child else {
+                return Ok(None);
+            };
+            let mut equality = None;
+            let mut has_residual = false;
+            for conjunct in conjuncts {
+                let Predicate::Leaf {
+                    column,
+                    op,
+                    literals,
+                    ..
+                } = conjunct
+                else {
+                    return Ok(None);
+                };
+                let indexed = self
+                    .find_field_id_by_name(column)?
+                    .and_then(|field_id| self.entries_for_field(field_id));
+                let Some(entries) = indexed else {
+                    has_residual = true;
+                    continue;
+                };
+                if *op != PredicateOperator::Eq
+                    || literals.len() != 1
+                    || equality.is_some()
+                    || !entries
+                        .iter()
+                        .all(|entry| entry.index_type == GlobalIndexFileKind::BTree)
+                {
+                    return Ok(None);
+                }
+                equality = Some(conjunct);
+            }
+            let Some(equality) = equality else {
+                return Ok(None);
+            };
+            if !has_residual {
+                return Ok(None);
+            }
+            if let Some(first) = &first_equality {
+                let (
+                    Predicate::Leaf {
+                        column: first_column,
+                        index: first_index,
+                        data_type: first_type,
+                        ..
+                    },
+                    Predicate::Leaf {
+                        column,
+                        index,
+                        data_type,
+                        ..
+                    },
+                ) = (first, equality)
+                else {
+                    unreachable!();
+                };
+                if first_column != column || first_index != index || first_type != data_type {
+                    return Ok(None);
+                }
+            } else {
+                first_equality = Some(equality.clone());
+            }
+            let Predicate::Leaf { literals, .. } = equality else {
+                unreachable!();
+            };
+            values.push(literals[0].clone());
+        }
+
+        let Some(mut batched) = first_equality else {
+            return Ok(None);
+        };
+        if let Predicate::Leaf { op, literals, .. } = &mut batched {
+            *op = PredicateOperator::In;
+            *literals = values;
+        }
+        Ok(Some(batched))
+    }
+
     fn predicate_within_fields(
         &self,
         predicate: &Predicate,
@@ -378,6 +467,12 @@ impl GlobalIndexScanner {
                     }))
                 }
                 Predicate::Or(children) => {
+                    if let Some(batched) = self.batched_or_btree_eq(children)? {
+                        if let Some(mut result) = self.evaluate(&batched).await? {
+                            result.fully_evaluated = false;
+                            return Ok(Some(result));
+                        }
+                    }
                     let mut all_ranges: Vec<RowRange> = Vec::new();
                     let mut candidate_ranges = Vec::new();
                     // Rows some arm proves match. Another arm's candidates must not

@@ -892,6 +892,7 @@ async fn test_btree_all_match_without_index_io() {
     entry.index_file.file_size = i64::MAX;
     for (op, values) in [
         (PredicateOperator::Eq, vec![7]),
+        (PredicateOperator::In, vec![6, 7, 9]),
         (PredicateOperator::Lt, vec![8]),
         (PredicateOperator::LtEq, vec![7]),
         (PredicateOperator::Gt, vec![6]),
@@ -959,6 +960,54 @@ async fn test_btree_all_match_without_index_io() {
         .await
         .is_err());
     }
+}
+
+#[tokio::test]
+async fn test_batched_or_all_match_without_index_io() {
+    let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+    let fields = two_field_schema_fields();
+    let entries = [7, 9]
+        .into_iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let start = index as i64 * 10_000;
+            let meta = BTreeIndexMeta::new(Some(le_int_key(key)), Some(le_int_key(key)), false);
+            let mut entry = make_global_index_entry(
+                &format!("absent-{key}.index"),
+                1,
+                start,
+                start + 9_999,
+                &meta,
+            );
+            entry.index_file.row_count = 10_000;
+            entry
+        })
+        .collect::<Vec<_>>();
+    let predicate = Predicate::or(
+        [(7, 1), (9, 2)]
+            .map(|(id, value)| Predicate::and(vec![int_eq("id", 0, id), int_eq("value", 1, value)]))
+            .to_vec(),
+    );
+    let mut scanner = GlobalIndexScanner::create(
+        &io,
+        "memory:/absent",
+        4,
+        i64::MAX,
+        i64::MAX,
+        &entries,
+        &fields,
+    )
+    .unwrap()
+    .unwrap();
+    let probe = Arc::new(QueryIoProbe::default());
+    scanner.query_io_probe = Some(Arc::clone(&probe));
+    let result = scanner.evaluate(&predicate).await.unwrap().unwrap();
+    assert_eq!(result.row_ranges, vec![RowRange::new(0, 19_999)]);
+    assert!(
+        !result.fully_evaluated,
+        "unindexed residuals still require filtering"
+    );
+    assert_eq!(probe.btree_opens.load(TestOrdering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -3665,6 +3714,50 @@ async fn test_or_reuses_one_btree_reader_for_same_file() {
     );
     assert_eq!(probe.peak(), 1);
     assert_eq!(probe.btree_opens.load(TestOrdering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_or_batches_btree_equalities_with_unindexed_residuals() {
+    let (io, path, name, _tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
+    let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+    let entries = vec![make_global_index_entry(&name, 1, 0, 99, &meta)];
+    let mut fields = int_schema_fields();
+    fields.push(DataField::new(
+        2,
+        "residual".into(),
+        fields[0].data_type().clone(),
+    ));
+    let mut scanner =
+        GlobalIndexScanner::create(&io, &path, 4, i64::MAX, i64::MAX, &entries, &fields)
+            .unwrap()
+            .unwrap();
+    let probe = Arc::new(QueryIoProbe::default());
+    scanner.query_io_probe = Some(Arc::clone(&probe));
+    let predicate = Predicate::or(
+        [10, 20, 30, 40, 20]
+            .map(|value| Predicate::and(vec![int_eq("id", 0, value), int_eq("residual", 1, value)]))
+            .to_vec(),
+    );
+
+    let result = scanner.evaluate(&predicate).await.unwrap().unwrap();
+    assert_eq!(
+        result.row_ranges,
+        [5, 10, 15, 20].map(|row| RowRange::new(row, row)).to_vec()
+    );
+    assert_eq!(result.indexed_coverage, vec![RowRange::new(0, 99)]);
+    assert_eq!(result.evaluated_field_ids, HashSet::from([1]));
+    assert!(!result.fully_evaluated);
+    assert!(result.candidate_ranges.is_empty());
+    assert_eq!(probe.predicate_queries.load(TestOrdering::SeqCst), 1);
+    assert!(
+        !scanner
+            .matching_ranges_with_exactness(&predicate)
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
+        "unindexed conjuncts must stay in the residual filter"
+    );
 }
 
 #[tokio::test]
