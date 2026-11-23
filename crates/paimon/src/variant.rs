@@ -43,6 +43,10 @@ const MAX_CACHED_VARIANT_METADATA_TOTAL_BYTES: usize = 1024 * 1024;
 const MAX_CACHED_VARIANT_METADATA_ENTRIES: usize = 16;
 const MAX_REBUILD_METADATA_ENTRIES: usize = 8;
 const MAX_REBUILD_METADATA_BYTES: usize = 8 * 1024 * 1024;
+// Compact output needs only validation, not a decoded key map. Keep these raw
+// dictionaries separately so rotating sparse rows do not thrash the TLS cache.
+const MAX_COMPACT_METADATA_ENTRIES: usize = 16;
+const MAX_COMPACT_METADATA_BYTES: usize = 2 * 1024 * 1024;
 // A shared dictionary is useful for wide objects, but copying it into every
 // sparse result costs more than remapping the keys actually present.
 const MIN_SPARSE_REBUILD_METADATA_BYTES: usize = 4 * 1024;
@@ -1445,15 +1449,41 @@ impl RebuildMetadata {
     }
 }
 
-/// Bound parsed dictionaries to one assembly call. Exact bytes, not a hash or
-/// an address, determine whether field IDs can be reused.
+/// Bound parsed dictionaries and compact validation results to one assembly call.
+/// Exact bytes, not a hash or address, determine whether results can be reused.
 #[derive(Default)]
 pub(crate) struct RebuildMetadataCache {
     entries: VecDeque<Arc<RebuildMetadata>>,
     bytes: usize,
+    validated: VecDeque<Box<[u8]>>,
+    validated_bytes: usize,
 }
 
 impl RebuildMetadataCache {
+    fn validate_compact_metadata(&mut self, bytes: &[u8]) -> Result<()> {
+        if let Some(index) = self
+            .validated
+            .iter()
+            .position(|entry| entry.as_ref() == bytes)
+        {
+            let entry = self.validated.remove(index).expect("entry exists");
+            self.validated.push_back(entry);
+            return Ok(());
+        }
+        validate_metadata(bytes)?;
+        if bytes.len() <= MAX_COMPACT_METADATA_BYTES {
+            while self.validated.len() >= MAX_COMPACT_METADATA_ENTRIES
+                || self.validated_bytes + bytes.len() > MAX_COMPACT_METADATA_BYTES
+            {
+                let evicted = self.validated.pop_front().expect("cache is nonempty");
+                self.validated_bytes -= evicted.len();
+            }
+            self.validated_bytes += bytes.len();
+            self.validated.push_back(bytes.into());
+        }
+        Ok(())
+    }
+
     fn get_or_parse(&mut self, bytes: &[u8]) -> Result<Arc<RebuildMetadata>> {
         if let Some(index) = self.entries.iter().position(|entry| entry.bytes == bytes) {
             let entry = self.entries.remove(index).expect("entry exists");
@@ -2988,7 +3018,7 @@ pub(crate) fn rebuild_shredded_with_cache(
         if metadata.len() > SIZE_LIMIT {
             return data_invalid("Variant value or metadata exceeds constructor size limit");
         }
-        validate_metadata(metadata)?;
+        cache.validate_compact_metadata(metadata)?;
         VariantBuilder::new()
     } else {
         VariantBuilder::with_source_metadata(cache.get_or_parse(metadata)?)
@@ -4718,8 +4748,7 @@ mod tests {
             ShreddedValue::Binary(metadata),
         )
         .unwrap();
-        let err = rebuild_shredded_with_cache(&row, &schema, &mut RebuildMetadataCache::default())
-            .unwrap_err();
+        let err = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap_err();
         assert!(matches!(err, Error::DataInvalid { message, .. } if message.contains("UTF-8")));
     }
 
@@ -4753,6 +4782,76 @@ mod tests {
         }
         assert!(total_metadata_bytes < 512 * 128);
         assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn compact_rebuild_reuses_validation_for_rotating_large_dictionaries() {
+        let schema = simple_object_shredding_schema();
+        let small = GenericVariant::parse_json(r#"{"age":27}"#).unwrap();
+        let mut row = cast_shredded(&small, &schema).unwrap();
+        assert!(row.field(schema.variant_idx.unwrap()).is_none());
+        let dictionaries = (0..9)
+            .map(|suffix| {
+                let extra = (0..5362)
+                    .map(|key| format!(r#", "unused_{suffix}_{key:04}_field":0"#))
+                    .collect::<String>();
+                GenericVariant::parse_json(&format!(r#"{{"age":27{extra}}}"#))
+                    .unwrap()
+                    .metadata()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        let total = dictionaries.iter().map(Vec::len).sum::<usize>();
+        assert!(total > MAX_CACHED_VARIANT_METADATA_TOTAL_BYTES);
+        assert!(total <= MAX_COMPACT_METADATA_BYTES);
+        let mut cache = RebuildMetadataCache::default();
+        for i in 0..512 {
+            row.set(0, ShreddedValue::Binary(dictionaries[i % 9].clone()))
+                .unwrap();
+            VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
+            let rebuilt = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap();
+            if i >= 9 {
+                // A miss would validate and populate the thread-local cache.
+                // This asserts reuse, independent of timing or machine speed.
+                VALIDATED_METADATA.with(|cached| assert!(cached.borrow().is_empty()));
+            }
+            assert_eq!(rebuilt.to_json().unwrap(), small.to_json().unwrap());
+            assert!(rebuilt.metadata().len() < 128);
+        }
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.validated.len(), 9);
+        assert_eq!(cache.validated_bytes, total);
+    }
+
+    #[test]
+    fn compact_metadata_cache_is_bounded_and_rejects_invalid_bytes() {
+        let mut cache = RebuildMetadataCache::default();
+        for i in 0..=MAX_COMPACT_METADATA_ENTRIES {
+            let v = GenericVariant::parse_json(&format!(r#"{{"key_{i}":0}}"#)).unwrap();
+            cache.validate_compact_metadata(v.metadata()).unwrap();
+        }
+        assert_eq!(cache.validated.len(), MAX_COMPACT_METADATA_ENTRIES);
+        assert!(cache.validate_compact_metadata(&[0]).is_err());
+        assert_eq!(cache.validated.len(), MAX_COMPACT_METADATA_ENTRIES);
+        // Exercise byte eviction and oversized dictionaries independently of
+        // the entry limit. Oversized valid dictionaries are not retained.
+        for size in [
+            MAX_COMPACT_METADATA_BYTES / 2,
+            MAX_COMPACT_METADATA_BYTES / 2 + 1,
+            MAX_COMPACT_METADATA_BYTES + 1,
+        ] {
+            let key = "x".repeat(size);
+            let v = GenericVariant::parse_json(&format!(r#"{{"{key}":0}}"#)).unwrap();
+            cache.validate_compact_metadata(v.metadata()).unwrap();
+            assert!(cache.validated_bytes <= MAX_COMPACT_METADATA_BYTES);
+            assert_eq!(
+                cache.validated_bytes,
+                cache.validated.iter().map(|b| b.len()).sum::<usize>()
+            );
+            if v.metadata().len() > MAX_COMPACT_METADATA_BYTES {
+                assert!(!cache.validated.iter().any(|b| b.as_ref() == v.metadata()));
+            }
+        }
     }
 
     #[test]
