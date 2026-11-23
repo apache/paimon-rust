@@ -56,7 +56,7 @@ use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use crate::vindex::{is_vindex_index_type, vector_search_timing_enabled};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
 use arrow_select::interleave::interleave_record_batch;
-use futures::{stream, TryStreamExt};
+use futures::{future::try_join_all, stream, TryStreamExt};
 use paimon_vindex_core::blas::sgemm_a_bt;
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::io::SeekRead;
@@ -2314,30 +2314,51 @@ async fn resolve_raw_vector_metric_resolved(
     field_name: &str,
     check: &VectorMetricCheck,
 ) -> crate::Result<RawVectorMetric> {
-    let resolved = check.lock_state()?.resolved;
-    if let Some(metric) = resolved {
-        return Ok(metric);
-    }
-    let table_path = evaluation.table_path.trim_end_matches('/');
-    for entry in index_entries {
-        if entry.kind != FileKind::Add
-            || entry
-                .index_file
-                .global_index_meta
-                .as_ref()
-                .is_none_or(|meta| meta.index_field_id != field_id)
-        {
-            continue;
+    let unchecked = {
+        let state = check.lock_state()?;
+        if let Some(metric) = state.resolved {
+            return Ok(metric);
         }
         // Filtered ANN work can skip shards whose metric must still agree.
-        let file = VectorMetricCheck::file_key(&entry.index_file);
-        if check.lock_state()?.validated_files.contains(file) {
-            continue;
-        }
-        if let Some(metric) =
-            read_index_vector_metric(evaluation.file_io, table_path, entry).await?
-        {
-            check.check(file, RawVectorMetric::from_vindex(metric))?;
+        index_entries
+            .iter()
+            .filter(|entry| {
+                entry.kind == FileKind::Add
+                    && is_vindex_index_type(&entry.index_file.index_type)
+                    && entry
+                        .index_file
+                        .global_index_meta
+                        .as_ref()
+                        .is_some_and(|meta| meta.index_field_id == field_id)
+                    && !state
+                        .validated_files
+                        .contains(VectorMetricCheck::file_key(&entry.index_file))
+            })
+            .collect::<Vec<_>>()
+    };
+    if !unchecked.is_empty() {
+        let options = CoreOptions::new(evaluation.table_options);
+        let concurrency = options
+            .global_index_thread_num()?
+            .min(options.global_index_vindex_read_thread_num()?);
+        let table_path = evaluation.table_path.trim_end_matches('/');
+        for batch in unchecked.chunks(concurrency) {
+            let mut reads = Vec::with_capacity(batch.len());
+            for entry in batch {
+                reads.push(read_index_vector_metric(
+                    evaluation.file_io,
+                    table_path,
+                    entry,
+                ));
+            }
+            for (entry, metric) in batch.iter().zip(try_join_all(reads).await?) {
+                if let Some(metric) = metric {
+                    check.check(
+                        VectorMetricCheck::file_key(&entry.index_file),
+                        RawVectorMetric::from_vindex(metric),
+                    )?;
+                }
+            }
         }
     }
     let mut state = check.lock_state()?;

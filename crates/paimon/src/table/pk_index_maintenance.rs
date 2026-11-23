@@ -28,7 +28,7 @@ use crate::table::index_build::full_text::native_full_text_options;
 use crate::table::index_file_path::IndexFileLocation;
 use crate::table::pk_index_options::{definitions, Definition};
 use crate::table::vector_search_common::{
-    read_retained_vector_index_header, read_vector_index_header,
+    read_retained_vector_index_header, read_vector_index_header, stat_retained_vector_index_size,
 };
 use crate::table::Table;
 use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
@@ -160,15 +160,6 @@ async fn compatible(
     }
     if is_vindex_index_type(&definition.index_type) {
         let empty = file.row_count == 0 && file.file_size == 0;
-        if empty && retained_header_reads.is_some() {
-            return Ok(true);
-        }
-        let expected = VindexVectorIndexOptions::new(
-            table.schema().options(),
-            &definition.options,
-            &definition.index_type,
-            &definition.field,
-        )?;
         let in_data_dir = table.schema().core_options().index_file_in_data_file_dir();
         let bucket_path = if in_data_dir && file.external_path.is_none() {
             table.data_file_bucket_path(&entry.partition, entry.bucket)?
@@ -189,6 +180,10 @@ async fn compatible(
                 .acquire()
                 .await
                 .expect("the compaction header read semaphore is never closed");
+            if empty {
+                let input = table.file_io().new_input(&path)?;
+                return Ok(stat_retained_vector_index_size(&input).await? == Some(0));
+            }
             let Some(persisted) =
                 read_retained_vector_index_header(table.file_io(), &path, file_size).await?
             else {
@@ -213,12 +208,27 @@ async fn compatible(
             }
             read_vector_index_header(table.file_io(), &path, file_size).await?
         };
-        let matches_nlist = expected.native_options.get("nlist").is_none_or(|value| {
-            let value = value.trim();
-            value == "auto" || value.parse::<usize>().ok() == Some(persisted.nlist)
+        let expected = VindexVectorIndexOptions::new(
+            table.schema().options(),
+            &definition.options,
+            &definition.index_type,
+            &definition.field,
+        )?;
+        let matches_geometry = [
+            ("nlist", Some(persisted.nlist)),
+            ("rq.bits", persisted.rq_bits),
+            ("pq.m", persisted.pq_m),
+        ]
+        .into_iter()
+        .all(|(key, actual)| {
+            expected.native_options.get(key).is_none_or(|value| {
+                let value = value.trim();
+                (key == "nlist" && value == "auto")
+                    || actual.is_some_and(|actual| value.parse() == Ok(actual))
+            })
         });
         return Ok(persisted.matches_options(&expected)
-            && matches_nlist
+            && matches_geometry
             && persisted.total_vectors == file.row_count);
     }
     if definition.index_type == "full-text" {

@@ -508,6 +508,84 @@ async fn auto_maintenance_reuses_ivf_sq_shard_with_large_quantizer() {
 }
 
 #[tokio::test]
+async fn auto_maintenance_rebuilds_missing_or_truncated_vector_shards() {
+    for truncate in [false, true] {
+        let (_catalog, table) = search_table(&[
+            ("global-index.ivf-flat.index-columns", "embedding"),
+            ("ivf-flat.dimension", "128"),
+            ("ivf-flat.nlist", "1"),
+            ("ivf-flat.metric", "l2"),
+        ])
+        .await;
+        TableCommit::new(table.clone(), "first-vector-shard".into())
+            .commit(search_messages(&table, &[[0.; 128], [1.; 128]]).await)
+            .await
+            .unwrap();
+        let original = indexes(&table).await.pop().unwrap();
+        let path = format!(
+            "{}/index/{}",
+            table.location(),
+            original.index_file.file_name
+        );
+        if truncate {
+            let payload = table
+                .file_io()
+                .new_input(&path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            assert!(payload.len() > 256);
+            table
+                .file_io()
+                .new_output(&path)
+                .unwrap()
+                .write(payload.slice(..256))
+                .await
+                .unwrap();
+        } else {
+            table.file_io().delete_file(&path).await.unwrap();
+        }
+
+        TableCommit::new(table.clone(), "second-vector-shard".into())
+            .commit(search_messages(&table, &[[2.; 128], [3.; 128]]).await)
+            .await
+            .unwrap();
+        let active = indexes(&table).await;
+        assert!(!active.contains(&original));
+        let rebuilt = active
+            .iter()
+            .find(|entry| {
+                entry
+                    .index_file
+                    .global_index_meta
+                    .as_ref()
+                    .is_some_and(|meta| meta.row_range_start == 0 && meta.row_range_end == 1)
+            })
+            .unwrap();
+        assert_eq!(
+            rebuilt
+                .index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .index_meta
+                .as_deref(),
+            Some(b"{}".as_slice())
+        );
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![0.; 128])
+            .with_limit(4)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.row_ids().unwrap().row_ids, [0, 1, 2, 3]);
+    }
+}
+
+#[tokio::test]
 async fn detail_search_reuses_the_ann_metric_for_refinement_and_raw_rows() {
     use crate::table::SearchScanSplit;
 
@@ -558,6 +636,79 @@ async fn detail_search_reuses_the_ann_metric_for_refinement_and_raw_rows() {
     assert_eq!(rows.row_ids, [2, 1]);
     assert_eq!(rows.scores, [4., 2.]);
     assert_eq!(reads.counts()[&index_path], 1);
+}
+
+#[tokio::test]
+async fn filtered_rerank_checks_unsearched_shards_with_bounded_concurrency() {
+    use crate::spec::{Datum, PredicateBuilder};
+    use std::time::Duration;
+
+    let schema = search_schema(&[
+        ("global-index.btree.index-columns", "id"),
+        ("global-index.ivf-flat.index-columns", "embedding"),
+        ("global-index.row-count-per-shard", "1"),
+        ("ivf-flat.dimension", "2"),
+        ("ivf-flat.nlist", "1"),
+        ("ivf-flat.metric", "l2"),
+    ]);
+    let (table, reads) =
+        crate::table::maintenance_test_utils::table(TableSchema::new(0, &schema)).await;
+    TableCommit::new(table.clone(), "vector-and-scalar-indexes".into())
+        .commit(search_messages(&table, &[[0., 0.], [1., 0.], [2., 0.], [3., 0.]]).await)
+        .await
+        .unwrap();
+    let skipped_paths: Vec<_> = indexes(&table)
+        .await
+        .into_iter()
+        .filter(|entry| {
+            entry.index_file.index_type == "ivf-flat"
+                && entry
+                    .index_file
+                    .global_index_meta
+                    .as_ref()
+                    .unwrap()
+                    .row_range_start
+                    > 0
+        })
+        .map(|entry| format!("{}/index/{}", table.location(), entry.index_file.file_name))
+        .collect();
+    assert_eq!(skipped_paths.len(), 3);
+
+    for (tasks, ranges) in [("2", "3"), ("3", "2")] {
+        let table = table.copy_with_options(HashMap::from([
+            ("global-index.thread-num".into(), tasks.into()),
+            ("global-index.vindex.read-thread-num".into(), ranges.into()),
+        ]));
+        let filter = PredicateBuilder::new(table.schema().fields())
+            .equal("id", Datum::Int(0))
+            .unwrap();
+        let mut query = table.new_vector_search_builder();
+        query
+            .with_vector_column("embedding")
+            .with_query_vector(vec![0., 0.])
+            .with_limit(1)
+            .with_filter(filter)
+            .with_options(HashMap::from([("refine_factor".into(), "2".into())]));
+        let plan = query.new_scan().unwrap().plan().await.unwrap();
+        let read = query.new_read().unwrap();
+        reads.watch(skipped_paths.clone());
+        let gate = reads.pause_watched_reads();
+        let check_limit = async {
+            gate.started.acquire_many(2).await.unwrap().forget();
+            let exceeded = tokio::time::timeout(Duration::from_millis(200), gate.started.acquire())
+                .await
+                .is_ok();
+            gate.release.add_permits(3);
+            assert!(!exceeded, "the third shard must wait for a query slot");
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(read.read(plan), check_limit)
+        })
+        .await
+        .expect("two unsearched shard headers must be checked concurrently");
+        assert_eq!(result.unwrap().row_ids().unwrap().row_ids, [0]);
+        assert!(reads.counts().values().all(|&count| count == 1));
+    }
 }
 
 async fn vector_scores(table: &Table, mode: &str) -> crate::vector_search::ScoredRowIds {

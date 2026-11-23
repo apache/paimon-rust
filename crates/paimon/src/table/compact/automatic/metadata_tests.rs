@@ -152,12 +152,14 @@ async fn automatic_tasks_read_captured_metadata_once_and_keep_bucket_indexes() {
 }
 
 #[tokio::test]
-async fn automatic_pk_vector_header_reads_share_a_limit_across_buckets() {
-    async fn append(table: &Table, ids: std::ops::Range<i32>) {
+async fn automatic_pk_vector_header_reads_and_empty_stats_share_a_limit_across_buckets() {
+    async fn append(table: &Table, ids: std::ops::Range<i32>, empty_first_bucket: bool) {
         let count = ids.len();
         let ids = (0..2).flat_map(|_| ids.clone()).collect::<Vec<_>>();
         let vectors = ListArray::from_iter_primitive::<Float32Type, _, _>(
-            ids.iter().map(|id| Some([Some(*id as f32), Some(0.)])),
+            ids.iter().enumerate().map(|(position, id)| {
+                (!empty_first_bucket || position >= count).then_some([Some(*id as f32), Some(0.)])
+            }),
         );
         let batch = RecordBatch::try_from_iter([
             (
@@ -203,7 +205,7 @@ async fn automatic_pk_vector_header_reads_share_a_limit_across_buckets() {
     let (table, counter) = table(TableSchema::new(0, &schema)).await;
     let builder = table.new_compact_builder();
     let executor = builder.new_auto_executor().unwrap();
-    append(&table, 0..1000).await;
+    append(&table, 0..1000, true).await;
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     assert_eq!(plan.tasks().len(), 2);
     let mut results = Vec::new();
@@ -224,13 +226,20 @@ async fn automatic_pk_vector_header_reads_share_a_limit_across_buckets() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        indexes
+            .iter()
+            .filter(|entry| entry.index_file.file_size == 0)
+            .count(),
+        1
+    );
     let paths = indexes
         .iter()
         .map(|entry| format!("{}/index/{}", table.location(), entry.index_file.file_name))
         .collect::<Vec<_>>();
     assert_eq!(paths.len(), 2);
 
-    append(&table, 1000..1004).await;
+    append(&table, 1000..1004, false).await;
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     assert_eq!(plan.tasks().len(), 2);
     counter.watch(paths);
@@ -243,7 +252,7 @@ async fn automatic_pk_vector_header_reads_share_a_limit_across_buckets() {
         gate.release.add_permits(2);
         assert!(
             !concurrent,
-            "two buckets opened retained headers against a shared limit of one"
+            "a retained header read and an empty-segment stat exceeded the shared limit of one"
         );
     };
     let (prepared, ()) = tokio::time::timeout(Duration::from_secs(5), async {

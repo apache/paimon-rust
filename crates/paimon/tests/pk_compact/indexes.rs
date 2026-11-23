@@ -308,6 +308,68 @@ async fn explicit_nlist_changes_rebuild_retained_pk_indexes() {
 }
 
 #[tokio::test]
+async fn explicit_quantization_changes_rebuild_retained_pk_indexes() {
+    use paimon::spec::SchemaChange;
+    use paimon_vindex_core::index::VectorIndexReader;
+    use std::io::Cursor;
+
+    for (kind, option, previous, current) in [("ivf-rq", "rq.bits", 8, 1), ("ivf-pq", "pq.m", 1, 2)]
+    {
+        let options = |value| format!(r#"{{"dimension":2,"nlist":1,"{option}":{value}}}"#);
+        let option_key = "fields.embedding.pk-vector.index.options";
+        let table = vector_table_for_indexes(&[
+            ("fields.embedding.pk-vector.index.type", kind),
+            (option_key, &options(previous)),
+        ])
+        .await;
+        let old = seed_vector_history(&table).await;
+        let schema = table
+            .schema()
+            .apply_changes(vec![SchemaChange::set_option(
+                option_key.into(),
+                options(current),
+            )])
+            .unwrap();
+        persist_table_schema(table.file_io(), table.location(), &schema).await;
+        let table = table.copy_with_resolved_schema(schema, "main").unwrap();
+        write_vector_range(&table, 1000..1004).await;
+        compact(&table).await;
+
+        let active = indexes(&table).await;
+        assert_eq!(active.len(), 2, "{kind}");
+        assert!(!active.contains(&old), "{kind}");
+        for entry in &active {
+            let payload = table
+                .file_io()
+                .new_input(&index_path(&table, entry))
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let metadata = VectorIndexReader::open(Cursor::new(payload))
+                .unwrap()
+                .metadata();
+            let recorded = if kind == "ivf-rq" {
+                metadata.rq_bits
+            } else {
+                metadata.pq_m
+            };
+            assert_eq!(recorded, Some(current), "{kind}");
+            assert_eq!(
+                entry
+                    .index_file
+                    .global_index_meta
+                    .as_ref()
+                    .unwrap()
+                    .index_meta
+                    .as_deref(),
+                Some(b"{}".as_slice())
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn missing_or_damaged_retained_pk_vector_indexes_are_rebuilt() {
     for damage in ["missing", "truncated", "truncated-tail", "invalid-header"] {
         let table = vector_table_for_indexes(&[]).await;
@@ -408,6 +470,37 @@ async fn cached_header_does_not_hide_a_missing_retained_pk_vector_index() {
         .exists(&index_path(&table, rebuilt))
         .await
         .unwrap());
+}
+
+#[cfg(all(feature = "storage-fs", unix))]
+#[tokio::test]
+async fn retained_pk_vector_index_rebuilds_when_its_path_is_a_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let table = table_with_cache_at(
+        vector_schema_for_indexes(&[]),
+        directory.path().join("table").to_str().unwrap().into(),
+        &[],
+    )
+    .await;
+    let old = seed_vector_history(&table).await;
+    let path = index_path(&table, &old);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+
+    write_vector_range(&table, 1000..1004).await;
+    compact(&table).await;
+    let active = indexes(&table).await;
+    assert_eq!(active.len(), 2);
+    assert!(!active.contains(&old));
+    let rebuilt = active
+        .iter()
+        .find(|entry| entry.index_file.row_count == 1000)
+        .unwrap();
+    assert_eq!(
+        rebuilt.index_file.global_index_meta,
+        old.index_file.global_index_meta
+    );
+    assert!(std::path::Path::new(&index_path(&table, rebuilt)).is_file());
 }
 
 #[tokio::test]
@@ -541,6 +634,31 @@ async fn empty_vector_level_is_persisted_reused_and_searchable() {
             assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
         }
     }
+
+    let missing_path = index_path(&table, &empty);
+    table.file_io().delete_file(&missing_path).await.unwrap();
+    assert!(!table.file_io().exists(&missing_path).await.unwrap());
+    write_vector_range(&table, 1000..1004).await;
+    compact(&table).await;
+    let active = indexes(&table).await;
+    assert!(!active.contains(&empty));
+    let rebuilt = active
+        .iter()
+        .find(|entry| entry.index_file.row_count == 0)
+        .unwrap();
+    assert_eq!(
+        rebuilt.index_file.global_index_meta,
+        empty.index_file.global_index_meta
+    );
+    let status = table
+        .file_io()
+        .new_input(&index_path(&table, rebuilt))
+        .unwrap()
+        .metadata()
+        .await
+        .unwrap();
+    assert!(!status.is_dir);
+    assert_eq!(status.size, 0);
 }
 
 #[tokio::test]

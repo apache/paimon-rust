@@ -49,6 +49,8 @@ pub(super) struct IndexVectorSemantics {
     pub metric: MetricType,
     pub dimension: usize,
     pub nlist: usize,
+    pub rq_bits: Option<usize>,
+    pub pq_m: Option<usize>,
     pub total_vectors: i64,
 }
 
@@ -81,14 +83,15 @@ pub(super) async fn read_index_vector_metric(
         }
         return descriptor.router_metric().map(Some);
     }
+    let path = global_vector_index_path(table_path, entry);
+    let size = entry.index_file.file_size.max(0) as u64;
     Ok(Some(
-        read_index_vector_header(file_io, table_path, entry)
-            .await?
-            .metric,
+        read_vector_index_header(file_io, &path, size).await?.metric,
     ))
 }
 
 /// Read the native definition of an existing range index before reusing its coverage.
+/// Missing or damaged payloads are eligible for rebuilding from their source rows.
 pub(super) async fn read_index_vector_semantics(
     file_io: &FileIO,
     table_path: &str,
@@ -99,21 +102,16 @@ pub(super) async fn read_index_vector_semantics(
     {
         return Ok(None);
     }
-    read_index_vector_header(file_io, table_path, entry)
-        .await
-        .map(Some)
+    let path = global_vector_index_path(table_path, entry);
+    let size = entry.index_file.file_size.max(0) as u64;
+    read_retained_vector_index_header(file_io, &path, size).await
 }
 
-async fn read_index_vector_header(
-    file_io: &FileIO,
-    table_path: &str,
-    entry: &IndexManifestEntry,
-) -> crate::Result<IndexVectorSemantics> {
-    let path = IndexFileLocation::Global { table_path }.resolve(
+fn global_vector_index_path(table_path: &str, entry: &IndexManifestEntry) -> String {
+    IndexFileLocation::Global { table_path }.resolve(
         &entry.index_file.file_name,
         entry.index_file.external_path.as_deref(),
-    );
-    read_vector_index_header(file_io, &path, entry.index_file.file_size.max(0) as u64).await
+    )
 }
 
 /// Read the index type, metric and dimension from a native vector index header.
@@ -141,6 +139,14 @@ pub(super) async fn read_retained_vector_index_header(
         Ok(header) => header,
         Err(error) => {
             let check_size = match &error {
+                // OpenDAL reports a local EISDIR as a temporary Unexpected error.
+                crate::Error::IoUnexpected { source, .. }
+                    if std::error::Error::source(source)
+                        .and_then(|cause| cause.downcast_ref::<io::Error>())
+                        .is_some_and(|cause| cause.kind() == io::ErrorKind::IsADirectory) =>
+                {
+                    true
+                }
                 crate::Error::IoUnexpected { source, .. } if !source.is_temporary() => {
                     if source.is_permanent() && source.kind() == opendal::ErrorKind::NotFound {
                         return Ok(None);
@@ -153,7 +159,7 @@ pub(super) async fn read_retained_vector_index_header(
                             | opendal::ErrorKind::Unexpected
                     )
                 }
-                // A cached reader can report a short source block as DataInvalid.
+                // The range can return fewer bytes than the recorded header length.
                 crate::Error::DataInvalid { .. } => true,
                 _ => false,
             };
@@ -195,7 +201,9 @@ pub(super) async fn read_retained_vector_index_header(
     }
 }
 
-async fn stat_retained_vector_index_size(input: &InputFile) -> crate::Result<Option<u64>> {
+pub(super) async fn stat_retained_vector_index_size(
+    input: &InputFile,
+) -> crate::Result<Option<u64>> {
     match input.metadata().await {
         Ok(status) => Ok((!status.is_dir).then_some(status.size)),
         Err(crate::Error::IoUnexpected { source, .. })
@@ -335,6 +343,8 @@ fn parse_vector_index_header(bytes: Bytes, file_size: u64) -> io::Result<IndexVe
             metric,
             dimension: dimension as usize,
             nlist: nlist as usize,
+            rq_bits: None,
+            pq_m: None,
             total_vectors,
         });
     }
@@ -344,6 +354,8 @@ fn parse_vector_index_header(bytes: Bytes, file_size: u64) -> io::Result<IndexVe
         metric: metadata.metric,
         dimension: metadata.dimension,
         nlist: metadata.nlist,
+        rq_bits: metadata.rq_bits,
+        pq_m: metadata.pq_m,
         total_vectors: metadata.total_vectors,
     })
 }
@@ -1009,6 +1021,8 @@ mod tests {
                     metric: MetricType::L2,
                     dimension: 2,
                     nlist: 1,
+                    rq_bits: None,
+                    pq_m: None,
                     total_vectors: 3,
                 })
             );
@@ -1129,6 +1143,8 @@ mod tests {
             .with_context(opendal::OperationContext::new().with_http_transport(transport));
         let io = FileIOBuilder::new("file")
             .with_fs_operator(operator)
+            .with_prop("local-cache.enabled", "true")
+            .with_prop("local-cache.whitelist", "file-index")
             .build()
             .unwrap();
         for (path, expected_stats) in [("/full.index", 0), ("/partial.index", 1)] {

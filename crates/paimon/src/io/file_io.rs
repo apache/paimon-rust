@@ -1835,19 +1835,24 @@ impl InputFile {
         self.reader_with_size_hint(Some(size)).await
     }
 
-    /// Read a range and return the size reported by the storage reader, if present.
-    /// A cache hit leaves the fresh storage reader unopened.
+    /// Read a range and return the size reported by storage, if present.
+    /// Reuse cached bytes when available. On a miss, read just the range and leave the cache alone.
     pub(crate) async fn read_range_with_reported_size(
         &self,
         range: Range<u64>,
         size_hint: u64,
     ) -> crate::Result<(Bytes, Option<u64>)> {
         let reader = self.reader_with_size_hint(Some(size_hint)).await?;
-        let bytes = reader.read(range).await?;
         let source = match &reader {
             InputFileReader::Direct { reader, .. } => reader,
-            InputFileReader::Cached { source, .. } => source,
+            InputFileReader::Cached { reader, source, .. } => {
+                if let Some(bytes) = reader.read_cached_range(range.clone()).await {
+                    return Ok((bytes, None));
+                }
+                source
+            }
         };
+        let bytes = FileRead::read(source, range).await?;
         let reported_size = source
             .metadata()
             .filter(|meta| meta.is_file())
@@ -2216,14 +2221,17 @@ mod file_action_test {
             .await
             .unwrap();
         let input = io.new_input(path).unwrap();
-        let (prefix, object_size) = input.read_range_with_reported_size(0..4, 12).await.unwrap();
-        assert_eq!(prefix, bytes.slice(..4));
-        assert_eq!(object_size, Some(8));
+        for _ in 0..2 {
+            let (prefix, object_size) =
+                input.read_range_with_reported_size(0..3, 12).await.unwrap();
+            assert_eq!(prefix, bytes.slice(..3));
+            assert_eq!(object_size, Some(8), "range misses must not fill the cache");
+        }
 
         // Warm all blocks before checking the cache hit with a fresh reader.
         assert_eq!(input.read().await.unwrap(), bytes);
-        let (prefix, object_size) = input.read_range_with_reported_size(0..4, 12).await.unwrap();
-        assert_eq!(prefix, bytes.slice(..4));
+        let (prefix, object_size) = input.read_range_with_reported_size(2..6, 12).await.unwrap();
+        assert_eq!(prefix, bytes.slice(2..6));
         assert_eq!(object_size, None);
     }
 

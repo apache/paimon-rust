@@ -257,7 +257,7 @@ impl CachedFileReader {
         if self.file_size == 0 {
             return Ok(Bytes::new());
         }
-        if let Some(payload) = self.read_cached_full().await {
+        if let Some(payload) = self.read_cached_range(0..self.file_size).await {
             return Ok(payload);
         }
 
@@ -265,7 +265,7 @@ impl CachedFileReader {
         let load_lock = self.cache.block_load_lock(&first_key).await;
         let load_guard = load_lock.lock().await;
         let _shared_guard = self.cache.shared_load_lock(&first_key).await;
-        let result = if let Some(payload) = self.read_cached_full().await {
+        let result = if let Some(payload) = self.read_cached_range(0..self.file_size).await {
             Ok(payload)
         } else {
             match self.delegate.read(0..self.file_size).await {
@@ -308,15 +308,21 @@ impl CachedFileReader {
         result
     }
 
-    async fn read_cached_full(&self) -> Option<Bytes> {
+    /// Read an already cached range without loading missing blocks.
+    pub(in crate::io) async fn read_cached_range(&self, range: Range<u64>) -> Option<Bytes> {
+        if range.start > range.end || range.end > self.file_size {
+            return None;
+        }
+        if range.is_empty() {
+            return Some(Bytes::new());
+        }
         let block_size = self.cache.block_size();
-        let block_count = self.file_size.div_ceil(block_size);
-        let output_len = usize::try_from(self.file_size).ok()?;
+        let output_len = usize::try_from(range.end - range.start).ok()?;
         let mut output = BytesMut::with_capacity(output_len);
-        for block_index in 0..block_count {
+        for block_index in range.start / block_size..range.end.div_ceil(block_size) {
             let key = self.cache.block_key(&self.path, block_index);
             let start = block_index * block_size;
-            let expected_len = (self.file_size - start).min(block_size) as usize;
+            let expected_len = usize::try_from((self.file_size - start).min(block_size)).ok()?;
             let payload = self
                 .cache
                 .get_block(&key, expected_len, &self.read_token)
@@ -325,7 +331,9 @@ impl CachedFileReader {
                 self.cache.remove_block(&key).await;
                 return None;
             }
-            output.extend_from_slice(&payload);
+            let from = (range.start.max(start) - start) as usize;
+            let to = (range.end - start).min(expected_len as u64) as usize;
+            output.extend_from_slice(&payload[from..to]);
         }
         Some(output.freeze())
     }
