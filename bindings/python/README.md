@@ -153,8 +153,8 @@ batches = read_builder.new_read().read(plan.splits())
 
 # Core schedules a bounded set of split readers and owns their global limit.
 # By default, filtered reads without a limit use up to 64 splits for
-# descriptors or 32 when the table may resolve BLOBs. Other reads use
-# available CPU parallelism. The split count always caps the worker count.
+# descriptors or 32 when the table may resolve BLOBs. Other reads retain
+# the single-split default. The split count always caps the worker count.
 # Set ordered=True to retain the supplied split order. The default emits
 # whichever split group is ready first. Ordered parallel reads disable background
 # Parquet row-group prefetch; split workers still read concurrently.

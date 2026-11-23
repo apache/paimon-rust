@@ -999,10 +999,9 @@ fn default_split_parallelism(
     split_count: usize,
     resolves_blob: bool,
     filtered_without_limit: bool,
-    available_parallelism: usize,
 ) -> usize {
     let cap = if !filtered_without_limit {
-        available_parallelism
+        1
     } else if resolves_blob {
         DEFAULT_BLOB_SPLIT_PARALLELISM
     } else {
@@ -1045,14 +1044,10 @@ impl PyTableRead {
                 || (self.table.rest_env().is_some()
                     && options.blob_view_resolve_enabled()
                     && !options.blob_view_fields().is_empty());
-            let available_parallelism = std::thread::available_parallelism()
-                .map(|count| count.get())
-                .unwrap_or(1);
             default_split_parallelism(
                 splits.len(),
                 resolves_blob,
                 self.filter.is_some() && self.limit.is_none(),
-                available_parallelism,
             )
         });
         py.detach(|| {
@@ -1099,8 +1094,8 @@ impl PyTableRead {
     /// Core owns split scheduling, the global row limit and cancellation.
     /// ordered=True retains the supplied split order; the default emits ready groups first.
     /// Without an explicit parallelism, filtered reads without a limit use up
-    /// to 64 splits for descriptors or 32 for BLOB payloads. Other reads use
-    /// the available CPU parallelism.
+    /// to 64 splits for descriptors or 32 for BLOB payloads. Other reads keep
+    /// the existing single-split default.
     #[pyo3(signature = (splits, *, parallelism = None, ordered = false))]
     fn read_arrow(
         &self,
@@ -1468,12 +1463,12 @@ mod tests {
 
     #[test]
     fn default_parallelism_follows_split_count_and_payload_cap() {
-        assert_eq!(default_split_parallelism(0, false, true, 8), 1);
-        assert_eq!(default_split_parallelism(20, false, true, 8), 20);
-        assert_eq!(default_split_parallelism(100, false, true, 8), 64);
-        assert_eq!(default_split_parallelism(20, true, true, 8), 20);
-        assert_eq!(default_split_parallelism(100, true, true, 8), 32);
-        assert_eq!(default_split_parallelism(100, false, false, 8), 8);
+        assert_eq!(default_split_parallelism(0, false, true), 1);
+        assert_eq!(default_split_parallelism(20, false, true), 20);
+        assert_eq!(default_split_parallelism(100, false, true), 64);
+        assert_eq!(default_split_parallelism(20, true, true), 20);
+        assert_eq!(default_split_parallelism(100, true, true), 32);
+        assert_eq!(default_split_parallelism(100, false, false), 1);
     }
 
     #[test]
