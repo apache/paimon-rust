@@ -1868,7 +1868,7 @@ def test_append_row_position_slices_and_shards_are_native_readable(row_tracking)
         ):
             plan = builder.new_scan().with_row_position_slice(start, end).plan()
             restored = [Split.deserialize(split.serialize()) for split in plan.splits()]
-            batches = builder.new_read().read(restored)
+            batches = builder.new_read().read(restored, ordered=True)
             actual = pa.Table.from_batches(batches).column("id").to_pylist() if batches else []
             assert actual == expected
             assert plan.snapshot_id() == 3
@@ -1876,7 +1876,7 @@ def test_append_row_position_slices_and_shards_are_native_readable(row_tracking)
         shards = []
         for index, expected in enumerate(([0, 1, 2], [3, 4], [5, 6], [7, 8])):
             plan = builder.new_scan().with_row_position_shard(index, 4).plan()
-            actual = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+            actual = pa.Table.from_batches(builder.new_read().read(plan.splits(), ordered=True))
             values = actual.column("id").to_pylist()
             assert values == expected
             shards.extend(values)
@@ -1898,9 +1898,14 @@ def test_append_row_positions_follow_stats_pruned_file_order_before_limit(row_tr
         plan = builder.new_scan().with_row_position_slice(1, 5).plan()
         # Stats remove the first file before positions are assigned. LIMIT
         # must not truncate the candidate files before applying the slice.
-        full_selection = table.new_read_builder().with_projection(["id"]).new_read().read(plan.splits())
+        full_selection = (
+            table.new_read_builder()
+            .with_projection(["id"])
+            .new_read()
+            .read(plan.splits(), ordered=True)
+        )
         assert pa.Table.from_batches(full_selection).column("id").to_pylist() == [4, 5, 6, 7]
-        actual = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        actual = pa.Table.from_batches(builder.new_read().read(plan.splits(), ordered=True))
         # The configured reader enforces the final LIMIT after selection.
         assert actual.column("id").to_pylist() == expected
 
@@ -1919,7 +1924,7 @@ def test_append_incremental_row_positions_use_combined_delta_order():
                 .plan()
             )
             restored = [pickle.loads(pickle.dumps(split)) for split in plan.splits()]
-            actual = pa.Table.from_batches(builder.new_read().read(restored))
+            actual = pa.Table.from_batches(builder.new_read().read(restored, ordered=True))
             assert actual.column("id").to_pylist() == expected
 
 
