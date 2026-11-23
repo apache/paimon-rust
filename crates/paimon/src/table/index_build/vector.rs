@@ -30,7 +30,9 @@ use arrow_array::RecordBatch;
 use arrow_buffer::MutableBuffer;
 use futures::TryStreamExt;
 use paimon_vindex_core::autotune::default_training_vector_count;
-use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
+use paimon_vindex_core::index::{
+    VectorIndexConfig, VectorIndexTrainer, VectorIndexTraining, VectorIndexWriter,
+};
 use paimon_vindex_core::io::PosWriter;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -355,7 +357,8 @@ fn train_and_add_spilled_vectors(
     timing_enabled: bool,
 ) -> std::io::Result<(VectorIndexWriter, Duration, Duration, Duration)> {
     let train_start = timing_enabled.then(Instant::now);
-    let mut writer = train_spilled_model(&mut raw_file, config, vector_count, dimension, ratio)?;
+    let training = train_spilled_model(&mut raw_file, config, vector_count, dimension, ratio)?;
+    let mut writer = VectorIndexWriter::new(training);
     let batch_rows = batch_rows(vector_count, dimension)?;
     let mut buffer = MutableBuffer::new(checked_std_vector_bytes(batch_rows, dimension)?);
     let train_finish = train_start.map_or(Duration::ZERO, |start| start.elapsed());
@@ -405,7 +408,7 @@ fn train_spilled_model(
     vector_count: usize,
     dimension: usize,
     ratio: f64,
-) -> std::io::Result<VectorIndexWriter> {
+) -> std::io::Result<VectorIndexTraining> {
     let samples =
         checked_training_vector_count(vector_count, ratio).map_err(std::io::Error::other)?;
     let batch_rows = batch_rows(vector_count, dimension)?;
@@ -441,7 +444,7 @@ fn train_spilled_model(
             "vindex training sample count mismatch",
         ));
     }
-    Ok(VectorIndexWriter::new(trainer.finish()?))
+    trainer.finish()
 }
 
 /// Keep one pair of files open for all centroids. Each source batch contributes
@@ -473,7 +476,7 @@ impl SpilledVectors {
         &mut self,
         config: VectorIndexConfig,
         ratio: f64,
-    ) -> Result<VectorIndexWriter> {
+    ) -> Result<VectorIndexTraining> {
         train_spilled_model(&mut self.raw, config, self.count, self.dimension, ratio)
             .map_err(spill_error)
     }
