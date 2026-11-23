@@ -160,7 +160,7 @@ uuid = { version = "1", features = ["v4"] }
 paimon-mosaic-core = "0.3.0"
 paimon-ftindex-core = "0.2.0"
 tempfile = "3"
-paimon-vindex-core = "0.5.0"
+paimon-vindex-core = "0.6.0"
 # Also used by paimon-vindex-core for the single-precision matrix multiply.
 matrixmultiply = "0.3.11"
 vortex = { version = "0.90.0", features = ["tokio"], optional = true }
