@@ -214,19 +214,21 @@ async fn compatible(
             &definition.index_type,
             &definition.field,
         )?;
-        let matches_geometry = [
-            ("nlist", Some(persisted.nlist)),
-            ("rq.bits", persisted.rq_bits),
-            ("pq.m", persisted.pq_m),
-        ]
-        .into_iter()
-        .all(|(key, actual)| {
-            expected.native_options.get(key).is_none_or(|value| {
-                let value = value.trim();
-                (key == "nlist" && value == "auto")
-                    || actual.is_some_and(|actual| value.parse() == Ok(actual))
-            })
-        });
+        // Build parameters apply to new segments. Readers use each retained segment's layout.
+        let matches_geometry = retained_header_reads.is_some()
+            || [
+                ("nlist", Some(persisted.nlist)),
+                ("rq.bits", persisted.rq_bits),
+                ("pq.m", persisted.pq_m),
+            ]
+            .into_iter()
+            .all(|(key, actual)| {
+                expected.native_options.get(key).is_none_or(|value| {
+                    let value = value.trim();
+                    (key == "nlist" && value == "auto")
+                        || actual.is_some_and(|actual| value.parse() == Ok(actual))
+                })
+            });
         return Ok(persisted.matches_options(&expected)
             && matches_geometry
             && persisted.total_vectors == file.row_count);

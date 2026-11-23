@@ -1835,6 +1835,20 @@ impl InputFile {
         self.reader_with_size_hint(Some(size)).await
     }
 
+    /// Read up to `max_len` bytes from the start of an immutable file.
+    /// On a cache miss, the cache entry covers only the prefix.
+    pub(crate) async fn read_prefix_with_cache(
+        &self,
+        size: u64,
+        max_len: u64,
+    ) -> crate::Result<Bytes> {
+        let length = size.min(max_len);
+        match self.reader_with_size_hint(Some(size)).await? {
+            InputFileReader::Direct { reader, .. } => FileRead::read(&reader, 0..length).await,
+            InputFileReader::Cached { reader, .. } => reader.read_prefix(length).await,
+        }
+    }
+
     /// Read a range and return the size reported by storage, if present.
     /// Reuse cached bytes when available. On a miss, read just the range and leave the cache alone.
     pub(crate) async fn read_range_with_reported_size(
@@ -2233,6 +2247,30 @@ mod file_action_test {
         let (prefix, object_size) = input.read_range_with_reported_size(2..6, 12).await.unwrap();
         assert_eq!(prefix, bytes.slice(2..6));
         assert_eq!(object_size, None);
+    }
+
+    #[tokio::test]
+    async fn test_cached_prefix_obeys_file_invalidation() {
+        let io = FileIOBuilder::new("memory")
+            .with_prop(CatalogOptions::LOCAL_CACHE_ENABLED, "true")
+            .with_prop(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4")
+            .build()
+            .unwrap();
+        let path = "memory:/cached-prefix/snapshot-1";
+        let input = io.new_input(path).unwrap();
+        for bytes in [b"abcdefgh", b"12345678"] {
+            io.new_output(path)
+                .unwrap()
+                .write(Bytes::from_static(bytes))
+                .await
+                .unwrap();
+            let prefix = input.read_prefix_with_cache(8, 3).await.unwrap();
+            assert_eq!(prefix.as_ref(), &bytes[..3]);
+            let (exact, reported_size) =
+                input.read_range_with_reported_size(0..3, 8).await.unwrap();
+            assert_eq!(exact, prefix);
+            assert_eq!(reported_size, Some(8));
+        }
     }
 
     #[tokio::test]
@@ -3925,13 +3963,17 @@ mod input_output_test {
                     .unwrap()
                     .with_file_block_cache(cache.clone(), 64, "meta")
                     .unwrap();
+                let input = reader_io.new_input(&location).unwrap();
                 assert_eq!(
-                    reader_io
-                        .new_input(&location)
-                        .unwrap()
-                        .read()
+                    input
+                        .read_prefix_with_cache(b"old metadata".len() as u64, 3)
                         .await
                         .unwrap(),
+                    Bytes::from_static(b"old")
+                );
+                assert!(cache.0.lock().unwrap().is_empty());
+                assert_eq!(
+                    input.read().await.unwrap(),
                     Bytes::from_static(b"old metadata")
                 );
                 assert_eq!(cache.0.lock().unwrap().len(), 1);

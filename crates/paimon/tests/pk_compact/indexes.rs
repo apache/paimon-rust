@@ -237,85 +237,27 @@ async fn seed_vector_history(table: &Table) -> paimon::spec::IndexManifestEntry 
 }
 
 #[tokio::test]
-async fn explicit_nlist_changes_rebuild_retained_pk_indexes() {
+async fn build_parameters_apply_to_new_pk_vector_segments() {
     use paimon::spec::SchemaChange;
     use paimon_vindex_core::index::VectorIndexReader;
     use std::io::Cursor;
 
-    let table = vector_table_for_indexes(&[]).await;
-    let old = seed_vector_history(&table).await;
-    let schema = table
-        .schema()
-        .apply_changes(vec![SchemaChange::set_option(
-            "fields.embedding.pk-vector.index.options".into(),
-            r#"{"dimension":2,"nlist":2}"#.into(),
-        )])
-        .unwrap();
-    persist_table_schema(table.file_io(), table.location(), &schema).await;
-    let table = table.copy_with_resolved_schema(schema, "main").unwrap();
-    write_vector_range(&table, 1000..1004).await;
-    compact(&table).await;
-    let active = indexes(&table).await;
-    assert_eq!(active.len(), 2);
-    assert!(!active.contains(&old));
-    for entry in &active {
-        let payload = table
-            .file_io()
-            .new_input(&index_path(&table, entry))
-            .unwrap()
-            .read()
-            .await
-            .unwrap();
-        assert_eq!(
-            VectorIndexReader::open(Cursor::new(payload))
-                .unwrap()
-                .metadata()
-                .nlist,
-            2
-        );
-        assert_eq!(
-            entry
-                .index_file
-                .global_index_meta
-                .as_ref()
-                .unwrap()
-                .index_meta
-                .as_deref(),
-            Some(b"{}".as_slice())
-        );
-    }
-
-    let schema = table
-        .schema()
-        .apply_changes(vec![SchemaChange::set_option(
-            "fields.embedding.pk-vector.index.options".into(),
-            r#"{"dimension":2,"nlist":"auto"}"#.into(),
-        )])
-        .unwrap();
-    persist_table_schema(table.file_io(), table.location(), &schema).await;
-    let table = table.copy_with_resolved_schema(schema, "main").unwrap();
-    let retained = active
-        .iter()
-        .find(|entry| entry.index_file.row_count == 1000)
-        .unwrap();
-    assert_eq!(
-        retained.index_file.global_index_meta,
-        old.index_file.global_index_meta
-    );
-    write_vector_range(&table, 1004..1008).await;
-    compact(&table).await;
-    assert!(indexes(&table).await.contains(retained));
-}
-
-#[tokio::test]
-async fn explicit_quantization_changes_rebuild_retained_pk_indexes() {
-    use paimon::spec::SchemaChange;
-    use paimon_vindex_core::index::VectorIndexReader;
-    use std::io::Cursor;
-
-    for (kind, option, previous, current) in [("ivf-rq", "rq.bits", 8, 1), ("ivf-pq", "pq.m", 1, 2)]
-    {
-        let options = |value| format!(r#"{{"dimension":2,"nlist":1,"{option}":{value}}}"#);
+    for (kind, option, previous, current) in [
+        ("ivf-flat", "nlist", 1, 2),
+        ("ivf-rq", "rq.bits", 8, 1),
+        ("ivf-pq", "pq.m", 1, 2),
+        ("diskann", "pq.bits", 8, 4),
+    ] {
+        let options = |value| {
+            let mut options = serde_json::json!({"dimension": 2});
+            if kind == "diskann" {
+                options["pq.m"] = serde_json::json!(2);
+            } else {
+                options["nlist"] = serde_json::json!(1);
+            }
+            options[option] = serde_json::json!(value);
+            options.to_string()
+        };
         let option_key = "fields.embedding.pk-vector.index.options";
         let table = vector_table_for_indexes(&[
             ("fields.embedding.pk-vector.index.type", kind),
@@ -337,7 +279,7 @@ async fn explicit_quantization_changes_rebuild_retained_pk_indexes() {
 
         let active = indexes(&table).await;
         assert_eq!(active.len(), 2, "{kind}");
-        assert!(!active.contains(&old), "{kind}");
+        assert!(active.contains(&old), "{kind}");
         for entry in &active {
             let payload = table
                 .file_io()
@@ -349,12 +291,15 @@ async fn explicit_quantization_changes_rebuild_retained_pk_indexes() {
             let metadata = VectorIndexReader::open(Cursor::new(payload))
                 .unwrap()
                 .metadata();
-            let recorded = if kind == "ivf-rq" {
-                metadata.rq_bits
-            } else {
-                metadata.pq_m
+            let recorded = match kind {
+                "ivf-flat" => Some(metadata.nlist),
+                "ivf-rq" => metadata.rq_bits,
+                "ivf-pq" => metadata.pq_m,
+                "diskann" => metadata.pq_bits,
+                _ => unreachable!(),
             };
-            assert_eq!(recorded, Some(current), "{kind}");
+            let expected = if entry == &old { previous } else { current };
+            assert_eq!(recorded, Some(expected), "{kind}");
             assert_eq!(
                 entry
                     .index_file

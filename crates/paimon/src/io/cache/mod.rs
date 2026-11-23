@@ -185,7 +185,11 @@ impl LocalCache {
     }
 
     fn block_key(&self, path: &str, block_index: u64) -> BlockKey {
-        BlockKey::with_namespace(&self.namespace, path, self.block_size, block_index)
+        self.block_key_with_size(path, block_index, self.block_size)
+    }
+
+    fn block_key_with_size(&self, path: &str, block_index: u64, block_size: u64) -> BlockKey {
+        BlockKey::with_namespace(&self.namespace, path, block_size, block_index)
     }
 
     pub(super) fn is_cacheable(&self, path: &str) -> bool {

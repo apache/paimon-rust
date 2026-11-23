@@ -406,6 +406,8 @@ Unchanged coverage is retained. Changed coverage and incompatible vector
 definitions replace the previous references in the same COMPACT snapshot as
 data, changelogs and deletion vectors. Old payload files remain for historical
 snapshots. L0 files remain outside these indexes and use the existing read path.
+Build parameters such as IVF list count and quantization apply to new segments.
+Retained segments keep their recorded native layout.
 All-NULL vector levels retain an explicit empty segment, as in Java, so later
 maintenance reuses their coverage without rescanning or opening a native index.
 Vector payload row counts count indexed vectors; source ranges retain all physical positions.

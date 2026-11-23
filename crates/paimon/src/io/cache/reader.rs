@@ -22,7 +22,7 @@ use bytes::{Bytes, BytesMut};
 
 use crate::io::FileRead;
 
-use super::{CacheReadToken, LocalCache};
+use super::{CacheBackend, CacheReadToken, LocalCache};
 
 pub(crate) struct CachedFileReader {
     delegate: Arc<dyn FileRead>,
@@ -61,9 +61,29 @@ impl CachedFileReader {
         }
     }
 
-    async fn read_block(&self, block_index: u64) -> crate::Result<Bytes> {
+    /// Cache a prefix at its own size while reusing any ordinary cached blocks that cover it.
+    pub(in crate::io) async fn read_prefix(&self, length: u64) -> crate::Result<Bytes> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
         let block_size = self.cache.block_size();
-        let key = self.cache.block_key(&self.path, block_index);
+        if length == block_size.min(self.file_size) {
+            return self.read_block(0, block_size).await;
+        }
+        if matches!(self.cache.backend, CacheBackend::External(_)) {
+            // External slots are addressed by path and offset and expect aligned blocks.
+            return match self.read_cached_range(0..length).await {
+                Some(payload) => Ok(payload),
+                None => self.delegate.read(0..length).await,
+            };
+        }
+        self.read_block(0, length).await
+    }
+
+    async fn read_block(&self, block_index: u64, block_size: u64) -> crate::Result<Bytes> {
+        let key = self
+            .cache
+            .block_key_with_size(&self.path, block_index, block_size);
         let start = block_index * block_size;
         let end = start.saturating_add(block_size).min(self.file_size);
         let expected_len = usize::try_from(end - start).map_err(|_| crate::Error::DataInvalid {
@@ -79,6 +99,11 @@ impl CachedFileReader {
                 return Ok(payload);
             }
             self.cache.remove_block(&key).await;
+        }
+        if block_size != self.cache.block_size() {
+            if let Some(payload) = self.read_cached_range(start..end).await {
+                return Ok(payload);
+            }
         }
 
         let load_lock = self.cache.block_load_lock(&key).await;
@@ -146,10 +171,10 @@ impl CachedFileReader {
     }
 
     async fn read_blocks(&self, first: u64, last: u64) -> crate::Result<Vec<Bytes>> {
-        if first == last {
-            return Ok(vec![self.read_block(first).await?]);
-        }
         let size = self.cache.block_size();
+        if first == last {
+            return Ok(vec![self.read_block(first, size).await?]);
+        }
         let mut blocks = Vec::new();
         let mut locks = Vec::new();
         // Acquire missing-block locks in offset order, including overlapping reads.

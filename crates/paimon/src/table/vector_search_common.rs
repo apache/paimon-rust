@@ -86,7 +86,9 @@ pub(super) async fn read_index_vector_metric(
     let path = global_vector_index_path(table_path, entry);
     let size = entry.index_file.file_size.max(0) as u64;
     Ok(Some(
-        read_vector_index_header(file_io, &path, size).await?.metric,
+        load_vector_index_header(file_io, &path, size, HeaderCache::Prefix)
+            .await?
+            .metric,
     ))
 }
 
@@ -120,8 +122,17 @@ pub(super) async fn read_vector_index_header(
     path: &str,
     file_size: u64,
 ) -> crate::Result<IndexVectorSemantics> {
+    load_vector_index_header(file_io, path, file_size, HeaderCache::Existing).await
+}
+
+async fn load_vector_index_header(
+    file_io: &FileIO,
+    path: &str,
+    file_size: u64,
+    cache: HeaderCache,
+) -> crate::Result<IndexVectorSemantics> {
     let input = file_io.new_input(path)?;
-    let header = read_vector_index_header_bytes(&input, file_size)
+    let header = read_vector_index_header_bytes(&input, file_size, cache)
         .await
         .map_err(|error| vector_header_read_error(path, error))?;
     parse_vector_index_header(header.bytes, header.expected_size)
@@ -135,7 +146,8 @@ pub(super) async fn read_retained_vector_index_header(
     file_size: u64,
 ) -> crate::Result<Option<IndexVectorSemantics>> {
     let input = file_io.new_input(path)?;
-    let header = match read_vector_index_header_bytes(&input, file_size).await {
+    let result = read_vector_index_header_bytes(&input, file_size, HeaderCache::Existing).await;
+    let header = match result {
         Ok(header) => header,
         Err(error) => {
             let check_size = match &error {
@@ -235,9 +247,15 @@ struct VectorIndexHeaderBytes {
     reported_size: Option<u64>,
 }
 
+enum HeaderCache {
+    Existing,
+    Prefix,
+}
+
 async fn read_vector_index_header_bytes(
     input: &InputFile,
     file_size: u64,
+    cache: HeaderCache,
 ) -> crate::Result<VectorIndexHeaderBytes> {
     let stat_size = if file_size == 0 {
         Some(input.metadata().await?.size)
@@ -246,9 +264,17 @@ async fn read_vector_index_header_bytes(
     };
     let file_size = stat_size.unwrap_or(file_size);
     let header_size = file_size.min(DISKANN_HEADER_SIZE as u64);
-    let (bytes, reported_size) = input
-        .read_range_with_reported_size(0..header_size, file_size)
-        .await?;
+    let (bytes, reported_size) = match cache {
+        HeaderCache::Existing => {
+            input
+                .read_range_with_reported_size(0..header_size, file_size)
+                .await?
+        }
+        HeaderCache::Prefix => (
+            input.read_prefix_with_cache(file_size, header_size).await?,
+            None,
+        ),
+    };
     if bytes.len() < header_size as usize {
         return Err(crate::Error::DataInvalid {
             message: format!(
@@ -1087,7 +1113,7 @@ mod tests {
 
     #[cfg(all(feature = "storage-oss", feature = "storage-fs"))]
     #[tokio::test]
-    async fn retained_vector_header_uses_the_total_from_range_responses() {
+    async fn vector_header_reads_use_exact_ranges_and_cache_query_prefixes() {
         use axum::body::Body;
         use axum::http::{header, HeaderMap, Method, Response, StatusCode, Uri};
         use axum::Router;
@@ -1100,9 +1126,12 @@ mod tests {
         let size = payload.len() as u64;
         let prefix = Bytes::from(payload).slice(..256);
         let stats = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
         let server_stats = stats.clone();
+        let server_reads = reads.clone();
         let app = Router::new().fallback(move |method: Method, uri: Uri, headers: HeaderMap| {
             let stats = server_stats.clone();
+            let reads = server_reads.clone();
             let prefix = prefix.clone();
             async move {
                 if method == Method::HEAD {
@@ -1114,6 +1143,7 @@ mod tests {
                 }
                 assert_eq!(method, Method::GET);
                 assert_eq!(headers[header::RANGE], "bytes=0-255");
+                reads.fetch_add(1, Ordering::Relaxed);
                 let content_range = if uri.path().ends_with("/full.index") {
                     format!("bytes 0-255/{size}")
                 } else {
@@ -1154,6 +1184,21 @@ mod tests {
             assert_eq!(header.unwrap().index_type, IndexType::IvfFlat, "{path}");
             assert_eq!(stats.load(Ordering::Relaxed), expected_stats, "{path}");
         }
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+
+        let mut query_entry = entry(Some(b"{}".to_vec()));
+        query_entry.index_file.file_name = "full.index".into();
+        query_entry.index_file.file_size = size as i64;
+        for _ in 0..2 {
+            assert_eq!(
+                read_index_vector_metric(&io, "/table", &query_entry)
+                    .await
+                    .unwrap(),
+                Some(MetricType::L2)
+            );
+            assert_eq!(reads.load(Ordering::Relaxed), 3);
+        }
+        assert_eq!(stats.load(Ordering::Relaxed), 1);
         server.abort();
     }
 
