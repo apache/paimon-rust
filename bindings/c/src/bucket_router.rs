@@ -22,9 +22,11 @@ use paimon::spec::TableSchema;
 use paimon::table::{BucketRouter, PostponeBucketPlan};
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
-use crate::result::paimon_result_bucket_router;
-use crate::types::paimon_bucket_router;
+use crate::result::{paimon_result_bucket_router, paimon_result_next_batch};
+use crate::types::{paimon_arrow_batch, paimon_bucket_router};
 use crate::write::import_record_batch;
+use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+use arrow_array::{Array, StructArray};
 
 fn router_error(error: *mut paimon_error) -> paimon_result_bucket_router {
     paimon_result_bucket_router {
@@ -191,11 +193,109 @@ pub unsafe extern "C" fn paimon_bucket_router_route_arrow(
     ptr::null_mut()
 }
 
+/// Export required routing fields into an initialized empty ArrowSchema.
+/// The result has independent ownership and must be released by its callback.
+/// Shared read-only calls are allowed. Plan mutation and free require exclusive
+/// access to the router, including exclusion of in-flight route/schema calls.
+///
+/// # Safety
+/// router must be live and schema must point to writable initialized empty
+/// ArrowSchema storage. Null pointers return an error.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_bucket_router_export_arrow_schema(
+    router: *const paimon_bucket_router,
+    schema: *mut c_void,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(router, "router") {
+        return error;
+    }
+    if let Err(error) = check_non_null((*router).inner, "router.inner") {
+        return error;
+    }
+    if let Err(error) = check_non_null(schema, "schema") {
+        return error;
+    }
+    let output = schema.cast::<FFI_ArrowSchema>();
+    if (*output).release.is_some() {
+        return paimon_error::new(
+            PaimonErrorCode::InvalidInput,
+            "ArrowSchema output must be empty".into(),
+        );
+    }
+    let state = &*(*router).inner.cast::<RouterState>();
+    let schema = match state.router.routing_schema() {
+        Ok(schema) => schema,
+        Err(error) => return paimon_error::from_paimon(error),
+    };
+    match FFI_ArrowSchema::try_from(schema.as_ref()) {
+        Ok(schema) => {
+            ptr::write(output, schema);
+            ptr::null_mut()
+        }
+        Err(error) => paimon_error::new(PaimonErrorCode::InvalidInput, error.to_string()),
+    }
+}
+
+/// Return a row-aligned Arrow batch with partition_key (LargeBinary) and
+/// bucket_id (Int32), using fixed-bucket routing. Release the output containers
+/// with paimon_arrow_batch_free, including after moving their Arrow contents.
+/// Output can outlive the router. Empty input returns an owned empty batch.
+///
+/// Once pointer validation succeeds, both input Arrow structs are consumed,
+/// including on routing/import errors. Before import, validation errors leave
+/// input ownership with the caller. No input references survive this call.
+/// Calls may share a router concurrently with independent input/output storage.
+/// Plan mutation and free require exclusive access. Temporary allocations and
+/// output scale with batch rows and key sizes and use the normal Rust allocator.
+///
+/// # Safety
+/// router must be live. array and schema must point to valid initialized Arrow
+/// C Data structs with a Struct root. Null pointers return an error.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_bucket_router_route_with_partitions_arrow(
+    router: *const paimon_bucket_router,
+    array: *mut c_void,
+    schema: *mut c_void,
+) -> paimon_result_next_batch {
+    let route = || -> Result<paimon_arrow_batch, *mut paimon_error> {
+        check_non_null(router, "router")?;
+        check_non_null((*router).inner, "router.inner")?;
+        check_non_null(array, "array")?;
+        check_non_null(schema, "schema")?;
+        let batch = import_record_batch(array, schema)?;
+        let state = &*(*router).inner.cast::<RouterState>();
+        let output = state
+            .router
+            .route_with_partitions(&batch)
+            .map_err(paimon_error::from_paimon)?;
+        let ffi_schema = FFI_ArrowSchema::try_from(output.schema().as_ref())
+            .map_err(|error| paimon_error::new(PaimonErrorCode::InvalidInput, error.to_string()))?;
+        let ffi_array = FFI_ArrowArray::new(&StructArray::from(output).to_data());
+        Ok(paimon_arrow_batch {
+            array: Box::into_raw(Box::new(ffi_array)).cast(),
+            schema: Box::into_raw(Box::new(ffi_schema)).cast(),
+        })
+    };
+    match route() {
+        Ok(batch) => paimon_result_next_batch {
+            batch,
+            error: ptr::null_mut(),
+        },
+        Err(error) => paimon_result_next_batch {
+            batch: paimon_arrow_batch {
+                array: ptr::null_mut(),
+                schema: ptr::null_mut(),
+            },
+            error,
+        },
+    }
+}
+
 /// Free a bucket router handle.
 ///
 /// # Safety
 /// Only call with a handle returned from `paimon_bucket_router_new_from_schema_json`
-/// once, or pass null.
+/// once, or pass null. Exclude all in-flight router calls before freeing.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_bucket_router_free(router: *mut paimon_bucket_router) {
     if !router.is_null() {
@@ -223,3 +323,11 @@ const _: unsafe extern "C" fn(
     usize,
 ) -> *mut paimon_error = paimon_bucket_router_route_arrow;
 const _: unsafe extern "C" fn(*mut paimon_bucket_router) = paimon_bucket_router_free;
+
+const _: unsafe extern "C" fn(*const paimon_bucket_router, *mut c_void) -> *mut paimon_error =
+    paimon_bucket_router_export_arrow_schema;
+const _: unsafe extern "C" fn(
+    *const paimon_bucket_router,
+    *mut c_void,
+    *mut c_void,
+) -> paimon_result_next_batch = paimon_bucket_router_route_with_partitions_arrow;

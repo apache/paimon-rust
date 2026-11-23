@@ -28,9 +28,11 @@ use crate::spec::{
 };
 use crate::table::PostponeBucketPlan;
 use crate::Result;
-use arrow_array::{Int32Array, RecordBatch, RecordBatchOptions};
+use arrow_array::{Array, Int32Array, LargeBinaryArray, RecordBatch, RecordBatchOptions};
 use arrow_schema::SchemaRef;
+use arrow_schema::{DataType as ArrowDataType, Field, Schema};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Compute the bucket of every input row without opening files or authorizing a table.
 ///
@@ -53,6 +55,7 @@ enum BucketRouterInner {
 
 #[derive(Debug, Clone)]
 struct FixedBucketRouter {
+    partition_fields: Vec<DataField>,
     bucket_fields: Vec<DataField>,
     bucket_indices: Vec<usize>,
     arrow_schema: SchemaRef,
@@ -86,7 +89,20 @@ impl FixedBucketRouter {
             .collect::<Result<Vec<_>>>()?;
         let bucket_function = CoreOptions::new(schema.options()).bucket_function_type()?;
         validate_bucket_function(bucket_function, &bucket_fields)?;
+        let partition_fields = schema
+            .partition_keys()
+            .iter()
+            .map(|name| {
+                schema
+                    .fields()
+                    .iter()
+                    .find(|field| field.name() == name)
+                    .cloned()
+                    .ok_or_else(|| data_invalid(format!("Unknown partition column '{name}'")))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            partition_fields,
             arrow_schema: crate::arrow::build_target_arrow_schema(&bucket_fields)?,
             bucket_indices: (0..bucket_fields.len()).collect(),
             bucket_fields,
@@ -254,6 +270,69 @@ impl BucketRouter {
                 "A bucket plan requires a postpone-bucket schema",
             )),
         }
+    }
+
+    /// Required fields for joint partition and bucket routing, with the core
+    /// write types and field IDs. Payload fields may be omitted from inputs.
+    pub fn routing_schema(&self) -> Result<SchemaRef> {
+        match &self.inner {
+            BucketRouterInner::Fixed(router) => {
+                let mut fields = router.partition_fields.clone();
+                for field in &router.bucket_fields {
+                    if !fields
+                        .iter()
+                        .any(|existing| existing.name() == field.name())
+                    {
+                        fields.push(field.clone());
+                    }
+                }
+                crate::arrow::build_target_arrow_schema(&fields)
+            }
+            BucketRouterInner::Postpone(router) => Ok(router.arrow_schema.clone()),
+        }
+    }
+
+    /// Route fixed-bucket inputs to non-null `partition_key` (LargeBinary) and
+    /// `bucket_id` (Int32) columns in input row order.
+    ///
+    /// Partition bytes use the writer's binary-row partition encoding. Compare
+    /// them only within one frozen schema and SDK implementation during an
+    /// execution. Their cross-version persisted representation is unspecified.
+    /// Inputs must include partition and bucket fields. Normalization follows
+    /// the core write-array conversion and does not evaluate missing defaults.
+    /// Postpone joint routing requires a separate plan-aware API.
+    pub fn route_with_partitions(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let BucketRouterInner::Fixed(router) = &self.inner else {
+            return Err(crate::Error::Unsupported {
+                message: "Joint routing currently requires fixed buckets".into(),
+            });
+        };
+        for field in self.routing_schema()?.fields() {
+            if let Some(column) = batch.column_by_name(field.name()) {
+                if !field.is_nullable() && column.null_count() != 0 {
+                    return Err(data_invalid(format!(
+                        "Routing column '{}' is NOT NULL",
+                        field.name()
+                    )));
+                }
+            }
+        }
+        let schema = crate::arrow::build_target_arrow_schema(&router.partition_fields)?;
+        let partitions = project_routing_input(batch, &router.partition_fields, &schema)?;
+        let indices = (0..router.partition_fields.len()).collect::<Vec<_>>();
+        let keys = batch_to_serialized_bytes(&partitions, &indices, &router.partition_fields)?;
+        let buckets = router.route(batch)?;
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("partition_key", ArrowDataType::LargeBinary, false),
+                Field::new("bucket_id", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(LargeBinaryArray::from_iter_values(keys)),
+                Arc::new(buckets),
+            ],
+        )
+        .map_err(|error| data_invalid(error.to_string()))
     }
 
     /// Return non-null Int32 bucket IDs in input row order.

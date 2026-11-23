@@ -1041,3 +1041,64 @@ message.
 Every opaque handle returned by the C API has a matching free function. Free
 resources in reverse construction order. Pointer-based free functions accept
 null, which makes cleanup paths straightforward.
+
+## Schema-only Partition and Bucket Routing
+
+Create a reusable router with `paimon_bucket_router_new_from_schema_json` from a
+frozen complete `TableSchema` JSON. Construction and routing use schema metadata
+and Arrow inputs without accessing a catalog or storage. Existing
+`paimon_bucket_router_route_arrow` returns bucket IDs into caller storage.
+
+For fixed-bucket tables, `paimon_bucket_router_route_with_partitions_arrow`
+returns an owned Arrow batch with non-null `partition_key` (LargeBinary) and
+`bucket_id` (Int32) columns, in the original input row order. Use the pair to
+group rows during an execution, then assign writer channels in the embedding
+engine. The key uses the core writer's binary-row partition encoding. All rows
+of an unpartitioned table share one key. Key bytes are scoped to the frozen
+schema and SDK implementation used by that execution.
+
+`paimon_bucket_router_export_arrow_schema` exports the required partition and
+bucket fields into initialized empty caller-owned ArrowSchema storage. It uses
+the core write type mapping and field IDs. Release the schema with its callback.
+Inputs may project out payload columns and reorder required columns. Missing
+or duplicate names, incompatible types and NULL values in required NOT NULL
+fields return errors. The router uses core Arrow layout normalization.
+Consumers must supply the same logical values to routing and writing, including
+CHAR padding, defaults, timezone conversion and decimal/timestamp precision.
+The router requires all routing keys to be present.
+
+```c
+paimon_result_bucket_router router =
+    paimon_bucket_router_new_from_schema_json(frozen_schema_json);
+CHECK_RESULT(router);
+/* Use the exported input schema to prepare an Arrow Struct batch. */
+paimon_result_next_batch routes =
+    paimon_bucket_router_route_with_partitions_arrow(router.router, array, schema);
+CHECK_RESULT(routes);
+/* Import routes.batch through the Arrow C Data Interface. Group by both
+   columns and complete the consumer's reads before releasing its buffers. */
+paimon_arrow_batch_free(routes.batch);
+paimon_bucket_router_free(router.router);
+```
+
+Before Arrow import, null-pointer/handle validation errors leave input ownership
+with the caller. Once import begins, both input structs are moved to released
+values, including on import or routing errors. The router retains no batch
+references after the synchronous call. Errors return null output containers.
+An empty input returns a valid owned zero-row output, and zero-field inputs
+preserve their row count when the schema has no routing keys. Output data and
+exported schemas can outlive the router. After moving output into a consumer,
+call `paimon_arrow_batch_free` to release the library-owned container structs.
+
+Read-only routing and schema exports may share a router concurrently with
+independent input/output storage. Plan replacement and free require exclusive
+access and completion of all in-flight calls. Reconstruct independent routers
+from the same JSON when separate ownership is preferable. Temporary projections,
+normalization, partition encoding, bucket IDs and output buffers use ordinary
+Rust allocation. Their memory cost grows with batch row count and routing-key
+bytes, so callers should bound batch sizes.
+
+The joint result currently supports fixed buckets. Existing bucket-only
+postpone APIs use their shared bucket-count plan. A plan-aware joint C contract
+and its corresponding write/commit integration are follow-up work. Stateful
+dynamic-bucket coordination requires a separate API.
