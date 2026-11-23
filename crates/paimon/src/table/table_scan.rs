@@ -861,12 +861,12 @@ fn global_index_detail_data_ranges(entries: &[ManifestEntry]) -> Vec<RowRange> {
 
 fn should_use_global_index_row_range_optimization(
     row_range_optimization_disabled: bool,
-    data_evolution_enabled: bool,
+    supports_global_row_ranges: bool,
     global_index_enabled: bool,
     has_data_predicates: bool,
 ) -> bool {
     !row_range_optimization_disabled
-        && data_evolution_enabled
+        && supports_global_row_ranges
         && global_index_enabled
         && has_data_predicates
 }
@@ -2519,10 +2519,14 @@ impl<'a> PaimonTableScan<'a> {
         core_options: &CoreOptions,
         data_evolution_enabled: bool,
     ) -> crate::Result<Option<GlobalIndexScanSettings>> {
+        let supports_global_row_ranges = data_evolution_enabled
+            || (self.table.schema().primary_keys().is_empty()
+                && core_options.row_tracking_enabled()
+                && core_options.bucket() == -1);
         if !self.is_streaming()
             && should_use_global_index_row_range_optimization(
                 self.row_range_optimization_disabled,
-                data_evolution_enabled,
+                supports_global_row_ranges,
                 core_options.global_index_enabled(),
                 !self.data_predicates.is_empty(),
             )
@@ -3375,9 +3379,10 @@ impl<'a> PaimonTableScan<'a> {
 
                 let split_row_ranges =
                     split_row_ranges_for_files(effective_row_ranges.as_deref(), &file_group)?;
-                if split_row_ranges
-                    .as_deref()
-                    .is_some_and(<[RowRange]>::is_empty)
+                if append_row_position_selection.is_none()
+                    && split_row_ranges
+                        .as_deref()
+                        .is_some_and(<[RowRange]>::is_empty)
                 {
                     continue;
                 }

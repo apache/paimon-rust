@@ -282,6 +282,141 @@ async fn data_evolution_and_query_index_switches_do_not_gate_automatic_builds() 
 }
 
 #[tokio::test]
+async fn append_scalar_indexes_prune_rows_and_preserve_unindexed_matches() {
+    use crate::table::RowRange;
+
+    let table = table(Some(true), false)
+        .await
+        .copy_with_options(HashMap::from([(
+            "data-evolution.enabled".into(),
+            "false".into(),
+        )]));
+    TableCommit::new(table.clone(), "indexed".into())
+        .commit(messages(&table, vec![0, 3, 9]).await)
+        .await
+        .unwrap();
+    let unindexed = table.copy_with_options(HashMap::from([("write-only".into(), "true".into())]));
+    TableCommit::new(unindexed.clone(), "unindexed".into())
+        .commit(messages(&unindexed, vec![0, 3, 9]).await)
+        .await
+        .unwrap();
+
+    for mode in [None, Some("fast"), Some("full"), Some("detail")] {
+        let table = if let Some(mode) = mode {
+            table.copy_with_options(HashMap::from([(
+                "global-index.search-mode".into(),
+                mode.into(),
+            )]))
+        } else {
+            table.clone()
+        };
+        let fast = mode == Some("fast");
+        let mut read = table.new_read_builder();
+        read.with_filter(
+            crate::spec::PredicateBuilder::new(table.schema().fields())
+                .equal("id", Datum::Int(3))
+                .unwrap(),
+        );
+        let plan = read.new_scan().plan().await.unwrap();
+        let ranges = plan
+            .splits()
+            .iter()
+            .flat_map(|split| {
+                split
+                    .row_ranges()
+                    .expect("append scalar scans must produce indexed row ranges")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ranges,
+            if fast {
+                vec![RowRange::new(1, 1)]
+            } else {
+                vec![RowRange::new(1, 1), RowRange::new(3, 5)]
+            },
+            "{mode:?} must respect index coverage"
+        );
+        let batches: Vec<RecordBatch> = read
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let found = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(found, if fast { vec![3] } else { vec![3, 3] });
+    }
+}
+
+#[tokio::test]
+async fn append_scalar_indexes_preserve_row_position_slices() {
+    let table = table(Some(true), false)
+        .await
+        .copy_with_options(HashMap::from([
+            ("data-evolution.enabled".into(), "false".into()),
+            ("source.split.target-size".into(), "1b".into()),
+        ]));
+    let commit = TableCommit::new(table.clone(), "writer".into());
+    commit
+        .commit(messages(&table, vec![0, 4, 9]).await)
+        .await
+        .unwrap();
+    commit
+        .commit(messages(&table, vec![0, 3, 9]).await)
+        .await
+        .unwrap();
+    let mut read = table.new_read_builder();
+    read.with_filter(
+        crate::spec::PredicateBuilder::new(table.schema().fields())
+            .equal("id", Datum::Int(3))
+            .unwrap(),
+    );
+    let plan = read
+        .new_scan()
+        .with_row_position_slice(4, 5)
+        .unwrap()
+        .plan()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = read
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let found = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(found, vec![3]);
+}
+
+#[tokio::test]
 async fn append_only_adds_missing_ranges_and_empty_commits_do_nothing() {
     let table = table(Some(true), false).await;
     let commit = TableCommit::new(table.clone(), "writer".into());
