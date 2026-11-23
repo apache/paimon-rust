@@ -405,16 +405,7 @@ async fn manual_builds_and_planned_shards_share_declarations_and_preserve_explic
     }
 }
 
-async fn search_table(options: &[(&str, &str)]) -> (FileSystemCatalog, Table) {
-    let catalog = FileSystemCatalog::new(Options::from_map(HashMap::from([(
-        "warehouse".into(),
-        format!("memory:/auto-index-search/{}", uuid::Uuid::new_v4()),
-    )])))
-    .unwrap();
-    catalog
-        .create_database("default", false, HashMap::new())
-        .await
-        .unwrap();
+fn search_schema(options: &[(&str, &str)]) -> TableSchemaBuilder {
     let mut schema = TableSchemaBuilder::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("text", DataType::VarChar(VarCharType::string_type()))
@@ -433,16 +424,32 @@ async fn search_table(options: &[(&str, &str)]) -> (FileSystemCatalog, Table) {
     for (key, value) in options {
         schema = schema.option(*key, *value);
     }
+    schema.build().unwrap()
+}
+
+async fn search_table(options: &[(&str, &str)]) -> (FileSystemCatalog, Table) {
+    let catalog = FileSystemCatalog::new(Options::from_map(HashMap::from([(
+        "warehouse".into(),
+        format!("memory:/auto-index-search/{}", uuid::Uuid::new_v4()),
+    )])))
+    .unwrap();
+    catalog
+        .create_database("default", false, HashMap::new())
+        .await
+        .unwrap();
     let id = Identifier::new("default", "search");
     catalog
-        .create_table(&id, schema.build().unwrap(), false)
+        .create_table(&id, search_schema(options), false)
         .await
         .unwrap();
     let table = catalog.get_table(&id).await.unwrap();
     (catalog, table)
 }
 
-async fn search_messages(table: &Table, vectors: &[[f32; 2]]) -> Vec<CommitMessage> {
+async fn search_messages<const DIM: usize>(
+    table: &Table,
+    vectors: &[[f32; DIM]],
+) -> Vec<CommitMessage> {
     let mut builder = ListBuilder::new(Float32Builder::new());
     for vector in vectors {
         builder.values().append_slice(vector);
@@ -473,6 +480,84 @@ async fn search_messages(table: &Table, vectors: &[[f32; 2]]) -> Vec<CommitMessa
     let mut writer = builder.new_write().unwrap();
     writer.write_arrow_batch(&batch).await.unwrap();
     writer.prepare_commit().await.unwrap()
+}
+
+#[tokio::test]
+async fn auto_maintenance_reuses_ivf_sq_shard_with_large_quantizer() {
+    let (_catalog, table) = search_table(&[
+        ("global-index.ivf-sq.index-columns", "embedding"),
+        ("ivf-sq.dimension", "128"),
+        ("ivf-sq.nlist", "1"),
+    ])
+    .await;
+    TableCommit::new(table.clone(), "first-sq-shard".into())
+        .commit(search_messages(&table, &[[0.; 128], [1.; 128]]).await)
+        .await
+        .unwrap();
+    let original = indexes(&table).await;
+    assert_eq!(original.len(), 1);
+    assert!(original[0].index_file.file_size > 256);
+
+    TableCommit::new(table.clone(), "second-sq-shard".into())
+        .commit(search_messages(&table, &[[2.; 128], [3.; 128]]).await)
+        .await
+        .unwrap();
+    let current = indexes(&table).await;
+    assert_eq!(current.len(), 2);
+    assert!(current.contains(&original[0]));
+}
+
+#[tokio::test]
+async fn detail_search_reuses_the_ann_metric_for_refinement_and_raw_rows() {
+    use crate::table::SearchScanSplit;
+
+    let schema = search_schema(&[("write-only", "true"), ("ivf-flat.metric", "l2")]);
+    let (table, reads) =
+        crate::table::maintenance_test_utils::table(TableSchema::new(0, &schema)).await;
+    TableCommit::new(table.clone(), "indexed-vectors".into())
+        .commit(search_messages(&table, &[[1., 0.], [2., 0.]]).await)
+        .await
+        .unwrap();
+    let count = table
+        .new_global_index_build_builder()
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat")
+        .with_options(HashMap::from([
+            ("ivf-flat.dimension".into(), "2".into()),
+            ("ivf-flat.nlist".into(), "1".into()),
+            ("ivf-flat.metric".into(), "inner_product".into()),
+        ]))
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    let file_name = &indexes(&table).await[0].index_file.file_name;
+    let index_path = format!("{}/index/{file_name}", table.location());
+    TableCommit::new(table.clone(), "raw-vectors".into())
+        .commit(search_messages(&table, &[[4., 0.]]).await)
+        .await
+        .unwrap();
+
+    let mut query = table.new_vector_search_builder();
+    query
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1., 0.])
+        .with_limit(2)
+        .with_options(HashMap::from([
+            ("vector-index.search-mode".into(), "detail".into()),
+            ("fields.embedding.ivf.refine-factor".into(), "2".into()),
+        ]));
+    let plan = query.new_scan().unwrap().plan().await.unwrap();
+    assert!(plan
+        .splits()
+        .iter()
+        .any(|split| matches!(split, SearchScanSplit::Raw { .. })));
+    reads.watch(vec![index_path.clone()]);
+    let results = query.new_read().unwrap().read(plan).await.unwrap();
+    let rows = results.row_ids().unwrap();
+    assert_eq!(rows.row_ids, [2, 1]);
+    assert_eq!(rows.scores, [4., 2.]);
+    assert_eq!(reads.counts()[&index_path], 1);
 }
 
 async fn vector_scores(table: &Table, mode: &str) -> crate::vector_search::ScoredRowIds {

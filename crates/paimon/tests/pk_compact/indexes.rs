@@ -22,6 +22,9 @@ use std::collections::HashSet;
 #[tokio::test]
 async fn unified_index_config_drives_pk_compaction_and_ranked_reads() {
     use paimon::spec::{ArrayType, FloatType};
+    use paimon_vindex_core::distance::MetricType;
+    use paimon_vindex_core::index::VectorIndexReader;
+    use std::io::Cursor;
     use std::sync::Arc;
     for suffix in ["index-columns", "index-column"] {
         let schema = Schema::builder()
@@ -35,6 +38,14 @@ async fn unified_index_config_drives_pk_compaction_and_ranked_reads() {
             .option("bucket", "1")
             .option("deletion-vectors.enabled", "true")
             .option("deletion-vectors.merge-on-read", "false")
+            .option(
+                "index-file-in-data-file-dir",
+                if suffix == "index-column" {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
             .option(format!("global-index.btree.{suffix}"), "id")
             .option(format!("global-index.full-text.{suffix}"), "text")
             .option(format!("global-index.ivf-flat.{suffix}"), "embedding")
@@ -90,19 +101,20 @@ async fn unified_index_config_drives_pk_compaction_and_ranked_reads() {
             .iter()
             .find(|e| e.index_file.index_type == "ivf-flat")
             .unwrap();
-        let meta: std::collections::HashMap<String, String> = serde_json::from_slice(
-            vector
-                .index_file
-                .global_index_meta
-                .as_ref()
-                .unwrap()
-                .index_meta
-                .as_ref()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(meta["dimension"], "2");
-        assert_eq!(meta["metric"], "l2");
+        let meta = vector.index_file.global_index_meta.as_ref().unwrap();
+        assert_eq!(meta.index_meta.as_deref(), Some(b"{}".as_slice()));
+        let payload = table
+            .file_io()
+            .new_input(&index_path(&table, vector))
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let native = VectorIndexReader::open(Cursor::new(payload))
+            .unwrap()
+            .metadata();
+        assert_eq!(native.dimension, 2);
+        assert_eq!(native.metric, MetricType::L2);
         let result = table
             .new_vector_search_builder()
             .with_vector_column("embedding")
@@ -775,6 +787,33 @@ async fn vector_output_cannot_be_omitted_and_counts_non_null_vectors() {
     );
     assert_eq!(latest(&table).await.id(), 1);
     assert!(table.file_io().exists(&path).await.unwrap());
+    let payload = table
+        .file_io()
+        .new_input(&path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let mut mismatched = payload.to_vec();
+    // The native IVF-FLAT header stores the metric code at offset 16.
+    mismatched[16..20]
+        .copy_from_slice(&(paimon_vindex_core::distance::MetricType::Cosine as u32).to_le_bytes());
+    let output = table.file_io().new_output(&path).unwrap();
+    output.write(mismatched.into()).await.unwrap();
+    let error = builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("PK index output does not match complete compacted level"),
+        "{error}"
+    );
+    assert_eq!(latest(&table).await.id(), 1);
+    output.write(payload).await.unwrap();
     builder
         .new_commit()
         .unwrap()

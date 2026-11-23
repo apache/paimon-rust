@@ -23,19 +23,38 @@ use crate::table::Table;
 use crate::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Semaphore;
+
+#[derive(Debug)]
+pub(super) struct WatchedReads {
+    pub started: Semaphore,
+    pub release: Semaphore,
+}
 
 #[derive(Debug)]
 pub(super) struct MetadataIo {
     operator: opendal::Operator,
     watched: Mutex<BTreeMap<String, usize>>,
     observed: Mutex<BTreeSet<String>>,
+    pause: Mutex<Option<Arc<WatchedReads>>>,
 }
 #[async_trait::async_trait]
 impl FileIOProvider for MetadataIo {
     async fn create(&self, path: &str) -> Result<(opendal::Operator, String)> {
         self.observed.lock().unwrap().insert(path.into());
-        if let Some(reads) = self.watched.lock().unwrap().get_mut(path) {
-            *reads += 1;
+        let watched = self
+            .watched
+            .lock()
+            .unwrap()
+            .get_mut(path)
+            .is_some_and(|reads| {
+                *reads += 1;
+                true
+            });
+        let pause = self.pause.lock().unwrap().clone();
+        if let Some(pause) = pause.filter(|_| watched) {
+            pause.started.add_permits(1);
+            pause.release.acquire().await.unwrap().forget();
         }
         Ok((
             self.operator.clone(),
@@ -47,6 +66,15 @@ impl FileIOProvider for MetadataIo {
     }
 }
 impl MetadataIo {
+    pub fn pause_watched_reads(&self) -> Arc<WatchedReads> {
+        let pause = Arc::new(WatchedReads {
+            started: Semaphore::new(0),
+            release: Semaphore::new(0),
+        });
+        *self.pause.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+
     pub fn watch(&self, paths: Vec<String>) {
         *self.watched.lock().unwrap() = paths.into_iter().map(|path| (path, 0)).collect();
     }
@@ -63,6 +91,7 @@ pub(super) async fn table(schema: TableSchema) -> (Table, Arc<MetadataIo>) {
             .unwrap(),
         watched: Mutex::new(BTreeMap::new()),
         observed: Mutex::new(BTreeSet::new()),
+        pause: Mutex::new(None),
     });
     let io = FileIOBuilder::new("memory")
         .with_provider(counter.clone())

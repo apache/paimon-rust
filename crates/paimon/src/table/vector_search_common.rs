@@ -25,23 +25,34 @@ use crate::table::index_file_path::IndexFileLocation;
 use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
 use crate::table::read_builder::resolve_projected_fields;
 use crate::table::Table;
-use crate::vindex::is_vindex_index_type;
 use crate::vindex::range_reader::RangeIoStats;
+use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_select::interleave::interleave_record_batch;
+use bytes::{Buf, Bytes};
 use paimon_vindex_core::diskann_io::DISKANN_HEADER_SIZE;
 use paimon_vindex_core::distance::MetricType;
-use paimon_vindex_core::index::VectorIndexReader as VIndexReader;
+use paimon_vindex_core::index::{IndexType, VectorIndexReader as VIndexReader};
+use paimon_vindex_core::ivfsq_io::{IVF_SQ_BITS, IVF_SQ_HEADER_SIZE, IVF_SQ_MAGIC, IVF_SQ_VERSION};
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::{self, Cursor};
 
 pub(super) use super::partition_filter::validate_partition_filter;
 
 /// Persisted vector properties which must agree across all runs of one column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct IndexVectorSemantics {
+    pub index_type: IndexType,
     pub metric: MetricType,
     pub dimension: usize,
+}
+
+impl IndexVectorSemantics {
+    pub(super) fn matches_options(self, options: &VindexVectorIndexOptions) -> bool {
+        self.index_type.as_str() == options.native_options["index.type"]
+            && self.metric.as_str() == options.native_options["metric"]
+            && self.dimension == options.dimension()
+    }
 }
 
 /// Read the scoring metric from the centroid descriptor or the native file header.
@@ -100,7 +111,7 @@ async fn read_index_vector_header(
     read_vector_index_header(file_io, &path, entry.index_file.file_size.max(0) as u64).await
 }
 
-/// Read the metric and dimension from the native header of a selected index file.
+/// Read the index type, metric and dimension from a native vector index header.
 pub(super) async fn read_vector_index_header(
     file_io: &FileIO,
     path: &str,
@@ -114,27 +125,83 @@ pub(super) async fn read_vector_index_header(
         ),
         source: Some(Box::new(e)),
     };
-    let header_size = if file_size > 0 {
-        file_size.min(DISKANN_HEADER_SIZE as u64)
+    let file_size = if file_size > 0 {
+        file_size
     } else {
-        input
-            .metadata()
-            .await
-            .map_err(&read_error)?
-            .size
-            .min(DISKANN_HEADER_SIZE as u64)
+        input.metadata().await.map_err(&read_error)?.size
     };
-    let file_reader = input.reader().await.map_err(&read_error)?;
+    let header_size = file_size.min(DISKANN_HEADER_SIZE as u64);
+    let file_reader = input
+        .reader_with_size(file_size)
+        .await
+        .map_err(&read_error)?;
     let bytes = file_reader.read(0..header_size).await.map_err(read_error)?;
-    let reader = VIndexReader::open(Cursor::new(bytes)).map_err(|e| crate::Error::DataInvalid {
+    parse_vector_index_header(bytes, file_size).map_err(|e| crate::Error::DataInvalid {
         message: format!(
-            "Failed to open paimon-vindex-core reader for vector metric: {}",
-            e
+            "Failed to read native vector index metadata for '{}': {}",
+            path, e
         ),
         source: Some(Box::new(e)),
-    })?;
-    let metadata = reader.metadata();
+    })
+}
+
+fn parse_vector_index_header(bytes: Bytes, file_size: u64) -> io::Result<IndexVectorSemantics> {
+    // Opening an IVF-SQ reader also loads its quantizer sections. The fixed
+    // header carries the index properties needed for scoring and maintenance.
+    if bytes.starts_with(&IVF_SQ_MAGIC.to_le_bytes()) {
+        let header = bytes.get(..IVF_SQ_HEADER_SIZE).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated IVF-SQ header")
+        })?;
+        let mut fields = &header[4..36];
+        let version = fields.get_u32_le();
+        let dimension = fields.get_i32_le();
+        let nlist = fields.get_i32_le();
+        let code = fields.get_u32_le();
+        let total_vectors = fields.get_i64_le();
+        let bits = fields.get_u32_le();
+        let flags = fields.get_u32_le();
+        // IVF-SQ v1 requires delta IDs and blocked codes.
+        if version != IVF_SQ_VERSION
+            || dimension <= 0
+            || nlist <= 0
+            || total_vectors < 0
+            || bits != IVF_SQ_BITS
+            || flags != 0b11
+            || header[44..].iter().any(|&byte| byte != 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid IVF-SQ header",
+            ));
+        }
+        let metric = MetricType::from_code(code).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unknown metric type: {code}"),
+            )
+        })?;
+        let lists = nlist as u128;
+        let dimensions = dimension as u128;
+        let bounds_bytes = (lists + 1) * dimensions * 8;
+        let centroid_bytes = lists * dimensions * 4;
+        let offset_table_bytes = lists * 16;
+        let minimum_size =
+            IVF_SQ_HEADER_SIZE as u128 + bounds_bytes + centroid_bytes + offset_table_bytes;
+        if u128::from(file_size) < minimum_size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Truncated IVF-SQ metadata",
+            ));
+        }
+        return Ok(IndexVectorSemantics {
+            index_type: IndexType::IvfSq,
+            metric,
+            dimension: dimension as usize,
+        });
+    }
+    let metadata = VIndexReader::open(Cursor::new(bytes))?.metadata();
     Ok(IndexVectorSemantics {
+        index_type: metadata.index_type,
         metric: metadata.metric,
         dimension: metadata.dimension,
     })
@@ -797,10 +864,41 @@ mod tests {
                     .await
                     .unwrap(),
                 Some(IndexVectorSemantics {
+                    index_type: IndexType::IvfFlat,
                     metric: MetricType::L2,
                     dimension: 2,
                 })
             );
         }
+    }
+
+    #[test]
+    fn ivf_sq_header_rejects_incomplete_or_unsupported_metadata() {
+        let mut header = vec![0; IVF_SQ_HEADER_SIZE];
+        for (offset, value) in [
+            (0, IVF_SQ_MAGIC),
+            (4, IVF_SQ_VERSION),
+            (8, 128),
+            (12, 1),
+            (28, IVF_SQ_BITS),
+            (32, 0b11),
+        ] {
+            header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let minimum_size = 2640;
+        assert!(parse_vector_index_header(Bytes::from(header.clone()), minimum_size).is_ok());
+        assert_eq!(
+            parse_vector_index_header(Bytes::from(header.clone()), minimum_size - 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof,
+        );
+        header[32] = 0;
+        assert_eq!(
+            parse_vector_index_header(Bytes::from(header), minimum_size)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
     }
 }

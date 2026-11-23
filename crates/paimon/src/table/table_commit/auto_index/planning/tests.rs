@@ -161,3 +161,81 @@ async fn unchanged_logical_sources_reuse_runs_but_removed_rows_and_overlaps_are_
         &vec![RowRange::new(0, 1)]
     );
 }
+
+#[tokio::test]
+async fn vector_maintenance_bounds_header_reads_for_reusable_shards() {
+    use crate::spec::{ArrayType, DataType, FloatType, Schema, TableSchema};
+    use std::time::Duration;
+
+    let (_, _, data) = source(6).await;
+    let schema = Schema::builder()
+        .column(
+            "embedding",
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        )
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("global-index.enabled", "true")
+        .option("global-index.ivf-flat.index-columns", "embedding")
+        .option("global-index.row-count-per-shard", "2")
+        .option("global-index.thread-num", "2")
+        .option("ivf-flat.dimension", "2")
+        .option("ivf-flat.metric", "l2")
+        .build()
+        .unwrap();
+    let (table, reads) =
+        crate::table::maintenance_test_utils::table(TableSchema::new(0, &schema)).await;
+    let definition = definitions(&table).unwrap().pop().unwrap();
+    let payload = crate::table::vector_search_test_utils::build_vindex_segment_bytes("l2");
+    let mut indexes = Vec::new();
+    let mut paths = Vec::new();
+    for (shard, name) in [
+        "first.index",
+        "second.index",
+        "third.index",
+        "retired.index",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let start = shard as i64 * 2;
+        let mut file = entry(&data[0], name, start, start + 1);
+        file.index_file.index_type = "ivf-flat".into();
+        file.index_file.file_size = payload.len() as i64;
+        let path = format!("{}/index/{name}", table.location());
+        if shard < 3 {
+            table
+                .file_io()
+                .new_output(&path)
+                .unwrap()
+                .write(payload.clone().into())
+                .await
+                .unwrap();
+        }
+        indexes.push(file);
+        paths.push(path);
+    }
+    reads.watch(paths.clone());
+    let gate = reads.pause_watched_reads();
+    let maintenance = tokio::time::timeout(Duration::from_secs(5), async {
+        let release = async {
+            gate.started.acquire_many(2).await.unwrap().forget();
+            assert_eq!(reads.counts().values().sum::<usize>(), 2);
+            gate.release.add_permits(3);
+        };
+        tokio::join!(plan(&table, &definition, &data, &indexes), release).0
+    })
+    .await
+    .expect("maintenance must read two headers concurrently")
+    .unwrap();
+
+    assert!(!maintenance.needs_build);
+    assert_eq!(maintenance.deletions.len(), 1);
+    assert_eq!(
+        maintenance.deletions[0].deleted_index_files,
+        [indexes[3].index_file.clone()]
+    );
+    let counts = reads.counts();
+    assert!(paths[..3].iter().all(|path| counts[path] == 1));
+    assert_eq!(counts[&paths[3]], 0);
+}

@@ -23,7 +23,6 @@ use paimon_vindex_core::io::PosWriter;
 use paimon_vindex_core::ivfflat::IVFFlatIndex;
 use paimon_vindex_core::ivfflat_io::write_ivfflat_index;
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
 
 const ROOT: &str = "memory:/centroid-joint";
 const ROWS: usize = 192;
@@ -152,7 +151,7 @@ async fn run(
             top_ks: vec![],
         },
         VectorMetricCheck {
-            persisted: Arc::new(Mutex::new(None)),
+            state: Default::default(),
             requested: None,
         },
         RangeReadLimiter::new(2),

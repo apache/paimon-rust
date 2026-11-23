@@ -235,7 +235,10 @@ pub(super) async fn execute_work(
         &group.descriptor,
     )
     .await?;
-    metric_check.check(RawVectorMetric::from_vindex(router.metric))?;
+    metric_check.check(
+        VectorMetricCheck::file_key(&group.router.index_file),
+        RawVectorMetric::from_vindex(router.metric),
+    )?;
     if work
         .queries
         .iter()

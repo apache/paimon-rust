@@ -50,7 +50,7 @@ pub(crate) type ExactFileSearchFuture<'a> =
 ///
 /// `Clone` so one segment's search inputs can be moved into a dedicated global-index
 /// executor leaf (the ANN CPU search runs off the async worker). Cloning copies only
-/// the segment's addressing metadata (path, size, `index_meta`, source meta). Each
+/// the segment's addressing metadata and source metadata. Each
 /// leaf opens its own segment source lazily and drops it after scoring; vindex
 /// sources stay range-backed instead of holding the full index bytes.
 #[derive(Clone)]
@@ -62,7 +62,6 @@ pub(crate) struct BucketAnnSegment {
     pub file_size: u64,
     /// Indexed vectors; zero is Java's completed, empty source unit.
     pub row_count: i64,
-    pub index_meta: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -76,7 +75,6 @@ impl BucketAnnSegment {
             path: "seg".to_string(),
             file_size: 0,
             row_count: 1,
-            index_meta: Vec::new(),
         }
     }
 }
@@ -1635,7 +1633,6 @@ mod tests {
             path: "duplicate-path".to_string(),
             file_size: 100,
             row_count: 1,
-            index_meta: vec![1, 2, 3],
         };
         let seg2 = BucketAnnSegment {
             index_type: "ivf-flat".to_string(),
@@ -1643,7 +1640,6 @@ mod tests {
             path: "duplicate-path".to_string(),
             file_size: 200,
             row_count: 1,
-            index_meta: vec![4, 5, 6],
         };
         let ann = FakeAnnSearcher { result: vec![] };
         let factory = unreachable_search();
@@ -1679,7 +1675,6 @@ mod tests {
             path: "segment-1".to_string(),
             file_size: 100,
             row_count: 1,
-            index_meta: vec![1, 2, 3],
         };
         let seg2 = BucketAnnSegment {
             index_type: "ivf-flat".to_string(),
@@ -1687,7 +1682,6 @@ mod tests {
             path: "segment-2".to_string(),
             file_size: 200,
             row_count: 1,
-            index_meta: vec![4, 5, 6],
         };
         let ann = FakeAnnSearcher { result: vec![] };
         let factory = unreachable_search();
@@ -2627,7 +2621,6 @@ mod tests {
                 path: format!("seg-{i}"),
                 file_size: 0,
                 row_count: 1,
-                index_meta: Vec::new(),
             });
             actives.push(active(&src, 2));
         }
@@ -2792,7 +2785,6 @@ mod tests {
             path: "seg-1".to_string(),
             file_size: 0,
             row_count: 1,
-            index_meta: Vec::new(),
         };
         let searcher: Arc<dyn PkVectorAnnSearcher> = probe;
         let factory = unreachable_search();
@@ -3277,7 +3269,6 @@ mod tests {
             path: "seg-a".to_string(),
             file_size: 0,
             row_count: 1,
-            index_meta: Vec::new(),
         };
         let seg_b = BucketAnnSegment {
             index_type: "ivf-flat".to_string(),
@@ -3285,7 +3276,6 @@ mod tests {
             path: "seg-b".to_string(),
             file_size: 0,
             row_count: 1,
-            index_meta: Vec::new(),
         };
         let factory = unreachable_search();
         bucket_search(

@@ -397,11 +397,8 @@ async fn search_pk_raw_candidates_batch_with_plan(
 
     let scorer: crate::vindex::pkvector::ann::SourceBatchScorer = Box::new(
         move |segment: &BucketAnnSegment, source: AnnSegmentSource, searches: &[VectorSearch]| {
-            let io_meta = GlobalIndexIOMeta::new(
-                segment.path.clone(),
-                segment.file_size,
-                segment.index_meta.clone(),
-            );
+            let io_meta =
+                GlobalIndexIOMeta::new(segment.path.clone(), segment.file_size, Vec::new());
             match source {
                 AnnSegmentSource::Vindex(source) => {
                     let range_io_stats = source.range_io_stats();

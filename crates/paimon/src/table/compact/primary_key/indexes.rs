@@ -78,7 +78,8 @@ pub(in crate::table::compact) async fn prepare(
         &unsupported,
         &task.partition,
         task.bucket,
-    )?;
+    )
+    .await?;
     let vector_levels = maintenance
         .builds
         .iter()
