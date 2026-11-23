@@ -107,6 +107,16 @@ async fn centroid_build_replaces_selected_range_files_and_is_queryable() {
     let indexed = active_entries(&table).await;
     let groups = centroid_index::group(&indexed).unwrap();
     assert_eq!(groups.len(), 1);
+    let router_meta = groups[0]
+        .router
+        .index_file
+        .global_index_meta
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        router_meta.index_meta.as_deref().unwrap(),
+        b"PAIMCENT\x01R\0\0\0\x02l2"
+    );
     assert!(groups
         .iter()
         .all(|group| group.shards.len() == 2 && group.vector_count == 8));

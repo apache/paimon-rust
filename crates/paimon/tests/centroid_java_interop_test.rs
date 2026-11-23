@@ -76,7 +76,7 @@ fn descriptor(file: &IndexFileMeta) -> &[u8] {
         .as_deref()
         .unwrap();
     assert_eq!(&bytes[..8], b"PAIMCENT");
-    assert_eq!(bytes[9], 1);
+    assert_eq!(bytes[8], 1);
     bytes
 }
 
@@ -136,23 +136,23 @@ async fn reads_java_centroid_manifest_and_single_bitmap_across_schema_evolution(
     assert_eq!(files.len(), 5);
     let empty_router = files
         .iter()
-        .find(|file| descriptor(file)[8] == b'R' && file.file_size == 0)
+        .find(|file| descriptor(file)[9] == b'R' && file.file_size == 0)
         .unwrap();
     assert_eq!(&descriptor(empty_router)[10..], b"\0\0\0\0l2");
     let empty_shard = files
         .iter()
-        .find(|file| descriptor(file)[8] == b'S' && file.row_count == 0)
+        .find(|file| descriptor(file)[9] == b'S' && file.row_count == 0)
         .unwrap();
     assert_eq!(descriptor(empty_shard).len(), 14);
     assert_eq!(empty_shard.file_size, 8);
     let shard = files
         .iter()
-        .find(|file| descriptor(file)[8] == b'S' && file.row_count > 0)
+        .find(|file| descriptor(file)[9] == b'S' && file.row_count > 0)
         .unwrap();
     assert_eq!(&descriptor(shard)[14..], &1i32.to_be_bytes());
     let bitmap = files
         .iter()
-        .find(|file| descriptor(file)[8] == b'B')
+        .find(|file| descriptor(file)[9] == b'B')
         .unwrap();
     assert_eq!(descriptor(bitmap).len(), 14);
     assert_eq!(&descriptor(bitmap)[10..14], &descriptor(shard)[10..14]);
@@ -235,7 +235,7 @@ async fn reads_java_centroid_metrics_and_ivf_pq_geometry() {
         let files = index_files(&table, column).await;
         let router = files
             .iter()
-            .find(|file| descriptor(file)[8] == b'R')
+            .find(|file| descriptor(file)[9] == b'R')
             .unwrap();
         assert_eq!(&descriptor(router)[14..], metric);
         let native = table
@@ -254,7 +254,7 @@ async fn reads_java_centroid_metrics_and_ivf_pq_geometry() {
         let mut populated = 0;
         for shard in files
             .iter()
-            .filter(|file| descriptor(file)[8] == b'S' && file.row_count > 0)
+            .filter(|file| descriptor(file)[9] == b'S' && file.row_count > 0)
         {
             populated += 1;
             if column == "pq" {

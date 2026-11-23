@@ -79,14 +79,14 @@ impl<'a> Descriptor<'a> {
                 file.file_name
             ))
         };
-        if bytes.len() < META_HEADER || bytes[9] != META_VERSION {
+        if bytes.len() < META_HEADER || bytes[8] != META_VERSION {
             return Err(invalid());
         }
         let count = read_u32(bytes, 10, true);
         if count > i32::MAX as u32 {
             return Err(invalid());
         }
-        let role = match bytes[8] {
+        let role = match bytes[9] {
             b'R' => Role::Router(count as usize),
             b'S' => Role::Shard(count as usize),
             b'B' => Role::Bitmap(count as usize),
@@ -109,7 +109,7 @@ impl<'a> Descriptor<'a> {
         let payload = self.payload.unwrap_or_default();
         let mut bytes = Vec::with_capacity(META_HEADER + payload.len());
         bytes.extend_from_slice(META_MAGIC);
-        bytes.extend([role, META_VERSION]);
+        bytes.extend([META_VERSION, role]);
         bytes.extend(count.to_be_bytes());
         bytes.extend_from_slice(payload);
         Ok(bytes)
