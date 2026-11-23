@@ -43,13 +43,17 @@ const MAX_CACHED_VARIANT_METADATA_TOTAL_BYTES: usize = 1024 * 1024;
 const MAX_CACHED_VARIANT_METADATA_ENTRIES: usize = 16;
 const MAX_REBUILD_METADATA_ENTRIES: usize = 8;
 const MAX_REBUILD_METADATA_BYTES: usize = 8 * 1024 * 1024;
+// Compact rebuild validation is only cached for source dictionaries above this size.
+const MIN_SPARSE_REBUILD_METADATA_BYTES: usize = 4 * 1024;
 // Compact output needs only validation, not a decoded key map. Keep these raw
 // dictionaries separately so rotating sparse rows do not thrash the TLS cache.
-const MAX_COMPACT_METADATA_ENTRIES: usize = 16;
 const MAX_COMPACT_METADATA_BYTES: usize = 2 * 1024 * 1024;
+// Let the byte budget, rather than an arbitrary small entry count, bound wide
+// dictionaries. This cap only matters for callers caching smaller metadata.
+const MAX_COMPACT_METADATA_ENTRIES: usize =
+    MAX_COMPACT_METADATA_BYTES / MIN_SPARSE_REBUILD_METADATA_BYTES;
 // A shared dictionary is useful for wide objects, but copying it into every
 // sparse result costs more than remapping the keys actually present.
-const MIN_SPARSE_REBUILD_METADATA_BYTES: usize = 4 * 1024;
 const SPARSE_REBUILD_KEY_RATIO: usize = 8;
 const MAX_SPARSE_REBUILD_SCAN_NODES: usize = 4096;
 
@@ -4790,7 +4794,7 @@ mod tests {
         let small = GenericVariant::parse_json(r#"{"age":27}"#).unwrap();
         let mut row = cast_shredded(&small, &schema).unwrap();
         assert!(row.field(schema.variant_idx.unwrap()).is_none());
-        let dictionaries = (0..9)
+        let dictionaries = (0..17)
             .map(|suffix| {
                 let extra = (0..5362)
                     .map(|key| format!(r#", "unused_{suffix}_{key:04}_field":0"#))
@@ -4806,11 +4810,11 @@ mod tests {
         assert!(total <= MAX_COMPACT_METADATA_BYTES);
         let mut cache = RebuildMetadataCache::default();
         for i in 0..512 {
-            row.set(0, ShreddedValue::Binary(dictionaries[i % 9].clone()))
+            row.set(0, ShreddedValue::Binary(dictionaries[i % 17].clone()))
                 .unwrap();
             VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
             let rebuilt = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap();
-            if i >= 9 {
+            if i >= 17 {
                 // A miss would validate and populate the thread-local cache.
                 // This asserts reuse, independent of timing or machine speed.
                 VALIDATED_METADATA.with(|cached| assert!(cached.borrow().is_empty()));
@@ -4819,7 +4823,7 @@ mod tests {
             assert!(rebuilt.metadata().len() < 128);
         }
         assert!(cache.entries.is_empty());
-        assert_eq!(cache.validated.len(), 9);
+        assert_eq!(cache.validated.len(), 17);
         assert_eq!(cache.validated_bytes, total);
     }
 
