@@ -1157,11 +1157,11 @@ impl<'a> CoreOptions<'a> {
     /// `CoreOptions.GLOBAL_INDEX_THREAD_NUM` (key `global-index.thread-num`,
     /// default 32). Used as the per-operation fan-out limit for sorted BTree and
     /// bitmap shard reads, global-index vector search, and primary-key vector
-    /// search. Vindex file range reads use
-    /// [`Self::global_index_vindex_read_thread_num`] instead. A value of `1`
-    /// makes these search tasks sequential, but does not serialize Vindex range
-    /// reads. A non-positive value, or one above [`MAX_GLOBAL_INDEX_THREAD_NUM`],
-    /// is a misconfiguration and fails loud rather than being silently clamped.
+    /// search. Also limits retained vector index checks across all buckets in
+    /// one automatic primary-key compaction round, including header reads and
+    /// storage metadata checks. Vindex file range reads during search use
+    /// [`Self::global_index_vindex_read_thread_num`]. A non-positive value, or
+    /// one above [`MAX_GLOBAL_INDEX_THREAD_NUM`], is a misconfiguration.
     pub fn global_index_thread_num(&self) -> crate::Result<usize> {
         let value = self
             .parse_i64_option(GLOBAL_INDEX_THREAD_NUM_OPTION)?

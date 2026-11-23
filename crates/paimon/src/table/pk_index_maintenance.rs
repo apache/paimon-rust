@@ -183,8 +183,8 @@ async fn compatible(
         .resolve(&file.file_name, file.external_path.as_deref());
         let file_size = file.file_size.max(0) as u64;
         let persisted = if let Some(limit) = retained_header_reads {
-            // All buckets in one automatic round share this limit, including
-            // any length checks needed after an ambiguous storage failure.
+            // All buckets in one automatic round share the limit for header
+            // reads and storage metadata checks.
             let _permit = limit
                 .acquire()
                 .await

@@ -17,7 +17,7 @@
 
 //! Shared vector-search option validation, index I/O helpers, and result ordering.
 
-use crate::io::{FileIO, FileRead, InputFile};
+use crate::io::{FileIO, InputFile};
 use crate::spec::{
     CoreOptions, DataField, FileKind, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
 };
@@ -123,9 +123,11 @@ pub(super) async fn read_vector_index_header(
     file_size: u64,
 ) -> crate::Result<IndexVectorSemantics> {
     let input = file_io.new_input(path)?;
-    load_vector_index_header(&input, file_size)
+    let header = read_vector_index_header_bytes(&input, file_size)
         .await
-        .map_err(|error| error.with_path(path))
+        .map_err(|error| vector_header_read_error(path, error))?;
+    parse_vector_index_header(header.bytes, header.expected_size)
+        .map_err(|error| vector_header_format_error(path, error))
 }
 
 /// A missing or malformed retained payload can be rebuilt from its live sources.
@@ -135,108 +137,124 @@ pub(super) async fn read_retained_vector_index_header(
     file_size: u64,
 ) -> crate::Result<Option<IndexVectorSemantics>> {
     let input = file_io.new_input(path)?;
-    let error = match load_vector_index_header(&input, file_size).await {
-        Ok(header) => return Ok(Some(header)),
-        Err(error) => error,
+    let header = match read_vector_index_header_bytes(&input, file_size).await {
+        Ok(header) => header,
+        Err(error) => {
+            let check_size = match &error {
+                crate::Error::IoUnexpected { source, .. } if !source.is_temporary() => {
+                    if source.is_permanent() && source.kind() == opendal::ErrorKind::NotFound {
+                        return Ok(None);
+                    }
+                    // Retry layers mark terminal errors as persistent, including 404s.
+                    matches!(
+                        source.kind(),
+                        opendal::ErrorKind::NotFound
+                            | opendal::ErrorKind::RangeNotSatisfied
+                            | opendal::ErrorKind::Unexpected
+                    )
+                }
+                // A cached reader can report a short source block as DataInvalid.
+                crate::Error::DataInvalid { .. } => true,
+                _ => false,
+            };
+            if check_size
+                && stat_retained_vector_index_size(&input)
+                    .await
+                    .is_ok_and(|size| size.is_none_or(|size| size < file_size))
+            {
+                return Ok(None);
+            }
+            return Err(vector_header_read_error(path, error));
+        }
     };
-    let check_size = match &error {
-        VectorHeaderError::Format(error)
+    // With an unknown total in Content-Range, OpenDAL may report the length
+    // of the response fragment. Confirm a potentially short object with stat.
+    let object_size = match header
+        .reported_size
+        .filter(|&size| size >= header.expected_size)
+    {
+        Some(size) => Some(size),
+        None => stat_retained_vector_index_size(&input)
+            .await
+            .map_err(|error| vector_header_read_error(path, error))?,
+    };
+    if object_size.is_none_or(|size| size < header.expected_size) {
+        return Ok(None);
+    }
+    match parse_vector_index_header(header.bytes, header.expected_size) {
+        Ok(header) => Ok(Some(header)),
+        Err(error)
             if matches!(
                 error.kind(),
                 io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
             ) =>
         {
-            return Ok(None);
+            Ok(None)
         }
-        VectorHeaderError::Storage(crate::Error::IoUnexpected { source, .. })
-            if !source.is_temporary() =>
+        Err(error) => Err(vector_header_format_error(path, error)),
+    }
+}
+
+async fn stat_retained_vector_index_size(input: &InputFile) -> crate::Result<Option<u64>> {
+    match input.metadata().await {
+        Ok(status) => Ok((!status.is_dir).then_some(status.size)),
+        Err(crate::Error::IoUnexpected { source, .. })
+            if !source.is_temporary() && source.kind() == opendal::ErrorKind::NotFound =>
         {
-            if source.is_permanent() && source.kind() == opendal::ErrorKind::NotFound {
-                return Ok(None);
-            }
-            // Retry layers mark terminal errors as persistent, including 404s.
-            // Confirm a persistent missing or short object with a stat.
-            matches!(
-                source.kind(),
-                opendal::ErrorKind::NotFound
-                    | opendal::ErrorKind::RangeNotSatisfied
-                    | opendal::ErrorKind::Unexpected
-            )
+            Ok(None)
         }
-        // A cached reader can report a short source block as DataInvalid.
-        VectorHeaderError::Storage(crate::Error::DataInvalid { .. }) => true,
-        _ => false,
-    };
-    if check_size {
-        match input.metadata().await {
-            Ok(status) if status.size < file_size => return Ok(None),
-            Err(crate::Error::IoUnexpected { source, .. })
-                if !source.is_temporary() && source.kind() == opendal::ErrorKind::NotFound =>
-            {
-                return Ok(None);
-            }
-            _ => {}
-        }
-    }
-    Err(error.with_path(path))
-}
-
-enum VectorHeaderError {
-    Storage(crate::Error),
-    Format(io::Error),
-}
-
-impl VectorHeaderError {
-    fn with_path(self, path: &str) -> crate::Error {
-        match self {
-            Self::Storage(error) => crate::Error::DataInvalid {
-                message: format!(
-                    "Failed to read vindex index file '{path}' for vector metric: {error}"
-                ),
-                source: Some(Box::new(error)),
-            },
-            Self::Format(error) => crate::Error::DataInvalid {
-                message: format!(
-                    "Failed to read native vector index metadata for '{path}': {error}"
-                ),
-                source: Some(Box::new(error)),
-            },
-        }
+        Err(error) => Err(error),
     }
 }
 
-async fn load_vector_index_header(
+fn vector_header_read_error(path: &str, error: crate::Error) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: format!("Failed to read vindex index file '{path}' for vector metric: {error}"),
+        source: Some(Box::new(error)),
+    }
+}
+
+fn vector_header_format_error(path: &str, error: io::Error) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: format!("Failed to read native vector index metadata for '{path}': {error}"),
+        source: Some(Box::new(error)),
+    }
+}
+
+struct VectorIndexHeaderBytes {
+    bytes: Bytes,
+    expected_size: u64,
+    reported_size: Option<u64>,
+}
+
+async fn read_vector_index_header_bytes(
     input: &InputFile,
     file_size: u64,
-) -> Result<IndexVectorSemantics, VectorHeaderError> {
-    let file_size = if file_size > 0 {
-        file_size
+) -> crate::Result<VectorIndexHeaderBytes> {
+    let stat_size = if file_size == 0 {
+        Some(input.metadata().await?.size)
     } else {
-        input
-            .metadata()
-            .await
-            .map_err(VectorHeaderError::Storage)?
-            .size
+        None
     };
+    let file_size = stat_size.unwrap_or(file_size);
     let header_size = file_size.min(DISKANN_HEADER_SIZE as u64);
-    let file_reader = input
-        .reader_with_size(file_size)
-        .await
-        .map_err(VectorHeaderError::Storage)?;
-    let bytes = file_reader
-        .read(0..header_size)
-        .await
-        .map_err(VectorHeaderError::Storage)?;
+    let (bytes, reported_size) = input
+        .read_range_with_reported_size(0..header_size, file_size)
+        .await?;
     if bytes.len() < header_size as usize {
-        return Err(VectorHeaderError::Storage(crate::Error::DataInvalid {
+        return Err(crate::Error::DataInvalid {
             message: format!(
                 "Short vector index header read, expected {header_size} bytes, received {}",
                 bytes.len()
             ),
             source: None,
-        }));
+        });
     }
-    parse_vector_index_header(bytes, file_size).map_err(VectorHeaderError::Format)
+    Ok(VectorIndexHeaderBytes {
+        bytes,
+        expected_size: file_size,
+        reported_size: reported_size.or(stat_size),
+    })
 }
 
 fn parse_vector_index_header(bytes: Bytes, file_size: u64) -> io::Result<IndexVectorSemantics> {
@@ -1051,6 +1069,76 @@ mod tests {
                 .contains("Unsupported vector index version"),
             "{error}"
         );
+    }
+
+    #[cfg(all(feature = "storage-oss", feature = "storage-fs"))]
+    #[tokio::test]
+    async fn retained_vector_header_uses_the_total_from_range_responses() {
+        use axum::body::Body;
+        use axum::http::{header, HeaderMap, Method, Response, StatusCode, Uri};
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut payload = crate::table::vector_search_test_utils::build_vindex_segment_bytes("l2");
+        // The fixture needs an object larger than the requested header range.
+        payload.resize(512, 0);
+        let size = payload.len() as u64;
+        let prefix = Bytes::from(payload).slice(..256);
+        let stats = Arc::new(AtomicUsize::new(0));
+        let server_stats = stats.clone();
+        let app = Router::new().fallback(move |method: Method, uri: Uri, headers: HeaderMap| {
+            let stats = server_stats.clone();
+            let prefix = prefix.clone();
+            async move {
+                if method == Method::HEAD {
+                    stats.fetch_add(1, Ordering::Relaxed);
+                    return Response::builder()
+                        .header(header::CONTENT_LENGTH, size)
+                        .body(Body::empty())
+                        .unwrap();
+                }
+                assert_eq!(method, Method::GET);
+                assert_eq!(headers[header::RANGE], "bytes=0-255");
+                let content_range = if uri.path().ends_with("/full.index") {
+                    format!("bytes 0-255/{size}")
+                } else {
+                    "bytes 0-255/*".into()
+                };
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_RANGE, content_range)
+                    .header(header::CONTENT_LENGTH, prefix.len())
+                    .body(Body::from(prefix))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = opendal_service_oss::OssConfig::default();
+        config.endpoint = Some(format!("http://{address}"));
+        config.bucket = "bucket".into();
+        config.addressing_style = Some("path".into());
+        config.skip_signature = true;
+        let transport = opendal::HttpTransporter::new(
+            opendal_http_transport_reqwest::ReqwestTransport::default(),
+        );
+        let operator = opendal::Operator::from_config(config)
+            .unwrap()
+            .with_context(opendal::OperationContext::new().with_http_transport(transport));
+        let io = FileIOBuilder::new("file")
+            .with_fs_operator(operator)
+            .build()
+            .unwrap();
+        for (path, expected_stats) in [("/full.index", 0), ("/partial.index", 1)] {
+            let header = read_retained_vector_index_header(&io, path, size)
+                .await
+                .unwrap();
+            assert_eq!(header.unwrap().index_type, IndexType::IvfFlat, "{path}");
+            assert_eq!(stats.load(Ordering::Relaxed), expected_stats, "{path}");
+        }
+        server.abort();
     }
 
     #[cfg(all(

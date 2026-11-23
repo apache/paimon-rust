@@ -1454,6 +1454,7 @@ enum InputFileReader {
     },
     Cached {
         reader: CachedFileReader,
+        source: opendal::Reader,
         cache_key: String,
         file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
         blob_index_cache: Arc<BlobIndexCacheContext>,
@@ -1834,7 +1835,27 @@ impl InputFile {
         self.reader_with_size_hint(Some(size)).await
     }
 
-    async fn reader_with_size_hint(&self, size: Option<u64>) -> crate::Result<impl FileRead> {
+    /// Read a range and return the size reported by the storage reader, if present.
+    /// A cache hit leaves the fresh storage reader unopened.
+    pub(crate) async fn read_range_with_reported_size(
+        &self,
+        range: Range<u64>,
+        size_hint: u64,
+    ) -> crate::Result<(Bytes, Option<u64>)> {
+        let reader = self.reader_with_size_hint(Some(size_hint)).await?;
+        let bytes = reader.read(range).await?;
+        let source = match &reader {
+            InputFileReader::Direct { reader, .. } => reader,
+            InputFileReader::Cached { source, .. } => source,
+        };
+        let reported_size = source
+            .metadata()
+            .filter(|meta| meta.is_file())
+            .map(opendal::Metadata::content_length);
+        Ok((bytes, reported_size))
+    }
+
+    async fn reader_with_size_hint(&self, size: Option<u64>) -> crate::Result<InputFileReader> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let cache_key = cache_path.as_ref().map(|path| {
             if op.info().scheme() == "memory" {
@@ -1867,12 +1888,13 @@ impl InputFile {
         };
         Ok(InputFileReader::Cached {
             reader: CachedFileReader::new_with_token(
-                Arc::new(reader),
+                Arc::new(reader.clone()),
                 cache_path.as_str(),
                 size,
                 cache.clone(),
                 read_token,
             ),
+            source: reader,
             cache_key: cache_key.unwrap(),
             file_format_metadata_cache: Arc::clone(&self.file_format_metadata_cache),
             blob_index_cache: Arc::clone(&self.blob_index_cache),
@@ -2177,6 +2199,32 @@ mod file_action_test {
 
     fn setup_memory_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_range_reports_live_object_size_only_on_storage_reads() {
+        let io = FileIOBuilder::new("memory")
+            .with_prop(CatalogOptions::LOCAL_CACHE_ENABLED, "true")
+            .with_prop(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4")
+            .build()
+            .unwrap();
+        let path = "memory:/range-object-size/snapshot-1";
+        let bytes = Bytes::from_static(b"abcdefgh");
+        io.new_output(path)
+            .unwrap()
+            .write(bytes.clone())
+            .await
+            .unwrap();
+        let input = io.new_input(path).unwrap();
+        let (prefix, object_size) = input.read_range_with_reported_size(0..4, 12).await.unwrap();
+        assert_eq!(prefix, bytes.slice(..4));
+        assert_eq!(object_size, Some(8));
+
+        // Warm all blocks before checking the cache hit with a fresh reader.
+        assert_eq!(input.read().await.unwrap(), bytes);
+        let (prefix, object_size) = input.read_range_with_reported_size(0..4, 12).await.unwrap();
+        assert_eq!(prefix, bytes.slice(..4));
+        assert_eq!(object_size, None);
     }
 
     #[tokio::test]

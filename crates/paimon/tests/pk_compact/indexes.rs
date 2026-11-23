@@ -168,6 +168,10 @@ async fn unified_index_config_drives_pk_compaction_and_ranked_reads() {
 }
 
 async fn vector_table_for_indexes(options: &[(&str, &str)]) -> Table {
+    table_with_schema(vector_schema_for_indexes(options)).await
+}
+
+fn vector_schema_for_indexes(options: &[(&str, &str)]) -> TableSchema {
     use paimon::spec::{ArrayType, FloatType};
     let mut schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
@@ -190,7 +194,7 @@ async fn vector_table_for_indexes(options: &[(&str, &str)]) -> Table {
     for (key, value) in options {
         schema = schema.option(*key, *value);
     }
-    table_with_schema(TableSchema::new(0, &schema.build().unwrap())).await
+    TableSchema::new(0, &schema.build().unwrap())
 }
 
 fn vector_index_batch(ids: Vec<i32>, values: Vec<Option<[f32; 2]>>) -> RecordBatch {
@@ -305,7 +309,7 @@ async fn explicit_nlist_changes_rebuild_retained_pk_indexes() {
 
 #[tokio::test]
 async fn missing_or_damaged_retained_pk_vector_indexes_are_rebuilt() {
-    for damage in ["missing", "truncated", "invalid-header"] {
+    for damage in ["missing", "truncated", "truncated-tail", "invalid-header"] {
         let table = vector_table_for_indexes(&[]).await;
         let old = seed_vector_history(&table).await;
         let path = index_path(&table, &old);
@@ -320,11 +324,17 @@ async fn missing_or_damaged_retained_pk_vector_indexes_are_rebuilt() {
                 .await
                 .unwrap()
                 .to_vec();
-            if damage == "truncated" {
-                payload.truncate(31);
-            } else {
-                // Keep the native version and file size, but invalidate the metric code.
-                payload[16..20].fill(0xff);
+            match damage {
+                "truncated" => payload.truncate(31),
+                "truncated-tail" => {
+                    assert!(payload.len() > 256);
+                    // Leave the entire range used for reading the header intact.
+                    payload.truncate(256);
+                }
+                _ => {
+                    // Keep the native version and file size, but invalidate the metric code.
+                    payload[16..20].fill(0xff);
+                }
             }
             table
                 .file_io()
@@ -353,6 +363,51 @@ async fn missing_or_damaged_retained_pk_vector_indexes_are_rebuilt() {
             .await
             .unwrap());
     }
+}
+
+#[cfg(feature = "storage-fs")]
+#[tokio::test]
+async fn cached_header_does_not_hide_a_missing_retained_pk_vector_index() {
+    let directory = tempfile::tempdir().unwrap();
+    let table = table_with_cache_at(
+        vector_schema_for_indexes(&[]),
+        directory.path().join("table").to_str().unwrap().into(),
+        &[
+            ("local-cache.whitelist", "meta,file-index"),
+            (
+                "local-cache.dir",
+                directory.path().join("cache").to_str().unwrap(),
+            ),
+        ],
+    )
+    .await;
+    let old = seed_vector_history(&table).await;
+    let path = index_path(&table, &old);
+    let input = table.file_io().new_input(&path).unwrap();
+    let cached = input.read().await.unwrap();
+    // Simulate deletion by another process without going through this cache.
+    std::fs::remove_file(&path).unwrap();
+    assert!(!input.exists().await.unwrap());
+    assert_eq!(input.read().await.unwrap(), cached);
+
+    write_vector_range(&table, 1000..1004).await;
+    compact(&table).await;
+    let active = indexes(&table).await;
+    assert_eq!(active.len(), 2);
+    assert!(!active.contains(&old));
+    let rebuilt = active
+        .iter()
+        .find(|entry| entry.index_file.row_count == 1000)
+        .unwrap();
+    assert_eq!(
+        rebuilt.index_file.global_index_meta,
+        old.index_file.global_index_meta
+    );
+    assert!(table
+        .file_io()
+        .exists(&index_path(&table, rebuilt))
+        .await
+        .unwrap());
 }
 
 #[tokio::test]
