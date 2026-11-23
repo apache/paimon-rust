@@ -20,6 +20,7 @@ use crate::io::{FileIO, FileIOBuilder};
 use crate::spec::{BinaryRow, FileKind, GlobalIndexMeta, IndexFileMeta, VectorIndexOptions};
 use crate::table::vector_search_test_utils::{vector_search_log_start, vector_search_logs_since};
 use crate::vector_search::GlobalIndexIOMeta;
+use paimon_vindex_core::index::{CentroidRouter, VectorIndexConfig, VectorIndexTrainer};
 use paimon_vindex_core::io::PosWriter;
 use paimon_vindex_core::ivfflat::IVFFlatIndex;
 use paimon_vindex_core::ivfflat_io::write_ivfflat_index;
@@ -178,13 +179,18 @@ async fn run(
 #[tokio::test]
 async fn joint_routes_use_four_shards_with_or_without_manifest_geometry() {
     let io = FileIOBuilder::new("memory").build().unwrap();
-    let router = Router::new(
-        MetricType::L2,
-        1,
-        (0..64).map(|i| i as f32 * 10.0).collect(),
-    )
+    let config = VectorIndexConfig::from_options(&HashMap::from([
+        ("index.type".into(), "ivf_flat".into()),
+        ("dimension".into(), "1".into()),
+        ("metric".into(), "l2".into()),
+        ("nlist".into(), "64".into()),
+    ]))
     .unwrap();
-    let bytes = router.encode("test-router").unwrap();
+    let centers = (0..64).map(|i| i as f32 * 10.0).collect::<Vec<_>>();
+    let training = VectorIndexTrainer::train(config, &centers, centers.len()).unwrap();
+    let router = CentroidRouter::from_training(training).unwrap();
+    let mut bytes = centroid_index::encode_router_envelope("test-router").unwrap();
+    bytes.extend(router.serialize());
     let router_entry = entry(Role::Router(64), bytes.len(), 0, None);
     store(&io, &router_entry, bytes).await;
     let mut entries = vec![router_entry];

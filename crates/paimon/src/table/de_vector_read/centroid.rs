@@ -264,11 +264,11 @@ pub(super) async fn execute_work(
     if work
         .queries
         .iter()
-        .any(|query| query.vector.len() != router.dimension)
+        .any(|query| query.vector.len() != router.model.dimension())
     {
         return Err(centroid_index::invalid(format!(
             "Query vector dimension mismatch: centroid router expects {}",
-            router.dimension
+            router.model.dimension()
         )));
     }
 
@@ -377,7 +377,7 @@ impl RoutedSearch<'_> {
     ) -> Result<Vec<ScoredRowIds>> {
         let group = self.group;
         let router = self.router;
-        let nlist = router.nlist();
+        let nlist = router.model.nlist();
         let explicit_width = self.explicit_width;
         let mut routes = Vec::with_capacity(queries.len());
         for search in queries {
@@ -404,7 +404,10 @@ impl RoutedSearch<'_> {
             } else if explicit_width.is_none() && router.metric == MetricType::InnerProduct {
                 (0..nlist).collect()
             } else {
-                router.nearest(&search.vector)?
+                router
+                    .model
+                    .find_nearest_centroids(&search.vector, explicit_width.unwrap_or(nlist))
+                    .map_err(centroid_index::router_error)?
             };
             routes.push(Route {
                 nearest,

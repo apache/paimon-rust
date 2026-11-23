@@ -21,17 +21,14 @@ use super::index_file_path::IndexFileLocation;
 use crate::io::{FileIO, FileRead};
 use crate::spec::{IndexFileMeta, IndexManifestEntry};
 use crate::{Error, Result};
-use paimon_vindex_core::distance::{fvec_l2sqr, fvec_normalize, MetricType};
+use paimon_vindex_core::distance::MetricType;
+use paimon_vindex_core::index::CentroidRouter;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
 const META_MAGIC: &[u8; 8] = b"PAIMCENT";
 const META_HEADER: usize = 22;
-const ROUTER_MAGIC: &[u8; 8] = b"PVROUT01";
-const ROUTER_HEADER: usize = 20;
 const MAX_ENVELOPE: usize = 65536;
-const MAX_CENTERS_BYTES: usize = 512 * 1024 * 1024;
 pub(super) const EMPTY_SHARD: &[u8] = b"PCEMPTY1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -301,60 +298,25 @@ struct Envelope<'a> {
     model_id: &'a str,
 }
 
+pub(super) fn encode_router_envelope(model_id: &str) -> Result<Vec<u8>> {
+    let header = serde_json::to_vec(&Envelope {
+        version: 1,
+        shard_mode: "centroid-based",
+        model_id,
+    })
+    .map_err(|error| invalid(format!("Cannot encode centroid router envelope: {error}")))?;
+    let mut bytes = Vec::with_capacity(4 + header.len());
+    bytes.extend((header.len() as u32).to_be_bytes());
+    bytes.extend(&header);
+    Ok(bytes)
+}
+
 pub(super) struct Router {
     pub(super) metric: MetricType,
-    pub(super) dimension: usize,
-    centers: Vec<f32>,
+    pub(super) model: CentroidRouter,
 }
 
 impl Router {
-    pub(super) fn new(metric: MetricType, dimension: usize, centers: Vec<f32>) -> Result<Self> {
-        if dimension == 0
-            || dimension > i32::MAX as usize
-            || !centers.len().is_multiple_of(dimension)
-            || centers.is_empty()
-            || centers.len() > MAX_CENTERS_BYTES / 4
-            || centers.iter().any(|value| !value.is_finite())
-        {
-            return Err(invalid("Invalid centroid routing centers or dimensions"));
-        }
-        Ok(Self {
-            metric,
-            dimension,
-            centers,
-        })
-    }
-
-    pub(super) fn nlist(&self) -> usize {
-        self.centers.len() / self.dimension
-    }
-
-    pub(super) fn encode(&self, model_id: &str) -> Result<Vec<u8>> {
-        let mut bytes = Self::encode_empty(model_id)?;
-        bytes.reserve(ROUTER_HEADER + self.centers.len() * 4);
-        bytes.extend(ROUTER_MAGIC);
-        bytes.extend((self.dimension as u32).to_le_bytes());
-        bytes.extend((self.nlist() as u32).to_le_bytes());
-        bytes.extend((self.metric as u32).to_le_bytes());
-        for center in &self.centers {
-            bytes.extend(center.to_le_bytes());
-        }
-        Ok(bytes)
-    }
-
-    pub(super) fn encode_empty(model_id: &str) -> Result<Vec<u8>> {
-        let header = serde_json::to_vec(&Envelope {
-            version: 1,
-            shard_mode: "centroid-based",
-            model_id,
-        })
-        .map_err(|error| invalid(format!("Cannot encode centroid router envelope: {error}")))?;
-        let mut bytes = Vec::with_capacity(4 + header.len());
-        bytes.extend((header.len() as u32).to_be_bytes());
-        bytes.extend(&header);
-        Ok(bytes)
-    }
-
     pub(super) async fn load(
         file_io: &FileIO,
         table_path: &str,
@@ -367,9 +329,8 @@ impl Router {
         let path = IndexFileLocation::Global { table_path }
             .resolve(&file.file_name, file.external_path.as_deref());
         let size = usize::try_from(file.file_size).unwrap_or_default();
-        if !(4 + ROUTER_HEADER..=4 + MAX_ENVELOPE + ROUTER_HEADER + MAX_CENTERS_BYTES)
-            .contains(&size)
-        {
+        let max_size = 4 + MAX_ENVELOPE + CentroidRouter::MAX_SERIALIZED_BYTES;
+        if !(4 + CentroidRouter::HEADER_BYTES..=max_size).contains(&size) {
             return Err(invalid("Invalid centroid routing file size"));
         }
         let input = file_io.new_input(&path)?.reader().await?;
@@ -387,7 +348,7 @@ impl Router {
             return Err(invalid());
         }
         let len = read_u32(bytes, 0, true) as usize;
-        if len == 0 || len > MAX_ENVELOPE || bytes.len() < 4 + len + ROUTER_HEADER {
+        if len == 0 || len > MAX_ENVELOPE || bytes.len() < 4 + len {
             return Err(invalid());
         }
         let header: Envelope<'_> =
@@ -396,72 +357,16 @@ impl Router {
         if header.version != 1
             || header.shard_mode != "centroid-based"
             || header.model_id != model_id
-            || !payload.starts_with(ROUTER_MAGIC)
         {
             return Err(invalid());
         }
-        let dimension = read_u32(payload, 8, false) as usize;
-        if read_u32(payload, 12, false) as usize != nlist
-            || dimension.checked_mul(nlist).and_then(|n| n.checked_mul(4))
-                != Some(payload.len() - ROUTER_HEADER)
-        {
+        let model = CentroidRouter::deserialize(payload).map_err(router_error)?;
+        if model.nlist() != nlist {
             return Err(invalid());
         }
+        // Vector Index 0.6.0 validates the metric in the header but exposes no getter.
         let metric = MetricType::from_code(read_u32(payload, 16, false)).ok_or_else(invalid)?;
-        let centers = payload[ROUTER_HEADER..]
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .copied()
-            .map(f32::from_le_bytes)
-            .collect();
-        Self::new(metric, dimension, centers)
-    }
-
-    fn distances<'a>(
-        &'a self,
-        vector: &'a [f32],
-    ) -> Result<impl Iterator<Item = (usize, f32)> + 'a> {
-        if vector.len() != self.dimension || vector.iter().any(|value| !value.is_finite()) {
-            return Err(invalid(format!(
-                "Centroid routing expects {} finite coordinates, got {}",
-                self.dimension,
-                vector.len()
-            )));
-        }
-        let mut point = Cow::Borrowed(vector);
-        if self.metric == MetricType::Cosine {
-            fvec_normalize(point.to_mut());
-        }
-        // Like native training, coarse assignment is Euclidean in the metric's
-        // training space, including when the local index ranks by inner product.
-        Ok(self
-            .centers
-            .chunks_exact(self.dimension)
-            .enumerate()
-            .map(move |(id, center)| (id, fvec_l2sqr(&point, center))))
-    }
-
-    pub(super) fn nearest(&self, vector: &[f32]) -> Result<Vec<usize>> {
-        let mut distances = self.distances(vector)?.collect::<Vec<_>>();
-        if distances.iter().any(|(_, distance)| !distance.is_finite()) {
-            return Err(invalid("Non-finite centroid distance"));
-        }
-        distances.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        Ok(distances.into_iter().map(|(id, _)| id).collect())
-    }
-
-    pub(super) fn assign(&self, vector: &[f32]) -> Result<usize> {
-        let mut nearest = (0, f32::INFINITY);
-        for (id, distance) in self.distances(vector)? {
-            if !distance.is_finite() {
-                return Err(invalid("Non-finite centroid distance"));
-            }
-            if distance < nearest.1 {
-                nearest = (id, distance);
-            }
-        }
-        Ok(nearest.0)
+        Ok(Self { metric, model })
     }
 }
 
@@ -529,5 +434,12 @@ pub(super) fn invalid(message: impl Into<String>) -> Error {
     Error::DataInvalid {
         message: message.into(),
         source: None,
+    }
+}
+
+pub(super) fn router_error(error: std::io::Error) -> Error {
+    Error::DataInvalid {
+        message: format!("Invalid centroid router: {error}"),
+        source: Some(Box::new(error)),
     }
 }

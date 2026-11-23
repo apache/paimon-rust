@@ -23,7 +23,7 @@ use crate::spec::{
     DataEvolutionIndexSourceMeta, FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry,
     ROW_ID_FIELD_NAME,
 };
-use crate::table::centroid_index::{self, Descriptor, Role, Router, EMPTY_SHARD};
+use crate::table::centroid_index::{self, Descriptor, Role, EMPTY_SHARD};
 use crate::table::global_index_build_common::{vector::VectorIndexShard, GlobalIndexBuildView};
 use crate::table::index_build::{
     vector::{serialize_writer, VectorSpill},
@@ -34,8 +34,9 @@ use crate::table::partition_filter::PartitionFilter;
 use crate::table::{CommitMessage, RowRange, Table};
 use crate::vindex::VindexVectorIndexOptions;
 use crate::{Error, Result};
+use bytes::Bytes;
 use futures::TryStreamExt;
-use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexWriter};
+use paimon_vindex_core::index::{CentroidRouter, VectorIndexConfig, VectorIndexWriter};
 use std::collections::HashMap;
 
 pub(in crate::table) struct CentroidBuildOptions {
@@ -264,17 +265,18 @@ impl VindexIndexBuildBuilder<'_> {
             .unwrap_or_default();
         let metric = &options.native_options["metric"];
         let router_meta = json_options(&options.native_options)?;
-        let (nlist, model_file) = if let Some(mut spill) = spill.finish().await? {
+        let mut model_file = vec![centroid_index::encode_router_envelope(model_id)?.into()];
+        let nlist = if let Some(mut spill) = spill.finish().await? {
             let config = centroid.router_config(options, spill.vector_count())?;
             let ratio = options.train_sample_ratio;
-            let dimension = options.dimension();
             let (router, mut routed) = tokio::task::spawn_blocking(move || {
-                let VectorIndexWriter::IvfFlat(flat) = spill.train_router(config, ratio)? else {
-                    unreachable!("router configuration uses IVF-FLAT");
-                };
-                let router =
-                    Router::new(flat.metric, dimension, flat.quantizer_centroids().to_vec())?;
-                let routed = spill.route(router.nlist(), |vector| router.assign(vector))?;
+                let router = CentroidRouter::from_training(spill.train_router(config, ratio)?)
+                    .map_err(centroid_index::router_error)?;
+                let routed = spill.route(router.nlist(), |vector| {
+                    router
+                        .assign_centroid(vector)
+                        .map_err(centroid_index::router_error)
+                })?;
                 Ok::<_, Error>((router, routed))
             })
             .await
@@ -362,14 +364,15 @@ impl VindexIndexBuildBuilder<'_> {
                         },
                         count,
                         index,
-                        EMPTY_SHARD.to_vec(),
+                        vec![Bytes::from_static(EMPTY_SHARD)],
                     )
                     .await?,
                 );
             }
-            (router.nlist(), router.encode(model_id)?)
+            model_file.push(router.serialize().into());
+            router.nlist()
         } else {
-            (0, Router::encode_empty(model_id)?)
+            0
         };
         files.push(
             self.write_centroid_file(
@@ -400,7 +403,7 @@ impl VindexIndexBuildBuilder<'_> {
         descriptor: Descriptor<'_>,
         row_count: i64,
         writer: Option<VectorIndexWriter>,
-        bytes: Vec<u8>,
+        parts: Vec<Bytes>,
     ) -> Result<IndexFileMeta> {
         let prefix = format!("vector-{}", self.index_type);
         let file_name = if matches!(descriptor.role, Role::Router(_)) {
@@ -417,7 +420,13 @@ impl VindexIndexBuildBuilder<'_> {
             .write(self.table, |output| async move {
                 match writer {
                     Some(writer) => serialize_writer(writer, output).await?,
-                    None => output.write(bytes.into()).await?,
+                    None => {
+                        let mut output = output.writer().await?;
+                        for part in parts {
+                            output.write(part).await?;
+                        }
+                        output.close().await?;
+                    }
                 }
                 Ok(Some(IndexPayload {
                     row_count,
