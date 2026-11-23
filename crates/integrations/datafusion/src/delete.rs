@@ -49,13 +49,43 @@ pub(crate) async fn execute_delete(
     let tables = match &delete.from {
         FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
     };
-    if let Some(first) = tables.first() {
-        if let TableFactor::Table { alias: Some(a), .. } = &first.relation {
-            return Err(DataFusionError::Plan(format!(
-                "Table alias '{}' in DELETE is not yet supported",
-                a.name.value
-            )));
-        }
+    let [target] = tables.as_slice() else {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE requires a single target table".into(),
+        ));
+    };
+    if !delete.tables.is_empty() {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE with an explicit target table list is not supported".into(),
+        ));
+    }
+    if delete.using.is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE ... USING is not supported".into(),
+        ));
+    }
+    if !target.joins.is_empty() {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE ... JOIN is not supported".into(),
+        ));
+    }
+    if let TableFactor::Table { alias: Some(a), .. } = &target.relation {
+        return Err(DataFusionError::Plan(format!(
+            "Table alias '{}' in DELETE is not yet supported",
+            a.name.value
+        )));
+    }
+    if matches!(&target.relation, TableFactor::Table { args: Some(_), .. }) {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE on table functions is not supported".into(),
+        ));
+    }
+    if matches!(&target.relation, TableFactor::Table { sample, partitions, .. }
+        if sample.is_some() || !partitions.is_empty())
+    {
+        return Err(DataFusionError::NotImplemented(
+            "DELETE with TABLESAMPLE or PARTITION is not supported".into(),
+        ));
     }
 
     let schema = table.schema();
@@ -65,7 +95,7 @@ pub(crate) async fn execute_delete(
         return execute_data_evolution_delete(ctx, delete, &table, table_ref).await;
     }
     if !schema.trimmed_primary_keys().is_empty() {
-        return execute_primary_key_delete(ctx, delete, &table, table_ref).await;
+        return execute_primary_key_delete(ctx, delete, &target.relation, &table, table_ref).await;
     }
 
     execute_cow_delete(ctx, delete, &table, table_ref).await
@@ -74,6 +104,7 @@ pub(crate) async fn execute_delete(
 async fn execute_primary_key_delete(
     ctx: &SQLContext,
     delete: &Delete,
+    target: &TableFactor,
     table: &Table,
     table_ref: &str,
 ) -> DFResult<DataFrame> {
@@ -83,22 +114,15 @@ async fn execute_primary_key_delete(
             "DELETE on primary-key tables requires ignore-delete=false".into(),
         ));
     }
-    let from = match &delete.from {
-        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
-    };
-    if from.len() != 1
-        || !from[0].joins.is_empty()
-        || !delete.tables.is_empty()
-        || delete.using.is_some()
-        || delete.returning.is_some()
+    if delete.returning.is_some()
         || delete.output.is_some()
         || !delete.order_by.is_empty()
         || delete.limit.is_some()
-        || !matches!(&from[0].relation,
+        || !matches!(target,
             TableFactor::Table {
-                args: None, version: None, with_ordinality: false,
-                json_path: None, sample: None, with_hints, partitions, index_hints, ..
-            } if with_hints.is_empty() && partitions.is_empty() && index_hints.is_empty())
+                version: None, with_ordinality: false,
+                json_path: None, with_hints, index_hints, ..
+            } if with_hints.is_empty() && index_hints.is_empty())
     {
         return Err(DataFusionError::NotImplemented(
             "Primary-key DELETE supports a single target with an optional WHERE clause".into(),
