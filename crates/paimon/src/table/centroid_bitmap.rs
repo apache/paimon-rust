@@ -44,19 +44,21 @@ fn directory(file: &IndexFileMeta) -> Result<HashMap<i32, Range<u64>>> {
     let descriptor = Descriptor::parse(file)?
         .filter(|descriptor| matches!(descriptor.role, Role::Bitmap(_)))
         .ok_or_else(invalid)?;
-    let offsets = descriptor.payload.unwrap_or_default().chunks_exact(8);
+    let (offsets, remainder) = descriptor.payload.unwrap_or_default().as_chunks::<8>();
     let field_ids = file
         .global_index_meta
         .as_ref()
         .and_then(|meta| meta.extra_field_ids.as_ref())
         .filter(|fields| !fields.is_empty())
         .ok_or_else(invalid)?;
-    if !offsets.remainder().is_empty() || offsets.len() != field_ids.len() - 1 {
+    if !remainder.is_empty() || offsets.len() != field_ids.len() - 1 {
         return Err(invalid());
     }
     let size = u64::try_from(file.file_size).map_err(|_| invalid())?;
     let ends = offsets
-        .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
+        .iter()
+        .copied()
+        .map(u64::from_be_bytes)
         .chain(std::iter::once(size));
     let mut offset = 0u64;
     let mut sections = HashMap::with_capacity(field_ids.len());
