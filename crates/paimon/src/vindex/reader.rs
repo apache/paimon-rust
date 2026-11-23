@@ -1224,17 +1224,19 @@ mod tests {
         query_for_cluster(0, 10)
     }
 
+    fn uncached_ivf_flat_options() -> HashMap<String, String> {
+        // Disable partition caching so read counts measure reuse within a batch.
+        HashMap::from([
+            (NPROBE_PARAMETER.to_string(), "1".to_string()),
+            (READER_MEMORY_BUDGET_PARAMETER.to_string(), "0".to_string()),
+        ])
+    }
+
     async fn tracked_batch_search(
         index: Bytes,
         query_count: usize,
     ) -> (Vec<Option<HashMap<u64, f32>>>, usize) {
-        tracked_batch_search_with_options(
-            index,
-            query_count,
-            HashMap::from([(NPROBE_PARAMETER.to_string(), "1".to_string())]),
-            1,
-        )
-        .await
+        tracked_batch_search_with_options(index, query_count, uncached_ivf_flat_options(), 1).await
     }
 
     async fn tracked_batch_search_with_options(
@@ -1951,7 +1953,7 @@ mod tests {
     async fn batch_search_reuses_probed_lists_and_avoids_full_file_read() {
         let index = build_ivf_flat_index();
         let batch_index = index.clone();
-        let options = HashMap::from([(NPROBE_PARAMETER.to_string(), "1".to_string())]);
+        let options = uncached_ivf_flat_options();
         let search = query();
 
         let scalar_tracking = TrackingIndexRead::new(index.clone());
@@ -2025,7 +2027,7 @@ mod tests {
     async fn filtered_batch_matches_scalar_searches_and_reuses_probed_lists() {
         let index = build_ivf_flat_index();
         let batch_index = index.clone();
-        let options = HashMap::from([(NPROBE_PARAMETER.to_string(), "1".to_string())]);
+        let options = uncached_ivf_flat_options();
         let mut include_row_ids = roaring::RoaringTreemap::new();
         for row_id in (0..256).step_by(16) {
             include_row_ids.insert(row_id);
@@ -2132,10 +2134,8 @@ mod tests {
             rq_bits: None,
             diskann: None,
         };
-        let options = HashMap::from([
-            (NPROBE_PARAMETER.to_string(), "1".to_string()),
-            ("global-index.thread-num".to_string(), "1".to_string()),
-        ]);
+        let mut options = uncached_ivf_flat_options();
+        options.insert("global-index.thread-num".to_string(), "1".to_string());
         let prepared = prepare_search(&metadata, &options, &query())
             .unwrap()
             .unwrap();
