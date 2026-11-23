@@ -16,19 +16,25 @@
 // under the License.
 
 use super::{
-    execute_vector_file_work, matching_row_ids_for_filter, post_filter,
+    execute_vector_file_probes, execute_vector_file_work, matching_row_ids_for_filter, post_filter,
     sorted_row_ids_to_row_ranges, IndexSearchTiming, RangeReadLimiter, RawVectorMetric,
     VectorIndexWork, VectorMetricCheck, VectorSearchEvaluation,
 };
 use crate::spec::{IndexManifestEntry, VectorIndexOptions};
+use crate::table::centroid_bitmap::BitmapPredicate;
 use crate::table::centroid_index::{self, Descriptor, Generation, Role, Router};
+use crate::table::RowRange;
 use crate::vector_search::{ScoredRowIds, VectorSearch};
+use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use crate::{Error, Result};
 use paimon_vindex_core::distance::MetricType;
+use paimon_vindex_core::index::VectorIndexMetadata;
+use paimon_vindex_core::io::SeekRead;
 use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
-type CentroidFiles<'a> = HashMap<&'a str, Vec<IndexManifestEntry>>;
+type CentroidFiles<'a> = HashMap<&'a str, Generation<'a>>;
 
 pub(super) fn plan<'a>(
     entries: &[&'a IndexManifestEntry],
@@ -42,13 +48,96 @@ pub(super) fn plan<'a>(
     for group in centroid_index::group(entries.iter().copied())? {
         if group.vector_count != 0 {
             plans.push(group.router);
-            files.insert(
-                group.router.index_file.file_name.as_str(),
-                group.files.into_iter().cloned().collect(),
-            );
+            files.insert(group.router.index_file.file_name.as_str(), group);
         }
     }
     Ok((plans, files))
+}
+
+const ROUTER_LISTS: usize = 64;
+const AUTOMATIC_WIDTH: usize = 8;
+const JOINT_OUTER_PROBES: usize = 4;
+const JOINT_INNER_PROBES: usize = 16;
+const SHARD_LISTS: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Probe {
+    Standard,
+    Joint,
+}
+
+pub(super) type NativeMatches = Option<HashMap<u64, f32>>;
+
+pub(super) fn search_file<S: SeekRead + 'static>(
+    reader: &mut VindexVectorGlobalIndexReader,
+    searches: &[VectorSearch],
+    probes: &[Probe],
+    source: S,
+    validate: impl FnOnce(&VectorIndexMetadata) -> Result<()>,
+) -> Result<Vec<NativeMatches>> {
+    if probes.is_empty() {
+        return reader.visit_batch_vector_search_validated(searches, |_| Ok(source), validate);
+    }
+
+    debug_assert_eq!(searches.len(), probes.len());
+    reader.load_validated(|_| Ok(source), validate)?;
+    let mut standard_queries = Vec::new();
+    let mut standard_indices = Vec::new();
+    let mut joint_queries = Vec::new();
+    let mut joint_indices = Vec::new();
+    for (index, (query, probe)) in searches.iter().zip(probes).enumerate() {
+        match probe {
+            Probe::Standard => {
+                standard_queries.push(query);
+                standard_indices.push(index);
+            }
+            Probe::Joint => {
+                joint_queries.push(query);
+                joint_indices.push(index);
+            }
+        }
+    }
+
+    let mut results = vec![None; searches.len()];
+    if !standard_queries.is_empty() {
+        let hits = reader.search_loaded_batch(&standard_queries, None)?;
+        for (index, hits) in standard_indices.into_iter().zip(hits) {
+            results[index] = hits;
+        }
+    }
+    if joint_queries.is_empty() {
+        return Ok(results);
+    }
+
+    // Java retries an incomplete local joint probe at the ordinary width.
+    let joint_hits = reader.search_loaded_batch(&joint_queries, Some(JOINT_INNER_PROBES))?;
+    let mut retry = Vec::new();
+    for (index, hits) in joint_indices.into_iter().zip(joint_hits) {
+        if hits.as_ref().map_or(0, HashMap::len) < searches[index].limit {
+            retry.push(index);
+        } else {
+            results[index] = hits;
+        }
+    }
+    if !retry.is_empty() {
+        let queries = retry
+            .iter()
+            .map(|&index| &searches[index])
+            .collect::<Vec<_>>();
+        for (index, hits) in retry
+            .into_iter()
+            .zip(reader.search_loaded_batch(&queries, None)?)
+        {
+            results[index] = hits;
+        }
+    }
+    Ok(results)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct BitmapWork {
+    pub(super) predicate: BitmapPredicate,
+    pub(super) deleted: Vec<RowRange>,
 }
 
 struct Route {
@@ -57,6 +146,7 @@ struct Route {
     width: usize,
     limit: usize,
     hits: ScoredRowIds,
+    joint: bool,
 }
 
 pub(super) async fn execute_work(
@@ -66,9 +156,10 @@ pub(super) async fn execute_work(
     range_read_limiter: RangeReadLimiter,
     batch_parallelism: usize,
 ) -> Result<(Vec<ScoredRowIds>, IndexSearchTiming)> {
-    let allow_buffered_read = work.queries.len() > 1 || work.filter.is_some();
+    let allow_buffered_read =
+        work.queries.len() > 1 || work.filter.is_some() || work.bitmap.is_some();
     if work.centroid_files.is_empty() {
-        if Descriptor::is_wrapped(&work.entry.index_file) {
+        if Descriptor::is_wrapped(&work.entry.index_file) || work.bitmap.is_some() {
             return Err(centroid_index::invalid(
                 "Expected a complete centroid generation",
             ));
@@ -144,18 +235,37 @@ pub(super) async fn execute_work(
         &group.descriptor,
     )
     .await?;
-    metric_check.check(RawVectorMetric::from_vindex(router.metric))?;
+    metric_check.check(
+        VectorMetricCheck::file_key(&group.router.index_file),
+        RawVectorMetric::from_vindex(router.metric),
+    )?;
     if work
         .queries
         .iter()
-        .any(|query| query.vector.len() != router.dimension)
+        .any(|query| query.vector.len() != router.model.dimension())
     {
         return Err(centroid_index::invalid(format!(
             "Query vector dimension mismatch: centroid router expects {}",
-            router.dimension
+            router.model.dimension()
         )));
     }
 
+    let joint_enabled = explicit_width.is_none()
+        && nlist == ROUTER_LISTS
+        && router.metric == MetricType::L2
+        && work.filter.is_none()
+        && work.bitmap.is_none()
+        && matches!(
+            work.entry.index_file.index_type.as_str(),
+            "ivf-flat" | "ivf-pq"
+        )
+        && [
+            "ivf.nprobe",
+            "diskann.l_search",
+            "ivf.max_initial_filter_expansion_factor",
+        ]
+        .iter()
+        .all(|option| !configuration.options.contains_key(*option));
     let search = RoutedSearch {
         evaluation,
         group,
@@ -166,6 +276,8 @@ pub(super) async fn execute_work(
         range_read_limiter,
         batch_parallelism,
         allow_buffered_read,
+        joint_enabled,
+        bitmap: work.bitmap.as_ref(),
     };
     let Some(predicate) = work.filter else {
         let mut timing = IndexSearchTiming::default();
@@ -231,6 +343,8 @@ struct RoutedSearch<'a> {
     range_read_limiter: RangeReadLimiter,
     batch_parallelism: usize,
     allow_buffered_read: bool,
+    joint_enabled: bool,
+    bitmap: Option<&'a BitmapWork>,
 }
 
 impl RoutedSearch<'_> {
@@ -241,7 +355,7 @@ impl RoutedSearch<'_> {
     ) -> Result<Vec<ScoredRowIds>> {
         let group = self.group;
         let router = self.router;
-        let nlist = router.nlist();
+        let nlist = router.model.nlist();
         let explicit_width = self.explicit_width;
         let mut routes = Vec::with_capacity(queries.len());
         for search in queries {
@@ -268,7 +382,10 @@ impl RoutedSearch<'_> {
             } else if explicit_width.is_none() && router.metric == MetricType::InnerProduct {
                 (0..nlist).collect()
             } else {
-                router.nearest(&search.vector)?
+                router
+                    .model
+                    .find_nearest_centroids(&search.vector, explicit_width.unwrap_or(nlist))
+                    .map_err(centroid_index::router_error)?
             };
             routes.push(Route {
                 nearest,
@@ -276,7 +393,12 @@ impl RoutedSearch<'_> {
                 width,
                 limit,
                 hits: ScoredRowIds::empty(),
+                joint: false,
             });
+        }
+
+        if self.joint_enabled {
+            self.resolve_joint_routes(queries, &mut routes);
         }
 
         loop {
@@ -284,38 +406,77 @@ impl RoutedSearch<'_> {
             for (index, route) in routes.iter_mut().enumerate() {
                 for &centroid in &route.nearest[route.visited..route.width] {
                     if group.shards[&centroid].index_file.row_count > 0 {
-                        queries_by_centroid.entry(centroid).or_default().push(index);
+                        let probe = if route.joint {
+                            Probe::Joint
+                        } else {
+                            Probe::Standard
+                        };
+                        queries_by_centroid
+                            .entry(centroid)
+                            .or_default()
+                            .push((index, probe));
                     }
                 }
                 route.visited = route.width;
             }
-            for (centroid, indices) in queries_by_centroid {
-                let (results, stats) = execute_vector_file_work(
+            for (centroid, pending) in queries_by_centroid {
+                let (indices, probes): (Vec<_>, Vec<_>) = pending.into_iter().unzip();
+                let mut shard = self.shard_work(queries, centroid, &indices);
+                if let Some(bitmap) = self.bitmap {
+                    let table = self.evaluation.table.ok_or_else(|| {
+                        centroid_index::invalid("Centroid Bitmap search requires table context")
+                    })?;
+                    let file = &group
+                        .bitmaps
+                        .get(&centroid)
+                        .ok_or_else(|| centroid_index::invalid("Missing centroid Bitmap file"))?
+                        .index_file;
+                    let source = file.global_index_meta.as_ref().unwrap();
+                    let mut filter = bitmap.predicate.matching(table, file).await?;
+                    for range in &bitmap.deleted {
+                        if range.from() < source.row_range_start
+                            || range.to() > source.row_range_end
+                            || range.from() > range.to()
+                        {
+                            return Err(centroid_index::invalid(
+                                "Invalid deletion range for centroid Bitmap task",
+                            ));
+                        }
+                        filter.remove_range(
+                            (range.from() - source.row_range_start) as u64
+                                ..=(range.to() - source.row_range_start) as u64,
+                        );
+                    }
+                    if filter.is_empty() {
+                        continue;
+                    }
+                    let filter = Arc::new(filter);
+                    for query in &mut shard.queries {
+                        let eligible = query.effective_include_row_ids().map_or_else(
+                            || Arc::clone(&filter),
+                            |include| Arc::new(include & filter.as_ref()),
+                        );
+                        query.set_shared_include_row_ids(eligible);
+                    }
+                }
+                let (results, stats) = execute_vector_file_probes(
                     self.evaluation,
-                    VectorIndexWork {
-                        entry: group.shards[&centroid].clone(),
-                        centroid_files: vec![],
-                        queries: indices
-                            .iter()
-                            .map(|&index| queries[index].clone())
-                            .collect(),
-                        resolved: Some(self.configuration.clone()),
-                        filter: None,
-                        top_ks: vec![],
-                    },
+                    shard,
                     self.metric_check.clone(),
                     self.range_read_limiter.clone(),
                     self.batch_parallelism,
+                    if probes.contains(&Probe::Joint) {
+                        probes
+                    } else {
+                        vec![]
+                    },
                     self.allow_buffered_read,
                 )
                 .await?;
-                timing.permit_wait = timing.permit_wait.saturating_add(stats.permit_wait);
-                timing.file_reader_open = timing
-                    .file_reader_open
-                    .saturating_add(stats.file_reader_open);
-                for (index, result) in indices.into_iter().zip(results) {
+                add_timing(timing, stats);
+                for (index, hits) in indices.into_iter().zip(results) {
                     let route = &mut routes[index];
-                    route.hits = route.hits.or(&result).top_k(route.limit);
+                    route.hits = route.hits.or(&hits).top_k(route.limit);
                 }
             }
 
@@ -327,6 +488,7 @@ impl RoutedSearch<'_> {
                         && route.hits.row_ids.len() < route.limit
                     {
                         route.width = route.width.saturating_mul(2).min(nlist);
+                        route.joint = false;
                         expand = true;
                     }
                 }
@@ -337,4 +499,55 @@ impl RoutedSearch<'_> {
         }
         Ok(routes.into_iter().map(|route| route.hits).collect())
     }
+
+    fn shard_work(
+        &self,
+        queries: &[VectorSearch],
+        id: usize,
+        indices: &[usize],
+    ) -> VectorIndexWork {
+        VectorIndexWork {
+            entry: self.group.shards[&id].clone(),
+            centroid_files: vec![],
+            bitmap: None,
+            queries: indices
+                .iter()
+                .map(|&index| queries[index].clone())
+                .collect(),
+            resolved: Some(self.configuration.clone()),
+            filter: None,
+            top_ks: vec![],
+        }
+    }
+
+    fn resolve_joint_routes(&self, queries: &[VectorSearch], routes: &mut [Route]) {
+        for (route, query) in routes.iter_mut().zip(queries) {
+            if route.width != AUTOMATIC_WIDTH
+                || !(10..=100).contains(&query.limit)
+                || query.effective_include_row_ids().is_some()
+            {
+                continue;
+            }
+            let compatible = route.nearest[..JOINT_OUTER_PROBES].iter().all(|id| {
+                self.group.shards[id].index_file.row_count
+                    >= (JOINT_INNER_PROBES * query.limit) as i64
+                    && self.group.local_nlists.get(id) == Some(&SHARD_LISTS)
+            });
+            if compatible {
+                route.width = JOINT_OUTER_PROBES;
+                route.joint = true;
+            }
+        }
+    }
 }
+
+fn add_timing(timing: &mut IndexSearchTiming, stats: IndexSearchTiming) {
+    timing.permit_wait = timing.permit_wait.saturating_add(stats.permit_wait);
+    timing.file_reader_open = timing
+        .file_reader_open
+        .saturating_add(stats.file_reader_open);
+}
+
+#[cfg(test)]
+#[path = "centroid_joint_tests.rs"]
+mod joint_tests;

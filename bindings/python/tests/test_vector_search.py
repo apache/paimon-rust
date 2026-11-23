@@ -255,6 +255,35 @@ def test_scan_read_keeps_snapshot_and_is_reusable(table):
     assert rows.column('id').to_pylist() == [1]
 
 
+def test_centroid_bitmap_plan_keeps_scalar_coverage_when_pickled(table):
+    import pickle
+
+    table = table.copy({'vector-index.search-mode': 'fast',
+                        'scalar-index.prefilter.search-mode': 'full'})
+    pt0 = {'method': 'equal', 'field': 'pt', 'literals': [0]}
+    pt1 = {'method': 'equal', 'field': 'pt', 'literals': [1]}
+    ivf = {'ivf-flat.dimension': '2', 'ivf-flat.nlist': '1', 'ivf-flat.metric': 'l2'}
+    (table.new_global_index_build_builder().with_index_column('embedding')
+     .with_index_type('ivf-flat').with_partition_filter(pt0).with_options({
+         **ivf, 'ivf-flat.sharding': 'centroid', 'ivf-flat.centroid.nlist': '2',
+         'extra_fields': '{"id":"bitmap"}',
+     }).execute())
+    (table.new_global_index_build_builder().with_index_column('embedding')
+     .with_index_type('ivf-flat').with_partition_filter(pt1).with_options(ivf).execute())
+    (table.new_global_index_build_builder().with_index_column('id')
+     .with_index_type('btree').with_partition_filter(pt1).execute())
+
+    builder = (_single(table).with_limit(1).with_option('centroid.nprobe', '1')
+               .with_filter({'method': 'equal', 'field': 'id', 'literals': [2]}))
+    plan = builder.new_vector_search_scan().scan()
+    reader = builder.new_vector_search_read()
+    assert len(reader.read_plan(plan)) == 0
+    assert len(reader.read_plan(pickle.loads(pickle.dumps(plan)))) == 0
+
+    explicit = type(plan)(plan.splits(), plan.snapshot())
+    assert len(reader.read_plan(explicit)) == 1
+
+
 def test_batch_order_empty_results_and_scan_reuse(table):
     queries = [[1, 0], [0, 1], [1, 0]]
     builder = (table.new_batch_vector_search_builder().with_vector_column('embedding')
@@ -284,6 +313,39 @@ def test_invalid_query_is_reported_before_planning(table, query):
 def test_single_vector_keyword_matches_stub(table):
     builder = _single(table).with_query_vector(vector=[1, 0]).with_limit(1)
     assert builder.execute().row_ids() == _single(table).with_limit(1).execute().row_ids()
+
+
+def test_multi_vector_query_reranks_complete_embedding_lists(tmp_path):
+    ctx = SQLContext()
+    ctx.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    ctx.sql('CREATE SCHEMA paimon.db')
+    ctx.sql("CREATE TABLE paimon.db.chunks (id INT, embeddings FLOAT[][]) "
+            "WITH ('bucket'='-1', 'data-evolution.enabled'='true', "
+            "'row-tracking.enabled'='true', 'global-index.enabled'='true', "
+            "'vector-index.search-mode'='fast')")
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('db.chunks')
+    write = table.new_batch_write_builder()
+    writer = write.new_write()
+    commit = write.new_commit()
+    try:
+        writer.write_arrow(pa.record_batch([
+            pa.array([10, 20, 30], type=pa.int32()),
+            pa.array([[[1, 0], [1, 0]], [[0, 1]], [[1, 1]]],
+                     type=pa.list_(pa.list_(pa.float32()))),
+        ], names=['id', 'embeddings']))
+        commit.commit(writer.prepare_commit())
+    finally:
+        writer.close()
+        commit.close()
+
+    assert (table.new_global_index_build_builder().with_index_column('embeddings')
+            .with_index_type('ivf-flat').with_options({
+                'ivf-flat.dimension': '2', 'ivf-flat.nlist': '1'}).execute()) == 1
+    result = (table.new_vector_search_builder().with_vector_column('embeddings')
+              .with_multi_vector(vectors=[(1, 0), (0, 1)]).with_limit(1).execute())
+    assert list(result.row_ids().values()) == pytest.approx([2 ** 0.5])
+    rows = pa.Table.from_batches(result.new_read_builder().with_projection(['id']).read())
+    assert rows.column('id').to_pylist() == [30]
 
 
 @pytest.mark.parametrize('batch', [False, True])

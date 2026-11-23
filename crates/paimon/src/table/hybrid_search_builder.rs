@@ -36,12 +36,15 @@ use crate::table::pk_full_text_scan::PrimaryKeyFullTextScan;
 use crate::table::pk_search_position::PrimaryKeySearchPosition;
 use crate::table::pk_search_ranker::{self, Ranking};
 use crate::table::pk_vector_indexed_split_read::{PkVectorIndexedSplit, PkVectorIndexedSplitRead};
+use crate::table::pk_vector_orchestrator::build_indexed_splits;
 use crate::table::source::DataSplit;
 use crate::table::vector_search_common::{
-    collect_ranked_rows, ensure_no_reserved_read_columns, reorder_and_strip_position, RankedRow,
+    collect_ranked_rows, ensure_no_reserved_read_columns, reorder_and_strip_position,
+    take_only_result, RankedRow,
 };
 use crate::table::{ArrowRecordBatchStream, GlobalIndexResult, RowRange, Table};
 use crate::vector_search::ScoredRowIds;
+use crate::vindex::pkvector::metric::VectorSearchMetric;
 
 const RRF_K: f32 = 60.0;
 const MAX_ROUTE_WORKERS: usize = 4;
@@ -883,7 +886,7 @@ impl<'a> HybridSearchBuilder<'a> {
             .map(|snapshot| self.table.copy_with_pinned_snapshot(Some(&snapshot))))
     }
 
-    /// Consume the vector search's scored positions, retaining its source files
+    /// Consume the raw vector candidates, retaining their source files
     /// and pinned snapshot for fusion before materialization.
     async fn pk_vector_route(
         &self,
@@ -891,18 +894,34 @@ impl<'a> HybridSearchBuilder<'a> {
         route: &HybridSearchRoute,
     ) -> crate::Result<PkRoute> {
         let builder = self.vector_route_builder(table, route);
-        let result = builder.execute().await?;
-        let positions = result
-            .positions()?
+        let (scan, read) = builder.new_scan_and_read()?;
+        let result = read.search_primary_key(scan.plan().await?).await?;
+        let candidates = take_only_result(result.candidates, "vector search")?;
+        let cosine_distance_scores = result.metric == VectorSearchMetric::Cosine;
+        let positions = candidates
             .iter()
-            .map(PrimaryKeySearchPosition::from_vector_position)
+            .map(|candidate| {
+                // Negation preserves distance order and ties for RRF and MRR.
+                // Min-max normalization also works on -distance because it
+                // cancels the constant in the public cosine score 1 - distance.
+                let score = if cosine_distance_scores {
+                    -candidate.distance
+                } else {
+                    result.metric.distance_to_score(candidate.distance)
+                };
+                PrimaryKeySearchPosition::from_vector_candidate(candidate, score)
+            })
             .collect::<crate::Result<Vec<_>>>()?;
-        let source_splits = result.splits()?.to_vec();
+        let source_splits = build_indexed_splits(candidates, &result.source_splits, result.metric)?
+            .into_iter()
+            .map(|split| split.split)
+            .collect();
         Ok(PkRoute {
             positions,
             source_splits,
-            snapshot_id: result.snapshot_id().unwrap_or(0),
+            snapshot_id: result.snapshot_id,
             weight: route.weight as f64,
+            cosine_distance_scores,
         })
     }
 
@@ -1010,6 +1029,7 @@ impl<'a> HybridSearchBuilder<'a> {
             source_splits,
             snapshot_id: result.snapshot_id,
             weight: route.weight as f64,
+            cosine_distance_scores: false,
         })
     }
 
@@ -1024,7 +1044,10 @@ impl<'a> HybridSearchBuilder<'a> {
         let mut rankings = Vec::with_capacity(routes.len());
         for route in routes {
             if !route.positions.is_empty() {
-                rankings.push(Ranking::new(route.positions.clone(), route.weight)?);
+                rankings.push(
+                    Ranking::new(route.positions.clone(), route.weight)?
+                        .with_cosine_distance_scores(route.cosine_distance_scores),
+                );
             }
         }
         match self.ranker {
@@ -1043,6 +1066,7 @@ struct PkRoute {
     source_splits: Vec<DataSplit>,
     snapshot_id: i64,
     weight: f64,
+    cosine_distance_scores: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1675,6 +1699,7 @@ mod pk_hybrid_tests {
         location: &str,
         file_name: &str,
         vectors: &[[f32; DIM]],
+        metric: &str,
     ) -> u64 {
         let n = vectors.len();
         let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
@@ -1683,7 +1708,7 @@ mod pk_hybrid_tests {
             ("index.type".to_string(), "ivf_flat".to_string()),
             ("dimension".to_string(), DIM.to_string()),
             ("nlist".to_string(), "1".to_string()),
-            ("metric".to_string(), "l2".to_string()),
+            ("metric".to_string(), metric.to_string()),
         ]);
         let config = VectorIndexConfig::from_options(&native_options).unwrap();
         let training = VectorIndexTrainer::train(config, &flat, n).unwrap();
@@ -1790,8 +1815,10 @@ mod pk_hybrid_tests {
 
         // Vector ANN segment.
         let vector_index_name = "vector-ivf-flat-pk-hybrid.index".to_string();
+        let metric =
+            &schema.options()[&format!("fields.{VECTOR_COLUMN}.pk-vector.distance.metric")];
         let vector_index_size =
-            write_ann_segment(&file_io, location, &vector_index_name, vectors).await;
+            write_ann_segment(&file_io, location, &vector_index_name, vectors, metric).await;
         let vector_index = IndexFileMeta {
             index_type: VECTOR_INDEX_TYPE.to_string(),
             file_name: vector_index_name,
@@ -1969,6 +1996,169 @@ mod pk_hybrid_tests {
             empty.is_empty(),
             "a pinned empty view must not observe the existing rows"
         );
+    }
+
+    #[tokio::test]
+    async fn pk_hybrid_preserves_cosine_distance_order_after_reranking() {
+        let query = [3.0, 4.0, 0.0, 0.0];
+        let table = build_hybrid_table(
+            "memory:/pk_hybrid_cosine_order",
+            &[0, 1, 2],
+            &[[3.0015, 4.0, 0.0, 0.0], query, [4.0, -3.0, 0.0, 0.0]],
+            &["nearby", "exact", "orthogonal"],
+            &[("fields.embedding.pk-vector.distance.metric", "cosine")],
+        )
+        .await;
+
+        for (ranker, include_text) in [
+            (HybridSearchRanker::Rrf, false),
+            (HybridSearchRanker::Mrr, false),
+            (HybridSearchRanker::WeightedScore, false),
+            (HybridSearchRanker::WeightedScore, true),
+        ] {
+            for route_limit in [1, 2, 3] {
+                let mut builder = table.new_hybrid_search_builder();
+                builder
+                    .add_vector_route(
+                        VECTOR_COLUMN,
+                        query.to_vec(),
+                        route_limit,
+                        1.0,
+                        HashMap::from([(
+                            "fields.embedding.ivf.refine-factor".to_string(),
+                            "2".to_string(),
+                        )]),
+                    )
+                    .unwrap();
+                if include_text {
+                    builder
+                        .add_full_text_route(
+                            TEXT_COLUMN,
+                            r#"{"match":{"query":"orthogonal"}}"#,
+                            1,
+                            0.5,
+                            HashMap::new(),
+                        )
+                        .unwrap();
+                }
+                builder.with_limit(1).with_ranker(ranker.as_str()).unwrap();
+                let batches = builder
+                    .execute_read()
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    column_i32(&batches, "id"),
+                    vec![1],
+                    "{ranker:?}, limit={route_limit}, full text={include_text}"
+                );
+                let expected_score = if ranker == HybridSearchRanker::Rrf {
+                    (1.0 / (f64::from(pk_search_ranker::DEFAULT_RRF_K) + 1.0)) as f32
+                } else {
+                    1.0
+                };
+                assert_eq!(
+                    column_f32(&batches, SEARCH_SCORE_COLUMN),
+                    vec![expected_score]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pk_hybrid_weighted_cosine_breaks_equal_totals_by_position_in_either_route_order() {
+        let a = [1.0, 0.0, 0.0, 0.0];
+        let b = [0.0, 1.0, 0.0, 0.0];
+        let middle = [1.0, 1.0, 0.0, 0.0];
+        let table = build_hybrid_table(
+            "memory:/pk_hybrid_weighted_cosine_route_order",
+            &[0, 1, 2],
+            &[a, b, [-1.0, -1.0, 15.0, 0.0]],
+            &["alpha", "beta", "gamma"],
+            &[("fields.embedding.pk-vector.distance.metric", "cosine")],
+        )
+        .await;
+
+        let mut scores = Vec::new();
+        for queries in [[a, middle, b], [b, middle, a]] {
+            let mut builder = table.new_hybrid_search_builder();
+            for query in queries {
+                builder
+                    .add_vector_route(
+                        VECTOR_COLUMN,
+                        query.to_vec(),
+                        3,
+                        1.0,
+                        HashMap::from([("fields.embedding.ivf.refine-factor".into(), "2".into())]),
+                    )
+                    .unwrap();
+            }
+            builder.with_limit(1).with_weighted_score_ranker();
+            let batches = builder
+                .execute_read()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(column_i32(&batches, "id"), [0], "queries={queries:?}");
+            scores.push(column_f32(&batches, SEARCH_SCORE_COLUMN));
+        }
+        assert_eq!(scores[0], scores[1]);
+    }
+
+    #[tokio::test]
+    async fn pk_hybrid_weighted_cosine_preserves_tiny_distance_with_a_full_text_route() {
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let table = build_hybrid_table(
+            "memory:/pk_hybrid_weighted_cosine_tiny_distance",
+            &[0, 1, 2],
+            &[
+                [1.0, 2.0_f32.powi(-30), 0.0, 0.0],
+                query,
+                [0.0, 1.0, 0.0, 0.0],
+            ],
+            &["nearby", "exact", "orthogonal"],
+            &[("fields.embedding.pk-vector.distance.metric", "cosine")],
+        )
+        .await;
+        let mut builder = table.new_hybrid_search_builder();
+        builder
+            .add_vector_route(
+                VECTOR_COLUMN,
+                query.to_vec(),
+                3,
+                1.0,
+                HashMap::from([("fields.embedding.ivf.refine-factor".into(), "2".into())]),
+            )
+            .unwrap()
+            .with_limit(1)
+            .with_weighted_score_ranker();
+
+        for include_text in [false, true] {
+            if include_text {
+                builder
+                    .add_full_text_route(
+                        TEXT_COLUMN,
+                        r#"{"match":{"query":"orthogonal"}}"#,
+                        1,
+                        0.5,
+                        HashMap::new(),
+                    )
+                    .unwrap();
+            }
+            let batches = builder
+                .execute_read()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(column_i32(&batches, "id"), [1], "full text={include_text}");
+            assert_eq!(column_f32(&batches, SEARCH_SCORE_COLUMN), [1.0]);
+        }
     }
 
     #[tokio::test]

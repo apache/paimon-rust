@@ -118,6 +118,23 @@ impl VectorSearchFunction {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum VectorQuery {
+    Single(Vec<f32>),
+    Matrix(Vec<Vec<f32>>),
+}
+
+impl VectorQuery {
+    pub(crate) fn parse(json: &str) -> Result<Self, serde_json::Error> {
+        // Parse directly into floats. Untagged enum buffering turns decimal
+        // numbers into a private map with serde_json's arbitrary_precision.
+        serde_json::from_str::<Vec<f32>>(json)
+            .map(Self::Single)
+            .or_else(|_| serde_json::from_str::<Vec<Vec<f32>>>(json).map(Self::Matrix))
+    }
+}
+
 impl TableFunctionImpl for VectorSearchFunction {
     fn call(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
         if args.len() != 4 {
@@ -172,14 +189,14 @@ impl TableFunctionImpl for VectorSearchFunction {
                 Err(err) => return Err(err),
             };
 
-        let query_vector: Vec<f32> = serde_json::from_str(&query_vector_json).map_err(|e| {
+        let query_vector = VectorQuery::parse(&query_vector_json).map_err(|e| {
             DataFusionError::Plan(format!(
-                "vector_search: query_vector_json must be a JSON array of floats, got '{}': {}",
+                "vector_search: query_vector_json must be a JSON vector or matrix of floats, got '{}': {}",
                 query_vector_json, e
             ))
         })?;
 
-        if query_vector.is_empty() {
+        if matches!(&query_vector, VectorQuery::Single(vector) if vector.is_empty()) {
             return Err(DataFusionError::Plan(
                 "vector_search: query vector cannot be empty".to_string(),
             ));
@@ -247,7 +264,7 @@ impl TableProvider for LateralVectorSearchTableProvider {
 struct VectorSearchTableProvider {
     inner: PaimonTableProvider,
     column_name: String,
-    query_vector: Vec<f32>,
+    query_vector: VectorQuery,
     limit: usize,
 }
 
@@ -332,7 +349,7 @@ impl TableProvider for VectorSearchTableProvider {
 struct VectorSearchExec {
     table: Table,
     column_name: String,
-    query_vector: Vec<f32>,
+    query_vector: VectorQuery,
     /// The table function's own top-k — drives the ANN search width; never reduced.
     search_limit: usize,
     /// The outer DataFusion `LIMIT`, applied by truncating the ranked result.
@@ -347,7 +364,7 @@ impl VectorSearchExec {
     fn new(
         table: Table,
         column_name: String,
-        query_vector: Vec<f32>,
+        query_vector: VectorQuery,
         search_limit: usize,
         output_limit: Option<usize>,
         projection: Option<Vec<usize>>,
@@ -387,17 +404,21 @@ impl VectorSearchExec {
         // recall is unchanged (data-evolution / global-index path; PK-vector tables are
         // unsupported here, as before).
         let mut search_result = await_with_runtime(async {
-            let mut builder = search_table.new_batch_vector_search_builder();
+            let mut builder = search_table.new_vector_search_builder();
             builder
                 .with_vector_column(&self.column_name)
-                .with_query_vectors(vec![self.query_vector.clone()])
                 .with_limit(self.search_limit);
+            match &self.query_vector {
+                VectorQuery::Single(vector) => builder.with_query_vector(vector.clone()),
+                VectorQuery::Matrix(vectors) => builder.with_multi_vector(vectors.clone()),
+            };
             if let Some(filter) = &self.filter {
                 builder.with_filter(filter.clone());
             }
-            let mut results = builder.execute().await.map_err(to_datafusion_error)?;
-            results
-                .remove(0)
+            builder
+                .execute()
+                .await
+                .map_err(to_datafusion_error)?
                 .into_row_ids()
                 .map_err(to_datafusion_error)
         })
@@ -648,6 +669,19 @@ mod tests {
     use crate::SQLContext;
 
     #[test]
+    fn vector_query_accepts_decimal_vectors_and_matrices() {
+        assert!(matches!(
+            VectorQuery::parse("[1.0, -2.5]").unwrap(),
+            VectorQuery::Single(vector) if vector == [1.0, -2.5]
+        ));
+        assert!(matches!(
+            VectorQuery::parse("[[1.0, -2.5], [0.0, 3e-1]]").unwrap(),
+            VectorQuery::Matrix(vectors) if vectors == [vec![1.0, -2.5], vec![0.0, 0.3]]
+        ));
+        assert!(VectorQuery::parse("[1.0, [2.5]]").is_err());
+    }
+
+    #[test]
     fn unfiltered_snapshot_io_uses_runtime_bridge_when_polled_without_tokio() {
         let temp_dir = tempfile::tempdir().unwrap();
         let table = crate::runtime::runtime().block_on(async {
@@ -668,7 +702,7 @@ mod tests {
         let exec = VectorSearchExec::new(
             table,
             "embedding".into(),
-            vec![1.0],
+            VectorQuery::Single(vec![1.0]),
             1,
             None,
             None,

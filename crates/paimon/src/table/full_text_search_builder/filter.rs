@@ -19,6 +19,7 @@
 
 use super::*;
 use crate::table::global_index_scanner::GlobalIndexScanner;
+use crate::table::global_index_schema::GlobalIndexSchema;
 use crate::table::global_index_search_filter::matching_row_ids_for_filter;
 use crate::table::global_index_types::normalize_queryable_global_index_type;
 
@@ -134,6 +135,14 @@ pub(super) async fn matching_indexed_rows(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let scalar_entries = match evaluation.table {
+        Some(table) => {
+            GlobalIndexSchema::new(table)
+                .filter_entries(scalar_entries)
+                .await
+        }
+        None => scalar_entries,
+    };
     let mut fields = HashSet::new();
     field_ids(filter, evaluation.schema_fields, &mut fields);
     let detail = if mode == GlobalIndexSearchMode::Detail {

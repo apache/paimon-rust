@@ -765,7 +765,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         select_first(&granules, eligible, retained, shard_seed(shard))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn build_index_file_granule(
         &self,
         shard: &VindexIndexShard,
@@ -773,7 +772,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         dimension: i32,
         index_field_id: i32,
         options: &VindexVectorIndexOptions,
-        index_meta: Vec<u8>,
     ) -> Result<GranuleBuildOutcome> {
         let timing_enabled = vector_index_build_timing_enabled();
         let total_start = timing_enabled.then(Instant::now);
@@ -1111,7 +1109,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
 
         let serialize_upload_start = timing_enabled.then(Instant::now);
         let meta = self
-            .finish_index_file(writer, shard, index_field_id, index_meta, row_count)
+            .finish_index_file(writer, shard, index_field_id, row_count)
             .await?;
         let serialize_upload =
             serialize_upload_start.map_or(Duration::ZERO, |start| start.elapsed());

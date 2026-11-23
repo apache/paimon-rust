@@ -26,7 +26,8 @@
 //! each builder.
 
 use crate::spec::{
-    DataField, FileKind, IndexManifest, IndexManifestEntry, ManifestEntry, Predicate, Snapshot,
+    DataField, FileKind, GlobalIndexMeta, IndexManifest, IndexManifestEntry, ManifestEntry,
+    Predicate, Snapshot,
 };
 use crate::table::{merge_row_ranges, RowRange, Table};
 use crate::{Error, Result};
@@ -277,28 +278,39 @@ fn ranges_overlap(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
     a_start <= b_end && b_start <= a_end
 }
 
+pub(super) fn matching_index_meta<'a>(
+    entry: &'a IndexManifestEntry,
+    index_type: &str,
+    index_field_id: i32,
+    extra_field_ids: Option<&[i32]>,
+) -> Option<&'a GlobalIndexMeta> {
+    if entry.kind != FileKind::Add || entry.index_file.index_type != index_type {
+        return None;
+    }
+    entry.index_file.global_index_meta.as_ref().filter(|meta| {
+        meta.index_field_id == index_field_id
+            && same_extra_field_ids(
+                super::centroid_index::index_identity_extra_fields(&entry.index_file),
+                extra_field_ids,
+            )
+    })
+}
+
 /// Row ranges already covered by `index_type` global-index files for
 /// `index_field_id` (and matching `extra_field_ids`). Mirrors Java
 /// `GlobalIndexBuilderUtils.indexedRowRanges`.
-pub(crate) fn indexed_row_ranges(
-    entries: &[IndexManifestEntry],
+pub(crate) fn indexed_row_ranges<'a>(
+    entries: impl IntoIterator<Item = &'a IndexManifestEntry>,
     index_type: &str,
     index_field_id: i32,
     extra_field_ids: Option<&[i32]>,
 ) -> Vec<RowRange> {
     let mut ranges = Vec::new();
     for entry in entries {
-        if entry.kind != FileKind::Add || entry.index_file.index_type != index_type {
-            continue;
-        }
-        let Some(meta) = &entry.index_file.global_index_meta else {
+        let Some(meta) = matching_index_meta(entry, index_type, index_field_id, extra_field_ids)
+        else {
             continue;
         };
-        if meta.index_field_id != index_field_id
-            || !same_extra_field_ids(meta.extra_field_ids.as_deref(), extra_field_ids)
-        {
-            continue;
-        }
         ranges.push(RowRange::new(meta.row_range_start, meta.row_range_end));
     }
     merge_row_ranges(ranges)
@@ -310,25 +322,18 @@ pub(crate) fn indexed_row_ranges(
 /// `indexed_row_ranges` and Java `GlobalIndexIdentifier` -- so a different index
 /// type (or different `extra_field_ids`) on the same field coexists. Two files
 /// of the same identity with overlapping ranges are still rejected.
-pub(crate) fn validate_existing_index_overlap(
-    entries: &[IndexManifestEntry],
+pub(crate) fn validate_existing_index_overlap<'a>(
+    entries: impl IntoIterator<Item = &'a IndexManifestEntry>,
     index_type: &str,
     index_field_id: i32,
     extra_field_ids: Option<&[i32]>,
     planned: &[RowRange],
 ) -> Result<()> {
     for entry in entries {
-        if entry.kind != FileKind::Add || entry.index_file.index_type != index_type {
-            continue;
-        }
-        let Some(meta) = &entry.index_file.global_index_meta else {
+        let Some(meta) = matching_index_meta(entry, index_type, index_field_id, extra_field_ids)
+        else {
             continue;
         };
-        if meta.index_field_id != index_field_id
-            || !same_extra_field_ids(meta.extra_field_ids.as_deref(), extra_field_ids)
-        {
-            continue;
-        }
         if planned
             .iter()
             .any(|r| ranges_overlap(meta.row_range_start, meta.row_range_end, r.from(), r.to()))

@@ -103,6 +103,19 @@ fn entry_all_matches(
         (PredicateOperator::Eq, [value]) => {
             cmp(first, value)? == Equal && cmp(last, value)? == Equal
         }
+        (PredicateOperator::In, values) => {
+            // Bounds prove membership only for a single distinct key. Merely
+            // including both endpoints does not cover keys between them.
+            if cmp(first, last)? != Equal {
+                return Ok(false);
+            }
+            for value in values {
+                if cmp(first, value)? == Equal {
+                    return Ok(true);
+                }
+            }
+            false
+        }
         (PredicateOperator::Lt, [value]) => cmp(last, value)? == Less,
         (PredicateOperator::LtEq, [value]) => cmp(last, value)? != Greater,
         (PredicateOperator::Gt, [value]) => cmp(first, value)? == Greater,
@@ -112,4 +125,37 @@ fn entry_all_matches(
         }
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_in_all_match_requires_single_non_null_key() {
+        let ty = DataType::Int(crate::spec::IntType::new());
+        let cmp = make_key_comparator(&ty);
+        for (first, last, nulls, literals, expected) in [
+            (7i32, 7i32, false, vec![6i32, 7, 9], true),
+            (7, 7, false, vec![6, 9], false),
+            (7, 7, false, vec![], false),
+            (7, 7, true, vec![7], false),
+            (6, 9, false, vec![6, 9], false),
+            (9, 6, false, vec![6, 9], false),
+        ] {
+            let meta = BTreeIndexMeta::new(
+                Some(first.to_le_bytes().to_vec()),
+                Some(last.to_le_bytes().to_vec()),
+                nulls,
+            );
+            let values = literals
+                .iter()
+                .map(|v| v.to_le_bytes().to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                entry_all_matches(&meta, PredicateOperator::In, &values, &cmp).unwrap(),
+                expected
+            );
+        }
+    }
 }

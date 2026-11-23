@@ -31,6 +31,9 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+use num_rational::BigRational;
+use num_traits::ToPrimitive;
+
 use crate::table::hybrid_search_builder::normalize_route_score;
 use crate::table::pk_search_position::PrimaryKeySearchPosition;
 
@@ -51,6 +54,7 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
 pub(crate) struct Ranking {
     positions: Vec<PrimaryKeySearchPosition>,
     weight: f64,
+    cosine_distance_scores: bool,
 }
 
 impl Ranking {
@@ -65,7 +69,16 @@ impl Ranking {
                 "Search route weight must be finite and positive: {weight}."
             )));
         }
-        Ok(Self { positions, weight })
+        Ok(Self {
+            positions,
+            weight,
+            cosine_distance_scores: false,
+        })
+    }
+
+    pub(crate) fn with_cosine_distance_scores(mut self, cosine_distance_scores: bool) -> Self {
+        self.cosine_distance_scores = cosine_distance_scores;
+        self
     }
 
     pub(crate) fn positions(&self) -> &[PrimaryKeySearchPosition] {
@@ -149,34 +162,121 @@ pub(crate) fn weighted_rrf(
     top_k(fused_scores, limit)
 }
 
-/// Fuses heterogeneous route scores after independently normalizing each route
-/// to `[0, 1]`. Mirrors Java `weightedScore`.
+/// Fuses heterogeneous route scores by normalizing each route to `[0, 1]`
+/// as in Java `weightedScore`. Cosine routes retain precision through
+/// normalization and fused ordering. A single cosine route keeps its
+/// distance order, including when normalized scores round to a tie.
 pub(crate) fn weighted_score(
     rankings: &[Ranking],
     limit: usize,
 ) -> crate::Result<Vec<PrimaryKeySearchPosition>> {
     check_limit(limit, "Weighted-score result limit")?;
+    let has_cosine = rankings
+        .iter()
+        .any(|ranking| ranking.cosine_distance_scores);
+    if has_cosine && rankings.len() > 1 {
+        return weighted_score_with_cosine(rankings, limit);
+    }
+
     let mut fused_scores: HashMap<PrimaryKeySearchPosition, f64> = HashMap::new();
     for ranking in rankings {
-        let mut unique: HashSet<PrimaryKeySearchPosition> = HashSet::new();
-        let mut min = f32::INFINITY;
-        let mut max = f32::NEG_INFINITY;
+        let (min, max) = score_bounds(ranking)?;
         for position in ranking.positions() {
-            if !unique.insert(position.clone()) {
-                return Err(data_invalid(format!(
-                    "One weighted-score ranking contains duplicate physical position {}.",
-                    describe(position)
-                )));
-            }
-            min = min.min(position.score());
-            max = max.max(position.score());
-        }
-        for position in ranking.positions() {
-            let normalized = f64::from(normalize_route_score(position.score(), min, max));
+            let normalized = if ranking.cosine_distance_scores && max > min {
+                (f64::from(position.score()) - f64::from(min)) / (f64::from(max) - f64::from(min))
+            } else {
+                f64::from(normalize_route_score(position.score(), min, max))
+            };
             *fused_scores.entry(position.clone()).or_insert(0.0) += ranking.weight() * normalized;
         }
     }
+    if has_cosine {
+        // The normalized score is monotone within one cosine route. Order
+        // directly by its original score so rounding cannot introduce ties.
+        let mut ranked = fused_scores
+            .into_iter()
+            .map(|(position, score)| Ok((position.with_score(score as f32)?, position.score())))
+            .collect::<crate::Result<Vec<_>>>()?;
+        ranked.sort_by(|(left, left_order), (right, right_order)| {
+            right_order
+                .total_cmp(left_order)
+                .then_with(|| compare_to(left, right))
+        });
+        ranked.truncate(limit);
+        return Ok(ranked.into_iter().map(|(position, _)| position).collect());
+    }
     top_k(fused_scores, limit)
+}
+
+fn score_bounds(ranking: &Ranking) -> crate::Result<(f32, f32)> {
+    let mut unique = HashSet::new();
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for position in ranking.positions() {
+        if !unique.insert(position) {
+            return Err(data_invalid(format!(
+                "One weighted-score ranking contains duplicate physical position {}.",
+                describe(position)
+            )));
+        }
+        min = min.min(position.score());
+        max = max.max(position.score());
+    }
+    Ok((min, max))
+}
+
+fn weighted_score_with_cosine(
+    rankings: &[Ranking],
+    limit: usize,
+) -> crate::Result<Vec<PrimaryKeySearchPosition>> {
+    let mut fused_scores: HashMap<PrimaryKeySearchPosition, BigRational> = HashMap::new();
+    for ranking in rankings {
+        let (min, max) = score_bounds(ranking)?;
+        let cosine_scale = (ranking.cosine_distance_scores && max > min).then(|| {
+            // Min-max normalization is a ratio of finite binary floats. Keep
+            // it exact so tiny distances survive normalization near one and
+            // the sum of route contributions is independent of route order.
+            let min = BigRational::from_float(min).expect("finite route score");
+            let max = BigRational::from_float(max).expect("finite route score");
+            let weight = BigRational::from_float(ranking.weight()).expect("finite route weight");
+            let scale = weight / (max - &min);
+            (min, scale)
+        });
+        for position in ranking.positions() {
+            let contribution = match &cosine_scale {
+                Some((min, scale)) => {
+                    (BigRational::from_float(position.score()).expect("finite route score") - min)
+                        * scale
+                }
+                None => {
+                    let normalized = normalize_route_score(position.score(), min, max);
+                    BigRational::from_float(ranking.weight() * f64::from(normalized))
+                        .expect("finite weighted route score")
+                }
+            };
+            *fused_scores.entry(position.clone()).or_default() += contribution;
+        }
+    }
+    let mut ranked = fused_scores
+        .into_iter()
+        .map(|(position, exact_score)| {
+            let score = exact_score.to_f64().expect("valid ratio");
+            Ok((position.with_score(score as f32)?, score, exact_score))
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    ranked.sort_unstable_by(
+        |(left, left_score, left_exact), (right, right_score, right_exact)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| right_exact.cmp(left_exact))
+                .then_with(|| compare_to(left, right))
+        },
+    );
+    ranked.truncate(limit);
+    Ok(ranked
+        .into_iter()
+        .map(|(position, _, _)| position)
+        .collect())
 }
 
 /// Fuses routes using weighted reciprocal rank without the RRF smoothing
@@ -375,6 +475,21 @@ mod tests {
         assert_eq!(file_names(&ranked), vec!["c", "b"]);
         assert_eq!(ranked[0].score(), 4.0);
         assert_eq!(ranked[1].score(), 2.0);
+    }
+
+    #[test]
+    fn weighted_score_uses_physical_ties_for_non_cosine_routes() {
+        let route = ranking(
+            vec![
+                position("file", 0, 1.0_f32.next_down()),
+                position("file", 1, 1.0),
+                position("file", 2, -1.0),
+            ],
+            1.0,
+        );
+        let fused = weighted_score(&[route], 1).unwrap();
+        assert_eq!(fused[0].row_position(), 0);
+        assert_eq!(fused[0].score(), 1.0);
     }
 
     #[test]

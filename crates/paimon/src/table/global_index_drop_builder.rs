@@ -190,7 +190,7 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             };
             if global_meta.index_field_id != index_fields[0].id()
                 || !super::global_index_build_common::same_extra_field_ids(
-                    global_meta.extra_field_ids.as_deref(),
+                    super::centroid_index::index_identity_extra_fields(&entry.index_file),
                     Some(&extra_field_ids),
                 )
             {

@@ -56,22 +56,59 @@ pub(in crate::table) fn validate_vector_batch(
     expected_row_id: &mut i64,
 ) -> Result<ValidatedVectorBatch> {
     validate_vector_batch_with(batch, index_column, dimension, |row_id| {
-        if row_id != *expected_row_id {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "vindex vector extraction expected _ROW_ID {}, got {}",
-                    expected_row_id, row_id
-                ),
-                source: None,
-            });
+        validate_contiguous_row_id(row_id, expected_row_id)
+    })
+}
+
+fn validate_contiguous_row_id(row_id: i64, expected_row_id: &mut i64) -> Result<()> {
+    if row_id != *expected_row_id {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "vindex vector extraction expected _ROW_ID {}, got {}",
+                expected_row_id, row_id
+            ),
+            source: None,
+        });
+    }
+    *expected_row_id = expected_row_id
+        .checked_add(1)
+        .ok_or_else(|| Error::DataInvalid {
+            message: "vindex expected row id overflows i64".to_string(),
+            source: None,
+        })?;
+    Ok(())
+}
+
+pub(in crate::table) fn validate_multi_vector_batch(
+    batch: &RecordBatch,
+    index_column: &str,
+    dimension: usize,
+    expected_row_id: &mut i64,
+) -> Result<ValidatedVectorBatch> {
+    use crate::vindex::multi_vector::{invalid, normalize_into, MultiVectorArray};
+    let column = batch
+        .column_by_name(index_column)
+        .ok_or_else(|| invalid(format!("MultiVector column '{index_column}' is missing")))?;
+    let vectors = MultiVectorArray::new(column.as_ref())?;
+    let ids = batch
+        .column_by_name(ROW_ID_FIELD_NAME)
+        .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+        .filter(|ids| ids.null_count() == 0)
+        .ok_or_else(|| invalid("MultiVector extraction requires non-null Int64 _ROW_ID"))?;
+    let mut values = Vec::new();
+    let mut row_ids = Vec::new();
+    for (row, &row_id) in ids.values().iter().enumerate() {
+        validate_contiguous_row_id(row_id, expected_row_id)?;
+        for vector in vectors.row(row, dimension) {
+            normalize_into(vector?, &mut values);
+            row_ids.push(row_id);
         }
-        *expected_row_id = expected_row_id
-            .checked_add(1)
-            .ok_or_else(|| Error::DataInvalid {
-                message: "vindex expected row id overflows i64".to_string(),
-                source: None,
-            })?;
-        Ok(())
+    }
+    Ok(ValidatedVectorBatch {
+        vector_count: row_ids.len(),
+        source_rows: batch.num_rows(),
+        values: values.into(),
+        row_ids: row_ids.into(),
     })
 }
 

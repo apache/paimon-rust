@@ -22,7 +22,7 @@ use bytes::{Bytes, BytesMut};
 
 use crate::io::FileRead;
 
-use super::{CacheReadToken, LocalCache};
+use super::{CacheBackend, CacheReadToken, LocalCache};
 
 pub(crate) struct CachedFileReader {
     delegate: Arc<dyn FileRead>,
@@ -61,9 +61,29 @@ impl CachedFileReader {
         }
     }
 
-    async fn read_block(&self, block_index: u64) -> crate::Result<Bytes> {
+    /// Cache a prefix at its own size while reusing any ordinary cached blocks that cover it.
+    pub(in crate::io) async fn read_prefix(&self, length: u64) -> crate::Result<Bytes> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
         let block_size = self.cache.block_size();
-        let key = self.cache.block_key(&self.path, block_index);
+        if length == block_size.min(self.file_size) {
+            return self.read_block(0, block_size).await;
+        }
+        if matches!(self.cache.backend, CacheBackend::External(_)) {
+            // External slots are addressed by path and offset and expect aligned blocks.
+            return match self.read_cached_range(0..length).await {
+                Some(payload) => Ok(payload),
+                None => self.delegate.read(0..length).await,
+            };
+        }
+        self.read_block(0, length).await
+    }
+
+    async fn read_block(&self, block_index: u64, block_size: u64) -> crate::Result<Bytes> {
+        let key = self
+            .cache
+            .block_key_with_size(&self.path, block_index, block_size);
         let start = block_index * block_size;
         let end = start.saturating_add(block_size).min(self.file_size);
         let expected_len = usize::try_from(end - start).map_err(|_| crate::Error::DataInvalid {
@@ -79,6 +99,11 @@ impl CachedFileReader {
                 return Ok(payload);
             }
             self.cache.remove_block(&key).await;
+        }
+        if block_size != self.cache.block_size() {
+            if let Some(payload) = self.read_cached_range(start..end).await {
+                return Ok(payload);
+            }
         }
 
         let load_lock = self.cache.block_load_lock(&key).await;
@@ -146,10 +171,10 @@ impl CachedFileReader {
     }
 
     async fn read_blocks(&self, first: u64, last: u64) -> crate::Result<Vec<Bytes>> {
-        if first == last {
-            return Ok(vec![self.read_block(first).await?]);
-        }
         let size = self.cache.block_size();
+        if first == last {
+            return Ok(vec![self.read_block(first, size).await?]);
+        }
         let mut blocks = Vec::new();
         let mut locks = Vec::new();
         // Acquire missing-block locks in offset order, including overlapping reads.
@@ -257,7 +282,7 @@ impl CachedFileReader {
         if self.file_size == 0 {
             return Ok(Bytes::new());
         }
-        if let Some(payload) = self.read_cached_full().await {
+        if let Some(payload) = self.read_cached_range(0..self.file_size).await {
             return Ok(payload);
         }
 
@@ -265,7 +290,7 @@ impl CachedFileReader {
         let load_lock = self.cache.block_load_lock(&first_key).await;
         let load_guard = load_lock.lock().await;
         let _shared_guard = self.cache.shared_load_lock(&first_key).await;
-        let result = if let Some(payload) = self.read_cached_full().await {
+        let result = if let Some(payload) = self.read_cached_range(0..self.file_size).await {
             Ok(payload)
         } else {
             match self.delegate.read(0..self.file_size).await {
@@ -308,15 +333,21 @@ impl CachedFileReader {
         result
     }
 
-    async fn read_cached_full(&self) -> Option<Bytes> {
+    /// Read an already cached range without loading missing blocks.
+    pub(in crate::io) async fn read_cached_range(&self, range: Range<u64>) -> Option<Bytes> {
+        if range.start > range.end || range.end > self.file_size {
+            return None;
+        }
+        if range.is_empty() {
+            return Some(Bytes::new());
+        }
         let block_size = self.cache.block_size();
-        let block_count = self.file_size.div_ceil(block_size);
-        let output_len = usize::try_from(self.file_size).ok()?;
+        let output_len = usize::try_from(range.end - range.start).ok()?;
         let mut output = BytesMut::with_capacity(output_len);
-        for block_index in 0..block_count {
+        for block_index in range.start / block_size..range.end.div_ceil(block_size) {
             let key = self.cache.block_key(&self.path, block_index);
             let start = block_index * block_size;
-            let expected_len = (self.file_size - start).min(block_size) as usize;
+            let expected_len = usize::try_from((self.file_size - start).min(block_size)).ok()?;
             let payload = self
                 .cache
                 .get_block(&key, expected_len, &self.read_token)
@@ -325,7 +356,9 @@ impl CachedFileReader {
                 self.cache.remove_block(&key).await;
                 return None;
             }
-            output.extend_from_slice(&payload);
+            let from = (range.start.max(start) - start) as usize;
+            let to = (range.end - start).min(expected_len as u64) as usize;
+            output.extend_from_slice(&payload[from..to]);
         }
         Some(output.freeze())
     }

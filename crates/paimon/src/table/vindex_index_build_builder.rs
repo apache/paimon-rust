@@ -16,6 +16,7 @@
 // under the License.
 
 pub(super) mod centroid;
+mod centroid_bitmap;
 mod extraction;
 mod pipeline;
 mod planning;
@@ -83,21 +84,35 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             &procedure,
             column,
         );
+        let multi_vector = crate::vindex::multi_vector::embedding_type(field.data_type()).is_some();
         let defaults = super::global_index_options::declared_options(
             &effective,
             column,
             "vector",
             &self.index_type,
+            !multi_vector,
         )?;
         let user =
             super::global_index_options::build_options(&procedure, column, &self.index_type)?;
-        let centroid = centroid::CentroidBuildOptions::resolve(
+        let mut centroid = centroid::CentroidBuildOptions::resolve(
             &effective,
             &defaults,
             &user,
             &self.index_type,
             column,
         )?;
+        if multi_vector {
+            if !self.table.schema().core_options().data_evolution_enabled() {
+                return Err(crate::vindex::multi_vector::invalid(
+                    "MultiVector indexes require a Data Evolution table",
+                ));
+            }
+            if centroid.is_some() {
+                return Err(crate::vindex::multi_vector::invalid(
+                    "MultiVector indexes require range sharding",
+                ));
+            }
+        }
         let mut native_defaults = defaults.clone();
         let mut native_user = crate::vindex::build_parameters(&user, &self.index_type, column);
         for options in [&mut native_defaults, &mut native_user] {
@@ -122,6 +137,15 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         )?;
         effective.extend(defaults);
         effective.extend(user);
+        if let Some(bitmap) = centroid_bitmap::BitmapBuild::resolve(self.table, column, &effective)?
+        {
+            let centroid = centroid.as_mut().ok_or_else(|| {
+                crate::table::centroid_index::invalid(
+                    "Vector Bitmap extra fields require centroid sharding",
+                )
+            })?;
+            centroid.bitmap = Some(bitmap);
+        }
         Ok((effective, native, centroid))
     }
 
@@ -261,20 +285,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             options.dimension() as u64,
             "vindex dimension is too large for Rust builder",
         )?;
-        let index_meta =
-            serde_json::to_vec(&options.native_options).map_err(|error| Error::DataInvalid {
-                message: format!("Failed to serialize vindex options metadata: {error}"),
-                source: Some(Box::new(error)),
-            })?;
         let built = self
-            .build_index_file(
-                shard,
-                index_column,
-                dimension,
-                index_field.id(),
-                &options,
-                index_meta,
-            )
+            .build_index_file(shard, index_column, dimension, index_field.id(), &options)
             .await?;
         Ok(built.map(|built| {
             let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);

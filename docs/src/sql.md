@@ -2948,7 +2948,7 @@ SELECT * FROM vector_search('table_name', 'column_name', 'query_vector_json', li
 |---|---|---|
 | `table_name` | STRING | Table name, fully qualified (`catalog.db.table`) or short form |
 | `column_name` | STRING | The vector column to search |
-| `query_vector_json` | STRING | Query vector as a JSON array of floats |
+| `query_vector_json` | STRING | JSON vector, or a matrix of floats for an embedding-list column |
 | `limit` | INT | Maximum number of results (top-k) |
 
 Example:
@@ -2982,12 +2982,72 @@ explicitly with the build procedure. A Rust build plan also exposes
 `replacement_messages()` to publish with the completed shards in the same
 snapshot-guarded commit.
 
+Before upgrading, use the previous version to drop all indexes written in an
+earlier Centroid development format. Rebuild those indexes after upgrading.
+
+For unfiltered L2 searches over centroid-sharded `ivf-flat` or `ivf-pq`,
+automatic probing can choose both widths together. With 64 outer centers,
+an automatic outer width of eight, and Top-K from 10 through 100, the joint
+policy starts with four shards and 16 local lists per shard. Each of those
+four shards must have 64 lists and at least 16 times Top-K vectors. Explicit
+outer or inner widths and filter expansion settings use independent probe sizing.
+
 Set `centroid.nprobe` to choose the outer probe width. `ivf.nprobe` controls a
 selected shard's local IVF search, and `diskann.l_search` controls its DiskANN
 search. Automatic cosine and L2 routing can widen the search when necessary.
 Automatic inner-product routing searches all centroids. The layout is stored
 in the index manifest and is available when searching Java-built indexes.
 The current native DiskANN reader supports up to 1,024 dimensions.
+
+### Bitmap Filters in Centroid Shards
+
+Supply a JSON object named `extra_fields` when building a centroid index to
+index scalar columns alongside each populated vector shard:
+
+```sql
+CALL sys.create_global_index(
+    table => 'my_db.items',
+    index_column => 'embedding',
+    index_type => 'ivf-flat',
+    options => 'ivf-flat.sharding=centroid,ivf-flat.dimension=4',
+    extra_fields => '{"tenant_id":"bitmap","status":"bitmap"}'
+);
+```
+
+In Rust, pass the same JSON as the `extra_fields` build option.
+A search can prefilter exactly with equality, `IN`, `IS NULL`, `IS NOT NULL`,
+and `AND` or `OR` over those predicates, including across columns. An eligible
+shard with no visible matches can skip its ANN file. After a schema change,
+the Bitmap remains usable when each field referenced by the predicate has the
+same ID and type in the build schema, ignoring nullability. Unsupported
+predicates and incompatible field changes use ordinary scalar filtering.
+Rebuilding replaces the selected partitions' groups. Dropping the index on
+the vector column also drops its Bitmap files.
+Use `THROW_ERROR` or `DROP_PARTITION_INDEX` for
+`global-index.column-update-action` when building centroid Bitmap indexes.
+
+### MultiVector MaxSim
+
+On Data Evolution append tables, a range-sharded cosine index can search an
+`ARRAY<VECTOR<FLOAT, d>>` or `ARRAY<ARRAY<FLOAT>>` column. Give the second type an
+explicit embedding dimension when building the index. Each row can contain a
+different number of embeddings. Null elements are ignored, and rows without
+embeddings have no score.
+
+```sql
+SELECT id
+FROM vector_search('paimon.my_db.documents', 'chunks', '[[1.0, 0.0], [0.0, 1.0]]', 10);
+
+CALL sys.vector_search('my_db.documents', 'chunks', '[[1.0, 0.0], [0.0, 1.0]]', 10, 'id');
+```
+
+For each query vector, MaxSim takes the best cosine similarity over a row's
+embeddings and sums the scores across the matrix. ANN retrieves distinct row
+candidates for each query vector and the union is reranked using the full
+embedding lists. The default matrix candidate multiplier is four. A single
+query vector uses its best matching embedding and a default multiplier of
+one. Set `refine_factor` to override the multiplier. The Rust and Python
+single-search builders expose `with_multi_vector` for a query matrix.
 
 ### Scalar Pre-Filters
 
@@ -3096,6 +3156,19 @@ column `embedding`, these keys are accepted, from more specific to more general:
 Larger refine factors may improve recall and ordering quality, but they also
 increase index result merging, raw-vector reads, and exact scoring work. Use the
 smallest factor that provides the desired recall.
+
+### Exact Cosine Scoring in Rust and Java
+
+For the cosine metric on Data Evolution tables, exact raw scans and reranking
+rank by similarity. Rust accumulates the dot product in wider precision. Java
+can accumulate it in `float`, where cancellation can change scores and the
+Top-K order of closely matched candidates.
+
+Rust's exact scans and reranking on primary-key tables round the cosine distance
+(`1 - cosine`) to `f32`. The Java scorer rounds the similarity to `float` before
+subtracting it from one. Closely matched candidates can therefore have different
+distances or Top-K order across the two runtimes.
+[Java exact scorer](https://github.com/apache/paimon/blob/68dddca6ba335b17bbf8febb6444a121dcd8dcce/paimon-core/src/main/java/org/apache/paimon/globalindex/VectorSearchMetric.java#L87-L130)
 
 ### Lateral Joins
 
@@ -4134,14 +4207,14 @@ optimization may be disabled. Full-text builds reject deletion-vector tables.
 | `vector-index.search-mode` | `fast` | Coverage mode for vector search. |
 | `full-text-index.search-mode` | `fast` | Coverage mode for full-text search. |
 | `vector-index.post-filter.candidates-factor` | `10` | Multiplier of each query's original Top-K for one ANN query followed by exact scalar post-filtering. At least the required reranking/deletion allowance, capped by shard size and the backend limit. Positive integer no greater than `2147483647`. Short results are returned without retry. |
-| `global-index.thread-num` | `32` | Number of concurrent global-index search tasks; must be greater than 0 and must not exceed the runtime's task limit. This does not limit Vindex file range reads. |
+| `global-index.thread-num` | `32` | Maximum number of concurrent global-index search tasks. Also limits concurrent retained vector index checks across all buckets in one automatic primary-key compaction round, including header reads and storage metadata checks. Must be greater than 0 and must not exceed the runtime's task limit. |
 | `global-index.vindex.read-thread-num` | `64` | Maximum number of concurrent Vindex file range reads shared by one search operation; must be greater than 0 and must not exceed the runtime semaphore limit. |
 | `global-index.column-update-action` | `THROW_ERROR` | What a commit does when it updates an indexed column: `THROW_ERROR` rejects the commit, `DROP_PARTITION_INDEX` drops the affected partition index instead. |
 
 `global-index.vindex.read-thread-num` is independent of `global-index.thread-num`.
-When upgrading a table that sets `global-index.thread-num`, set the new option
-explicitly to the same value if Vindex range reads should keep the previous limit;
-otherwise they use the new default of `64`.
+When upgrading a table that sets `global-index.thread-num`, set
+`global-index.vindex.read-thread-num` to the same value to preserve the previous
+limit for Vindex range reads during search. The new option defaults to `64`.
 
 ### Variant Shredding Options
 

@@ -22,6 +22,9 @@ use std::collections::HashSet;
 #[tokio::test]
 async fn unified_index_config_drives_pk_compaction_and_ranked_reads() {
     use paimon::spec::{ArrayType, FloatType};
+    use paimon_vindex_core::distance::MetricType;
+    use paimon_vindex_core::index::VectorIndexReader;
+    use std::io::Cursor;
     use std::sync::Arc;
     for suffix in ["index-columns", "index-column"] {
         let schema = Schema::builder()
@@ -35,6 +38,14 @@ async fn unified_index_config_drives_pk_compaction_and_ranked_reads() {
             .option("bucket", "1")
             .option("deletion-vectors.enabled", "true")
             .option("deletion-vectors.merge-on-read", "false")
+            .option(
+                "index-file-in-data-file-dir",
+                if suffix == "index-column" {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
             .option(format!("global-index.btree.{suffix}"), "id")
             .option(format!("global-index.full-text.{suffix}"), "text")
             .option(format!("global-index.ivf-flat.{suffix}"), "embedding")
@@ -90,19 +101,20 @@ async fn unified_index_config_drives_pk_compaction_and_ranked_reads() {
             .iter()
             .find(|e| e.index_file.index_type == "ivf-flat")
             .unwrap();
-        let meta: std::collections::HashMap<String, String> = serde_json::from_slice(
-            vector
-                .index_file
-                .global_index_meta
-                .as_ref()
-                .unwrap()
-                .index_meta
-                .as_ref()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(meta["dimension"], "2");
-        assert_eq!(meta["metric"], "l2");
+        let meta = vector.index_file.global_index_meta.as_ref().unwrap();
+        assert_eq!(meta.index_meta.as_deref(), Some(b"{}".as_slice()));
+        let payload = table
+            .file_io()
+            .new_input(&index_path(&table, vector))
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let native = VectorIndexReader::open(Cursor::new(payload))
+            .unwrap()
+            .metadata();
+        assert_eq!(native.dimension, 2);
+        assert_eq!(native.metric, MetricType::L2);
         let result = table
             .new_vector_search_builder()
             .with_vector_column("embedding")
@@ -156,6 +168,10 @@ async fn unified_index_config_drives_pk_compaction_and_ranked_reads() {
 }
 
 async fn vector_table_for_indexes(options: &[(&str, &str)]) -> Table {
+    table_with_schema(vector_schema_for_indexes(options)).await
+}
+
+fn vector_schema_for_indexes(options: &[(&str, &str)]) -> TableSchema {
     use paimon::spec::{ArrayType, FloatType};
     let mut schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
@@ -178,7 +194,7 @@ async fn vector_table_for_indexes(options: &[(&str, &str)]) -> Table {
     for (key, value) in options {
         schema = schema.option(*key, *value);
     }
-    table_with_schema(TableSchema::new(0, &schema.build().unwrap())).await
+    TableSchema::new(0, &schema.build().unwrap())
 }
 
 fn vector_index_batch(ids: Vec<i32>, values: Vec<Option<[f32; 2]>>) -> RecordBatch {
@@ -203,6 +219,233 @@ fn vector_index_batch(ids: Vec<i32>, values: Vec<Option<[f32; 2]>>) -> RecordBat
         ("embedding", Arc::new(vectors.finish()) as ArrayRef),
     ])
     .unwrap()
+}
+
+async fn write_vector_range(table: &Table, ids: std::ops::Range<i32>) {
+    let vectors = ids.clone().map(|id| Some([id as f32, 0.])).collect();
+    write_batch(table, &vector_index_batch(ids.collect(), vectors)).await;
+}
+
+async fn seed_vector_history(table: &Table) -> paimon::spec::IndexManifestEntry {
+    write_vector_range(table, 0..1000).await;
+    let results = compact(table).await;
+    let base = &results[0].files()[0];
+    assert!(base.level > 1);
+    let entries = indexes(table).await;
+    assert_eq!(entries.len(), 1);
+    entries.into_iter().next().unwrap()
+}
+
+#[tokio::test]
+async fn build_parameters_apply_to_new_pk_vector_segments() {
+    use paimon::spec::SchemaChange;
+    use paimon_vindex_core::index::VectorIndexReader;
+    use std::io::Cursor;
+
+    for (kind, option, previous, current) in [
+        ("ivf-flat", "nlist", 1, 2),
+        ("ivf-rq", "rq.bits", 8, 1),
+        ("ivf-pq", "pq.m", 1, 2),
+        ("diskann", "pq.bits", 8, 4),
+    ] {
+        let options = |value| {
+            let mut options = serde_json::json!({"dimension": 2});
+            if kind == "diskann" {
+                options["pq.m"] = serde_json::json!(2);
+            } else {
+                options["nlist"] = serde_json::json!(1);
+            }
+            options[option] = serde_json::json!(value);
+            options.to_string()
+        };
+        let option_key = "fields.embedding.pk-vector.index.options";
+        let table = vector_table_for_indexes(&[
+            ("fields.embedding.pk-vector.index.type", kind),
+            (option_key, &options(previous)),
+        ])
+        .await;
+        let old = seed_vector_history(&table).await;
+        let schema = table
+            .schema()
+            .apply_changes(vec![SchemaChange::set_option(
+                option_key.into(),
+                options(current),
+            )])
+            .unwrap();
+        persist_table_schema(table.file_io(), table.location(), &schema).await;
+        let table = table.copy_with_resolved_schema(schema, "main").unwrap();
+        write_vector_range(&table, 1000..1004).await;
+        compact(&table).await;
+
+        let active = indexes(&table).await;
+        assert_eq!(active.len(), 2, "{kind}");
+        assert!(active.contains(&old), "{kind}");
+        for entry in &active {
+            let payload = table
+                .file_io()
+                .new_input(&index_path(&table, entry))
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let metadata = VectorIndexReader::open(Cursor::new(payload))
+                .unwrap()
+                .metadata();
+            let recorded = match kind {
+                "ivf-flat" => Some(metadata.nlist),
+                "ivf-rq" => metadata.rq_bits,
+                "ivf-pq" => metadata.pq_m,
+                "diskann" => metadata.pq_bits,
+                _ => unreachable!(),
+            };
+            let expected = if entry == &old { previous } else { current };
+            assert_eq!(recorded, Some(expected), "{kind}");
+            assert_eq!(
+                entry
+                    .index_file
+                    .global_index_meta
+                    .as_ref()
+                    .unwrap()
+                    .index_meta
+                    .as_deref(),
+                Some(b"{}".as_slice())
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_or_damaged_retained_pk_vector_indexes_are_rebuilt() {
+    for damage in ["missing", "truncated", "truncated-tail", "invalid-header"] {
+        let table = vector_table_for_indexes(&[]).await;
+        let old = seed_vector_history(&table).await;
+        let path = index_path(&table, &old);
+        if damage == "missing" {
+            table.file_io().delete_file(&path).await.unwrap();
+        } else {
+            let mut payload = table
+                .file_io()
+                .new_input(&path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .to_vec();
+            match damage {
+                "truncated" => payload.truncate(31),
+                "truncated-tail" => {
+                    assert!(payload.len() > 256);
+                    // Leave the entire range used for reading the header intact.
+                    payload.truncate(256);
+                }
+                _ => {
+                    // Keep the native version and file size, but invalidate the metric code.
+                    payload[16..20].fill(0xff);
+                }
+            }
+            table
+                .file_io()
+                .new_output(&path)
+                .unwrap()
+                .write(payload.into())
+                .await
+                .unwrap();
+        }
+        write_vector_range(&table, 1000..1004).await;
+        compact(&table).await;
+        let active = indexes(&table).await;
+        assert_eq!(active.len(), 2, "{damage}");
+        assert!(!active.contains(&old), "{damage}");
+        let rebuilt = active
+            .iter()
+            .find(|entry| entry.index_file.row_count == 1000)
+            .unwrap();
+        assert_eq!(
+            rebuilt.index_file.global_index_meta,
+            old.index_file.global_index_meta
+        );
+        assert!(table
+            .file_io()
+            .exists(&index_path(&table, rebuilt))
+            .await
+            .unwrap());
+    }
+}
+
+#[cfg(feature = "storage-fs")]
+#[tokio::test]
+async fn cached_header_does_not_hide_a_missing_retained_pk_vector_index() {
+    let directory = tempfile::tempdir().unwrap();
+    let table = table_with_cache_at(
+        vector_schema_for_indexes(&[]),
+        directory.path().join("table").to_str().unwrap().into(),
+        &[
+            ("local-cache.whitelist", "meta,file-index"),
+            (
+                "local-cache.dir",
+                directory.path().join("cache").to_str().unwrap(),
+            ),
+        ],
+    )
+    .await;
+    let old = seed_vector_history(&table).await;
+    let path = index_path(&table, &old);
+    let input = table.file_io().new_input(&path).unwrap();
+    let cached = input.read().await.unwrap();
+    // Simulate deletion by another process without going through this cache.
+    std::fs::remove_file(&path).unwrap();
+    assert!(!input.exists().await.unwrap());
+    assert_eq!(input.read().await.unwrap(), cached);
+
+    write_vector_range(&table, 1000..1004).await;
+    compact(&table).await;
+    let active = indexes(&table).await;
+    assert_eq!(active.len(), 2);
+    assert!(!active.contains(&old));
+    let rebuilt = active
+        .iter()
+        .find(|entry| entry.index_file.row_count == 1000)
+        .unwrap();
+    assert_eq!(
+        rebuilt.index_file.global_index_meta,
+        old.index_file.global_index_meta
+    );
+    assert!(table
+        .file_io()
+        .exists(&index_path(&table, rebuilt))
+        .await
+        .unwrap());
+}
+
+#[cfg(all(feature = "storage-fs", unix))]
+#[tokio::test]
+async fn retained_pk_vector_index_rebuilds_when_its_path_is_a_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let table = table_with_cache_at(
+        vector_schema_for_indexes(&[]),
+        directory.path().join("table").to_str().unwrap().into(),
+        &[],
+    )
+    .await;
+    let old = seed_vector_history(&table).await;
+    let path = index_path(&table, &old);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+
+    write_vector_range(&table, 1000..1004).await;
+    compact(&table).await;
+    let active = indexes(&table).await;
+    assert_eq!(active.len(), 2);
+    assert!(!active.contains(&old));
+    let rebuilt = active
+        .iter()
+        .find(|entry| entry.index_file.row_count == 1000)
+        .unwrap();
+    assert_eq!(
+        rebuilt.index_file.global_index_meta,
+        old.index_file.global_index_meta
+    );
+    assert!(std::path::Path::new(&index_path(&table, rebuilt)).is_file());
 }
 
 #[tokio::test]
@@ -336,6 +579,31 @@ async fn empty_vector_level_is_persisted_reused_and_searchable() {
             assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
         }
     }
+
+    let missing_path = index_path(&table, &empty);
+    table.file_io().delete_file(&missing_path).await.unwrap();
+    assert!(!table.file_io().exists(&missing_path).await.unwrap());
+    write_vector_range(&table, 1000..1004).await;
+    compact(&table).await;
+    let active = indexes(&table).await;
+    assert!(!active.contains(&empty));
+    let rebuilt = active
+        .iter()
+        .find(|entry| entry.index_file.row_count == 0)
+        .unwrap();
+    assert_eq!(
+        rebuilt.index_file.global_index_meta,
+        empty.index_file.global_index_meta
+    );
+    let status = table
+        .file_io()
+        .new_input(&index_path(&table, rebuilt))
+        .unwrap()
+        .metadata()
+        .await
+        .unwrap();
+    assert!(!status.is_dir);
+    assert_eq!(status.size, 0);
 }
 
 #[tokio::test]
@@ -738,17 +1006,16 @@ async fn retained_vector_sources_reject_same_bucket_dv_overwrites() {
 #[tokio::test]
 async fn vector_output_cannot_be_omitted_and_counts_non_null_vectors() {
     let table = vector_table_for_indexes(&[]).await;
-    write_batch(
-        &table,
-        &vector_index_batch(vec![1, 2], vec![None, Some([2., 0.])]),
-    )
-    .await;
+    let vectors = std::iter::once(None)
+        .chain((1..64).map(|id| Some([id as f32, 0.])))
+        .collect();
+    write_batch(&table, &vector_index_batch((0..64).collect(), vectors)).await;
     let builder = table.new_compact_builder();
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     let results = execute(&table, &plan).await;
     let entry = &results[0].index_entries().unwrap()[0];
     assert_eq!(
-        entry.index_file.row_count, 1,
+        entry.index_file.row_count, 63,
         "Java records indexed vectors separately from the physical source range"
     );
     assert_eq!(
@@ -758,7 +1025,7 @@ async fn vector_output_cannot_be_omitted_and_counts_non_null_vectors() {
             .as_ref()
             .unwrap()
             .row_range_end,
-        1
+        63
     );
     let path = index_path(&table, entry);
     let mut wire = serde_json::to_value(&results).unwrap();
@@ -775,6 +1042,74 @@ async fn vector_output_cannot_be_omitted_and_counts_non_null_vectors() {
     );
     assert_eq!(latest(&table).await.id(), 1);
     assert!(table.file_io().exists(&path).await.unwrap());
+    let mut empty = entry.clone();
+    empty.index_file.row_count = 0;
+    empty.index_file.file_size = 0;
+    wire = serde_json::to_value(&results).unwrap();
+    wire[0]["index_entries"] = serde_json::json!([empty]);
+    let error = builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(serde_json::from_value(wire).unwrap())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("expected 0"), "{error}");
+    assert_eq!(latest(&table).await.id(), 1);
+    let payload = table
+        .file_io()
+        .new_input(&path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let output = table.file_io().new_output(&path).unwrap();
+    // Change nlist, metric, and the low word of the indexed vector count.
+    for (offset, value) in [
+        (12, 2),
+        (16, paimon_vindex_core::distance::MetricType::Cosine as u32),
+        (20, 64),
+    ] {
+        let mut mismatched = payload.to_vec();
+        mismatched[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        output.write(mismatched.into()).await.unwrap();
+        let error = builder
+            .new_commit()
+            .unwrap()
+            .commit_compact(results.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("PK index output does not match complete compacted level"),
+            "{error}"
+        );
+        assert_eq!(latest(&table).await.id(), 1);
+    }
+    // Preserve the complete header and truncate the rest of the prepared file.
+    assert!(payload.len() > 256);
+    output.write(payload.slice(..256)).await.unwrap();
+    let error = builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("has size 256, expected"),
+        "{error}"
+    );
+    assert_eq!(latest(&table).await.id(), 1);
+    table.file_io().delete_file(&path).await.unwrap();
+    let error = builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results.clone())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("does not exist"), "{error}");
+    assert_eq!(latest(&table).await.id(), 1);
+    output.write(payload).await.unwrap();
     builder
         .new_commit()
         .unwrap()

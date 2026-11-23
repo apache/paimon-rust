@@ -28,7 +28,11 @@ pub(super) fn find_index_field<'a>(table: &'a Table, column: &str) -> Result<&'a
 }
 
 pub(super) fn validate_vector_field(field: &DataField) -> Result<()> {
-    validate_common_vector_field(field, "vindex")
+    if crate::vindex::multi_vector::embedding_type(field.data_type()).is_some() {
+        Ok(())
+    } else {
+        validate_common_vector_field(field, "vindex")
+    }
 }
 
 pub(super) use crate::table::index_build::vector_validation::*;

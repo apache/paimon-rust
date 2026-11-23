@@ -16,7 +16,7 @@
 // under the License.
 
 //! Shared sparse-vector spill, training, and native serialization.
-use super::vector_extraction::{local_ids, validate_vector_batch};
+use super::vector_extraction::{local_ids, validate_multi_vector_batch, validate_vector_batch};
 use super::vector_validation::{
     checked_std_vector_bytes, checked_training_sample_index, checked_training_vector_count,
     checked_vector_bytes,
@@ -30,7 +30,9 @@ use arrow_array::RecordBatch;
 use arrow_buffer::MutableBuffer;
 use futures::TryStreamExt;
 use paimon_vindex_core::autotune::default_training_vector_count;
-use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
+use paimon_vindex_core::index::{
+    VectorIndexConfig, VectorIndexTrainer, VectorIndexTraining, VectorIndexWriter,
+};
 use paimon_vindex_core::io::PosWriter;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -44,6 +46,7 @@ pub(in crate::table) struct VectorSpill {
     ids: tokio::fs::File,
     range: RowRange,
     dimension: usize,
+    multi_vector: bool,
     next_id: i64,
     rows: usize,
     vectors: usize,
@@ -66,11 +69,17 @@ impl VectorSpill {
             next_id: range.from(),
             range,
             dimension,
+            multi_vector: false,
             rows: 0,
             vectors: 0,
             bytes: 0,
         })
     }
+    pub fn with_multi_vector(mut self, multi_vector: bool) -> Self {
+        self.multi_vector = multi_vector;
+        self
+    }
+
     pub fn bytes_written(&self) -> usize {
         self.bytes
     }
@@ -81,7 +90,11 @@ impl VectorSpill {
         column: &str,
         timing_enabled: bool,
     ) -> Result<Duration> {
-        let vectors = validate_vector_batch(batch, column, self.dimension, &mut self.next_id)?;
+        let vectors = if self.multi_vector {
+            validate_multi_vector_batch(batch, column, self.dimension, &mut self.next_id)?
+        } else {
+            validate_vector_batch(batch, column, self.dimension, &mut self.next_id)?
+        };
         self.rows =
             self.rows
                 .checked_add(vectors.source_rows)
@@ -299,7 +312,6 @@ pub(in crate::table) async fn write_payload(
     column: &str,
     options: &VindexVectorIndexOptions,
     range: RowRange,
-    index_meta: Vec<u8>,
 ) -> Result<Option<IndexPayload>> {
     let mut spill = VectorSpill::new(range, options.dimension())?;
     while let Some(batch) = batches.try_next().await? {
@@ -313,7 +325,7 @@ pub(in crate::table) async fn write_payload(
     serialize_writer(trained.writer, output).await?;
     Ok(Some(IndexPayload {
         row_count,
-        index_meta,
+        index_meta: b"{}".to_vec(),
     }))
 }
 
@@ -324,7 +336,7 @@ fn spill_error(error: std::io::Error) -> Error {
     }
 }
 
-fn temporary_vector_file(kind: &str) -> Result<tokio::fs::File> {
+pub(in crate::table) fn temporary_vector_file(kind: &str) -> Result<tokio::fs::File> {
     tempfile::tempfile()
         .map(tokio::fs::File::from_std)
         .map_err(|error| Error::UnexpectedError {
@@ -344,7 +356,8 @@ fn train_and_add_spilled_vectors(
     timing_enabled: bool,
 ) -> std::io::Result<(VectorIndexWriter, Duration, Duration, Duration)> {
     let train_start = timing_enabled.then(Instant::now);
-    let mut writer = train_spilled_model(&mut raw_file, config, vector_count, dimension, ratio)?;
+    let training = train_spilled_model(&mut raw_file, config, vector_count, dimension, ratio)?;
+    let mut writer = VectorIndexWriter::new(training);
     let batch_rows = batch_rows(vector_count, dimension)?;
     let mut buffer = MutableBuffer::new(checked_std_vector_bytes(batch_rows, dimension)?);
     let train_finish = train_start.map_or(Duration::ZERO, |start| start.elapsed());
@@ -394,7 +407,7 @@ fn train_spilled_model(
     vector_count: usize,
     dimension: usize,
     ratio: f64,
-) -> std::io::Result<VectorIndexWriter> {
+) -> std::io::Result<VectorIndexTraining> {
     let samples =
         checked_training_vector_count(vector_count, ratio).map_err(std::io::Error::other)?;
     let batch_rows = batch_rows(vector_count, dimension)?;
@@ -430,7 +443,7 @@ fn train_spilled_model(
             "vindex training sample count mismatch",
         ));
     }
-    Ok(VectorIndexWriter::new(trainer.finish()?))
+    trainer.finish()
 }
 
 /// Keep one pair of files open for all centroids. Each source batch contributes
@@ -448,11 +461,21 @@ impl SpilledVectors {
         self.count
     }
 
+    pub fn local_row_ids(&mut self) -> Result<impl Iterator<Item = Result<i64>> + '_> {
+        self.ids.seek(SeekFrom::Start(0)).map_err(spill_error)?;
+        let mut reader = std::io::BufReader::new(&mut self.ids);
+        Ok((0..self.count).map(move |_| {
+            let mut bytes = [0; size_of::<i64>()];
+            reader.read_exact(&mut bytes).map_err(spill_error)?;
+            Ok(i64::from_ne_bytes(bytes))
+        }))
+    }
+
     pub fn train_router(
         &mut self,
         config: VectorIndexConfig,
         ratio: f64,
-    ) -> Result<VectorIndexWriter> {
+    ) -> Result<VectorIndexTraining> {
         train_spilled_model(&mut self.raw, config, self.count, self.dimension, ratio)
             .map_err(spill_error)
     }

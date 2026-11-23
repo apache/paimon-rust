@@ -48,7 +48,6 @@ struct UnresolvedAnnSegment {
     external_path: Option<String>,
     file_size: u64,
     row_count: i64,
-    index_meta: Vec<u8>,
 }
 
 /// A bucket's identity across planning inputs: the partition's serialized bytes
@@ -375,7 +374,7 @@ impl Scan for PkVectorScan {
                 if !crate::vindex::is_vindex_index_type(&entry.index_file.index_type) {
                     continue;
                 }
-                let Some(gim) = entry.index_file.global_index_meta.clone() else {
+                let Some(gim) = entry.index_file.global_index_meta.as_ref() else {
                     continue;
                 };
                 if gim.index_field_id != self.vector_field_id {
@@ -391,8 +390,7 @@ impl Scan for PkVectorScan {
                 let partition = BinaryRow::from_serialized_bytes(&entry.partition)?;
                 let file_size = u64::try_from(entry.index_file.file_size)
                     .map_err(|_| data_invalid("index file size must not be negative"))?;
-                let Ok(source_meta) = PrimaryKeyIndexSourceMeta::from_global_index_meta(&gim)
-                else {
+                let Ok(source_meta) = PrimaryKeyIndexSourceMeta::from_global_index_meta(gim) else {
                     continue;
                 };
                 entries.push((
@@ -405,7 +403,6 @@ impl Scan for PkVectorScan {
                         external_path: entry.index_file.external_path.clone(),
                         file_size,
                         row_count: entry.index_file.row_count,
-                        index_meta: gim.index_meta.clone().unwrap_or_default(),
                     },
                 ));
             }
@@ -532,11 +529,6 @@ fn plan_from_bucket_splits(
             else {
                 continue;
             };
-            let index_meta = parts
-                .global_index_meta
-                .index_meta
-                .clone()
-                .unwrap_or_default();
             index_entries.push((
                 data_split.partition().clone(),
                 data_split.bucket(),
@@ -547,7 +539,6 @@ fn plan_from_bucket_splits(
                     external_path: parts.external_path,
                     file_size,
                     row_count: parts.row_count,
-                    index_meta,
                 },
             ));
         }
@@ -734,7 +725,6 @@ pub(super) fn plan_from_search_splits(
                     file_size: u64::try_from(file.file_size)
                         .map_err(|_| data_invalid("Index file size must not be negative"))?,
                     row_count: file.row_count,
-                    index_meta: meta.index_meta.clone().unwrap_or_default(),
                 },
             ));
         }
@@ -859,7 +849,6 @@ fn plan_from_inputs(
                 path: location.resolve(&p.file_name, p.external_path.as_deref()),
                 file_size: p.file_size,
                 row_count: p.row_count,
-                index_meta: p.index_meta,
             })
             .collect();
         let ann_segments = current_ann_segments(data_split.data_files(), resolved_segments)?;
@@ -988,7 +977,6 @@ mod tests {
             path: path.to_string(),
             file_size: 1,
             row_count: 1,
-            index_meta: Vec::new(),
         }
     }
 
@@ -1005,7 +993,6 @@ mod tests {
             external_path: external_path.map(str::to_string),
             file_size: 10,
             row_count: 1,
-            index_meta: gim.index_meta.clone().unwrap_or_default(),
         }
     }
 

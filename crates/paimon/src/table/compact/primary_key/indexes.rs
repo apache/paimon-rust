@@ -25,7 +25,9 @@ mod tests;
 use super::super::CompactTask;
 use crate::resource::ResourceContext;
 use crate::spec::{DataFileMeta, FileKind, IndexManifestEntry, ManifestEntry};
-use crate::table::pk_index_maintenance::{levels, plan, unsupported_scalar_units};
+use crate::table::pk_index_maintenance::{
+    levels, plan, unsupported_scalar_units, MaintenanceRound,
+};
 use crate::table::pk_index_options::definitions;
 use crate::table::{CommitMessage, DataSplit, Table, TableCommit};
 use crate::Result;
@@ -42,6 +44,7 @@ pub(in crate::table::compact) async fn prepare(
     files: &[DataFileMeta],
     deletion_updates: &[super::super::deletion_vectors::DeletionVectorUpdate],
     resources: Option<ResourceContext>,
+    round: &MaintenanceRound,
 ) -> Result<Vec<IndexManifestEntry>> {
     let defs = definitions(table.schema())?;
     let changes = task
@@ -76,9 +79,10 @@ pub(in crate::table::compact) async fn prepare(
         &after,
         &defs,
         &unsupported,
-        &task.partition,
-        task.bucket,
-    )?;
+        (&task.partition, task.bucket),
+        round,
+    )
+    .await?;
     let vector_levels = maintenance
         .builds
         .iter()

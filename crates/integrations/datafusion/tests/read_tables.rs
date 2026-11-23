@@ -1965,6 +1965,79 @@ mod vector_search_tests {
         assert!(batches.iter().all(|batch| batch.num_columns() == 1));
     }
 
+    #[tokio::test]
+    async fn test_multi_vector_call_matches_table_function() {
+        let (ctx, _catalog, _tmp) = create_empty_vector_search_context().await;
+        for sql in [
+            "CREATE TABLE paimon.default.multi_vector_sql (id INT, chunks FLOAT[][]) \
+             WITH ('bucket'='-1', 'row-tracking.enabled'='true', \
+             'data-evolution.enabled'='true', 'global-index.enabled'='true', \
+             'vector-index.search-mode'='fast')",
+            "INSERT INTO paimon.default.multi_vector_sql (id, chunks) VALUES \
+             (0, [[1.0, 0.0]]), (1, [[0.0, 1.0]]), (2, [[1.0, 1.0]])",
+            "CALL sys.create_global_index(table => 'default.multi_vector_sql', \
+             index_column => 'chunks', index_type => 'ivf-flat', \
+             options => 'ivf-flat.dimension=2,ivf-flat.nlist=1')",
+            "SET 'paimon.ivf.nprobe' = '1'",
+            "SET 'paimon.diskann.l_search' = '100'",
+        ] {
+            ctx.sql(sql)
+                .await
+                .unwrap_or_else(|error| panic!("{sql}: {error}"))
+                .collect()
+                .await
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+
+        for sql in [
+            "SELECT id FROM vector_search('paimon.default.multi_vector_sql', 'chunks', \
+             '[[1.0, 0.0], [0.0, 1.0]]', 1)",
+            "CALL paimon.sys.vector_search('default.multi_vector_sql', 'chunks', \
+             '[[1.0, 0.0], [0.0, 1.0]]', 1, 'id')",
+        ] {
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            assert_eq!(extract_ids_in_order(&batches), [2], "{sql}");
+        }
+        super::common::assert_sql_error(
+            &ctx,
+            "CALL sys.vector_search('default.multi_vector_sql', 'chunks', '[[1.0], [0.0, 1.0]]', 1)",
+            "rectangular JSON matrix",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_create_centroid_bitmap_prefilters_sql_top_k() {
+        let (ctx, _catalog, _tmp) = create_empty_vector_search_context().await;
+        for sql in [
+            "CREATE TABLE paimon.default.centroid_bitmap_sql \
+             (id INT, embedding FLOAT[], tenant INT, status INT) \
+             WITH ('bucket'='-1', 'row-tracking.enabled'='true', \
+             'data-evolution.enabled'='true', 'global-index.enabled'='true', \
+             'vector-index.post-filter.candidates-factor'='1')",
+            "INSERT INTO paimon.default.centroid_bitmap_sql (id, embedding, tenant, status) \
+             VALUES (0, [0.0, 0.0], 1, 0), (1, [1.0, 0.0], 2, 0), (2, [2.0, 0.0], 1, 3)",
+            "CALL sys.create_global_index(table => 'default.centroid_bitmap_sql', \
+             index_column => 'embedding', index_type => 'ivf-flat', \
+             options => 'ivf-flat.sharding=centroid,ivf-flat.centroid.nlist=1,\
+             ivf-flat.nlist=1,ivf-flat.dimension=2,ivf-flat.metric=l2', \
+             extra_fields => '{\"tenant\":\"bitmap\",\"status\":\"bitmap\"}')",
+        ] {
+            ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        }
+        let batches = ctx
+            .sql(
+                "SELECT id FROM vector_search('paimon.default.centroid_bitmap_sql', 'embedding', \
+                 '[0.0, 0.0]', 1) WHERE tenant = 2 OR status = 3",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(extract_ids_in_order(&batches), [1]);
+    }
+
     /// `vector_search` must return rows in relevance order, not file order. Querying
     /// id 2's vector ranks `[2, 5, 1]` by L2 distance, which differs from the
     /// ascending-id file order `[1, 2, 5]` the pre-fix scan produced.

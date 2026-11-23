@@ -49,6 +49,7 @@ pub(crate) struct BlobFormatReader {
     descriptor_mode: bool,
     file_path: String,
     blob_parallelism: usize,
+    verify_crc: bool,
 }
 
 impl BlobFormatReader {
@@ -57,7 +58,13 @@ impl BlobFormatReader {
             descriptor_mode,
             file_path,
             blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
+            verify_crc: true,
         }
+    }
+
+    pub(crate) fn with_crc_verification(mut self, verify_crc: bool) -> Self {
+        self.verify_crc = verify_crc;
+        self
     }
 
     pub(crate) fn with_blob_parallelism(mut self, blob_parallelism: usize) -> Self {
@@ -73,6 +80,7 @@ pub(crate) struct IndexedBlobReader {
     descriptor_mode: bool,
     file_path: String,
     blob_parallelism: usize,
+    verify_crc: bool,
 }
 
 impl IndexedBlobReader {
@@ -108,7 +116,13 @@ impl IndexedBlobReader {
             descriptor_mode,
             file_path,
             blob_parallelism,
+            verify_crc: true,
         })
+    }
+
+    pub(crate) fn with_crc_verification(mut self, verify_crc: bool) -> Self {
+        self.verify_crc = verify_crc;
+        self
     }
 
     pub(crate) fn num_rows(&self) -> usize {
@@ -123,7 +137,13 @@ impl IndexedBlobReader {
             build_descriptor_values(&self.index, positions, &self.file_path)
         } else {
             let planned_reads = plan_blob_reads(&self.index, positions)?;
-            fetch_blob_values(self.reader.as_ref(), planned_reads, self.blob_parallelism).await
+            fetch_blob_values(
+                self.reader.as_ref(),
+                planned_reads,
+                self.blob_parallelism,
+                self.verify_crc,
+            )
+            .await
         }
     }
 
@@ -138,6 +158,7 @@ impl IndexedBlobReader {
             &self.file_path,
             self.descriptor_mode,
             self.blob_parallelism,
+            self.verify_crc,
         )
         .await
     }
@@ -155,6 +176,7 @@ impl IndexedBlobReader {
             self.descriptor_mode,
             key_type,
             self.blob_parallelism,
+            self.verify_crc,
         )
         .await
     }
@@ -232,7 +254,8 @@ impl FormatFileReader for BlobFormatReader {
             self.descriptor_mode,
             self.blob_parallelism,
         )
-        .await?;
+        .await?
+        .with_crc_verification(self.verify_crc);
         let mut selection = RowSelectionCursor::new(blob_reader.num_rows(), row_selection)?;
 
         Ok(try_stream! {
@@ -694,6 +717,7 @@ async fn fetch_blob_values(
     reader: &dyn FileRead,
     planned_reads: Vec<PlannedBlobRead>,
     blob_parallelism: usize,
+    verify_crc: bool,
 ) -> crate::Result<Vec<BlobReadValue>> {
     let mut values = Vec::with_capacity(planned_reads.len());
     let mut entry_reads = Vec::new();
@@ -712,7 +736,7 @@ async fn fetch_blob_values(
     }
 
     for resolved in read_merged_blob_entries(reader, entry_reads, blob_parallelism).await? {
-        let value = decode_blob_entry(resolved.entry, resolved.range)?;
+        let value = decode_blob_entry(resolved.entry, resolved.range, verify_crc)?;
         values[resolved.result_index] = Some(BlobReadValue::Value(value));
     }
     collect_blob_read_values(values)
@@ -859,12 +883,20 @@ fn blob_entry_range(payload_range: &Range<u64>) -> Range<u64> {
     payload_range.start - BLOB_INLINE_HEADER_SIZE..payload_range.end + BLOB_TRAILER_SIZE
 }
 
-async fn read_blob_entry(reader: &dyn FileRead, entry_range: Range<u64>) -> crate::Result<Bytes> {
+async fn read_blob_entry(
+    reader: &dyn FileRead,
+    entry_range: Range<u64>,
+    verify_crc: bool,
+) -> crate::Result<Bytes> {
     let entry = reader.read(entry_range.clone()).await?;
-    decode_blob_entry(entry, entry_range)
+    decode_blob_entry(entry, entry_range, verify_crc)
 }
 
-fn decode_blob_entry(entry: Bytes, entry_range: Range<u64>) -> crate::Result<Bytes> {
+fn decode_blob_entry(
+    entry: Bytes,
+    entry_range: Range<u64>,
+    verify_crc: bool,
+) -> crate::Result<Bytes> {
     let expected_entry_length = entry_range.end - entry_range.start;
     if entry.len() as u64 != expected_entry_length {
         return Err(Error::DataInvalid {
@@ -904,16 +936,25 @@ fn decode_blob_entry(entry: Bytes, entry_range: Range<u64>) -> crate::Result<Byt
         });
     }
 
-    let expected_crc = u32::from_le_bytes(entry[crc_offset..].try_into().unwrap());
-    let actual_crc = crc32fast::hash(&entry[..crc_offset]);
-    if actual_crc != expected_crc {
-        return Err(Error::DataInvalid {
-            message: format!(
-                "Blob entry CRC32 mismatch at offset {}: expected {expected_crc:#010x}, got {actual_crc:#010x}",
-                entry_range.start
-            ),
-            source: None,
-        });
+    if verify_crc {
+        let expected_crc = u32::from_le_bytes(entry[crc_offset..].try_into().unwrap());
+        // Python writers before apache/paimon#9426 omitted the trailing length
+        // from the checksum. Share the payload scan between both checksums;
+        // the embedded length is still checked independently above.
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&entry[..length_offset]);
+        let legacy_crc = hasher.clone().finalize();
+        hasher.update(&entry[length_offset..crc_offset]);
+        let actual_crc = hasher.finalize();
+        if actual_crc != expected_crc && legacy_crc != expected_crc {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Blob entry CRC32 mismatch at offset {}: expected {expected_crc:#010x}, got {actual_crc:#010x}",
+                    entry_range.start
+                ),
+                source: None,
+            });
+        }
     }
 
     Ok(entry.slice(BLOB_INLINE_HEADER_SIZE as usize..length_offset))
@@ -987,6 +1028,7 @@ async fn fetch_blob_array_values(
     file_path: &str,
     descriptor_mode: bool,
     blob_parallelism: usize,
+    verify_crc: bool,
 ) -> crate::Result<Vec<BlobReadValue>> {
     if !descriptor_mode {
         return fetch_inline_nested_blob_values(
@@ -994,6 +1036,7 @@ async fn fetch_blob_array_values(
             planned_reads,
             blob_parallelism,
             InlineNestedBlobKind::Array,
+            verify_crc,
         )
         .await;
     }
@@ -1206,10 +1249,11 @@ async fn read_blob_array_range(
 async fn read_inline_blob_array_entry(
     reader: &dyn FileRead,
     payload_range: Range<u64>,
+    verify_crc: bool,
 ) -> crate::Result<BlobReadValue> {
     let _preflight_layout = read_blob_array_layout(reader, payload_range.clone()).await?;
 
-    let payload = read_blob_entry(reader, blob_entry_range(&payload_range)).await?;
+    let payload = read_blob_entry(reader, blob_entry_range(&payload_range), verify_crc).await?;
     let payload_length = validate_blob_array_payload_range(&payload_range)?;
     if payload.len() as u64 != payload_length {
         return Err(Error::DataInvalid {
@@ -1296,6 +1340,7 @@ async fn fetch_blob_map_values(
     descriptor_mode: bool,
     key_type: &DataType,
     blob_parallelism: usize,
+    verify_crc: bool,
 ) -> crate::Result<Vec<BlobReadValue>> {
     if !descriptor_mode {
         return fetch_inline_nested_blob_values(
@@ -1306,6 +1351,7 @@ async fn fetch_blob_map_values(
                 file_path,
                 key_type,
             },
+            verify_crc,
         )
         .await;
     }
@@ -1315,8 +1361,15 @@ async fn fetch_blob_map_values(
             PlannedBlobArrayRead::Null => Ok(BlobReadValue::Null),
             PlannedBlobArrayRead::Placeholder => Ok(BlobReadValue::Placeholder),
             PlannedBlobArrayRead::Read(payload_range) => {
-                read_blob_map_entry(reader, payload_range, file_path, descriptor_mode, key_type)
-                    .await
+                read_blob_map_entry(
+                    reader,
+                    payload_range,
+                    file_path,
+                    descriptor_mode,
+                    key_type,
+                    verify_crc,
+                )
+                .await
             }
         }
     }))
@@ -1339,6 +1392,7 @@ async fn fetch_inline_nested_blob_values(
     planned_reads: Vec<PlannedBlobArrayRead>,
     blob_parallelism: usize,
     kind: InlineNestedBlobKind<'_>,
+    verify_crc: bool,
 ) -> crate::Result<Vec<BlobReadValue>> {
     let mut values = Vec::with_capacity(planned_reads.len());
     let mut entry_reads = Vec::new();
@@ -1366,14 +1420,21 @@ async fn fetch_inline_nested_blob_values(
         };
         let value = match kind {
             InlineNestedBlobKind::Array => {
-                read_inline_blob_array_entry(&memory_reader, payload_range).await?
+                read_inline_blob_array_entry(&memory_reader, payload_range, verify_crc).await?
             }
             InlineNestedBlobKind::Map {
                 file_path,
                 key_type,
             } => {
-                read_blob_map_entry(&memory_reader, payload_range, file_path, false, key_type)
-                    .await?
+                read_blob_map_entry(
+                    &memory_reader,
+                    payload_range,
+                    file_path,
+                    false,
+                    key_type,
+                    verify_crc,
+                )
+                .await?
             }
         };
         values[result_index] = Some(value);
@@ -1387,6 +1448,7 @@ async fn read_blob_map_entry(
     file_path: &str,
     descriptor_mode: bool,
     key_type: &DataType,
+    verify_crc: bool,
 ) -> crate::Result<BlobReadValue> {
     let payload_length = payload_range
         .end
@@ -1603,7 +1665,7 @@ async fn read_blob_map_entry(
             })
             .collect::<crate::Result<Vec<_>>>()?
     } else {
-        let payload = read_blob_entry(reader, blob_entry_range(&payload_range)).await?;
+        let payload = read_blob_entry(reader, blob_entry_range(&payload_range), verify_crc).await?;
         reads
             .into_iter()
             .map(|range| {
@@ -3335,7 +3397,7 @@ mod tests {
         let reader = TrackingFileRead::new(Bytes::from(payload.clone()));
         let key_type = DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap());
 
-        read_blob_map_entry(&reader, 0..payload.len() as u64, "", true, &key_type)
+        read_blob_map_entry(&reader, 0..payload.len() as u64, "", true, &key_type, true)
             .await
             .unwrap();
 
@@ -3407,9 +3469,10 @@ mod tests {
         let (reader, payload_range) = sparse_blob_map_entry(&[0], &[value_length as i64]);
         let key_type = DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap());
 
-        let _error = read_blob_map_entry(&reader, payload_range.clone(), "", false, &key_type)
-            .await
-            .unwrap_err();
+        let _error =
+            read_blob_map_entry(&reader, payload_range.clone(), "", false, &key_type, true)
+                .await
+                .unwrap_err();
 
         assert!(
             reader.ranges().contains(&blob_entry_range(&payload_range)),
@@ -3423,7 +3486,7 @@ mod tests {
         let (reader, payload_range) = sparse_blob_map_entry(&[key_length as i64], &[0]);
         let key_type = DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap());
 
-        let error = read_blob_map_entry(&reader, payload_range.clone(), "", false, &key_type)
+        let error = read_blob_map_entry(&reader, payload_range.clone(), "", false, &key_type, true)
             .await
             .unwrap_err();
 
@@ -3438,7 +3501,7 @@ mod tests {
         let (reader, payload_range) = sparse_blob_map_entry(&[key_length as i64], &[0]);
         let key_type = DataType::Int(crate::spec::IntType::new());
 
-        let error = read_blob_map_entry(&reader, payload_range.clone(), "", false, &key_type)
+        let error = read_blob_map_entry(&reader, payload_range.clone(), "", false, &key_type, true)
             .await
             .unwrap_err();
 
@@ -3452,7 +3515,7 @@ mod tests {
         let (reader, payload_range) = sparse_blob_map_entry(&[-1], &[0]);
         let key_type = DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap());
 
-        let error = read_blob_map_entry(&reader, payload_range, "", false, &key_type)
+        let error = read_blob_map_entry(&reader, payload_range, "", false, &key_type, true)
             .await
             .unwrap_err();
 
@@ -3516,7 +3579,7 @@ mod tests {
             ),
         ]);
 
-        let _error = read_inline_blob_array_entry(&reader, payload_range.clone())
+        let _error = read_inline_blob_array_entry(&reader, payload_range.clone(), true)
             .await
             .unwrap_err();
 
@@ -3662,7 +3725,9 @@ mod tests {
         }
         let reader = TrackingFileRead::new(Bytes::from(bytes));
 
-        let values = fetch_blob_values(&reader, planned_reads, 2).await.unwrap();
+        let values = fetch_blob_values(&reader, planned_reads, 2, true)
+            .await
+            .unwrap();
         let actual = values
             .into_iter()
             .map(|value| match value {
@@ -3784,7 +3849,9 @@ mod tests {
             .map(PlannedBlobRead::Entry)
             .collect();
 
-        let values = fetch_blob_values(&reader, planned_reads, 1).await.unwrap();
+        let values = fetch_blob_values(&reader, planned_reads, 1, true)
+            .await
+            .unwrap();
 
         assert_eq!(values.len(), 3);
         assert!(values.into_iter().all(|value| matches!(
@@ -3849,6 +3916,7 @@ mod tests {
                 PlannedBlobRead::Entry(second_start..second_end),
             ],
             1,
+            true,
         )
         .await
         .unwrap();
@@ -4225,6 +4293,196 @@ mod tests {
         assert!(
             matches!(result, Err(Error::DataInvalid { message, .. }) if message.contains("minimum overhead"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_blob_crc_option_preserves_structure_checks() {
+        use crate::arrow::format::{
+            create_format_reader_with_budget, FormatReadFields, MosaicPrefetchOptions,
+        };
+        let payload = b"hello";
+        let original = blob_test_utils::build_blob_file_bytes(&[Some(payload.as_slice())]);
+        let fields = vec![DataField::new(
+            0,
+            "payload".to_string(),
+            DataType::Blob(BlobType::new()),
+        )];
+        for verify in [true, false] {
+            let options = std::collections::HashMap::from([(
+                "blob.read.verify-crc".to_string(),
+                verify.to_string(),
+            )]);
+            let configured = create_format_reader_with_budget(
+                "data.blob",
+                false,
+                FormatReadFields {
+                    data_schema: &fields,
+                    projected: &fields,
+                },
+                &options,
+                None,
+                DEFAULT_BLOB_READ_PARALLELISM,
+                MosaicPrefetchOptions::default(),
+            )
+            .unwrap();
+            for (offset, message) in [
+                (0, "magic"),
+                (BLOB_INLINE_HEADER_SIZE as usize, "CRC32 mismatch"),
+                (
+                    BLOB_INLINE_HEADER_SIZE as usize + payload.len(),
+                    "length mismatch",
+                ),
+            ] {
+                let mut bytes = original.clone();
+                bytes[offset] ^= 0xff;
+                let result = async {
+                    configured
+                        .reader
+                        .read_batch_stream(
+                            Box::new(BytesFileRead(Bytes::from(bytes.clone()))),
+                            bytes.len() as u64,
+                            &fields,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await?
+                        .try_collect::<Vec<_>>()
+                        .await
+                }
+                .await;
+                if !verify && message == "CRC32 mismatch" {
+                    let mut expected = payload.to_vec();
+                    expected[0] ^= 0xff;
+                    assert_eq!(
+                        collect_binary_values(&result.unwrap()[0]),
+                        vec![Some(expected)]
+                    );
+                } else {
+                    assert_data_invalid(result.unwrap_err(), message);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_blob_reader_reads_legacy_python_fixtures() {
+        // Written by BlobFormatWriter at apache/paimon 19a933b7d9^ (before #9426):
+        // add_blob("payload", BlobData(b"legacy"));
+        // add_blob_array("payload", [BlobData(b"legacy"), None, BlobData(b"")]);
+        // add_blob_map("payload", {"key": BlobData(b"legacy")}, AtomicType("STRING"));
+        let fixtures = [
+            ("cf114e586c656761637916000000000000002ab4a15b2c0100000001", vec![DataField::new(0, "payload".to_string(), DataType::Blob(BlobType::new()))]),
+            ("cf114e584243424101030000006c65676163790c0d0203000000260000000000000081ec551d4c0100000001", blob_array_read_fields()),
+            ("cf114e584243424d01010000006b65796c6567616379060c01000000010000002c00000000000000495fc62d580100000001", blob_map_read_fields()),
+        ];
+        for (i, (hex, fields)) in fixtures.into_iter().enumerate() {
+            let file_bytes = (0..hex.len())
+                .step_by(2)
+                .map(|offset| u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap())
+                .collect::<Vec<_>>();
+            let batches = BlobFormatReader::new(String::new(), false)
+                .read_batch_stream(
+                    Box::new(BytesFileRead(Bytes::from(file_bytes.clone()))),
+                    file_bytes.len() as u64,
+                    &fields,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            // A bad checksum is accepted only with verification explicitly disabled,
+            // including ARRAY and MAP materialization paths.
+            let mut corrupt = file_bytes.clone();
+            corrupt[[18, 34, 40][i]] ^= 0xff;
+            for verify_crc in [true, false] {
+                let result = async {
+                    BlobFormatReader::new(String::new(), false)
+                        .with_crc_verification(verify_crc)
+                        .read_batch_stream(
+                            Box::new(BytesFileRead(Bytes::from(corrupt.clone()))),
+                            corrupt.len() as u64,
+                            &fields,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await?
+                        .try_collect::<Vec<_>>()
+                        .await
+                }
+                .await;
+                if verify_crc {
+                    assert_data_invalid(result.unwrap_err(), "CRC32 mismatch");
+                } else {
+                    assert_eq!(result.unwrap(), batches);
+                }
+            }
+            match i {
+                0 => assert_eq!(
+                    collect_binary_values(&batches[0]),
+                    vec![Some(b"legacy".to_vec())]
+                ),
+                1 => assert_eq!(
+                    collect_blob_array_values(&batches[0]),
+                    vec![Some(vec![Some(b"legacy".to_vec()), None, Some(vec![])])]
+                ),
+                2 => assert_eq!(
+                    collect_blob_map_values(&batches[0]),
+                    vec![Some(vec![("key".to_string(), Some(b"legacy".to_vec()))])]
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_blob_reader_accepts_legacy_python_crc() {
+        let payloads = [
+            Some(b"legacy".as_slice()),
+            Some(b"".as_slice()),
+            None,
+            Some(b"standard".as_slice()),
+        ];
+        let mut file_bytes = blob_test_utils::build_blob_file_bytes(&payloads);
+        // Historical Python CRC covered magic + payload, excluding the length.
+        let mut offset = 0;
+        for payload in payloads[..2].iter().flatten() {
+            let length_offset = offset + BLOB_INLINE_HEADER_SIZE as usize + payload.len();
+            let crc_offset = length_offset + size_of::<i64>();
+            let crc = crc32fast::hash(&file_bytes[offset..length_offset]);
+            file_bytes[crc_offset..crc_offset + size_of::<u32>()]
+                .copy_from_slice(&crc.to_le_bytes());
+            offset = crc_offset + size_of::<u32>();
+        }
+        assert_eq!(
+            read_scalar_blob_values(file_bytes.clone()).await.unwrap(),
+            payloads
+                .iter()
+                .map(|v| v.map(|b| b.to_vec()))
+                .collect::<Vec<_>>()
+        );
+
+        for (offset, message) in [
+            (0, "magic"),
+            (BLOB_INLINE_HEADER_SIZE as usize, "CRC32 mismatch"),
+            (
+                BLOB_INLINE_HEADER_SIZE as usize + b"legacy".len(),
+                "length mismatch",
+            ),
+            (
+                BLOB_INLINE_HEADER_SIZE as usize + b"legacy".len() + size_of::<i64>(),
+                "CRC32 mismatch",
+            ),
+        ] {
+            let mut corrupt = file_bytes.clone();
+            corrupt[offset] ^= 0xff;
+            assert_data_invalid(read_scalar_blob_values(corrupt).await.unwrap_err(), message);
+        }
     }
 
     #[tokio::test]

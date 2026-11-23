@@ -17,7 +17,7 @@
 
 //! Shared vector-search option validation, index I/O helpers, and result ordering.
 
-use crate::io::{FileIO, FileRead};
+use crate::io::{FileIO, InputFile};
 use crate::spec::{
     CoreOptions, DataField, FileKind, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
 };
@@ -25,173 +25,364 @@ use crate::table::index_file_path::IndexFileLocation;
 use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
 use crate::table::read_builder::resolve_projected_fields;
 use crate::table::Table;
-use crate::vindex::is_vindex_index_type;
 use crate::vindex::range_reader::RangeIoStats;
+use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_select::interleave::interleave_record_batch;
-use paimon_vindex_core::diskann_io::DISKANN_HEADER_SIZE;
+use bytes::{Buf, Bytes};
+use paimon_vindex_core::diskann_io::{DISKANN_HEADER_SIZE, DISKANN_MAGIC, DISKANN_VERSION};
 use paimon_vindex_core::distance::MetricType;
-use paimon_vindex_core::index::VectorIndexReader as VIndexReader;
+use paimon_vindex_core::index::{IndexType, VectorIndexReader as VIndexReader};
+use paimon_vindex_core::io::{MAGIC as IVF_PQ_MAGIC, VERSION as IVF_PQ_VERSION};
+use paimon_vindex_core::ivfflat_io::{IVFFLAT_MAGIC, IVFFLAT_VERSION};
+use paimon_vindex_core::ivfrq_io::{IVF_RQ_MAGIC, IVF_RQ_VERSION};
+use paimon_vindex_core::ivfsq_io::{IVF_SQ_BITS, IVF_SQ_HEADER_SIZE, IVF_SQ_MAGIC, IVF_SQ_VERSION};
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::{self, Cursor};
 
 pub(super) use super::partition_filter::validate_partition_filter;
 
-/// Persisted vector properties which must agree across all runs of one column.
+/// Persisted properties available from the native vector file header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct IndexVectorSemantics {
+    pub index_type: IndexType,
     pub metric: MetricType,
     pub dimension: usize,
+    pub nlist: usize,
+    pub rq_bits: Option<usize>,
+    pub pq_m: Option<usize>,
+    pub total_vectors: i64,
 }
 
-/// Read the scoring metric without requiring dimension metadata or a payload read.
-/// Older callers and JSON-only metadata need only this scoring property.
+impl IndexVectorSemantics {
+    pub(super) fn matches_options(self, options: &VindexVectorIndexOptions) -> bool {
+        self.index_type.as_str() == options.native_options["index.type"]
+            && self.metric.as_str() == options.native_options["metric"]
+            && self.dimension == options.dimension()
+    }
+}
+
+/// Read the scoring metric from the centroid descriptor or the native file header.
 pub(super) async fn read_index_vector_metric(
     file_io: &FileIO,
     table_path: &str,
     entry: &IndexManifestEntry,
 ) -> crate::Result<Option<MetricType>> {
-    let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
-        return Ok(None);
-    };
-    if !is_vindex_index_type(&entry.index_file.index_type) {
+    if entry.index_file.global_index_meta.is_none()
+        || !is_vindex_index_type(&entry.index_file.index_type)
+    {
         return Ok(None);
     }
     if let Some(descriptor) = super::centroid_index::Descriptor::parse(&entry.index_file)? {
-        use super::centroid_index::{payload_options, Role, Router};
+        use super::centroid_index::Role;
         let Role::Router(nlist) = descriptor.role else {
             return Ok(None);
         };
         if nlist == 0 {
             return Ok(None);
         }
-        if let Some(metric) = metric_from_index_options(&payload_options(&descriptor)?) {
-            return Ok(Some(metric));
-        }
-        let router = Router::load(file_io, table_path, &entry.index_file, &descriptor).await?;
-        return Ok(Some(router.metric));
+        return descriptor.router_metric().map(Some);
     }
-    let path = IndexFileLocation::Global { table_path }.resolve(
-        &entry.index_file.file_name,
-        entry.index_file.external_path.as_deref(),
-    );
-    read_vector_index_metric(
-        file_io,
-        &path,
-        entry.index_file.file_size.max(0) as u64,
-        global_meta.index_meta.as_deref(),
-    )
-    .await
-    .map(Some)
+    let path = global_vector_index_path(table_path, entry);
+    let size = entry.index_file.file_size.max(0) as u64;
+    Ok(Some(
+        load_vector_index_header(file_io, &path, size, HeaderCache::Prefix)
+            .await?
+            .metric,
+    ))
 }
 
-/// Resolve the metric of an already selected payload, including bucket-local PK files.
-pub(super) async fn read_vector_index_metric(
-    file_io: &FileIO,
-    path: &str,
-    file_size: u64,
-    index_meta: Option<&[u8]>,
-) -> crate::Result<MetricType> {
-    if let Some(index_meta) = index_meta {
-        if let Ok(options) = serde_json::from_slice::<HashMap<String, String>>(index_meta) {
-            if let Some(metric) = metric_from_index_options(&options) {
-                return Ok(metric);
-            }
-        }
-    }
-    Ok(read_vector_index_header(file_io, path, file_size)
-        .await?
-        .metric)
-}
-
-/// Read the structural definition of an existing run before reusing its coverage.
-/// Java and older metadata may omit these options, so fall back to the native header.
+/// Read the native definition of an existing range index before reusing its coverage.
+/// Missing or damaged payloads are eligible for rebuilding from their source rows.
 pub(super) async fn read_index_vector_semantics(
     file_io: &FileIO,
     table_path: &str,
     entry: &IndexManifestEntry,
 ) -> crate::Result<Option<IndexVectorSemantics>> {
-    let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
-        return Ok(None);
-    };
-    if !is_vindex_index_type(&entry.index_file.index_type) {
+    if entry.index_file.global_index_meta.is_none()
+        || !is_vindex_index_type(&entry.index_file.index_type)
+    {
         return Ok(None);
     }
-    if let Some(index_meta) = global_meta.index_meta.as_ref() {
-        if let Ok(options) = serde_json::from_slice::<HashMap<String, String>>(index_meta) {
-            let dimension = options
-                .get("dimension")
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|dimension| *dimension > 0);
-            if let (Some(metric), Some(dimension)) =
-                (metric_from_index_options(&options), dimension)
-            {
-                return Ok(Some(IndexVectorSemantics { metric, dimension }));
-            }
-        }
-    }
-    Ok(Some(
-        read_index_vector_header(file_io, table_path, entry).await?,
-    ))
+    let path = global_vector_index_path(table_path, entry);
+    let size = entry.index_file.file_size.max(0) as u64;
+    read_retained_vector_index_header(file_io, &path, size).await
 }
 
-fn metric_from_index_options(options: &HashMap<String, String>) -> Option<MetricType> {
-    match normalize_metric(options.get("metric")?).as_str() {
-        "l2" => Some(MetricType::L2),
-        "cosine" => Some(MetricType::Cosine),
-        "inner_product" => Some(MetricType::InnerProduct),
-        _ => None,
-    }
-}
-
-async fn read_index_vector_header(
-    file_io: &FileIO,
-    table_path: &str,
-    entry: &IndexManifestEntry,
-) -> crate::Result<IndexVectorSemantics> {
-    let path = IndexFileLocation::Global { table_path }.resolve(
+fn global_vector_index_path(table_path: &str, entry: &IndexManifestEntry) -> String {
+    IndexFileLocation::Global { table_path }.resolve(
         &entry.index_file.file_name,
         entry.index_file.external_path.as_deref(),
-    );
-    read_vector_index_header(file_io, &path, entry.index_file.file_size.max(0) as u64).await
+    )
 }
 
-async fn read_vector_index_header(
+/// Read the index type, metric and dimension from a native vector index header.
+pub(super) async fn read_vector_index_header(
     file_io: &FileIO,
     path: &str,
     file_size: u64,
 ) -> crate::Result<IndexVectorSemantics> {
+    load_vector_index_header(file_io, path, file_size, HeaderCache::Existing).await
+}
+
+async fn load_vector_index_header(
+    file_io: &FileIO,
+    path: &str,
+    file_size: u64,
+    cache: HeaderCache,
+) -> crate::Result<IndexVectorSemantics> {
     let input = file_io.new_input(path)?;
-    let read_error = |e| crate::Error::DataInvalid {
-        message: format!(
-            "Failed to read vindex index file '{}' for vector metric: {}",
-            path, e
-        ),
-        source: Some(Box::new(e)),
+    let header = read_vector_index_header_bytes(&input, file_size, cache)
+        .await
+        .map_err(|error| vector_header_read_error(path, error))?;
+    parse_vector_index_header(header.bytes, header.expected_size)
+        .map_err(|error| vector_header_format_error(path, error))
+}
+
+/// A missing or malformed retained payload can be rebuilt from its live sources.
+pub(super) async fn read_retained_vector_index_header(
+    file_io: &FileIO,
+    path: &str,
+    file_size: u64,
+) -> crate::Result<Option<IndexVectorSemantics>> {
+    let input = file_io.new_input(path)?;
+    let result = read_vector_index_header_bytes(&input, file_size, HeaderCache::Existing).await;
+    let header = match result {
+        Ok(header) => header,
+        Err(error) => {
+            let check_size = match &error {
+                // OpenDAL reports a local EISDIR as a temporary Unexpected error.
+                crate::Error::IoUnexpected { source, .. }
+                    if std::error::Error::source(source)
+                        .and_then(|cause| cause.downcast_ref::<io::Error>())
+                        .is_some_and(|cause| cause.kind() == io::ErrorKind::IsADirectory) =>
+                {
+                    true
+                }
+                crate::Error::IoUnexpected { source, .. } if !source.is_temporary() => {
+                    if source.is_permanent() && source.kind() == opendal::ErrorKind::NotFound {
+                        return Ok(None);
+                    }
+                    // Retry layers mark terminal errors as persistent, including 404s.
+                    matches!(
+                        source.kind(),
+                        opendal::ErrorKind::NotFound
+                            | opendal::ErrorKind::RangeNotSatisfied
+                            | opendal::ErrorKind::Unexpected
+                    )
+                }
+                // The range can return fewer bytes than the recorded header length.
+                crate::Error::DataInvalid { .. } => true,
+                _ => false,
+            };
+            if check_size
+                && stat_retained_vector_index_size(&input)
+                    .await
+                    .is_ok_and(|size| size.is_none_or(|size| size < file_size))
+            {
+                return Ok(None);
+            }
+            return Err(vector_header_read_error(path, error));
+        }
     };
-    let header_size = if file_size > 0 {
-        file_size.min(DISKANN_HEADER_SIZE as u64)
-    } else {
-        input
-            .metadata()
+    // With an unknown total in Content-Range, OpenDAL may report the length
+    // of the response fragment. Confirm a potentially short object with stat.
+    let object_size = match header
+        .reported_size
+        .filter(|&size| size >= header.expected_size)
+    {
+        Some(size) => Some(size),
+        None => stat_retained_vector_index_size(&input)
             .await
-            .map_err(&read_error)?
-            .size
-            .min(DISKANN_HEADER_SIZE as u64)
+            .map_err(|error| vector_header_read_error(path, error))?,
     };
-    let file_reader = input.reader().await.map_err(&read_error)?;
-    let bytes = file_reader.read(0..header_size).await.map_err(read_error)?;
-    let reader = VIndexReader::open(Cursor::new(bytes)).map_err(|e| crate::Error::DataInvalid {
-        message: format!(
-            "Failed to open paimon-vindex-core reader for vector metric: {}",
-            e
+    if object_size.is_none_or(|size| size < header.expected_size) {
+        return Ok(None);
+    }
+    match parse_vector_index_header(header.bytes, header.expected_size) {
+        Ok(header) => Ok(Some(header)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(vector_header_format_error(path, error)),
+    }
+}
+
+pub(super) async fn stat_retained_vector_index_size(
+    input: &InputFile,
+) -> crate::Result<Option<u64>> {
+    match input.metadata().await {
+        Ok(status) => Ok((!status.is_dir).then_some(status.size)),
+        Err(crate::Error::IoUnexpected { source, .. })
+            if !source.is_temporary() && source.kind() == opendal::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn vector_header_read_error(path: &str, error: crate::Error) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: format!("Failed to read vindex index file '{path}' for vector metric: {error}"),
+        source: Some(Box::new(error)),
+    }
+}
+
+fn vector_header_format_error(path: &str, error: io::Error) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: format!("Failed to read native vector index metadata for '{path}': {error}"),
+        source: Some(Box::new(error)),
+    }
+}
+
+struct VectorIndexHeaderBytes {
+    bytes: Bytes,
+    expected_size: u64,
+    reported_size: Option<u64>,
+}
+
+enum HeaderCache {
+    Existing,
+    Prefix,
+}
+
+async fn read_vector_index_header_bytes(
+    input: &InputFile,
+    file_size: u64,
+    cache: HeaderCache,
+) -> crate::Result<VectorIndexHeaderBytes> {
+    let stat_size = if file_size == 0 {
+        Some(input.metadata().await?.size)
+    } else {
+        None
+    };
+    let file_size = stat_size.unwrap_or(file_size);
+    let header_size = file_size.min(DISKANN_HEADER_SIZE as u64);
+    let (bytes, reported_size) = match cache {
+        HeaderCache::Existing => {
+            input
+                .read_range_with_reported_size(0..header_size, file_size)
+                .await?
+        }
+        HeaderCache::Prefix => (
+            input.read_prefix_with_cache(file_size, header_size).await?,
+            None,
         ),
-        source: Some(Box::new(e)),
+    };
+    if bytes.len() < header_size as usize {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Short vector index header read, expected {header_size} bytes, received {}",
+                bytes.len()
+            ),
+            source: None,
+        });
+    }
+    Ok(VectorIndexHeaderBytes {
+        bytes,
+        expected_size: file_size,
+        reported_size: reported_size.or(stat_size),
+    })
+}
+
+fn parse_vector_index_header(bytes: Bytes, file_size: u64) -> io::Result<IndexVectorSemantics> {
+    let mut prefix = bytes.get(..8).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Truncated vector index header",
+        )
     })?;
-    let metadata = reader.metadata();
+    let magic = prefix.get_u32_le();
+    let version = prefix.get_u32_le();
+    let supported_version = match magic {
+        IVFFLAT_MAGIC => IVFFLAT_VERSION,
+        IVF_PQ_MAGIC => IVF_PQ_VERSION,
+        IVF_RQ_MAGIC => IVF_RQ_VERSION,
+        IVF_SQ_MAGIC => IVF_SQ_VERSION,
+        DISKANN_MAGIC => DISKANN_VERSION,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unknown vector index magic: {magic:#010x}"),
+            ));
+        }
+    };
+    if version != supported_version {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("Unsupported vector index version {version} for magic {magic:#010x}"),
+        ));
+    }
+    // Opening an IVF-SQ reader also loads its quantizer sections. The fixed
+    // header carries the index properties needed for scoring and maintenance.
+    if magic == IVF_SQ_MAGIC {
+        let header = bytes.get(..IVF_SQ_HEADER_SIZE).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated IVF-SQ header")
+        })?;
+        let mut fields = &header[8..36];
+        let dimension = fields.get_i32_le();
+        let nlist = fields.get_i32_le();
+        let code = fields.get_u32_le();
+        let total_vectors = fields.get_i64_le();
+        let bits = fields.get_u32_le();
+        let flags = fields.get_u32_le();
+        // IVF-SQ v1 requires delta IDs and blocked codes.
+        if dimension <= 0
+            || nlist <= 0
+            || total_vectors < 0
+            || bits != IVF_SQ_BITS
+            || flags != 0b11
+            || header[44..].iter().any(|&byte| byte != 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid IVF-SQ header",
+            ));
+        }
+        let metric = MetricType::from_code(code).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unknown metric type: {code}"),
+            )
+        })?;
+        let lists = nlist as u128;
+        let dimensions = dimension as u128;
+        let bounds_bytes = (lists + 1) * dimensions * 8;
+        let centroid_bytes = lists * dimensions * 4;
+        let offset_table_bytes = lists * 16;
+        let minimum_size =
+            IVF_SQ_HEADER_SIZE as u128 + bounds_bytes + centroid_bytes + offset_table_bytes;
+        if u128::from(file_size) < minimum_size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Truncated IVF-SQ metadata",
+            ));
+        }
+        return Ok(IndexVectorSemantics {
+            index_type: IndexType::IvfSq,
+            metric,
+            dimension: dimension as usize,
+            nlist: nlist as usize,
+            rq_bits: None,
+            pq_m: None,
+            total_vectors,
+        });
+    }
+    let metadata = VIndexReader::open(Cursor::new(bytes))?.metadata();
     Ok(IndexVectorSemantics {
+        index_type: metadata.index_type,
         metric: metadata.metric,
         dimension: metadata.dimension,
+        nlist: metadata.nlist,
+        rq_bits: metadata.rq_bits,
+        pq_m: metadata.pq_m,
+        total_vectors: metadata.total_vectors,
     })
 }
 
@@ -805,34 +996,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metric_only_json_does_not_require_dimension_or_payload() {
-        let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let entry = entry(Some(br#"{"metric":"L2"}"#.to_vec()));
-        let table_path = "memory:/metric-only-vector-metadata";
-        assert!(!file_io
-            .exists(&format!("{table_path}/index/vectors.index"))
-            .await
-            .unwrap());
-        assert_eq!(
-            read_index_vector_metric(&file_io, table_path, &entry)
-                .await
-                .unwrap(),
-            Some(MetricType::L2)
-        );
-    }
-
-    #[tokio::test]
     async fn empty_centroid_router_has_no_scoring_metric() {
         use crate::table::centroid_index::{Descriptor, Role};
 
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let descriptor = Descriptor {
-            model_id: "empty-centroid",
-            version: 1,
             role: Role::Router(0),
-            payload: Some(br#"{"metric":"cosine"}"#),
+            payload: Some(b"cosine"),
         };
         let mut entry = entry(Some(descriptor.encode().unwrap()));
+        entry.index_file.file_size = 0;
         entry.index_file.row_count = 0;
         assert_eq!(
             read_index_vector_metric(&file_io, "memory:/metric-empty-centroid", &entry)
@@ -843,31 +1016,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_vector_semantics_json_does_not_read_payload() {
+    async fn range_vector_metric_and_dimension_come_from_native_header() {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let entry = entry(Some(
-            br#"{"metric":"inner-product","dimension":"3"}"#.to_vec(),
-        ));
-        let table_path = "memory:/complete-vector-metadata";
-        assert!(!file_io
-            .exists(&format!("{table_path}/index/vectors.index"))
-            .await
-            .unwrap());
-        assert_eq!(
-            read_index_vector_semantics(&file_io, table_path, &entry)
-                .await
-                .unwrap(),
-            Some(IndexVectorSemantics {
-                metric: MetricType::InnerProduct,
-                dimension: 3,
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_vector_semantics_read_dimension_from_native_header() {
-        let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let table_path = "memory:/legacy-vector-metadata";
+        let table_path = "memory:/range-vector-metadata";
         let payload = crate::table::vector_search_test_utils::build_vindex_segment_bytes("l2");
         file_io
             .new_output(&format!("{table_path}/index/vectors.index"))
@@ -877,19 +1028,249 @@ mod tests {
             .unwrap();
         for index_meta in [
             None,
-            Some(br#"{}"#.to_vec()),
-            Some(br#"{"metric":"l2"}"#.to_vec()),
-            Some(br#"{"metric":"l2","dimension":"0"}"#.to_vec()),
+            Some(b"{}".to_vec()),
+            Some(br#"{"metric":"cosine","dimension":"3"}"#.to_vec()),
         ] {
+            let entry = entry(index_meta);
             assert_eq!(
-                read_index_vector_semantics(&file_io, table_path, &entry(index_meta))
+                read_index_vector_metric(&file_io, table_path, &entry)
+                    .await
+                    .unwrap(),
+                Some(MetricType::L2)
+            );
+            assert_eq!(
+                read_index_vector_semantics(&file_io, table_path, &entry)
                     .await
                     .unwrap(),
                 Some(IndexVectorSemantics {
+                    index_type: IndexType::IvfFlat,
                     metric: MetricType::L2,
                     dimension: 2,
+                    nlist: 1,
+                    rq_bits: None,
+                    pq_m: None,
+                    total_vectors: 3,
                 })
             );
         }
+    }
+
+    #[tokio::test]
+    async fn retained_vector_header_propagates_access_errors_and_unsupported_versions() {
+        #[derive(Debug)]
+        struct FailingProvider(opendal::ErrorKind, bool);
+
+        #[async_trait::async_trait]
+        impl crate::io::FileIOProvider for FailingProvider {
+            async fn create(&self, _path: &str) -> crate::Result<(opendal::Operator, String)> {
+                let mut error = opendal::Error::new(self.0, "Injected storage error");
+                if self.1 {
+                    error = error.set_temporary();
+                }
+                Err(error.into())
+            }
+        }
+
+        let path = "memory:/retained-vector-header/index";
+        for (kind, temporary) in [
+            (opendal::ErrorKind::PermissionDenied, false),
+            (opendal::ErrorKind::NotFound, true),
+            (opendal::ErrorKind::Unexpected, true),
+        ] {
+            let file_io = FileIOBuilder::new("memory")
+                .with_provider(std::sync::Arc::new(FailingProvider(kind, temporary)))
+                .build()
+                .unwrap();
+            let error = read_retained_vector_index_header(&file_io, path, 256)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Injected storage error"),
+                "{error}"
+            );
+        }
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let mut payload = crate::table::vector_search_test_utils::build_vindex_segment_bytes("l2");
+        payload[4..8].copy_from_slice(&(IVFFLAT_VERSION + 1).to_le_bytes());
+        let size = payload.len() as u64;
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(payload.into())
+            .await
+            .unwrap();
+        let error = read_retained_vector_index_header(&file_io, path, size)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Unsupported vector index version"),
+            "{error}"
+        );
+    }
+
+    #[cfg(all(feature = "storage-oss", feature = "storage-fs"))]
+    #[tokio::test]
+    async fn vector_header_reads_use_exact_ranges_and_cache_query_prefixes() {
+        use axum::body::Body;
+        use axum::http::{header, HeaderMap, Method, Response, StatusCode, Uri};
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut payload = crate::table::vector_search_test_utils::build_vindex_segment_bytes("l2");
+        // The fixture needs an object larger than the requested header range.
+        payload.resize(512, 0);
+        let size = payload.len() as u64;
+        let prefix = Bytes::from(payload).slice(..256);
+        let stats = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let server_stats = stats.clone();
+        let server_reads = reads.clone();
+        let app = Router::new().fallback(move |method: Method, uri: Uri, headers: HeaderMap| {
+            let stats = server_stats.clone();
+            let reads = server_reads.clone();
+            let prefix = prefix.clone();
+            async move {
+                if method == Method::HEAD {
+                    stats.fetch_add(1, Ordering::Relaxed);
+                    return Response::builder()
+                        .header(header::CONTENT_LENGTH, size)
+                        .body(Body::empty())
+                        .unwrap();
+                }
+                assert_eq!(method, Method::GET);
+                assert_eq!(headers[header::RANGE], "bytes=0-255");
+                reads.fetch_add(1, Ordering::Relaxed);
+                let content_range = if uri.path().ends_with("/full.index") {
+                    format!("bytes 0-255/{size}")
+                } else {
+                    "bytes 0-255/*".into()
+                };
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_RANGE, content_range)
+                    .header(header::CONTENT_LENGTH, prefix.len())
+                    .body(Body::from(prefix))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = opendal_service_oss::OssConfig::default();
+        config.endpoint = Some(format!("http://{address}"));
+        config.bucket = "bucket".into();
+        config.addressing_style = Some("path".into());
+        config.skip_signature = true;
+        let transport = opendal::HttpTransporter::new(
+            opendal_http_transport_reqwest::ReqwestTransport::default(),
+        );
+        let operator = opendal::Operator::from_config(config)
+            .unwrap()
+            .with_context(opendal::OperationContext::new().with_http_transport(transport));
+        let io = FileIOBuilder::new("file")
+            .with_fs_operator(operator)
+            .with_prop("local-cache.enabled", "true")
+            .with_prop("local-cache.whitelist", "file-index")
+            .build()
+            .unwrap();
+        for (path, expected_stats) in [("/full.index", 0), ("/partial.index", 1)] {
+            let header = read_retained_vector_index_header(&io, path, size)
+                .await
+                .unwrap();
+            assert_eq!(header.unwrap().index_type, IndexType::IvfFlat, "{path}");
+            assert_eq!(stats.load(Ordering::Relaxed), expected_stats, "{path}");
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+
+        let mut query_entry = entry(Some(b"{}".to_vec()));
+        query_entry.index_file.file_name = "full.index".into();
+        query_entry.index_file.file_size = size as i64;
+        for _ in 0..2 {
+            assert_eq!(
+                read_index_vector_metric(&io, "/table", &query_entry)
+                    .await
+                    .unwrap(),
+                Some(MetricType::L2)
+            );
+            assert_eq!(reads.load(Ordering::Relaxed), 3);
+        }
+        assert_eq!(stats.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[cfg(all(
+        feature = "storage-memory",
+        any(feature = "storage-oss", feature = "storage-s3")
+    ))]
+    #[tokio::test]
+    async fn retained_vector_header_confirms_missing_after_storage_retries() {
+        #[derive(Debug)]
+        struct RetriedMemory(opendal::Operator);
+
+        #[async_trait::async_trait]
+        impl crate::io::FileIOProvider for RetriedMemory {
+            async fn create(&self, path: &str) -> crate::Result<(opendal::Operator, String)> {
+                Ok((
+                    self.0.clone(),
+                    path.strip_prefix("memory:/").unwrap().into(),
+                ))
+            }
+        }
+
+        let operator = opendal::Operator::new(opendal::services::Memory::default())
+            .unwrap()
+            .layer(opendal_layer_retry::RetryLayer::default());
+        let missing = operator.stat("missing.index").await.unwrap_err();
+        assert!(missing.is_persistent());
+        assert_eq!(missing.kind(), opendal::ErrorKind::NotFound);
+        let file_io = FileIOBuilder::new("memory")
+            .with_provider(std::sync::Arc::new(RetriedMemory(operator)))
+            .build()
+            .unwrap();
+        let path = "memory:/missing.index";
+        assert!(read_retained_vector_index_header(&file_io, path, 256)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(read_vector_index_header(&file_io, path, 256).await.is_err());
+    }
+
+    #[test]
+    fn ivf_sq_header_rejects_incomplete_or_unsupported_metadata() {
+        let mut header = vec![0; IVF_SQ_HEADER_SIZE];
+        for (offset, value) in [
+            (0, IVF_SQ_MAGIC),
+            (4, IVF_SQ_VERSION),
+            (8, 128),
+            (12, 1),
+            (28, IVF_SQ_BITS),
+            (32, 0b11),
+        ] {
+            header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let minimum_size = 2640;
+        assert_eq!(
+            parse_vector_index_header(Bytes::from(header.clone()), minimum_size)
+                .unwrap()
+                .nlist,
+            1
+        );
+        assert_eq!(
+            parse_vector_index_header(Bytes::from(header.clone()), minimum_size - 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof,
+        );
+        header[32] = 0;
+        assert_eq!(
+            parse_vector_index_header(Bytes::from(header), minimum_size)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
     }
 }

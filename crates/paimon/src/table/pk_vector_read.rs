@@ -38,7 +38,7 @@ use crate::table::source::DataSplit;
 use crate::table::vector_read::Read;
 use crate::table::vector_search_common::{
     collect_ranked_rows, current_tokio_runtime_handle, log_vindex_range_io_stats,
-    read_vector_index_metric, reorder_and_strip_position, vindex_concurrency_limits, RankedRow,
+    read_vector_index_header, reorder_and_strip_position, vindex_concurrency_limits, RankedRow,
 };
 use crate::table::{ArrowRecordBatchStream, RowRange, Table};
 use crate::vector_search::{GlobalIndexIOMeta, GlobalIndexResult, VectorSearch};
@@ -53,6 +53,13 @@ use arrow_array::{Array, Int64Array, RecordBatch};
 use futures::{stream, TryStreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+pub(super) struct PkVectorSearchBatch {
+    pub(super) candidates: Vec<Vec<PkVectorCandidate>>,
+    pub(super) source_splits: Vec<PkVectorSearchSplit>,
+    pub(super) snapshot_id: i64,
+    pub(super) metric: VectorSearchMetric,
+}
 
 pub(super) struct PkVectorRead {
     table: Table,
@@ -82,12 +89,12 @@ impl PkVectorRead {
             limit,
         }
     }
-}
 
-impl Read for PkVectorRead {
-    type Plan = PkVectorScanPlan;
-
-    async fn read(&self, plan: PkVectorScanPlan) -> crate::Result<Vec<GlobalIndexResult>> {
+    /// Search the pinned plan with distances and file references intact.
+    pub(super) async fn search(
+        &self,
+        plan: PkVectorScanPlan,
+    ) -> crate::Result<PkVectorSearchBatch> {
         let core = CoreOptions::new(self.table.schema().options());
         let queries: Vec<&[f32]> = self.queries.iter().map(Vec::as_slice).collect();
         let mut metadata_type = None;
@@ -125,13 +132,9 @@ impl Read for PkVectorRead {
             .find(|segment| segment.row_count > 0)
         {
             let metric = VectorSearchMetric::from_vindex(
-                read_vector_index_metric(
-                    self.table.file_io(),
-                    &segment.path,
-                    segment.file_size,
-                    Some(&segment.index_meta),
-                )
-                .await?,
+                read_vector_index_header(self.table.file_io(), &segment.path, segment.file_size)
+                    .await?
+                    .metric,
             );
             params.metric = metric;
             params.vector_options.metric = metric.as_str().into();
@@ -147,16 +150,31 @@ impl Read for PkVectorRead {
             &params,
         )
         .await?;
+        Ok(PkVectorSearchBatch {
+            candidates,
+            source_splits: plan.splits,
+            snapshot_id: plan.snapshot_id,
+            metric: params.metric,
+        })
+    }
+}
+
+impl Read for PkVectorRead {
+    type Plan = PkVectorScanPlan;
+
+    async fn read(&self, plan: PkVectorScanPlan) -> crate::Result<Vec<GlobalIndexResult>> {
+        let result = self.search(plan).await?;
         let table = Arc::new(self.table.clone());
-        candidates
+        result
+            .candidates
             .into_iter()
             .map(|candidates| {
                 GlobalIndexResult::from_primary_key(
                     table.clone(),
-                    plan.snapshot_id,
+                    result.snapshot_id,
                     candidates,
-                    &plan.splits,
-                    params.metric,
+                    &result.source_splits,
+                    result.metric,
                 )
             })
             .collect()
@@ -379,11 +397,8 @@ async fn search_pk_raw_candidates_batch_with_plan(
 
     let scorer: crate::vindex::pkvector::ann::SourceBatchScorer = Box::new(
         move |segment: &BucketAnnSegment, source: AnnSegmentSource, searches: &[VectorSearch]| {
-            let io_meta = GlobalIndexIOMeta::new(
-                segment.path.clone(),
-                segment.file_size,
-                segment.index_meta.clone(),
-            );
+            let io_meta =
+                GlobalIndexIOMeta::new(segment.path.clone(), segment.file_size, Vec::new());
             match source {
                 AnnSegmentSource::Vindex(source) => {
                     let range_io_stats = source.range_io_stats();
@@ -855,6 +870,7 @@ async fn rerank_indexed_positional(
     let indexed_splits = build_indexed_splits(indexed, plan_splits, metric)?;
 
     let dimension = query_vector.len();
+    let prepared_query = metric.prepare_query(query_vector);
     let mut reranked: Vec<PkVectorCandidate> = Vec::new();
     for split in indexed_splits {
         let data_split = split.split.clone();
@@ -918,7 +934,7 @@ async fn rerank_indexed_positional(
                     ),
                     source: None,
                 })?;
-                candidate.distance = metric.compute_distance(query_vector, vector);
+                candidate.distance = prepared_query.compute_distance(vector);
                 reranked.push(candidate);
             }
         }

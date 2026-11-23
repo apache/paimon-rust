@@ -515,6 +515,7 @@ async fn vector_source_deletions_skip_schema_casts_without_renumbering_live_rows
         .unwrap();
     assert_eq!(payload.row_count, 1);
     let meta = payload.global_index_meta.as_ref().unwrap();
+    assert_eq!(meta.index_meta.as_deref(), Some(b"{}".as_slice()));
     assert_eq!((meta.row_range_start, meta.row_range_end), (0, 1));
     let source = PrimaryKeyIndexSourceMeta::from_global_index_meta(meta).unwrap();
     assert_eq!(source.source_files().len(), 1);

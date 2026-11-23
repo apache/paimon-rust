@@ -41,6 +41,7 @@ mod bucket_assigner_fixed;
 mod bucket_filter;
 mod bucket_function;
 mod bucket_router;
+mod centroid_bitmap;
 mod centroid_index;
 mod chunk_shuffle;
 mod commit_callback;
@@ -299,9 +300,9 @@ pub use write_builder::WriteBuilder;
 use crate::catalog::{validate_branch_name, Identifier, DEFAULT_MAIN_BRANCH};
 use crate::io::FileIO;
 use crate::spec::{
-    CoreOptions, DataField, Snapshot, TableSchema, SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION,
-    SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_TIMESTAMP_OPTION, SCAN_VERSION_OPTION,
-    SCAN_WATERMARK_OPTION,
+    bucket_path, bucket_path_under, BinaryRow, CoreOptions, DataField, PartitionComputer, Snapshot,
+    TableSchema, SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION,
+    SCAN_TIMESTAMP_OPTION, SCAN_VERSION_OPTION, SCAN_WATERMARK_OPTION,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -432,6 +433,28 @@ impl Table {
         crate::spec::data_file_path(
             self.location(),
             self.schema().core_options().data_file_path_directory(),
+        )
+    }
+
+    fn data_file_bucket_path(&self, partition: &[u8], bucket: i32) -> Result<String> {
+        let partition_keys = self.schema().partition_keys();
+        let data_location = self.data_file_location();
+        if partition_keys.is_empty() {
+            // Unpartitioned buckets sit directly under the data location.
+            return Ok(bucket_path_under(&data_location, "", bucket));
+        }
+        let options = self.schema().core_options();
+        let computer = PartitionComputer::new(
+            partition_keys,
+            self.schema().fields(),
+            options.partition_default_name(),
+            options.legacy_partition_name(),
+        )?;
+        bucket_path(
+            &data_location,
+            Some(&computer),
+            &BinaryRow::from_serialized_bytes(partition)?,
+            bucket,
         )
     }
 

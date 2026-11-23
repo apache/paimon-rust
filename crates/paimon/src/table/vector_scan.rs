@@ -29,7 +29,7 @@ use crate::table::vector_search_common::{
     targets_primary_key_column, validate_global_vector_index_types,
 };
 use crate::table::SearchScanSplit;
-use crate::table::{find_field_id_by_name, BucketVectorSearchSplit, Table};
+use crate::table::{find_field_id_by_name, BucketVectorSearchSplit, RowRange, Table};
 use std::collections::{HashMap, HashSet};
 
 /// Resolve one snapshot and the work a vector reader will consume.
@@ -50,6 +50,9 @@ pub(super) trait Scan: Sync {
 pub struct VectorScanPlan {
     snapshot: Option<Snapshot>,
     splits: Vec<SearchScanSplit>,
+    /// Raw work added solely to cover gaps in the scalar indexes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    scalar_prefilter_ranges: Vec<RowRange>,
 }
 
 impl VectorScanPlan {
@@ -91,7 +94,11 @@ impl VectorScanPlan {
                 }
             }
         }
-        Ok(Self { snapshot, splits })
+        Ok(Self {
+            snapshot,
+            splits,
+            scalar_prefilter_ranges: vec![],
+        })
     }
 
     /// The complete snapshot captured by planning, including retained tags.
@@ -103,6 +110,10 @@ impl VectorScanPlan {
     /// never causes the reader to discover additional index or raw sources.
     pub fn splits(&self) -> &[SearchScanSplit] {
         &self.splits
+    }
+
+    pub(super) fn scalar_prefilter_ranges(&self) -> &[RowRange] {
+        &self.scalar_prefilter_ranges
     }
 
     pub fn snapshot_id(&self) -> Option<i64> {
@@ -118,10 +129,17 @@ impl<'de> serde::Deserialize<'de> for VectorScanPlan {
         struct Sources {
             snapshot: Option<Snapshot>,
             splits: Vec<SearchScanSplit>,
+            #[serde(default)]
+            scalar_prefilter_ranges: Vec<RowRange>,
         }
-        let Sources { snapshot, splits } =
-            <Sources as serde::Deserialize>::deserialize(deserializer)?;
-        Self::new(snapshot, splits).map_err(serde::de::Error::custom)
+        let Sources {
+            snapshot,
+            splits,
+            scalar_prefilter_ranges,
+        } = <Sources as serde::Deserialize>::deserialize(deserializer)?;
+        let mut plan = Self::new(snapshot, splits).map_err(serde::de::Error::custom)?;
+        plan.scalar_prefilter_ranges = super::merge_row_ranges(scalar_prefilter_ranges);
+        Ok(plan)
     }
 }
 
@@ -313,8 +331,8 @@ impl VectorScan {
                     )?;
                 }
                 let snapshot = plan.table.travel_snapshot().cloned();
-                let splits = if plan.skip_search {
-                    vec![]
+                let (splits, scalar_prefilter_ranges) = if plan.skip_search {
+                    (vec![], vec![])
                 } else {
                     super::search_scan_split::global_search_splits(
                         &plan.table,
@@ -326,7 +344,9 @@ impl VectorScan {
                     )
                     .await?
                 };
-                VectorScanPlan::new(snapshot, splits)
+                let mut sources = VectorScanPlan::new(snapshot, splits)?;
+                sources.scalar_prefilter_ranges = scalar_prefilter_ranges;
+                Ok(sources)
             }
             VectorScanKind::PrimaryKey(scan) => {
                 let plan = scan.plan().await?;

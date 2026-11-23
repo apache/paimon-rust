@@ -1045,6 +1045,10 @@ fn assemble_row_wise_variant_extraction(
         } else {
             None
         };
+        // A clipped residual has no typed_value and follows this owned-Variant
+        // fallback. Borrow its validated root once for all requested paths;
+        // GenericVariant::get_path would revalidate it for every field.
+        let variant = variant.as_ref().map(GenericVariant::as_ref).transpose()?;
         let (shredded_metadata, dictionary_key) = if shredded.is_some() {
             match variant_metadata_at(input, row) {
                 Ok((bytes, key)) => (Some(bytes), key),
@@ -1087,18 +1091,12 @@ fn assemble_row_wise_variant_extraction(
                 }
                 _ => {
                     let extracted = match &variant {
-                        Some(variant) => {
-                            variant
-                                .get_path(field_metadata.path())
-                                .and_then(|selected| {
-                                    selected.map(|value| value.to_owned_variant()).transpose()
-                                })
-                        }
+                        Some(variant) => variant.get_path(field_metadata.path()),
                         None => Ok(None),
                     };
                     match extracted {
                         Ok(Some(extracted)) => cast_variant_to_shredded_value(
-                            extracted.as_ref()?,
+                            extracted,
                             field.data_type(),
                             field_metadata.fail_on_error(),
                         )?,
@@ -2972,6 +2970,84 @@ mod tests {
         assert_eq!(rest.value(0), "A");
         assert!(rest.is_null(1));
         assert_eq!(rest.value(2), "B");
+    }
+
+    #[test]
+    fn clipped_residual_projection_preserves_casts_nulls_and_errors() {
+        let input = shredded_for_test(
+            &[
+                Some(r#"{"hot":1,"a":2,"n":{"x":"3.5"},"bad":"bad","label":"first"}"#),
+                None,
+                Some(r#"{"hot":2,"a":7,"n":{"x":null},"bad":9,"label":"last"}"#),
+            ],
+            r#"[{"name":"hot","type":"INT"}]"#,
+        );
+        // Parquet clips away typed_value for cold-only projections and retains
+        // metadata before value, unlike the canonical plain-Variant layout.
+        let names = [VARIANT_METADATA_FIELD_NAME, VARIANT_VALUE_FIELD_NAME];
+        let fields: Fields = names
+            .iter()
+            .map(|name| {
+                input
+                    .fields()
+                    .iter()
+                    .find(|f| f.name().as_str() == *name)
+                    .unwrap()
+                    .clone()
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let columns = names
+            .iter()
+            .map(|name| input.column_by_name(name).unwrap().clone())
+            .collect();
+        let clipped = StructArray::try_new(fields, columns, input.nulls().cloned()).unwrap();
+        let float = || DataType::Float(FloatType::new());
+        let (row_type, _) = extraction_for_test(&[
+            (float(), "$.a"),
+            (float(), "$.n.x"),
+            (float(), "$.bad"),
+            (float(), "$.missing"),
+            (DataType::VarChar(VarCharType::string_type()), "$.label"),
+        ]);
+        for storage in [clipped.clone(), with_dictionary_metadata(&clipped)] {
+            assert!(!is_shredded_variant_array(&storage));
+            assert!(!is_plain_variant_array(&storage));
+            let result = assemble_variant_extraction_array(&storage, &row_type).unwrap();
+            let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+            assert!(result.is_null(1));
+            for (index, expected) in [
+                vec![Some(2.0), None, Some(7.0)],
+                vec![Some(3.5), None, None],
+                vec![None, None, Some(9.0)],
+                vec![None, None, None],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let values = result
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap();
+                assert_eq!(values.iter().collect::<Vec<_>>(), expected);
+            }
+            let labels = result
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(
+                labels.iter().collect::<Vec<_>>(),
+                vec![Some("first"), None, Some("last")]
+            );
+            let strict = variant_extraction_row(
+                true,
+                vec![(float(), "$.bad".to_string(), true, "UTC".to_string())],
+            )
+            .unwrap();
+            assert!(assemble_variant_extraction_array(&storage, &strict).is_err());
+        }
     }
 
     #[test]

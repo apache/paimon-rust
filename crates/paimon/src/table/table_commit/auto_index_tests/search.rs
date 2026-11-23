@@ -18,9 +18,11 @@
 use super::*;
 use crate::catalog::{Catalog, FileSystemCatalog};
 use crate::spec::{ArrayType, FloatType, SchemaChange, VarCharType};
+use crate::table::vector_search_common::read_index_vector_semantics;
 use crate::Options;
 use arrow_array::builder::{Float32Builder, ListBuilder};
 use arrow_array::{ArrayRef, StringArray};
+use paimon_vindex_core::distance::MetricType;
 
 #[tokio::test]
 async fn unified_and_dlf_declarations_share_build_and_raw_search_options() {
@@ -58,19 +60,12 @@ async fn unified_and_dlf_declarations_share_build_and_raw_search_options() {
             .iter()
             .find(|e| e.index_file.index_type == "ivf-flat")
             .unwrap();
-        let meta: HashMap<String, String> = serde_json::from_slice(
-            vector
-                .index_file
-                .global_index_meta
-                .as_ref()
-                .unwrap()
-                .index_meta
-                .as_ref()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(meta["dimension"], "2");
-        assert_eq!(meta["metric"], "cosine");
+        let native = read_index_vector_semantics(table.file_io(), table.location(), vector)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(native.dimension, 2);
+        assert_eq!(native.metric, MetricType::Cosine);
         let indexed = vector_scores(&table, "fast").await;
         let bad_read_options = table.copy_with_options(HashMap::from([(
             "fields.embedding.index-options".into(),
@@ -410,16 +405,7 @@ async fn manual_builds_and_planned_shards_share_declarations_and_preserve_explic
     }
 }
 
-async fn search_table(options: &[(&str, &str)]) -> (FileSystemCatalog, Table) {
-    let catalog = FileSystemCatalog::new(Options::from_map(HashMap::from([(
-        "warehouse".into(),
-        format!("memory:/auto-index-search/{}", uuid::Uuid::new_v4()),
-    )])))
-    .unwrap();
-    catalog
-        .create_database("default", false, HashMap::new())
-        .await
-        .unwrap();
+fn search_schema(options: &[(&str, &str)]) -> TableSchemaBuilder {
     let mut schema = TableSchemaBuilder::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("text", DataType::VarChar(VarCharType::string_type()))
@@ -438,16 +424,32 @@ async fn search_table(options: &[(&str, &str)]) -> (FileSystemCatalog, Table) {
     for (key, value) in options {
         schema = schema.option(*key, *value);
     }
+    schema.build().unwrap()
+}
+
+async fn search_table(options: &[(&str, &str)]) -> (FileSystemCatalog, Table) {
+    let catalog = FileSystemCatalog::new(Options::from_map(HashMap::from([(
+        "warehouse".into(),
+        format!("memory:/auto-index-search/{}", uuid::Uuid::new_v4()),
+    )])))
+    .unwrap();
+    catalog
+        .create_database("default", false, HashMap::new())
+        .await
+        .unwrap();
     let id = Identifier::new("default", "search");
     catalog
-        .create_table(&id, schema.build().unwrap(), false)
+        .create_table(&id, search_schema(options), false)
         .await
         .unwrap();
     let table = catalog.get_table(&id).await.unwrap();
     (catalog, table)
 }
 
-async fn search_messages(table: &Table, vectors: &[[f32; 2]]) -> Vec<CommitMessage> {
+async fn search_messages<const DIM: usize>(
+    table: &Table,
+    vectors: &[[f32; DIM]],
+) -> Vec<CommitMessage> {
     let mut builder = ListBuilder::new(Float32Builder::new());
     for vector in vectors {
         builder.values().append_slice(vector);
@@ -478,6 +480,235 @@ async fn search_messages(table: &Table, vectors: &[[f32; 2]]) -> Vec<CommitMessa
     let mut writer = builder.new_write().unwrap();
     writer.write_arrow_batch(&batch).await.unwrap();
     writer.prepare_commit().await.unwrap()
+}
+
+#[tokio::test]
+async fn auto_maintenance_reuses_ivf_sq_shard_with_large_quantizer() {
+    let (_catalog, table) = search_table(&[
+        ("global-index.ivf-sq.index-columns", "embedding"),
+        ("ivf-sq.dimension", "128"),
+        ("ivf-sq.nlist", "1"),
+    ])
+    .await;
+    TableCommit::new(table.clone(), "first-sq-shard".into())
+        .commit(search_messages(&table, &[[0.; 128], [1.; 128]]).await)
+        .await
+        .unwrap();
+    let original = indexes(&table).await;
+    assert_eq!(original.len(), 1);
+    assert!(original[0].index_file.file_size > 256);
+
+    TableCommit::new(table.clone(), "second-sq-shard".into())
+        .commit(search_messages(&table, &[[2.; 128], [3.; 128]]).await)
+        .await
+        .unwrap();
+    let current = indexes(&table).await;
+    assert_eq!(current.len(), 2);
+    assert!(current.contains(&original[0]));
+}
+
+#[tokio::test]
+async fn auto_maintenance_rebuilds_missing_or_truncated_vector_shards() {
+    for truncate in [false, true] {
+        let (_catalog, table) = search_table(&[
+            ("global-index.ivf-flat.index-columns", "embedding"),
+            ("ivf-flat.dimension", "128"),
+            ("ivf-flat.nlist", "1"),
+            ("ivf-flat.metric", "l2"),
+        ])
+        .await;
+        TableCommit::new(table.clone(), "first-vector-shard".into())
+            .commit(search_messages(&table, &[[0.; 128], [1.; 128]]).await)
+            .await
+            .unwrap();
+        let original = indexes(&table).await.pop().unwrap();
+        let path = format!(
+            "{}/index/{}",
+            table.location(),
+            original.index_file.file_name
+        );
+        if truncate {
+            let payload = table
+                .file_io()
+                .new_input(&path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            assert!(payload.len() > 256);
+            table
+                .file_io()
+                .new_output(&path)
+                .unwrap()
+                .write(payload.slice(..256))
+                .await
+                .unwrap();
+        } else {
+            table.file_io().delete_file(&path).await.unwrap();
+        }
+
+        TableCommit::new(table.clone(), "second-vector-shard".into())
+            .commit(search_messages(&table, &[[2.; 128], [3.; 128]]).await)
+            .await
+            .unwrap();
+        let active = indexes(&table).await;
+        assert!(!active.contains(&original));
+        let rebuilt = active
+            .iter()
+            .find(|entry| {
+                entry
+                    .index_file
+                    .global_index_meta
+                    .as_ref()
+                    .is_some_and(|meta| meta.row_range_start == 0 && meta.row_range_end == 1)
+            })
+            .unwrap();
+        assert_eq!(
+            rebuilt
+                .index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .index_meta
+                .as_deref(),
+            Some(b"{}".as_slice())
+        );
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![0.; 128])
+            .with_limit(4)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.row_ids().unwrap().row_ids, [0, 1, 2, 3]);
+    }
+}
+
+#[tokio::test]
+async fn detail_search_reuses_the_ann_metric_for_refinement_and_raw_rows() {
+    use crate::table::SearchScanSplit;
+
+    let schema = search_schema(&[("write-only", "true"), ("ivf-flat.metric", "l2")]);
+    let (table, reads) =
+        crate::table::maintenance_test_utils::table(TableSchema::new(0, &schema)).await;
+    TableCommit::new(table.clone(), "indexed-vectors".into())
+        .commit(search_messages(&table, &[[1., 0.], [2., 0.]]).await)
+        .await
+        .unwrap();
+    let count = table
+        .new_global_index_build_builder()
+        .with_index_column("embedding")
+        .with_index_type("ivf-flat")
+        .with_options(HashMap::from([
+            ("ivf-flat.dimension".into(), "2".into()),
+            ("ivf-flat.nlist".into(), "1".into()),
+            ("ivf-flat.metric".into(), "inner_product".into()),
+        ]))
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    let file_name = &indexes(&table).await[0].index_file.file_name;
+    let index_path = format!("{}/index/{file_name}", table.location());
+    TableCommit::new(table.clone(), "raw-vectors".into())
+        .commit(search_messages(&table, &[[4., 0.]]).await)
+        .await
+        .unwrap();
+
+    let mut query = table.new_vector_search_builder();
+    query
+        .with_vector_column("embedding")
+        .with_query_vector(vec![1., 0.])
+        .with_limit(2)
+        .with_options(HashMap::from([
+            ("vector-index.search-mode".into(), "detail".into()),
+            ("fields.embedding.ivf.refine-factor".into(), "2".into()),
+        ]));
+    let plan = query.new_scan().unwrap().plan().await.unwrap();
+    assert!(plan
+        .splits()
+        .iter()
+        .any(|split| matches!(split, SearchScanSplit::Raw { .. })));
+    reads.watch(vec![index_path.clone()]);
+    let results = query.new_read().unwrap().read(plan).await.unwrap();
+    let rows = results.row_ids().unwrap();
+    assert_eq!(rows.row_ids, [2, 1]);
+    assert_eq!(rows.scores, [4., 2.]);
+    assert_eq!(reads.counts()[&index_path], 1);
+}
+
+#[tokio::test]
+async fn filtered_rerank_checks_unsearched_shards_with_bounded_concurrency() {
+    use crate::spec::{Datum, PredicateBuilder};
+    use std::time::Duration;
+
+    let schema = search_schema(&[
+        ("global-index.btree.index-columns", "id"),
+        ("global-index.ivf-flat.index-columns", "embedding"),
+        ("global-index.row-count-per-shard", "1"),
+        ("ivf-flat.dimension", "2"),
+        ("ivf-flat.nlist", "1"),
+        ("ivf-flat.metric", "l2"),
+    ]);
+    let (table, reads) =
+        crate::table::maintenance_test_utils::table(TableSchema::new(0, &schema)).await;
+    TableCommit::new(table.clone(), "vector-and-scalar-indexes".into())
+        .commit(search_messages(&table, &[[0., 0.], [1., 0.], [2., 0.], [3., 0.]]).await)
+        .await
+        .unwrap();
+    let skipped_paths: Vec<_> = indexes(&table)
+        .await
+        .into_iter()
+        .filter(|entry| {
+            entry.index_file.index_type == "ivf-flat"
+                && entry
+                    .index_file
+                    .global_index_meta
+                    .as_ref()
+                    .unwrap()
+                    .row_range_start
+                    > 0
+        })
+        .map(|entry| format!("{}/index/{}", table.location(), entry.index_file.file_name))
+        .collect();
+    assert_eq!(skipped_paths.len(), 3);
+
+    for (tasks, ranges) in [("2", "3"), ("3", "2")] {
+        let table = table.copy_with_options(HashMap::from([
+            ("global-index.thread-num".into(), tasks.into()),
+            ("global-index.vindex.read-thread-num".into(), ranges.into()),
+        ]));
+        let filter = PredicateBuilder::new(table.schema().fields())
+            .equal("id", Datum::Int(0))
+            .unwrap();
+        let mut query = table.new_vector_search_builder();
+        query
+            .with_vector_column("embedding")
+            .with_query_vector(vec![0., 0.])
+            .with_limit(1)
+            .with_filter(filter)
+            .with_options(HashMap::from([("refine_factor".into(), "2".into())]));
+        let plan = query.new_scan().unwrap().plan().await.unwrap();
+        let read = query.new_read().unwrap();
+        reads.watch(skipped_paths.clone());
+        let gate = reads.pause_watched_reads();
+        let check_limit = async {
+            gate.started.acquire_many(2).await.unwrap().forget();
+            let exceeded = tokio::time::timeout(Duration::from_millis(200), gate.started.acquire())
+                .await
+                .is_ok();
+            gate.release.add_permits(3);
+            assert!(!exceeded, "the third shard must wait for a query slot");
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(read.read(plan), check_limit)
+        })
+        .await
+        .expect("two unsearched shard headers must be checked concurrently");
+        assert_eq!(result.unwrap().row_ids().unwrap().row_ids, [0]);
+        assert!(reads.counts().values().all(|&count| count == 1));
+    }
 }
 
 async fn vector_scores(table: &Table, mode: &str) -> crate::vector_search::ScoredRowIds {
@@ -643,13 +874,13 @@ async fn vector_algorithm_and_metric_changes_atomically_replace_incompatible_pay
             "fields.embedding.global-index.vector.index-type",
             "ivf-sq",
             "ivf-sq",
-            "inner_product",
+            MetricType::InnerProduct,
         ),
         (
             "fields.embedding.global-index.vector.distance-metric",
             "cosine",
             "ivf-flat",
-            "cosine",
+            MetricType::Cosine,
         ),
     ] {
         let (catalog, table) = search_table(&[
@@ -717,23 +948,16 @@ async fn vector_algorithm_and_metric_changes_atomically_replace_incompatible_pay
                 !historical.contains(entry),
                 "every incompatible full shard must be replaced"
             );
-            let native: HashMap<String, String> = serde_json::from_slice(
-                entry
-                    .index_file
-                    .global_index_meta
-                    .as_ref()
-                    .unwrap()
-                    .index_meta
-                    .as_ref()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(native["metric"], expected_metric);
+            let native = read_index_vector_semantics(changed.file_io(), changed.location(), entry)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(native.metric, expected_metric);
         }
         for mode in ["full", "detail"] {
             let scores = vector_scores(&changed, mode).await;
             assert_eq!(scores.row_ids.len(), 4);
-            if expected_metric == "cosine" {
+            if expected_metric == MetricType::Cosine {
                 assert_eq!(scores.row_ids, vec![2, 0, 1, 3]);
                 assert!((scores.scores[0] - 1.).abs() < 1e-5);
             }

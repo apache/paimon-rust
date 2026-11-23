@@ -248,6 +248,7 @@ impl FullTextScan {
                 true,
             )
             .await?
+            .0
         };
         FullTextScanPlan::new(Some(snapshot), splits)
     }

@@ -24,8 +24,9 @@ use paimon::table::{
     VectorSearchBuilder,
 };
 use paimon_datafusion::runtime::runtime;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::PyDict;
 
 use crate::error::to_py_err;
 use crate::global_index_result::PyGlobalIndexResult;
@@ -101,6 +102,15 @@ impl PyVectorSearchBuilder {
         slf.inner.with_query_vector(vector);
         slf
     }
+    /// Rank each row's embedding list with cosine MaxSim for a query matrix.
+    fn with_multi_vector(
+        mut slf: PyRefMut<'_, Self>,
+        vectors: Vec<Vec<f32>>,
+    ) -> PyRefMut<'_, Self> {
+        slf.inner.with_multi_vector(vectors);
+        slf
+    }
+
     fn with_option(mut slf: PyRefMut<'_, Self>, key: String, value: String) -> PyRefMut<'_, Self> {
         slf.inner.with_options(HashMap::from([(key, value)]));
         slf
@@ -283,12 +293,20 @@ impl PyVectorScanPlan {
         vector_splits_to_python(py, self.inner.splits())
     }
 
-    fn __reduce__(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyTuple>)> {
-        let plan = slf.borrow();
-        let args = (plan.splits(py)?, plan.snapshot())
-            .into_pyobject(py)?
-            .unbind();
-        Ok((slf.get_type().unbind().into_any(), args))
+    #[staticmethod]
+    fn _from_json(value: &str) -> PyResult<Self> {
+        let inner = serde_json::from_str(value).map_err(|error| {
+            PyValueError::new_err(format!("Invalid vector search plan: {error}"))
+        })?;
+        Ok(Self { inner })
+    }
+
+    fn __reduce__(slf: &Bound<'_, Self>) -> PyResult<(Py<PyAny>, (String,))> {
+        let value = serde_json::to_string(&slf.borrow().inner).map_err(|error| {
+            PyValueError::new_err(format!("Cannot serialize vector search plan: {error}"))
+        })?;
+        let restore = slf.get_type().getattr("_from_json")?.unbind();
+        Ok((restore, (value,)))
     }
 }
 

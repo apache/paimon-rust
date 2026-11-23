@@ -59,6 +59,31 @@ pub(crate) async fn execute_update(
             a.name.value
         )));
     }
+    if update.from.is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "UPDATE ... FROM is not supported".into(),
+        ));
+    }
+    if !update.table.joins.is_empty() {
+        return Err(DataFusionError::NotImplemented(
+            "UPDATE ... JOIN is not supported".into(),
+        ));
+    }
+    if matches!(
+        &update.table.relation,
+        TableFactor::Table { args: Some(_), .. }
+    ) {
+        return Err(DataFusionError::NotImplemented(
+            "UPDATE on table functions is not supported".into(),
+        ));
+    }
+    if matches!(&update.table.relation, TableFactor::Table { sample, partitions, .. }
+        if sample.is_some() || !partitions.is_empty())
+    {
+        return Err(DataFusionError::NotImplemented(
+            "UPDATE with TABLESAMPLE or PARTITION is not supported".into(),
+        ));
+    }
 
     let schema = table.schema();
     let core_options = CoreOptions::new(schema.options());
@@ -79,9 +104,7 @@ async fn execute_primary_key_update(
     enable_ident_normalization: bool,
 ) -> DFResult<DataFrame> {
     primary_key_dml::validate_table(table, "UPDATE")?;
-    if !update.table.joins.is_empty()
-        || update.from.is_some()
-        || update.returning.is_some()
+    if update.returning.is_some()
         || update.output.is_some()
         || update.or.is_some()
         || !update.optimizer_hints.is_empty()
@@ -89,9 +112,9 @@ async fn execute_primary_key_update(
         || update.limit.is_some()
         || !matches!(&update.table.relation,
             TableFactor::Table {
-                args: None, version: None, with_ordinality: false,
-                json_path: None, sample: None, with_hints, partitions, index_hints, ..
-            } if with_hints.is_empty() && partitions.is_empty() && index_hints.is_empty())
+                version: None, with_ordinality: false,
+                json_path: None, with_hints, index_hints, ..
+            } if with_hints.is_empty() && index_hints.is_empty())
     {
         return Err(DataFusionError::NotImplemented(
             "Primary-key UPDATE supports a single target, SET assignments and an optional WHERE clause".into(),

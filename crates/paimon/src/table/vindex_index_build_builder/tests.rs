@@ -1652,3 +1652,6 @@ mod sparse_tests;
 
 #[path = "centroid_tests.rs"]
 mod centroid_tests;
+
+#[path = "multi_vector_tests.rs"]
+mod multi_vector_tests;

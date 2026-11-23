@@ -35,7 +35,7 @@ use crate::table::index_build::{
     vector::{serialize_writer, TrainedVectors, VectorSpill},
     IndexFileWriter, IndexPayload,
 };
-use crate::table::index_file_path::IndexFileLocation;
+use crate::table::index_file_path::{new_global_index_file_name, IndexFileLocation};
 use crate::table::RowRange;
 
 pub(super) struct BuiltIndexFile {
@@ -51,7 +51,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         dimension: i32,
         index_field_id: i32,
         options: &VindexVectorIndexOptions,
-        index_meta: Vec<u8>,
     ) -> Result<Option<BuiltIndexFile>> {
         let rows = usize::try_from(checked_row_count(
             shard.row_range_start,
@@ -61,7 +60,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             message: "vindex row count does not fit usize".into(),
             source: Some(Box::new(error)),
         })?;
-        let use_granule = self.index_type != DISKANN_IDENTIFIER
+        let use_granule = !options.multi_vector && self.index_type != DISKANN_IDENTIFIER
             && options.granule_build_enabled
             && !options.needs_vector_count()
             // Invalid training options still produce no file for an all-NULL
@@ -76,14 +75,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         );
         if use_granule {
             match self
-                .build_index_file_granule(
-                    shard,
-                    index_column,
-                    dimension,
-                    index_field_id,
-                    options,
-                    index_meta.clone(),
-                )
+                .build_index_file_granule(shard, index_column, dimension, index_field_id, options)
                 .await?
             {
                 GranuleBuildOutcome::Built(built) => return Ok(Some(*built)),
@@ -94,15 +86,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 }
             }
         }
-        self.build_full_spill_index_file(
-            shard,
-            index_column,
-            dimension,
-            index_field_id,
-            options,
-            index_meta,
-        )
-        .await
+        self.build_full_spill_index_file(shard, index_column, dimension, index_field_id, options)
+            .await
     }
 
     async fn build_full_spill_index_file(
@@ -112,7 +97,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         dimension: i32,
         index_field_id: i32,
         options: &VindexVectorIndexOptions,
-        index_meta: Vec<u8>,
     ) -> Result<Option<BuiltIndexFile>> {
         let timing_enabled = vector_index_build_timing_enabled();
         let total_start = timing_enabled.then(Instant::now);
@@ -139,7 +123,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let mut spill = VectorSpill::new(
             RowRange::new(shard.row_range_start, shard.row_range_end),
             dimension_usize,
-        )?;
+        )?
+        .with_multi_vector(options.multi_vector);
         let split = data_split_for_shard(shard)?;
         let mut read_builder = self.table.new_read_builder();
         read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
@@ -182,7 +167,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
 
         let serialize_upload_start = timing_enabled.then(Instant::now);
         let meta = self
-            .finish_index_file(writer, shard, index_field_id, index_meta, row_count)
+            .finish_index_file(writer, shard, index_field_id, row_count)
             .await?;
         let serialize_upload =
             serialize_upload_start.map_or(Duration::ZERO, |start| start.elapsed());
@@ -237,21 +222,20 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         writer: VectorIndexWriter,
         shard: &VindexIndexShard,
         index_field_id: i32,
-        index_meta: Vec<u8>,
         row_count: i64,
     ) -> Result<IndexFileMeta> {
-        let file_name = format!(
-            "vector-{}-global-index-{}.index",
-            self.index_type,
-            uuid::Uuid::new_v4()
-        );
+        let file_name = new_global_index_file_name(&format!("vector-{}", self.index_type));
         let meta = GlobalIndexMeta {
             row_range_start: shard.row_range_start,
             row_range_end: shard.row_range_end,
             index_field_id,
             extra_field_ids: None,
             source_meta: Some(
-                crate::spec::DataEvolutionIndexSourceMeta::new(shard.snapshot_id)?.serialize(),
+                crate::spec::DataEvolutionIndexSourceMeta::new_with_schema_id(
+                    shard.snapshot_id,
+                    self.table.schema().id(),
+                )?
+                .serialize(),
             ),
             index_meta: None,
         };
@@ -270,7 +254,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             serialize_writer(writer, output).await?;
             Ok(Some(IndexPayload {
                 row_count,
-                index_meta,
+                index_meta: b"{}".to_vec(),
             }))
         })
         .await

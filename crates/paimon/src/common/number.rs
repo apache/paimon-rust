@@ -25,6 +25,62 @@ use num_traits::ToPrimitive;
 mod floating;
 pub(crate) use floating::parse_java_float;
 
+/// Accumulate finite terms as nonoverlapping partial sums, retaining roundoff
+/// that can survive cancellation in a later term.
+pub(crate) fn accumulate_f64_partials(
+    terms: impl IntoIterator<Item = f64>,
+    partials: &mut Vec<f64>,
+) {
+    partials.clear();
+    for mut term in terms {
+        let mut kept = 0;
+        for i in 0..partials.len() {
+            let mut part = partials[i];
+            if term.abs() < part.abs() {
+                std::mem::swap(&mut term, &mut part);
+            }
+            // With |term| >= |part|, FastTwoSum gives an exact residual.
+            let sum = term + part;
+            let residual = part - (sum - term);
+            if residual != 0.0 {
+                partials[kept] = residual;
+                kept += 1;
+            }
+            term = sum;
+        }
+        partials.truncate(kept);
+        if term != 0.0 {
+            partials.push(term);
+        }
+    }
+}
+
+/// Round a nonoverlapping sum once, including when a smaller part resolves a
+/// midpoint between two `f64` values.
+pub(crate) fn round_f64_partials(partials: &[f64]) -> f64 {
+    let mut parts = partials.iter().rev().copied();
+    let mut total = parts.next().unwrap_or(0.0);
+    while let Some(part) = parts.next() {
+        let sum = total + part;
+        let residual = part - (sum - total);
+        total = sum;
+        if residual != 0.0 {
+            if parts
+                .next()
+                .is_some_and(|next| next.is_sign_negative() == residual.is_sign_negative())
+            {
+                let twice = 2.0 * residual;
+                let adjusted = total + twice;
+                if adjusted - total == twice {
+                    total = adjusted;
+                }
+            }
+            break;
+        }
+    }
+    total
+}
+
 /// Character.digit for decimal BMP digits (Java scans UTF-16 chars).
 pub(crate) fn java_decimal_digit(ch: char) -> Option<u8> {
     const ZEROES: &[u32] = &[

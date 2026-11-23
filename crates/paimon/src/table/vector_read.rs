@@ -19,7 +19,8 @@
 
 use crate::spec::{CoreOptions, Predicate};
 use crate::table::de_vector_read::DeVectorRead;
-use crate::table::pk_vector_read::PkVectorRead;
+use crate::table::pk_vector_read::{PkVectorRead, PkVectorSearchBatch};
+use crate::table::pk_vector_scan::{plan_from_search_splits, PkVectorScanPlan};
 use crate::table::pk_vector_search_params::PkVectorSearchParams;
 use crate::table::vector_scan::{PlanContext, VectorScanPlan};
 use crate::table::vector_search_common::{take_only_result, targets_primary_key_column};
@@ -61,6 +62,21 @@ impl VectorRead {
             "vector search",
         )
     }
+
+    pub(super) async fn search_primary_key(
+        &self,
+        plan: VectorScanPlan,
+    ) -> crate::Result<PkVectorSearchBatch> {
+        let table = self.batch.table_for_plan(&plan)?;
+        let VectorReadKind::PrimaryKey(reader) = &self.batch.reader else {
+            return Err(crate::Error::Unsupported {
+                message: "Primary-key vector search requires a primary-key vector reader".into(),
+            });
+        };
+        reader
+            .search(self.batch.primary_key_plan(&table, &plan)?)
+            .await
+    }
 }
 
 /// Searches a common plan with multiple queries, preserving input order and arity.
@@ -94,12 +110,30 @@ impl BatchVectorRead {
                 table, options, filter, &pk_col, queries, limit,
             )))
         } else {
+            validate_list_queries(table, column, queries, false)?;
             VectorReadKind::DataEvolution(DeVectorRead::new(column, queries, limit, options)?)
         };
         Ok(Self {
             context,
             table: table.clone(),
             reader,
+        })
+    }
+
+    pub(super) fn new_max_sim(
+        table: &Table,
+        column: &str,
+        queries: &[&[f32]],
+        limit: usize,
+        options: &HashMap<String, String>,
+        context: PlanContext,
+    ) -> crate::Result<Self> {
+        validate_list_queries(table, column, queries, true)?;
+        let reader = DeVectorRead::new(column, queries, limit, options)?.with_max_sim();
+        Ok(Self {
+            context,
+            table: table.clone(),
+            reader: VectorReadKind::DataEvolution(reader),
         })
     }
 
@@ -113,11 +147,7 @@ impl BatchVectorRead {
     ) -> crate::Result<Vec<GlobalIndexResult>> {
         self.read_impl(plan, Some(executor)).await
     }
-    async fn read_impl(
-        &self,
-        plan: VectorScanPlan,
-        executor: Option<&dyn SearchTaskExecutor>,
-    ) -> crate::Result<Vec<GlobalIndexResult>> {
+    fn table_for_plan(&self, plan: &VectorScanPlan) -> crate::Result<Table> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         if let Some(snapshot) = &self.context.prepared_snapshot {
             if snapshot.as_ref() != plan.snapshot() {
@@ -129,7 +159,29 @@ impl BatchVectorRead {
                 });
             }
         }
-        let table = self.table.copy_with_pinned_snapshot(plan.snapshot());
+        Ok(self.table.copy_with_pinned_snapshot(plan.snapshot()))
+    }
+
+    fn primary_key_plan(
+        &self,
+        table: &Table,
+        plan: &VectorScanPlan,
+    ) -> crate::Result<PkVectorScanPlan> {
+        plan_from_search_splits(
+            table,
+            &self.context.column,
+            self.context.filter.as_ref(),
+            plan.snapshot().cloned(),
+            plan.splits(),
+        )
+    }
+
+    async fn read_impl(
+        &self,
+        plan: VectorScanPlan,
+        executor: Option<&dyn SearchTaskExecutor>,
+    ) -> crate::Result<Vec<GlobalIndexResult>> {
+        let table = self.table_for_plan(&plan)?;
         match &self.reader {
             VectorReadKind::DataEvolution(reader) => {
                 for source in plan.splits() {
@@ -166,6 +218,7 @@ impl BatchVectorRead {
                     include_row_ids: self.context.include_row_ids.clone(),
                     timing: None,
                     source_splits: Some(plan.splits().to_vec()),
+                    scalar_prefilter_ranges: plan.scalar_prefilter_ranges().to_vec(),
                 };
                 reader.read_with_executor(work, executor).await
             }
@@ -175,16 +228,40 @@ impl BatchVectorRead {
                         message: "Distributed primary-key vector search is not supported".into(),
                     });
                 }
-                reader
-                    .read(super::pk_vector_scan::plan_from_search_splits(
-                        &table,
-                        &self.context.column,
-                        self.context.filter.as_ref(),
-                        plan.snapshot().cloned(),
-                        plan.splits(),
-                    )?)
-                    .await
+                reader.read(self.primary_key_plan(&table, &plan)?).await
             }
         }
+    }
+}
+
+fn validate_list_queries(
+    table: &Table,
+    column: &str,
+    queries: &[&[f32]],
+    matrix: bool,
+) -> crate::Result<()> {
+    use crate::vindex::multi_vector::{embedding_type, invalid, validate_queries};
+    let list = table
+        .schema()
+        .fields()
+        .iter()
+        .find(|field| field.name() == column)
+        .and_then(|field| embedding_type(field.data_type()));
+    if let Some(inner) = list {
+        let schema = table.schema();
+        if !schema.core_options().data_evolution_enabled() || !schema.primary_keys().is_empty() {
+            return Err(invalid(
+                "MultiVector search requires a Data Evolution append table",
+            ));
+        }
+        let width = match inner {
+            crate::spec::DataType::Vector(v) => Some(v.length() as usize),
+            _ => None,
+        };
+        validate_queries(queries, width)
+    } else if matrix {
+        Err(invalid("MaxSim queries require an embedding-list column"))
+    } else {
+        Ok(())
     }
 }

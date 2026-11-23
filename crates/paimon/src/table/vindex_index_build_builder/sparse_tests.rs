@@ -467,14 +467,7 @@ async fn null_in_rest_granules_discards_private_training_then_builds_sparse_inde
     )
     .unwrap();
     let outcome = builder
-        .build_index_file_granule(
-            shard,
-            "embedding",
-            2,
-            field.id(),
-            &options,
-            serde_json::to_vec(&options.native_options).unwrap(),
-        )
+        .build_index_file_granule(shard, "embedding", 2, field.id(), &options)
         .await
         .unwrap();
     assert!(matches!(outcome, GranuleBuildOutcome::Sparse));

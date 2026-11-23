@@ -1454,6 +1454,7 @@ enum InputFileReader {
     },
     Cached {
         reader: CachedFileReader,
+        source: opendal::Reader,
         cache_key: String,
         file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
         blob_index_cache: Arc<BlobIndexCacheContext>,
@@ -1839,7 +1840,46 @@ impl InputFile {
         self.reader_with_size_hint(Some(size)).await
     }
 
-    async fn reader_with_size_hint(&self, size: Option<u64>) -> crate::Result<impl FileRead> {
+    /// Read up to `max_len` bytes from the start of an immutable file.
+    /// On a cache miss, the cache entry covers only the prefix.
+    pub(crate) async fn read_prefix_with_cache(
+        &self,
+        size: u64,
+        max_len: u64,
+    ) -> crate::Result<Bytes> {
+        let length = size.min(max_len);
+        match self.reader_with_size_hint(Some(size)).await? {
+            InputFileReader::Direct { reader, .. } => FileRead::read(&reader, 0..length).await,
+            InputFileReader::Cached { reader, .. } => reader.read_prefix(length).await,
+        }
+    }
+
+    /// Read a range and return the size reported by storage, if present.
+    /// Reuse cached bytes when available. On a miss, read just the range and leave the cache alone.
+    pub(crate) async fn read_range_with_reported_size(
+        &self,
+        range: Range<u64>,
+        size_hint: u64,
+    ) -> crate::Result<(Bytes, Option<u64>)> {
+        let reader = self.reader_with_size_hint(Some(size_hint)).await?;
+        let source = match &reader {
+            InputFileReader::Direct { reader, .. } => reader,
+            InputFileReader::Cached { reader, source, .. } => {
+                if let Some(bytes) = reader.read_cached_range(range.clone()).await {
+                    return Ok((bytes, None));
+                }
+                source
+            }
+        };
+        let bytes = FileRead::read(source, range).await?;
+        let reported_size = source
+            .metadata()
+            .filter(|meta| meta.is_file())
+            .map(opendal::Metadata::content_length);
+        Ok((bytes, reported_size))
+    }
+
+    async fn reader_with_size_hint(&self, size: Option<u64>) -> crate::Result<InputFileReader> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let cache_key = cache_path.as_ref().map(|path| {
             if op.info().scheme() == "memory" {
@@ -1872,12 +1912,13 @@ impl InputFile {
         };
         Ok(InputFileReader::Cached {
             reader: CachedFileReader::new_with_token(
-                Arc::new(reader),
+                Arc::new(reader.clone()),
                 cache_path.as_str(),
                 size,
                 cache.clone(),
                 read_token,
             ),
+            source: reader,
             cache_key: cache_key.unwrap(),
             file_format_metadata_cache: Arc::clone(&self.file_format_metadata_cache),
             blob_index_cache: Arc::clone(&self.blob_index_cache),
@@ -2182,6 +2223,59 @@ mod file_action_test {
 
     fn setup_memory_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_range_reports_live_object_size_only_on_storage_reads() {
+        let io = FileIOBuilder::new("memory")
+            .with_prop(CatalogOptions::LOCAL_CACHE_ENABLED, "true")
+            .with_prop(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4")
+            .build()
+            .unwrap();
+        let path = "memory:/range-object-size/snapshot-1";
+        let bytes = Bytes::from_static(b"abcdefgh");
+        io.new_output(path)
+            .unwrap()
+            .write(bytes.clone())
+            .await
+            .unwrap();
+        let input = io.new_input(path).unwrap();
+        for _ in 0..2 {
+            let (prefix, object_size) =
+                input.read_range_with_reported_size(0..3, 12).await.unwrap();
+            assert_eq!(prefix, bytes.slice(..3));
+            assert_eq!(object_size, Some(8), "range misses must not fill the cache");
+        }
+
+        // Warm all blocks before checking the cache hit with a fresh reader.
+        assert_eq!(input.read().await.unwrap(), bytes);
+        let (prefix, object_size) = input.read_range_with_reported_size(2..6, 12).await.unwrap();
+        assert_eq!(prefix, bytes.slice(2..6));
+        assert_eq!(object_size, None);
+    }
+
+    #[tokio::test]
+    async fn test_cached_prefix_obeys_file_invalidation() {
+        let io = FileIOBuilder::new("memory")
+            .with_prop(CatalogOptions::LOCAL_CACHE_ENABLED, "true")
+            .with_prop(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4")
+            .build()
+            .unwrap();
+        let path = "memory:/cached-prefix/snapshot-1";
+        let input = io.new_input(path).unwrap();
+        for bytes in [b"abcdefgh", b"12345678"] {
+            io.new_output(path)
+                .unwrap()
+                .write(Bytes::from_static(bytes))
+                .await
+                .unwrap();
+            let prefix = input.read_prefix_with_cache(8, 3).await.unwrap();
+            assert_eq!(prefix.as_ref(), &bytes[..3]);
+            let (exact, reported_size) =
+                input.read_range_with_reported_size(0..3, 8).await.unwrap();
+            assert_eq!(exact, prefix);
+            assert_eq!(reported_size, Some(8));
+        }
     }
 
     #[tokio::test]
@@ -3874,13 +3968,17 @@ mod input_output_test {
                     .unwrap()
                     .with_file_block_cache(cache.clone(), 64, "meta")
                     .unwrap();
+                let input = reader_io.new_input(&location).unwrap();
                 assert_eq!(
-                    reader_io
-                        .new_input(&location)
-                        .unwrap()
-                        .read()
+                    input
+                        .read_prefix_with_cache(b"old metadata".len() as u64, 3)
                         .await
                         .unwrap(),
+                    Bytes::from_static(b"old")
+                );
+                assert!(cache.0.lock().unwrap().is_empty());
+                assert_eq!(
+                    input.read().await.unwrap(),
                     Bytes::from_static(b"old metadata")
                 );
                 assert_eq!(cache.0.lock().unwrap().len(), 1);
