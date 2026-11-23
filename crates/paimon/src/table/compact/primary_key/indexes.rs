@@ -25,13 +25,14 @@ mod tests;
 use super::super::CompactTask;
 use crate::resource::ResourceContext;
 use crate::spec::{DataFileMeta, FileKind, IndexManifestEntry, ManifestEntry};
-use crate::table::pk_index_maintenance::{levels, plan, unsupported_scalar_units};
+use crate::table::pk_index_maintenance::{
+    levels, plan, unsupported_scalar_units, MaintenanceRound,
+};
 use crate::table::pk_index_options::definitions;
 use crate::table::{CommitMessage, DataSplit, Table, TableCommit};
 use crate::Result;
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::Semaphore;
+use std::sync::Arc;
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::table::compact) async fn prepare(
@@ -43,7 +44,7 @@ pub(in crate::table::compact) async fn prepare(
     files: &[DataFileMeta],
     deletion_updates: &[super::super::deletion_vectors::DeletionVectorUpdate],
     resources: Option<ResourceContext>,
-    header_reads: &OnceLock<Semaphore>,
+    round: &MaintenanceRound,
 ) -> Result<Vec<IndexManifestEntry>> {
     let defs = definitions(table.schema())?;
     let changes = task
@@ -79,7 +80,7 @@ pub(in crate::table::compact) async fn prepare(
         &defs,
         &unsupported,
         (&task.partition, task.bucket),
-        header_reads,
+        round,
     )
     .await?;
     let vector_levels = maintenance

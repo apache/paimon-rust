@@ -255,6 +255,12 @@ fn compatibility_parallelism(table: &Table, defs: &[Definition]) -> Result<usize
     }
 }
 
+/// Shares the retained vector-index I/O limit across buckets in one PK compaction round.
+#[derive(Default)]
+pub(super) struct MaintenanceRound {
+    header_reads: OnceLock<Semaphore>,
+}
+
 pub(super) struct Maintenance<'a> {
     pub(super) deletes: Vec<IndexManifestEntry>,
     pub(super) builds: Vec<(i32, &'a Definition)>,
@@ -291,7 +297,7 @@ pub(super) async fn plan<'a>(
     defs: &'a [Definition],
     unsupported: &HashSet<(i32, i32)>,
     bucket_key: (&[u8], i32),
-    header_reads: &OnceLock<Semaphore>,
+    round: &MaintenanceRound,
 ) -> Result<Maintenance<'a>> {
     let (partition, bucket) = bucket_key;
     let mut existing = BTreeMap::<(i32, i32), Vec<&IndexManifestEntry>>::new();
@@ -316,7 +322,9 @@ pub(super) async fn plan<'a>(
     let mut deletes = Vec::new();
     let mut builds = Vec::new();
     let parallelism = compatibility_parallelism(table, defs)?;
-    let header_reads = header_reads.get_or_init(|| Semaphore::new(parallelism));
+    let header_reads = round
+        .header_reads
+        .get_or_init(|| Semaphore::new(parallelism));
     let existing_entries = existing.iter().collect::<Vec<_>>();
     for batch in existing_entries.chunks(parallelism) {
         let mut checks = Vec::with_capacity(batch.len());
@@ -408,7 +416,7 @@ pub(super) async fn validate(
     let mut required_deletes = Vec::new();
     let mut required_builds = HashSet::new();
     let mut after_levels = BTreeMap::new();
-    let header_reads = OnceLock::new();
+    let round = MaintenanceRound::default();
     for (partition, bucket) in &buckets {
         let after = levels(active, changes, partition, *bucket);
         let unsupported = unsupported_scalar_units(table, &after, &defs).await;
@@ -419,7 +427,7 @@ pub(super) async fn validate(
             &defs,
             &unsupported,
             (partition, *bucket),
-            &header_reads,
+            &round,
         )
         .await?;
         required_deletes.extend(maintenance.deletes);

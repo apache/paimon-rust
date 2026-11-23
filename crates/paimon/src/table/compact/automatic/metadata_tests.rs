@@ -242,25 +242,33 @@ async fn automatic_pk_vector_header_reads_and_empty_stats_share_a_limit_across_b
     append(&table, 1000..1004, false).await;
     let plan = builder.new_planner().unwrap().plan().await.unwrap();
     assert_eq!(plan.tasks().len(), 2);
-    counter.watch(paths);
-    let gate = counter.pause_watched_reads();
-    let check_limit = async {
-        gate.started.acquire().await.unwrap().forget();
-        let concurrent = tokio::time::timeout(Duration::from_millis(250), gate.started.acquire())
-            .await
-            .is_ok();
-        gate.release.add_permits(2);
-        assert!(
-            !concurrent,
-            "a retained header read and an empty-segment stat exceeded the shared limit of one"
-        );
-    };
-    let (prepared, ()) = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(execute_auto_plan(&table, &plan, &executor, 2), check_limit)
-    })
-    .await
-    .expect("both retained indexes must be checked");
-    let prepared = prepared.unwrap();
-    assert_eq!(prepared.index_entries.unwrap().len(), 2);
-    assert!(counter.counts().values().all(|&count| count == 1));
+    // Overlapping rounds using the same executor each get one permit.
+    for rounds in [1, 2] {
+        counter.watch(paths.clone());
+        let gate = counter.pause_watched_reads();
+        let check_limit = async {
+            gate.started.acquire_many(rounds).await.unwrap().forget();
+            let excess = tokio::time::timeout(Duration::from_millis(250), gate.started.acquire())
+                .await
+                .is_ok();
+            gate.release.add_permits(2 * rounds as usize);
+            assert!(
+                !excess,
+                "retained header reads and empty-segment stats exceeded one permit per round"
+            );
+        };
+        let executions = (0..rounds).map(|_| execute_auto_plan(&table, &plan, &executor, 2));
+        let (prepared, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(futures::future::join_all(executions), check_limit)
+        })
+        .await
+        .expect("each round must start an index check while the other rounds are paused");
+        for result in prepared {
+            assert_eq!(result.unwrap().index_entries.unwrap().len(), 2);
+        }
+        assert!(counter
+            .counts()
+            .values()
+            .all(|&count| count == rounds as usize));
+    }
 }

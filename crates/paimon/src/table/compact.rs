@@ -26,17 +26,17 @@ pub(super) mod primary_key;
 use deletion_vectors::DeletionVectorUpdate;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
 
 use super::data_file_index_writer::FileIndexOptions;
 use super::data_file_writer::DataFileWriter;
 use super::managed_blob_writer::managed_blob_fields;
 use super::partition_filter::{validate_partition_filter, PartitionFilter};
+use super::pk_index_maintenance::MaintenanceRound;
 use super::snapshot_manifest::read_snapshot_entries;
 use super::write_builder::{ensure_table_write_authorized, validate_commit_user};
 use super::{DataSplit, Plan, Table, TableCommit, TableScan};
@@ -419,7 +419,24 @@ struct CompactInputs {
     snapshot: Snapshot,
     data: HashMap<(Vec<u8>, i32), Vec<ManifestEntry>>,
     indexes: HashMap<(Vec<u8>, i32), Vec<IndexManifestEntry>>,
-    pk_index_header_reads: OnceLock<Semaphore>,
+}
+
+enum CompactRound {
+    Append,
+    DataEvolution,
+    PrimaryKey(MaintenanceRound),
+}
+
+impl CompactRound {
+    fn for_task(task: &CompactTask) -> Self {
+        if task.is_data_evolution() {
+            Self::DataEvolution
+        } else if task.is_primary_key() {
+            Self::PrimaryKey(MaintenanceRound::default())
+        } else {
+            Self::Append
+        }
+    }
 }
 
 /// Prepared data, changelog and index files owned by the caller until submitted
@@ -513,7 +530,8 @@ impl CompactExecutor {
 
     pub async fn execute(&self, task: &CompactTask) -> Result<CompactResult> {
         let inputs = self.capture_inputs(task).await?;
-        self.execute_captured(task, &inputs).await
+        let round = CompactRound::for_task(task);
+        self.execute_captured(task, &inputs, &round).await
     }
 
     async fn capture_inputs(&self, task: &CompactTask) -> Result<CompactInputs> {
@@ -553,7 +571,6 @@ impl CompactExecutor {
             snapshot,
             data,
             indexes: by_bucket,
-            pk_index_header_reads: OnceLock::new(),
         })
     }
 
@@ -561,6 +578,7 @@ impl CompactExecutor {
         &self,
         task: &CompactTask,
         inputs: &CompactInputs,
+        round: &CompactRound,
     ) -> Result<CompactResult> {
         task.validate_target(&self.table)?;
         let snapshot = &inputs.snapshot;
@@ -602,12 +620,13 @@ impl CompactExecutor {
             .with_bucket_path(bucket_path)
             .with_data_files(task.files.clone())
             .build()?;
-        let split = if options.deletion_vectors_enabled() && task.is_primary_key() {
-            primary_key::deletion_vectors::with_deletion_entries(&table, &split, indexes)?
-        } else {
-            split
-        };
-        if task.is_data_evolution() {
+        let split =
+            if options.deletion_vectors_enabled() && matches!(round, CompactRound::PrimaryKey(_)) {
+                primary_key::deletion_vectors::with_deletion_entries(&table, &split, indexes)?
+            } else {
+                split
+            };
+        if matches!(round, CompactRound::DataEvolution) {
             let files = data_evolution::execute(
                 &table,
                 task,
@@ -624,7 +643,7 @@ impl CompactExecutor {
                 index_entries: None,
             });
         }
-        if task.is_primary_key() {
+        if let CompactRound::PrimaryKey(maintenance) = round {
             let mut deletions = None;
             let lookup = if let Some(cache) = &self.lookup_cache {
                 let history = active
@@ -688,7 +707,7 @@ impl CompactExecutor {
                 &files,
                 &deletion_vector_updates,
                 self.resources.clone(),
-                &inputs.pk_index_header_reads,
+                maintenance,
             )
             .await
             {
