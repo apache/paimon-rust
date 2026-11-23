@@ -18,9 +18,11 @@
 use super::*;
 use crate::catalog::{Catalog, FileSystemCatalog};
 use crate::spec::{ArrayType, FloatType, SchemaChange, VarCharType};
+use crate::table::vector_search_common::read_index_vector_semantics;
 use crate::Options;
 use arrow_array::builder::{Float32Builder, ListBuilder};
 use arrow_array::{ArrayRef, StringArray};
+use paimon_vindex_core::distance::MetricType;
 
 #[tokio::test]
 async fn unified_and_dlf_declarations_share_build_and_raw_search_options() {
@@ -58,19 +60,12 @@ async fn unified_and_dlf_declarations_share_build_and_raw_search_options() {
             .iter()
             .find(|e| e.index_file.index_type == "ivf-flat")
             .unwrap();
-        let meta: HashMap<String, String> = serde_json::from_slice(
-            vector
-                .index_file
-                .global_index_meta
-                .as_ref()
-                .unwrap()
-                .index_meta
-                .as_ref()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(meta["dimension"], "2");
-        assert_eq!(meta["metric"], "cosine");
+        let native = read_index_vector_semantics(table.file_io(), table.location(), vector)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(native.dimension, 2);
+        assert_eq!(native.metric, MetricType::Cosine);
         let indexed = vector_scores(&table, "fast").await;
         let bad_read_options = table.copy_with_options(HashMap::from([(
             "fields.embedding.index-options".into(),
@@ -643,13 +638,13 @@ async fn vector_algorithm_and_metric_changes_atomically_replace_incompatible_pay
             "fields.embedding.global-index.vector.index-type",
             "ivf-sq",
             "ivf-sq",
-            "inner_product",
+            MetricType::InnerProduct,
         ),
         (
             "fields.embedding.global-index.vector.distance-metric",
             "cosine",
             "ivf-flat",
-            "cosine",
+            MetricType::Cosine,
         ),
     ] {
         let (catalog, table) = search_table(&[
@@ -717,23 +712,16 @@ async fn vector_algorithm_and_metric_changes_atomically_replace_incompatible_pay
                 !historical.contains(entry),
                 "every incompatible full shard must be replaced"
             );
-            let native: HashMap<String, String> = serde_json::from_slice(
-                entry
-                    .index_file
-                    .global_index_meta
-                    .as_ref()
-                    .unwrap()
-                    .index_meta
-                    .as_ref()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(native["metric"], expected_metric);
+            let native = read_index_vector_semantics(changed.file_io(), changed.location(), entry)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(native.metric, expected_metric);
         }
         for mode in ["full", "detail"] {
             let scores = vector_scores(&changed, mode).await;
             assert_eq!(scores.row_ids.len(), 4);
-            if expected_metric == "cosine" {
+            if expected_metric == MetricType::Cosine {
                 assert_eq!(scores.row_ids, vec![2, 0, 1, 3]);
                 assert!((scores.scores[0] - 1.).abs() < 1e-5);
             }

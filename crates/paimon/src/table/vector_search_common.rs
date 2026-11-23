@@ -44,17 +44,15 @@ pub(super) struct IndexVectorSemantics {
     pub dimension: usize,
 }
 
-/// Read the scoring metric without requiring dimension metadata or a payload read.
-/// Older callers and JSON-only metadata need only this scoring property.
+/// Read the scoring metric from the centroid descriptor or the native file header.
 pub(super) async fn read_index_vector_metric(
     file_io: &FileIO,
     table_path: &str,
     entry: &IndexManifestEntry,
 ) -> crate::Result<Option<MetricType>> {
-    let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
-        return Ok(None);
-    };
-    if !is_vindex_index_type(&entry.index_file.index_type) {
+    if entry.index_file.global_index_meta.is_none()
+        || !is_vindex_index_type(&entry.index_file.index_type)
+    {
         return Ok(None);
     }
     if let Some(descriptor) = super::centroid_index::Descriptor::parse(&entry.index_file)? {
@@ -67,77 +65,27 @@ pub(super) async fn read_index_vector_metric(
         }
         return descriptor.router_metric().map(Some);
     }
-    let path = IndexFileLocation::Global { table_path }.resolve(
-        &entry.index_file.file_name,
-        entry.index_file.external_path.as_deref(),
-    );
-    read_vector_index_metric(
-        file_io,
-        &path,
-        entry.index_file.file_size.max(0) as u64,
-        global_meta.index_meta.as_deref(),
-    )
-    .await
-    .map(Some)
+    Ok(Some(
+        read_index_vector_header(file_io, table_path, entry)
+            .await?
+            .metric,
+    ))
 }
 
-/// Resolve the metric of an already selected payload, including bucket-local PK files.
-pub(super) async fn read_vector_index_metric(
-    file_io: &FileIO,
-    path: &str,
-    file_size: u64,
-    index_meta: Option<&[u8]>,
-) -> crate::Result<MetricType> {
-    if let Some(index_meta) = index_meta {
-        if let Ok(options) = serde_json::from_slice::<HashMap<String, String>>(index_meta) {
-            if let Some(metric) = metric_from_index_options(&options) {
-                return Ok(metric);
-            }
-        }
-    }
-    Ok(read_vector_index_header(file_io, path, file_size)
-        .await?
-        .metric)
-}
-
-/// Read the structural definition of an existing run before reusing its coverage.
-/// Java and older metadata may omit these options, so fall back to the native header.
+/// Read the native definition of an existing range index before reusing its coverage.
 pub(super) async fn read_index_vector_semantics(
     file_io: &FileIO,
     table_path: &str,
     entry: &IndexManifestEntry,
 ) -> crate::Result<Option<IndexVectorSemantics>> {
-    let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
+    if entry.index_file.global_index_meta.is_none()
+        || !is_vindex_index_type(&entry.index_file.index_type)
+    {
         return Ok(None);
-    };
-    if !is_vindex_index_type(&entry.index_file.index_type) {
-        return Ok(None);
     }
-    if let Some(index_meta) = global_meta.index_meta.as_ref() {
-        if let Ok(options) = serde_json::from_slice::<HashMap<String, String>>(index_meta) {
-            let dimension = options
-                .get("dimension")
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|dimension| *dimension > 0);
-            if let (Some(metric), Some(dimension)) =
-                (metric_from_index_options(&options), dimension)
-            {
-                return Ok(Some(IndexVectorSemantics { metric, dimension }));
-            }
-        }
-    }
-    Ok(Some(
-        read_index_vector_header(file_io, table_path, entry).await?,
-    ))
-}
-
-fn metric_from_index_options(options: &HashMap<String, String>) -> Option<MetricType> {
-    match normalize_metric(options.get("metric")?).as_str() {
-        "l2" => Some(MetricType::L2),
-        "cosine" => Some(MetricType::Cosine),
-        "inner_product" => Some(MetricType::InnerProduct),
-        _ => None,
-    }
+    read_index_vector_header(file_io, table_path, entry)
+        .await
+        .map(Some)
 }
 
 async fn read_index_vector_header(
@@ -152,7 +100,8 @@ async fn read_index_vector_header(
     read_vector_index_header(file_io, &path, entry.index_file.file_size.max(0) as u64).await
 }
 
-async fn read_vector_index_header(
+/// Read the metric and dimension from the native header of a selected index file.
+pub(super) async fn read_vector_index_header(
     file_io: &FileIO,
     path: &str,
     file_size: u64,
@@ -801,23 +750,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metric_only_json_does_not_require_dimension_or_payload() {
-        let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let entry = entry(Some(br#"{"metric":"L2"}"#.to_vec()));
-        let table_path = "memory:/metric-only-vector-metadata";
-        assert!(!file_io
-            .exists(&format!("{table_path}/index/vectors.index"))
-            .await
-            .unwrap());
-        assert_eq!(
-            read_index_vector_metric(&file_io, table_path, &entry)
-                .await
-                .unwrap(),
-            Some(MetricType::L2)
-        );
-    }
-
-    #[tokio::test]
     async fn empty_centroid_router_has_no_scoring_metric() {
         use crate::table::centroid_index::{Descriptor, Role};
 
@@ -838,31 +770,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_vector_semantics_json_does_not_read_payload() {
+    async fn range_vector_metric_and_dimension_come_from_native_header() {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let entry = entry(Some(
-            br#"{"metric":"inner-product","dimension":"3"}"#.to_vec(),
-        ));
-        let table_path = "memory:/complete-vector-metadata";
-        assert!(!file_io
-            .exists(&format!("{table_path}/index/vectors.index"))
-            .await
-            .unwrap());
-        assert_eq!(
-            read_index_vector_semantics(&file_io, table_path, &entry)
-                .await
-                .unwrap(),
-            Some(IndexVectorSemantics {
-                metric: MetricType::InnerProduct,
-                dimension: 3,
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_vector_semantics_read_dimension_from_native_header() {
-        let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let table_path = "memory:/legacy-vector-metadata";
+        let table_path = "memory:/range-vector-metadata";
         let payload = crate::table::vector_search_test_utils::build_vindex_segment_bytes("l2");
         file_io
             .new_output(&format!("{table_path}/index/vectors.index"))
@@ -872,12 +782,18 @@ mod tests {
             .unwrap();
         for index_meta in [
             None,
-            Some(br#"{}"#.to_vec()),
-            Some(br#"{"metric":"l2"}"#.to_vec()),
-            Some(br#"{"metric":"l2","dimension":"0"}"#.to_vec()),
+            Some(b"{}".to_vec()),
+            Some(br#"{"metric":"cosine","dimension":"3"}"#.to_vec()),
         ] {
+            let entry = entry(index_meta);
             assert_eq!(
-                read_index_vector_semantics(&file_io, table_path, &entry(index_meta))
+                read_index_vector_metric(&file_io, table_path, &entry)
+                    .await
+                    .unwrap(),
+                Some(MetricType::L2)
+            );
+            assert_eq!(
+                read_index_vector_semantics(&file_io, table_path, &entry)
                     .await
                     .unwrap(),
                 Some(IndexVectorSemantics {

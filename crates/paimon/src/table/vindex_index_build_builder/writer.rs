@@ -51,7 +51,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         dimension: i32,
         index_field_id: i32,
         options: &VindexVectorIndexOptions,
-        index_meta: Vec<u8>,
     ) -> Result<Option<BuiltIndexFile>> {
         let rows = usize::try_from(checked_row_count(
             shard.row_range_start,
@@ -76,14 +75,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         );
         if use_granule {
             match self
-                .build_index_file_granule(
-                    shard,
-                    index_column,
-                    dimension,
-                    index_field_id,
-                    options,
-                    index_meta.clone(),
-                )
+                .build_index_file_granule(shard, index_column, dimension, index_field_id, options)
                 .await?
             {
                 GranuleBuildOutcome::Built(built) => return Ok(Some(*built)),
@@ -94,15 +86,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 }
             }
         }
-        self.build_full_spill_index_file(
-            shard,
-            index_column,
-            dimension,
-            index_field_id,
-            options,
-            index_meta,
-        )
-        .await
+        self.build_full_spill_index_file(shard, index_column, dimension, index_field_id, options)
+            .await
     }
 
     async fn build_full_spill_index_file(
@@ -112,7 +97,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         dimension: i32,
         index_field_id: i32,
         options: &VindexVectorIndexOptions,
-        index_meta: Vec<u8>,
     ) -> Result<Option<BuiltIndexFile>> {
         let timing_enabled = vector_index_build_timing_enabled();
         let total_start = timing_enabled.then(Instant::now);
@@ -183,7 +167,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
 
         let serialize_upload_start = timing_enabled.then(Instant::now);
         let meta = self
-            .finish_index_file(writer, shard, index_field_id, index_meta, row_count)
+            .finish_index_file(writer, shard, index_field_id, row_count)
             .await?;
         let serialize_upload =
             serialize_upload_start.map_or(Duration::ZERO, |start| start.elapsed());
@@ -238,7 +222,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         writer: VectorIndexWriter,
         shard: &VindexIndexShard,
         index_field_id: i32,
-        index_meta: Vec<u8>,
         row_count: i64,
     ) -> Result<IndexFileMeta> {
         let file_name = new_global_index_file_name(&format!("vector-{}", self.index_type));
@@ -271,7 +254,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             serialize_writer(writer, output).await?;
             Ok(Some(IndexPayload {
                 row_count,
-                index_meta,
+                index_meta: b"{}".to_vec(),
             }))
         })
         .await
