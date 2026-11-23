@@ -28,7 +28,9 @@ use common::incremental_helpers::{
 use futures::TryStreamExt;
 use paimon::catalog::{FileSystemCatalog, Identifier};
 use paimon::spec::{CommitKind, DataType, IntType, Schema, TableSchema, VarCharType};
-use paimon::table::{CommitCallback, CommitCallbackContext, IncrementalScanMode, Table};
+use paimon::table::{
+    CommitCallback, CommitCallbackContext, CommitMessage, IncrementalScanMode, Table, TableCommit,
+};
 
 async fn table() -> Table {
     table_with_schema(pk_schema(&[
@@ -172,26 +174,25 @@ async fn rows(table: &Table) -> Vec<(i32, i32)> {
     rows
 }
 
-#[tokio::test]
-async fn overwrite_recovery_preserves_later_lookup_append_and_its_changelog() {
-    let table = table().await;
+async fn interrupt_overwrite(
+    table: &Table,
+    batch: &RecordBatch,
+    identifier: i64,
+) -> (TableCommit, Vec<CommitMessage>) {
     let builder = table
         .new_write_builder()
         .with_commit_user("overwrite-job")
         .unwrap()
         .with_overwrite();
     let mut writer = builder.new_write().unwrap();
-    writer
-        .write_arrow_batch(&make_batch(vec![1], vec![10]))
-        .await
-        .unwrap();
+    writer.write_arrow_batch(batch).await.unwrap();
     let messages = writer.prepare_commit().await.unwrap();
     let mut commit = builder.new_commit();
     commit
         .add_commit_callback(Arc::new(FailOverwriteOnce(AtomicBool::new(false))))
         .unwrap();
     let error = commit
-        .overwrite_with_identifier(messages.clone(), None, 7)
+        .overwrite_with_identifier(messages.clone(), None, identifier)
         .await
         .unwrap_err();
     assert!(
@@ -200,6 +201,13 @@ async fn overwrite_recovery_preserves_later_lookup_append_and_its_changelog() {
             .contains("injected overwrite callback failure"),
         "{error}"
     );
+    (commit, messages)
+}
+
+#[tokio::test]
+async fn overwrite_recovery_preserves_later_lookup_append_and_its_changelog() {
+    let table = table().await;
+    let (commit, messages) = interrupt_overwrite(&table, &make_batch(vec![1], vec![10]), 7).await;
     let source = table
         .snapshot_manager()
         .get_latest_snapshot()
@@ -265,33 +273,45 @@ async fn overwrite_recovery_preserves_later_lookup_append_and_its_changelog() {
 }
 
 #[tokio::test]
+async fn dv_overwrite_retry_preserves_append_that_already_compacted() {
+    let table = table_with_schema(pk_schema(&[
+        ("write-only", "false"),
+        ("changelog-producer", "lookup"),
+        ("deletion-vectors.enabled", "true"),
+        ("deletion-vectors.merge-on-read", "true"),
+    ]))
+    .await;
+    let (commit, messages) = interrupt_overwrite(&table, &make_batch(vec![1], vec![10]), 7).await;
+    let manager = table.snapshot_manager();
+    let overwrite = manager.get_latest_snapshot().await.unwrap().unwrap();
+    assert_eq!(overwrite.commit_kind(), &CommitKind::OVERWRITE);
+
+    write_batch(&table, &make_batch(vec![2], vec![20])).await;
+    let compacted = manager.get_latest_snapshot().await.unwrap().unwrap();
+    assert_eq!(compacted.commit_kind(), &CommitKind::COMPACT);
+    assert!(files(&table).await.iter().all(|(_, level)| *level > 0));
+
+    commit
+        .overwrite_with_identifier(messages, None, 7)
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.get_latest_snapshot_id().await.unwrap(),
+        Some(compacted.id())
+    );
+    let append_events: Vec<_> = events(&table, overwrite.id(), compacted.id())
+        .await
+        .into_iter()
+        .filter(|(_, id, _)| *id == 2)
+        .collect();
+    assert_eq!(append_events, vec![("+I".into(), 2, 20)]);
+    assert_eq!(rows(&table).await, vec![(1, 10), (2, 20)]);
+}
+
+#[tokio::test]
 async fn overwrite_recovery_does_not_resurrect_inputs_replaced_by_a_later_overwrite() {
     let table = table().await;
-    let builder = table
-        .new_write_builder()
-        .with_commit_user("original-overwrite-job")
-        .unwrap()
-        .with_overwrite();
-    let mut writer = builder.new_write().unwrap();
-    writer
-        .write_arrow_batch(&make_batch(vec![1], vec![10]))
-        .await
-        .unwrap();
-    let messages = writer.prepare_commit().await.unwrap();
-    let mut commit = builder.new_commit();
-    commit
-        .add_commit_callback(Arc::new(FailOverwriteOnce(AtomicBool::new(false))))
-        .unwrap();
-    let error = commit
-        .overwrite_with_identifier(messages.clone(), None, 7)
-        .await
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("injected overwrite callback failure"),
-        "{error}"
-    );
+    let (commit, messages) = interrupt_overwrite(&table, &make_batch(vec![1], vec![10]), 7).await;
     let source = table
         .snapshot_manager()
         .get_latest_snapshot()

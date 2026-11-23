@@ -2879,12 +2879,10 @@ impl TableCommit {
             } else {
                 self.snapshot_manager.get_snapshot(id).await?
             };
-            if snapshot.commit_user() != self.commit_user
-                && matches!(
-                    snapshot.commit_kind(),
-                    CommitKind::COMPACT | CommitKind::OVERWRITE
-                )
-            {
+            if matches!(
+                snapshot.commit_kind(),
+                CommitKind::COMPACT | CommitKind::OVERWRITE
+            ) {
                 let changes_data = self
                     .read_delta_entries(partition_filter.as_ref(), &snapshot)
                     .await?

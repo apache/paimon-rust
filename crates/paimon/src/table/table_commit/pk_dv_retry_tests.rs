@@ -77,7 +77,7 @@ mod pk_dv_retry {
         .unwrap()
     }
 
-    async fn replace_vectors(table: &Table, masks: &[(&str, &[u32])]) {
+    async fn vector_replacement(table: &Table, masks: &[(&str, &[u32])]) -> CommitMessage {
         let mut message = CommitMessage::new(EMPTY_SERIALIZED_ROW.to_vec(), 0, vec![]);
         message.deleted_index_files = vectors(table).await.1;
         message.new_index_files.push(
@@ -95,6 +95,11 @@ mod pk_dv_retry {
             .await
             .unwrap(),
         );
+        message
+    }
+
+    async fn replace_vectors(table: &Table, masks: &[(&str, &[u32])]) {
+        let message = vector_replacement(table, masks).await;
         table
             .new_write_builder()
             .new_commit()
@@ -391,7 +396,14 @@ mod pk_dv_retry {
                     .collect();
                 *self.rejected_paths.lock().unwrap() = paths;
                 let (_, pending) = write(&self.table, vec![3, 4], 0).await;
-                replace_vectors(&self.table, &[(&pending.file_name, &[0])]).await;
+                // A different checkpoint from the same commit user still invalidates the plan.
+                let update = vector_replacement(&self.table, &[(&pending.file_name, &[0])]).await;
+                self.table
+                    .new_write_builder()
+                    .with_commit_user(snapshot.commit_user())?
+                    .new_commit()
+                    .commit_with_identifier(vec![update], snapshot.commit_identifier() - 1)
+                    .await?;
                 return Ok(false);
             }
             self.table

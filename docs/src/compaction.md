@@ -472,7 +472,7 @@ generation, so a DELETE may publish a changelog without a new data file.
 
 Commit atomically unions historical row deletions with the latest DV indexes and
 retires rewritten inputs' ranges, preserving unrelated ranges and HASH indexes.
-If another writer's `COMPACT` or `OVERWRITE` changes data or indexes in the same
+If a `COMPACT` or `OVERWRITE` snapshot changes data or indexes in the same
 partition and bucket after planning, plan again from the latest snapshot.
 This applies to manual and automatic compaction, including `write-only=true`.
 Different buckets can compact independently. Concurrent `APPEND` snapshots still
