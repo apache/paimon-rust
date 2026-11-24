@@ -1073,3 +1073,105 @@ async fn lookup_changelog_charges_a_lone_row_for_its_own_value() {
         );
     }
 }
+
+/// A changelog row with a large nested value is copied as a whole.
+#[tokio::test]
+async fn lookup_changelog_copies_a_large_map_row() {
+    use arrow_array::builder::{Int32Builder, MapBuilder};
+    use paimon::spec::MapType;
+    const ENTRIES: i32 = 500_000;
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "value",
+            DataType::Map(MapType::new(
+                DataType::Int(IntType::new()),
+                DataType::Int(IntType::new()),
+            )),
+        )
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("changelog-producer", "lookup")
+        .option("changelog-producer.row-deduplicate", "true")
+        .build()
+        .unwrap();
+    let table = table_with_schema(TableSchema::new(0, &schema)).await;
+    let write = |ids: std::ops::RangeInclusive<i32>, large: Option<i32>| {
+        let mut maps = MapBuilder::new(None, Int32Builder::new(), Int32Builder::new());
+        let mut keys = Vec::new();
+        for id in ids {
+            let len = if Some(id) == large { ENTRIES } else { 1 };
+            for entry in 0..len {
+                maps.keys().append_value(entry);
+                maps.values().append_value(id);
+            }
+            maps.append(true).unwrap();
+            keys.push(id);
+        }
+        RecordBatch::try_from_iter([
+            (
+                "id",
+                std::sync::Arc::new(Int32Array::from(keys)) as arrow_array::ArrayRef,
+            ),
+            ("value", std::sync::Arc::new(maps.finish()) as _),
+        ])
+        .unwrap()
+    };
+    write_batch(&table, &write(1..=127, None)).await;
+    let published = compact(&table).await;
+    write_batch(&table, &write(1..=128, Some(128))).await;
+    let compacted = compact(&table).await;
+
+    let plan = table
+        .new_read_builder()
+        .new_incremental_scan(IncrementalScanMode::Auto, published + 1, compacted)
+        .plan_combined()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow_with_row_kind(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    for batch in batches {
+        let kinds = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let maps = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::MapArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            let entries = maps.value(row);
+            let keys = entries
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let values = entries
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert!(keys.values().iter().copied().eq(0..entries.len() as i32));
+            assert!(values.values().iter().all(|value| *value == ids.value(row)));
+            events.push((kinds.value(row).to_string(), ids.value(row), entries.len()));
+        }
+    }
+    assert_eq!(events, vec![("+I".to_string(), 128, ENTRIES as usize)]);
+}

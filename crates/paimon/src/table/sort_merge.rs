@@ -31,11 +31,13 @@ use crate::table::aggregator::{new_aggregator, FieldAggregator};
 use crate::table::ArrowRecordBatchStream;
 use crate::Error;
 use arrow_array::{
-    new_null_array, Array, ArrayRef, Int32Array, Int64Array, Int8Array, RecordBatch,
+    make_array, new_null_array, Array, ArrayRef, Int32Array, Int64Array, Int8Array, RecordBatch,
+    RecordBatchOptions,
 };
+use arrow_data::transform::MutableArrayData;
 use arrow_ord::ord::make_comparator;
 use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
-use arrow_schema::{Schema, SchemaRef, SortOptions};
+use arrow_schema::{ArrowError, DataType, Schema, SchemaRef, SortOptions};
 use arrow_select::interleave::interleave;
 use async_stream::try_stream;
 use futures::StreamExt;
@@ -2030,22 +2032,67 @@ fn detach_changelog(
     if pending.is_empty() {
         return Ok(());
     }
-    let batches = pending.iter().collect::<Vec<_>>();
+    let schema = pending[0].schema();
     let indices = pending
         .iter()
         .enumerate()
         .flat_map(|(batch, rows)| (0..rows.num_rows()).map(move |row| (batch, row)))
         .collect::<Vec<_>>();
-    let chunk =
-        arrow_select::interleave::interleave_record_batch(&batches, &indices).map_err(|error| {
-            Error::DataInvalid {
-                message: format!("Invalid changelog batch: {error}"),
-                source: Some(Box::new(error)),
+    let chunk = (0..schema.fields().len())
+        .map(|column| {
+            let arrays = pending
+                .iter()
+                .map(|batch| batch.column(column).as_ref())
+                .collect::<Vec<_>>();
+            if indexes_each_element(schema.field(column).data_type()) {
+                copy_ranges(&arrays, indices.len())
+            } else {
+                interleave(&arrays, &indices)
             }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|columns| {
+            RecordBatch::try_new_with_options(
+                schema,
+                columns,
+                &RecordBatchOptions::new().with_row_count(Some(indices.len())),
+            )
+        })
+        .map_err(|error| Error::DataInvalid {
+            message: format!("Invalid changelog batch: {error}"),
+            source: Some(Box::new(error)),
         })?;
     chunks.push(chunk);
     pending.clear();
     Ok(())
+}
+
+/// Whether `interleave` builds an index for every element of a selected row:
+/// it does for MAP entries and for list items that are not primitive.
+fn indexes_each_element(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Map(..) => true,
+        DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
+            !item.data_type().is_primitive()
+        }
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| indexes_each_element(field.data_type())),
+        _ => false,
+    }
+}
+
+/// Copies whole arrays one after another, by value range.
+fn copy_ranges(arrays: &[&dyn Array], rows: usize) -> Result<ArrayRef, ArrowError> {
+    let data = arrays
+        .iter()
+        .map(|array| array.to_data())
+        .collect::<Vec<_>>();
+    let mut copy = MutableArrayData::new(data.iter().collect(), false, rows);
+    for (index, array) in data.iter().enumerate() {
+        copy.try_extend(index, 0, array.len())?;
+    }
+    Ok(make_array(copy.freeze()))
 }
 
 /// Hands on the changelog gathered so far as one batch that owns its rows.
@@ -3469,6 +3516,79 @@ mod tests {
             data.iter().flat_map(|batch| pks(batch)).collect::<Vec<_>>(),
             vec![1, 2, 3, 4, 5]
         );
+    }
+
+    #[test]
+    fn test_detached_nested_changelog_rows_own_their_entries() {
+        use arrow_array::builder::{Int32Builder, MapBuilder};
+        let mut maps = MapBuilder::new(None, Int32Builder::new(), Int32Builder::new());
+        for (row, len) in [3, 100_000, 2].into_iter().enumerate() {
+            for entry in 0..len {
+                maps.keys().append_value(entry);
+                maps.values().append_value(row as i32);
+            }
+            maps.append(true).unwrap();
+        }
+        let maps = Arc::new(maps.finish()) as ArrayRef;
+        let batch = RecordBatch::try_from_iter([
+            ("pk", Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef),
+            ("value", maps.clone()),
+        ])
+        .unwrap();
+        let source = maps.as_map().entries().column(0).to_data().buffers()[0].clone();
+
+        let mut chunks = Vec::new();
+        let mut pending = vec![batch.slice(1, 1), batch.slice(2, 1)];
+        detach_changelog(&mut chunks, &mut pending).unwrap();
+        drop(batch);
+
+        assert!(pending.is_empty());
+        let chunk = &chunks[0];
+        assert_eq!(chunk.num_rows(), 2);
+        let copied = chunk.column(1).as_map();
+        assert_eq!(copied.value_length(0), 100_000);
+        assert_eq!(copied.value_length(1), 2);
+        assert_eq!(
+            copied
+                .value(1)
+                .column(0)
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[0, 1]
+        );
+        // Only `maps` and `source` hold the keys, not the copied chunk.
+        assert_eq!(source.strong_count(), 2);
+    }
+
+    #[test]
+    fn test_only_element_indexed_columns_are_copied_by_range() {
+        let item = |data_type| Arc::new(Field::new("item", data_type, true));
+        let map = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Int32, false),
+                        Field::new("value", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        assert!(indexes_each_element(&map));
+        assert!(indexes_each_element(&DataType::List(item(DataType::Utf8))));
+        assert!(indexes_each_element(&DataType::Struct(
+            vec![Field::new("m", map, true)].into()
+        )));
+        assert!(!indexes_each_element(&DataType::List(item(
+            DataType::Int64
+        ))));
+        assert!(!indexes_each_element(&DataType::Struct(
+            vec![Field::new("a", DataType::Int32, true)].into()
+        )));
+        assert!(!indexes_each_element(&DataType::Utf8));
     }
 
     /// A changelog row sliced from a source batch must not keep that batch
