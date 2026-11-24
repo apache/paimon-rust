@@ -1031,8 +1031,12 @@ ALTER TABLE paimon.my_db.users RENAME COLUMN name TO username;
 ALTER TABLE paimon.my_db.users RENAME TO members;
 
 -- Set table properties
-ALTER TABLE paimon.my_db.users SET TBLPROPERTIES('data-evolution.enabled' = 'true');
+ALTER TABLE paimon.my_db.users SET TBLPROPERTIES('read.batch-size' = '1024');
 ```
+
+For filesystem catalog tables, set `row-tracking.enabled` and
+`data-evolution.enabled` before the first snapshot. Once snapshots exist,
+`ALTER TABLE` can only retain the current effective values of these two options.
 
 `IF EXISTS` is supported:
 

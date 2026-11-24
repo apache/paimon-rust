@@ -28,8 +28,9 @@ use crate::error::{ConfigInvalidSnafu, Error, Result};
 use crate::io::cache::{create_local_cache, LocalCache};
 use crate::io::FileIO;
 use crate::spec::{
-    CoreOptions, Schema, Snapshot, TableSchema, TableType, INDEX_FILE_IN_DATA_FILE_DIR_OPTION,
-    PRIMARY_KEY_NULLABLE_OPTION, TABLE_TYPE_OPTION,
+    CoreOptions, Schema, Snapshot, TableSchema, TableType, DATA_EVOLUTION_ENABLED_OPTION,
+    INDEX_FILE_IN_DATA_FILE_DIR_OPTION, PRIMARY_KEY_NULLABLE_OPTION, ROW_TRACKING_ENABLED_OPTION,
+    TABLE_TYPE_OPTION,
 };
 use crate::table::{ObjectTable, SchemaManager, Table};
 use async_trait::async_trait;
@@ -566,20 +567,38 @@ impl Catalog for FileSystemCatalog {
             crate::spec::SchemaChange::RemoveOption { key } => key == PRIMARY_KEY_NULLABLE_OPTION,
             _ => false,
         });
-        if changes_key_nullability
-            && crate::table::SnapshotManager::new(self.file_io.clone(), table_path.clone())
-                .get_latest_snapshot()
-                .await?
-                .is_some()
-        {
-            return Err(Error::Unsupported {
-                message: format!("Change '{PRIMARY_KEY_NULLABLE_OPTION}' is not supported yet."),
-            });
-        }
-
         let new_schema = current
             .apply_changes(changes)
             .map_err(|e| fill_table_name(e, identifier))?;
+
+        // Existing files rely on the row tracking and column layout they were written with.
+        // Compare the final effective values so equivalent SET and RESET operations are allowed.
+        let current_options = current.core_options();
+        let new_options = new_schema.core_options();
+        let changed_snapshot_option = [
+            (PRIMARY_KEY_NULLABLE_OPTION, changes_key_nullability),
+            (
+                ROW_TRACKING_ENABLED_OPTION,
+                current_options.row_tracking_enabled() != new_options.row_tracking_enabled(),
+            ),
+            (
+                DATA_EVOLUTION_ENABLED_OPTION,
+                current_options.data_evolution_enabled() != new_options.data_evolution_enabled(),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(key, changed)| changed.then_some(key));
+        if let Some(key) = changed_snapshot_option {
+            if crate::table::SnapshotManager::new(self.file_io.clone(), table_path.clone())
+                .get_latest_snapshot()
+                .await?
+                .is_some()
+            {
+                return Err(Error::Unsupported {
+                    message: format!("Change '{key}' is not supported yet."),
+                });
+            }
+        }
         self.save_table_schema(&table_path, &new_schema).await
     }
 
@@ -1209,6 +1228,78 @@ mod tests {
             let after = catalog.get_table(&identifier).await.unwrap();
             assert_eq!(after.schema().options(), before.options());
             assert_eq!(after.schema().fields(), before.fields());
+        }
+    }
+
+    #[tokio::test]
+    async fn row_layout_options_change_only_before_first_snapshot() {
+        use crate::spec::{DataType, IntType, SchemaChange};
+
+        let catalog = create_memory_catalog();
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+
+        for (key, needs_row_tracking) in [
+            ("row-tracking.enabled", false),
+            ("data-evolution.enabled", true),
+        ] {
+            let set = |value: &str| SchemaChange::set_option(key.into(), value.into());
+            let reset = || SchemaChange::remove_option(key.into());
+            for enabled in [false, true] {
+                let identifier = Identifier::new("db", format!("{key}-{enabled}"));
+                let mut schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .option("bucket", "-1");
+                if needs_row_tracking {
+                    schema = schema.option("row-tracking.enabled", "true");
+                }
+                catalog
+                    .create_table(&identifier, schema.build().unwrap(), false)
+                    .await
+                    .unwrap();
+
+                catalog
+                    .alter_table(&identifier, vec![set("true")], false)
+                    .await
+                    .unwrap();
+                if !enabled {
+                    catalog
+                        .alter_table(&identifier, vec![reset()], false)
+                        .await
+                        .unwrap();
+                }
+                give_the_table_a_snapshot(&catalog, &identifier).await;
+
+                let same_value = if enabled { "TRUE" } else { "FALSE" };
+                catalog
+                    .alter_table(&identifier, vec![set(same_value)], false)
+                    .await
+                    .unwrap();
+                if !enabled {
+                    catalog
+                        .alter_table(&identifier, vec![reset()], false)
+                        .await
+                        .unwrap();
+                }
+                let before = catalog.get_table(&identifier).await.unwrap();
+                let invalid_changes = if enabled {
+                    vec![set("false"), reset()]
+                } else {
+                    vec![set("true")]
+                };
+                for change in invalid_changes {
+                    let result = catalog.alter_table(&identifier, vec![change], false).await;
+                    assert!(
+                        matches!(result, Err(Error::Unsupported { ref message }) if message.contains(key)),
+                        "expected change from {key}={enabled} to be rejected, got {result:?}"
+                    );
+                }
+                let after = catalog.get_table(&identifier).await.unwrap();
+                assert_eq!(after.schema().id(), before.schema().id());
+                assert_eq!(after.schema().options(), before.schema().options());
+            }
         }
     }
 

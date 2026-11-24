@@ -25,7 +25,7 @@ pub use index_options::VectorIndexOptions;
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DELETION_VECTORS_MERGE_ON_READ_OPTION: &str = "deletion-vectors.merge-on-read";
 pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
-const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
+pub(crate) const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
 const DATA_EVOLUTION_NESTED_FIELD_ENABLED_OPTION: &str = "data-evolution.nested-field.enabled";
 const FILE_INDEX_READ_ENABLED_OPTION: &str = "file-index.read.enabled";
 const GLOBAL_INDEX_FILTER_REFINE_FROM_DATA_OPTION: &str = "global-index.filter.refine-from-data";
@@ -92,7 +92,7 @@ const DEFAULT_METADATA_STATS_DENSE_STORE: bool = true;
 const DEFAULT_METADATA_STATS_KEEP_FIRST_N_COLUMNS: i32 = -1;
 const FIELDS_PREFIX: &str = "fields";
 const STATS_MODE_SUFFIX: &str = "stats-mode";
-const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
+pub(crate) const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const ROW_TRACKING_PARTITION_GROUP_ON_COMMIT_OPTION: &str =
     "row-tracking.partition-group-on-commit";
 const CLUSTERING_INCREMENTAL_OPTION: &str = "clustering.incremental";
