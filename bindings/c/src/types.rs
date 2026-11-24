@@ -361,6 +361,8 @@ pub(crate) struct VectorSearchState {
     pub limit: Option<usize>,
     pub options: std::collections::HashMap<String, String>,
     pub filter: Option<Predicate>,
+    pub row_range: Option<(i64, i64)>,
+    pub distance_metric: Option<String>,
     // Optional column projection applied by `execute_read` (plus the always-appended
     // `__paimon_search_score`). `None` materializes every user column.
     pub projection: Option<Vec<String>>,

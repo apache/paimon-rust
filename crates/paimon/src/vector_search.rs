@@ -27,6 +27,7 @@ pub struct VectorSearch {
     pub limit: usize,
     pub field_name: String,
     pub options: HashMap<String, String>,
+    pub expected_distance_metric: Option<String>,
     pub include_row_ids: Option<roaring::RoaringTreemap>,
     pub(crate) shared_include_row_ids: Option<Arc<roaring::RoaringTreemap>>,
 }
@@ -56,6 +57,7 @@ impl VectorSearch {
             limit,
             field_name,
             options: HashMap::new(),
+            expected_distance_metric: None,
             include_row_ids: None,
             shared_include_row_ids: None,
         })
@@ -70,6 +72,26 @@ impl VectorSearch {
         self.include_row_ids = Some(include_row_ids);
         self.shared_include_row_ids = None;
         self
+    }
+
+    pub fn with_expected_distance_metric(mut self, metric: String) -> Self {
+        self.expected_distance_metric = Some(metric);
+        self
+    }
+
+    pub(crate) fn ensure_distance_metric(&self, actual: &str) -> crate::Result<()> {
+        if let Some(expected) = &self.expected_distance_metric {
+            use crate::vindex::pkvector::metric::VectorSearchMetric;
+            if VectorSearchMetric::parse(expected)? != VectorSearchMetric::parse(actual)? {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Vector search metric mismatch: query expects {expected}, but index uses {actual}"
+                    ),
+                    source: None,
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn set_shared_include_row_ids(

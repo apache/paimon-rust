@@ -140,6 +140,7 @@ async fn run(
             schema_fields: &[],
             next_row_id: None,
             filter: None,
+            row_range: None,
         },
         VectorIndexWork {
             entry: entries[0].clone(),

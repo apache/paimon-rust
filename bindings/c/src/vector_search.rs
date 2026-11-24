@@ -29,6 +29,12 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
+use std::sync::Arc;
+
+use arrow_array::{Float32Array, Int64Array, RecordBatch};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use futures::stream;
+use paimon::vector_search::ScoredRowIds;
 
 use paimon::spec::Predicate;
 use paimon::table::GlobalIndexResult;
@@ -65,6 +71,8 @@ pub unsafe extern "C" fn paimon_table_new_vector_search_builder(
         limit: None,
         options: HashMap::new(),
         filter: None,
+        row_range: None,
+        distance_metric: None,
         projection: None,
     };
     let inner = Box::into_raw(Box::new(state)) as *mut c_void;
@@ -145,6 +153,58 @@ pub unsafe extern "C" fn paimon_vector_search_builder_with_limit(
     }
     let state = &mut *((*b).inner as *mut VectorSearchState);
     state.limit = Some(limit);
+    std::ptr::null_mut()
+}
+
+/// Restrict candidates to the inclusive global row-ID interval before Top-K.
+///
+/// # Safety
+/// A non-null builder must be a live vector-search handle.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vector_search_builder_with_row_range(
+    b: *mut paimon_vector_search_builder,
+    from: i64,
+    to: i64,
+) -> *mut paimon_error {
+    if let Err(e) = check_non_null(b, "b") {
+        return e;
+    }
+    if from < 0 || from > to {
+        return paimon_error::new(
+            PaimonErrorCode::InvalidInput,
+            format!("Invalid vector search row range [{from}, {to}]"),
+        );
+    }
+    let state = &mut *((*b).inner as *mut VectorSearchState);
+    state.row_range = Some((from, to));
+    std::ptr::null_mut()
+}
+
+/// Require the persisted vector metric to match the requested metric.
+///
+/// # Safety
+/// A non-null builder must be a live vector-search handle. A non-null metric must be a null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vector_search_builder_with_distance_metric(
+    b: *mut paimon_vector_search_builder,
+    metric: *const c_char,
+) -> *mut paimon_error {
+    if let Err(e) = check_non_null(b, "b") {
+        return e;
+    }
+    let metric = match validate_cstr(metric, "distance metric") {
+        Ok(metric) => metric,
+        Err(e) => return e,
+    };
+    let normalized = metric.to_ascii_lowercase().replace('-', "_");
+    if !matches!(normalized.as_str(), "l2" | "cosine" | "inner_product") {
+        return paimon_error::new(
+            PaimonErrorCode::InvalidInput,
+            format!("Unknown vector search metric: {metric}"),
+        );
+    }
+    let state = &mut *((*b).inner as *mut VectorSearchState);
+    state.distance_metric = Some(normalized);
     std::ptr::null_mut()
 }
 
@@ -319,6 +379,63 @@ pub unsafe extern "C" fn paimon_vector_search_builder_execute_read(
     }))
 }
 
+/// Return an Arrow reader of global Int64 row IDs and Float32 scores. Free the returned reader with paimon_record_batch_reader_free.
+///
+/// # Safety
+/// A non-null builder must be a live vector-search handle.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vector_search_builder_execute_scored(
+    b: *mut paimon_vector_search_builder,
+) -> paimon_result_record_batch_reader {
+    let state = match vector_search_state(b) {
+        Ok(state) => state,
+        Err(error) => {
+            return paimon_result_record_batch_reader {
+                reader: std::ptr::null_mut(),
+                error,
+            }
+        }
+    };
+    let builder = configured_builder(state);
+    wrap_vector_stream(
+        runtime()
+            .block_on(async { scored_row_ids_to_stream(builder.execute().await?.into_row_ids()?) }),
+    )
+}
+
+fn scored_row_ids_to_stream(result: ScoredRowIds) -> paimon::Result<ArrowRecordBatchStream> {
+    let row_ids = result
+        .row_ids
+        .into_iter()
+        .map(|row_id| {
+            i64::try_from(row_id).map_err(|_| paimon::Error::DataInvalid {
+                message: format!("Vector search row id {row_id} exceeds i64::MAX"),
+                source: None,
+            })
+        })
+        .collect::<paimon::Result<Vec<_>>>()?;
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("row_id", ArrowDataType::Int64, false),
+        ArrowField::new("score", ArrowDataType::Float32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(row_ids)),
+            Arc::new(Float32Array::from(result.scores)),
+        ],
+    )
+    .map_err(|e| paimon::Error::UnexpectedError {
+        message: format!("Failed to build scored vector-search batch: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+    if batch.num_rows() == 0 {
+        Ok(Box::pin(stream::empty()))
+    } else {
+        Ok(Box::pin(stream::iter([Ok(batch)])))
+    }
+}
+
 pub(crate) async fn materialize_search_result(
     result: GlobalIndexResult,
     projection: Option<&[String]>,
@@ -370,6 +487,12 @@ fn configured_builder(state: &VectorSearchState) -> VectorSearchBuilder<'_> {
     builder.with_options(state.options.clone());
     if let Some(filter) = &state.filter {
         builder.with_filter(filter.clone());
+    }
+    if let Some((from, to)) = state.row_range {
+        builder.with_row_range(paimon::table::RowRange::new(from, to));
+    }
+    if let Some(metric) = &state.distance_metric {
+        builder.with_expected_distance_metric(metric);
     }
     builder
 }
@@ -480,3 +603,13 @@ const _: unsafe extern "C" fn(*const paimon_vector_search_builder) -> paimon_res
     paimon_vector_search_builder_new_scan;
 const _: unsafe extern "C" fn(*const paimon_vector_search_builder) -> paimon_result_vector_read =
     paimon_vector_search_builder_new_read;
+
+const _: unsafe extern "C" fn(*mut paimon_vector_search_builder, i64, i64) -> *mut paimon_error =
+    paimon_vector_search_builder_with_row_range;
+const _: unsafe extern "C" fn(
+    *mut paimon_vector_search_builder,
+    *const c_char,
+) -> *mut paimon_error = paimon_vector_search_builder_with_distance_metric;
+const _: unsafe extern "C" fn(
+    *mut paimon_vector_search_builder,
+) -> paimon_result_record_batch_reader = paimon_vector_search_builder_execute_scored;

@@ -121,6 +121,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             column,
             self.filter.as_ref(),
             self.include_row_ids.as_ref(),
+            None,
             self.prepared_filter.as_ref(),
         )
         .map(|scan| scan.with_options(&self.options))
@@ -134,6 +135,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             column,
             self.filter.as_ref(),
             self.include_row_ids.as_ref(),
+            None,
             self.prepared_filter.as_ref(),
         )?;
         let queries = self
@@ -149,11 +151,11 @@ impl<'a> BatchVectorSearchBuilder<'a> {
         let query_refs: Vec<&[f32]> = queries.iter().map(Vec::as_slice).collect();
         BatchVectorRead::new(
             self.table,
-            column,
             &query_refs,
             limit,
             &self.options,
             self.filter.as_ref(),
+            None,
             context,
         )
     }

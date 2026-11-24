@@ -520,6 +520,17 @@ and ranges. Combine predicates with `paimon_predicate_and`,
 
 ## Vector Scan, Plan, and Read
 
+`paimon_vector_search_builder_execute_scored` returns global row IDs and scores
+as Arrow Int64 and Float32 columns named `row_id` and `score`. An inclusive
+interval supplied to `paimon_vector_search_builder_with_row_range` restricts
+the ANN candidates before Top-K. A usable scalar index can further restrict the
+candidates before ranking. Otherwise the scalar predicate filters the candidate
+shortlist, so fewer than K hits may be returned even if additional matching rows
+exist in the interval. Use
+`paimon_vector_search_builder_with_distance_metric` when the query requires a
+specific metric. Scored execution requires global row IDs and returns an error
+for primary-key vector results, which use file-local positions.
+
 DE and primary-key vector searches use the same execution API:
 
 1. Configure a `paimon_vector_search_builder` with the column, query, limit,

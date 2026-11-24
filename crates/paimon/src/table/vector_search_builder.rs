@@ -21,7 +21,7 @@ use crate::spec::{CoreOptions, Predicate};
 use crate::table::vector_read::{BatchVectorRead, VectorRead};
 use crate::table::vector_scan::{PlanContext, VectorScan};
 use crate::table::vector_search_common::{add_filter, validate_partition_filter};
-use crate::table::Table;
+use crate::table::{RowRange, Table};
 use crate::vector_search::GlobalIndexResult;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -45,6 +45,9 @@ struct VectorSearchConfig {
     limit: Option<usize>,
     options: HashMap<String, String>,
     filter: Option<Predicate>,
+    include_row_ids: Option<Arc<roaring::RoaringTreemap>>,
+    expected_distance_metric: Option<String>,
+    row_range: Option<RowRange>,
 }
 
 impl<'a> VectorSearchBuilder<'a> {
@@ -124,6 +127,23 @@ impl<'a> VectorSearchBuilder<'a> {
         self
     }
 
+    pub fn with_include_row_ids(&mut self, include_row_ids: roaring::RoaringTreemap) -> &mut Self {
+        self.config.write().unwrap().include_row_ids = Some(Arc::new(include_row_ids));
+        self
+    }
+
+    /// Restrict candidates to an inclusive interval of global row IDs before Top-K.
+    /// Replaces an earlier interval and intersects any scalar or bitmap filter.
+    pub fn with_row_range(&mut self, range: RowRange) -> &mut Self {
+        self.config.write().unwrap().row_range = Some(range);
+        self
+    }
+
+    pub fn with_expected_distance_metric(&mut self, metric: &str) -> &mut Self {
+        self.config.write().unwrap().expected_distance_metric = Some(metric.to_string());
+        self
+    }
+
     /// Add a partition-only predicate expressed against the table schema.
     pub fn with_partition_filter(&mut self, filter: Predicate) -> crate::Result<&mut Self> {
         validate_partition_filter(&self.table, &filter)?;
@@ -145,8 +165,15 @@ impl<'a> VectorSearchBuilder<'a> {
                 .ok_or_else(|| crate::Error::ConfigInvalid {
                     message: "Vector column must be set via with_vector_column()".to_string(),
                 })?;
-        VectorScan::new(&self.table, column, config.filter.as_ref(), None, None)
-            .map(|scan| scan.with_options(&config.options))
+        VectorScan::new(
+            &self.table,
+            column,
+            config.filter.as_ref(),
+            config.include_row_ids.as_ref(),
+            config.row_range.as_ref(),
+            None,
+        )
+        .map(|scan| scan.with_options(&config.options))
     }
 
     /// Create an owned reader; query errors are reported before planning.
@@ -157,7 +184,14 @@ impl<'a> VectorSearchBuilder<'a> {
 
     fn read_with_config(&self, config: &VectorSearchConfig) -> crate::Result<VectorRead> {
         let (column, queries, limit) = self.query(config)?;
-        let context = PlanContext::new(&self.table, column, config.filter.as_ref(), None, None)?;
+        let context = PlanContext::new(
+            &self.table,
+            column,
+            config.filter.as_ref(),
+            config.include_row_ids.as_ref(),
+            config.row_range.as_ref(),
+            None,
+        )?;
         let queries = queries.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let batch = if config.max_sim {
             BatchVectorRead::new_max_sim(
@@ -166,16 +200,17 @@ impl<'a> VectorSearchBuilder<'a> {
                 &queries,
                 limit,
                 &config.options,
+                config.expected_distance_metric.as_deref(),
                 context,
             )?
         } else {
             BatchVectorRead::new(
                 &self.table,
-                column,
                 &queries,
                 limit,
                 &config.options,
                 config.filter.as_ref(),
+                config.expected_distance_metric.as_deref(),
                 context,
             )?
         };

@@ -185,6 +185,7 @@ pub(super) async fn global_search_splits(
                     schema_fields: table.schema().fields(),
                     next_row_id,
                     filter: Some(filter),
+                    row_range: None,
                 },
                 entries,
                 filter,

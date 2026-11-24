@@ -209,6 +209,7 @@ pub(super) struct PlanContext {
     pub(super) column: String,
     pub(super) filter: Option<Predicate>,
     pub(super) include_row_ids: Option<Arc<RoaringTreemap>>,
+    pub(super) row_range: Option<RowRange>,
     pub(super) prepared_snapshot: Option<Option<Snapshot>>,
 }
 
@@ -218,6 +219,7 @@ impl PlanContext {
         column: &str,
         filter: Option<&Predicate>,
         include_row_ids: Option<&Arc<RoaringTreemap>>,
+        row_range: Option<&RowRange>,
         prepared: Option<&PreparedVectorSearchFilter>,
     ) -> crate::Result<Self> {
         let core = CoreOptions::new(table.schema().options());
@@ -240,8 +242,13 @@ impl PlanContext {
                 message: "Vector column must be set via with_vector_column()".to_string(),
             });
         }
+        if row_range.is_some_and(|r| r.from() < 0) {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Global row IDs must be nonnegative".into(),
+            });
+        }
         if targets_primary_key_column(table, column)
-            && (include_row_ids.is_some() || prepared.is_some())
+            && (row_range.is_some() || include_row_ids.is_some() || prepared.is_some())
         {
             return Err(crate::Error::DataInvalid {
                 message: "global row-ID filters cannot be applied to primary-key file positions; use with_filter()".to_string(), source: None,
@@ -250,6 +257,7 @@ impl PlanContext {
         Ok(Self {
             column: column.to_string(),
             filter: filter.cloned(),
+            row_range: row_range.cloned(),
             include_row_ids: prepared
                 .map(PreparedVectorSearchFilter::include_row_ids)
                 .or(include_row_ids)
@@ -278,9 +286,11 @@ impl VectorScan {
         column: &str,
         filter: Option<&Predicate>,
         include_row_ids: Option<&Arc<RoaringTreemap>>,
+        row_range: Option<&RowRange>,
         prepared: Option<&PreparedVectorSearchFilter>,
     ) -> crate::Result<Self> {
-        let context = PlanContext::new(table, column, filter, include_row_ids, prepared)?;
+        let context =
+            PlanContext::new(table, column, filter, include_row_ids, row_range, prepared)?;
         let core = CoreOptions::new(table.schema().options());
         let scan = if targets_primary_key_column(table, column) {
             let column = core.single_vector_index_column()?;

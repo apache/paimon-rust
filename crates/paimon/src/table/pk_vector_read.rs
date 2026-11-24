@@ -68,9 +68,15 @@ pub(super) struct PkVectorRead {
     vector_column: String,
     queries: Vec<Vec<f32>>,
     limit: usize,
+    expected_distance_metric: Option<String>,
 }
 
 impl PkVectorRead {
+    pub(super) fn with_expected_distance_metric(mut self, metric: Option<&str>) -> Self {
+        self.expected_distance_metric = metric.map(str::to_string);
+        self
+    }
+
     /// Capture query inputs; format-dependent options wait for the scan plan.
     pub(super) fn new(
         table: &Table,
@@ -87,6 +93,7 @@ impl PkVectorRead {
             vector_column: vector_column.to_string(),
             queries: queries.iter().map(|query| query.to_vec()).collect(),
             limit,
+            expected_distance_metric: None,
         }
     }
 
@@ -138,6 +145,19 @@ impl PkVectorRead {
             );
             params.metric = metric;
             params.vector_options.metric = metric.as_str().into();
+        }
+        if let Some(expected) = &self.expected_distance_metric {
+            let expected = VectorSearchMetric::parse(expected)?;
+            if expected != params.metric {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Vector search metric mismatch: query expects {}, but index uses {}",
+                        expected.as_str(),
+                        params.metric.as_str()
+                    ),
+                    source: None,
+                });
+            }
         }
         let candidates = search_pk_candidates_batch_with_plan(
             &self.table,

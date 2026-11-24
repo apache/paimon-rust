@@ -42,12 +42,12 @@ use std::sync::{Arc, Mutex};
 
 use arrow::buffer::NullBuffer;
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray};
+use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use paimon::catalog::Identifier;
 use paimon::io::FileIOBuilder;
 use paimon::spec::{
-    BlobDescriptor, CommitKind, DataType, IntType, Schema, TableSchema, VarCharType,
+    ArrayType, BlobDescriptor, CommitKind, DataType, IntType, Schema, TableSchema, VarCharType,
 };
 use paimon::table::{SnapshotManager, Table};
 use paimon::{Catalog, FileSystemCatalog, Options};
@@ -3339,13 +3339,13 @@ fn test_two_commits_same_builder() {
 // `__paimon_search_score` Float32 column; row order is best-first.
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
-use arrow_array::{ArrayRef, Float32Array};
+use arrow_array::Float32Array;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use paimon::io::FileIO;
 use paimon::spec::{
-    ArrayType, DataFileMeta, Datum, FloatType, GlobalIndexMeta, IndexFileMeta, Predicate,
-    PredicateBuilder, VectorType,
+    DataFileMeta, Datum, FloatType, GlobalIndexMeta, IndexFileMeta, Predicate, PredicateBuilder,
+    VectorType,
 };
 use paimon::table::{CommitMessage, TableCommit};
 
@@ -4288,6 +4288,157 @@ fn vector_search_append_table_read_matches_rust() {
                 "score diverges: {c_score} vs {r_score}"
             );
         }
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn vector_search_execute_scored_honors_global_row_range() {
+    let path = "memory:/vsearch_scored_row_range";
+    let table = build_append_vector_table(path);
+    let query = [1.0f32, 0.0];
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let builder = c_vector_builder(handle, "embedding", &query, 6, ptr::null_mut());
+        let metric = CString::new("inner_product").unwrap();
+        let error = paimon_vector_search_builder_with_distance_metric(builder, metric.as_ptr());
+        assert!(error.is_null());
+        let error = paimon_vector_search_builder_with_row_range(builder, 2, 4);
+        assert!(error.is_null());
+        let result = paimon_vector_search_builder_execute_scored(builder);
+        paimon_vector_search_builder_free(builder);
+        assert!(result.error.is_null());
+        assert!(!result.reader.is_null());
+
+        let next = paimon_record_batch_reader_next(result.reader);
+        assert!(next.error.is_null());
+        let batch = import_batch(&next.batch);
+        paimon_arrow_batch_free(next.batch);
+        let row_ids = batch
+            .column_by_name("row_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(row_ids.len(), 3);
+        assert_eq!(scores.len(), 3);
+        let mut ids = row_ids.values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 3, 4]);
+
+        let eof = paimon_record_batch_reader_next(result.reader);
+        assert!(eof.error.is_null());
+        assert!(eof.batch.array.is_null());
+        paimon_record_batch_reader_free(result.reader);
+
+        let builder = c_vector_builder(handle, "embedding", &query, 3, ptr::null_mut());
+        let error = paimon_vector_search_builder_with_row_range(builder, 0, i64::MAX);
+        assert!(error.is_null());
+        let result = paimon_vector_search_builder_execute_scored(builder);
+        assert!(result.error.is_null());
+        let next = paimon_record_batch_reader_next(result.reader);
+        assert!(next.error.is_null());
+        assert_eq!(import_batch(&next.batch).num_rows(), 3);
+        paimon_arrow_batch_free(next.batch);
+        paimon_record_batch_reader_free(result.reader);
+        let error = paimon_vector_search_builder_with_row_range(builder, 5, 4);
+        assert!(!error.is_null());
+        paimon_error_free(error);
+        paimon_vector_search_builder_free(builder);
+
+        let builder = c_vector_builder(handle, "embedding", &query, 3, ptr::null_mut());
+        let wrong_metric = CString::new("l2").unwrap();
+        let error =
+            paimon_vector_search_builder_with_distance_metric(builder, wrong_metric.as_ptr());
+        assert!(error.is_null());
+        let result = paimon_vector_search_builder_execute_scored(builder);
+        paimon_vector_search_builder_free(builder);
+        assert!(!result.error.is_null());
+        assert!(result.reader.is_null());
+        paimon_error_free(result.error);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn vector_search_scored_intersects_scalar_filter_and_row_range() {
+    let table = build_append_vector_table("memory:/vsearch_scored_filter_scope");
+    let handle = unsafe { wrap_table(table) };
+    unsafe {
+        for (threshold, expected) in [(3, vec![3, 4]), (99, vec![])] {
+            let predicate = build_predicate_ge(handle, "id", threshold);
+            let builder = c_vector_builder(handle, "embedding", &[1.0, 0.0], 6, predicate);
+            assert!(paimon_vector_search_builder_with_row_range(builder, 2, 4).is_null());
+            let result = paimon_vector_search_builder_execute_scored(builder);
+            paimon_vector_search_builder_free(builder);
+            assert!(result.error.is_null());
+            let mut ids = Vec::new();
+            loop {
+                let next = paimon_record_batch_reader_next(result.reader);
+                assert!(next.error.is_null());
+                if next.batch.array.is_null() {
+                    break;
+                }
+                let batch = import_batch(&next.batch);
+                paimon_arrow_batch_free(next.batch);
+                ids.extend_from_slice(
+                    batch
+                        .column_by_name("row_id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values(),
+                );
+            }
+            ids.sort_unstable();
+            assert_eq!(ids, expected);
+            paimon_record_batch_reader_free(result.reader);
+        }
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn vector_search_execute_scored_forwards_scalar_filter() {
+    let path = "memory:/vsearch_scored_filter";
+    let table = build_append_vector_table(path);
+    let query = [1.0f32, 0.0];
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let predicate = build_predicate_ge(handle, "id", 3);
+        let builder = c_vector_builder(handle, "embedding", &query, 6, predicate);
+        let result = paimon_vector_search_builder_execute_scored(builder);
+        paimon_vector_search_builder_free(builder);
+        assert!(result.error.is_null());
+        assert!(!result.reader.is_null());
+
+        let next = paimon_record_batch_reader_next(result.reader);
+        assert!(next.error.is_null());
+        let batch = import_batch(&next.batch);
+        paimon_arrow_batch_free(next.batch);
+        let row_ids = batch
+            .column_by_name("row_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut ids = row_ids.values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![3, 4, 5]);
+
+        let eof = paimon_record_batch_reader_next(result.reader);
+        assert!(eof.error.is_null());
+        assert!(eof.batch.array.is_null());
+        paimon_record_batch_reader_free(result.reader);
         unwrap_table(handle);
     }
 }
