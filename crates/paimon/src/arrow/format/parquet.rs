@@ -161,19 +161,29 @@ impl ParquetFormatReader {
         let mut reader = ArrowFileReader::new(file_size, reader.into())
             .with_metadata_cache_enabled(self.metadata_cache_enabled);
         let mut fetch = ParquetMetadataFetch::new(&mut reader);
-        let row_group_match = match selected_filter.as_ref().filter(|_| self.page_index_enabled) {
+        let indexed_selection = selected_filter.as_ref().filter(|_| self.page_index_enabled);
+        let row_group_match = match indexed_selection {
             Some(filter) => selected_row_group_match(fetch.load(None).await?.as_ref(), filter),
             None => RowGroupMatch::Unknown,
         };
+        let use_statistics = match row_group_match {
+            RowGroupMatch::AllRows => false,
+            RowGroupMatch::NoRows => true,
+            // For a single selected row, read its pages with the OffsetIndex and
+            // let the merged residual filter decide whether the row matches.
+            RowGroupMatch::Unknown => {
+                !indexed_selection.is_some_and(|filter| filter.span.from() == filter.span.to())
+            }
+        };
         let options = self.reader_options(
-            row_group_match == RowGroupMatch::Unknown,
+            use_statistics && row_group_match == RowGroupMatch::Unknown,
             selected_filter.is_some(),
         );
         let metadata = fetch.load(Some(&options)).await?;
         let arrow = ArrowReaderMetadata::try_new(metadata, options)?;
         Ok(MergedReadMetadata {
             arrow,
-            use_statistics: row_group_match != RowGroupMatch::AllRows,
+            use_statistics,
             verify_page_rows: false,
         })
     }

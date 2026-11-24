@@ -401,7 +401,7 @@ async fn merged_candidates_share_pages_and_fall_back_to_row_groups_or_full_reads
 
             let selected = split
                 .clone()
-                .with_selected_row_ranges(vec![RowRange::new(FIRST + 2118, FIRST + 2118)]);
+                .with_selected_row_ranges(vec![RowRange::new(FIRST + 2118, FIRST + 2119)]);
             assert_candidates(&table, &selected, &predicate, &[], Some(0)).await;
         }
         if stats != EnabledStatistics::None {
@@ -517,15 +517,40 @@ async fn sparse_merged_reads_defer_column_indexes_when_footer_statistics_decide(
         }
 
         let predicate = p.equal("rating", Datum::Int(4095)).unwrap();
-        let selected =
-            split.with_selected_row_ranges(vec![RowRange::new(FIRST + 2117, FIRST + 2118)]);
+        for end in [2117, 2118] {
+            let selected = split
+                .clone()
+                .with_selected_row_ranges(vec![RowRange::new(FIRST + 2117, FIRST + end)]);
+            let baseline = scan(&off, &selected, &predicate, None).await;
+            let result = scan(&table, &selected, &predicate, None).await;
+            assert!(baseline.ids.is_empty());
+            assert_eq!(result.ids, baseline.ids);
+            assert_eq!(result.source_rows, 0);
+            assert_eq!(result.data_bytes, 0);
+            assert!(result.total_bytes < baseline.total_bytes);
+        }
+    }
+}
+
+#[tokio::test]
+async fn merged_point_reads_keep_offsets_when_footer_statistics_are_inconclusive() {
+    let (table, split) = fixture_with_score_columns(100_000, EnabledStatistics::Page, 64, 48).await;
+    let row_id = FIRST + 2117;
+    let selected = split.with_selected_row_ranges(vec![RowRange::new(row_id, row_id)]);
+    let p = PredicateBuilder::new(table.schema().fields());
+    let off = disabled(&table);
+
+    for (lower_bound, expected) in [(2117, &[2117][..]), (2118, &[][..])] {
+        let predicate = p
+            .greater_or_equal("rating", Datum::Int(lower_bound))
+            .unwrap();
         let baseline = scan(&off, &selected, &predicate, None).await;
         let result = scan(&table, &selected, &predicate, None).await;
-        assert!(baseline.ids.is_empty());
+        assert_eq!(result.ids, expected);
         assert_eq!(result.ids, baseline.ids);
-        assert_eq!(result.source_rows, 0);
-        assert_eq!(result.data_bytes, 0);
-        assert!(result.total_bytes < baseline.total_bytes);
+        assert_eq!(result.source_rows, 2);
+        assert_eq!(result.total_bytes, baseline.total_bytes);
+        assert_eq!(result.data_bytes, baseline.data_bytes);
     }
 }
 
@@ -1070,15 +1095,8 @@ async fn merged_candidates_require_independent_projected_page_row_counts() {
             .await
             .unwrap();
         assert_candidates(&table, &damaged_split, &exact_rating, &[36], Some(2)).await;
-        let point = damaged_split
-            .clone()
-            .with_selected_row_ranges(vec![RowRange::new(FIRST + 36, FIRST + 36)]);
-        let result = scan(&table, &point, &exact_rating, None).await;
-        assert_eq!(result.ids, [36]);
-        assert_eq!(result.source_rows, 2);
-        let selected = damaged_split
-            .clone()
-            .with_selected_row_ranges(vec![RowRange::new(FIRST + 36, FIRST + 37)]);
+        let selected =
+            damaged_split.with_selected_row_ranges(vec![RowRange::new(FIRST + 36, FIRST + 37)]);
         for predicate in &predicates {
             let result = scan(&table, &selected, predicate, None).await;
             assert_eq!(result.ids, [36, 37]);
