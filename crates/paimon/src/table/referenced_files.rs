@@ -275,10 +275,14 @@ async fn collect_summary(
     }
     let extra_resolver_ref = &extra_resolver;
 
-    let include_catalog_snapshot = rest_env.is_some();
+    let snapshot_rest_env = rest_env
+        .as_ref()
+        .filter(|env| env.catalog_owns_snapshots())
+        .cloned();
+    let include_catalog_snapshot = snapshot_rest_env.is_some();
     // Collection always starts at the table root, even for a branch table.
     let sm = SnapshotManager::new(file_io.clone(), table_location.to_string())
-        .with_rest_env(rest_env.clone());
+        .with_rest_env(snapshot_rest_env);
     let tm = TagManager::new(file_io.clone(), table_location.to_string()).with_rest_env(rest_env);
 
     // 1. Main branch snapshots + tags (concurrently)

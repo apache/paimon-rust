@@ -1238,7 +1238,7 @@ pub(super) async fn authorize_row_id_plan(
         Some(id) => {
             let snapshot = if let Some(snapshot) = table.travel_snapshot() {
                 snapshot.clone()
-            } else if table.rest_env().is_some() {
+            } else if table.snapshot_rest_env().is_some() {
                 match table.snapshot_manager().get_latest_snapshot().await? {
                     Some(snapshot) if snapshot.id() == id => snapshot,
                     // A concurrent append does not invalidate the captured

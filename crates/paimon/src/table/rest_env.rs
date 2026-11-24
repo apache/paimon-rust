@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 impl Table {
     /// Reuse the matching REST response and merged catalog options without config/get-table requests.
-    /// Preserves REST snapshots, credential refresh and local caching.
+    /// Preserves snapshot ownership, credential refresh and local caching.
     pub async fn from_rest_response(
         identifier: Identifier,
         response: crate::api::GetTableResponse,
@@ -91,6 +91,7 @@ impl Table {
 pub struct RESTEnv {
     identifier: Identifier,
     uuid: String,
+    is_external: bool,
     api: Arc<RESTApi>,
     options: Options,
     data_token_enabled: bool,
@@ -123,6 +124,7 @@ impl RESTEnv {
         Self {
             identifier,
             uuid,
+            is_external: false,
             api,
             options,
             data_token_enabled,
@@ -258,6 +260,10 @@ impl RESTEnv {
     /// Catalog identity used to reject commits against a replaced table.
     pub fn uuid(&self) -> &str {
         &self.uuid
+    }
+
+    pub(crate) fn catalog_owns_snapshots(&self) -> bool {
+        !self.is_external
     }
 
     /// Attach Java's outermost table identity to dependency requests. The
@@ -450,6 +456,7 @@ impl RESTEnv {
             local_cache,
             file_io_cache,
         );
+        rest_env.is_external = is_external;
         rest_env.fuse_resolver = fuse_resolver;
         let parsed_identifier = identifier.parsed_object_name()?;
         let branch = parsed_identifier.branch_or_default().to_string();

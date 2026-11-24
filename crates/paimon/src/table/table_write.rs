@@ -529,7 +529,7 @@ impl TableWrite {
         Ok(Self {
             format_writer: None,
             table: table.clone(),
-            branch_schema_checked: table.is_main_branch() || table.rest_env.is_some(),
+            branch_schema_checked: table.is_main_branch() || table.snapshot_rest_env().is_some(),
             write_schema,
             write_fields: fields.to_vec(),
             column_defaults,
@@ -1449,8 +1449,8 @@ impl TableWrite {
         result
     }
 
-    /// Resolved filesystem handles must name an existing branch schema before
-    /// creating output. Main and REST tables retain their established metadata path.
+    /// Filesystem-backed branch handles must name an existing branch schema before
+    /// creating output.
     async fn ensure_branch_schema_exists(&mut self) -> Result<()> {
         if self.branch_schema_checked {
             return Ok(());

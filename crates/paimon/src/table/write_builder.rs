@@ -296,14 +296,13 @@ pub(super) fn ensure_table_write_authorized(table: &Table) -> crate::Result<()> 
     ensure_table_write_allowed(table)?;
     let options = crate::spec::CoreOptions::new(table.schema().options());
     // Query authorization protects reads, not INSERT/OVERWRITE/TRUNCATE.
-    // A catalog-loaded REST table retains its publication identity and uses
-    // the server's commit authorization. Supplied schemas without that binding
-    // must not turn a guarded table into a filesystem write.
+    // A guarded table relies on the server's commit authorization. Require
+    // both its catalog identity and publication through REST.
     if options.query_auth_enabled()
-        && (table.rest_env().is_none() || table.query_auth_session().is_none())
+        && (table.snapshot_rest_env().is_none() || table.query_auth_session().is_none())
     {
         return Err(crate::Error::Unsupported {
-            message: "Writing a table with 'query-auth.enabled' = true requires a catalog-loaded REST table with its resolved schema".into(),
+            message: "Writing a table with 'query-auth.enabled' = true requires a catalog-loaded table with REST snapshot publication".into(),
         });
     }
     Ok(())

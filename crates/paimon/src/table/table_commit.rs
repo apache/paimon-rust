@@ -224,7 +224,7 @@ pub struct TableCommit {
 impl TableCommit {
     pub fn new(table: Table, commit_user: String) -> Self {
         let snapshot_manager = table.snapshot_manager();
-        let snapshot_commit = if let Some(env) = &table.rest_env {
+        let snapshot_commit = if let Some(env) = table.snapshot_rest_env() {
             env.snapshot_commit()
         } else {
             Arc::new(crate::table::snapshot_commit::RenamingSnapshotCommit::new(
@@ -1689,7 +1689,7 @@ impl TableCommit {
     }
 
     async fn latest_schema_id(&self) -> Result<i64> {
-        if let Some(env) = &self.table.rest_env {
+        if let Some(env) = self.table.snapshot_rest_env() {
             return env
                 .api()
                 .get_table(&env.identifier().with_branch(self.table.branch())?)

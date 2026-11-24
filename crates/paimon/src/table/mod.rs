@@ -518,7 +518,7 @@ impl Table {
 
     pub fn snapshot_manager(&self) -> SnapshotManager {
         let manager = SnapshotManager::new(self.file_io.clone(), self.location.clone())
-            .with_rest_env(self.rest_env.clone());
+            .with_rest_env(self.snapshot_rest_env().cloned());
         if self.is_main_branch() {
             manager
         } else {
@@ -641,11 +641,12 @@ impl Table {
                 }) {
                     return Ok(());
                 }
-                if rest_env
-                    .load_snapshot(&self.branch)
-                    .await?
-                    .as_ref()
-                    .is_some_and(|stored| snapshot.has_same_read_metadata(stored))
+                if rest_env.catalog_owns_snapshots()
+                    && rest_env
+                        .load_snapshot(&self.branch)
+                        .await?
+                        .as_ref()
+                        .is_some_and(|stored| snapshot.has_same_read_metadata(stored))
                 {
                     return Ok(());
                 }
@@ -674,6 +675,10 @@ impl Table {
     /// Get the REST environment, if this table was loaded from a REST catalog.
     pub fn rest_env(&self) -> Option<&RESTEnv> {
         self.rest_env.as_ref()
+    }
+
+    fn snapshot_rest_env(&self) -> Option<&RESTEnv> {
+        self.rest_env().filter(|env| env.catalog_owns_snapshots())
     }
 
     pub(crate) fn is_format_table(&self) -> bool {

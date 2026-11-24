@@ -681,6 +681,132 @@ async fn rest_branch_copy_retains_bound_file_io_and_loads_branch_identity() {
 }
 
 #[tokio::test]
+async fn rest_external_table_reads_and_publishes_filesystem_snapshots() {
+    use crate::catalog::{Catalog, RESTCatalog};
+    use axum::{extract::Path, http::StatusCode, routing::get, Json, Router};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let (_dir, filesystem) = table(false, &[]).await;
+    append(&filesystem, "seed", batch(vec![1], vec![10])).await;
+    let filesystem_branch = tagged_branch(&filesystem).await;
+    append(&filesystem, "local-main", batch(vec![2], vec![20])).await;
+
+    let location = filesystem.location().to_owned();
+    let schema = serde_json::to_value(filesystem.schema()).unwrap();
+    let identity_only = Arc::new(AtomicBool::new(false));
+    let omit_schema = identity_only.clone();
+    let unexpected = Arc::new(AtomicUsize::new(0));
+    let requests = unexpected.clone();
+    let app = Router::new()
+        .route(
+            "/v1/databases/:db/tables/:table",
+            get(move |Path((database, name)): Path<(String, String)>| {
+                let mut schema = if name == "t" && omit_schema.load(Ordering::Relaxed) {
+                    serde_json::Value::Null
+                } else {
+                    schema.clone()
+                };
+                if name == "guarded" {
+                    schema["options"]["query-auth.enabled"] = serde_json::json!("true");
+                }
+                let response = serde_json::json!({
+                    "database": database, "name": name, "id": format!("uuid-{name}"),
+                    "path": location, "isExternal": true, "schemaId": 0, "schema": schema
+                });
+                async move { Json(response) }
+            }),
+        )
+        .fallback(move || async move {
+            requests.fetch_add(1, Ordering::Relaxed);
+            StatusCode::NOT_IMPLEMENTED
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut options = crate::Options::new();
+    options.set("uri", format!("http://{}", listener.local_addr().unwrap()));
+    options.set("token.provider", "bear");
+    options.set("token", "test-token");
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let catalog = RESTCatalog::new(options, false).await.unwrap();
+
+    let external = catalog.get_table(filesystem.identifier()).await.unwrap();
+    assert_eq!(external.rest_env().unwrap().uuid(), "uuid-t");
+    assert_eq!(
+        table_write::tests::read_id_value_rows(&external).await,
+        vec![(1, 10), (2, 20)]
+    );
+    let external_branch = external.copy_with_branch("dev").await.unwrap();
+    assert_eq!(
+        external_branch.rest_env().unwrap().uuid(),
+        "uuid-t$branch_dev"
+    );
+    assert_eq!(
+        table_write::tests::read_id_value_rows(&external_branch).await,
+        vec![(1, 10)]
+    );
+
+    // The registry can still verify the table identity after a filesystem-only
+    // schema change. Post-commit maintenance needs the new storage schema.
+    let evolved = filesystem
+        .schema()
+        .apply_changes(vec![crate::spec::SchemaChange::set_option(
+            "compaction.min.file-num".into(),
+            "100".into(),
+        )])
+        .unwrap();
+    filesystem
+        .file_io()
+        .new_output(&filesystem.schema_manager().schema_path(evolved.id()))
+        .unwrap()
+        .write(bytes::Bytes::from(serde_json::to_vec(&evolved).unwrap()))
+        .await
+        .unwrap();
+    identity_only.store(true, Ordering::Relaxed);
+    let maintained =
+        external.copy_with_options(HashMap::from([("write-only".into(), "false".into())]));
+    append(&maintained, "rest-main", batch(vec![3], vec![30])).await;
+    assert_eq!(latest(&filesystem).await.schema_id(), evolved.id());
+    assert_eq!(
+        table_write::tests::read_id_value_rows(&filesystem).await,
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
+    let builder = external_branch
+        .new_write_builder()
+        .with_commit_user("rest-branch")
+        .unwrap();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&batch(vec![4], vec![40]))
+        .await
+        .unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    let commit = builder.try_new_commit().unwrap();
+    for _ in 0..2 {
+        commit
+            .filter_and_commit_with_identifier(messages.clone(), 1)
+            .await
+            .unwrap();
+    }
+    assert_eq!(latest(&filesystem).await.id(), 3);
+    assert_eq!(latest(&filesystem_branch).await.id(), 2);
+    assert_eq!(
+        table_write::tests::read_id_value_rows(&filesystem_branch).await,
+        vec![(1, 10), (4, 40)]
+    );
+
+    let guarded = catalog
+        .get_table(&Identifier::new("db", "guarded"))
+        .await
+        .unwrap();
+    assert!(guarded.query_auth_session().is_some());
+    assert!(matches!(
+        guarded.new_write_builder().try_new_commit(),
+        Err(crate::Error::Unsupported { message }) if message.contains("query-auth.enabled")
+    ));
+    assert_eq!(unexpected.load(Ordering::Relaxed), 0);
+    server.abort();
+}
+
+#[tokio::test]
 async fn branch_write_rest_publisher_routes_by_argument_and_preserves_payload() {
     use crate::api::rest_api::RESTApi;
     use crate::table::snapshot_commit::{RESTSnapshotCommit, SnapshotCommit};
