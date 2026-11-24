@@ -197,6 +197,8 @@ impl<'a> TableRead<'a> {
     /// Ordered parallel reads disable background Parquet row-group prefetch so
     /// a later group cannot retain scheduling permits needed by an earlier one.
     /// Foreground reads still share memory admission from [`Self::with_resources`].
+    /// With a finite limit and shared resources, ordered splits are read one at
+    /// a time so a speculative split cannot exhaust the current split's memory.
     pub fn with_ordered(mut self, ordered: bool) -> Self {
         self.ordered = ordered;
         self
@@ -608,6 +610,14 @@ impl<'a> PaimonTableRead<'a> {
             self.data_predicates.is_empty() && self.partition_predicate.is_none(),
             resolves_blob,
         );
+        // A speculative split can reserve the shared memory needed by the
+        // current split, even when the current split alone satisfies LIMIT.
+        // Keep finite ordered reads demand-driven when memory is shared.
+        let parallelism = if ordered && self.limit.is_some() && budget.has_resources() {
+            1
+        } else {
+            parallelism
+        };
         let workers = parallelism.min(splits.len()).max(1);
         // A later ordered group may retain its ready batch while the current
         // group is still reading. Background prefetch must not keep a shared

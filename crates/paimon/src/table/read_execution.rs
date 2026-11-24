@@ -241,6 +241,19 @@ where
                     if completed.remove(&current) {
                         current += 1;
                         if current == count { break Ok(None); }
+                        // Empty speculative splits may have freed all worker
+                        // slots while the current split was still blocked.
+                        // Refill only as the ordered output position advances.
+                        if limit.is_some() {
+                            let end = current.saturating_add(parallelism.saturating_mul(2));
+                            while next_index < end && pending.len() + ready.len() + ready_errors.len() < parallelism {
+                                let Some(item) = unscheduled.pop_front() else { break; };
+                                let index = next_index;
+                                next_index += 1;
+                                let task = pending.spawn_on(next_batch(index, make_stream(item)), &handle);
+                                task_indices.insert(task.id(), index);
+                            }
+                        }
                         continue;
                     }
                     if let Some(error) = ready_errors.remove(&current) { break Err(error); }
@@ -262,15 +275,18 @@ where
                     if next.1.is_none() {
                         // An empty later split frees its worker slot immediately.
                         // Keep only its completion marker until ordered output
-                        // reaches it, and start the next split now.
+                        // reaches it. A finite LIMIT also caps lookahead.
                         completed.insert(next.0);
                         drop(next.2);
-                        if let Some(item) = unscheduled.pop_front() {
-                            let index = next_index;
-                            next_index += 1;
-                            let task = pending.spawn_on(next_batch(index, make_stream(item)), &handle);
-                            if limit.is_some() {
-                                task_indices.insert(task.id(), index);
+                        let end = current.saturating_add(parallelism.saturating_mul(2));
+                        if limit.is_none() || next_index < end {
+                            if let Some(item) = unscheduled.pop_front() {
+                                let index = next_index;
+                                next_index += 1;
+                                let task = pending.spawn_on(next_batch(index, make_stream(item)), &handle);
+                                if limit.is_some() {
+                                    task_indices.insert(task.id(), index);
+                                }
                             }
                         }
                         continue;
@@ -571,6 +587,37 @@ mod tests {
         assert_eq!(value(&output.next().await.unwrap().unwrap()), 0);
         assert!(output.next().await.is_none());
         assert_eq!(created.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn ordered_limit_caps_lookahead_across_empty_splits() {
+        let (release, wait) = oneshot::channel();
+        let first = std::sync::Mutex::new(Some(wait));
+        let created = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&created);
+        let output = merge_items_bounded((0..2_048).collect(), true, Some(1), 2, move |index| {
+            count.fetch_add(1, Ordering::SeqCst);
+            if index == 0 {
+                let wait = first.lock().unwrap().take().unwrap();
+                Box::pin(async_stream::try_stream! {
+                    let _ = wait.await;
+                    yield batch(0);
+                })
+            } else {
+                Box::pin(futures::stream::empty())
+            }
+        });
+        let result = tokio::spawn(async move {
+            output
+                .map_ok(|batch| value(&batch))
+                .try_collect::<Vec<_>>()
+                .await
+        });
+        wait_for_count(&created, 4).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(created.load(Ordering::SeqCst), 4);
+        release.send(()).unwrap();
+        assert_eq!(result.await.unwrap().unwrap(), vec![0]);
     }
 
     #[tokio::test]
