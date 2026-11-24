@@ -232,6 +232,7 @@ impl TableCommit {
             ))
         };
         let core_options = CoreOptions::new(table.schema().options());
+        let ignore_empty_commit = core_options.snapshot_ignore_empty_commit();
         let total_buckets = core_options.bucket();
         let commit_max_retries = core_options.commit_max_retries();
         let commit_timeout_ms = core_options.commit_timeout_ms();
@@ -249,7 +250,7 @@ impl TableCommit {
             snapshot_manager,
             snapshot_commit,
             commit_user,
-            ignore_empty_commit: true,
+            ignore_empty_commit,
             total_buckets,
             commit_max_retries,
             commit_timeout_ms,
@@ -5320,6 +5321,42 @@ mod tests {
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap();
         assert!(snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_empty_append_honors_snapshot_option() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_empty_append_snapshot_option";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_table_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([
+                ("partition".into(), "name".into()),
+                ("snapshot.ignore-empty-commit".into(), "false".into()),
+            ]),
+        );
+        let commit = table.new_write_builder().new_commit();
+        let snapshots = table.snapshot_manager();
+
+        commit
+            .clone()
+            .with_ignore_empty_commit(true)
+            .commit(vec![])
+            .await
+            .unwrap();
+        commit.overwrite(vec![], None).await.unwrap();
+        assert!(snapshots.get_latest_snapshot().await.unwrap().is_none());
+
+        commit.commit(vec![]).await.unwrap();
+        let snapshot = snapshots
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .expect("the table option allows empty append snapshots");
+        assert_eq!(snapshot.id(), 1);
+        assert_eq!(*snapshot.commit_kind(), CommitKind::APPEND);
+        assert_eq!(snapshot.total_record_count(), Some(0));
     }
 
     #[tokio::test]
