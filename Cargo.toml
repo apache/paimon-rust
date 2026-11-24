@@ -50,7 +50,7 @@ datafusion = "55.2.0"
 datafusion-ffi = "55.2.0"
 datafusion-spark = { version = "55.2.0", features = ["core"] }
 paimon = { version = "0.6.0", path = "crates/paimon" }
-parquet = "59.2"
+parquet = "59.3.3"
 constant_time_eq = ">=0.4.0, <0.5.0"
 tokio = "1.39.2"
 tokio-util = "0.7"
