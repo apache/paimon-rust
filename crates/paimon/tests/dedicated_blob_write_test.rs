@@ -18,7 +18,7 @@
 mod common;
 
 use arrow_array::{ArrayRef, Int32Array, LargeBinaryArray, RecordBatch};
-use common::incremental_helpers::{memory_table, persist_table_schema, setup_dirs};
+use common::incremental_helpers::{memory_table, persist_table_schema, setup_dirs, write_batch};
 use futures::TryStreamExt;
 use paimon::spec::{BlobDescriptor, BlobType, DataType, IntType, Schema, TableSchema};
 use paimon::table::Table;
@@ -429,6 +429,38 @@ async fn inline_descriptors_accept_v1_v2_and_null_but_reject_malformed_values() 
             .is_err());
     }
     assert_eq!(rows(&table).await.len(), 3);
+}
+
+#[tokio::test]
+async fn avro_writes_legacy_blob_descriptors_as_readable_references() {
+    let table = table(&[
+        ("blob-descriptor-field", "payload"),
+        ("file.format", "avro"),
+    ])
+    .await;
+    let source = "memory:/source/legacy-payload";
+    table
+        .file_io()
+        .new_output(source)
+        .unwrap()
+        .write(bytes::Bytes::from_static(b"prefix:value"))
+        .await
+        .unwrap();
+    let current = BlobDescriptor::new(source.into(), 7, -1).serialize();
+    let mut legacy = vec![1];
+    legacy.extend_from_slice(&current[9..]);
+    write_batch(&table, &batch(vec![1, 2], vec![Some(&legacy), None])).await;
+
+    assert_eq!(
+        rows(&table).await,
+        vec![(1, Some(b"value".to_vec())), (2, None)]
+    );
+    let descriptors =
+        table.copy_with_options([("blob-as-descriptor".into(), "true".into())].into());
+    assert_eq!(
+        rows(&descriptors).await,
+        vec![(1, Some(current)), (2, None)]
+    );
 }
 
 #[tokio::test]
