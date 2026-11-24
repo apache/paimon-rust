@@ -2093,6 +2093,58 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual wide-dictionary compact rebuild benchmark"]
+    fn benchmark_wide_compact_residual_rebuild() {
+        let configured = DataType::Row(RowType::new(vec![DataField::new(
+            7,
+            "age".to_string(),
+            DataType::BigInt(BigIntType::new()),
+        )]));
+        let physical = variant_shredding_type(&configured).unwrap();
+        let small = GenericVariant::parse_json(r#"{"age":27,"cold":1}"#).unwrap();
+        for dictionaries in [1, 18] {
+            let sources = (0..dictionaries)
+                .map(|suffix| {
+                    let extra = (0..5362)
+                        .map(|key| format!(r#", "unused_{suffix}_{key:04}_field":0"#))
+                        .collect::<String>();
+                    let wide =
+                        GenericVariant::parse_json(&format!(r#"{{"age":27,"cold":1{extra}}}"#))
+                            .unwrap();
+                    assert!(wide.metadata().len() > 100_000);
+                    GenericVariant::from_parts(small.value().to_vec(), wide.metadata().to_vec())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let input = variant_array(
+                (0..512)
+                    .map(|row| Some(sources[row % dictionaries].clone()))
+                    .collect(),
+            )
+            .unwrap();
+            let shredded = shred_variant_array(input.as_ref(), &physical).unwrap();
+            let mut samples = Vec::new();
+            for run in 0..16 {
+                let start = std::time::Instant::now();
+                let assembled = assemble_shredded_variant_array(shredded.as_ref()).unwrap();
+                if run == 0 {
+                    let first = variant_from_array(assembled.as_ref(), 0).unwrap().unwrap();
+                    assert_eq!(first.to_json().unwrap(), small.to_json().unwrap());
+                }
+                if run >= 2 {
+                    samples.push(start.elapsed());
+                }
+                std::hint::black_box(assembled);
+            }
+            samples.sort();
+            eprintln!(
+                "512 compact residual rows, {dictionaries} dictionaries: {:?}",
+                samples[samples.len() / 2]
+            );
+        }
+    }
+
+    #[test]
     fn sparse_shredded_batch_does_not_copy_wide_dictionaries() {
         let configured = DataType::Row(RowType::new(vec![DataField::new(
             7,

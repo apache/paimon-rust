@@ -52,6 +52,8 @@ const MAX_COMPACT_METADATA_BYTES: usize = 2 * 1024 * 1024;
 // dictionaries. This cap only matters for callers caching smaller metadata.
 const MAX_COMPACT_METADATA_ENTRIES: usize =
     MAX_COMPACT_METADATA_BYTES / MIN_SPARSE_REBUILD_METADATA_BYTES;
+const RECENT_BORROWED_METADATA_ENTRIES: usize = 4;
+const RECENT_BORROWED_METADATA_SAMPLE_BYTES: usize = 32;
 // A shared dictionary is useful for wide objects, but copying it into every
 // sparse result costs more than remapping the keys actually present.
 const SPARSE_REBUILD_KEY_RATIO: usize = 8;
@@ -1462,8 +1464,20 @@ pub(crate) struct RebuildMetadataCache<'a> {
     validated: VecDeque<Box<[u8]>>,
     validated_bytes: usize,
     validated_borrowed: HashSet<&'a [u8]>,
+    validated_borrowed_recent: VecDeque<&'a [u8]>,
     validated_borrowed_addresses: HashSet<(usize, usize)>,
     validated_dictionary_keys: HashSet<i32>,
+}
+
+fn recent_metadata_matches(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let sample = left.len().min(RECENT_BORROWED_METADATA_SAMPLE_BYTES);
+    let middle = (left.len() - sample) / 2;
+    left[left.len() - sample..] == right[right.len() - sample..]
+        && left[middle..middle + sample] == right[middle..middle + sample]
+        && left == right
 }
 
 impl<'a> RebuildMetadataCache<'a> {
@@ -1485,9 +1499,25 @@ impl<'a> RebuildMetadataCache<'a> {
         if self.validated_borrowed_addresses.contains(&address) {
             return Ok(());
         }
-        if !self.validated_borrowed.contains(bytes) {
-            validate_metadata(bytes)?;
-            self.validated_borrowed.insert(bytes);
+        if let Some(index) = self
+            .validated_borrowed_recent
+            .iter()
+            .position(|entry| recent_metadata_matches(entry, bytes))
+        {
+            let entry = self
+                .validated_borrowed_recent
+                .remove(index)
+                .expect("entry exists");
+            self.validated_borrowed_recent.push_back(entry);
+        } else {
+            if !self.validated_borrowed.contains(bytes) {
+                validate_metadata(bytes)?;
+                self.validated_borrowed.insert(bytes);
+            }
+            if self.validated_borrowed_recent.len() == RECENT_BORROWED_METADATA_ENTRIES {
+                self.validated_borrowed_recent.pop_front();
+            }
+            self.validated_borrowed_recent.push_back(bytes);
         }
         self.validated_borrowed_addresses.insert(address);
         Ok(())
@@ -5072,6 +5102,22 @@ mod tests {
         // A different Arrow slice with the same bytes must reuse validation too.
         VALIDATED_METADATA.with(|cached| assert!(cached.borrow().is_empty()));
         assert_eq!(cache.validated_borrowed.len(), dictionaries.len());
+        assert_eq!(
+            cache.validated_borrowed_recent.len(),
+            RECENT_BORROWED_METADATA_ENTRIES
+        );
+        cache.validated_borrowed.clear();
+        let duplicate_again = duplicate.clone();
+        rebuild_shredded_with_borrowed_metadata(&row, &schema, &mut cache, &duplicate_again, None)
+            .unwrap();
+        // An equal Arrow slice uses the recent exact-byte match before hashing.
+        VALIDATED_METADATA.with(|cached| assert!(cached.borrow().is_empty()));
+        assert!(cache.validated_borrowed.is_empty());
+        let mut invalid = duplicate.clone();
+        invalid[0] = 0xff;
+        assert!(cache
+            .validate_compact_metadata_borrowed(&invalid, None)
+            .is_err());
         assert!(cache.validated.is_empty());
 
         let mut dictionary_cache = RebuildMetadataCache::default();
