@@ -28,7 +28,7 @@ use crate::spec::{
 };
 use crate::variant::{
     build_variant_schema, cast_shredded, cast_variant_to_shredded_value,
-    infer_variant_shredding_schema, rebuild_shredded, rebuild_shredded_with_cache,
+    infer_variant_shredding_schema, rebuild_shredded, rebuild_shredded_with_borrowed_metadata,
     top_level_path_key, variant_shredding_type, GenericVariant, RebuildMetadataCache, ShreddedRow,
     ShreddedValue, VariantShreddingInferConfig, VariantShreddingInferenceSession,
     VARIANT_METADATA_FIELD_NAME, VARIANT_TYPED_VALUE_FIELD_NAME, VARIANT_VALUE_FIELD_NAME,
@@ -796,14 +796,18 @@ pub(crate) fn assemble_shredded_variant_array(array: &dyn Array) -> Result<Array
             variants.push(None);
         } else {
             let shredded =
-                struct_row_at(input, row, &row_type)?.ok_or_else(|| Error::DataInvalid {
-                    message: "Shredded Variant row is null".to_string(),
-                    source: None,
-                })?;
-            variants.push(Some(rebuild_shredded_with_cache(
+                struct_row_at_skipping(input, row, &row_type, schema.top_level_metadata_idx)?
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: "Shredded Variant row is null".to_string(),
+                        source: None,
+                    })?;
+            let (metadata, dictionary_key) = variant_metadata_at(input, row)?;
+            variants.push(Some(rebuild_shredded_with_borrowed_metadata(
                 &shredded,
                 &schema,
                 &mut metadata_cache,
+                metadata,
+                dictionary_key,
             )?));
         }
     }
@@ -1454,7 +1458,8 @@ fn is_variant_storage_array(array: &dyn Array) -> bool {
             .any(|field| field.name() == name && field.data_type() == &ArrowDataType::Binary)
     };
     (has_binary(VARIANT_VALUE_FIELD_NAME) || is_shredded_variant_array(array))
-        && has_binary(VARIANT_METADATA_FIELD_NAME)
+        && (has_binary(VARIANT_METADATA_FIELD_NAME)
+            || fields.iter().any(|field| is_dictionary_metadata(field)))
         && (!is_variant_arrow_fields(fields) || is_shredded_variant_array(array))
 }
 
@@ -2077,6 +2082,58 @@ mod tests {
             let first = variant_from_array(assembled.as_ref(), 0).unwrap().unwrap();
             assert_eq!(first.to_json().unwrap(), original.to_json().unwrap());
             std::hint::black_box(assembled);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual wide-dictionary compact rebuild benchmark"]
+    fn benchmark_wide_compact_residual_rebuild() {
+        let configured = DataType::Row(RowType::new(vec![DataField::new(
+            7,
+            "age".to_string(),
+            DataType::BigInt(BigIntType::new()),
+        )]));
+        let physical = variant_shredding_type(&configured).unwrap();
+        let small = GenericVariant::parse_json(r#"{"age":27,"cold":1}"#).unwrap();
+        for dictionaries in [1, 18] {
+            let sources = (0..dictionaries)
+                .map(|suffix| {
+                    let extra = (0..5362)
+                        .map(|key| format!(r#", "unused_{suffix}_{key:04}_field":0"#))
+                        .collect::<String>();
+                    let wide =
+                        GenericVariant::parse_json(&format!(r#"{{"age":27,"cold":1{extra}}}"#))
+                            .unwrap();
+                    assert!(wide.metadata().len() > 100_000);
+                    GenericVariant::from_parts(small.value().to_vec(), wide.metadata().to_vec())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let input = variant_array(
+                (0..512)
+                    .map(|row| Some(sources[row % dictionaries].clone()))
+                    .collect(),
+            )
+            .unwrap();
+            let shredded = shred_variant_array(input.as_ref(), &physical).unwrap();
+            let mut samples = Vec::new();
+            for run in 0..16 {
+                let start = std::time::Instant::now();
+                let assembled = assemble_shredded_variant_array(shredded.as_ref()).unwrap();
+                if run == 0 {
+                    let first = variant_from_array(assembled.as_ref(), 0).unwrap().unwrap();
+                    assert_eq!(first.to_json().unwrap(), small.to_json().unwrap());
+                }
+                if run >= 2 {
+                    samples.push(start.elapsed());
+                }
+                std::hint::black_box(assembled);
+            }
+            samples.sort();
+            eprintln!(
+                "512 compact residual rows, {dictionaries} dictionaries: {:?}",
+                samples[samples.len() / 2]
+            );
         }
     }
 
@@ -3467,5 +3524,50 @@ mod tests {
             let actual = variant_from_array(restored.as_ref(), row).unwrap().unwrap();
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn parquet_shredded_decimal_rejects_value_exceeding_typed_precision() {
+        use crate::spec::DecimalType;
+
+        let DataType::Row(physical) =
+            variant_shredding_type(&DataType::Decimal(DecimalType::new(9, 0).unwrap())).unwrap()
+        else {
+            panic!("expected shredded Variant ROW");
+        };
+        let schema = build_variant_schema(&physical).unwrap();
+        let original = GenericVariant::parse_json("1").unwrap();
+        let mut row = cast_shredded(&original, &schema).unwrap();
+        assert!(row.field(schema.variant_idx.unwrap()).is_none());
+
+        row.set(
+            schema.typed_idx.unwrap(),
+            ShreddedValue::Decimal128(999_999_999),
+        )
+        .unwrap();
+        let valid = parquet_roundtrip(
+            shredded_rows_to_struct_array(vec![Some(row.clone())], &physical).unwrap(),
+        );
+        let restored = assemble_shredded_variant_array(valid.as_ref()).unwrap();
+        assert_eq!(
+            variant_from_array(restored.as_ref(), 0)
+                .unwrap()
+                .unwrap()
+                .to_json()
+                .unwrap(),
+            "999999999"
+        );
+
+        row.set(
+            schema.typed_idx.unwrap(),
+            ShreddedValue::Decimal128(1_000_000_000),
+        )
+        .unwrap();
+        let invalid =
+            parquet_roundtrip(shredded_rows_to_struct_array(vec![Some(row)], &physical).unwrap());
+        let err = assemble_shredded_variant_array(invalid.as_ref()).unwrap_err();
+        assert!(
+            matches!(err, Error::DataInvalid { message, .. } if message.contains("decimal typed_value precision"))
+        );
     }
 }

@@ -43,9 +43,19 @@ const MAX_CACHED_VARIANT_METADATA_TOTAL_BYTES: usize = 1024 * 1024;
 const MAX_CACHED_VARIANT_METADATA_ENTRIES: usize = 16;
 const MAX_REBUILD_METADATA_ENTRIES: usize = 8;
 const MAX_REBUILD_METADATA_BYTES: usize = 8 * 1024 * 1024;
+// Compact rebuild validation is only cached for source dictionaries above this size.
+const MIN_SPARSE_REBUILD_METADATA_BYTES: usize = 4 * 1024;
+// Compact output needs only validation, not a decoded key map. Keep these raw
+// dictionaries separately so rotating sparse rows do not thrash the TLS cache.
+const MAX_COMPACT_METADATA_BYTES: usize = 2 * 1024 * 1024;
+// Let the byte budget, rather than an arbitrary small entry count, bound wide
+// dictionaries. This cap only matters for callers caching smaller metadata.
+const MAX_COMPACT_METADATA_ENTRIES: usize =
+    MAX_COMPACT_METADATA_BYTES / MIN_SPARSE_REBUILD_METADATA_BYTES;
+const RECENT_BORROWED_METADATA_ENTRIES: usize = 4;
+const RECENT_BORROWED_METADATA_SAMPLE_BYTES: usize = 32;
 // A shared dictionary is useful for wide objects, but copying it into every
 // sparse result costs more than remapping the keys actually present.
-const MIN_SPARSE_REBUILD_METADATA_BYTES: usize = 4 * 1024;
 const SPARSE_REBUILD_KEY_RATIO: usize = 8;
 const MAX_SPARSE_REBUILD_SCAN_NODES: usize = 4096;
 
@@ -186,6 +196,15 @@ impl<'a> VariantRef<'a> {
         pos: usize,
         metadata: &mut VariantMetadataValidation<'a>,
     ) -> Result<Self> {
+        Self::new_with_cached_metadata_at_depth(value, pos, metadata, 0)
+    }
+
+    fn new_with_cached_metadata_at_depth(
+        value: &'a [u8],
+        pos: usize,
+        metadata: &mut VariantMetadataValidation<'a>,
+        depth: usize,
+    ) -> Result<Self> {
         if metadata.bytes.is_empty() || (metadata.bytes[0] & VERSION_MASK) != VERSION {
             return data_invalid("Malformed Variant metadata version");
         }
@@ -196,7 +215,7 @@ impl<'a> VariantRef<'a> {
             validate_metadata(metadata.bytes)?;
             metadata.validated = true;
         }
-        let root_size = validate_value(value, metadata.bytes, 0, 0)?;
+        let root_size = validate_value(value, metadata.bytes, 0, depth)?;
         if root_size != value.len() {
             return data_invalid("Malformed Variant root size");
         }
@@ -473,6 +492,7 @@ pub(crate) struct VariantSchema {
     pub(crate) scalar_schema: Option<VariantScalarSchema>,
     pub(crate) object_schema: Option<Vec<VariantObjectField>>,
     pub(crate) object_schema_map: HashMap<String, usize>,
+    object_schema_order: Vec<usize>,
     pub(crate) array_schema: Option<Box<VariantSchema>>,
 }
 
@@ -661,13 +681,12 @@ fn validate_object(value: &[u8], metadata: &[u8], pos: usize, depth: usize) -> R
     }
 
     let mut ranges = Vec::with_capacity(layout.size);
-    let mut previous_key: Option<String> = None;
+    let mut previous_key: Option<&str> = None;
     for i in 0..layout.size {
         let id = read_unsigned(value, layout.id_start + layout.id_size * i, layout.id_size)?;
-        let key = get_metadata_key(metadata, id)?;
+        let key = get_metadata_key_ref(metadata, id)?;
         if previous_key
-            .as_deref()
-            .is_some_and(|previous| java_string_cmp(previous, &key) != std::cmp::Ordering::Less)
+            .is_some_and(|previous| java_string_cmp(previous, key) != std::cmp::Ordering::Less)
         {
             return data_invalid("Malformed Variant object key order");
         }
@@ -1427,8 +1446,8 @@ pub(crate) fn top_level_path_key(path: &str) -> Result<Option<String>> {
 }
 
 #[derive(Clone)]
-struct FieldEntry {
-    key: String,
+struct FieldEntry<K = String> {
+    key: K,
     id: usize,
     offset: usize,
 }
@@ -1467,15 +1486,98 @@ impl RebuildMetadata {
     }
 }
 
-/// Bound parsed dictionaries to one assembly call. Exact bytes, not a hash or
-/// an address, determine whether field IDs can be reused.
+/// Bound parsed dictionaries and compact validation results to one assembly call.
+/// Arrow batches can also borrow validated metadata without copying its bytes.
 #[derive(Default)]
-pub(crate) struct RebuildMetadataCache {
+pub(crate) struct RebuildMetadataCache<'a> {
     entries: VecDeque<Arc<RebuildMetadata>>,
     bytes: usize,
+    validated: VecDeque<Box<[u8]>>,
+    validated_bytes: usize,
+    validated_borrowed: HashSet<&'a [u8]>,
+    validated_borrowed_recent: VecDeque<&'a [u8]>,
+    validated_borrowed_addresses: HashSet<(usize, usize)>,
+    validated_dictionary_keys: HashSet<i32>,
 }
 
-impl RebuildMetadataCache {
+fn recent_metadata_matches(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let sample = left.len().min(RECENT_BORROWED_METADATA_SAMPLE_BYTES);
+    let middle = (left.len() - sample) / 2;
+    left[left.len() - sample..] == right[right.len() - sample..]
+        && left[middle..middle + sample] == right[middle..middle + sample]
+        && left == right
+}
+
+impl<'a> RebuildMetadataCache<'a> {
+    fn validate_compact_metadata_borrowed(
+        &mut self,
+        bytes: &'a [u8],
+        dictionary_key: Option<i32>,
+    ) -> Result<()> {
+        if let Some(key) = dictionary_key {
+            if !self.validated_dictionary_keys.contains(&key) {
+                validate_metadata(bytes)?;
+                self.validated_dictionary_keys.insert(key);
+            }
+            return Ok(());
+        }
+        // The source Arrow array is immutable throughout this cache's lifetime.
+        // Check its slice address first so repeated dictionary values are O(1).
+        let address = (bytes.as_ptr() as usize, bytes.len());
+        if self.validated_borrowed_addresses.contains(&address) {
+            return Ok(());
+        }
+        if let Some(index) = self
+            .validated_borrowed_recent
+            .iter()
+            .position(|entry| recent_metadata_matches(entry, bytes))
+        {
+            let entry = self
+                .validated_borrowed_recent
+                .remove(index)
+                .expect("entry exists");
+            self.validated_borrowed_recent.push_back(entry);
+        } else {
+            if !self.validated_borrowed.contains(bytes) {
+                validate_metadata(bytes)?;
+                self.validated_borrowed.insert(bytes);
+            }
+            if self.validated_borrowed_recent.len() == RECENT_BORROWED_METADATA_ENTRIES {
+                self.validated_borrowed_recent.pop_front();
+            }
+            self.validated_borrowed_recent.push_back(bytes);
+        }
+        self.validated_borrowed_addresses.insert(address);
+        Ok(())
+    }
+
+    fn validate_compact_metadata(&mut self, bytes: &[u8]) -> Result<()> {
+        if let Some(index) = self
+            .validated
+            .iter()
+            .position(|entry| entry.as_ref() == bytes)
+        {
+            let entry = self.validated.remove(index).expect("entry exists");
+            self.validated.push_back(entry);
+            return Ok(());
+        }
+        validate_metadata(bytes)?;
+        if bytes.len() <= MAX_COMPACT_METADATA_BYTES {
+            while self.validated.len() >= MAX_COMPACT_METADATA_ENTRIES
+                || self.validated_bytes + bytes.len() > MAX_COMPACT_METADATA_BYTES
+            {
+                let evicted = self.validated.pop_front().expect("cache is nonempty");
+                self.validated_bytes -= evicted.len();
+            }
+            self.validated_bytes += bytes.len();
+            self.validated.push_back(bytes.into());
+        }
+        Ok(())
+    }
+
     fn get_or_parse(&mut self, bytes: &[u8]) -> Result<Arc<RebuildMetadata>> {
         if let Some(index) = self.entries.iter().position(|entry| entry.bytes == bytes) {
             let entry = self.entries.remove(index).expect("entry exists");
@@ -1542,17 +1644,38 @@ impl VariantBuilder {
         id
     }
 
-    fn result(mut self) -> Result<GenericVariant> {
+    fn result(self) -> Result<GenericVariant> {
+        self.result_inner(true)
+    }
+
+    // Only the shredded rebuild uses this: every residual is validated at its
+    // final nesting depth, and typed values plus object/array headers are
+    // emitted by this builder. Keep the general builder's full validation.
+    fn result_from_validated_inputs(self) -> Result<GenericVariant> {
+        self.result_inner(false)
+    }
+
+    fn result_inner(mut self, validate_output: bool) -> Result<GenericVariant> {
+        if !validate_output && (self.value.is_empty() || self.value.len() > SIZE_LIMIT) {
+            return data_invalid("Variant value exceeds constructor size limit");
+        }
         if let Some(metadata) = &self.source_metadata {
             if self.dictionary_keys.is_empty() {
-                if self.value.len() > SIZE_LIMIT {
+                if !validate_output && metadata.bytes.len() > SIZE_LIMIT {
                     return data_invalid(
                         "Variant value or metadata exceeds constructor size limit",
                     );
                 }
-                let root_size = validate_value(&self.value, &metadata.bytes, 0, 0)?;
-                if root_size != self.value.len() {
-                    return data_invalid("Malformed Variant root size");
+                if validate_output {
+                    if self.value.len() > SIZE_LIMIT {
+                        return data_invalid(
+                            "Variant value or metadata exceeds constructor size limit",
+                        );
+                    }
+                    let root_size = validate_value(&self.value, &metadata.bytes, 0, 0)?;
+                    if root_size != self.value.len() {
+                        return data_invalid("Malformed Variant root size");
+                    }
                 }
                 return Ok(GenericVariant {
                     value: self.value,
@@ -1597,7 +1720,17 @@ impl VariantBuilder {
             current_offset,
             offset_size,
         );
-        GenericVariant::from_parts(self.value, metadata)
+        if validate_output {
+            GenericVariant::from_parts(self.value, metadata)
+        } else {
+            if metadata.len() > SIZE_LIMIT {
+                return data_invalid("Variant value or metadata exceeds constructor size limit");
+            }
+            Ok(GenericVariant {
+                value: self.value,
+                metadata,
+            })
+        }
     }
 
     fn add_key(&mut self, key: &str) -> usize {
@@ -1790,11 +1923,27 @@ impl VariantBuilder {
         }
     }
 
-    fn finish_object(&mut self, start: usize, mut fields: Vec<FieldEntry>) -> Result<()> {
-        fields.sort_by(|a, b| java_string_cmp(&a.key, &b.key));
+    fn finish_object<K: AsRef<str>>(
+        &mut self,
+        start: usize,
+        mut fields: Vec<FieldEntry<K>>,
+    ) -> Result<()> {
+        fields.sort_by(|a, b| java_string_cmp(a.key.as_ref(), b.key.as_ref()));
+        self.finish_sorted_object(start, fields)
+    }
+
+    fn finish_sorted_object<K: AsRef<str>>(
+        &mut self,
+        start: usize,
+        fields: Vec<FieldEntry<K>>,
+    ) -> Result<()> {
         for pair in fields.windows(2) {
-            if pair[0].key == pair[1].key {
-                return data_invalid("VARIANT_DUPLICATE_KEY");
+            match java_string_cmp(pair[0].key.as_ref(), pair[1].key.as_ref()) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => return data_invalid("VARIANT_DUPLICATE_KEY"),
+                std::cmp::Ordering::Greater => {
+                    return data_invalid("Malformed Variant object key order")
+                }
             }
         }
 
@@ -1806,7 +1955,11 @@ impl VariantBuilder {
         let id_size = integer_size(max_id)?;
         let offset_size = integer_size(data_size)?;
         let header_size = 1 + size_bytes + size * id_size + (size + 1) * offset_size;
-        self.value.splice(start..start, vec![0; header_size]);
+        // The exact width is known only after writing the body. Shift it in
+        // place rather than allocating an intermediate zero-filled header.
+        let old_len = self.value.len();
+        self.value.resize(old_len + header_size, 0);
+        self.value.copy_within(start..old_len, start + header_size);
         self.value[start] = object_header(large_size, id_size, offset_size);
         write_le_at(&mut self.value, start + 1, size, size_bytes);
         let id_start = start + 1 + size_bytes;
@@ -2762,6 +2915,16 @@ fn build_variant_schema_with_level(row_type: &RowType, top_level: bool) -> Resul
                 .collect()
         })
         .unwrap_or_default();
+    let object_schema_order = object_schema
+        .as_ref()
+        .map(|fields| {
+            let mut order = (0..fields.len()).collect::<Vec<_>>();
+            order.sort_by(|left, right| {
+                java_string_cmp(&fields[*left].field_name, &fields[*right].field_name)
+            });
+            order
+        })
+        .unwrap_or_default();
 
     Ok(VariantSchema {
         typed_idx,
@@ -2771,6 +2934,7 @@ fn build_variant_schema_with_level(row_type: &RowType, top_level: bool) -> Resul
         scalar_schema,
         object_schema,
         object_schema_map,
+        object_schema_order,
         array_schema,
     })
 }
@@ -2907,14 +3071,37 @@ pub(crate) fn rebuild_shredded(
 pub(crate) fn rebuild_shredded_with_cache(
     row: &ShreddedRow,
     schema: &VariantSchema,
-    cache: &mut RebuildMetadataCache,
+    cache: &mut RebuildMetadataCache<'_>,
+) -> Result<GenericVariant> {
+    rebuild_shredded_with_metadata(row, schema, cache, None)
+}
+
+/// Borrow metadata from the immutable Arrow batch for the whole assembly call.
+pub(crate) fn rebuild_shredded_with_borrowed_metadata<'a>(
+    row: &ShreddedRow,
+    schema: &VariantSchema,
+    cache: &mut RebuildMetadataCache<'a>,
+    metadata: &'a [u8],
+    dictionary_key: Option<i32>,
+) -> Result<GenericVariant> {
+    rebuild_shredded_with_metadata(row, schema, cache, Some((metadata, dictionary_key)))
+}
+
+fn rebuild_shredded_with_metadata<'a>(
+    row: &ShreddedRow,
+    schema: &VariantSchema,
+    cache: &mut RebuildMetadataCache<'a>,
+    borrowed_metadata: Option<(&'a [u8], Option<i32>)>,
 ) -> Result<GenericVariant> {
     let Some(metadata_idx) = schema.top_level_metadata_idx else {
         return data_invalid("Malformed shredded Variant: missing top-level metadata field");
     };
-    let metadata = match row.field(metadata_idx) {
-        Some(ShreddedValue::Binary(bytes)) => bytes.as_slice(),
-        _ => return data_invalid("Malformed shredded Variant: missing metadata"),
+    let metadata = match borrowed_metadata {
+        Some((bytes, _)) => bytes,
+        None => match row.field(metadata_idx) {
+            Some(ShreddedValue::Binary(bytes)) => bytes.as_slice(),
+            _ => return data_invalid("Malformed shredded Variant: missing metadata"),
+        },
     };
     if schema.is_unshredded() {
         let value = binary_field(row, schema.variant_idx)?;
@@ -2944,12 +3131,26 @@ pub(crate) fn rebuild_shredded_with_cache(
         false
     };
     let mut builder = if compact {
+        if metadata.len() > SIZE_LIMIT {
+            return data_invalid("Variant value or metadata exceeds constructor size limit");
+        }
+        // Compact output discards the source dictionary. Validate it only if
+        // a residual value actually refers to its keys; fully typed rows use
+        // only the schema keys emitted by the builder.
+        if shredded_row_has_residual(row, schema, 0) {
+            if let Some((bytes, dictionary_key)) = borrowed_metadata {
+                cache.validate_compact_metadata_borrowed(bytes, dictionary_key)?;
+            } else {
+                cache.validate_compact_metadata(metadata)?;
+            }
+        }
         VariantBuilder::new()
     } else {
         VariantBuilder::with_source_metadata(cache.get_or_parse(metadata)?)
     };
-    rebuild_shredded_into(row, metadata, schema, &mut builder)?;
-    builder.result()
+    let mut validation = VariantMetadataValidation::new(metadata, true);
+    rebuild_shredded_into(row, &mut validation, schema, &mut builder, 0)?;
+    builder.result_from_validated_inputs()
 }
 
 /// A bounded, best-effort preflight. `Some(true)` proves that enough distinct
@@ -3229,7 +3430,8 @@ fn extract_shredded_segments(
             return Ok(None);
         }
         let mut builder = VariantBuilder::new();
-        rebuild_shredded_into(row, metadata, schema, &mut builder)?;
+        let mut validation = VariantMetadataValidation::new(metadata, false);
+        rebuild_shredded_into(row, &mut validation, schema, &mut builder, 0)?;
         return builder.result().map(Some);
     };
     if let Some(typed) = schema.typed_idx.and_then(|index| row.field(index)) {
@@ -3527,12 +3729,16 @@ fn parse_decimal_string(input: &str) -> Option<VariantDecimal> {
     })
 }
 
-fn rebuild_shredded_into(
-    row: &ShreddedRow,
-    metadata: &[u8],
+fn rebuild_shredded_into<'a>(
+    row: &'a ShreddedRow,
+    validation: &mut VariantMetadataValidation<'a>,
     schema: &VariantSchema,
     builder: &mut VariantBuilder,
+    depth: usize,
 ) -> Result<()> {
+    if depth > MAX_NESTING_DEPTH {
+        return data_invalid("Malformed Variant nesting depth");
+    }
     if let Some(typed_idx) = schema.typed_idx {
         if let Some(typed_value) = row.field(typed_idx) {
             if let Some(scalar) = &schema.scalar_schema {
@@ -3545,7 +3751,7 @@ fn rebuild_shredded_into(
                 let mut offsets = Vec::with_capacity(elements.len());
                 for element in elements {
                     offsets.push(builder.write_pos() - start);
-                    rebuild_shredded_into(element, metadata, element_schema, builder)?;
+                    rebuild_shredded_into(element, validation, element_schema, builder, depth + 1)?;
                 }
                 builder.finish_array(start, offsets)?;
             } else if let Some(object_schema) = &schema.object_schema {
@@ -3553,7 +3759,7 @@ fn rebuild_shredded_into(
                     return data_invalid("Malformed shredded Variant object typed_value");
                 };
                 let start = builder.write_pos();
-                let mut fields = Vec::new();
+                let mut typed_fields = vec![None; object_schema.len()];
                 for (idx, field) in object_schema.iter().enumerate() {
                     let Some(ShreddedValue::Row(field_row)) = object_row.field(idx) else {
                         return data_invalid("Malformed shredded Variant object field");
@@ -3564,24 +3770,29 @@ fn rebuild_shredded_into(
                         } else {
                             builder.add_key(&field.field_name)
                         };
-                        fields.push(FieldEntry {
-                            key: field.field_name.clone(),
+                        typed_fields[idx] = Some(FieldEntry {
+                            key: field.field_name.as_str(),
                             id,
                             offset: builder.write_pos() - start,
                         });
-                        rebuild_shredded_into(field_row, metadata, &field.schema, builder)?;
+                        rebuild_shredded_into(
+                            field_row,
+                            validation,
+                            &field.schema,
+                            builder,
+                            depth + 1,
+                        )?;
                     }
                 }
+                let mut residual_fields = Vec::new();
                 if let Some(value) = optional_binary_field(row, schema.variant_idx)? {
-                    let mut validation =
-                        VariantMetadataValidation::new(metadata, builder.source_metadata.is_some());
                     let variant_ref =
-                        VariantRef::new_with_cached_metadata(value, 0, &mut validation)?;
+                        VariantRef::new_with_cached_metadata_at_depth(value, 0, validation, depth)?;
                     if variant_ref.kind()? != VariantKind::Object {
                         return data_invalid("Malformed shredded Variant object value");
                     }
-                    for field in variant_ref.object_fields()? {
-                        if schema.object_field_index(&field.key).is_some() {
+                    for field in variant_ref.object_fields_borrowed()? {
+                        if schema.object_field_index(field.key).is_some() {
                             return data_invalid(
                                 "Malformed shredded Variant duplicate object field",
                             );
@@ -3589,9 +3800,9 @@ fn rebuild_shredded_into(
                         let id = if builder.source_metadata.is_some() {
                             field.id
                         } else {
-                            builder.add_key(&field.key)
+                            builder.add_key(field.key)
                         };
-                        fields.push(FieldEntry {
+                        residual_fields.push(FieldEntry {
                             key: field.key,
                             id,
                             offset: builder.write_pos() - start,
@@ -3603,16 +3814,44 @@ fn rebuild_shredded_into(
                         }
                     }
                 }
-                builder.finish_object(start, fields)?;
+                // The validated residual object is already key-sorted. Keep
+                // the body in its original order, and merge only header entries.
+                let capacity = typed_fields.len() + residual_fields.len();
+                let mut typed = schema
+                    .object_schema_order
+                    .iter()
+                    .filter_map(|&idx| typed_fields[idx].take())
+                    .peekable();
+                let mut residual = residual_fields.into_iter().peekable();
+                let mut fields = Vec::with_capacity(capacity);
+                loop {
+                    match (typed.peek(), residual.peek()) {
+                        (Some(left), Some(right)) => {
+                            if java_string_cmp(left.key, right.key).is_lt() {
+                                fields.push(typed.next().unwrap());
+                            } else {
+                                fields.push(residual.next().unwrap());
+                            }
+                        }
+                        (Some(_), None) => {
+                            fields.extend(typed);
+                            break;
+                        }
+                        (None, Some(_)) => {
+                            fields.extend(residual);
+                            break;
+                        }
+                        (None, None) => break,
+                    }
+                }
+                builder.finish_sorted_object(start, fields)?;
             }
             return Ok(());
         }
     }
 
     if let Some(value) = optional_binary_field(row, schema.variant_idx)? {
-        let mut validation =
-            VariantMetadataValidation::new(metadata, builder.source_metadata.is_some());
-        let variant = VariantRef::new_with_cached_metadata(value, 0, &mut validation)?;
+        let variant = VariantRef::new_with_cached_metadata_at_depth(value, 0, validation, depth)?;
         if builder.source_metadata.is_some() {
             builder.value.extend_from_slice(variant.value_slice()?);
         } else {
@@ -3629,6 +3868,40 @@ fn shredded_row_has_value(row: &ShreddedRow, schema: &VariantSchema) -> bool {
         || schema
             .variant_idx
             .is_some_and(|idx| row.field(idx).is_some())
+}
+
+fn shredded_row_has_residual(row: &ShreddedRow, schema: &VariantSchema, depth: usize) -> bool {
+    if depth > MAX_NESTING_DEPTH {
+        return true;
+    }
+    if schema
+        .variant_idx
+        .is_some_and(|idx| row.field(idx).is_some())
+    {
+        return true;
+    }
+    let Some(typed) = schema.typed_idx.and_then(|idx| row.field(idx)) else {
+        return false;
+    };
+    match (typed, &schema.object_schema, &schema.array_schema) {
+        (ShreddedValue::Row(object), Some(fields), _) => {
+            fields
+                .iter()
+                .enumerate()
+                .any(|(idx, field)| match object.field(idx) {
+                    Some(ShreddedValue::Row(child)) => {
+                        shredded_row_has_residual(child, &field.schema, depth + 1)
+                    }
+                    Some(_) => true,
+                    None => false,
+                })
+        }
+        (ShreddedValue::List(elements), _, Some(element)) => elements
+            .iter()
+            .any(|child| shredded_row_has_residual(child, element, depth + 1)),
+        (_, None, None) => false,
+        _ => true,
+    }
 }
 
 fn optional_binary_field(row: &ShreddedRow, idx: Option<usize>) -> Result<Option<&[u8]>> {
@@ -3665,11 +3938,16 @@ fn append_scalar_shredded_value(
         (
             VariantScalarSchema::Decimal { precision, scale },
             ShreddedValue::Decimal128(unscaled),
-        ) => builder.append_decimal(VariantDecimal {
-            unscaled: *unscaled,
-            precision: *precision,
-            scale: *scale,
-        }),
+        ) => {
+            if decimal_precision(*unscaled) > *precision {
+                return data_invalid("Malformed shredded Variant decimal typed_value precision");
+            }
+            builder.append_decimal(VariantDecimal {
+                unscaled: *unscaled,
+                precision: *precision,
+                scale: *scale,
+            });
+        }
         (VariantScalarSchema::String, ShreddedValue::String(v)) => builder.append_string(v),
         (VariantScalarSchema::Binary, ShreddedValue::Binary(v)) => builder.append_binary(v),
         (VariantScalarSchema::Date32, ShreddedValue::Date32(v)) => builder.append_date(*v),
@@ -3811,8 +4089,14 @@ pub(crate) struct ObjectFieldRef<'a> {
     pub(crate) value: VariantRef<'a>,
 }
 
+struct BorrowedObjectFieldRef<'a> {
+    key: &'a str,
+    id: usize,
+    value: VariantRef<'a>,
+}
+
 impl<'a> VariantRef<'a> {
-    pub(crate) fn object_fields(&self) -> Result<Vec<ObjectFieldRef<'a>>> {
+    fn object_fields_borrowed(&self) -> Result<Vec<BorrowedObjectFieldRef<'a>>> {
         let layout = object_layout(self.value, self.pos)?;
         let mut fields = Vec::with_capacity(layout.size);
         for i in 0..layout.size {
@@ -3821,19 +4105,31 @@ impl<'a> VariantRef<'a> {
                 layout.id_start + layout.id_size * i,
                 layout.id_size,
             )?;
-            let key = get_metadata_key(self.metadata, id)?;
+            let key = get_metadata_key_ref(self.metadata, id)?;
             let offset = read_unsigned(
                 self.value,
                 layout.offset_start + layout.offset_size * i,
                 layout.offset_size,
             )?;
-            fields.push(ObjectFieldRef {
+            fields.push(BorrowedObjectFieldRef {
                 key,
                 id,
                 value: VariantRef::new_at(self.value, self.metadata, layout.data_start + offset)?,
             });
         }
         Ok(fields)
+    }
+
+    pub(crate) fn object_fields(&self) -> Result<Vec<ObjectFieldRef<'a>>> {
+        Ok(self
+            .object_fields_borrowed()?
+            .into_iter()
+            .map(|field| ObjectFieldRef {
+                key: field.key.to_owned(),
+                id: field.id,
+                value: field.value,
+            })
+            .collect())
     }
 
     pub(crate) fn array_elements(&self) -> Result<Vec<VariantRef<'a>>> {
@@ -4586,6 +4882,7 @@ mod tests {
     #[test]
     fn rebuild_shredded_reuses_original_metadata_ids() {
         let schema = simple_object_shredding_schema();
+        assert_eq!(schema.object_schema_order, vec![2, 0, 1]);
         // The source dictionary order differs from the shredding schema order.
         let original = GenericVariant::parse_json(
             r#"{"city":"Beijing","nested":{"x":1},"age":27,"active":true}"#,
@@ -4633,6 +4930,149 @@ mod tests {
     }
 
     #[test]
+    fn compact_rebuild_skips_unused_metadata_for_fully_typed_row() {
+        let schema = simple_object_shredding_schema();
+        let original = GenericVariant::parse_json(r#"{"age":27}"#).unwrap();
+        let mut row = cast_shredded(&original, &schema).unwrap();
+        assert!(row.field(schema.variant_idx.unwrap()).is_none());
+
+        let unused_keys = (0..512)
+            .map(|key| format!(r#", "zz_{key:04}_abcdefghijklmnop":0"#))
+            .collect::<String>();
+        let wide = GenericVariant::parse_json(&format!(r#"{{"age":27{unused_keys}}}"#)).unwrap();
+        let mut metadata = wide.metadata().to_vec();
+        assert!(metadata.len() > MIN_SPARSE_REBUILD_METADATA_BYTES);
+
+        row.set(
+            schema.top_level_metadata_idx.unwrap(),
+            ShreddedValue::Binary(metadata.clone()),
+        )
+        .unwrap();
+        let mut cache = RebuildMetadataCache::default();
+        let rebuilt = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap();
+        assert_eq!(rebuilt.to_json().unwrap(), original.to_json().unwrap());
+        assert!(
+            cache.entries.is_empty(),
+            "the valid row must use compact output"
+        );
+
+        *metadata.last_mut().unwrap() = 0xff;
+        row.set(
+            schema.top_level_metadata_idx.unwrap(),
+            ShreddedValue::Binary(metadata),
+        )
+        .unwrap();
+        let rebuilt = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap();
+        assert_eq!(rebuilt.to_json().unwrap(), original.to_json().unwrap());
+        assert!(cache.validated.is_empty());
+
+        // Distinct borrowed values, as with plain Parquet pages, must not
+        // populate either validation cache when the dictionary is discarded.
+        let valid_metadata = wide.metadata().to_vec();
+        let mut distinct = Vec::with_capacity(512);
+        for suffix in 0..512 {
+            let mut bytes = valid_metadata.clone();
+            let end = bytes.len();
+            bytes[end - 3..].copy_from_slice(format!("{suffix:03x}").as_bytes());
+            distinct.push(bytes);
+        }
+        let mut borrowed_cache = RebuildMetadataCache::default();
+        for metadata in &distinct {
+            let rebuilt = rebuild_shredded_with_borrowed_metadata(
+                &row,
+                &schema,
+                &mut borrowed_cache,
+                metadata,
+                None,
+            )
+            .unwrap();
+            assert_eq!(rebuilt.to_json().unwrap(), original.to_json().unwrap());
+        }
+        assert!(borrowed_cache.validated_borrowed.is_empty());
+        assert!(borrowed_cache.validated_dictionary_keys.is_empty());
+    }
+
+    #[test]
+    fn compact_rebuild_validates_source_metadata_with_residual() {
+        let schema = simple_object_shredding_schema();
+        let original = GenericVariant::parse_json(r#"{"age":27,"extra":1}"#).unwrap();
+        let mut row = cast_shredded(&original, &schema).unwrap();
+        assert!(row.field(schema.variant_idx.unwrap()).is_some());
+        let unused_keys = (0..512)
+            .map(|key| format!(r#", "zz_{key:04}_abcdefghijklmnop":0"#))
+            .collect::<String>();
+        let wide =
+            GenericVariant::parse_json(&format!(r#"{{"age":27,"extra":1{unused_keys}}}"#)).unwrap();
+        let mut metadata = wide.metadata().to_vec();
+        assert!(metadata.len() > MIN_SPARSE_REBUILD_METADATA_BYTES);
+        row.set(
+            schema.top_level_metadata_idx.unwrap(),
+            ShreddedValue::Binary(metadata.clone()),
+        )
+        .unwrap();
+        let mut cache = RebuildMetadataCache::default();
+        let rebuilt = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap();
+        assert_eq!(rebuilt.to_json().unwrap(), original.to_json().unwrap());
+        assert!(cache.entries.is_empty(), "the row must use compact output");
+        *metadata.last_mut().unwrap() = 0xff;
+        row.set(
+            schema.top_level_metadata_idx.unwrap(),
+            ShreddedValue::Binary(metadata),
+        )
+        .unwrap();
+        let err = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap_err();
+        assert!(matches!(err, Error::DataInvalid { message, .. } if message.contains("UTF-8")));
+    }
+
+    #[test]
+    fn compact_rebuild_validates_source_metadata_with_nested_residual() {
+        let configured = DataType::Row(RowType::new(vec![DataField::new(
+            7,
+            "nested".to_string(),
+            DataType::Row(RowType::new(vec![DataField::new(
+                8,
+                "age".to_string(),
+                DataType::BigInt(BigIntType::new()),
+            )])),
+        )]));
+        let DataType::Row(physical) = variant_shredding_type(&configured).unwrap() else {
+            panic!("expected row shredding type");
+        };
+        let schema = build_variant_schema(&physical).unwrap();
+        let original = GenericVariant::parse_json(r#"{"nested":{"age":27,"cold":1}}"#).unwrap();
+        let mut row = cast_shredded(&original, &schema).unwrap();
+        assert!(row.field(schema.variant_idx.unwrap()).is_none());
+        assert!(shredded_row_has_residual(&row, &schema, 0));
+
+        let unused_keys = (0..512)
+            .map(|key| format!(r#", "zz_{key:04}_abcdefghijklmnop":0"#))
+            .collect::<String>();
+        let wide = GenericVariant::parse_json(&format!(
+            r#"{{"nested":{{"age":27,"cold":1}}{unused_keys}}}"#
+        ))
+        .unwrap();
+        let mut metadata = wide.metadata().to_vec();
+        assert!(metadata.len() > MIN_SPARSE_REBUILD_METADATA_BYTES);
+        row.set(
+            schema.top_level_metadata_idx.unwrap(),
+            ShreddedValue::Binary(metadata.clone()),
+        )
+        .unwrap();
+        let mut cache = RebuildMetadataCache::default();
+        let rebuilt = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap();
+        assert_eq!(rebuilt.to_json().unwrap(), original.to_json().unwrap());
+        assert!(cache.entries.is_empty(), "the row must use compact output");
+        *metadata.last_mut().unwrap() = 0xff;
+        row.set(
+            schema.top_level_metadata_idx.unwrap(),
+            ShreddedValue::Binary(metadata),
+        )
+        .unwrap();
+        let err = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap_err();
+        assert!(matches!(err, Error::DataInvalid { message, .. } if message.contains("UTF-8")));
+    }
+
+    #[test]
     fn rebuild_shredded_compacts_sparse_rows_with_wide_rotating_dictionaries() {
         let schema = simple_object_shredding_schema();
         let small = GenericVariant::parse_json(r#"{"age":27,"extra":{"nested":1}}"#).unwrap();
@@ -4662,6 +5102,161 @@ mod tests {
         }
         assert!(total_metadata_bytes < 512 * 128);
         assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn compact_rebuild_reuses_validation_for_rotating_large_dictionaries() {
+        let schema = simple_object_shredding_schema();
+        let small = GenericVariant::parse_json(r#"{"age":27,"extra":1}"#).unwrap();
+        let mut row = cast_shredded(&small, &schema).unwrap();
+        assert!(row.field(schema.variant_idx.unwrap()).is_some());
+        let dictionaries = (0..17)
+            .map(|suffix| {
+                let extra = (0..5362)
+                    .map(|key| format!(r#", "unused_{suffix}_{key:04}_field":0"#))
+                    .collect::<String>();
+                GenericVariant::parse_json(&format!(r#"{{"age":27,"extra":1{extra}}}"#))
+                    .unwrap()
+                    .metadata()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        let total = dictionaries.iter().map(Vec::len).sum::<usize>();
+        assert!(total > MAX_CACHED_VARIANT_METADATA_TOTAL_BYTES);
+        assert!(total <= MAX_COMPACT_METADATA_BYTES);
+        let mut cache = RebuildMetadataCache::default();
+        for i in 0..512 {
+            row.set(0, ShreddedValue::Binary(dictionaries[i % 17].clone()))
+                .unwrap();
+            VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
+            let rebuilt = rebuild_shredded_with_cache(&row, &schema, &mut cache).unwrap();
+            if i >= 17 {
+                // A miss would validate and populate the thread-local cache.
+                // This asserts reuse, independent of timing or machine speed.
+                VALIDATED_METADATA.with(|cached| assert!(cached.borrow().is_empty()));
+            }
+            assert_eq!(rebuilt.to_json().unwrap(), small.to_json().unwrap());
+            assert!(rebuilt.metadata().len() < 128);
+        }
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.validated.len(), 17);
+        assert_eq!(cache.validated_bytes, total);
+    }
+
+    #[test]
+    fn compact_rebuild_reuses_borrowed_validation_beyond_byte_limit() {
+        let schema = simple_object_shredding_schema();
+        let small = GenericVariant::parse_json(r#"{"age":27,"extra":1}"#).unwrap();
+        let mut row = cast_shredded(&small, &schema).unwrap();
+        assert!(row.field(schema.variant_idx.unwrap()).is_some());
+        row.fields[schema.top_level_metadata_idx.unwrap()] = None;
+        let dictionaries = (0..18)
+            .map(|suffix| {
+                let extra = (0..5362)
+                    .map(|key| format!(r#", "unused_{suffix}_{key:04}_field":0"#))
+                    .collect::<String>();
+                GenericVariant::parse_json(&format!(r#"{{"age":27,"extra":1{extra}}}"#))
+                    .unwrap()
+                    .metadata()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert!(dictionaries.iter().map(Vec::len).sum::<usize>() > MAX_COMPACT_METADATA_BYTES);
+        let mut cache = RebuildMetadataCache::default();
+        for i in 0..512 {
+            VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
+            let rebuilt = rebuild_shredded_with_borrowed_metadata(
+                &row,
+                &schema,
+                &mut cache,
+                &dictionaries[i % dictionaries.len()],
+                None,
+            )
+            .unwrap();
+            if i >= dictionaries.len() {
+                // A miss would validate and populate the thread-local cache.
+                VALIDATED_METADATA.with(|cached| assert!(cached.borrow().is_empty()));
+            }
+            assert_eq!(rebuilt.to_json().unwrap(), small.to_json().unwrap());
+        }
+        assert_eq!(cache.validated_borrowed.len(), dictionaries.len());
+        let duplicate = dictionaries[0].clone();
+        VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
+        rebuild_shredded_with_borrowed_metadata(&row, &schema, &mut cache, &duplicate, None)
+            .unwrap();
+        // A different Arrow slice with the same bytes must reuse validation too.
+        VALIDATED_METADATA.with(|cached| assert!(cached.borrow().is_empty()));
+        assert_eq!(cache.validated_borrowed.len(), dictionaries.len());
+        assert_eq!(
+            cache.validated_borrowed_recent.len(),
+            RECENT_BORROWED_METADATA_ENTRIES
+        );
+        cache.validated_borrowed.clear();
+        let duplicate_again = duplicate.clone();
+        rebuild_shredded_with_borrowed_metadata(&row, &schema, &mut cache, &duplicate_again, None)
+            .unwrap();
+        // An equal Arrow slice uses the recent exact-byte match before hashing.
+        VALIDATED_METADATA.with(|cached| assert!(cached.borrow().is_empty()));
+        assert!(cache.validated_borrowed.is_empty());
+        let mut invalid = duplicate.clone();
+        invalid[0] = 0xff;
+        assert!(cache
+            .validate_compact_metadata_borrowed(&invalid, None)
+            .is_err());
+        assert!(cache.validated.is_empty());
+
+        let mut dictionary_cache = RebuildMetadataCache::default();
+        for i in 0..512 {
+            VALIDATED_METADATA.with(|cached| cached.borrow_mut().clear());
+            let key = (i % dictionaries.len()) as i32;
+            rebuild_shredded_with_borrowed_metadata(
+                &row,
+                &schema,
+                &mut dictionary_cache,
+                &dictionaries[key as usize],
+                Some(key),
+            )
+            .unwrap();
+            if i >= dictionaries.len() {
+                VALIDATED_METADATA.with(|cached| assert!(cached.borrow().is_empty()));
+            }
+        }
+        assert_eq!(
+            dictionary_cache.validated_dictionary_keys.len(),
+            dictionaries.len()
+        );
+        assert!(dictionary_cache.validated_borrowed.is_empty());
+    }
+
+    #[test]
+    fn compact_metadata_cache_is_bounded_and_rejects_invalid_bytes() {
+        let mut cache = RebuildMetadataCache::default();
+        for i in 0..=MAX_COMPACT_METADATA_ENTRIES {
+            let v = GenericVariant::parse_json(&format!(r#"{{"key_{i}":0}}"#)).unwrap();
+            cache.validate_compact_metadata(v.metadata()).unwrap();
+        }
+        assert_eq!(cache.validated.len(), MAX_COMPACT_METADATA_ENTRIES);
+        assert!(cache.validate_compact_metadata(&[0]).is_err());
+        assert_eq!(cache.validated.len(), MAX_COMPACT_METADATA_ENTRIES);
+        // Exercise byte eviction and oversized dictionaries independently of
+        // the entry limit. Oversized valid dictionaries are not retained.
+        for size in [
+            MAX_COMPACT_METADATA_BYTES / 2,
+            MAX_COMPACT_METADATA_BYTES / 2 + 1,
+            MAX_COMPACT_METADATA_BYTES + 1,
+        ] {
+            let key = "x".repeat(size);
+            let v = GenericVariant::parse_json(&format!(r#"{{"{key}":0}}"#)).unwrap();
+            cache.validate_compact_metadata(v.metadata()).unwrap();
+            assert!(cache.validated_bytes <= MAX_COMPACT_METADATA_BYTES);
+            assert_eq!(
+                cache.validated_bytes,
+                cache.validated.iter().map(|b| b.len()).sum::<usize>()
+            );
+            if v.metadata().len() > MAX_COMPACT_METADATA_BYTES {
+                assert!(!cache.validated.iter().any(|b| b.as_ref() == v.metadata()));
+            }
+        }
     }
 
     #[test]
@@ -4774,6 +5369,37 @@ mod tests {
         age.set(0, ShreddedValue::Binary(vec![0xff])).unwrap();
 
         assert!(rebuild_shredded(&row, &schema).is_err());
+    }
+
+    #[test]
+    fn rebuild_shredded_rejects_misordered_residual_keys() {
+        let schema = simple_object_shredding_schema();
+        let original = GenericVariant::parse_json(r#"{"age":27,"left":1,"right":2}"#).unwrap();
+        let mut row = cast_shredded(&original, &schema).unwrap();
+        let idx = schema.variant_idx.unwrap();
+        let Some(ShreddedValue::Binary(value)) = row.field(idx) else {
+            panic!("expected residual object");
+        };
+        let mut malformed = value.clone();
+        let layout = object_layout(&malformed, 0).unwrap();
+        assert_eq!(layout.size, 2);
+        assert_eq!(layout.id_size, 1);
+        malformed.swap(layout.id_start, layout.id_start + 1);
+        row.set(idx, ShreddedValue::Binary(malformed)).unwrap();
+        assert!(rebuild_shredded(&row, &schema).is_err());
+    }
+
+    #[test]
+    fn residual_validation_checks_final_nesting_depth() {
+        let nested = GenericVariant::parse_json("[null]").unwrap();
+        let mut metadata = VariantMetadataValidation::new(nested.metadata(), false);
+        assert!(VariantRef::new_with_cached_metadata_at_depth(
+            nested.value(),
+            0,
+            &mut metadata,
+            MAX_NESTING_DEPTH,
+        )
+        .is_err());
     }
 
     #[test]
