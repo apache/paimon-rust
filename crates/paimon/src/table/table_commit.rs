@@ -224,9 +224,7 @@ pub struct TableCommit {
 
 impl TableCommit {
     pub fn new(table: Table, commit_user: String) -> Self {
-        // Rollback and branch fast-forward can reuse a snapshot path outside this process.
-        // Commit and recovery need current metadata for that ID.
-        let snapshot_manager = table.snapshot_manager().without_snapshot_cache();
+        let snapshot_manager = table.snapshot_manager();
         let snapshot_commit = if let Some(env) = &table.rest_env {
             env.snapshot_commit()
         } else {
@@ -249,7 +247,9 @@ impl TableCommit {
         let partition_default_name = core_options.partition_default_name().to_string();
         Self {
             table,
-            snapshot_manager,
+            // Rollback and branch fast-forward can reuse a snapshot path outside this process.
+            // Commit and recovery need current metadata for that ID.
+            snapshot_manager: snapshot_manager.without_snapshot_cache(),
             snapshot_commit,
             commit_user,
             ignore_empty_commit: true,
