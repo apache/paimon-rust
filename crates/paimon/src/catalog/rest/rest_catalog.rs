@@ -370,7 +370,26 @@ impl Catalog for RESTCatalog {
             .api
             .send_create_table(&request)
             .await
-            .map_err(|e| map_rest_error_for_table(e, identifier));
+            .map_err(|error| match error {
+                // Legacy create endpoints can omit the missing database's type.
+                Error::RestApi {
+                    source:
+                        RestError::NoSuchResource {
+                            ref resource_type, ..
+                        },
+                } if resource_type
+                    .as_deref()
+                    .is_none_or(|kind| kind.eq_ignore_ascii_case("database")) =>
+                {
+                    Error::DatabaseNotExist {
+                        database: identifier.database().to_string(),
+                    }
+                }
+                typed @ Error::RestApi {
+                    source: RestError::NoSuchResource { .. },
+                } => typed,
+                other => map_rest_error_for_table(other, identifier),
+            });
         ignore_error_if(result, |e| {
             ignore_if_exists && matches!(e, Error::TableAlreadyExist { .. })
         })
@@ -1236,6 +1255,120 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn create_table_maps_http_errors_by_resource() {
+        use crate::spec::{DataType, IntType};
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        let app = Router::new()
+            .route(
+                "/v1/config",
+                get(|| async { Json(serde_json::json!({"defaults": {}, "overrides": {}})) }),
+            )
+            .route(
+                "/v1/databases/:db/tables",
+                post(|Path(database): Path<String>| async move {
+                    let (status, resource_type, resource_name) = match database.as_str() {
+                        "missing" => (StatusCode::NOT_FOUND, "DATABASE", "missing"),
+                        "column" => (StatusCode::NOT_FOUND, "COLUMN", "age"),
+                        "table" => (StatusCode::NOT_FOUND, "table", "source_table"),
+                        "catalog" => (StatusCode::NOT_FOUND, "CATALOG", "warehouse"),
+                        "duplicate" => (StatusCode::CONFLICT, "TABLE", "new_table"),
+                        "legacy" => return (StatusCode::NOT_FOUND, "not found").into_response(),
+                        "malformed" => return (StatusCode::NOT_FOUND, "{").into_response(),
+                        _ => return (StatusCode::FORBIDDEN, "access denied").into_response(),
+                    };
+                    (
+                        status,
+                        Json(serde_json::json!({
+                            "message": if status == StatusCode::CONFLICT {
+                                "already exists"
+                            } else {
+                                "missing resource"
+                            },
+                            "resourceType": resource_type,
+                            "resourceName": resource_name,
+                        })),
+                    )
+                        .into_response()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut options = Options::new();
+        options.set(CatalogOptions::URI, format!("http://{address}"));
+        options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+        options.set(CatalogOptions::TOKEN, "test-token");
+        let catalog = RESTCatalog::new(options, true).await.unwrap();
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        for ignore_if_exists in [false, true] {
+            for database in [
+                "missing",
+                "legacy",
+                "malformed",
+                "column",
+                "table",
+                "catalog",
+                "duplicate",
+                "denied",
+            ] {
+                let identifier = Identifier::new(database, "new_table");
+                let result = catalog
+                    .create_table(&identifier, schema.clone(), ignore_if_exists)
+                    .await;
+                if database == "duplicate" && ignore_if_exists {
+                    result.unwrap();
+                    continue;
+                }
+                let error = result.unwrap_err();
+                match database {
+                    "missing" | "legacy" | "malformed" => assert!(
+                        matches!(&error, Error::DatabaseNotExist { database: name } if name == database),
+                        "{error:?}"
+                    ),
+                    "column" | "table" | "catalog" => {
+                        let (kind, name) = match database {
+                            "column" => ("COLUMN", "age"),
+                            "table" => ("table", "source_table"),
+                            _ => ("CATALOG", "warehouse"),
+                        };
+                        assert!(
+                            matches!(&error, Error::RestApi {
+                                source: RestError::NoSuchResource { resource_type, resource_name, message }
+                            } if resource_type.as_deref() == Some(kind)
+                                && resource_name.as_deref() == Some(name)
+                                && message == "missing resource"),
+                            "{error:?}"
+                        );
+                    }
+                    "duplicate" => assert!(
+                        matches!(&error, Error::TableAlreadyExist { full_name }
+                            if full_name == "duplicate.new_table"),
+                        "{error:?}"
+                    ),
+                    _ => assert!(
+                        matches!(
+                            &error,
+                            Error::RestApi {
+                                source: RestError::Forbidden { .. }
+                            }
+                        ),
+                        "{error:?}"
+                    ),
+                }
+            }
+        }
+        server.abort();
+    }
 
     #[tokio::test]
     async fn test_rest_catalog_optional_warehouse() {
