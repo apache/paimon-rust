@@ -25,10 +25,9 @@ pub(super) async fn timestamp_snapshot_range(
     start: i64,
     end: i64,
 ) -> crate::Result<Option<(i64, i64)>> {
-    let Some(earliest_id) = manager.earliest_snapshot_id().await? else {
+    let Some(earliest) = manager.earliest_available_snapshot().await? else {
         return Ok(None);
     };
-    let earliest = manager.get_snapshot(earliest_id).await?;
     let Some(latest) = manager.get_latest_snapshot().await? else {
         return Ok(None);
     };
@@ -41,15 +40,25 @@ pub(super) async fn timestamp_snapshot_range(
     if start == end || start > latest.time_millis() as i64 || end < earliest.time_millis() as i64 {
         return Ok(None);
     }
-    let start_id = manager
-        .earlier_or_equal_time_millis(start)
-        .await?
-        .map_or(earliest.id() - 1, |snapshot| snapshot.id());
-    let end_id = manager
-        .earlier_or_equal_time_millis(end)
-        .await?
-        .map_or(latest.id(), |snapshot| snapshot.id());
-    Ok(Some((start_id, end_id)))
+    let start_snapshot = manager.earlier_or_equal_time_millis(start).await?;
+    let Some(end_snapshot) = manager.earlier_or_equal_time_millis(end).await? else {
+        return Ok(None);
+    };
+    let start_id = match start_snapshot {
+        Some(snapshot) => snapshot.id(),
+        None => {
+            // The earliest snapshot can expire between the initial check and
+            // the timestamp lookup. Start before the remaining history.
+            let Some(earliest_id) = manager.earliest_snapshot_id().await? else {
+                return Ok(None);
+            };
+            if earliest_id > end_snapshot.id() {
+                return Ok(None);
+            }
+            earliest_id - 1
+        }
+    };
+    Ok((start_id <= end_snapshot.id()).then_some((start_id, end_snapshot.id())))
 }
 
 /// Batch incremental scan mode.

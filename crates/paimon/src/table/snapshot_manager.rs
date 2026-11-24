@@ -458,21 +458,44 @@ impl SnapshotManager {
         Ok(result)
     }
 
+    async fn snapshot_if_available(&self, id: i64) -> crate::Result<Option<Snapshot>> {
+        // Expiration can remove the file before the existence check or the read.
+        match self.get_snapshot(id).await {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(crate::Error::SnapshotNotExist { .. }) => Ok(None),
+            Err(crate::Error::IoUnexpected { source, .. })
+                if source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn first_available_snapshot(
         &self,
         ids: &[i64],
     ) -> crate::Result<Option<(usize, Snapshot)>> {
         for (offset, &id) in ids.iter().enumerate() {
-            // Expiration can remove the file before the existence check or before the read.
-            match self.get_snapshot(id).await {
-                Ok(snapshot) => return Ok(Some((offset, snapshot))),
-                Err(crate::Error::SnapshotNotExist { .. }) => {}
-                Err(crate::Error::IoUnexpected { source, .. })
-                    if source.kind() == opendal::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+            if let Some(snapshot) = self.snapshot_if_available(id).await? {
+                return Ok(Some((offset, snapshot)));
             }
         }
         Ok(None)
+    }
+
+    pub(super) async fn earliest_available_snapshot(&self) -> crate::Result<Option<Snapshot>> {
+        let Some(id) = self.earliest_snapshot_id().await? else {
+            return Ok(None);
+        };
+        if let Some(snapshot) = self.snapshot_if_available(id).await? {
+            return Ok(Some(snapshot));
+        }
+        let ids = self.list_all_ids().await?;
+        Ok(self
+            .first_available_snapshot(&ids)
+            .await?
+            .map(|(_, snapshot)| snapshot))
     }
 
     /// Returns the snapshot whose commit time is earlier than or equal to the given
@@ -789,6 +812,22 @@ mod tests {
         }
     }
 
+    fn expiry_file_io(
+        op: &opendal::Operator,
+        expired_path: &str,
+        accesses_before_expiry: usize,
+    ) -> FileIO {
+        FileIOBuilder::new("memory")
+            .with_provider(std::sync::Arc::new(SnapshotExpiryProvider {
+                op: op.clone(),
+                expired_path: expired_path.into(),
+                accesses_before_expiry,
+                accesses: std::sync::atomic::AtomicUsize::new(0),
+            }))
+            .build()
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_earlier_or_equal_time_millis_skips_expired_snapshot_files() {
         // The first path resolution precedes the existence check. The second precedes the read.
@@ -806,19 +845,101 @@ mod tests {
                 op.write(&path, json).await.unwrap();
             }
             let expired_path = format!("expiry/snapshot/snapshot-{expired}");
-            let io = FileIOBuilder::new("memory")
-                .with_provider(std::sync::Arc::new(SnapshotExpiryProvider {
-                    op: op.clone(),
-                    expired_path: expired_path.clone(),
-                    accesses_before_expiry,
-                    accesses: std::sync::atomic::AtomicUsize::new(0),
-                }))
-                .build()
-                .unwrap();
+            let io = expiry_file_io(&op, &expired_path, accesses_before_expiry);
             let sm = SnapshotManager::new(io, "memory:/expiry".into());
             let result = sm.earlier_or_equal_time_millis(timestamp).await;
             assert!(!op.exists(&expired_path).await.unwrap());
             assert_eq!(result.unwrap().map(|snapshot| snapshot.id()), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_timestamp_scan_respects_bounds_after_expiration() {
+        use crate::catalog::Identifier;
+        use crate::spec::{DataType, IntType, Schema, TableSchema};
+        use crate::table::Table;
+        use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // The old file can disappear while loading the earliest snapshot
+        // or while resolving either timestamp boundary.
+        for (accesses_before_expiry, end, expected) in
+            [(4, 1500, vec![]), (2, 2500, vec![2]), (0, 2500, vec![2])]
+        {
+            let op =
+                opendal::Operator::from_config(opendal::services::MemoryConfig::default()).unwrap();
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("write-only", "true")
+                .build()
+                .unwrap();
+            let schema = TableSchema::new(0, &schema);
+            let identifier = Identifier::new("db", "expiry");
+            let table = Table::new(
+                expiry_file_io(&op, "", usize::MAX),
+                identifier.clone(),
+                "memory:/expiry".into(),
+                schema.clone(),
+                None,
+            );
+            for id in [1, 2] {
+                let builder = table.new_write_builder();
+                let mut writer = builder.new_write().unwrap();
+                let batch = RecordBatch::try_from_iter([(
+                    "id",
+                    Arc::new(Int32Array::from(vec![id])) as ArrayRef,
+                )])
+                .unwrap();
+                writer.write_arrow_batch(&batch).await.unwrap();
+                builder
+                    .new_commit()
+                    .commit(writer.prepare_commit().await.unwrap())
+                    .await
+                    .unwrap();
+                let path = format!("expiry/snapshot/snapshot-{id}");
+                let mut snapshot: serde_json::Value =
+                    serde_json::from_slice(&op.read(&path).await.unwrap().to_bytes()).unwrap();
+                snapshot["timeMillis"] = (id * 1000).into();
+                op.write(&path, serde_json::to_vec(&snapshot).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let expired_path = "expiry/snapshot/snapshot-1";
+            let table = Table::new(
+                expiry_file_io(&op, expired_path, accesses_before_expiry),
+                identifier,
+                "memory:/expiry".into(),
+                schema,
+                None,
+            )
+            .copy_with_options(HashMap::from([(
+                "incremental-between-timestamp".into(),
+                format!("500,{end}"),
+            )]));
+            let builder = table.new_read_builder();
+            let result = builder.new_scan().plan().await;
+            assert!(!op.exists(expired_path).await.unwrap());
+            let plan = result.unwrap();
+            let read = builder.new_read().unwrap();
+            let batches: Vec<RecordBatch> =
+                futures::TryStreamExt::try_collect(read.to_arrow(plan.splits()).unwrap())
+                    .await
+                    .unwrap();
+            let actual = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "end timestamp {end}");
         }
     }
 
