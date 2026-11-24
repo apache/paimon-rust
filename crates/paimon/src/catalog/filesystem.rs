@@ -2798,11 +2798,6 @@ mod tests {
         let table_path = catalog.table_path(&id);
         catalog
             .file_io
-            .mkdirs(&catalog.schema_dir_path(&table_path))
-            .await
-            .unwrap();
-        catalog
-            .file_io
             .new_output(&catalog.schema_file_path(&table_path, 0))
             .unwrap()
             .write(Bytes::from_static(include_bytes!(

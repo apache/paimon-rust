@@ -650,10 +650,12 @@ mod tests {
             assert_eq!(branch.get("job").await.unwrap(), None);
             assert_eq!(manager.get("job").await.unwrap(), Some(1));
             assert_eq!(sibling.get("job").await.unwrap(), Some(4));
-            assert!(file_io
-                .exists_dir(&format!("{table_path}/branch/branch-dev/consumer"))
-                .await
-                .unwrap());
+            if scheme == "file" {
+                assert!(file_io
+                    .exists_dir(&format!("{table_path}/branch/branch-dev/consumer"))
+                    .await
+                    .unwrap());
+            }
 
             branch.reset("job", 5).await.unwrap();
             manager.delete("job").await.unwrap();

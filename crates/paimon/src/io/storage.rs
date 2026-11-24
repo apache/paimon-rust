@@ -567,8 +567,7 @@ impl Storage {
         match self {
             Storage::CustomFs { .. } => true,
             #[cfg(feature = "storage-memory")]
-            // Preserve directory entries after their last file is deleted.
-            Storage::Memory { .. } => true,
+            Storage::Memory { .. } => false,
             #[cfg(feature = "storage-fs")]
             Storage::LocalFs { .. } => false,
             #[cfg(feature = "storage-oss")]
