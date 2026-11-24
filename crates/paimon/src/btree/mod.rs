@@ -58,7 +58,7 @@ pub(crate) use block::{
 };
 pub use composite_key::serialize_composite_key;
 pub(crate) use composite_key::CompositeKeyCodec;
-pub(crate) use composite_predicate::CompositePlan;
+pub(crate) use composite_predicate::{CompositePlan, MAX_INTERVALS};
 pub(crate) use data_block_cache::BTreeDataBlockCache;
 pub use footer::BTreeFileFooter;
 pub use key_serde::{make_key_comparator, serialize_datum};

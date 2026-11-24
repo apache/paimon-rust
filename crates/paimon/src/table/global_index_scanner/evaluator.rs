@@ -35,7 +35,7 @@ use super::row_ranges::{bitmap_to_ranges, intersect_sorted_ranges};
 use super::GlobalIndexScanner;
 use crate::btree::key_serde::normalize_key_literal;
 use crate::btree::query::extract_between;
-use crate::btree::{make_key_comparator, serialize_datum};
+use crate::btree::{make_key_comparator, serialize_datum, MAX_INTERVALS};
 #[cfg(test)]
 use crate::spec::GlobalIndexSearchMode;
 use crate::spec::{DataType, Datum, Predicate, PredicateOperator};
@@ -102,6 +102,119 @@ where
 }
 
 impl GlobalIndexScanner {
+    pub(super) fn coalesced_or_interval_limit(&self, children: &[Predicate]) -> Option<usize> {
+        let Predicate::And(parts) = children.first()? else {
+            return None;
+        };
+        let (
+            Some(Predicate::Leaf { column: first, .. }),
+            Some(Predicate::Leaf { column: second, .. }),
+        ) = (parts.first(), parts.get(1))
+        else {
+            return None;
+        };
+        let first_id = self
+            .schema_fields
+            .iter()
+            .find(|field| field.name() == first)?
+            .id();
+        let second_id = self
+            .schema_fields
+            .iter()
+            .find(|field| field.name() == second)?
+            .id();
+        self.composite_entries
+            .iter()
+            .any(|(ids, _)| ids.contains(&first_id) && ids.contains(&second_id))
+            .then_some(MAX_INTERVALS)
+    }
+
+    // (a = 1 AND b IN S) OR (a = 2 AND b IN S) is exactly
+    // (a IN (1, 2) AND b IN S). Leave uneven locator sets untouched.
+    pub(super) fn coalesce_equal_or_arms(
+        children: &[Predicate],
+        max_intervals: Option<usize>,
+    ) -> Option<Predicate> {
+        if children.len() < 2 {
+            return None;
+        }
+        let mut common = None;
+        let mut equalities = Vec::with_capacity(children.len());
+        for child in children {
+            let Predicate::And(parts) = child else {
+                return None;
+            };
+            if parts.len() != 2 {
+                return None;
+            }
+            let (eq, other) = if matches!(&parts[0], Predicate::Leaf { op: PredicateOperator::Eq, literals, .. } if literals.len() == 1)
+            {
+                (&parts[0], &parts[1])
+            } else {
+                (&parts[1], &parts[0])
+            };
+            let Predicate::Leaf {
+                column,
+                index,
+                data_type,
+                op: PredicateOperator::Eq,
+                literals,
+            } = eq
+            else {
+                return None;
+            };
+            if literals.len() != 1
+                || !matches!(
+                    other,
+                    Predicate::Leaf {
+                        op: PredicateOperator::In,
+                        ..
+                    }
+                )
+            {
+                return None;
+            }
+            if let Some((first_column, first_index, first_type, first_other)) = &common {
+                if column != first_column
+                    || index != first_index
+                    || data_type != first_type
+                    || other != first_other
+                {
+                    return None;
+                }
+            } else {
+                common = Some((column.clone(), *index, data_type.clone(), other.clone()));
+            }
+            equalities.push(literals[0].clone());
+        }
+        let (column, index, data_type, other) = common?;
+        let Predicate::Leaf {
+            literals: other_values,
+            ..
+        } = &other
+        else {
+            unreachable!();
+        };
+        // A composite plan drops the second key column if the Cartesian
+        // product exceeds its interval cap. Keep the original point lookups
+        // so a small fallback-scan budget cannot discard that index entirely.
+        if max_intervals.is_some_and(|limit| {
+            !other_values.is_empty() && equalities.len() > limit / other_values.len()
+        }) {
+            return None;
+        }
+        Some(Predicate::and(vec![
+            Predicate::Leaf {
+                column,
+                index,
+                data_type,
+                op: PredicateOperator::In,
+                literals: equalities,
+            },
+            other,
+        ]))
+    }
+
     /// Coalesce OR arms that differ only in an indexed BTree equality. The
     /// unindexed conjuncts remain in the table reader's residual predicate.
     fn batched_or_btree_eq(&self, children: &[Predicate]) -> Result<Option<Predicate>> {
@@ -227,6 +340,35 @@ impl GlobalIndexScanner {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         Box::pin(async move {
+            if let Predicate::And(children) = predicate {
+                let mut changed = false;
+                let normalized = children
+                    .iter()
+                    .map(|child| {
+                        if let Predicate::Or(arms) = child {
+                            if let Some(coalesced) = Self::coalesce_equal_or_arms(
+                                arms,
+                                self.coalesced_or_interval_limit(arms),
+                            ) {
+                                changed = true;
+                                return coalesced;
+                            }
+                        }
+                        child.clone()
+                    })
+                    .collect();
+                if changed {
+                    return self.evaluate(&Predicate::and(normalized)).await;
+                }
+            }
+            if let Predicate::Or(children) = predicate {
+                if let Some(coalesced) = Self::coalesce_equal_or_arms(
+                    children,
+                    self.coalesced_or_interval_limit(children),
+                ) {
+                    return self.evaluate(&coalesced).await;
+                }
+            }
             if !matches!(predicate, Predicate::And(_)) {
                 if let Some(composite) = self.evaluate_composite(predicate).await? {
                     return Ok(Some(composite.result));

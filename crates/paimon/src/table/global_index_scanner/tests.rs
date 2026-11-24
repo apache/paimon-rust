@@ -878,6 +878,150 @@ fn int_eq(column: &str, index: usize, value: i32) -> Predicate {
     }
 }
 
+#[test]
+fn test_coalesce_equal_or_arms_only_for_identical_other_predicate() {
+    let steps = Predicate::Leaf {
+        column: "step".into(),
+        index: 1,
+        data_type: DataType::Int(crate::spec::IntType::new()),
+        op: PredicateOperator::In,
+        literals: vec![Datum::Int(9), Datum::Int(10)],
+    };
+    let branch =
+        |episode, steps: Predicate| Predicate::and(vec![int_eq("episode", 0, episode), steps]);
+    let complete = vec![branch(0, steps.clone()), branch(1, steps.clone())];
+    let expected = Predicate::and(vec![
+        Predicate::Leaf {
+            column: "episode".into(),
+            index: 0,
+            data_type: DataType::Int(crate::spec::IntType::new()),
+            op: PredicateOperator::In,
+            literals: vec![Datum::Int(0), Datum::Int(1)],
+        },
+        steps.clone(),
+    ]);
+    assert_eq!(
+        GlobalIndexScanner::coalesce_equal_or_arms(&complete, None),
+        Some(expected)
+    );
+
+    let mut uneven = steps.clone();
+    if let Predicate::Leaf { literals, .. } = &mut uneven {
+        literals.pop();
+    }
+    assert_eq!(
+        GlobalIndexScanner::coalesce_equal_or_arms(&[branch(0, steps), branch(1, uneven)], None),
+        None
+    );
+}
+
+#[tokio::test]
+async fn test_rectangular_or_keeps_composite_point_lookups_above_interval_limit() {
+    let fields = two_field_schema_fields();
+    let key_type = DataType::Row(crate::spec::RowType::new(fields.clone()));
+    let output = VecFileWrite::new();
+    let mut writer = BTreeIndexWriter::with_comparator(
+        Box::new(output.clone()),
+        256,
+        BlockCompressionType::None,
+        make_key_comparator(&key_type),
+    );
+    for id in 0..2 {
+        let key = crate::btree::serialize_composite_key(
+            &[Some(Datum::Int(id)), Some(Datum::Int(1))],
+            &fields,
+        )
+        .unwrap();
+        writer.write(Some(&key), id as i64).await.unwrap();
+    }
+    let meta = writer.finish().await.unwrap().meta;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("index")).unwrap();
+    let bytes = output.to_vec();
+    std::fs::write(tmp.path().join("index/composite.btree"), &bytes).unwrap();
+    let mut entry = make_global_index_entry("composite.btree", 1, 0, 1, &meta);
+    entry.index_file.file_size = bytes.len() as i64;
+    entry
+        .index_file
+        .global_index_meta
+        .as_mut()
+        .unwrap()
+        .extra_field_ids = Some(vec![2]);
+    let io = crate::io::FileIOBuilder::new("file").build().unwrap();
+    let path = format!("file://{}", tmp.path().display());
+    // A non-point composite plan is rejected even for this tiny index file.
+    let scanner = GlobalIndexScanner::create(&io, &path, 2, 0, 0, &[entry.clone()], &fields)
+        .unwrap()
+        .unwrap();
+    let b = crate::spec::PredicateBuilder::new(&fields);
+    let values = b
+        .is_in("value", (1..=129).map(Datum::Int).collect())
+        .unwrap();
+    let arms = vec![
+        Predicate::and(vec![int_eq("id", 0, 0), values.clone()]),
+        Predicate::and(vec![int_eq("id", 0, 1), values.clone()]),
+    ];
+    assert!(
+        GlobalIndexScanner::coalesce_equal_or_arms(&arms, Some(crate::btree::MAX_INTERVALS))
+            .is_none()
+    );
+    let widened = Predicate::and(vec![
+        b.is_in("id", vec![Datum::Int(0), Datum::Int(1)]).unwrap(),
+        values,
+    ]);
+    assert!(scanner.evaluate(&widened).await.unwrap().is_none());
+    let result = scanner
+        .evaluate(&Predicate::or(arms))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.row_ranges, vec![RowRange::new(0, 1)]);
+
+    let at_limit = b
+        .is_in("value", (1..=128).map(Datum::Int).collect())
+        .unwrap();
+    let arms = vec![
+        Predicate::and(vec![int_eq("id", 0, 0), at_limit.clone()]),
+        Predicate::and(vec![int_eq("id", 0, 1), at_limit]),
+    ];
+    assert!(GlobalIndexScanner::coalesce_equal_or_arms(
+        &arms,
+        scanner.coalesced_or_interval_limit(&arms)
+    )
+    .is_some());
+    let result = scanner
+        .evaluate(&Predicate::or(arms))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.row_ranges, vec![RowRange::new(0, 1)]);
+
+    // An unrelated composite definition must not disable the scalar-only
+    // rectangular rewrite, even when the rectangle exceeds 256 cells.
+    let mut extended_fields = fields.clone();
+    extended_fields.push(DataField::new(
+        3,
+        "step".into(),
+        fields[0].data_type().clone(),
+    ));
+    let unrelated = GlobalIndexScanner::create(&io, &path, 2, 0, 0, &[entry], &extended_fields)
+        .unwrap()
+        .unwrap();
+    let step = Predicate::Leaf {
+        column: "step".into(),
+        index: 2,
+        data_type: fields[0].data_type().clone(),
+        op: PredicateOperator::In,
+        literals: (1..=129).map(Datum::Int).collect(),
+    };
+    let arms = vec![
+        Predicate::and(vec![int_eq("id", 0, 0), step.clone()]),
+        Predicate::and(vec![int_eq("id", 0, 1), step]),
+    ];
+    assert!(unrelated.coalesced_or_interval_limit(&arms).is_none());
+    assert!(GlobalIndexScanner::coalesce_equal_or_arms(&arms, None).is_some());
+}
+
 #[tokio::test]
 async fn test_btree_all_match_without_index_io() {
     let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
