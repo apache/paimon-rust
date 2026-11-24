@@ -908,6 +908,40 @@ async fn test_analyze_and_scan_count_only_the_files_a_reader_returns() {
 
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_analyze_counts_empty_orc_files_as_zero_rows() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let schema = Schema::builder()
+        .column("dt", varchar())
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .partition_keys(["dt"])
+        .option("type", "format-table")
+        .option("file.format", "orc")
+        .option("metastore.partitioned-table", "true")
+        .build()
+        .unwrap();
+    let (server, context) = setup_rest_table(&temp_dir, schema).await;
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (dt = 'a')"),
+    )
+    .await;
+    common::exec(
+        &context,
+        &format!("INSERT INTO {TABLE_NAME} (dt, id) VALUES ('a', 1), ('a', 2)"),
+    )
+    .await;
+    std::fs::write(temp_dir.path().join("dt=a/empty.orc"), b"").unwrap();
+
+    common::exec(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} COMPUTE STATISTICS"),
+    )
+    .await;
+    assert_eq!(counts(&partition_statistics(&server)["dt=a"]), (2, 2));
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_analyze_leaves_a_row_count_unknown_rather_than_short() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (server, context) =

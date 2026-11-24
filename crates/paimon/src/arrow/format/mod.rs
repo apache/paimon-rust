@@ -364,6 +364,8 @@ pub(crate) async fn read_file_row_count(
                 .await
                 .map(Some)
         }
+        // Hive's zero-byte ORC outputs contain no rows, as in Format Table scans.
+        "orc" if file_size == 0 => Ok(Some(0)),
         "orc" => {
             let reader = file_io.new_input(path)?.reader().await?;
             orc::read_row_count(Box::new(reader), file_size)
