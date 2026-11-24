@@ -370,7 +370,14 @@ impl Catalog for RESTCatalog {
             .api
             .send_create_table(&request)
             .await
-            .map_err(|e| map_rest_error_for_table(e, identifier));
+            .map_err(|e| match e {
+                Error::RestApi {
+                    source: RestError::NoSuchResource { .. },
+                } => Error::DatabaseNotExist {
+                    database: identifier.database().to_string(),
+                },
+                other => map_rest_error_for_table(other, identifier),
+            });
         ignore_error_if(result, |e| {
             ignore_if_exists && matches!(e, Error::TableAlreadyExist { .. })
         })
@@ -1236,6 +1243,58 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn create_table_reports_the_missing_database() {
+        use crate::spec::{DataType, IntType};
+        use axum::http::StatusCode;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        let app = Router::new()
+            .route(
+                "/v1/config",
+                get(|| async { Json(serde_json::json!({"defaults": {}, "overrides": {}})) }),
+            )
+            .route(
+                "/v1/databases/missing/tables",
+                post(|| async {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "code": 404,
+                            "message": "Database missing does not exist",
+                            "resourceType": "DATABASE",
+                            "resourceName": "missing",
+                        })),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut options = Options::new();
+        options.set(CatalogOptions::URI, format!("http://{address}"));
+        options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+        options.set(CatalogOptions::TOKEN, "test-token");
+        let catalog = RESTCatalog::new(options, true).await.unwrap();
+        let identifier = Identifier::new("missing", "new_table");
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        for ignore_if_exists in [false, true] {
+            let error = catalog
+                .create_table(&identifier, schema.clone(), ignore_if_exists)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, Error::DatabaseNotExist { database } if database == "missing"),
+                "{error:?}"
+            );
+        }
+        server.abort();
+    }
 
     #[tokio::test]
     async fn test_rest_catalog_optional_warehouse() {
