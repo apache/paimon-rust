@@ -48,7 +48,7 @@ use paimon::catalog::Catalog;
 use paimon::spec::{
     BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
-use paimon::table::{HybridSearchRanker, HybridSearchRoute, Table};
+use paimon::table::{GlobalIndexResult, HybridSearchRanker, HybridSearchRoute, Table};
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::{SearchScoreExec, SearchScoreOutputColumn};
@@ -217,7 +217,7 @@ impl TableProvider for HybridSearchTableProvider {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let table = self.inner.table();
 
-        let search_result = await_with_runtime(async {
+        let result = await_with_runtime(async {
             let mut builder = table.new_hybrid_search_builder();
             for route in self.routes.clone() {
                 builder.add_route(route);
@@ -226,14 +226,32 @@ impl TableProvider for HybridSearchTableProvider {
                 .with_limit(self.limit)
                 .with_ranker(&self.ranker)
                 .map_err(to_datafusion_error)?;
-            builder
-                .execute()
-                .await
-                .and_then(|result| result.into_row_ids())
-                .map_err(to_datafusion_error)
+            builder.execute().await.map_err(to_datafusion_error)
         })
         .await?;
 
+        self.scan_search_result(state, projection, result).await
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![
+            TableProviderFilterPushDown::Unsupported;
+            filters.len()
+        ])
+    }
+}
+
+impl HybridSearchTableProvider {
+    async fn scan_search_result(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        result: GlobalIndexResult,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let search_result = result.row_ids().map_err(to_datafusion_error)?;
         let row_ranges = search_result.to_row_ranges().map_err(to_datafusion_error)?;
 
         if row_ranges.is_empty() {
@@ -241,6 +259,10 @@ impl TableProvider for HybridSearchTableProvider {
             return Ok(Arc::new(EmptyExec::new(schema)));
         }
 
+        // The ranked row IDs only identify rows in the snapshot used by the search.
+        let table = result.table().ok_or_else(|| {
+            DataFusionError::Internal("Hybrid search result has no source table".into())
+        })?;
         // Raw row-range scans can include non-matching rows from selected files,
         // so the outer limit must remain above the row-ID filter.
         let scan = table
@@ -303,8 +325,9 @@ impl TableProvider for HybridSearchTableProvider {
         .build_with_read_fields(input_read_fields)?;
         let scores = search_result
             .row_ids
-            .into_iter()
-            .zip(search_result.scores)
+            .iter()
+            .copied()
+            .zip(search_result.scores.iter().copied())
             .collect();
         Ok(Arc::new(SearchScoreExec::new(
             input,
@@ -313,16 +336,6 @@ impl TableProvider for HybridSearchTableProvider {
             output_columns,
             Arc::new(scores),
         )))
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
     }
 }
 
@@ -889,4 +902,122 @@ fn is_function(actual: &str, expected: &[&str]) -> bool {
     expected
         .iter()
         .any(|expected| actual.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{
+        ArrayRef, Float32Array, Float32Builder, Int32Array, ListBuilder,
+    };
+    use datafusion::arrow::record_batch::RecordBatch;
+    use paimon::catalog::Identifier;
+    use paimon::spec::{ArrayType, FloatType, IntType, Schema as PaimonSchema};
+    use paimon::{CatalogOptions, FileSystemCatalog, Options};
+
+    async fn commit_row(table: &Table, id: i32, overwrite: bool) {
+        let builder = table.new_write_builder();
+        let builder = if overwrite {
+            builder.with_overwrite()
+        } else {
+            builder
+        };
+        let mut embedding = ListBuilder::new(Float32Builder::new()).with_field(Arc::new(
+            Field::new("element", ArrowDataType::Float32, true),
+        ));
+        embedding.values().append_slice(&[1.0, 0.0]);
+        embedding.append(true);
+        let batch = RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(vec![id])) as ArrayRef),
+            ("embedding", Arc::new(embedding.finish()) as ArrayRef),
+        ])
+        .unwrap();
+        let mut writer = builder.new_write().unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        let commit = builder.new_commit();
+        if overwrite {
+            commit.overwrite(messages, None).await.unwrap();
+        } else {
+            commit.commit(messages).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_reads_ranked_rows_after_overwrite() {
+        let warehouse = tempfile::tempdir().unwrap();
+        let mut options = Options::new();
+        options.set(
+            CatalogOptions::WAREHOUSE,
+            format!("file://{}", warehouse.path().display()),
+        );
+        let catalog = FileSystemCatalog::new(options).unwrap();
+        let identifier = Identifier::new("db", "hybrid");
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .option("bucket", "-1")
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .option("global-index.enabled", "true")
+            .option("global-index.search-mode", "full")
+            .build()
+            .unwrap();
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap();
+        let table = catalog.get_table(&identifier).await.unwrap();
+        commit_row(&table, 10, false).await;
+
+        let route =
+            HybridSearchRoute::vector("embedding", vec![1.0, 0.0], 1, 1.0, HashMap::new()).unwrap();
+        let provider = HybridSearchTableProvider::try_new(
+            PaimonTableProvider::try_new(table.clone()).unwrap(),
+            vec![route.clone()],
+            1,
+            HybridSearchRanker::RRF.to_string(),
+        )
+        .unwrap();
+        let mut search = table.new_hybrid_search_builder();
+        search.add_route(route).with_limit(1);
+        let ranked = search.execute().await.unwrap();
+        assert_eq!(ranked.len(), 1);
+
+        // Publish a replacement after ranking and before planning the row read.
+        commit_row(&table, 20, true).await;
+        let ctx = SessionContext::new();
+        let projection = vec![
+            provider.schema.index_of("id").unwrap(),
+            provider.schema.index_of(SEARCH_SCORE_COLUMN).unwrap(),
+        ];
+        let plan = provider
+            .scan_search_result(&ctx.state(), Some(&projection), ranked)
+            .await
+            .unwrap();
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let id = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let score = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(id.value(0), 10);
+        assert!(!score.is_null(0));
+        assert!((score.value(0) - 1.0 / 61.0).abs() < 1e-6);
+    }
 }
