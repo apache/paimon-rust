@@ -1034,9 +1034,12 @@ ALTER TABLE paimon.my_db.users RENAME TO members;
 ALTER TABLE paimon.my_db.users SET TBLPROPERTIES('read.batch-size' = '1024');
 ```
 
-For filesystem catalog tables, set `row-tracking.enabled` and
-`data-evolution.enabled` before the first snapshot. Once snapshots exist,
-`ALTER TABLE` can only retain the current effective values of these two options.
+Set `row-tracking.enabled` at `CREATE TABLE` in the filesystem catalog. You
+can enable `data-evolution.enabled` on an existing append table that has used
+row tracking throughout its schema history.
+Reload the table handle after enabling Data Evolution before reading or updating
+rows. Once enabled, the filesystem catalog rejects disabling or resetting the
+option even before the first snapshot.
 
 `IF EXISTS` is supported:
 

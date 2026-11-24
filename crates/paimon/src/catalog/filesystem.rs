@@ -254,6 +254,57 @@ impl FileSystemCatalog {
         Ok(manager.latest().await?.map(|arc| (*arc).clone()))
     }
 
+    async fn prepare_table_schema_changes(
+        &self,
+        table_path: &str,
+        current: &TableSchema,
+        changes: Vec<crate::spec::SchemaChange>,
+    ) -> Result<TableSchema> {
+        let new_schema = current.apply_changes(changes)?;
+        let current_options = current.core_options();
+        let new_options = new_schema.core_options();
+        // A writer can keep its old row-ID allocation mode through the first commit.
+        if current_options.row_tracking_enabled() != new_options.row_tracking_enabled() {
+            return Err(Error::Unsupported {
+                message: format!("Set '{ROW_TRACKING_ENABLED_OPTION}' when creating the table"),
+            });
+        }
+        match (
+            current_options.data_evolution_enabled(),
+            new_options.data_evolution_enabled(),
+        ) {
+            // Existing writers can publish partial-column files.
+            (true, false) => {
+                return Err(Error::Unsupported {
+                    message: format!(
+                        "Cannot disable '{DATA_EVOLUTION_ENABLED_OPTION}' once enabled"
+                    ),
+                });
+            }
+            // Data evolution needs row IDs for existing files and in-flight writes.
+            (false, true) if current.id() > 0 => {
+                let manager = SchemaManager::new(self.file_io.clone(), table_path.to_string());
+                for id in manager
+                    .list_all_ids()
+                    .await?
+                    .into_iter()
+                    .take_while(|&id| id < current.id())
+                {
+                    let schema = manager.schema(id).await?;
+                    if !schema.core_options().row_tracking_enabled() {
+                        return Err(Error::Unsupported {
+                            message: format!(
+                                "Cannot enable '{DATA_EVOLUTION_ENABLED_OPTION}' when schema {id} did not enable '{ROW_TRACKING_ENABLED_OPTION}'"
+                            ),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(new_schema)
+    }
+
     /// Save a table schema to a file.
     async fn save_table_schema(&self, table_path: &str, schema: &TableSchema) -> Result<()> {
         let schema_dir = self.schema_dir_path(table_path);
@@ -567,38 +618,21 @@ impl Catalog for FileSystemCatalog {
             crate::spec::SchemaChange::RemoveOption { key } => key == PRIMARY_KEY_NULLABLE_OPTION,
             _ => false,
         });
-        let new_schema = current
-            .apply_changes(changes)
-            .map_err(|e| fill_table_name(e, identifier))?;
-
-        // Existing files rely on the row tracking and column layout they were written with.
-        // Compare the final effective values so equivalent SET and RESET operations are allowed.
-        let current_options = current.core_options();
-        let new_options = new_schema.core_options();
-        let changed_snapshot_option = [
-            (PRIMARY_KEY_NULLABLE_OPTION, changes_key_nullability),
-            (
-                ROW_TRACKING_ENABLED_OPTION,
-                current_options.row_tracking_enabled() != new_options.row_tracking_enabled(),
-            ),
-            (
-                DATA_EVOLUTION_ENABLED_OPTION,
-                current_options.data_evolution_enabled() != new_options.data_evolution_enabled(),
-            ),
-        ]
-        .into_iter()
-        .find_map(|(key, changed)| changed.then_some(key));
-        if let Some(key) = changed_snapshot_option {
-            if crate::table::SnapshotManager::new(self.file_io.clone(), table_path.clone())
+        if changes_key_nullability
+            && crate::table::SnapshotManager::new(self.file_io.clone(), table_path.clone())
                 .get_latest_snapshot()
                 .await?
                 .is_some()
-            {
-                return Err(Error::Unsupported {
-                    message: format!("Change '{key}' is not supported yet."),
-                });
-            }
+        {
+            return Err(Error::Unsupported {
+                message: format!("Change '{PRIMARY_KEY_NULLABLE_OPTION}' is not supported yet."),
+            });
         }
+
+        let new_schema = self
+            .prepare_table_schema_changes(&table_path, &current, changes)
+            .await
+            .map_err(|e| fill_table_name(e, identifier))?;
         self.save_table_schema(&table_path, &new_schema).await
     }
 
@@ -773,10 +807,9 @@ fn local_datetime_to_millis<Tz: TimeZone>(
 /// only under `hasSnapshots && !unchanged`, so it allows the layout to be changed
 /// until the first snapshot exists. That window is not safe here, and closing it
 /// properly is not an index-path change: a writer created before the alter has
-/// already cached the old layout, and a commit stamps the schema id it was built
-/// with without checking whether the latest schema moved
-/// (`TableCommit`), so it can publish the first snapshot after the layout was
-/// flipped under it. Ordering schema publication against snapshot commit would fix
+/// already cached the old layout, and a commit can use those cached options
+/// while publishing the first snapshot with the latest schema ID
+/// (`TableCommit`). Ordering schema publication against snapshot commit would fix
 /// that for every option at once; until it exists, the layout is chosen at creation
 /// and not afterwards.
 fn reject_immutable_option_changes(
@@ -1232,7 +1265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn row_layout_options_change_only_before_first_snapshot() {
+    async fn row_layout_options_reject_unsafe_changes_even_without_snapshots() {
         use crate::spec::{DataType, IntType, SchemaChange};
 
         let catalog = create_memory_catalog();
@@ -1242,8 +1275,8 @@ mod tests {
             .unwrap();
 
         for (key, needs_row_tracking) in [
-            ("row-tracking.enabled", false),
-            ("data-evolution.enabled", true),
+            (ROW_TRACKING_ENABLED_OPTION, false),
+            (DATA_EVOLUTION_ENABLED_OPTION, true),
         ] {
             let set = |value: &str| SchemaChange::set_option(key.into(), value.into());
             let reset = || SchemaChange::remove_option(key.into());
@@ -1253,54 +1286,430 @@ mod tests {
                     .column("id", DataType::Int(IntType::new()))
                     .option("bucket", "-1");
                 if needs_row_tracking {
-                    schema = schema.option("row-tracking.enabled", "true");
+                    schema = schema.option(ROW_TRACKING_ENABLED_OPTION, "true");
+                }
+                if enabled {
+                    schema = schema.option(key, "true");
                 }
                 catalog
                     .create_table(&identifier, schema.build().unwrap(), false)
                     .await
                     .unwrap();
 
-                catalog
-                    .alter_table(&identifier, vec![set("true")], false)
-                    .await
-                    .unwrap();
-                if !enabled {
+                for with_snapshot in [false, true] {
+                    if with_snapshot {
+                        give_the_table_a_snapshot(&catalog, &identifier).await;
+                    }
+                    let same_value = if enabled { "TRUE" } else { "FALSE" };
                     catalog
-                        .alter_table(&identifier, vec![reset()], false)
+                        .alter_table(&identifier, vec![set(same_value)], false)
                         .await
                         .unwrap();
-                }
-                give_the_table_a_snapshot(&catalog, &identifier).await;
-
-                let same_value = if enabled { "TRUE" } else { "FALSE" };
-                catalog
-                    .alter_table(&identifier, vec![set(same_value)], false)
-                    .await
-                    .unwrap();
-                if !enabled {
+                    let net_noop = if enabled {
+                        vec![reset(), set("true")]
+                    } else {
+                        vec![set("true"), reset()]
+                    };
                     catalog
-                        .alter_table(&identifier, vec![reset()], false)
+                        .alter_table(&identifier, net_noop, false)
                         .await
                         .unwrap();
+                    let before = catalog.get_table(&identifier).await.unwrap();
+                    let invalid_changes = if enabled {
+                        vec![set("false"), reset()]
+                    } else if key == ROW_TRACKING_ENABLED_OPTION {
+                        vec![set("true")]
+                    } else {
+                        vec![]
+                    };
+                    for change in invalid_changes {
+                        let result = catalog.alter_table(&identifier, vec![change], false).await;
+                        assert!(
+                            matches!(result, Err(Error::Unsupported { ref message }) if message.contains(key)),
+                            "expected change from {key}={enabled} to be rejected, got {result:?}"
+                        );
+                    }
+                    let after = catalog.get_table(&identifier).await.unwrap();
+                    assert_eq!(after.schema().id(), before.schema().id());
+                    assert_eq!(after.schema().options(), before.schema().options());
                 }
-                let before = catalog.get_table(&identifier).await.unwrap();
-                let invalid_changes = if enabled {
-                    vec![set("false"), reset()]
-                } else {
-                    vec![set("true")]
-                };
-                for change in invalid_changes {
-                    let result = catalog.alter_table(&identifier, vec![change], false).await;
-                    assert!(
-                        matches!(result, Err(Error::Unsupported { ref message }) if message.contains(key)),
-                        "expected change from {key}={enabled} to be rejected, got {result:?}"
-                    );
-                }
-                let after = catalog.get_table(&identifier).await.unwrap();
-                assert_eq!(after.schema().id(), before.schema().id());
-                assert_eq!(after.schema().options(), before.schema().options());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn enabling_data_evolution_preserves_row_ids_and_in_flight_appends() {
+        use crate::spec::SchemaChange;
+
+        let catalog = create_memory_catalog();
+        let (identifier, original) = create_row_layout_test_table(&catalog, true).await;
+        let builder = original.new_write_builder();
+        builder
+            .new_commit()
+            .commit(prepare_row_layout_append(&builder, 10).await)
+            .await
+            .unwrap();
+        assert_eq!(rows_with_ids(&original, "id").await, [(0, 10)]);
+
+        catalog
+            .alter_table(
+                &identifier,
+                vec![SchemaChange::set_option(
+                    "read.batch-size".into(),
+                    "1024".into(),
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+        let in_flight = prepare_row_layout_append(&builder, 20).await;
+        catalog
+            .alter_table(
+                &identifier,
+                vec![SchemaChange::set_option(
+                    DATA_EVOLUTION_ENABLED_OPTION.into(),
+                    "true".into(),
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+        builder.new_commit().commit(in_flight).await.unwrap();
+
+        let evolved = catalog.get_table(&identifier).await.unwrap();
+        let fresh = evolved.new_write_builder();
+        fresh
+            .new_commit()
+            .commit(prepare_row_layout_append(&fresh, 30).await)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows_with_ids(&evolved, "id").await,
+            [(0, 10), (1, 20), (2, 30)]
+        );
+
+        let historical = evolved
+            .copy_with_time_travel_strict(HashMap::from([("scan.snapshot-id".into(), "1".into())]))
+            .await
+            .unwrap();
+        assert_eq!(rows_with_ids(&historical, "id").await, [(0, 10)]);
+    }
+
+    #[tokio::test]
+    async fn enabling_data_evolution_preserves_reads_of_legacy_untracked_files() {
+        use crate::spec::SchemaChange;
+
+        let catalog = create_memory_catalog();
+        let (identifier, original) = create_row_layout_test_table(&catalog, true).await;
+        let table_path = catalog.table_path(&identifier);
+        // An old catalog allowed disabling row tracking and enabling it again.
+        let untracked = original
+            .schema()
+            .apply_changes(vec![SchemaChange::remove_option(
+                ROW_TRACKING_ENABLED_OPTION.into(),
+            )])
+            .unwrap();
+        catalog
+            .save_table_schema(&table_path, &untracked)
+            .await
+            .unwrap();
+        let untracked = catalog.get_table(&identifier).await.unwrap();
+        let builder = untracked.new_write_builder();
+        builder
+            .new_commit()
+            .commit(prepare_row_layout_append(&builder, 10).await)
+            .await
+            .unwrap();
+
+        let legacy_schema = untracked
+            .schema()
+            .apply_changes(vec![SchemaChange::set_option(
+                ROW_TRACKING_ENABLED_OPTION.into(),
+                "true".into(),
+            )])
+            .unwrap();
+        catalog
+            .save_table_schema(&table_path, &legacy_schema)
+            .await
+            .unwrap();
+
+        let result = catalog
+            .alter_table(
+                &identifier,
+                vec![SchemaChange::set_option(
+                    DATA_EVOLUTION_ENABLED_OPTION.into(),
+                    "true".into(),
+                )],
+                false,
+            )
+            .await;
+        let current = catalog.get_table(&identifier).await.unwrap();
+        let scan = current.new_read_builder().new_scan().plan().await;
+        assert!(scan.is_ok(), "ALTER result {result:?}, scan {scan:?}");
+        assert!(matches!(result, Err(Error::Unsupported { .. })));
+        assert_eq!(current.schema().id(), legacy_schema.id());
+    }
+
+    async fn create_row_layout_test_table(
+        catalog: &FileSystemCatalog,
+        row_tracking: bool,
+    ) -> (Identifier, Table) {
+        use crate::spec::{DataType, IntType};
+
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+        let identifier = Identifier::new("db", "events");
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option(ROW_TRACKING_ENABLED_OPTION, row_tracking.to_string())
+            .build()
+            .unwrap();
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap();
+        let table = catalog.get_table(&identifier).await.unwrap();
+        (identifier, table)
+    }
+
+    async fn prepare_row_layout_append(
+        builder: &crate::table::WriteBuilder<'_>,
+        id: i32,
+    ) -> Vec<crate::table::CommitMessage> {
+        use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+
+        let batch =
+            RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(vec![id])) as ArrayRef)])
+                .unwrap();
+        let mut writer = builder.new_write().unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        writer.prepare_commit().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn stale_copy_on_write_cannot_remove_a_partial_update_anchor() {
+        check_copy_on_write_across_data_evolution_enable(false).await;
+    }
+
+    #[tokio::test]
+    async fn enabling_data_evolution_preserves_copy_on_write_conflict_checks() {
+        check_copy_on_write_across_data_evolution_enable(true).await;
+    }
+
+    async fn check_copy_on_write_across_data_evolution_enable(cow_first: bool) {
+        use crate::spec::{DataType, IntType, SchemaChange};
+        use crate::table::CopyOnWriteMergeWriter;
+        use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch};
+
+        let catalog = create_memory_catalog();
+        catalog
+            .create_database("db", false, HashMap::new())
+            .await
+            .unwrap();
+        let identifier = Identifier::new("db", "row_layout_updates");
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option(ROW_TRACKING_ENABLED_OPTION, "true")
+            .build()
+            .unwrap();
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap();
+        let original = catalog.get_table(&identifier).await.unwrap();
+        let batch = RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+            ("value", Arc::new(Int32Array::from(vec![10])) as ArrayRef),
+        ])
+        .unwrap();
+        let builder = original.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        builder
+            .new_commit()
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        let mut cow = CopyOnWriteMergeWriter::new(&original, vec![], None)
+            .await
+            .unwrap();
+        cow.add_matched_delete(0, 0);
+        let delete = cow.prepare_commit().await.unwrap();
+        assert_eq!(delete.len(), 1);
+
+        catalog
+            .alter_table(
+                &identifier,
+                vec![SchemaChange::set_option(
+                    DATA_EVOLUTION_ENABLED_OPTION.into(),
+                    "true".into(),
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+        let evolved = catalog.get_table(&identifier).await.unwrap();
+        let update = RecordBatch::try_from_iter([
+            ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+            ("value", Arc::new(Int32Array::from(vec![100])) as ArrayRef),
+        ])
+        .unwrap();
+        let evolved_builder = evolved.new_write_builder();
+        let messages = evolved_builder
+            .new_update()
+            .unwrap()
+            .update_by_arrow_with_row_id(vec![update])
+            .await
+            .unwrap();
+        let commit = evolved_builder.new_commit();
+        let cow_commit = builder.new_commit();
+        if cow_first {
+            cow_commit.commit(delete).await.unwrap();
+            let result = commit.commit(messages).await;
+            assert!(
+                matches!(result, Err(Error::RowIdExistenceConflict { .. })),
+                "{result:?}"
+            );
+            assert!(rows_with_ids(&evolved, "value").await.is_empty());
+        } else {
+            commit.commit(messages).await.unwrap();
+            let result = cow_commit.commit(delete).await;
+            assert_eq!(
+                rows_with_ids(&evolved, "id").await,
+                [(0, 1)],
+                "copy-on-write commit result {result:?}"
+            );
+            assert!(
+                matches!(result, Err(Error::Unsupported { .. })),
+                "{result:?}"
+            );
+            assert_eq!(rows_with_ids(&evolved, "value").await, [(0, 100)]);
+        }
+    }
+
+    async fn rows_with_ids(table: &Table, column: &str) -> Vec<(i64, i32)> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{Int32Type, Int64Type};
+        use arrow_array::RecordBatch;
+        use futures::TryStreamExt;
+
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["_ROW_ID", column]).unwrap();
+        let plan = builder.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let row_ids = batch.column(0).as_primitive::<Int64Type>();
+            let ids = batch.column(1).as_primitive::<Int32Type>();
+            rows.extend(
+                row_ids
+                    .values()
+                    .iter()
+                    .copied()
+                    .zip(ids.values().iter().copied()),
+            );
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    #[tokio::test]
+    async fn first_commit_from_an_old_writer_keeps_the_current_row_layout() {
+        check_row_layout_while_altering(false).await;
+    }
+
+    #[tokio::test]
+    async fn first_snapshot_and_row_layout_alteration_cannot_race() {
+        check_row_layout_while_altering(true).await;
+    }
+
+    #[derive(Debug)]
+    struct PauseSchemaPublication {
+        operator: opendal::Operator,
+        pause_once: std::sync::atomic::AtomicBool,
+        started: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::io::FileIOProvider for PauseSchemaPublication {
+        async fn create(&self, path: &str) -> Result<(opendal::Operator, String)> {
+            let relative = path.strip_prefix("memory:/").unwrap();
+            if relative.ends_with("/schema/schema-1")
+                && self
+                    .pause_once
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.started.notify_one();
+                self.resume.notified().await;
+            }
+            Ok((self.operator.clone(), relative.into()))
+        }
+    }
+
+    async fn check_row_layout_while_altering(race_first_snapshot: bool) {
+        use crate::spec::SchemaChange;
+
+        let mut catalog = create_memory_catalog();
+        let provider = Arc::new(PauseSchemaPublication {
+            operator: opendal::Operator::from_config(opendal::services::MemoryConfig::default())
+                .unwrap(),
+            pause_once: std::sync::atomic::AtomicBool::new(race_first_snapshot),
+            started: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        catalog.file_io = crate::io::FileIOBuilder::new("memory")
+            .with_provider(provider.clone())
+            .build()
+            .unwrap();
+        let (identifier, original) = create_row_layout_test_table(&catalog, false).await;
+        let builder = original.new_write_builder();
+        let messages = prepare_row_layout_append(&builder, 1).await;
+
+        let alter = catalog.alter_table(
+            &identifier,
+            vec![SchemaChange::set_option(
+                ROW_TRACKING_ENABLED_OPTION.into(),
+                "true".into(),
+            )],
+            false,
+        );
+        tokio::pin!(alter);
+        let (alter, commit, paused) = tokio::select! {
+            result = &mut alter => (result, builder.new_commit().commit(messages).await, false),
+            () = provider.started.notified() => {
+                let committed = builder.new_commit().commit(messages).await;
+                provider.resume.notify_one();
+                (alter.await, committed, true)
+            }
+        };
+        commit.unwrap();
+        let current = catalog.get_table(&identifier).await.unwrap();
+        let snapshot = current
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot.next_row_id(),
+            current.schema().core_options().row_tracking_enabled().then_some(1),
+            "first snapshot has a different row layout from its table schema, ALTER paused before publication: {paused}, result: {alter:?}"
+        );
+        assert!(
+            matches!(alter, Err(Error::Unsupported { message }) if message.contains(ROW_TRACKING_ENABLED_OPTION))
+        );
+        assert_eq!(current.schema().id(), original.schema().id());
     }
 
     /// Give the table a first snapshot, so a test can assert that a rejection does

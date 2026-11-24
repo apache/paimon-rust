@@ -1647,14 +1647,34 @@ impl TableCommit {
                 .write_index_manifest(file_io, &manifest_dir, entries, created_files)
                 .await?;
         }
-        let schema_id = if update_files.is_empty() {
+        // A newer filesystem snapshot can contain partial updates whose anchors
+        // are among the full files a pre-evolution writer planned to remove.
+        let validate_rewrite_layout = self.snapshot_manager.uses_filesystem_snapshots()
+            && self.row_tracking_enabled
+            && !self.data_evolution_enabled
+            && resolved.kind == CommitKind::OVERWRITE
+            && latest_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.schema_id() > self.table.schema().id())
+            && resolved
+                .entries
+                .iter()
+                .any(|entry| *entry.kind() == FileKind::Delete);
+        let schema_id = if update_files.is_empty() && !validate_rewrite_layout {
             self.latest_schema_id().await?
         } else {
             // Every CAS retry resolves the schema again. Validate against the
             // same schema recorded by this attempt, including catalog-only DDL.
             let schema = self.latest_row_id_schema().await?;
-            self.validate_row_id_update_fields(&schema, &update_files)
-                .await?;
+            if validate_rewrite_layout && schema.core_options().data_evolution_enabled() {
+                return Err(crate::Error::Unsupported {
+                    message: "Table enabled data evolution after the write handle was opened. Reload the table before replacing files.".into(),
+                });
+            }
+            if !update_files.is_empty() {
+                self.validate_row_id_update_fields(&schema, &update_files)
+                    .await?;
+            }
             schema.id()
         };
         let statistics_file = self

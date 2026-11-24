@@ -60,6 +60,10 @@ impl SnapshotManager {
         &self.file_io
     }
 
+    pub(super) fn uses_filesystem_snapshots(&self) -> bool {
+        self.rest_env.is_none()
+    }
+
     /// Path to the snapshot directory (e.g. `table_path/snapshot`).
     pub fn snapshot_dir(&self) -> String {
         let branch_path = if self.branch == DEFAULT_MAIN_BRANCH {
