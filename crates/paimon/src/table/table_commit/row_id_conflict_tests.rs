@@ -106,6 +106,101 @@ fn row_id_check_message(name: &str, column: &str) -> CommitMessage {
     message
 }
 
+struct ConcurrentManifestReplacement {
+    manager: SnapshotManager,
+    replacement: Snapshot,
+}
+
+#[async_trait::async_trait]
+impl SnapshotCommit for ConcurrentManifestReplacement {
+    async fn commit(
+        &self,
+        _: Option<&str>,
+        snapshot: &Snapshot,
+        _: &str,
+        _: &[PartitionStatistics],
+    ) -> Result<bool> {
+        if snapshot.id() == self.replacement.id() {
+            assert!(self.manager.commit_snapshot(&self.replacement).await?);
+            return Ok(false);
+        }
+        self.manager.commit_snapshot(snapshot).await
+    }
+}
+
+#[tokio::test]
+async fn row_id_update_retry_reloads_base_after_overwrite() {
+    let io = test_file_io();
+    let path = "memory:/row-id-reassignment-during-commit";
+    setup_dirs(&io, path).await;
+    let mut commit = setup_data_evolution_commit(&io, path);
+    let mut base = append_message("base.parquet");
+    base.partition = EMPTY_SERIALIZED_ROW.clone();
+    base.new_files[0].file_source = Some(0);
+    commit.commit_with_identifier(vec![base], 1).await.unwrap();
+
+    let initial = latest_snapshot(&io, path).await.unwrap();
+    let mut reassigned = active_entries(&io, path, &initial).await;
+    assert_eq!(reassigned[0].file().first_row_id, Some(0));
+    reassigned[0].file.first_row_id = Some(10);
+
+    // Java row-ID reassignment replaces the base manifest and publishes an empty delta.
+    let manifest_dir = commit.snapshot_manager.manifest_dir();
+    let base_metas = commit
+        .write_manifest_files(
+            &io,
+            &manifest_dir,
+            "reassigned",
+            &reassigned,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+    let base_list = "manifest-list-reassigned-base";
+    let delta_list = "manifest-list-reassigned-delta";
+    ManifestList::write(&io, &format!("{manifest_dir}/{base_list}"), &base_metas)
+        .await
+        .unwrap();
+    ManifestList::write(&io, &format!("{manifest_dir}/{delta_list}"), &[])
+        .await
+        .unwrap();
+    let replacement = Snapshot::builder()
+        .version(3)
+        .id(2)
+        .schema_id(initial.schema_id())
+        .base_manifest_list(base_list.to_string())
+        .delta_manifest_list(delta_list.to_string())
+        .commit_user("row-id-reassignment".to_string())
+        .commit_identifier(BATCH_COMMIT_IDENTIFIER)
+        .commit_kind(CommitKind::OVERWRITE)
+        .time_millis(current_time_millis())
+        .total_record_count(initial.total_record_count())
+        .delta_record_count(Some(0))
+        .next_row_id(Some(20))
+        .build();
+    commit.snapshot_commit = Arc::new(ConcurrentManifestReplacement {
+        manager: commit.snapshot_manager.clone(),
+        replacement,
+    });
+    commit.commit_min_retry_wait_ms = 0;
+    commit.commit_max_retry_wait_ms = 0;
+
+    let error = commit
+        .commit_with_identifier(vec![row_id_check_message("staged.parquet", "name")], 2)
+        .await
+        .expect_err("the old range no longer exists after the concurrent overwrite");
+    assert!(matches!(
+        error,
+        crate::Error::RowIdExistenceConflict {
+            first_row_id: Some(0),
+            ..
+        }
+    ));
+    let latest = latest_snapshot(&io, path).await.unwrap();
+    assert_eq!(latest.id(), 2);
+    assert_eq!(active_entries(&io, path, &latest).await, reassigned);
+}
+
 async fn row_id_check_history(path: &str) -> TableCommit {
     let io = test_file_io();
     setup_dirs(&io, path).await;

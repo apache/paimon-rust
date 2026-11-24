@@ -199,7 +199,7 @@ impl PyTable {
 
     /// REST catalog table identity used by callers with an already resolved schema.
     fn rest_table_uuid(&self) -> Option<&str> {
-        self.inner.rest_env().map(|env| env.uuid())
+        self.inner.rest_table_uuid()
     }
 
     fn schema(&self) -> PyTableSchema {

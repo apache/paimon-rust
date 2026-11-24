@@ -408,6 +408,9 @@ async fn fuse_validation_caches_success_but_never_swallows_rest_errors() {
 #[tokio::test]
 async fn external_tables_ignore_fuse_and_invalid_fuse_options_fail_for_internal_tables() {
     let g = written("external_fuse", people, vec![]).await;
+    g.ctx
+        .server
+        .set_table_external("default", "external_fuse", true);
     let mut options = g.ctx.catalog.options().clone();
     options.set("fuse.enabled", "true");
     let catalog = RESTCatalog::new(options.clone(), false).await.unwrap();

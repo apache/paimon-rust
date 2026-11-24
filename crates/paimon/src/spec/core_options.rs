@@ -73,6 +73,7 @@ const COMMIT_MAX_RETRIES_OPTION: &str = "commit.max-retries";
 const COMMIT_TIMEOUT_OPTION: &str = "commit.timeout";
 const COMMIT_MIN_RETRY_WAIT_OPTION: &str = "commit.min-retry-wait";
 const COMMIT_MAX_RETRY_WAIT_OPTION: &str = "commit.max-retry-wait";
+const SNAPSHOT_IGNORE_EMPTY_COMMIT_OPTION: &str = "snapshot.ignore-empty-commit";
 const FILE_COMPRESSION_OPTION: &str = "file.compression";
 const FILE_COMPRESSION_ZSTD_LEVEL_OPTION: &str = "file.compression.zstd-level";
 const FILE_FORMAT_OPTION: &str = "file.format";
@@ -1544,6 +1545,12 @@ impl<'a> CoreOptions<'a> {
             .map(str::to_string)
             .collect();
         (!keys.is_empty()).then_some(keys)
+    }
+
+    pub(crate) fn snapshot_ignore_empty_commit(&self) -> bool {
+        self.options
+            .get(SNAPSHOT_IGNORE_EMPTY_COMMIT_OPTION)
+            .is_none_or(|value| !value.eq_ignore_ascii_case("false"))
     }
 
     pub fn commit_max_retries(&self) -> u32 {

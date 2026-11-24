@@ -1577,12 +1577,26 @@ async fn metadata_replace_view_preserves_physical_name_collisions() {
 
 async fn assert_metadata_ddl_preserves_physical_table(name: &str, ddl: &str) {
     let env = setup_with_engine(Some(Arc::new(MetadataEngineResolver::default()))).await;
-    env.ctx
+    let error = env
+        .ctx
         .sql(&format!(
             "CREATE TABLE {CATALOG}.{DB}.\"{name}\" (id INT NOT NULL)"
         ))
         .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("reserved branch or system table suffix"));
+
+    // An older writer could leave a physical table at a reserved name.
+    env.ctx
+        .sql(&format!(
+            "CREATE TABLE {CATALOG}.{DB}.legacy_table (id INT NOT NULL)"
+        ))
+        .await
         .unwrap();
+    let database_path = env._paimon_dir.path().join(format!("{DB}.db"));
+    std::fs::rename(database_path.join("legacy_table"), database_path.join(name)).unwrap();
     let identifier = Identifier::new(DB, name);
     let table = env.catalog.get_table(&identifier).await.unwrap();
     let batch = RecordBatch::try_new(

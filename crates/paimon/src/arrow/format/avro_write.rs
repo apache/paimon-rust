@@ -661,24 +661,26 @@ mod tests {
     fn blob_fields_require_java_serializable_references() {
         let typ = DataType::Blob(BlobType::new());
         let descriptor = BlobDescriptor::new("memory:/blob-data".into(), 2, 4).serialize();
+        // Version 1 stores the same fields without the magic header.
+        let legacy_descriptor = [&[1][..], &descriptor[9..]].concat();
         let view = BlobViewStruct::new(Identifier::new("db", "source"), 3, 42)
             .serialize()
             .unwrap();
         let valid = LargeBinaryArray::from(vec![
             Some(descriptor.as_slice()),
+            Some(legacy_descriptor.as_slice()),
             Some(view.as_slice()),
             None,
         ]);
+        let encoded_descriptor = Value::Union(1, Box::new(Value::Bytes(descriptor)));
+        assert_eq!(value_at(&valid, 0, &typ).unwrap(), encoded_descriptor);
+        assert_eq!(value_at(&valid, 1, &typ).unwrap(), encoded_descriptor);
         assert_eq!(
-            value_at(&valid, 0, &typ).unwrap(),
-            Value::Union(1, Box::new(Value::Bytes(descriptor)))
-        );
-        assert_eq!(
-            value_at(&valid, 1, &typ).unwrap(),
+            value_at(&valid, 2, &typ).unwrap(),
             Value::Union(1, Box::new(Value::Bytes(view)))
         );
         assert_eq!(
-            value_at(&valid, 2, &typ).unwrap(),
+            value_at(&valid, 3, &typ).unwrap(),
             Value::Union(0, Box::new(Value::Null))
         );
         let raw = LargeBinaryArray::from(vec![b"raw blob".as_slice()]);

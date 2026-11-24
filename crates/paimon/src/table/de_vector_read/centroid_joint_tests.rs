@@ -176,23 +176,25 @@ async fn joint_routes_use_four_shards_only_with_matching_local_nlists() {
     let router_entry = entry(Role::Router(64), bytes.len(), 0, Some(b"l2"));
     store(&io, &router_entry, bytes).await;
     let mut entries = vec![router_entry];
-    for id in 0..64 {
+    for id in 0..8 {
         let base = if id < 4 { 100.0 + id as f32 } else { 0.0 };
-        let (bytes, count) = if id < 8 {
-            (flat_shard(64, base, id * ROWS, 3), ROWS)
-        } else {
-            (centroid_index::EMPTY_SHARD.to_vec(), 0)
-        };
+        let bytes = flat_shard(64, base, id * ROWS, 3);
         let payload = 64i32.to_be_bytes();
-        let shard = entry(
-            Role::Shard(id),
-            bytes.len(),
-            count,
-            (count != 0).then_some(&payload),
-        );
+        let shard = entry(Role::Shard(id), bytes.len(), ROWS, Some(&payload));
         store(&io, &shard, bytes).await;
         entries.push(shard);
     }
+    let explicit = run(
+        &io,
+        &entries,
+        &[630.0],
+        HashMap::from([("centroid.nprobe".into(), "1".into())]),
+    )
+    .await;
+    assert!(explicit[0].row_ids.is_empty());
+    let widened = run(&io, &entries, &[630.0], HashMap::new()).await;
+    assert_eq!(widened[0].row_ids.len(), 10);
+
     let queries = [0.0, 70.0];
     let joint = run(&io, &entries, &queries, HashMap::new()).await;
     assert_eq!(joint[0].row_ids.len(), 10);

@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 impl Table {
     /// Reuse the matching REST response and merged catalog options without config/get-table requests.
-    /// Preserves REST snapshots, credential refresh and local caching.
+    /// Preserves snapshot ownership, credential refresh and local caching.
     pub async fn from_rest_response(
         identifier: Identifier,
         response: crate::api::GetTableResponse,
@@ -299,7 +299,7 @@ impl RESTEnv {
         .await
     }
 
-    /// Load a REST table and attach a fresh RESTEnv to it.
+    /// Load table metadata and attach a RESTEnv for catalog-managed tables.
     pub(crate) async fn load_table(
         identifier: &Identifier,
         api: Arc<RESTApi>,
@@ -441,8 +441,25 @@ impl RESTEnv {
         )
         .await?;
 
+        let parsed_identifier = identifier.parsed_object_name()?;
+        let branch = parsed_identifier.branch_or_default().to_string();
+        let branch_reference = parsed_identifier.branch().is_some();
+        let table = Table::new(file_io, identifier, table_path, table_schema, None);
+
+        let mut table = table.copy_with_resolved_schema(table.schema().clone(), &branch)?;
+        table.branch_reference = branch_reference;
+        // Cache the catalog definition before any caller applies dynamic
+        // overrides. Historical DV checks must see the stored schema options.
+        table
+            .schema_manager()
+            .cache_resolved_schema(table.schema().clone());
+        if is_external {
+            table.external_rest_uuid = Some(uuid);
+            return Ok(table);
+        }
+
         let mut rest_env = RESTEnv::new(
-            identifier.clone(),
+            table.identifier().clone(),
             uuid,
             api,
             options,
@@ -451,25 +468,7 @@ impl RESTEnv {
             file_io_cache,
         );
         rest_env.fuse_resolver = fuse_resolver;
-        let parsed_identifier = identifier.parsed_object_name()?;
-        let branch = parsed_identifier.branch_or_default().to_string();
-        let branch_reference = parsed_identifier.branch().is_some();
-        let table = Table::new(
-            file_io,
-            identifier,
-            table_path,
-            table_schema,
-            Some(rest_env),
-        );
-
-        // Minted after the schema-replacing copy, which drops any session.
-        let mut table = table.copy_with_resolved_schema(table.schema().clone(), &branch)?;
-        table.branch_reference = branch_reference;
-        // Cache the catalog definition before any caller applies dynamic
-        // overrides. Historical DV checks must see the stored schema options.
-        table
-            .schema_manager()
-            .cache_resolved_schema(table.schema().clone());
+        table.rest_env = Some(rest_env);
         Ok(table.with_query_auth_session())
     }
 

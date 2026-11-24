@@ -924,6 +924,7 @@ async fn setup_rest_catalog_with_tables(
     for (database, table_name, schema) in table_configs {
         let table_path = format!("{catalog_path}/{database}.db/{table_name}");
         server.add_table_with_schema(database, table_name, schema.clone(), &table_path);
+        server.set_table_external(database, table_name, true);
     }
 
     let url = server.url().expect("Failed to get server URL");

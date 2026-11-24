@@ -134,13 +134,14 @@ impl BlobDescriptor {
         Ok(BlobRangeSpec { offset, length })
     }
 
+    /// Serialize in the current wire format, including descriptors read from version 1.
     pub fn serialize(&self) -> Vec<u8> {
         let uri_bytes = self.uri.as_bytes();
         let uri_length = uri_bytes.len();
         let total_size = 1 + 8 + 4 + uri_length + 8 + 8;
         let mut buf = Vec::with_capacity(total_size);
 
-        buf.push(self.version);
+        buf.push(CURRENT_VERSION);
         buf.extend_from_slice(&MAGIC.to_le_bytes());
         buf.extend_from_slice(&(uri_length as i32).to_le_bytes());
         buf.extend_from_slice(uri_bytes);
@@ -249,6 +250,23 @@ mod tests {
         assert_eq!(desc, deserialized);
         assert_eq!(deserialized.version(), CURRENT_VERSION);
         deserialized.validate().unwrap();
+    }
+
+    #[test]
+    fn test_reserialize_legacy_descriptor_as_current_version() {
+        let uri = "s3://bucket/legacy.blob";
+        let mut v1 = vec![1];
+        v1.extend_from_slice(&(uri.len() as i32).to_le_bytes());
+        v1.extend_from_slice(uri.as_bytes());
+        v1.extend_from_slice(&100_i64.to_le_bytes());
+        v1.extend_from_slice(&2048_i64.to_le_bytes());
+
+        let descriptor = BlobDescriptor::deserialize(&v1).unwrap();
+        assert_eq!(descriptor.version(), 1);
+
+        let serialized = descriptor.serialize();
+        let roundtrip = BlobDescriptor::deserialize(&serialized).unwrap();
+        assert_eq!(roundtrip, BlobDescriptor::new(uri.to_string(), 100, 2048));
     }
 
     #[test]
