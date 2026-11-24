@@ -110,7 +110,7 @@ async fn search(
 }
 
 #[tokio::test]
-async fn reads_java_centroid_manifest_and_single_bitmap_across_schema_evolution() {
+async fn reads_java_centroid_manifest_and_field_bitmaps_across_schema_evolution() {
     let fixture = java_fixture::unpack();
     let catalog = catalog(&fixture.path().join("warehouse"));
     let identifier = Identifier::new("test", "centroid_bitmap");
@@ -122,25 +122,45 @@ async fn reads_java_centroid_manifest_and_single_bitmap_across_schema_evolution(
         .find(|file| descriptor(file)[9] == b'R' && file.file_size == 0)
         .unwrap();
     assert_eq!(&descriptor(empty_router)[10..], b"\0\0\0\0l2");
-    let empty_shard = files
+    assert!(table
+        .file_io()
+        .exists(&format!(
+            "{}/index/{}",
+            table.location().trim_end_matches('/'),
+            empty_router.file_name
+        ))
+        .await
+        .unwrap());
+    let router = files
         .iter()
-        .find(|file| descriptor(file)[9] == b'S' && file.row_count == 0)
+        .find(|file| descriptor(file)[9] == b'R' && file.file_size > 0)
         .unwrap();
-    assert_eq!(descriptor(empty_shard).len(), 14);
-    assert_eq!(empty_shard.file_size, 8);
-    let shard = files
-        .iter()
-        .find(|file| descriptor(file)[9] == b'S' && file.row_count > 0)
-        .unwrap();
+    assert_eq!(&descriptor(router)[10..14], &2i32.to_be_bytes());
+    let mut shards = files.iter().filter(|file| descriptor(file)[9] == b'S');
+    let shard = shards.next().unwrap();
+    assert!(shards.next().is_none());
+    assert_eq!(shard.row_count, 4);
     assert_eq!(&descriptor(shard)[14..], &1i32.to_be_bytes());
-    let bitmap = files
+    let bitmaps = files
         .iter()
-        .find(|file| descriptor(file)[9] == b'B')
-        .unwrap();
-    assert_eq!(descriptor(bitmap).len(), 14);
-    assert_eq!(&descriptor(bitmap)[10..14], &descriptor(shard)[10..14]);
+        .filter(|file| descriptor(file)[9] == b'B')
+        .map(|file| {
+            (
+                i32::from_be_bytes(descriptor(file)[10..14].try_into().unwrap()),
+                file,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(bitmaps.keys().copied().collect::<Vec<_>>(), [0, 2]);
+    assert!(bitmaps
+        .values()
+        .all(|file| file.row_count == 4 && descriptor(file).len() > 14));
+    let bitmap = bitmaps.get(&2).unwrap();
     let bitmap_meta = bitmap.global_index_meta.as_ref().unwrap();
-    assert_eq!(bitmap_meta.extra_field_ids.as_deref(), Some([2].as_slice()));
+    assert_eq!(
+        bitmap_meta.extra_field_ids.as_deref(),
+        Some([0, 2].as_slice())
+    );
     let source =
         DataEvolutionIndexSourceMeta::deserialize(bitmap_meta.source_meta.as_deref().unwrap())
             .unwrap();
@@ -164,6 +184,11 @@ async fn reads_java_centroid_manifest_and_single_bitmap_across_schema_evolution(
         search(&table, "v", Some(predicates.is_null("status").unwrap()), 1).await,
         [2]
     );
+    let filter = Predicate::or(vec![
+        predicates.equal("id", Datum::Int(1)).unwrap(),
+        predicates.is_null("status").unwrap(),
+    ]);
+    assert_eq!(search(&table, "v", Some(filter), 1).await, [1]);
 
     catalog
         .alter_table(

@@ -21,7 +21,7 @@ use super::{
     VectorIndexWork, VectorMetricCheck, VectorSearchEvaluation,
 };
 use crate::spec::{IndexManifestEntry, VectorIndexOptions};
-use crate::table::centroid_bitmap::BitmapPredicate;
+use crate::table::centroid_bitmap::{rows_for_centroid, BitmapPredicate};
 use crate::table::centroid_index::{self, Descriptor, Generation, Role, Router};
 use crate::table::RowRange;
 use crate::vector_search::{ScoredRowIds, VectorSearch};
@@ -32,6 +32,7 @@ use paimon_vindex_core::index::VectorIndexMetadata;
 use paimon_vindex_core::io::SeekRead;
 use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, HashMap};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 type CentroidFiles<'a> = HashMap<&'a str, Generation<'a>>;
@@ -196,7 +197,7 @@ pub(super) async fn execute_work(
     let Role::Router(nlist) = group.descriptor.role else {
         unreachable!()
     };
-    if nlist == 0 {
+    if group.vector_count == 0 {
         return Ok((
             vec![ScoredRowIds::empty(); work.queries.len()],
             IndexSearchTiming::default(),
@@ -401,11 +402,13 @@ impl RoutedSearch<'_> {
             self.resolve_joint_routes(queries, &mut routes);
         }
 
+        let mut bitmap_matches = None;
+        let mut shard_bitmap_matches = HashMap::new();
         loop {
             let mut queries_by_centroid = BTreeMap::<_, Vec<_>>::new();
             for (index, route) in routes.iter_mut().enumerate() {
                 for &centroid in &route.nearest[route.visited..route.width] {
-                    if group.shards[&centroid].index_file.row_count > 0 {
+                    if group.shards.contains_key(&centroid) {
                         let probe = if route.joint {
                             Probe::Joint
                         } else {
@@ -423,37 +426,24 @@ impl RoutedSearch<'_> {
                 let (indices, probes): (Vec<_>, Vec<_>) = pending.into_iter().unzip();
                 let mut shard = self.shard_work(queries, centroid, &indices);
                 if let Some(bitmap) = self.bitmap {
-                    let table = self.evaluation.table.ok_or_else(|| {
-                        centroid_index::invalid("Centroid Bitmap search requires table context")
-                    })?;
-                    let file = &group
-                        .bitmaps
-                        .get(&centroid)
-                        .ok_or_else(|| centroid_index::invalid("Missing centroid Bitmap file"))?
-                        .index_file;
-                    let source = file.global_index_meta.as_ref().unwrap();
-                    let mut filter = bitmap.predicate.matching(table, file).await?;
-                    for range in &bitmap.deleted {
-                        if range.from() < source.row_range_start
-                            || range.to() > source.row_range_end
-                            || range.from() > range.to()
-                        {
-                            return Err(centroid_index::invalid(
-                                "Invalid deletion range for centroid Bitmap task",
-                            ));
+                    let matches = match &bitmap_matches {
+                        Some(matches) => matches,
+                        None => bitmap_matches.insert(self.load_bitmap_matches(bitmap).await?),
+                    };
+                    let (rows, deleted) = matches;
+                    let filter = shard_bitmap_matches.entry(centroid).or_insert_with(|| {
+                        let mut filter = rows_for_centroid(rows, group.range_size, centroid);
+                        for range in deleted {
+                            filter.remove_range(range.clone());
                         }
-                        filter.remove_range(
-                            (range.from() - source.row_range_start) as u64
-                                ..=(range.to() - source.row_range_start) as u64,
-                        );
-                    }
+                        Arc::new(filter)
+                    });
                     if filter.is_empty() {
                         continue;
                     }
-                    let filter = Arc::new(filter);
                     for query in &mut shard.queries {
                         let eligible = query.effective_include_row_ids().map_or_else(
-                            || Arc::clone(&filter),
+                            || Arc::clone(filter),
                             |include| Arc::new(include & filter.as_ref()),
                         );
                         query.set_shared_include_row_ids(eligible);
@@ -500,6 +490,39 @@ impl RoutedSearch<'_> {
         Ok(routes.into_iter().map(|route| route.hits).collect())
     }
 
+    async fn load_bitmap_matches(
+        &self,
+        bitmap: &BitmapWork,
+    ) -> Result<(RoaringTreemap, Vec<RangeInclusive<u64>>)> {
+        let table = self.evaluation.table.ok_or_else(|| {
+            centroid_index::invalid("Centroid Bitmap search requires table context")
+        })?;
+        let matches = bitmap.predicate.matching(table, self.group).await?;
+        let source = self
+            .group
+            .router
+            .index_file
+            .global_index_meta
+            .as_ref()
+            .unwrap();
+        let mut deleted = Vec::with_capacity(bitmap.deleted.len());
+        for range in &bitmap.deleted {
+            if range.from() < source.row_range_start
+                || range.to() > source.row_range_end
+                || range.from() > range.to()
+            {
+                return Err(centroid_index::invalid(
+                    "Invalid deletion range for centroid Bitmap task",
+                ));
+            }
+            deleted.push(
+                (range.from() - source.row_range_start) as u64
+                    ..=(range.to() - source.row_range_start) as u64,
+            );
+        }
+        Ok((matches, deleted))
+    }
+
     fn shard_work(
         &self,
         queries: &[VectorSearch],
@@ -529,9 +552,10 @@ impl RoutedSearch<'_> {
                 continue;
             }
             let compatible = route.nearest[..JOINT_OUTER_PROBES].iter().all(|id| {
-                self.group.shards[id].index_file.row_count
-                    >= (JOINT_INNER_PROBES * query.limit) as i64
-                    && self.group.local_nlists.get(id) == Some(&SHARD_LISTS)
+                self.group.shards.get(id).is_some_and(|entry| {
+                    entry.index_file.row_count >= (JOINT_INNER_PROBES * query.limit) as i64
+                        && self.group.local_nlists.get(id) == Some(&SHARD_LISTS)
+                })
             });
             if compatible {
                 route.width = JOINT_OUTER_PROBES;

@@ -20,7 +20,7 @@ use crate::spec::{extract_datum_from_arrow, CoreOptions, DataField};
 use crate::table::bitmap_global_index_format::{
     make_bitmap_key_comparator, serialize_bitmap_datum,
 };
-use crate::table::bitmap_global_index_writer::write_sorted_bitmap_section;
+use crate::table::bitmap_global_index_writer::write_sorted_bitmap_file;
 use crate::table::centroid_index::{self, Descriptor, Role};
 use crate::table::index_build::{
     fields::validate_btree_field,
@@ -93,37 +93,37 @@ impl BitmapBuild {
         self.fields.iter()
     }
 
+    pub(super) fn sorters(&self) -> Vec<IndexSorter> {
+        self.fields()
+            .map(|field| {
+                IndexSorter::new(
+                    self.sort_budget,
+                    make_bitmap_key_comparator(field.data_type()),
+                )
+            })
+            .collect()
+    }
+
     pub(super) async fn write(
         &self,
         output: OutputFile,
-        columns: Vec<SortedRows>,
+        rows: SortedRows,
         row_count: i64,
-        centroid: usize,
+        field_id: i32,
     ) -> Result<IndexPayload> {
         let mut writer = output.writer().await?;
-        let mut directory = Vec::with_capacity((self.fields.len() - 1) * 8);
-        let mut offset = 0u64;
-        for (section, column) in columns.into_iter().enumerate() {
-            if section > 0 {
-                directory.extend(offset.to_be_bytes());
-            }
-            let (length, result) =
-                write_sorted_bitmap_section(writer.as_mut(), column, &self.options).await?;
-            if result.row_count != row_count as u64 {
-                return Err(centroid_index::invalid(
-                    "Centroid Bitmap row count mismatch",
-                ));
-            }
-            offset = offset
-                .checked_add(length as u64)
-                .ok_or_else(|| centroid_index::invalid("Centroid Bitmap file is too large"))?;
+        let result = write_sorted_bitmap_file(writer.as_mut(), rows, &self.options).await?;
+        if result.row_count != row_count as u64 {
+            return Err(centroid_index::invalid(
+                "Centroid Bitmap row count mismatch",
+            ));
         }
         writer.close().await?;
         Ok(IndexPayload {
             row_count,
             index_meta: Descriptor {
-                role: Role::Bitmap(centroid),
-                payload: Some(&directory),
+                role: Role::Bitmap(field_id as usize),
+                payload: Some(&result.meta.serialize()),
             }
             .encode()?,
         })
@@ -237,26 +237,21 @@ pub(super) struct BitmapSpillReader {
 impl BitmapSpillReader {
     /// Both the routed IDs and the spilled offsets follow source row order.
     /// Relative seeks retain buffered reads for nearby rows.
-    pub(super) fn sort(
+    pub(super) fn add_rows(
         &mut self,
-        bitmap: &BitmapBuild,
+        sorters: &mut [IndexSorter],
         row_ids: impl Iterator<Item = Result<i64>>,
-    ) -> Result<Vec<SortedRows>> {
-        let mut sorters = bitmap
-            .fields()
-            .map(|field| {
-                IndexSorter::new(
-                    bitmap.sort_budget,
-                    make_bitmap_key_comparator(field.data_type()),
-                )
-            })
-            .collect::<Vec<_>>();
+        row_id_base: i64,
+    ) -> Result<()> {
         self.offsets.rewind().map_err(spill_error)?;
         self.keys.rewind().map_err(spill_error)?;
         let mut offsets_pos = 0;
         let mut keys_pos = 0;
         for row_id in row_ids {
             let row_id = row_id?;
+            let bitmap_row_id = row_id_base
+                .checked_add(row_id)
+                .ok_or_else(|| centroid_index::invalid("Centroid Bitmap position overflow"))?;
             let offset =
                 offset_slot(u64::try_from(row_id).map_err(crate::table::index_build::error)?)?;
             seek_relative(&mut self.offsets, offsets_pos, offset)?;
@@ -268,7 +263,7 @@ impl BitmapSpillReader {
                 .ok_or_else(|| centroid_index::invalid("Missing scalar key for a centroid row"))?;
             seek_relative(&mut self.keys, keys_pos, key_offset)?;
             keys_pos = key_offset;
-            for sorter in &mut sorters {
+            for sorter in &mut *sorters {
                 let mut bytes = [0; size_of::<u32>()];
                 self.keys.read_exact(&mut bytes).map_err(spill_error)?;
                 keys_pos += bytes.len() as u64;
@@ -281,10 +276,10 @@ impl BitmapSpillReader {
                     keys_pos += u64::from(len);
                     Some(key)
                 };
-                sorter.push((key, row_id))?;
+                sorter.push((key, bitmap_row_id))?;
             }
         }
-        sorters.into_iter().map(IndexSorter::finish).collect()
+        Ok(())
     }
 }
 

@@ -23,12 +23,11 @@ use crate::spec::{DataEvolutionIndexSourceMeta, IndexFileMeta, IndexManifestEntr
 use crate::{Error, Result};
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::CentroidRouter;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 const META_MAGIC: &[u8; 8] = b"PAIMCENT";
 const META_HEADER: usize = 14;
 const META_VERSION: u8 = 1;
-pub(super) const EMPTY_SHARD: &[u8] = b"PCEMPTY1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Role {
@@ -146,10 +145,42 @@ pub(super) struct Generation<'a> {
     pub(super) descriptor: Descriptor<'a>,
     pub(super) shards: BTreeMap<usize, &'a IndexManifestEntry>,
     pub(super) local_nlists: BTreeMap<usize, usize>,
-    pub(super) bitmaps: BTreeMap<usize, &'a IndexManifestEntry>,
+    pub(super) bitmaps: BTreeMap<i32, &'a IndexManifestEntry>,
     pub(super) bitmap_schema_id: Option<i64>,
+    pub(super) range_size: u64,
     pub(super) vector_count: u64,
     pub(super) files: Vec<&'a IndexManifestEntry>,
+}
+
+type GenerationKey<'a> = (&'a [u8], i32, &'a str, i32, i64, i64);
+
+fn generation_key(entry: &IndexManifestEntry) -> GenerationKey<'_> {
+    let file = &entry.index_file;
+    let meta = file.global_index_meta.as_ref().unwrap();
+    (
+        &entry.partition,
+        entry.bucket,
+        &file.index_type,
+        meta.index_field_id,
+        meta.row_range_start,
+        meta.row_range_end,
+    )
+}
+
+pub(super) fn check_complete_retirement(
+    retired: &[IndexManifestEntry],
+    retained: &[IndexManifestEntry],
+) -> Result<()> {
+    let retired: HashSet<_> = retired.iter().map(generation_key).collect();
+    for generation in group(retained)? {
+        if retired.contains(&generation_key(generation.router)) {
+            return Err(invalid(format!(
+                "Cannot partially retire a complete centroid generation for '{}'",
+                generation.router.index_file.file_name
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn group<'a>(
@@ -163,16 +194,8 @@ pub(super) fn group<'a>(
         let Some(descriptor) = Descriptor::parse(file)? else {
             continue;
         };
-        let meta = file.global_index_meta.as_ref().unwrap();
         grouped
-            .entry((
-                entry.partition.as_slice(),
-                entry.bucket,
-                file.index_type.as_str(),
-                meta.index_field_id,
-                meta.row_range_start,
-                meta.row_range_end,
-            ))
+            .entry(generation_key(entry))
             .or_default()
             .push((entry, descriptor));
     }
@@ -234,11 +257,14 @@ pub(super) fn group<'a>(
                         }
                     }
                     Role::Shard(id) => {
-                        if file.file_size == 0 || id >= nlist || shards.insert(id, *entry).is_some()
+                        if file.file_size == 0
+                            || file.row_count == 0
+                            || id >= nlist
+                            || shards.insert(id, *entry).is_some()
                         {
                             return Err(invalid());
                         }
-                        if has_local_nlist && file.row_count > 0 {
+                        if has_local_nlist {
                             local_nlists.insert(id, desc.local_nlist()?);
                         } else if desc.payload.is_some() {
                             return Err(invalid());
@@ -248,29 +274,24 @@ pub(super) fn group<'a>(
                             .ok_or_else(invalid)?;
                     }
                     Role::Bitmap(id) => {
-                        if extra.is_empty()
+                        let field = id as i32;
+                        if !extra.contains(&field)
                             || file.file_size == 0
-                            || id >= nlist
-                            || bitmaps.insert(id, *entry).is_some()
+                            || bitmaps.insert(field, *entry).is_some()
                         {
                             return Err(invalid());
                         }
                     }
                 }
             }
-            if router_count != 1
-                || shards.len() != nlist
-                || vector_count > range_len
-                || (nlist != 0 && vector_count == 0)
-            {
+            if router_count != 1 || vector_count > range_len || (nlist != 0 && vector_count == 0) {
                 return Err(invalid());
             }
-            if !extra.is_empty()
-                && shards.iter().any(|(id, shard)| {
-                    let count = shard.index_file.row_count;
-                    bitmaps.get(id).map(|entry| entry.index_file.row_count)
-                        != (count > 0).then_some(count)
-                })
+            let expected_bitmaps = if vector_count == 0 { 0 } else { extra.len() };
+            if bitmaps.len() != expected_bitmaps
+                || bitmaps
+                    .values()
+                    .any(|entry| entry.index_file.row_count as u64 != vector_count)
             {
                 return Err(invalid());
             }
@@ -292,6 +313,7 @@ pub(super) fn group<'a>(
                 local_nlists,
                 bitmaps,
                 bitmap_schema_id,
+                range_size: range_len,
                 vector_count,
                 files: files.into_iter().map(|(entry, _)| entry).collect(),
             })
