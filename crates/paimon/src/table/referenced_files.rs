@@ -32,7 +32,6 @@ use crate::spec::{
     bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta, IndexManifest, Manifest,
     ManifestEntry, ManifestFileMeta, PartitionComputer,
 };
-use crate::table::centroid_index::Descriptor;
 use crate::table::{BranchManager, RESTEnv, SnapshotManager, Table, TagManager};
 use futures::future::try_join_all;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -641,9 +640,6 @@ async fn collect_snapshot_files(
         }
 
         for entry in &index_entries.0 {
-            if Descriptor::is_manifest_only_router(&entry.index_file) {
-                continue;
-            }
             file_set
                 .index_files
                 .entry(entry.index_file.file_name.clone())

@@ -30,7 +30,6 @@ use crate::spec::{
     PartitionStatistics, Predicate, Snapshot, EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA,
     POSTPONE_BUCKET,
 };
-use crate::table::centroid_index::Descriptor;
 use crate::table::commit_callback::{CommitCallback, CommitCallbackContext};
 use crate::table::commit_message::CommitMessage;
 use crate::table::format_table_commit::FormatTableCommit;
@@ -1147,9 +1146,6 @@ impl TableCommit {
                 .iter()
                 .chain(&message.compact_new_index_files)
             {
-                if Descriptor::is_manifest_only_router(file) {
-                    continue;
-                }
                 let path = committed_index_file_path(
                     table_path,
                     &bucket_path,
@@ -1358,9 +1354,6 @@ impl TableCommit {
         let index_in_data_dir =
             CoreOptions::new(self.table.schema().options()).index_file_in_data_file_dir();
         for entry in index_entries.iter().filter(|e| e.kind == FileKind::Add) {
-            if Descriptor::is_manifest_only_router(&entry.index_file) {
-                continue;
-            }
             paths.insert(committed_index_file_path(
                 self.table.location().trim_end_matches('/'),
                 &self.bucket_path(&entry.partition, entry.bucket)?,

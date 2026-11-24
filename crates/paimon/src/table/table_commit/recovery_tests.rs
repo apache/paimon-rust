@@ -319,56 +319,6 @@ async fn recovery_checks_data_changelog_extra_and_index_paths() {
 }
 
 #[tokio::test]
-async fn centroid_manifest_only_router_can_be_recovered() {
-    use crate::table::centroid_index::{Descriptor, Role};
-
-    let io = test_file_io();
-    let path = "memory:/centroid-router-recovery";
-    setup_dirs(&io, path).await;
-    let commit = setup_commit(&io, path);
-    let mut router = test_global_index_file("empty-router.index", 0, 0, 9);
-    router.file_size = 0;
-    router.row_count = 0;
-    router.global_index_meta.as_mut().unwrap().index_meta = Some(
-        Descriptor {
-            role: Role::Router(0),
-            payload: Some(b"l2"),
-        }
-        .encode()
-        .unwrap(),
-    );
-    let mut index = test_global_index_file("physical.index", 1, 0, 9);
-    index.file_size = 0;
-    index.row_count = 0;
-    let mut message = CommitMessage::new(vec![], 0, vec![]);
-    message.new_index_files = vec![router.clone(), index];
-    let checkpoint = vec![(7, vec![message])];
-    let index_path = format!("{path}/index/physical.index");
-    let error = commit
-        .filter_and_commit(checkpoint.clone())
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains(&index_path), "{error}");
-    io.new_output(&index_path)
-        .unwrap()
-        .write(bytes::Bytes::new())
-        .await
-        .unwrap();
-
-    assert_eq!(commit.filter_and_commit(checkpoint).await.unwrap(), 1);
-    let snapshot = latest_snapshot(&io, path).await.unwrap();
-    let manifest = snapshot.index_manifest().unwrap();
-    let entries = IndexManifest::read(&io, &format!("{path}/manifest/{manifest}"))
-        .await
-        .unwrap();
-    assert!(entries.iter().any(|entry| entry.index_file == router));
-    assert!(!io
-        .exists(&format!("{path}/index/{}", router.file_name))
-        .await
-        .unwrap());
-}
-
-#[tokio::test]
 async fn batch_recovery_validates_all_groups_before_publication() {
     let io = test_file_io();
     let path = "memory:/batch-recovery";

@@ -284,7 +284,7 @@ async fn centroid_empty_router_does_not_define_raw_scoring() {
     };
     assert_eq!(empty.descriptor.role, Role::Router(0));
     assert_eq!(empty.router.index_file.file_size, 0);
-    assert!(!table
+    assert!(table
         .file_io()
         .exists(&format!(
             "{path}/index/{}",
@@ -292,11 +292,6 @@ async fn centroid_empty_router_does_not_define_raw_scoring() {
         ))
         .await
         .unwrap());
-    let referenced = crate::table::referenced_files::collect_table_referenced_files_summary(&table)
-        .await
-        .unwrap();
-    assert_eq!(referenced[0].source, "total");
-    assert_eq!(referenced[0].index_file_count, 0);
     write_vectors(&table, vec![1, 2], vec![vec![1., 0.], vec![100., 0.]]).await;
 
     let mut search = table.new_vector_search_builder();

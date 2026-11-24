@@ -47,10 +47,6 @@ impl<'a> Descriptor<'a> {
         Ok(Self::parse(file)?.is_some_and(|descriptor| descriptor.role == Role::Router(0)))
     }
 
-    pub(super) fn is_manifest_only_router(file: &'a IndexFileMeta) -> bool {
-        file.file_size == 0 && file.row_count == 0 && Self::is_empty_router(file).unwrap_or(false)
-    }
-
     pub(super) fn is_wrapped(file: &IndexFileMeta) -> bool {
         file.global_index_meta
             .as_ref()

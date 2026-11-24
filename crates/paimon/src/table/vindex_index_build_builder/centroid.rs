@@ -414,20 +414,6 @@ impl VindexIndexBuildBuilder<'_> {
             new_global_index_file_name(&prefix)
         };
         let index_meta = descriptor.encode()?;
-        if descriptor.role == Role::Router(0) {
-            let mut global_index_meta =
-                self.centroid_global_index_meta(shard, field_id, extra_fields)?;
-            global_index_meta.index_meta = Some(index_meta);
-            return Ok(IndexFileMeta {
-                index_type: self.index_type.clone(),
-                file_name,
-                file_size: 0,
-                row_count: 0,
-                deletion_vectors_ranges: None,
-                external_path: None,
-                global_index_meta: Some(global_index_meta),
-            });
-        }
         self.centroid_file_writer(shard, field_id, extra_fields, file_name)
             .await?
             .write(self.table, |output| async move {
@@ -450,26 +436,7 @@ impl VindexIndexBuildBuilder<'_> {
         extra_fields: &[i32],
         file_name: String,
     ) -> Result<IndexFileWriter> {
-        IndexFileWriter::new(
-            self.table,
-            &self.index_type,
-            file_name,
-            IndexFileLocation::Global {
-                table_path: self.table.location().trim_end_matches('/'),
-            },
-            "",
-            self.centroid_global_index_meta(shard, field_id, extra_fields)?,
-        )
-        .await
-    }
-
-    fn centroid_global_index_meta(
-        &self,
-        shard: &VectorIndexShard,
-        field_id: i32,
-        extra_fields: &[i32],
-    ) -> Result<GlobalIndexMeta> {
-        Ok(GlobalIndexMeta {
+        let meta = GlobalIndexMeta {
             row_range_start: shard.row_range_start,
             row_range_end: shard.row_range_end,
             index_field_id: field_id,
@@ -482,7 +449,18 @@ impl VindexIndexBuildBuilder<'_> {
                 .serialize(),
             ),
             index_meta: None,
-        })
+        };
+        IndexFileWriter::new(
+            self.table,
+            &self.index_type,
+            file_name,
+            IndexFileLocation::Global {
+                table_path: self.table.location().trim_end_matches('/'),
+            },
+            "",
+            meta,
+        )
+        .await
     }
 }
 
