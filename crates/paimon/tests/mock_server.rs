@@ -76,6 +76,7 @@ struct MockState {
     tags: HashMap<String, GetTagResponse>,
     tags_replaced_after_read: HashMap<String, (usize, Snapshot)>,
     catalog_snapshots: HashMap<String, Snapshot>,
+    omit_next_commit_success: bool,
     rollback_snapshots: HashMap<(String, i64), Snapshot>,
     create_tag_calls: Vec<(String, String, CreateTagRequest)>,
     get_tag_calls: Vec<(String, String, String)>,
@@ -946,6 +947,11 @@ impl RESTServer {
         }
         .await;
         match published {
+            Ok(true)
+                if std::mem::take(&mut state.inner.lock().unwrap().omit_next_commit_success) =>
+            {
+                (StatusCode::OK, Json(json!({}))).into_response()
+            }
             Ok(success) => (StatusCode::OK, Json(json!({"success": success}))).into_response(),
             Err(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -953,6 +959,10 @@ impl RESTServer {
             )
                 .into_response(),
         }
+    }
+
+    pub fn omit_next_commit_success(&self) {
+        self.inner.lock().unwrap().omit_next_commit_success = true;
     }
 
     /// Handle GET /databases/:db/tables/:table - get a specific table.

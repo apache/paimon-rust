@@ -1385,20 +1385,22 @@ impl TableCommit {
         commit_identifier: i64,
         partition_overwrite: bool,
     ) -> Result<CommitAttemptResult> {
-        let mut created_files = Vec::new();
+        let mut created_payloads = Vec::new();
+        let mut created_manifests = Vec::new();
         let prepared = self
             .prepare_snapshot(
                 &mut resolved,
                 latest_snapshot,
                 commit_identifier,
                 partition_overwrite,
-                &mut created_files,
+                &mut created_payloads,
+                &mut created_manifests,
             )
             .await;
         let (snapshot, statistics) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                for path in created_files {
+                for path in created_payloads.into_iter().chain(created_manifests) {
                     let _ = self.snapshot_manager.file_io().delete_file(&path).await;
                 }
                 return Err(error);
@@ -1425,36 +1427,10 @@ impl TableCommit {
                 return Ok(CommitAttemptResult::Success(Box::new(snapshot)));
             }
             Ok(false) => {
-                if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
-                    // Only this attempt's generated DV files are definitely
-                    // unpublished. Prepared data/changelogs and old shared
-                    // containers still belong to the caller or prior snapshots.
-                    let created = created_files
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<HashSet<_>>();
-                    for entry in resolved
-                        .new_index_manifest_entries
-                        .iter()
-                        .flatten()
-                        .filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
-                    {
-                        let Ok(bucket) = self.bucket_path(&entry.partition, entry.bucket) else {
-                            continue;
-                        };
-                        let path = committed_index_file_path(
-                            self.table.location(),
-                            &bucket,
-                            self.table
-                                .schema()
-                                .core_options()
-                                .index_file_in_data_file_dir(),
-                            &entry.index_file,
-                        );
-                        if created.contains(path.as_str()) {
-                            let _ = self.table.file_io().delete_file(&path).await;
-                        }
-                    }
+                // Only payloads written for this attempt can be discarded.
+                // The retry still needs the caller's staged inputs.
+                for path in created_payloads {
+                    let _ = self.table.file_io().delete_file(&path).await;
                 }
                 None
             }
@@ -1473,13 +1449,19 @@ impl TableCommit {
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
         partition_overwrite: bool,
-        created_files: &mut Vec<String>,
+        created_payloads: &mut Vec<String>,
+        created_manifests: &mut Vec<String>,
     ) -> Result<(Snapshot, Vec<PartitionStatistics>)> {
         let new_snapshot_id = latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1);
 
         let overwrite_schema_id = if partition_overwrite && self.deletion_vectors_enabled {
-            self.prepare_lookup_overwrite(resolved, latest_snapshot, new_snapshot_id, created_files)
-                .await?
+            self.prepare_lookup_overwrite(
+                resolved,
+                latest_snapshot,
+                new_snapshot_id,
+                created_payloads,
+            )
+            .await?
         } else {
             None
         };
@@ -1508,7 +1490,7 @@ impl TableCommit {
                     snapshot,
                     &resolved.entries,
                     &resolved.deletion_vector_updates,
-                    created_files,
+                    created_payloads,
                 )
                 .await?
                 {
@@ -1573,12 +1555,12 @@ impl TableCommit {
                 &manifest_dir,
                 &new_manifest_prefix,
                 &resolved.entries,
-                created_files,
+                created_manifests,
             )
             .await?;
 
         // Write delta manifest list
-        created_files.push(delta_manifest_list_path.clone());
+        created_manifests.push(delta_manifest_list_path.clone());
         ManifestList::write_with_compression(
             file_io,
             &delta_manifest_list_path,
@@ -1597,10 +1579,10 @@ impl TableCommit {
                         &manifest_dir,
                         &changelog_manifest_prefix,
                         &resolved.changelog_entries,
-                        created_files,
+                        created_manifests,
                     )
                     .await?;
-                created_files.push(changelog_manifest_list_path.clone());
+                created_manifests.push(changelog_manifest_list_path.clone());
                 ManifestList::write_with_compression(
                     file_io,
                     &changelog_manifest_list_path,
@@ -1638,7 +1620,7 @@ impl TableCommit {
             vec![]
         };
 
-        created_files.push(base_manifest_list_path.clone());
+        created_manifests.push(base_manifest_list_path.clone());
         ManifestList::write_with_compression(
             file_io,
             &base_manifest_list_path,
@@ -1659,7 +1641,7 @@ impl TableCommit {
 
         if let Some(entries) = &resolved.new_index_manifest_entries {
             resolved.index_manifest_name = self
-                .write_index_manifest(file_io, &manifest_dir, entries, created_files)
+                .write_index_manifest(file_io, &manifest_dir, entries, created_manifests)
                 .await?;
         }
         let schema_id = if update_files.is_empty() {

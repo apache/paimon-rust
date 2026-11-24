@@ -26,8 +26,10 @@ use common::incremental_helpers::{
     make_batch, persist_table_schema, pk_schema, setup_dirs, write_batch,
 };
 use futures::TryStreamExt;
-use paimon::catalog::{FileSystemCatalog, Identifier};
-use paimon::spec::{CommitKind, IndexManifest, PrimaryKeyIndexSourceMeta};
+use paimon::catalog::{Catalog, FileSystemCatalog, Identifier};
+use paimon::spec::{
+    CommitKind, DataType, IndexManifest, IntType, PrimaryKeyIndexSourceMeta, Schema, SchemaChange,
+};
 use paimon::table::{CommitCallback, CommitCallbackContext, IncrementalScanMode, Plan, Table};
 
 async fn table() -> Table {
@@ -164,6 +166,84 @@ async fn rows(table: &Table) -> Vec<(i32, i32)> {
     }
     rows.sort_unstable();
     rows
+}
+
+#[tokio::test]
+async fn stale_overwrite_after_enabling_lookup_bootstraps_from_the_overwrite_snapshot() {
+    let warehouse = tempfile::tempdir().unwrap();
+    let mut options = paimon::Options::new();
+    options.set("warehouse", warehouse.path().to_str().unwrap());
+    options.set("local-cache.enabled", "true");
+    let catalog = FileSystemCatalog::new(options).unwrap();
+    catalog
+        .create_database("default", false, HashMap::new())
+        .await
+        .unwrap();
+    let identifier = Identifier::new("default", "lookup_overwrite");
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("write-only", "false")
+        .option("deletion-vectors.enabled", "true")
+        .option("deletion-vectors.merge-on-read", "true")
+        .option("changelog-producer", "none")
+        .build()
+        .unwrap();
+    catalog
+        .create_table(&identifier, schema, false)
+        .await
+        .unwrap();
+    let stale = catalog.get_table(&identifier).await.unwrap();
+    catalog
+        .alter_table(
+            &identifier,
+            vec![SchemaChange::set_option(
+                "changelog-producer".into(),
+                "lookup".into(),
+            )],
+            false,
+        )
+        .await
+        .unwrap();
+    let builder = stale.new_write_builder().with_overwrite();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&make_batch(vec![7], vec![70]))
+        .await
+        .unwrap();
+    builder
+        .new_commit()
+        .overwrite(writer.prepare_commit().await.unwrap(), None)
+        .await
+        .unwrap();
+
+    let current = catalog.get_table(&identifier).await.unwrap();
+    let overwrite = current.snapshot_manager().get_snapshot(1).await.unwrap();
+    assert_eq!(overwrite.commit_kind(), &CommitKind::OVERWRITE);
+    assert_eq!(overwrite.schema_id(), current.schema().id());
+    assert_eq!(
+        rows(&current.copy_with_pinned_snapshot(Some(&overwrite))).await,
+        [(7, 70)]
+    );
+
+    let selected = current.copy_with_options(HashMap::from([
+        ("scan.mode".into(), "from-snapshot-full".into()),
+        ("scan.snapshot-id".into(), overwrite.id().to_string()),
+    ]));
+    let initial = selected
+        .new_stream_scan()
+        .unwrap()
+        .plan()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(initial.snapshot_id(), Some(overwrite.id()));
+    assert_eq!(
+        plan_events(&selected, &initial).await,
+        [("+I".into(), 7, 70)]
+    );
 }
 
 #[tokio::test]

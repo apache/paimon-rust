@@ -22,8 +22,8 @@ mod pk_dv_retry {
     use roaring::RoaringBitmap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    async fn write(table: &Table, ids: Vec<i32>, level: i32) -> (Vec<u8>, DataFileMeta) {
-        let batch = RecordBatch::try_from_iter([
+    fn batch(ids: Vec<i32>, level: i32) -> RecordBatch {
+        RecordBatch::try_from_iter([
             (
                 "id",
                 Arc::new(Int32Array::from(ids.clone())) as arrow_array::ArrayRef,
@@ -37,10 +37,13 @@ mod pk_dv_retry {
                 )),
             ),
         ])
-        .unwrap();
+        .unwrap()
+    }
+
+    async fn write(table: &Table, ids: Vec<i32>, level: i32) -> (Vec<u8>, DataFileMeta) {
         let builder = table.new_write_builder();
         let mut writer = builder.new_write().unwrap();
-        writer.write_arrow_batch(&batch).await.unwrap();
+        writer.write_arrow_batch(&batch(ids, level)).await.unwrap();
         let mut messages = writer.prepare_commit().await.unwrap();
         for file in &mut messages[0].new_files {
             file.level = level;
@@ -102,7 +105,7 @@ mod pk_dv_retry {
             .unwrap();
     }
 
-    async fn fixture() -> (Table, String, String) {
+    async fn retry_table() -> Table {
         let path = format!("memory:/pk-dv-retry/{}", uuid::Uuid::new_v4());
         let mut options = crate::Options::new();
         options.set("warehouse", &path);
@@ -136,6 +139,11 @@ mod pk_dv_retry {
             .write(serde_json::to_vec(table.schema()).unwrap().into())
             .await
             .unwrap();
+        table
+    }
+
+    async fn fixture() -> (Table, String, String) {
+        let table = retry_table().await;
         let (partition, anchor) = write(&table, (0..1000).collect(), 5).await;
         assert_eq!(partition.as_slice(), EMPTY_SERIALIZED_ROW.as_slice());
         let (_, unrelated) = write(&table, vec![2000, 2001], 5).await;
@@ -148,6 +156,10 @@ mod pk_dv_retry {
     }
 
     async fn dv_paths(table: &Table, snapshot: &Snapshot) -> Vec<String> {
+        index_paths(table, snapshot, DELETION_VECTORS_INDEX_TYPE).await
+    }
+
+    async fn index_paths(table: &Table, snapshot: &Snapshot, index_type: &str) -> Vec<String> {
         let entries = IndexManifest::read(
             table.file_io(),
             &table
@@ -159,7 +171,7 @@ mod pk_dv_retry {
         let commit = table.new_write_builder().new_commit();
         entries
             .into_iter()
-            .filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
+            .filter(|entry| entry.index_file.index_type == index_type)
             .map(|entry| {
                 committed_index_file_path(
                     table.location(),
@@ -187,7 +199,20 @@ mod pk_dv_retry {
             _: &str,
             _: &[PartitionStatistics],
         ) -> Result<bool> {
-            let paths = dv_paths(&self.table, snapshot).await;
+            let paths = if snapshot.commit_kind() == &CommitKind::OVERWRITE {
+                let mut paths = index_paths(&self.table, snapshot, "bitmap").await;
+                for entry in
+                    active_entries(self.table.file_io(), self.table.location(), snapshot).await
+                {
+                    let bucket = self
+                        .table
+                        .data_file_bucket_path(entry.partition(), entry.bucket())?;
+                    paths.extend(entry.file().collect_files(&bucket));
+                }
+                paths
+            } else {
+                dv_paths(&self.table, snapshot).await
+            };
             self.paths.lock().unwrap().push(paths);
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 if self.publish_first {
@@ -198,7 +223,7 @@ mod pk_dv_retry {
                             .await?
                     );
                     return Err(crate::Error::IoUnsupported {
-                        message: "lost compact response".into(),
+                        message: "lost commit response".into(),
                     });
                 }
                 write(&self.table, vec![4000], 0).await;
@@ -286,6 +311,98 @@ mod pk_dv_retry {
                     .unwrap(),
                 after
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_overwrite_reclaims_rejected_outputs_and_preserves_published_files() {
+        use arrow_array::{cast::AsArray, types::Int32Type};
+        use futures::TryStreamExt;
+
+        for publish_first in [false, true] {
+            let raw = retry_table().await;
+            let table = raw.copy_with_options(HashMap::from([
+                ("write-only".into(), "false".into()),
+                ("pk-bitmap.index.columns".into(), "value".into()),
+                ("write.parquet-buffer-size".into(), "1 B".into()),
+            ]));
+            let publisher = Arc::new(RacingCommit {
+                table: raw,
+                calls: AtomicUsize::new(0),
+                publish_first,
+                paths: Default::default(),
+            });
+            let builder = table.new_write_builder().with_overwrite();
+            let mut commit = builder.new_commit();
+            commit.snapshot_commit = publisher.clone();
+            commit.commit_min_retry_wait_ms = 0;
+            commit.commit_max_retry_wait_ms = 0;
+            let mut writer = builder.new_write().unwrap();
+            writer
+                .write_arrow_batch(&batch(vec![1, 2], 0))
+                .await
+                .unwrap();
+            writer
+                .write_arrow_batch(&batch(vec![2, 3], 0))
+                .await
+                .unwrap();
+            let inputs = writer.prepare_commit().await.unwrap();
+            let bucket = commit.bucket_path(&inputs[0].partition, 0).unwrap();
+            let staged: Vec<_> = inputs
+                .iter()
+                .flat_map(|msg| &msg.new_files)
+                .flat_map(|file| file.collect_files(&bucket))
+                .collect();
+            assert_eq!(staged.len(), 2);
+            commit
+                .overwrite_with_identifier(inputs, None, 7)
+                .await
+                .unwrap();
+
+            let attempts = publisher.paths.lock().unwrap().clone();
+            assert_eq!(attempts.len(), if publish_first { 1 } else { 2 });
+            for (i, paths) in attempts.iter().enumerate() {
+                assert_eq!(
+                    paths.len(),
+                    2,
+                    "expected a PK index and a replacement data file: {paths:?}"
+                );
+                for path in paths {
+                    assert_eq!(
+                        table.file_io().exists(path).await.unwrap(),
+                        i + 1 == attempts.len(),
+                        "{path}"
+                    );
+                }
+            }
+            for path in &staged {
+                assert!(
+                    table.file_io().exists(path).await.unwrap(),
+                    "missing staged input: {path}"
+                );
+            }
+            let read = table.new_read_builder();
+            let plan = read.new_scan().plan().await.unwrap();
+            let batches: Vec<_> = read
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let ids: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_primitive::<Int32Type>()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            assert_eq!(ids, [1, 2, 3]);
         }
     }
 

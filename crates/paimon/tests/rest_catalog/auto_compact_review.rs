@@ -32,6 +32,64 @@ fn schema(evolved: bool) -> Schema {
 }
 
 #[tokio::test]
+async fn lookup_overwrite_recovers_when_published_response_omits_success() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let name = "lookup_overwrite";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("write-only", "false")
+        .option("deletion-vectors.enabled", "true")
+        .option("changelog-producer", "lookup")
+        .option("pk-bitmap.index.columns", "name")
+        .option("write.parquet-buffer-size", "1 B")
+        .option("commit.max-retries", "0")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", name, schema, temp.path().to_str().unwrap());
+    let identifier = Identifier::new("default", name);
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+    let builder = table.new_write_builder().with_overwrite();
+    let mut writer = builder.new_write().unwrap();
+    writer.write_arrow_batch(&people_rows(1..=2)).await.unwrap();
+    writer.write_arrow_batch(&people_rows(2..=3)).await.unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    assert_eq!(messages[0].new_files.len(), 2);
+    let commit = builder.new_commit();
+    ctx.server.omit_next_commit_success();
+    let error = commit
+        .overwrite_with_identifier(messages.clone(), None, 7)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("outcome may be unknown"),
+        "{error}"
+    );
+    commit
+        .overwrite_with_identifier(messages, None, 7)
+        .await
+        .unwrap();
+
+    let reopened = ctx.catalog.get_table(&identifier).await.unwrap();
+    let snapshot = reopened
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.id(), 1);
+    assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
+    assert_eq!(
+        ids(&read_all(&reopened.new_read_builder()).await.unwrap()),
+        [1, 2, 3]
+    );
+}
+
+#[tokio::test]
 async fn stale_rest_committer_auto_indexes_with_catalog_schema_and_recovers() {
     let ctx = setup_catalog(vec!["default"]).await;
     let temp = tempfile::tempdir().unwrap();

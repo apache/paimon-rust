@@ -29,9 +29,7 @@ impl TableCommit {
     ) -> Result<Option<i64>> {
         use crate::spec::ChangelogProducer;
 
-        let schema = self.table.schema();
-        if schema.primary_keys().is_empty()
-            || schema.core_options().try_changelog_producer()? != ChangelogProducer::Lookup
+        if self.table.schema().primary_keys().is_empty()
             || !self.auto_compaction_enabled(
                 resolved
                     .entries
@@ -43,11 +41,13 @@ impl TableCommit {
         }
         let table = self.post_commit_table(latest.as_ref()).await?;
         let options = table.schema().core_options();
-        if !options.deletion_vectors_enabled()
-            || options.write_only()?
-            || options.try_changelog_producer()? != ChangelogProducer::Lookup
-        {
+        if !options.deletion_vectors_enabled() || options.write_only()? {
             return Ok(None);
+        }
+        // The producer may have changed since the writer opened the table. Check
+        // the resolved schema ID at publication even when it skips materialization.
+        if options.try_changelog_producer()? != ChangelogProducer::Lookup {
+            return Ok(Some(table.schema().id()));
         }
         match crate::table::compact::ensure_supported(&table) {
             Ok(()) => {}
