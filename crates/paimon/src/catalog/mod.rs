@@ -129,6 +129,20 @@ impl Identifier {
         validate_identifier_name("object", name)
     }
 
+    /// A new physical table must be addressable without branch or system table syntax.
+    pub(crate) fn validate_new_table_name(&self) -> Result<()> {
+        let name = self.parsed_object_name()?;
+        if name.branch().is_some() || name.system_table().is_some() {
+            return Err(Error::IdentifierInvalid {
+                message: format!(
+                    "Table name '{}' uses a reserved branch or system table suffix",
+                    self.full_name()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Database name.
     pub fn database(&self) -> &str {
         &self.database
@@ -466,7 +480,7 @@ pub trait Catalog: Send + Sync {
     /// * [`crate::Error::DatabaseNotExist`] - database does not exist.
     async fn list_tables(&self, database_name: &str) -> Result<Vec<String>>;
 
-    /// Create a table.
+    /// Create a physical table with a name that has no branch or system table suffix.
     ///
     /// * `ignore_if_exists` - if true, do nothing when the table already exists;
     ///   if false, return [`crate::Error::TableAlreadyExist`].
@@ -487,7 +501,7 @@ pub trait Catalog: Send + Sync {
     /// * [`crate::Error::TableNotExist`] - table does not exist when `ignore_if_not_exists` is false.
     async fn drop_table(&self, identifier: &Identifier, ignore_if_not_exists: bool) -> Result<()>;
 
-    /// Rename a table.
+    /// Rename a table to a name that has no branch or system table suffix.
     ///
     /// # Errors
     /// * [`crate::Error::TableNotExist`] - source table does not exist when `ignore_if_not_exists` is false.
