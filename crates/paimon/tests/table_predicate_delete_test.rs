@@ -23,11 +23,13 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use common::incremental_helpers::{memory_table, persist_table_schema, setup_dirs, write_batch};
 use futures::TryStreamExt;
+use paimon::catalog::Identifier;
 use paimon::spec::{
     DataType, Datum, DoubleType, IndexManifest, IntType, Predicate, PredicateBuilder, Schema,
-    TableSchema, VarCharType,
+    SchemaChange, TableSchema, VarCharType,
 };
 use paimon::table::{CommitMessage, Table};
+use paimon::{Catalog, CatalogOptions, Error, FileSystemCatalog, Options};
 
 async fn table(options: &[(&str, &str)]) -> Table {
     table_with_primary_keys(options, false).await
@@ -127,6 +129,82 @@ async fn ids(table: &Table) -> Vec<i32> {
         .collect();
     ids.sort_unstable();
     ids
+}
+
+#[tokio::test]
+async fn altering_deletion_vectors_mode_does_not_resurrect_deleted_rows() {
+    const DV_MODE: &str = "deletion-vectors.enabled";
+    let set_mode = |value: &str| SchemaChange::set_option(DV_MODE.into(), value.into());
+    let reset_mode = || SchemaChange::remove_option(DV_MODE.into());
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, "memory:/warehouse");
+    let catalog = FileSystemCatalog::new(options).unwrap();
+    catalog
+        .create_database("db", false, HashMap::new())
+        .await
+        .unwrap();
+    let identifier = Identifier::new("db", "events");
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .option("data-evolution.enabled", "true")
+        .option("row-tracking.enabled", "true")
+        .option(DV_MODE, "true")
+        .build()
+        .unwrap();
+    catalog
+        .create_table(&identifier, schema, false)
+        .await
+        .unwrap();
+    catalog
+        .alter_table(&identifier, vec![reset_mode()], false)
+        .await
+        .unwrap();
+    let table = catalog.get_table(&identifier).await.unwrap();
+    assert!(!table.schema().core_options().deletion_vectors_enabled());
+    let batch =
+        RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef)])
+            .unwrap();
+    write_batch(&table, &batch).await;
+    catalog
+        .alter_table(&identifier, vec![set_mode("true")], false)
+        .await
+        .unwrap();
+    let table = catalog.get_table(&identifier).await.unwrap();
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("id", Datum::Int(2))
+        .unwrap();
+    let messages = table
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .delete_by_predicate(Some(predicate))
+        .await
+        .unwrap();
+    commit(&table, messages).await;
+    assert_eq!(ids(&table).await, [1, 3]);
+
+    catalog
+        .alter_table(&identifier, vec![set_mode("TRUE")], false)
+        .await
+        .unwrap();
+    let table = catalog.get_table(&identifier).await.unwrap();
+    for change in [set_mode("false"), reset_mode()] {
+        let result = catalog.alter_table(&identifier, vec![change], false).await;
+        let reloaded = catalog.get_table(&identifier).await.unwrap();
+        assert_eq!(ids(&reloaded).await, [1, 3]);
+        assert!(matches!(result, Err(Error::Unsupported { message }) if message.contains(DV_MODE)));
+        assert_eq!(reloaded.schema().id(), table.schema().id());
+    }
+
+    let modifiable = SchemaChange::set_option("deletion-vectors.modifiable".into(), "true".into());
+    catalog
+        .alter_table(&identifier, vec![modifiable], false)
+        .await
+        .unwrap();
+    let result = catalog
+        .alter_table(&identifier, vec![reset_mode()], false)
+        .await;
+    assert!(matches!(result, Err(Error::Unsupported { .. })));
 }
 
 async fn read_ids(table: &Table, filter: Predicate) -> Vec<i32> {

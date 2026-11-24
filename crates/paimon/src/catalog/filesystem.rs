@@ -580,6 +580,19 @@ impl Catalog for FileSystemCatalog {
         let new_schema = current
             .apply_changes(changes)
             .map_err(|e| fill_table_name(e, identifier))?;
+        // Historical snapshot reads use the current mode to load deletion vectors.
+        if current.core_options().deletion_vectors_enabled()
+            && !new_schema.core_options().deletion_vectors_enabled()
+            && crate::table::SnapshotManager::new(self.file_io.clone(), table_path.clone())
+                .get_latest_snapshot()
+                .await?
+                .is_some()
+        {
+            return Err(Error::Unsupported {
+                message: "Cannot disable 'deletion-vectors.enabled' on a table with snapshots"
+                    .into(),
+            });
+        }
         self.save_table_schema(&table_path, &new_schema).await
     }
 
