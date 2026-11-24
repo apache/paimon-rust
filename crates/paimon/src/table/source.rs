@@ -551,7 +551,16 @@ impl DataSplit {
         self
     }
 
-    pub(crate) fn query_auth_required(&self) -> bool {
+    /// Whether this split requires catalog authorization before its files may be opened.
+    ///
+    /// True for a split that came from a `query-auth.enabled` table, including
+    /// after transport: the live grant is skipped on serialization, but this
+    /// flag and any captured response survive. The flag stays true after
+    /// `TableRead::authorize_splits` attaches a live grant, so it does not mean
+    /// "not yet authorized". This is not the same as
+    /// [`Self::has_query_auth_rules`]; an unrestricted response still requires
+    /// authorization.
+    pub fn query_auth_required(&self) -> bool {
         self.query_auth_required
     }
 
@@ -566,6 +575,9 @@ impl DataSplit {
     /// Whether the server attached rules to this split's read: its row counts
     /// and column statistics then describe rows the read will not return as
     /// they are.
+    ///
+    /// An unrestricted response has no such rules but may still require
+    /// authorization; use [`Self::query_auth_required`] for that.
     pub fn has_query_auth_rules(&self) -> bool {
         self.query_auth_grant
             .as_ref()
