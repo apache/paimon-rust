@@ -149,8 +149,8 @@ async fn old_files_with_dropped_stats_columns_remain_readable() {
 #[tokio::test]
 async fn branch_authorization_uses_the_decorated_identifier() {
     let g = guarded("main_auth", &["id"]).await;
-    add_internal_table_with_schema(
-        &g.ctx.server,
+    g.ctx.server.add_table_with_schema(
+        "default",
         "main_auth$branch_dev",
         schema_of(&["id"], GUARDED),
         g.table.location(),

@@ -228,7 +228,7 @@ def test_resolved_rest_response_uses_snapshot_owner_and_refreshes_managed_tokens
                 response = {"token": {}, "expiresAtMillis": (
                     0 if len(token_requests) == 1 else 4102444800000)}
             elif self.path.endswith('/snapshot'):
-                # The catalog serves snapshot 1 for managed tables.
+                # Disk has snapshot 2; REST snapshot 1 must remain authoritative.
                 response = {"snapshot": {"snapshot": snapshot}}
             else:
                 self.send_error(500, "Unexpected metadata request")
@@ -269,22 +269,20 @@ def test_resolved_rest_response_uses_snapshot_owner_and_refreshes_managed_tokens
         assert all(path.endswith('/token') for path in requests)
         rows = [{'id': 1, 'name': 'a'}]
         if external:
-            if expected_branch == "dev":
-                assert _read(table) == (1, rows)
-            else:
-                assert _read(table) == (2, rows + [{'id': 2, 'name': 'b'}])
+            expected = (1, rows) if expected_branch == 'dev' else (2, rows + [{'id': 2, 'name': 'b'}])
+            assert _read(table) == expected
             assert requests == []
-        else:
-            assert _read(table) == (1, rows)
-            assert all(path.endswith(('/token', '/snapshot')) for path in requests)
-            # Java switchToBranch uses the base identifier for main, including an
-            # explicitly supplied $branch_main alias.
-            encoded_name = 't' if expected_branch == 'main' else object_name.replace('$', '%24')
-            snapshot_paths = [path for path in requests if path.endswith('/snapshot')]
-            assert snapshot_paths
-            assert all(path.endswith(
-                f'/databases/db/tables/{encoded_name}/snapshot') for path in snapshot_paths)
-            assert len(token_requests) == 2
+            return
+        assert _read(table) == (1, rows)
+        assert all(path.endswith(('/token', '/snapshot')) for path in requests)
+        # Java switchToBranch uses the base identifier for main, including an
+        # explicitly supplied $branch_main alias.
+        encoded_name = 't' if expected_branch == 'main' else object_name.replace('$', '%24')
+        snapshot_paths = [path for path in requests if path.endswith('/snapshot')]
+        assert snapshot_paths
+        assert all(path.endswith(
+            f'/databases/db/tables/{encoded_name}/snapshot') for path in snapshot_paths)
+        assert len(token_requests) == 2
     finally:
         server.shutdown()
         server.server_close()

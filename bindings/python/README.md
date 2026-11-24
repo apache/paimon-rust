@@ -566,17 +566,14 @@ inherited Native state still raises `ForkSafetyError`.
 
 Catalog-managed REST tables load the latest snapshot through the catalog,
 including empty results and branch-scoped requests. Permission and service
-failures (including HTTP 501) propagate to the caller. REST-registered external
-Paimon tables use their configured credentials to access snapshots, branches
-and tags in table storage. BLOB views continue to resolve upstream tables
-through the REST catalog. The FileIO provider for managed tables continues to
-refresh catalog data tokens after schema replacement.
+failures (including HTTP 501) propagate to the caller. The FileIO provider
+refreshes catalog credentials after schema replacement. REST-registered external
+Paimon tables use table storage for snapshots, branches and tags.
 
 `Table.from_rest_response(response_json, database=..., table=..., rest_options=...)`
-constructs a table from the matching REST response and merged catalog options
-without config or get-table requests during construction. The handle retains
-the resolved schema, snapshot ownership and FileIO credentials. Use
-`copy_with_resolved_schema` to apply branch or dynamic options.
+reuses the matching REST table response and merged catalog options, skipping
+config/get-table requests while preserving snapshot ownership and token refresh.
+Use `copy_with_resolved_schema` to apply branch or dynamic options.
 
 ## Setup
 

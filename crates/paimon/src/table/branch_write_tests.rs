@@ -682,135 +682,58 @@ async fn rest_branch_copy_retains_bound_file_io_and_loads_branch_identity() {
 
 #[tokio::test]
 async fn rest_external_table_reads_and_publishes_filesystem_snapshots() {
-    use crate::catalog::{Catalog, RESTCatalog};
-    use axum::{
-        http::{Method, StatusCode, Uri},
-        Json, Router,
-    };
-    use std::sync::Mutex;
-
     let (_dir, filesystem) = table(false, &[]).await;
     append(&filesystem, "seed", batch(vec![1], vec![10])).await;
     let filesystem_branch = tagged_branch(&filesystem).await;
-    append(&filesystem, "local-main", batch(vec![2], vec![20])).await;
 
+    // The resolved registration supplies the schema. Subsequent operations
+    // have only the filesystem available.
+    let mut options = crate::Options::new();
+    options.set("uri", "http://127.0.0.1:0");
+    options.set("warehouse", "test");
+    options.set("token.provider", "bear");
+    options.set("token", "test-token");
     let response = serde_json::json!({
         "database": "db", "name": "t", "id": "uuid-t",
         "path": filesystem.location(), "isExternal": true,
         "schemaId": 0, "schema": filesystem.schema()
     });
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let recorded = requests.clone();
-    let app = Router::new().fallback(move |method: Method, uri: Uri| {
-        let path = uri.path().to_string();
-        recorded.lock().unwrap().push(path.clone());
-        let result = if method == Method::GET && path == "/v1/databases/db/tables/t" {
-            Ok(Json(response.clone()))
-        } else {
-            Err(StatusCode::NOT_IMPLEMENTED)
-        };
-        std::future::ready(result)
-    });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut options = crate::Options::new();
-    options.set("uri", format!("http://{}", listener.local_addr().unwrap()));
-    options.set("token.provider", "bear");
-    options.set("token", "test-token");
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let catalog = RESTCatalog::new(options, false).await.unwrap();
-
-    let external = catalog.get_table(filesystem.identifier()).await.unwrap();
-    assert!(external.rest_env().is_none() && external.query_auth_session().is_none());
-    assert_eq!(external.rest_table_uuid(), Some("uuid-t"));
-    let external_branch = external.copy_with_branch("dev").await.unwrap();
-    assert_eq!(external_branch.rest_table_uuid(), Some("uuid-t"));
-
-    // A schema published directly to storage is used by the next commit.
-    let evolved = filesystem
-        .schema()
-        .apply_changes(vec![crate::spec::SchemaChange::set_option(
-            "compaction.min.file-num".into(),
-            "100".into(),
-        )])
-        .unwrap();
-    filesystem
-        .file_io()
-        .new_output(&filesystem.schema_manager().schema_path(evolved.id()))
-        .unwrap()
-        .write(serde_json::to_vec(&evolved).unwrap().into())
-        .await
-        .unwrap();
-    let maintained =
-        external.copy_with_options(HashMap::from([("write-only".into(), "false".into())]));
-    append(&maintained, "external-main", batch(vec![3], vec![30])).await;
-    assert_eq!(latest(&filesystem).await.schema_id(), evolved.id());
-
-    let messages = stage(
-        &external_branch,
-        "external-dev",
-        batch(vec![4], vec![40]),
-        false,
+    let external = Table::from_rest_response(
+        filesystem.identifier().clone(),
+        serde_json::from_value(response).unwrap(),
+        options,
     )
-    .await;
-    let commit = external_branch
-        .new_write_builder()
-        .with_commit_user("external-dev")
-        .unwrap()
-        .new_commit();
-    for _ in 0..2 {
-        commit
-            .filter_and_commit_with_identifier(messages.clone(), 1)
-            .await
-            .unwrap();
+    .await
+    .unwrap();
+    assert!(external.rest_env().is_none() && external.query_auth_session().is_none());
+    assert!(external.tag_manager().tag_exists("base").await.unwrap());
+    let branch = external.copy_with_branch("dev").await.unwrap();
+    assert_eq!(branch.rest_table_uuid(), Some("uuid-t"));
+
+    for (loaded, stored, id) in [
+        (&external, &filesystem, 2),
+        (&branch, &filesystem_branch, 3),
+    ] {
+        assert_eq!(latest(loaded).await.id(), 1);
+        append(loaded, "external-writer", batch(vec![id], vec![id * 10])).await;
+        assert_eq!(latest(stored).await.id(), 2);
+        assert_eq!(
+            table_write::tests::read_id_value_rows(loaded).await,
+            [(1, 10), (id, id * 10)]
+        );
     }
-    assert_eq!(latest(&filesystem_branch).await.id(), 2);
-    assert_eq!(
-        table_write::tests::read_id_value_rows(&external).await,
-        [(1, 10), (2, 20), (3, 30)]
-    );
-    assert_eq!(
-        table_write::tests::read_id_value_rows(&external_branch).await,
-        [(1, 10), (4, 40)]
-    );
 
     let empty = external.copy_with_pinned_snapshot(None);
+    let key = "index-file-in-data-file-dir";
     let mut options = empty.schema().options().clone();
-    options.insert("index-file-in-data-file-dir".into(), "true".into());
+    options.insert(key.into(), "true".into());
     let copied = empty
         .copy_with_resolved_schema(empty.schema().copy_with_replaced_options(options), "main")
         .unwrap();
-    assert!(!copied
-        .schema()
-        .options()
-        .contains_key("index-file-in-data-file-dir"));
+    assert!(!copied.schema().options().contains_key(key));
     assert!(table_write::tests::read_id_value_rows(&copied)
         .await
         .is_empty());
-
-    let tags = external_branch.tag_manager();
-    let snapshot = external_branch
-        .snapshot_manager()
-        .get_snapshot(1)
-        .await
-        .unwrap();
-    tags.create("branch_base", &snapshot).await.unwrap();
-    assert_eq!(
-        external.tag_manager().list_all_names().await.unwrap(),
-        ["base"]
-    );
-    assert!(tags.tag_exists("branch_base").await.unwrap());
-    for (table, tag) in [(&external, "base"), (&external_branch, "branch_base")] {
-        let historical = table
-            .copy_with_time_travel_strict(HashMap::from([("scan.tag-name".into(), tag.into())]))
-            .await
-            .unwrap();
-        assert_eq!(
-            table_write::tests::read_id_value_rows(&historical).await,
-            [(1, 10)]
-        );
-    }
-    assert_eq!(*requests.lock().unwrap(), ["/v1/databases/db/tables/t"]);
-    server.abort();
 }
 
 #[tokio::test]

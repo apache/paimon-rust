@@ -159,7 +159,6 @@ async fn setup_rest_tag_rollback() -> (tempfile::TempDir, RESTServer, Arc<RESTCa
             .unwrap(),
         location.to_str().unwrap(),
     );
-    server.set_table_external(DATABASE, TABLE, false);
     server.add_tag(DATABASE, TABLE, "release");
     let (catalog, context) = connect(&server).await;
     let identifier = Identifier::new(DATABASE, TABLE);
@@ -795,7 +794,6 @@ async fn test_consumer_procedures_rejected_on_rest_catalog_without_changing_prog
         .unwrap();
     let path = format!("file://{}/{DATABASE}.db/{TABLE}", tmp.path().display());
     server.add_table_with_schema(DATABASE, TABLE, schema, &path);
-    server.set_table_external(DATABASE, TABLE, false);
     let consumer_path = tmp
         .path()
         .join(format!("{DATABASE}.db/{TABLE}/consumer/consumer-job"));
@@ -848,7 +846,6 @@ fn register_rest_table(
         schema,
         &format!("file://{}", root.display()),
     );
-    server.set_table_external(DATABASE, TABLE, false);
     root
 }
 
@@ -1119,7 +1116,6 @@ async fn test_branch_procedures_reject_unsupported_rest_tables() {
         schema,
         &format!("file://{}", root.display()),
     );
-    server.set_table_external(DATABASE, &branch_table, false);
     for procedure in ["create_branch", "delete_branch", "fast_forward"] {
         common::assert_sql_error(
             &context,
@@ -1176,7 +1172,6 @@ async fn test_rename_branch_rejected_on_rest_catalog() {
         .unwrap();
     let path = format!("file://{}/{DATABASE}.db/{TABLE}", tmp.path().display());
     server.add_table_with_schema(DATABASE, TABLE, schema, &path);
-    server.set_table_external(DATABASE, TABLE, false);
 
     common::assert_sql_error(
         &context,
@@ -1364,7 +1359,6 @@ async fn rest_table_with_two_snapshots() -> (
     let root = tmp.path().join(format!("{DATABASE}.db/{TABLE}"));
     let server = start_server(tmp.path()).await;
     server.add_table_with_schema(DATABASE, TABLE, schema, &location);
-    server.set_table_external(DATABASE, TABLE, false);
     let (catalog, context) = connect(&server).await;
     (tmp, server, catalog, context, root)
 }
@@ -1653,7 +1647,6 @@ async fn test_referenced_files_size_counts_catalog_only_branch_tags() {
         schema,
         &format!("file://{}", root.display()),
     );
-    server.set_table_external(DATABASE, &branch_table, false);
     for name in ["dev", "main", "dev"] {
         server.add_branch(DATABASE, TABLE, name);
     }
@@ -1731,7 +1724,6 @@ async fn test_referenced_files_size_counts_catalog_only_current_snapshots() {
         schema,
         &format!("file://{}", root.display()),
     );
-    server.set_table_external(DATABASE, &branch_table, false);
     server.add_branch(DATABASE, TABLE, "dev");
     server.set_catalog_snapshot(DATABASE, TABLE, first);
     server.set_catalog_snapshot(DATABASE, &branch_table, second);
@@ -1851,7 +1843,6 @@ async fn test_rest_tag_metadata_uses_local_timestamp_and_branch() {
         schema,
         &format!("file://{}", root.display()),
     );
-    server.set_table_external(DATABASE, &branch_table, false);
     let (catalog, context) = connect(&server).await;
     for (table_name, only_tag, epoch_millis, retention, seconds) in [
         (TABLE, "main_only", 1_704_067_200_000, "PT24H", 86_400.0),

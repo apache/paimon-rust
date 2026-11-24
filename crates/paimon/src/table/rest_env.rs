@@ -449,7 +449,7 @@ impl RESTEnv {
         )
         .await?;
 
-        let mut env = RESTEnv::new(
+        let mut rest_env = RESTEnv::new(
             identifier.clone(),
             uuid,
             api,
@@ -458,31 +458,31 @@ impl RESTEnv {
             local_cache,
             file_io_cache,
         );
-        env.fuse_resolver = fuse_resolver;
-        let (rest_env, external_blob_view_env) = if is_external {
-            (None, Some(Arc::new(env)))
-        } else {
-            (Some(env), None)
-        };
+        rest_env.fuse_resolver = fuse_resolver;
         let parsed_identifier = identifier.parsed_object_name()?;
         let branch = parsed_identifier.branch_or_default().to_string();
         let branch_reference = parsed_identifier.branch().is_some();
-        let table = Table::new(file_io, identifier, table_path, table_schema, rest_env);
+        let table = Table::new(
+            file_io,
+            identifier,
+            table_path,
+            table_schema,
+            Some(rest_env),
+        );
 
+        // Minted after the schema-replacing copy, which drops any session.
         let mut table = table.copy_with_resolved_schema(table.schema().clone(), &branch)?;
         table.branch_reference = branch_reference;
-        table.external_blob_view_env = external_blob_view_env;
         // Cache the catalog definition before any caller applies dynamic
         // overrides. Historical DV checks must see the stored schema options.
         table
             .schema_manager()
             .cache_resolved_schema(table.schema().clone());
-        Ok(if is_external {
-            table
-        } else {
-            // Mint the session after the schema-replacing copy.
-            table.with_query_auth_session()
-        })
+        if is_external {
+            table.external_blob_view_env = table.rest_env.take().map(Arc::new);
+            return Ok(table);
+        }
+        Ok(table.with_query_auth_session())
     }
 
     #[allow(clippy::too_many_arguments)]

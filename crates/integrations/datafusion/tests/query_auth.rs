@@ -118,7 +118,6 @@ async fn restricted_people_with_schema(
         schema(&[("query-auth.enabled", "true")]),
         table.location(),
     );
-    server.set_table_external("default", "people", false);
     server.set_auth_response(
         "default",
         "people",
@@ -576,7 +575,6 @@ async fn restricted_variants() -> (tempfile::TempDir, RESTServer, SQLContext) {
         schema(&[("query-auth.enabled", "true")]),
         &location,
     );
-    server.set_table_external("default", "vguard", false);
     server.set_auth_response(
         "default",
         "vguard",
