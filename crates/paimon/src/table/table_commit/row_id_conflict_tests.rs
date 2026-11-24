@@ -106,16 +106,6 @@ fn row_id_check_message(name: &str, column: &str) -> CommitMessage {
     message
 }
 
-async fn seed_row_id_table(io: &FileIO, path: &str) -> TableCommit {
-    setup_dirs(io, path).await;
-    let commit = setup_data_evolution_commit(io, path);
-    let mut base = append_message("base.parquet");
-    base.partition = EMPTY_SERIALIZED_ROW.clone();
-    base.new_files[0].file_source = Some(0);
-    commit.commit_with_identifier(vec![base], 1).await.unwrap();
-    commit
-}
-
 struct ConcurrentManifestReplacement {
     manager: SnapshotManager,
     replacement: Snapshot,
@@ -138,12 +128,19 @@ impl SnapshotCommit for ConcurrentManifestReplacement {
     }
 }
 
-async fn reassigned_snapshot(
-    commit: &TableCommit,
-    initial: &Snapshot,
-) -> (Snapshot, Vec<ManifestEntry>) {
-    let io = commit.table.file_io();
-    let mut reassigned = active_entries(io, commit.table.location(), initial).await;
+#[tokio::test]
+async fn row_id_update_retry_reloads_base_after_overwrite() {
+    let io = test_file_io();
+    let path = "memory:/row-id-reassignment-during-commit";
+    setup_dirs(&io, path).await;
+    let mut commit = setup_data_evolution_commit(&io, path);
+    let mut base = append_message("base.parquet");
+    base.partition = EMPTY_SERIALIZED_ROW.clone();
+    base.new_files[0].file_source = Some(0);
+    commit.commit_with_identifier(vec![base], 1).await.unwrap();
+
+    let initial = latest_snapshot(&io, path).await.unwrap();
+    let mut reassigned = active_entries(&io, path, &initial).await;
     assert_eq!(reassigned[0].file().first_row_id, Some(0));
     reassigned[0].file.first_row_id = Some(10);
 
@@ -151,7 +148,7 @@ async fn reassigned_snapshot(
     let manifest_dir = commit.snapshot_manager.manifest_dir();
     let base_metas = commit
         .write_manifest_files(
-            io,
+            &io,
             &manifest_dir,
             "reassigned",
             &reassigned,
@@ -161,15 +158,15 @@ async fn reassigned_snapshot(
         .unwrap();
     let base_list = "manifest-list-reassigned-base";
     let delta_list = "manifest-list-reassigned-delta";
-    ManifestList::write(io, &format!("{manifest_dir}/{base_list}"), &base_metas)
+    ManifestList::write(&io, &format!("{manifest_dir}/{base_list}"), &base_metas)
         .await
         .unwrap();
-    ManifestList::write(io, &format!("{manifest_dir}/{delta_list}"), &[])
+    ManifestList::write(&io, &format!("{manifest_dir}/{delta_list}"), &[])
         .await
         .unwrap();
     let replacement = Snapshot::builder()
         .version(3)
-        .id(initial.id() + 1)
+        .id(2)
         .schema_id(initial.schema_id())
         .base_manifest_list(base_list.to_string())
         .delta_manifest_list(delta_list.to_string())
@@ -181,17 +178,6 @@ async fn reassigned_snapshot(
         .delta_record_count(Some(0))
         .next_row_id(Some(20))
         .build();
-    (replacement, reassigned)
-}
-
-#[tokio::test]
-async fn row_id_update_retry_reloads_base_after_overwrite() {
-    let io = test_file_io();
-    let path = "memory:/row-id-reassignment-during-commit";
-    let mut commit = seed_row_id_table(&io, path).await;
-
-    let initial = latest_snapshot(&io, path).await.unwrap();
-    let (replacement, reassigned) = reassigned_snapshot(&commit, &initial).await;
     commit.snapshot_commit = Arc::new(ConcurrentManifestReplacement {
         manager: commit.snapshot_manager.clone(),
         replacement,
@@ -215,123 +201,28 @@ async fn row_id_update_retry_reloads_base_after_overwrite() {
     assert_eq!(active_entries(&io, path, &latest).await, reassigned);
 }
 
-#[tokio::test]
-async fn row_id_retry_uses_catalog_overwrite_even_with_an_older_storage_snapshot() {
-    for reuse_id in [false, true] {
-        let io = test_file_io();
-        let path = "memory:/rest-row-id-reassignment";
-        let seed = seed_row_id_table(&io, path).await;
-        let initial = latest_snapshot(&io, path).await.unwrap();
-        let (replacement, reassigned) = reassigned_snapshot(&seed, &initial).await;
-
-        // Simulate storage still exposing snapshot 2 from the previous history.
-        seed.clone()
-            .with_ignore_empty_commit(false)
-            .commit_with_identifier(Vec::new(), 2)
-            .await
-            .unwrap();
-        let stale = latest_snapshot(&io, path).await.unwrap();
-
-        let head = if reuse_id { stale } else { initial };
-        let (table, commits, server) = rest_retry_table(seed.table, head, replacement).await;
-        let mut commit = TableCommit::new(table, "rest-writer".into());
-        commit.commit_min_retry_wait_ms = 0;
-        commit.commit_max_retry_wait_ms = 0;
-
-        let result = commit
-            .commit_with_identifier(vec![row_id_check_message("staged.parquet", "name")], 2)
-            .await;
-        assert!(
-            matches!(
-                result,
-                Err(crate::Error::RowIdExistenceConflict {
-                    first_row_id: Some(0),
-                    ..
-                })
-            ),
-            "reuse_id={reuse_id}, {result:?}"
-        );
-        assert_eq!(commits.load(Ordering::Relaxed), 1);
-        let head = commit
-            .snapshot_manager
-            .get_latest_snapshot()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(active_entries(&io, path, &head).await, reassigned);
-        server.abort();
-    }
-}
-
 async fn row_id_check_history(path: &str) -> TableCommit {
-    row_id_check_history_with_io(&test_file_io(), path).await
-}
-
-async fn row_id_check_history_with_io(io: &FileIO, path: &str) -> TableCommit {
-    let commit = seed_row_id_table(io, path).await;
+    let io = test_file_io();
+    setup_dirs(&io, path).await;
+    let commit = setup_data_evolution_commit(&io, path);
+    let mut file = test_data_file("base.parquet", 10);
+    file.file_source = Some(0);
+    commit
+        .commit_with_identifier(
+            vec![CommitMessage::new(
+                EMPTY_SERIALIZED_ROW.clone(),
+                0,
+                vec![file],
+            )],
+            1,
+        )
+        .await
+        .unwrap();
     commit
         .commit_with_identifier(vec![row_id_check_message("concurrent.parquet", "name")], 2)
         .await
         .unwrap();
     commit
-}
-
-#[tokio::test]
-async fn row_id_retry_reloads_overwritten_history_before_a_new_append() {
-    let path = "memory:/row-id-reassignment-before-append";
-    let io = FileIOBuilder::new("memory")
-        .with_prop("local-cache.enabled", "true")
-        .build()
-        .unwrap();
-    let commit = row_id_check_history_with_io(&io, path).await;
-    let manager = &commit.snapshot_manager;
-    let initial = manager.get_snapshot(1).await.unwrap();
-    let cached_reader = commit.table.snapshot_manager();
-    let cached_snapshot = cached_reader.get_snapshot(2).await.unwrap();
-    let cached_files = active_entries(&io, path, &cached_snapshot).await;
-
-    // Rolling back to 1 lets an overwrite reuse ID 2. A subsequent append
-    // hides it behind the cached retry's lower boundary. An external writer
-    // cannot invalidate this instance's local block cache.
-    let (replacement, _) = reassigned_snapshot(&commit, &initial).await;
-    let (storage, relative_path) = io.create_static(&manager.snapshot_path(2)).unwrap();
-    storage
-        .write(&relative_path, serde_json::to_vec(&replacement).unwrap())
-        .await
-        .unwrap();
-    assert!(cached_reader
-        .get_snapshot(2)
-        .await
-        .unwrap()
-        .has_same_read_metadata(&cached_snapshot));
-    let mut value = serde_json::to_value(replacement).unwrap();
-    value["id"] = 3.into();
-    value["commitKind"] = "APPEND".into();
-    let latest: Snapshot = serde_json::from_value(value).unwrap();
-    assert!(manager.commit_snapshot(&latest).await.unwrap());
-
-    let changes = commit.messages_to_entries(&[row_id_check_message("staged.parquet", "name")]);
-    let retry = RetryState {
-        latest_snapshot: Some(cached_snapshot),
-        base_data_files: Some(cached_files),
-        publication_error: None,
-    };
-    let result = commit
-        .detect_commit_conflicts(
-            &Some(latest),
-            Some(&retry),
-            &changes,
-            &CommitKind::APPEND,
-            Some(1),
-        )
-        .await;
-    assert!(matches!(
-        result,
-        Err(crate::Error::RowIdExistenceConflict {
-            first_row_id: Some(0),
-            ..
-        })
-    ));
 }
 
 #[tokio::test]

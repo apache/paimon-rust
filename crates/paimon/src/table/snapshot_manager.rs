@@ -38,7 +38,6 @@ pub struct SnapshotManager {
     table_path: String,
     branch: String,
     rest_env: Option<super::RESTEnv>,
-    cache_snapshot_reads: bool,
 }
 
 impl SnapshotManager {
@@ -49,17 +48,11 @@ impl SnapshotManager {
             table_path,
             branch: DEFAULT_MAIN_BRANCH.to_string(),
             rest_env: None,
-            cache_snapshot_reads: true,
         }
     }
 
     pub(crate) fn with_rest_env(mut self, rest_env: Option<super::RESTEnv>) -> Self {
         self.rest_env = rest_env;
-        self
-    }
-
-    pub(super) fn without_snapshot_cache(mut self) -> Self {
-        self.cache_snapshot_reads = false;
         self
     }
 
@@ -85,8 +78,10 @@ impl SnapshotManager {
             branch_name
         };
         Self {
+            file_io: self.file_io.clone(),
+            table_path: self.table_path.clone(),
             branch: branch.to_string(),
-            ..self.clone()
+            rest_env: self.rest_env.clone(),
         }
     }
 
@@ -232,11 +227,6 @@ impl SnapshotManager {
     pub async fn get_snapshot(&self, snapshot_id: i64) -> crate::Result<Snapshot> {
         let snapshot_path = self.snapshot_path(snapshot_id);
         let snap_input = self.file_io.new_input(&snapshot_path)?;
-        let snap_input = if self.cache_snapshot_reads {
-            snap_input
-        } else {
-            snap_input.without_local_cache()
-        };
         if !snap_input.exists().await? {
             return Err(crate::Error::SnapshotNotExist { snapshot_id });
         }

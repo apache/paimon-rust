@@ -40,7 +40,6 @@ use crate::table::snapshot_commit::SnapshotCommit;
 use crate::table::{SnapshotManager, Table, TableScan};
 use crate::Result;
 use apache_avro::{to_value, Schema};
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -247,9 +246,7 @@ impl TableCommit {
         let partition_default_name = core_options.partition_default_name().to_string();
         Self {
             table,
-            // Rollback and branch fast-forward can reuse a snapshot path outside this process.
-            // Commit and recovery need current metadata for that ID.
-            snapshot_manager: snapshot_manager.without_snapshot_cache(),
+            snapshot_manager,
             snapshot_commit,
             commit_user,
             ignore_empty_commit: true,
@@ -2601,7 +2598,7 @@ impl TableCommit {
                     )
                     .await?
             }
-            Some(cached) => !cached.has_same_read_metadata(latest),
+            Some(_) => false,
         };
 
         if rebuild_cache {
@@ -2625,14 +2622,12 @@ impl TableCommit {
         let Some(partition_filter) = partition_filter else {
             return Ok(false);
         };
-        if !self.stored_snapshot_matches(cached_snapshot).await {
-            return Ok(false);
-        }
 
         for snapshot_id in cached_snapshot.id() + 1..=latest_snapshot.id() {
             *delta_probe_count += 1;
-            let Some(snapshot) = self.retry_snapshot(snapshot_id, latest_snapshot).await else {
-                return Ok(false);
+            let snapshot = match self.snapshot_manager.get_snapshot(snapshot_id).await {
+                Ok(snapshot) => snapshot,
+                Err(_) => return Ok(false),
             };
             if snapshot.commit_kind() != &CommitKind::APPEND {
                 return Ok(false);
@@ -2646,25 +2641,6 @@ impl TableCommit {
         }
 
         Ok(true)
-    }
-
-    async fn stored_snapshot_matches(&self, snapshot: &Snapshot) -> bool {
-        self.snapshot_manager
-            .get_snapshot(snapshot.id())
-            .await
-            .is_ok_and(|stored| snapshot.has_same_read_metadata(&stored))
-    }
-
-    async fn retry_snapshot<'a>(&self, id: i64, head: &'a Snapshot) -> Option<Cow<'a, Snapshot>> {
-        // A REST catalog can expose a different head from the file at the same ID.
-        if id == head.id() {
-            return Some(Cow::Borrowed(head));
-        }
-        self.snapshot_manager
-            .get_snapshot(id)
-            .await
-            .ok()
-            .map(Cow::Owned)
     }
 
     fn build_overwrite_result(
@@ -2737,25 +2713,13 @@ impl TableCommit {
         to_snapshot: &Snapshot,
         commit_entries: &[ManifestEntry],
     ) -> Result<Option<Vec<ManifestEntry>>> {
-        if to_snapshot.id() <= from_snapshot.id() {
-            // A rollback can move the head backward or reuse an ID.
-            return Ok(from_snapshot
-                .has_same_read_metadata(to_snapshot)
-                .then(Vec::new));
-        }
-        if to_snapshot.commit_kind() == &CommitKind::OVERWRITE {
-            return Ok(None);
-        }
-        if !self.stored_snapshot_matches(from_snapshot).await {
-            return Ok(None);
-        }
-
         let entry_refs = commit_entries.iter().collect::<Vec<_>>();
         let partition_filter = self.build_entries_partition_filter(&entry_refs)?;
         let mut entries = Vec::new();
         for snapshot_id in from_snapshot.id() + 1..=to_snapshot.id() {
-            let Some(snapshot) = self.retry_snapshot(snapshot_id, to_snapshot).await else {
-                return Ok(None);
+            let snapshot = match self.snapshot_manager.get_snapshot(snapshot_id).await {
+                Ok(snapshot) => snapshot,
+                Err(_) => return Ok(None),
             };
             // A metadata-only overwrite can replace the base manifests with an empty delta.
             if snapshot.commit_kind() == &CommitKind::OVERWRITE {
@@ -4224,7 +4188,6 @@ mod tests {
     };
     use apache_avro::types::Value;
     use chrono::{DateTime, Utc};
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn check_from_snapshot_uses_minimum_baseline() {
@@ -5182,181 +5145,6 @@ mod tests {
             vec!["intervening.parquet", "overwrite.parquet"],
             "the retry must not remove data committed in between"
         );
-    }
-
-    async fn rest_retry_table(
-        mut table: Table,
-        initial: Snapshot,
-        replacement: Snapshot,
-    ) -> (Table, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-        use crate::api::rest_api::RESTApi;
-        use crate::common::Options;
-        use axum::{
-            body::Bytes,
-            http::{Method, Uri},
-            Json, Router,
-        };
-        use std::sync::Mutex;
-
-        let head = Arc::new(Mutex::new((initial, Some(replacement))));
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let handler_attempts = attempts.clone();
-        let table_name = table.identifier().object().to_string();
-        let schema = serde_json::json!({"schemaId": table.schema().id(), "schema": table.schema()});
-        let app = Router::new().fallback(move |method: Method, uri: Uri, body: Bytes| {
-            let mut head = head.lock().unwrap();
-            let response = if uri.path().ends_with("/commit") {
-                assert_eq!(method, Method::POST);
-                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                assert_eq!(request["baseSnapshotUuid"].as_str(), head.0.uuid());
-                handler_attempts.fetch_add(1, Ordering::Relaxed);
-                if let Some(replacement) = head.1.take() {
-                    head.0 = replacement;
-                    serde_json::json!({"success": false})
-                } else {
-                    let next: Snapshot =
-                        serde_json::from_value(request["snapshot"].clone()).unwrap();
-                    assert_eq!(next.id(), head.0.id() + 1);
-                    head.0 = next;
-                    serde_json::json!({"success": true})
-                }
-            } else if uri.path().ends_with("/snapshot") {
-                assert_eq!(method, Method::GET);
-                serde_json::json!({"snapshot": {"snapshot": head.0}})
-            } else {
-                assert_eq!(method, Method::GET);
-                assert_eq!(uri.path().rsplit('/').next(), Some(table_name.as_str()));
-                schema.clone()
-            };
-            std::future::ready(Json(response))
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut options = Options::new();
-        options.set("uri", format!("http://{}", listener.local_addr().unwrap()));
-        options.set("token.provider", "bear");
-        options.set("token", "test-token");
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
-        let cache = crate::io::FileIOCacheContext::from_props(options.to_map()).unwrap();
-        table.rest_env = Some(crate::table::RESTEnv::new(
-            table.identifier().clone(),
-            "table-uuid".into(),
-            api,
-            options,
-            false,
-            None,
-            cache,
-        ));
-        (table, attempts, server)
-    }
-
-    #[tokio::test]
-    async fn test_partition_overwrite_retry_uses_current_snapshot_history() {
-        use crate::table::WriteBuilder;
-        use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
-        use futures::TryStreamExt;
-
-        async fn write_rows(
-            builder: &WriteBuilder<'_>,
-            partitions: Vec<&str>,
-            ids: Vec<i32>,
-        ) -> Vec<CommitMessage> {
-            let mut writer = builder.new_write().unwrap();
-            let batch = RecordBatch::try_from_iter([
-                ("pt", Arc::new(StringArray::from(partitions)) as ArrayRef),
-                ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
-            ])
-            .unwrap();
-            writer.write_arrow_batch(&batch).await.unwrap();
-            writer.prepare_commit().await.unwrap()
-        }
-
-        for (initial_id, replacement_id, expected) in [
-            (2, 2, &[20, 100][..]),
-            (1, 2, &[20, 100][..]),
-            (2, 3, &[20, 22, 100][..]),
-        ] {
-            let io = test_file_io();
-            let path = "memory:/partition-overwrite-retry";
-            setup_dirs(&io, path).await;
-            let seed = test_partitioned_table(&io, path);
-            let storage = seed.snapshot_manager();
-            let builder = seed.new_write_builder();
-            let writer = builder.new_commit();
-            for (partitions, ids) in [
-                (vec!["target", "other"], vec![10, 20]),
-                (vec!["other"], vec![21]),
-            ] {
-                writer
-                    .commit(write_rows(&builder, partitions, ids).await)
-                    .await
-                    .unwrap();
-            }
-            let initial = storage.get_snapshot(initial_id).await.unwrap();
-            let stale = storage.get_snapshot(2).await.unwrap();
-
-            // Roll back the storage history and append to the overwrite's target partition.
-            storage.delete_snapshot(2).await.unwrap();
-            storage.write_latest_hint(1).await.unwrap();
-            writer
-                .commit(write_rows(&builder, vec!["target"], vec![11]).await)
-                .await
-                .unwrap();
-            if replacement_id == 3 {
-                writer
-                    .commit(write_rows(&builder, vec!["other"], vec![22]).await)
-                    .await
-                    .unwrap();
-            }
-            let replacement = storage.get_snapshot(replacement_id).await.unwrap();
-            if replacement_id == 2 {
-                // The catalog can expose its new head while storage still returns the old file.
-                io.new_output(&storage.snapshot_path(2))
-                    .unwrap()
-                    .write(serde_json::to_vec(&stale).unwrap().into())
-                    .await
-                    .unwrap();
-            }
-
-            let (table, attempts, server) = rest_retry_table(seed, initial, replacement).await;
-            let builder = table.new_write_builder().with_overwrite();
-            let mut commit = builder.new_commit();
-            commit.commit_min_retry_wait_ms = 0;
-            commit.commit_max_retry_wait_ms = 0;
-            commit
-                .overwrite(write_rows(&builder, vec!["target"], vec![100]).await, None)
-                .await
-                .unwrap();
-
-            let mut read = table.new_read_builder();
-            read.with_projection(&["id"]).unwrap();
-            let plan = read.new_scan().plan().await.unwrap();
-            let batches: Vec<RecordBatch> = read
-                .new_read()
-                .unwrap()
-                .to_arrow(plan.splits())
-                .unwrap()
-                .try_collect()
-                .await
-                .unwrap();
-            let mut ids = batches
-                .iter()
-                .flat_map(|batch| {
-                    batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .unwrap()
-                        .values()
-                        .iter()
-                        .copied()
-                })
-                .collect::<Vec<_>>();
-            ids.sort_unstable();
-            assert_eq!(attempts.load(Ordering::Relaxed), 2);
-            assert_eq!(ids, expected, "snapshot {initial_id} to {replacement_id}");
-            server.abort();
-        }
     }
 
     #[tokio::test]
