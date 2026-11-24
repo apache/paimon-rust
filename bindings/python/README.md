@@ -564,14 +564,15 @@ response-decoding failures without an HTTP error status. Malformed identifiers
 remain `ValueError`, unsupported catalogs raise `NotImplementedError`, and
 inherited Native state still raises `ForkSafetyError`.
 
-REST tables load the latest snapshot through the catalog, including empty
-results and branch-scoped requests. Permission and service failures (including
-HTTP 501) are propagated as in Java, and the
-FileIO provider continues to refresh catalog credentials after schema replacement.
+Catalog-managed REST tables load the latest snapshot through the catalog,
+including empty results and branch-scoped requests. Permission and service
+failures (including HTTP 501) propagate to the caller. The FileIO provider
+refreshes catalog credentials after schema replacement. REST-registered external
+Paimon tables use table storage for snapshots, branches and tags.
 
 `Table.from_rest_response(response_json, database=..., table=..., rest_options=...)`
 reuses the matching REST table response and merged catalog options, skipping
-config/get-table requests while preserving REST snapshots and token refresh.
+config/get-table requests while preserving snapshot ownership and token refresh.
 Use `copy_with_resolved_schema` to apply branch or dynamic options.
 
 ## Setup

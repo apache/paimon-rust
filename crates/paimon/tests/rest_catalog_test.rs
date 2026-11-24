@@ -104,7 +104,7 @@ fn format_table_schema(options: &[(&str, &str)]) -> Schema {
     builder.build().unwrap()
 }
 
-/// Catalog-managed partitions require an internal table, and the mock serves external ones.
+/// Register a fixture whose metadata belongs to the REST catalog.
 fn add_internal_table_with_schema(
     server: &RESTServer,
     table: &str,
@@ -988,6 +988,7 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
     .await;
     server.add_table_with_schema("default", "blob_source", source_schema, source.location());
     server.add_table_with_schema("default", "blob_view_target", view_schema, view.location());
+    server.set_table_external("default", "blob_source", true);
 
     let url = server.url().expect("Failed to get server URL");
     let mut rest_options = Options::new();
@@ -1344,6 +1345,8 @@ async fn test_rest_catalog_reads_format_table_with_bearer_and_local_file_dlf_aut
     let identifier = Identifier::new("default", "format_users");
     ctx.server
         .add_table_with_schema("default", "format_users", schema, &format_path);
+    ctx.server
+        .set_table_external("default", "format_users", true);
 
     let table = ctx.catalog.get_table(&identifier).await.unwrap();
     assert_eq!(table.location(), format_path);
@@ -1507,21 +1510,25 @@ async fn test_rest_catalog_rejects_enabling_managed_partitions_in_dynamic_option
         "memory:/unmanaged_format",
     );
 
-    let table = ctx.catalog.get_table(&identifier).await.unwrap();
-    assert!(!table.has_catalog_managed_partitions());
+    for is_external in [false, true] {
+        ctx.server
+            .set_table_external("default", "unmanaged_format", is_external);
+        let table = ctx.catalog.get_table(&identifier).await.unwrap();
+        assert!(!table.has_catalog_managed_partitions());
 
-    let error = table
-        .copy_with_time_travel(HashMap::from([(
-            "metastore.partitioned-table".to_string(),
-            "true".to_string(),
-        )]))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, paimon::Error::DataInvalid { .. })
-            && error.to_string().contains("metastore.partitioned-table"),
-        "expected partition source validation error, got: {error}"
-    );
+        let error = table
+            .copy_with_time_travel(HashMap::from([(
+                "metastore.partitioned-table".to_string(),
+                "true".to_string(),
+            )]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, paimon::Error::DataInvalid { .. })
+                && error.to_string().contains("metastore.partitioned-table"),
+            "expected partition source validation error, got: {error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1535,6 +1542,8 @@ async fn test_rest_catalog_rejects_external_catalog_managed_format_table() {
         schema,
         "memory:/external_managed_format",
     );
+    ctx.server
+        .set_table_external("default", "external_managed_format", true);
 
     let error = ctx.catalog.get_table(&identifier).await.unwrap_err();
 

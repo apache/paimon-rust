@@ -2372,7 +2372,7 @@ impl RESTServer {
             .unwrap_or_default()
     }
 
-    /// Add a table with schema and path to the server state.
+    /// Add a managed table with schema and path to the server state.
     ///
     /// This is needed for `RESTCatalog::get_table` which requires
     /// the response to contain `schema` and `path`.
@@ -2405,7 +2405,7 @@ impl RESTServer {
                 Some(database.to_string()),
                 Some(table.to_string()),
                 Some(path.to_string()),
-                Some(true),
+                Some(false),
                 Some(0),
                 Some(schema),
                 AuditRESTResponse::new(None, None, None, None, None),

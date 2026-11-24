@@ -681,6 +681,62 @@ async fn rest_branch_copy_retains_bound_file_io_and_loads_branch_identity() {
 }
 
 #[tokio::test]
+async fn rest_external_table_reads_and_publishes_filesystem_snapshots() {
+    let (_dir, filesystem) = table(false, &[]).await;
+    append(&filesystem, "seed", batch(vec![1], vec![10])).await;
+    let filesystem_branch = tagged_branch(&filesystem).await;
+
+    // The resolved registration supplies the schema. Subsequent operations
+    // have only the filesystem available.
+    let mut options = crate::Options::new();
+    options.set("uri", "http://127.0.0.1:0");
+    options.set("warehouse", "test");
+    options.set("token.provider", "bear");
+    options.set("token", "test-token");
+    let response = serde_json::json!({
+        "database": "db", "name": "t", "id": "uuid-t",
+        "path": filesystem.location(), "isExternal": true,
+        "schemaId": 0, "schema": filesystem.schema()
+    });
+    let external = Table::from_rest_response(
+        filesystem.identifier().clone(),
+        serde_json::from_value(response).unwrap(),
+        options,
+    )
+    .await
+    .unwrap();
+    assert!(external.rest_env().is_none() && external.query_auth_session().is_none());
+    assert!(external.tag_manager().tag_exists("base").await.unwrap());
+    let branch = external.copy_with_branch("dev").await.unwrap();
+    assert_eq!(branch.rest_table_uuid(), Some("uuid-t"));
+
+    for (loaded, stored, id) in [
+        (&external, &filesystem, 2),
+        (&branch, &filesystem_branch, 3),
+    ] {
+        assert_eq!(latest(loaded).await.id(), 1);
+        append(loaded, "external-writer", batch(vec![id], vec![id * 10])).await;
+        assert_eq!(latest(stored).await.id(), 2);
+        assert_eq!(
+            table_write::tests::read_id_value_rows(loaded).await,
+            [(1, 10), (id, id * 10)]
+        );
+    }
+
+    let empty = external.copy_with_pinned_snapshot(None);
+    let key = "index-file-in-data-file-dir";
+    let mut options = empty.schema().options().clone();
+    options.insert(key.into(), "true".into());
+    let copied = empty
+        .copy_with_resolved_schema(empty.schema().copy_with_replaced_options(options), "main")
+        .unwrap();
+    assert!(!copied.schema().options().contains_key(key));
+    assert!(table_write::tests::read_id_value_rows(&copied)
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
 async fn branch_write_rest_publisher_routes_by_argument_and_preserves_payload() {
     use crate::api::rest_api::RESTApi;
     use crate::table::snapshot_commit::{RESTSnapshotCommit, SnapshotCommit};
