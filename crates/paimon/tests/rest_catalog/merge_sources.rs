@@ -40,12 +40,10 @@ async fn historical_append_writers_do_not_require_query_read_grants() {
                 vec![people_rows(1..=2), people_rows(3..=3)],
             )
             .await;
-            g.ctx
-                .server
-                .set_table_external("default", "historical_append_target", false);
-            let table = g.ctx.catalog.get_table(&g.identifier).await.unwrap();
-            let snapshot = table.snapshot_manager().get_snapshot(1).await.unwrap();
-            let target = table.copy_with_pinned_snapshot((!empty).then_some(&snapshot));
+            let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
+            let target = g
+                .table
+                .copy_with_pinned_snapshot((!empty).then_some(&snapshot));
             match policy {
                 "denied" => g.ctx.server.set_column_auth(
                     "default",
@@ -152,12 +150,10 @@ async fn historical_insert_mutations_require_whole_target_grants_before_staging(
                     vec![people_rows(1..=2), people_rows(3..=3)],
                 )
                 .await;
-                g.ctx
-                    .server
-                    .set_table_external("default", "historical_insert_target", false);
-                let table = g.ctx.catalog.get_table(&g.identifier).await.unwrap();
-                let snapshot = table.snapshot_manager().get_snapshot(1).await.unwrap();
-                let target = table.copy_with_pinned_snapshot((!empty).then_some(&snapshot));
+                let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
+                let target = g
+                    .table
+                    .copy_with_pinned_snapshot((!empty).then_some(&snapshot));
                 match policy {
                     "denied" => g.ctx.server.set_column_auth(
                         "default",

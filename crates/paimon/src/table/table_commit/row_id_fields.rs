@@ -31,7 +31,7 @@ impl TableCommit {
         // Conflict detection precedes snapshot preparation. A concurrent REST
         // update may introduce a catalog-only schema the old handle has never
         // seen. Resolve it before attempting to read a missing schema file.
-        if self.table.snapshot_rest_env().is_some() {
+        if self.table.rest_env.is_some() {
             let current = self.latest_row_id_schema().await?;
             if current.id() == file.schema_id {
                 return Ok(current);
@@ -41,7 +41,7 @@ impl TableCommit {
     }
 
     pub(super) async fn latest_row_id_schema(&self) -> Result<Arc<TableSchema>> {
-        if let Some(env) = self.table.snapshot_rest_env() {
+        if let Some(env) = &self.table.rest_env {
             // REST catalogs need not store schema files. Use one response for
             // both field identities and the snapshot's schema ID.
             let response = env

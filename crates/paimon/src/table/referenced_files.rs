@@ -224,10 +224,10 @@ pub async fn collect_referenced_files_summary_with_options(
 
 /// Collect referenced sizes for a table with its data-directory and partition options.
 ///
-/// REST catalogs supply branch names for their registered tables. For
-/// catalog-managed tables, tags and the current snapshot of each branch come
-/// from the catalog alongside the snapshot history in storage. External tables
-/// take their snapshots and tags from storage. Catalog metadata failures propagate.
+/// For a table managed by a REST catalog, branches, tags and each branch's current
+/// snapshot come from the catalog, together with the snapshot files in storage.
+/// REST metadata failures propagate: unknown metadata must not be reported as an
+/// empty set of references. Other tables read table storage only.
 pub async fn collect_table_referenced_files_summary(
     table: &Table,
 ) -> crate::Result<Vec<ReferencedFilesSummary>> {
@@ -275,14 +275,10 @@ async fn collect_summary(
     }
     let extra_resolver_ref = &extra_resolver;
 
-    let snapshot_rest_env = rest_env
-        .as_ref()
-        .filter(|env| env.catalog_owns_snapshots())
-        .cloned();
-    let include_catalog_snapshot = snapshot_rest_env.is_some();
+    let include_catalog_snapshot = rest_env.is_some();
     // Collection always starts at the table root, even for a branch table.
     let sm = SnapshotManager::new(file_io.clone(), table_location.to_string())
-        .with_rest_env(snapshot_rest_env);
+        .with_rest_env(rest_env.clone());
     let tm = TagManager::new(file_io.clone(), table_location.to_string()).with_rest_env(rest_env);
 
     // 1. Main branch snapshots + tags (concurrently)
@@ -309,8 +305,8 @@ async fn collect_summary(
         let branch_sm = sm.with_branch(branch_name);
         let branch_tm = tm.with_branch(branch_name);
 
-        // Historical snapshot files use the branch path. Catalog-managed tables
-        // also read current snapshots and tags from the catalog. Manifest paths use the
+        // Historical snapshot files use the branch path; current snapshots and
+        // tags also consult the catalog for REST tables. Manifest paths use the
         // table root. Process one branch at a time so completed file sets can
         // be summarized and released.
         let (mut branch_files, branch_tag_files) = tokio::try_join!(

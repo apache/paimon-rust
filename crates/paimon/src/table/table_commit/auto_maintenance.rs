@@ -189,13 +189,8 @@ impl TableCommit {
     pub(super) async fn post_commit_table(&self, snapshot: Option<&Snapshot>) -> Result<Table> {
         // A historical writer can publish old-schema files against a newer
         // schema. Post-commit maintenance must use the current field layout.
-        let catalog_response = if let Some(env) = self.table.rest_env() {
+        let current_schema = if let Some(env) = &self.table.rest_env {
             let response = env.current_table_identity_checked().await?;
-            env.catalog_owns_snapshots().then_some(response)
-        } else {
-            None
-        };
-        let current_schema = if let Some(response) = catalog_response {
             let schema_id = response
                 .schema_id
                 .ok_or_else(|| crate::Error::DataInvalid {
@@ -247,7 +242,7 @@ impl TableCommit {
             self.table.clone()
         };
         let table = table.copy_with_pinned_snapshot(snapshot);
-        if self.table.snapshot_rest_env().is_some() {
+        if self.table.rest_env.is_some() {
             table
                 .schema_manager()
                 .inherit_cached_schemas(self.table.schema_manager())?;

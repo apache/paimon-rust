@@ -862,14 +862,14 @@ async fn test_catalog_get_table() {
 async fn test_rest_env_get_table_reuses_catalog_environment() {
     let ctx = setup_catalog(vec!["default"]).await;
 
-    ctx.server.add_table_with_schema(
-        "default",
+    add_internal_table_with_schema(
+        &ctx.server,
         "current_table",
         test_schema(),
         "file:///tmp/test_warehouse/default.db/current_table",
     );
-    ctx.server.add_table_with_schema(
-        "default",
+    add_internal_table_with_schema(
+        &ctx.server,
         "upstream_table",
         test_schema(),
         "file:///tmp/test_warehouse/default.db/upstream_table",
@@ -1000,7 +1000,7 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
         .expect("create rest catalog");
 
     let read_via = paimon::api::RESTUtil::encode_string(&serde_json::to_string(&view_id).unwrap());
-    server.require_table_read_via("default", "blob_source", read_via);
+    server.require_table_read_via("default", "blob_source", read_via.clone());
     let rest_view = rest_catalog.get_table(&view_id).await.unwrap();
     let predicate = PredicateBuilder::new(rest_view.schema().fields())
         .equal("id", Datum::Int(1))
@@ -1020,6 +1020,35 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
         collect_blob_rows(&batches),
         vec![(1, "Kept".to_string(), Some(b"bob".to_vec()))]
     );
+
+    let snapshot = view.snapshot_manager().get_snapshot(1).await.unwrap();
+    view.tag_manager().create("base", &snapshot).await.unwrap();
+    paimon::table::BranchManager::new(view.file_io().clone(), view.location().to_string())
+        .create_branch_from_tag("dev", "base")
+        .await
+        .unwrap();
+    let branch_id = Identifier::new("default", "blob_view_target$branch_dev");
+    let branch_read_via =
+        paimon::api::RESTUtil::encode_string(&serde_json::to_string(&branch_id).unwrap());
+    server.require_table_read_via("default", "blob_source", branch_read_via);
+    let branch = rest_view.copy_with_branch("dev").await.unwrap();
+    let resolved_branch = rest_view
+        .copy_with_resolved_schema(branch.schema().clone(), "dev")
+        .unwrap();
+    for branch in [branch, resolved_branch] {
+        let mut builder = branch.new_read_builder();
+        builder.with_limit(1);
+        let batches = read_all(&builder).await.unwrap();
+        assert_eq!(
+            collect_blob_rows(&batches),
+            vec![(1, "Kept".to_string(), Some(b"bob".to_vec()))]
+        );
+    }
+    assert_eq!(
+        server.table_get_call_count("default", branch_id.object()),
+        0
+    );
+    server.require_table_read_via("default", "blob_source", read_via);
 
     // LIMIT alone must not resolve the invalid reference in the fourth row.
     // The repeated reference is read from the lookup cache in a later batch.
@@ -1140,8 +1169,8 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
 
     // The same selection must protect view lookups under server authorization,
     // including the multi-provider read after the partial-column updates.
-    server.add_table_with_schema(
-        "default",
+    add_internal_table_with_schema(
+        &server,
         "blob_view_target",
         blob_schema(&[
             ("blob-view-field", "picture"),
@@ -1507,21 +1536,25 @@ async fn test_rest_catalog_rejects_enabling_managed_partitions_in_dynamic_option
         "memory:/unmanaged_format",
     );
 
-    let table = ctx.catalog.get_table(&identifier).await.unwrap();
-    assert!(!table.has_catalog_managed_partitions());
+    for is_external in [false, true] {
+        ctx.server
+            .set_table_external("default", "unmanaged_format", is_external);
+        let table = ctx.catalog.get_table(&identifier).await.unwrap();
+        assert!(!table.has_catalog_managed_partitions());
 
-    let error = table
-        .copy_with_time_travel(HashMap::from([(
-            "metastore.partitioned-table".to_string(),
-            "true".to_string(),
-        )]))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, paimon::Error::DataInvalid { .. })
-            && error.to_string().contains("metastore.partitioned-table"),
-        "expected partition source validation error, got: {error}"
-    );
+        let error = table
+            .copy_with_time_travel(HashMap::from([(
+                "metastore.partitioned-table".to_string(),
+                "true".to_string(),
+            )]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, paimon::Error::DataInvalid { .. })
+                && error.to_string().contains("metastore.partitioned-table"),
+            "expected partition source validation error, got: {error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3042,8 +3075,7 @@ async fn test_query_auth_unrestricted_user_can_read() {
         .option("query-auth.enabled", "true")
         .build()
         .unwrap();
-    ctx.server
-        .add_table_with_schema("default", "guarded", guarded_schema, plain.location());
+    add_internal_table_with_schema(&ctx.server, "guarded", guarded_schema, plain.location());
 
     let table = ctx.catalog.get_table(&identifier).await.unwrap();
     let read_builder = table.new_read_builder();
@@ -3616,8 +3648,8 @@ async fn test_blob_view_mask_alias_resolves_the_source_view() {
         source_schema,
         source.location(),
     );
-    server.add_table_with_schema(
-        "default",
+    add_internal_table_with_schema(
+        &server,
         "alias_view_target",
         view_schema(&[("query-auth.enabled", "true")]),
         view.location(),
@@ -4027,8 +4059,7 @@ async fn guarded(name: &str, columns: &[&str]) -> Guarded {
     let ctx = setup_catalog(vec!["default"]).await;
     let tmp = tempfile::tempdir().unwrap();
     let path = format!("file://{}", tmp.path().display());
-    ctx.server
-        .add_table_with_schema("default", name, schema_of(columns, GUARDED), &path);
+    add_internal_table_with_schema(&ctx.server, name, schema_of(columns, GUARDED), &path);
     let identifier = Identifier::new("default", name);
     let table = ctx.catalog.get_table(&identifier).await.unwrap();
     Guarded {
@@ -4339,8 +4370,7 @@ async fn test_query_auth_allows_a_nested_projection_but_not_an_extra_nested_fiel
         .option("query-auth.enabled", "true")
         .build()
         .unwrap();
-    ctx.server
-        .add_table_with_schema("default", "nested", served, &path);
+    add_internal_table_with_schema(&ctx.server, "nested", served, &path);
 
     let table = ctx
         .catalog
@@ -4375,8 +4405,7 @@ async fn test_a_decorated_name_loads_and_only_query_auth_refuses_it() {
     ctx.server
         .add_table_with_schema("default", "plain$files", schema_of(&["id"], &[]), &path);
     for name in ["guarded$branch_dev", "guarded$files"] {
-        ctx.server
-            .add_table_with_schema("default", name, schema_of(&["id"], GUARDED), &path);
+        add_internal_table_with_schema(&ctx.server, name, schema_of(&["id"], GUARDED), &path);
     }
     ctx.catalog
         .get_table(&Identifier::new("default", "plain$files"))
@@ -4485,8 +4514,7 @@ async fn written(
     }
 
     let ctx = setup_catalog(vec!["default"]).await;
-    ctx.server
-        .add_table_with_schema("default", name, schema(GUARDED), plain.location());
+    add_internal_table_with_schema(&ctx.server, name, schema(GUARDED), plain.location());
     let table = ctx.catalog.get_table(&identifier).await.unwrap();
     Guarded {
         ctx,
@@ -5894,10 +5922,8 @@ async fn test_branch_write_copy_loads_catalog_schema_with_distinct_identity() {
 async fn test_branch_write_copy_rejects_replaced_source_identity_or_location() {
     let ctx = setup_catalog(vec!["default"]).await;
     let path = "memory:/branch-identity";
-    ctx.server
-        .add_table_with_schema("default", "t", test_schema(), path);
-    ctx.server
-        .add_table_with_schema("default", "t$branch_dev", test_schema(), path);
+    add_internal_table_with_schema(&ctx.server, "t", test_schema(), path);
+    add_internal_table_with_schema(&ctx.server, "t$branch_dev", test_schema(), path);
     ctx.server
         .set_table_uuid("default", "t$branch_dev", "branch-t");
     let main = ctx
@@ -5913,8 +5939,8 @@ async fn test_branch_write_copy_rejects_replaced_source_identity_or_location() {
         error.to_string().contains("now resolves to uuid"),
         "{error}"
     );
-    ctx.server.add_table_with_schema(
-        "default",
+    add_internal_table_with_schema(
+        &ctx.server,
         "t$branch_dev",
         test_schema(),
         "memory:/replacement",

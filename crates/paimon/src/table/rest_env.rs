@@ -91,7 +91,6 @@ impl Table {
 pub struct RESTEnv {
     identifier: Identifier,
     uuid: String,
-    is_external: bool,
     api: Arc<RESTApi>,
     options: Options,
     data_token_enabled: bool,
@@ -124,7 +123,6 @@ impl RESTEnv {
         Self {
             identifier,
             uuid,
-            is_external: false,
             api,
             options,
             data_token_enabled,
@@ -233,19 +231,15 @@ impl RESTEnv {
 
     /// Refused unless the identifier still resolves to this catalog entity.
     pub(crate) async fn current_table_identity_checked(&self) -> Result<GetTableResponse> {
-        self.table_identity_checked(&self.identifier).await
-    }
-
-    async fn table_identity_checked(&self, identifier: &Identifier) -> Result<GetTableResponse> {
-        let response = self.api.get_table(identifier).await?;
+        let response = self.api.get_table(&self.identifier).await?;
+        let name = self.identifier.full_name();
         match response.id.as_deref() {
             Some(uuid) if uuid == self.uuid => {}
             uuid => {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
-                        "table '{}' now resolves to uuid {}, not the {} this handle was loaded \
-                         with; re-load the table",
-                        identifier.full_name(),
+                        "table '{name}' now resolves to uuid {}, not the {} this handle was loaded \
+                         with; re-load the table before reading it",
                         uuid.unwrap_or("nothing the server reports"),
                         self.uuid
                     ),
@@ -254,39 +248,6 @@ impl RESTEnv {
             }
         }
         Ok(response)
-    }
-
-    pub(super) async fn check_external_snapshot_target(
-        &self,
-        branch: &str,
-        path: &str,
-    ) -> Result<()> {
-        let identifier = self.identifier.with_branch(branch)?;
-        let response = self.table_identity_checked(&identifier).await?;
-        response_identifier(&identifier, &response)?;
-        if response.is_external != Some(true) || response.path.as_deref() != Some(path) {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "table '{}' no longer resolves to the loaded external snapshot location; \
-                     re-load the table before committing",
-                    identifier.full_name()
-                ),
-                source: None,
-            });
-        }
-        if response
-            .schema
-            .as_ref()
-            .is_some_and(|schema| CoreOptions::new(schema.options()).query_auth_enabled())
-        {
-            return Err(Error::Unsupported {
-                message: format!(
-                    "table '{}' has 'query-auth.enabled' = true and requires REST snapshot publication",
-                    identifier.full_name()
-                ),
-            });
-        }
-        Ok(())
     }
 
     /// Get the table identifier.
@@ -299,8 +260,12 @@ impl RESTEnv {
         &self.uuid
     }
 
-    pub(crate) fn catalog_owns_snapshots(&self) -> bool {
-        !self.is_external
+    /// Use the selected branch as the source of a BLOB dependency read.
+    pub(super) fn with_dependency_branch(&self, branch: &str) -> Result<Self> {
+        Ok(Self {
+            identifier: self.identifier.with_branch(branch)?,
+            ..self.clone()
+        })
     }
 
     /// Attach Java's outermost table identity to dependency requests. The
@@ -342,7 +307,7 @@ impl RESTEnv {
         .await
     }
 
-    /// Load a REST table and attach a fresh RESTEnv to it.
+    /// Load table metadata and attach a RESTEnv for catalog-managed tables.
     pub(crate) async fn load_table(
         identifier: &Identifier,
         api: Arc<RESTApi>,
@@ -484,7 +449,7 @@ impl RESTEnv {
         )
         .await?;
 
-        let mut rest_env = RESTEnv::new(
+        let mut env = RESTEnv::new(
             identifier.clone(),
             uuid,
             api,
@@ -493,28 +458,31 @@ impl RESTEnv {
             local_cache,
             file_io_cache,
         );
-        rest_env.is_external = is_external;
-        rest_env.fuse_resolver = fuse_resolver;
+        env.fuse_resolver = fuse_resolver;
+        let (rest_env, external_blob_view_env) = if is_external {
+            (None, Some(Arc::new(env)))
+        } else {
+            (Some(env), None)
+        };
         let parsed_identifier = identifier.parsed_object_name()?;
         let branch = parsed_identifier.branch_or_default().to_string();
         let branch_reference = parsed_identifier.branch().is_some();
-        let table = Table::new(
-            file_io,
-            identifier,
-            table_path,
-            table_schema,
-            Some(rest_env),
-        );
+        let table = Table::new(file_io, identifier, table_path, table_schema, rest_env);
 
-        // Minted after the schema-replacing copy, which drops any session.
         let mut table = table.copy_with_resolved_schema(table.schema().clone(), &branch)?;
         table.branch_reference = branch_reference;
+        table.external_blob_view_env = external_blob_view_env;
         // Cache the catalog definition before any caller applies dynamic
         // overrides. Historical DV checks must see the stored schema options.
         table
             .schema_manager()
             .cache_resolved_schema(table.schema().clone());
-        Ok(table.with_query_auth_session())
+        Ok(if is_external {
+            table
+        } else {
+            // Mint the session after the schema-replacing copy.
+            table.with_query_auth_session()
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

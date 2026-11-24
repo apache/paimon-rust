@@ -212,9 +212,10 @@ def test_resolved_rest_response_uses_snapshot_owner_and_refreshes_managed_tokens
     snapshot = json.loads((root / "snapshot" / "snapshot-1").read_text())
     expected_branch = object_name.partition("$branch_")[2] or "main"
     if external and expected_branch == "dev":
-        branch_snapshots = root / "branch" / "branch-dev" / "snapshot"
-        branch_snapshots.mkdir(parents=True)
-        shutil.copy(root / "snapshot" / "snapshot-1", branch_snapshots / "snapshot-1")
+        branch_root = root / "branch" / "branch-dev"
+        for directory, filename in [("schema", "schema-0"), ("snapshot", "snapshot-1")]:
+            (branch_root / directory).mkdir(parents=True)
+            shutil.copy(root / directory / filename, branch_root / directory / filename)
     requests = []
     token_requests = []
 
@@ -260,6 +261,7 @@ def test_resolved_rest_response_uses_snapshot_owner_and_refreshes_managed_tokens
             },
         )
         assert table.branch() == expected_branch
+        assert table.rest_table_uuid() == 'table-uuid'
         builder = table.new_batch_write_builder()
         builder.new_write().close()
         builder.new_commit().close()

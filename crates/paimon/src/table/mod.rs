@@ -338,6 +338,8 @@ pub struct Table {
     /// replay a grant.
     query_auth_session: Option<u64>,
     rest_env: Option<RESTEnv>,
+    /// REST context used only for resolving BLOB views and exposing the registration UUID.
+    external_blob_view_env: Option<Arc<RESTEnv>>,
     /// True for a time-traveled or captured read view. Scans and row matching
     /// use its selected snapshot. Writers retain its schema; commits publish
     /// against latest state.
@@ -370,6 +372,7 @@ impl Table {
             branch_reference: false,
             query_auth_session: None,
             rest_env,
+            external_blob_view_env: None,
             time_traveled: false,
             travel_snapshot: None,
             applied_dynamic_option_keys: HashSet::new(),
@@ -413,6 +416,7 @@ impl Table {
             branch_reference,
             query_auth_session: None,
             rest_env: None,
+            external_blob_view_env: None,
             time_traveled: false,
             travel_snapshot: None,
             applied_dynamic_option_keys: HashSet::new(),
@@ -518,7 +522,7 @@ impl Table {
 
     pub fn snapshot_manager(&self) -> SnapshotManager {
         let manager = SnapshotManager::new(self.file_io.clone(), self.location.clone())
-            .with_rest_env(self.snapshot_rest_env().cloned());
+            .with_rest_env(self.rest_env.clone());
         if self.is_main_branch() {
             manager
         } else {
@@ -641,12 +645,11 @@ impl Table {
                 }) {
                     return Ok(());
                 }
-                if rest_env.catalog_owns_snapshots()
-                    && rest_env
-                        .load_snapshot(&self.branch)
-                        .await?
-                        .as_ref()
-                        .is_some_and(|stored| snapshot.has_same_read_metadata(stored))
+                if rest_env
+                    .load_snapshot(&self.branch)
+                    .await?
+                    .as_ref()
+                    .is_some_and(|stored| snapshot.has_same_read_metadata(stored))
                 {
                     return Ok(());
                 }
@@ -661,7 +664,7 @@ impl Table {
         Ok(())
     }
 
-    /// Handed out once per catalog-loaded table; wraps only after 2^64 loads.
+    /// Handed out once per catalog-managed table; wraps only after 2^64 loads.
     pub(crate) fn with_query_auth_session(mut self) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         self.query_auth_session = Some(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
@@ -672,13 +675,28 @@ impl Table {
         self.query_auth_session
     }
 
-    /// Get the REST environment, if this table was loaded from a REST catalog.
+    /// Get the environment for a catalog-managed REST table.
     pub fn rest_env(&self) -> Option<&RESTEnv> {
         self.rest_env.as_ref()
     }
 
-    fn snapshot_rest_env(&self) -> Option<&RESTEnv> {
-        self.rest_env().filter(|env| env.catalog_owns_snapshots())
+    /// The registration UUID supplied by a REST catalog, including for external tables.
+    pub fn rest_table_uuid(&self) -> Option<&str> {
+        self.blob_view_rest_env().map(RESTEnv::uuid)
+    }
+
+    fn blob_view_rest_env(&self) -> Option<&RESTEnv> {
+        self.rest_env().or(self.external_blob_view_env.as_deref())
+    }
+
+    fn external_blob_view_env_for_branch(&self, branch: &str) -> Result<Option<Arc<RESTEnv>>> {
+        if branch == self.branch {
+            return Ok(self.external_blob_view_env.clone());
+        }
+        self.external_blob_view_env
+            .as_ref()
+            .map(|env| env.with_dependency_branch(branch).map(Arc::new))
+            .transpose()
     }
 
     pub(crate) fn is_format_table(&self) -> bool {
@@ -794,6 +812,7 @@ impl Table {
             branch_reference: self.branch_reference,
             query_auth_session: self.query_auth_session,
             rest_env: self.rest_env.clone(),
+            external_blob_view_env: self.external_blob_view_env.clone(),
             time_traveled: self.time_traveled,
             applied_dynamic_option_keys,
             travel_snapshot: if selector_changed {
@@ -810,18 +829,18 @@ impl Table {
     /// and does not perform time travel. Unlike that constructor, it retains the
     /// FileIO provider, REST environment and identity of this table. The branch
     /// selects its metadata namespace without loading a different schema.
-    /// An options-only replacement of the catalog-loaded schema keeps its REST
-    /// authorization session and the stored immutable options.
+    /// An options-only replacement of the catalog-loaded schema keeps the
+    /// stored immutable options and any REST authorization session.
     /// Changing a snapshot selector discards its cached resolution. Unchanged
     /// selectors retain a verified historical snapshot and its schema.
     pub fn copy_with_resolved_schema(&self, schema: TableSchema, branch: &str) -> Result<Self> {
         schema.validate_resolved_structure()?;
         validate_branch_name(branch)?;
         // An options-only copy still reads the exact schema loaded by the
-        // catalog. Preserve its session through the existing dynamic-option
-        // path; supplied fields, IDs, keys, comments and branch must all match.
+        // catalog. Preserve its stored options and any session through the
+        // dynamic-option path when fields, IDs, keys, comments and branch match.
         // REST synthesizes creation times independently in different clients.
-        if self.query_auth_session.is_some()
+        if (self.query_auth_session.is_some() || self.external_blob_view_env.is_some())
             && branch == self.branch
             && schema.has_same_definition(&self.schema)
         {
@@ -860,6 +879,7 @@ impl Table {
         Ok(Self {
             schema,
             schema_manager,
+            external_blob_view_env: self.external_blob_view_env_for_branch(branch)?,
             branch: branch.to_string(),
             branch_reference: self.branch_reference || branch != DEFAULT_MAIN_BRANCH,
             time_traveled: false,
@@ -959,8 +979,9 @@ impl Table {
     /// table's fields and keys come from that snapshot's schema while the
     /// runtime options stay merged. Column declarations follow the historical
     /// schema unless explicitly overridden, as in Java.
-    /// A different `branch` option first loads that branch's schema and catalog
-    /// identity, retaining the bound FileIO and preceding dynamic overrides.
+    /// A different `branch` option first loads that branch's schema and, for
+    /// catalog-managed tables, its identity. The copy retains the bound FileIO
+    /// and preceding dynamic overrides.
     /// Like Java, resolution failures fall back silently to the current
     /// schema (the `if let Ok` below swallows them); an invalid selector
     /// still fails later at scan planning.
@@ -989,7 +1010,7 @@ impl Table {
         extra: &HashMap<String, String>,
     ) -> Result<()> {
         let current = CoreOptions::new(self.schema.options());
-        if self.rest_env.is_none() || !current.is_format_table() {
+        if self.rest_table_uuid().is_none() || !current.is_format_table() {
             return Ok(());
         }
         let mut merged_options = self.schema.options().clone();
@@ -1185,6 +1206,7 @@ impl Table {
                 message: format!("Branch '{branch}' does not exist."),
                 source: None,
             })?;
+        let external_blob_view_env = self.external_blob_view_env_for_branch(&branch)?;
         let mut options = schema.options().clone();
         options.insert("branch".to_string(), branch.clone());
         Ok(Self {
@@ -1197,6 +1219,7 @@ impl Table {
             branch_reference: true,
             query_auth_session: self.query_auth_session,
             rest_env: self.rest_env.clone(),
+            external_blob_view_env,
             time_traveled: false,
             travel_snapshot: None,
             applied_dynamic_option_keys: HashSet::new(),

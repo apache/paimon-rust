@@ -145,9 +145,9 @@ impl SnapshotManager {
 
     /// Get the latest snapshot id.
     ///
-    /// Tables with catalog-owned snapshots query the REST catalog. The filesystem
-    /// path checks for a valid LATEST hint with no next snapshot and lists snapshot
-    /// files when needed.
+    /// REST tables use the catalog snapshot. Otherwise, first tries the LATEST
+    /// hint file. If the hint is valid and no next snapshot exists, returns it.
+    /// Otherwise falls back to listing snapshot files.
     ///
     /// Reference: [HintFileUtils.findLatest](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/HintFileUtils.java)
     pub async fn get_latest_snapshot_id(&self) -> crate::Result<Option<i64>> {

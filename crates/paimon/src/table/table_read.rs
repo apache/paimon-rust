@@ -599,7 +599,7 @@ impl<'a> PaimonTableRead<'a> {
         // Captured masks and row policies may introduce hidden BLOB operands.
         // View descriptors still require REST resolution in descriptor mode.
         let resolves_blob = (!options.blob_as_descriptor() && uses(&blob_fields))
-            || (self.table.rest_env().is_some()
+            || (self.table.blob_view_rest_env().is_some()
                 && options.blob_view_resolve_enabled()
                 && uses(&views));
         let parallelism = execution_parallelism(
@@ -1533,7 +1533,7 @@ impl<'a> PaimonTableRead<'a> {
         let mut needed = rules.filter_columns();
         let core_options = self.table.schema.core_options();
         let view_fields = core_options.blob_view_fields();
-        if core_options.blob_view_resolve_enabled() && self.table.rest_env().is_some() {
+        if core_options.blob_view_resolve_enabled() && self.table.blob_view_rest_env().is_some() {
             if let Some(field) = needed
                 .iter()
                 .map(|i| &schema_fields[*i])
@@ -1730,7 +1730,7 @@ impl<'a> PaimonTableRead<'a> {
         let core_options = &CoreOptions::new(&payload_options);
         let view_fields = core_options.blob_view_fields();
         let resolve_views = core_options.blob_view_resolve_enabled()
-            && self.table.rest_env().is_some()
+            && self.table.blob_view_rest_env().is_some()
             && batch_fields.iter().any(|f| view_fields.contains(f.name()));
         let predicate_views: std::collections::HashSet<_> =
             super::query_auth::leaf_names(predicates)
@@ -1752,7 +1752,11 @@ impl<'a> PaimonTableRead<'a> {
             None => stream,
         };
         // User predicates see resolved descriptors or payloads, after authorization.
-        let stream = match self.table.rest_env().filter(|_| resolve_predicate_views) {
+        let stream = match self
+            .table
+            .blob_view_rest_env()
+            .filter(|_| resolve_predicate_views)
+        {
             Some(env) => super::data_evolution_reader::resolve_blob_view_stream(
                 stream,
                 predicate_views,
@@ -1838,7 +1842,7 @@ impl<'a> PaimonTableRead<'a> {
         };
         let stream = match self
             .table
-            .rest_env()
+            .blob_view_rest_env()
             .filter(|_| resolve_views && !output_views.is_empty())
         {
             Some(env) => super::data_evolution_reader::resolve_blob_view_stream(
@@ -2065,7 +2069,7 @@ impl<'a> PaimonTableRead<'a> {
             core_options.blob_descriptor_fields(),
             core_options.blob_view_fields(),
             core_options.blob_view_resolve_enabled(),
-            self.table.rest_env().cloned(),
+            self.table.blob_view_rest_env().cloned(),
         )?
         .with_partition_fields(self.table.schema().partition_fields())
         .with_batch_size(Some(core_options.read_batch_size()?))

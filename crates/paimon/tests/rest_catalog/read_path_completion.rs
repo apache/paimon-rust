@@ -149,8 +149,8 @@ async fn old_files_with_dropped_stats_columns_remain_readable() {
 #[tokio::test]
 async fn branch_authorization_uses_the_decorated_identifier() {
     let g = guarded("main_auth", &["id"]).await;
-    g.ctx.server.add_table_with_schema(
-        "default",
+    add_internal_table_with_schema(
+        &g.ctx.server,
         "main_auth$branch_dev",
         schema_of(&["id"], GUARDED),
         g.table.location(),
@@ -408,6 +408,9 @@ async fn fuse_validation_caches_success_but_never_swallows_rest_errors() {
 #[tokio::test]
 async fn external_tables_ignore_fuse_and_invalid_fuse_options_fail_for_internal_tables() {
     let g = written("external_fuse", people, vec![]).await;
+    g.ctx
+        .server
+        .set_table_external("default", "external_fuse", true);
     let mut options = g.ctx.catalog.options().clone();
     options.set("fuse.enabled", "true");
     let catalog = RESTCatalog::new(options.clone(), false).await.unwrap();
@@ -495,17 +498,12 @@ async fn authorized_pinned_snapshots_must_match_the_tables_snapshot() {
 #[tokio::test]
 async fn authorized_pinned_snapshot_can_verify_a_retained_tag_after_expiry_or_id_reuse() {
     for replaced in [false, true] {
-        let mut g = written(
+        let g = written(
             "pinned_tag",
             people,
             vec![people_rows(1..=1), people_rows(2..=2)],
         )
         .await;
-        // This fixture retains the tag through the REST catalog.
-        g.ctx
-            .server
-            .set_table_external("default", "pinned_tag", false);
-        g.table = g.ctx.catalog.get_table(&g.identifier).await.unwrap();
         let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
         g.ctx
             .catalog

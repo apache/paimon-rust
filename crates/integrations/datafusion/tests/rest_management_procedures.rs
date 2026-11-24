@@ -795,6 +795,7 @@ async fn test_consumer_procedures_rejected_on_rest_catalog_without_changing_prog
         .unwrap();
     let path = format!("file://{}/{DATABASE}.db/{TABLE}", tmp.path().display());
     server.add_table_with_schema(DATABASE, TABLE, schema, &path);
+    server.set_table_external(DATABASE, TABLE, false);
     let consumer_path = tmp
         .path()
         .join(format!("{DATABASE}.db/{TABLE}/consumer/consumer-job"));
@@ -847,6 +848,7 @@ fn register_rest_table(
         schema,
         &format!("file://{}", root.display()),
     );
+    server.set_table_external(DATABASE, TABLE, false);
     root
 }
 
@@ -1117,6 +1119,7 @@ async fn test_branch_procedures_reject_unsupported_rest_tables() {
         schema,
         &format!("file://{}", root.display()),
     );
+    server.set_table_external(DATABASE, &branch_table, false);
     for procedure in ["create_branch", "delete_branch", "fast_forward"] {
         common::assert_sql_error(
             &context,
@@ -1173,6 +1176,7 @@ async fn test_rename_branch_rejected_on_rest_catalog() {
         .unwrap();
     let path = format!("file://{}/{DATABASE}.db/{TABLE}", tmp.path().display());
     server.add_table_with_schema(DATABASE, TABLE, schema, &path);
+    server.set_table_external(DATABASE, TABLE, false);
 
     common::assert_sql_error(
         &context,
@@ -1836,7 +1840,6 @@ async fn test_rest_tag_metadata_uses_local_timestamp_and_branch() {
 
     let (tmp, server, _) = setup().await;
     let root = register_rest_table(&tmp, &server, &[]);
-    server.set_table_external(DATABASE, TABLE, false);
     let schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .build()
@@ -1938,7 +1941,6 @@ async fn test_rest_tag_metadata_uses_local_timestamp_and_branch() {
 async fn test_tag_catalog_errors_do_not_fall_back_to_storage() {
     let (tmp, server, context) = setup().await;
     let root = register_rest_table(&tmp, &server, &[]);
-    server.set_table_external(DATABASE, TABLE, false);
     server.add_tag(DATABASE, TABLE, "release");
     let tag_path = root.join("tag/tag-release");
     std::fs::create_dir_all(tag_path.parent().unwrap()).unwrap();
