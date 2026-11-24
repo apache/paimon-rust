@@ -599,7 +599,7 @@ impl<'a> PaimonTableRead<'a> {
         // Captured masks and row policies may introduce hidden BLOB operands.
         // View descriptors still require REST resolution in descriptor mode.
         let resolves_blob = (!options.blob_as_descriptor() && uses(&blob_fields))
-            || (self.table.blob_view_rest_env().is_some()
+            || (self.table.rest_env().is_some()
                 && options.blob_view_resolve_enabled()
                 && uses(&views));
         let parallelism = execution_parallelism(
@@ -2065,7 +2065,7 @@ impl<'a> PaimonTableRead<'a> {
             core_options.blob_descriptor_fields(),
             core_options.blob_view_fields(),
             core_options.blob_view_resolve_enabled(),
-            self.table.blob_view_rest_env().cloned(),
+            self.table.rest_env().cloned(),
         )?
         .with_partition_fields(self.table.schema().partition_fields())
         .with_batch_size(Some(core_options.read_batch_size()?))

@@ -338,8 +338,7 @@ pub struct Table {
     /// replay a grant.
     query_auth_session: Option<u64>,
     rest_env: Option<RESTEnv>,
-    /// REST context used only for resolving BLOB views and exposing the registration UUID.
-    external_blob_view_env: Option<Arc<RESTEnv>>,
+    external_rest_uuid: Option<String>,
     /// True for a time-traveled or captured read view. Scans and row matching
     /// use its selected snapshot. Writers retain its schema; commits publish
     /// against latest state.
@@ -372,7 +371,7 @@ impl Table {
             branch_reference: false,
             query_auth_session: None,
             rest_env,
-            external_blob_view_env: None,
+            external_rest_uuid: None,
             time_traveled: false,
             travel_snapshot: None,
             applied_dynamic_option_keys: HashSet::new(),
@@ -416,7 +415,7 @@ impl Table {
             branch_reference,
             query_auth_session: None,
             rest_env: None,
-            external_blob_view_env: None,
+            external_rest_uuid: None,
             time_traveled: false,
             travel_snapshot: None,
             applied_dynamic_option_keys: HashSet::new(),
@@ -682,21 +681,9 @@ impl Table {
 
     /// The registration UUID supplied by a REST catalog, including for external tables.
     pub fn rest_table_uuid(&self) -> Option<&str> {
-        self.blob_view_rest_env().map(RESTEnv::uuid)
-    }
-
-    fn blob_view_rest_env(&self) -> Option<&RESTEnv> {
-        self.rest_env().or(self.external_blob_view_env.as_deref())
-    }
-
-    fn external_blob_view_env_for_branch(&self, branch: &str) -> Result<Option<Arc<RESTEnv>>> {
-        if branch == self.branch {
-            return Ok(self.external_blob_view_env.clone());
-        }
-        self.external_blob_view_env
-            .as_ref()
-            .map(|env| env.with_dependency_branch(branch).map(Arc::new))
-            .transpose()
+        self.rest_env()
+            .map(RESTEnv::uuid)
+            .or(self.external_rest_uuid.as_deref())
     }
 
     pub(crate) fn is_format_table(&self) -> bool {
@@ -812,7 +799,7 @@ impl Table {
             branch_reference: self.branch_reference,
             query_auth_session: self.query_auth_session,
             rest_env: self.rest_env.clone(),
-            external_blob_view_env: self.external_blob_view_env.clone(),
+            external_rest_uuid: self.external_rest_uuid.clone(),
             time_traveled: self.time_traveled,
             applied_dynamic_option_keys,
             travel_snapshot: if selector_changed {
@@ -840,7 +827,7 @@ impl Table {
         // catalog. Preserve its stored options and any session through the
         // dynamic-option path when fields, IDs, keys, comments and branch match.
         // REST synthesizes creation times independently in different clients.
-        if (self.query_auth_session.is_some() || self.external_blob_view_env.is_some())
+        if (self.query_auth_session.is_some() || self.external_rest_uuid.is_some())
             && branch == self.branch
             && schema.has_same_definition(&self.schema)
         {
@@ -879,7 +866,6 @@ impl Table {
         Ok(Self {
             schema,
             schema_manager,
-            external_blob_view_env: self.external_blob_view_env_for_branch(branch)?,
             branch: branch.to_string(),
             branch_reference: self.branch_reference || branch != DEFAULT_MAIN_BRANCH,
             time_traveled: false,
@@ -1206,7 +1192,6 @@ impl Table {
                 message: format!("Branch '{branch}' does not exist."),
                 source: None,
             })?;
-        let external_blob_view_env = self.external_blob_view_env_for_branch(&branch)?;
         let mut options = schema.options().clone();
         options.insert("branch".to_string(), branch.clone());
         Ok(Self {
@@ -1219,7 +1204,7 @@ impl Table {
             branch_reference: true,
             query_auth_session: self.query_auth_session,
             rest_env: self.rest_env.clone(),
-            external_blob_view_env,
+            external_rest_uuid: self.external_rest_uuid.clone(),
             time_traveled: false,
             travel_snapshot: None,
             applied_dynamic_option_keys: HashSet::new(),

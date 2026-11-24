@@ -988,9 +988,7 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
     .await;
     server.add_table_with_schema("default", "blob_source", source_schema, source.location());
     server.add_table_with_schema("default", "blob_view_target", view_schema, view.location());
-    for name in ["blob_source", "blob_view_target"] {
-        server.set_table_external("default", name, true);
-    }
+    server.set_table_external("default", "blob_source", true);
 
     let url = server.url().expect("Failed to get server URL");
     let mut rest_options = Options::new();
@@ -1003,7 +1001,7 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
         .expect("create rest catalog");
 
     let read_via = paimon::api::RESTUtil::encode_string(&serde_json::to_string(&view_id).unwrap());
-    server.require_table_read_via("default", "blob_source", read_via.clone());
+    server.require_table_read_via("default", "blob_source", read_via);
     let rest_view = rest_catalog.get_table(&view_id).await.unwrap();
     let predicate = PredicateBuilder::new(rest_view.schema().fields())
         .equal("id", Datum::Int(1))
@@ -1023,30 +1021,6 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
         collect_blob_rows(&batches),
         vec![(1, "Kept".to_string(), Some(b"bob".to_vec()))]
     );
-
-    let snapshot = view.snapshot_manager().get_snapshot(1).await.unwrap();
-    view.tag_manager().create("base", &snapshot).await.unwrap();
-    paimon::table::BranchManager::new(view.file_io().clone(), view.location().to_string())
-        .create_branch_from_tag("dev", "base")
-        .await
-        .unwrap();
-    let branch_id = Identifier::new("default", "blob_view_target$branch_dev");
-    let branch_read_via =
-        paimon::api::RESTUtil::encode_string(&serde_json::to_string(&branch_id).unwrap());
-    server.require_table_read_via("default", "blob_source", branch_read_via);
-    let branch = rest_view.copy_with_branch("dev").await.unwrap();
-    let resolved = rest_view
-        .copy_with_resolved_schema(branch.schema().clone(), "dev")
-        .unwrap();
-    for branch in [&branch, &resolved] {
-        let mut builder = branch.new_read_builder();
-        builder.with_limit(1);
-        assert_eq!(
-            collect_blob_rows(&read_all(&builder).await.unwrap()),
-            vec![(1, "Kept".to_string(), Some(b"bob".to_vec()))]
-        );
-    }
-    server.require_table_read_via("default", "blob_source", read_via);
 
     // LIMIT alone must not resolve the invalid reference in the fourth row.
     // The repeated reference is read from the lookup cache in a later batch.

@@ -260,14 +260,6 @@ impl RESTEnv {
         &self.uuid
     }
 
-    /// Use the selected branch as the source of a BLOB dependency read.
-    pub(super) fn with_dependency_branch(&self, branch: &str) -> Result<Self> {
-        Ok(Self {
-            identifier: self.identifier.with_branch(branch)?,
-            ..self.clone()
-        })
-    }
-
     /// Attach Java's outermost table identity to dependency requests. The
     /// dependency client is separate so ordinary requests retain their headers.
     pub(crate) async fn for_dependency_reads(&self) -> Result<Self> {
@@ -449,28 +441,11 @@ impl RESTEnv {
         )
         .await?;
 
-        let mut rest_env = RESTEnv::new(
-            identifier.clone(),
-            uuid,
-            api,
-            options,
-            data_token_enabled,
-            local_cache,
-            file_io_cache,
-        );
-        rest_env.fuse_resolver = fuse_resolver;
         let parsed_identifier = identifier.parsed_object_name()?;
         let branch = parsed_identifier.branch_or_default().to_string();
         let branch_reference = parsed_identifier.branch().is_some();
-        let table = Table::new(
-            file_io,
-            identifier,
-            table_path,
-            table_schema,
-            Some(rest_env),
-        );
+        let table = Table::new(file_io, identifier, table_path, table_schema, None);
 
-        // Minted after the schema-replacing copy, which drops any session.
         let mut table = table.copy_with_resolved_schema(table.schema().clone(), &branch)?;
         table.branch_reference = branch_reference;
         // Cache the catalog definition before any caller applies dynamic
@@ -479,9 +454,21 @@ impl RESTEnv {
             .schema_manager()
             .cache_resolved_schema(table.schema().clone());
         if is_external {
-            table.external_blob_view_env = table.rest_env.take().map(Arc::new);
+            table.external_rest_uuid = Some(uuid);
             return Ok(table);
         }
+
+        let mut rest_env = RESTEnv::new(
+            table.identifier().clone(),
+            uuid,
+            api,
+            options,
+            data_token_enabled,
+            local_cache,
+            file_io_cache,
+        );
+        rest_env.fuse_resolver = fuse_resolver;
+        table.rest_env = Some(rest_env);
         Ok(table.with_query_auth_session())
     }
 
