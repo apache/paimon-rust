@@ -128,6 +128,53 @@ impl SnapshotCommit for ConcurrentManifestReplacement {
     }
 }
 
+async fn reassigned_snapshot(
+    commit: &TableCommit,
+    initial: &Snapshot,
+    id: i64,
+) -> (Snapshot, Vec<ManifestEntry>) {
+    let io = commit.table.file_io();
+    let mut reassigned = active_entries(io, commit.table.location(), initial).await;
+    assert_eq!(reassigned[0].file().first_row_id, Some(0));
+    reassigned[0].file.first_row_id = Some(10);
+
+    // Java row-ID reassignment replaces the base manifest and publishes an empty delta.
+    let manifest_dir = commit.snapshot_manager.manifest_dir();
+    let base_metas = commit
+        .write_manifest_files(
+            io,
+            &manifest_dir,
+            "reassigned",
+            &reassigned,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+    let base_list = "manifest-list-reassigned-base";
+    let delta_list = "manifest-list-reassigned-delta";
+    ManifestList::write(io, &format!("{manifest_dir}/{base_list}"), &base_metas)
+        .await
+        .unwrap();
+    ManifestList::write(io, &format!("{manifest_dir}/{delta_list}"), &[])
+        .await
+        .unwrap();
+    let replacement = Snapshot::builder()
+        .version(3)
+        .id(id)
+        .schema_id(initial.schema_id())
+        .base_manifest_list(base_list.to_string())
+        .delta_manifest_list(delta_list.to_string())
+        .commit_user("row-id-reassignment".to_string())
+        .commit_identifier(BATCH_COMMIT_IDENTIFIER)
+        .commit_kind(CommitKind::OVERWRITE)
+        .time_millis(current_time_millis())
+        .total_record_count(initial.total_record_count())
+        .delta_record_count(Some(0))
+        .next_row_id(Some(20))
+        .build();
+    (replacement, reassigned)
+}
+
 #[tokio::test]
 async fn row_id_update_retry_reloads_base_after_overwrite() {
     let io = test_file_io();
@@ -140,44 +187,7 @@ async fn row_id_update_retry_reloads_base_after_overwrite() {
     commit.commit_with_identifier(vec![base], 1).await.unwrap();
 
     let initial = latest_snapshot(&io, path).await.unwrap();
-    let mut reassigned = active_entries(&io, path, &initial).await;
-    assert_eq!(reassigned[0].file().first_row_id, Some(0));
-    reassigned[0].file.first_row_id = Some(10);
-
-    // Java row-ID reassignment replaces the base manifest and publishes an empty delta.
-    let manifest_dir = commit.snapshot_manager.manifest_dir();
-    let base_metas = commit
-        .write_manifest_files(
-            &io,
-            &manifest_dir,
-            "reassigned",
-            &reassigned,
-            &mut Vec::new(),
-        )
-        .await
-        .unwrap();
-    let base_list = "manifest-list-reassigned-base";
-    let delta_list = "manifest-list-reassigned-delta";
-    ManifestList::write(&io, &format!("{manifest_dir}/{base_list}"), &base_metas)
-        .await
-        .unwrap();
-    ManifestList::write(&io, &format!("{manifest_dir}/{delta_list}"), &[])
-        .await
-        .unwrap();
-    let replacement = Snapshot::builder()
-        .version(3)
-        .id(2)
-        .schema_id(initial.schema_id())
-        .base_manifest_list(base_list.to_string())
-        .delta_manifest_list(delta_list.to_string())
-        .commit_user("row-id-reassignment".to_string())
-        .commit_identifier(BATCH_COMMIT_IDENTIFIER)
-        .commit_kind(CommitKind::OVERWRITE)
-        .time_millis(current_time_millis())
-        .total_record_count(initial.total_record_count())
-        .delta_record_count(Some(0))
-        .next_row_id(Some(20))
-        .build();
+    let (replacement, reassigned) = reassigned_snapshot(&commit, &initial, 2).await;
     commit.snapshot_commit = Arc::new(ConcurrentManifestReplacement {
         manager: commit.snapshot_manager.clone(),
         replacement,
@@ -201,10 +211,115 @@ async fn row_id_update_retry_reloads_base_after_overwrite() {
     assert_eq!(active_entries(&io, path, &latest).await, reassigned);
 }
 
+#[tokio::test]
+async fn row_id_retry_uses_catalog_overwrite_even_with_an_older_storage_snapshot() {
+    use crate::api::rest_api::RESTApi;
+    use crate::common::Options;
+    use axum::{
+        http::{Method, Uri},
+        Json, Router,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    for reuse_id in [false, true] {
+        let io = test_file_io();
+        let path = "memory:/rest-row-id-reassignment";
+        setup_dirs(&io, path).await;
+        let seed = setup_data_evolution_commit(&io, path);
+        let mut base = append_message("base.parquet");
+        base.partition = EMPTY_SERIALIZED_ROW.clone();
+        base.new_files[0].file_source = Some(0);
+        seed.commit_with_identifier(vec![base], 1).await.unwrap();
+        let initial = latest_snapshot(&io, path).await.unwrap();
+        let (replacement, reassigned) = reassigned_snapshot(&seed, &initial, 2).await;
+
+        // Simulate storage still exposing snapshot 2 from the previous history.
+        seed.clone()
+            .with_ignore_empty_commit(false)
+            .commit_with_identifier(Vec::new(), 2)
+            .await
+            .unwrap();
+        let stale = latest_snapshot(&io, path).await.unwrap();
+
+        let latest = Arc::new(Mutex::new(if reuse_id { stale } else { initial }));
+        let commits = Arc::new(AtomicUsize::new(0));
+        let catalog_head = latest.clone();
+        let catalog_commits = commits.clone();
+        let schema = serde_json::to_value(seed.table.schema()).unwrap();
+        let app = Router::new().fallback(move |method: Method, uri: Uri| async move {
+            let body = if method == Method::POST && uri.path().ends_with("/commit") {
+                if catalog_commits.fetch_add(1, Ordering::Relaxed) == 0 {
+                    *catalog_head.lock().unwrap() = replacement;
+                    serde_json::json!({"success": false})
+                } else {
+                    serde_json::json!({"success": true})
+                }
+            } else if uri.path().ends_with("/snapshot") {
+                serde_json::json!({"snapshot": {"snapshot": *catalog_head.lock().unwrap()}})
+            } else {
+                serde_json::json!({"schemaId": 0, "schema": schema})
+            };
+            Json(body)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut options = Options::new();
+        options.set("uri", format!("http://{}", listener.local_addr().unwrap()));
+        options.set("token.provider", "bear");
+        options.set("token", "test-token");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+        let cache = crate::io::FileIOCacheContext::from_props(options.to_map()).unwrap();
+        let identifier = seed.table.identifier().clone();
+        let env = crate::table::RESTEnv::new(
+            identifier.clone(),
+            "table-uuid".into(),
+            api,
+            options,
+            false,
+            None,
+            cache,
+        );
+        let table = Table::new(
+            io.clone(),
+            identifier,
+            path.into(),
+            seed.table.schema().clone(),
+            Some(env),
+        );
+        let mut commit = TableCommit::new(table, "rest-writer".into());
+        commit.commit_min_retry_wait_ms = 0;
+        commit.commit_max_retry_wait_ms = 0;
+
+        let result = commit
+            .commit_with_identifier(vec![row_id_check_message("staged.parquet", "name")], 2)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::Error::RowIdExistenceConflict {
+                    first_row_id: Some(0),
+                    ..
+                })
+            ),
+            "reuse_id={reuse_id}, {result:?}"
+        );
+        assert_eq!(commits.load(Ordering::Relaxed), 1);
+        let head = latest.lock().unwrap().clone();
+        assert_eq!(active_entries(&io, path, &head).await, reassigned);
+        server.abort();
+    }
+}
+
 async fn row_id_check_history(path: &str) -> TableCommit {
-    let io = test_file_io();
-    setup_dirs(&io, path).await;
-    let commit = setup_data_evolution_commit(&io, path);
+    row_id_check_history_with_io(&test_file_io(), path).await
+}
+
+async fn row_id_check_history_with_io(io: &FileIO, path: &str) -> TableCommit {
+    setup_dirs(io, path).await;
+    let commit = setup_data_evolution_commit(io, path);
     let mut file = test_data_file("base.parquet", 10);
     file.file_source = Some(0);
     commit
@@ -223,6 +338,64 @@ async fn row_id_check_history(path: &str) -> TableCommit {
         .await
         .unwrap();
     commit
+}
+
+#[tokio::test]
+async fn row_id_retry_reloads_overwritten_history_before_a_new_append() {
+    let path = "memory:/row-id-reassignment-before-append";
+    let io = FileIOBuilder::new("memory")
+        .with_prop("local-cache.enabled", "true")
+        .build()
+        .unwrap();
+    let commit = row_id_check_history_with_io(&io, path).await;
+    let manager = &commit.snapshot_manager;
+    let initial = manager.get_snapshot(1).await.unwrap();
+    let cached_reader = commit.table.snapshot_manager();
+    let cached_snapshot = cached_reader.get_snapshot(2).await.unwrap();
+    let cached_files = active_entries(&io, path, &cached_snapshot).await;
+
+    // Rolling back to 1 lets an overwrite reuse ID 2. A subsequent append
+    // hides it behind the cached retry's lower boundary. An external writer
+    // cannot invalidate this instance's local block cache.
+    let (replacement, _) = reassigned_snapshot(&commit, &initial, 2).await;
+    let (storage, relative_path) = io.create_static(&manager.snapshot_path(2)).unwrap();
+    storage
+        .write(&relative_path, serde_json::to_vec(&replacement).unwrap())
+        .await
+        .unwrap();
+    assert!(cached_reader
+        .get_snapshot(2)
+        .await
+        .unwrap()
+        .has_same_read_metadata(&cached_snapshot));
+    let mut value = serde_json::to_value(replacement).unwrap();
+    value["id"] = 3.into();
+    value["commitKind"] = "APPEND".into();
+    let latest: Snapshot = serde_json::from_value(value).unwrap();
+    assert!(manager.commit_snapshot(&latest).await.unwrap());
+
+    let changes = commit.messages_to_entries(&[row_id_check_message("staged.parquet", "name")]);
+    let retry = RetryState {
+        latest_snapshot: Some(cached_snapshot),
+        base_data_files: Some(cached_files),
+        publication_error: None,
+    };
+    let result = commit
+        .detect_commit_conflicts(
+            &Some(latest),
+            Some(&retry),
+            &changes,
+            &CommitKind::APPEND,
+            Some(1),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::Error::RowIdExistenceConflict {
+            first_row_id: Some(0),
+            ..
+        })
+    ));
 }
 
 #[tokio::test]
