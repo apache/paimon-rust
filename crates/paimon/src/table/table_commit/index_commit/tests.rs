@@ -108,6 +108,65 @@ fn retirements_check_current_metadata_and_membership_for_both_layouts() {
 }
 
 #[test]
+fn centroid_shards_must_be_retired_with_their_generation() {
+    use crate::table::centroid_index::{Descriptor, Role};
+
+    let domain = IndexDomain::GlobalRowIds;
+    let centroid_entry = |name, row_count, role, payload| {
+        let mut entry = entry(domain, name, 0, 1);
+        entry.index_file.index_type = "diskann".into();
+        entry.index_file.row_count = row_count;
+        entry
+            .index_file
+            .global_index_meta
+            .as_mut()
+            .unwrap()
+            .index_meta = Some(Descriptor { role, payload }.encode().unwrap());
+        entry
+    };
+    let router = centroid_entry("router.index", 0, Role::Router(2), Some(b"l2"));
+    let first = centroid_entry("first.index", 6, Role::Shard(0), None);
+    let second = centroid_entry("second.index", 4, Role::Shard(1), None);
+    let error = TableCommit::merge_index_entries(vec![], std::slice::from_ref(&router), domain)
+        .expect_err("a nonempty router requires a populated shard");
+    assert!(error
+        .to_string()
+        .contains("Incomplete or conflicting centroid"));
+    TableCommit::merge_index_entries(vec![], &[router.clone(), first.clone()], domain).unwrap();
+
+    let unrelated = entry(domain, "unrelated.index", 1, 1);
+    let generation = [router, first, second];
+    let before =
+        TableCommit::merge_index_entries(vec![unrelated.clone()], &generation, domain).unwrap();
+    let deletions = generation.clone().map(|mut entry| {
+        entry.kind = FileKind::Delete;
+        entry.partition = crate::spec::EMPTY_SERIALIZED_ROW.to_vec();
+        entry
+    });
+    let error = TableCommit::merge_index_entries(before.clone(), &deletions[1..2], domain)
+        .expect_err("retiring one of two populated shards must fail");
+    assert!(error.to_string().contains("complete centroid generation"));
+
+    assert_eq!(
+        TableCommit::merge_index_entries(before.clone(), &deletions, domain).unwrap(),
+        vec![unrelated.clone()]
+    );
+    let moved = generation.map(|mut entry| {
+        let meta = entry.index_file.global_index_meta.as_mut().unwrap();
+        meta.row_range_start += 10;
+        meta.row_range_end += 10;
+        entry
+    });
+    let updates = [deletions.as_slice(), moved.as_slice()].concat();
+    let mut expected = vec![unrelated];
+    expected.extend(moved);
+    assert_eq!(
+        TableCommit::merge_index_entries(before, &updates, domain).unwrap(),
+        expected
+    );
+}
+
+#[test]
 fn pk_level_ordinals_can_overlap_while_global_row_id_ranges_cannot() {
     let first = entry(IndexDomain::PrimaryKeyLevel, "level-1.index", 0, 1);
     let second = entry(IndexDomain::PrimaryKeyLevel, "level-2.index", 0, 2);

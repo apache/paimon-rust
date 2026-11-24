@@ -29,6 +29,7 @@ use crate::{Error, Result};
 use futures::future::BoxFuture;
 use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, HashMap};
+use std::ops::RangeInclusive;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) enum BitmapPredicate {
@@ -175,27 +176,30 @@ impl BitmapPredicate {
         &self,
         table: &Table,
         group: &Generation<'_>,
-    ) -> Result<HashMap<usize, RoaringTreemap>> {
+    ) -> Result<RoaringTreemap> {
         let rows = self
             .evaluate(table, &group.bitmaps, &mut HashMap::new())
             .await?;
-        if rows.len() > group.vector_count {
+        let count = rows.len();
+        if count > group.vector_count {
             return Err(centroid_index::invalid(
                 "Centroid bitmap contains invalid row IDs",
             ));
         }
-        let mut matches = HashMap::<_, RoaringTreemap>::new();
-        for row in rows {
-            let centroid = (row / group.range_size) as usize;
-            if row > i64::MAX as u64 || !group.shards.contains_key(&centroid) {
+        if count != 0 {
+            // Check the compressed cardinality inside populated shards without
+            // expanding positions in centroids that the query may never probe.
+            let covered = group
+                .shards
+                .keys()
+                .filter_map(|&centroid| position_range(group.range_size, centroid))
+                .map(|range| rows.range_cardinality(range))
+                .sum::<u64>();
+            if covered != count {
                 return Err(centroid_index::invalid("Invalid centroid Bitmap position"));
             }
-            matches
-                .entry(centroid)
-                .or_default()
-                .insert(row % group.range_size);
         }
-        Ok(matches)
+        Ok(rows)
     }
 
     fn evaluate<'a>(
@@ -259,6 +263,44 @@ impl BitmapPredicate {
     }
 }
 
+fn position_range(range_size: u64, centroid: usize) -> Option<RangeInclusive<u64>> {
+    let start = (centroid as u64).checked_mul(range_size)?;
+    let maximum = i64::MAX as u64;
+    (start <= maximum).then(|| start..=start.saturating_add(range_size - 1).min(maximum))
+}
+
+pub(super) fn rows_for_centroid(
+    rows: &RoaringTreemap,
+    range_size: u64,
+    centroid: usize,
+) -> RoaringTreemap {
+    let Some(range) = position_range(range_size, centroid) else {
+        return RoaringTreemap::new();
+    };
+    let (start, end) = (*range.start(), *range.end());
+    let (first_partition, last_partition) = ((start >> 32) as u32, (end >> 32) as u32);
+    rows.bitmaps()
+        .skip_while(|(partition, _)| *partition < first_partition)
+        .take_while(|(partition, _)| *partition <= last_partition)
+        .flat_map(|(partition, bitmap)| {
+            let from = if partition == first_partition {
+                start as u32
+            } else {
+                0
+            };
+            let to = if partition == last_partition {
+                end as u32
+            } else {
+                u32::MAX
+            };
+            let base = u64::from(partition) << 32;
+            bitmap
+                .range(from..=to)
+                .map(move |row| base + u64::from(row) - start)
+        })
+        .collect()
+}
+
 fn equality_literals(data_type: &DataType, literals: &[Datum]) -> Option<Vec<Datum>> {
     let mut normalized = literals.to_vec();
     for literal in &mut normalized {
@@ -292,6 +334,33 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::spec::{IntType, Schema};
     use axum::{routing::get, Json, Router};
+
+    #[test]
+    fn centroid_bitmap_decodes_only_the_selected_64_bit_position_range() {
+        let boundary = 1u64 << 32;
+        let width = boundary + 10;
+        let rows = RoaringTreemap::from([width - 1, width, 2 * boundary, 2 * width - 1, 2 * width]);
+        assert_eq!(
+            rows_for_centroid(&rows, width, 1),
+            RoaringTreemap::from([0, boundary - 10, width - 1])
+        );
+
+        // The first 32-bit partition of centroid 2 is absent.
+        let sparse_rows = RoaringTreemap::from([3 * boundary + 2, 3 * width]);
+        assert_eq!(
+            rows_for_centroid(&sparse_rows, width, 2),
+            RoaringTreemap::from([boundary - 18])
+        );
+        assert!(rows_for_centroid(&sparse_rows, width, 1).is_empty());
+
+        let limit = i64::MAX as u64;
+        let limit_rows = RoaringTreemap::from([limit - 1, limit, limit + 1]);
+        assert_eq!(
+            rows_for_centroid(&limit_rows, limit, 1),
+            RoaringTreemap::from([0])
+        );
+        assert!(rows_for_centroid(&limit_rows, limit, 2).is_empty());
+    }
 
     #[tokio::test]
     async fn centroid_bitmap_accepts_only_the_requested_catalog_schema() {

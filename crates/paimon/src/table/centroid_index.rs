@@ -23,7 +23,7 @@ use crate::spec::{DataEvolutionIndexSourceMeta, IndexFileMeta, IndexManifestEntr
 use crate::{Error, Result};
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::CentroidRouter;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 const META_MAGIC: &[u8; 8] = b"PAIMCENT";
 const META_HEADER: usize = 14;
@@ -45,6 +45,10 @@ pub(super) struct Descriptor<'a> {
 impl<'a> Descriptor<'a> {
     pub(super) fn is_empty_router(file: &'a IndexFileMeta) -> Result<bool> {
         Ok(Self::parse(file)?.is_some_and(|descriptor| descriptor.role == Role::Router(0)))
+    }
+
+    pub(super) fn is_manifest_only_router(file: &'a IndexFileMeta) -> bool {
+        file.file_size == 0 && file.row_count == 0 && Self::is_empty_router(file).unwrap_or(false)
     }
 
     pub(super) fn is_wrapped(file: &IndexFileMeta) -> bool {
@@ -152,6 +156,37 @@ pub(super) struct Generation<'a> {
     pub(super) files: Vec<&'a IndexManifestEntry>,
 }
 
+type GenerationKey<'a> = (&'a [u8], i32, &'a str, i32, i64, i64);
+
+fn generation_key(entry: &IndexManifestEntry) -> GenerationKey<'_> {
+    let file = &entry.index_file;
+    let meta = file.global_index_meta.as_ref().unwrap();
+    (
+        &entry.partition,
+        entry.bucket,
+        &file.index_type,
+        meta.index_field_id,
+        meta.row_range_start,
+        meta.row_range_end,
+    )
+}
+
+pub(super) fn check_complete_retirement(
+    retired: &[IndexManifestEntry],
+    retained: &[IndexManifestEntry],
+) -> Result<()> {
+    let retired: HashSet<_> = retired.iter().map(generation_key).collect();
+    for generation in group(retained)? {
+        if retired.contains(&generation_key(generation.router)) {
+            return Err(invalid(format!(
+                "Cannot partially retire a complete centroid generation for '{}'",
+                generation.router.index_file.file_name
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn group<'a>(
     entries: impl IntoIterator<Item = &'a IndexManifestEntry>,
 ) -> Result<Vec<Generation<'a>>> {
@@ -163,16 +198,8 @@ pub(super) fn group<'a>(
         let Some(descriptor) = Descriptor::parse(file)? else {
             continue;
         };
-        let meta = file.global_index_meta.as_ref().unwrap();
         grouped
-            .entry((
-                entry.partition.as_slice(),
-                entry.bucket,
-                file.index_type.as_str(),
-                meta.index_field_id,
-                meta.row_range_start,
-                meta.row_range_end,
-            ))
+            .entry(generation_key(entry))
             .or_default()
             .push((entry, descriptor));
     }
@@ -261,7 +288,7 @@ pub(super) fn group<'a>(
                     }
                 }
             }
-            if router_count != 1 || vector_count > range_len {
+            if router_count != 1 || vector_count > range_len || (nlist != 0 && vector_count == 0) {
                 return Err(invalid());
             }
             let expected_bitmaps = if vector_count == 0 { 0 } else { extra.len() };

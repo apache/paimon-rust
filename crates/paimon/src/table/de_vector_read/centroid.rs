@@ -21,7 +21,7 @@ use super::{
     VectorIndexWork, VectorMetricCheck, VectorSearchEvaluation,
 };
 use crate::spec::{IndexManifestEntry, VectorIndexOptions};
-use crate::table::centroid_bitmap::BitmapPredicate;
+use crate::table::centroid_bitmap::{rows_for_centroid, BitmapPredicate};
 use crate::table::centroid_index::{self, Descriptor, Generation, Role, Router};
 use crate::table::RowRange;
 use crate::vector_search::{ScoredRowIds, VectorSearch};
@@ -32,6 +32,7 @@ use paimon_vindex_core::index::VectorIndexMetadata;
 use paimon_vindex_core::io::SeekRead;
 use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, HashMap};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 type CentroidFiles<'a> = HashMap<&'a str, Generation<'a>>;
@@ -402,6 +403,7 @@ impl RoutedSearch<'_> {
         }
 
         let mut bitmap_matches = None;
+        let mut shard_bitmap_matches = HashMap::new();
         loop {
             let mut queries_by_centroid = BTreeMap::<_, Vec<_>>::new();
             for (index, route) in routes.iter_mut().enumerate() {
@@ -428,9 +430,17 @@ impl RoutedSearch<'_> {
                         Some(matches) => matches,
                         None => bitmap_matches.insert(self.load_bitmap_matches(bitmap).await?),
                     };
-                    let Some(filter) = matches.get(&centroid) else {
+                    let (rows, deleted) = matches;
+                    let filter = shard_bitmap_matches.entry(centroid).or_insert_with(|| {
+                        let mut filter = rows_for_centroid(rows, group.range_size, centroid);
+                        for range in deleted {
+                            filter.remove_range(range.clone());
+                        }
+                        Arc::new(filter)
+                    });
+                    if filter.is_empty() {
                         continue;
-                    };
+                    }
                     for query in &mut shard.queries {
                         let eligible = query.effective_include_row_ids().map_or_else(
                             || Arc::clone(filter),
@@ -483,11 +493,11 @@ impl RoutedSearch<'_> {
     async fn load_bitmap_matches(
         &self,
         bitmap: &BitmapWork,
-    ) -> Result<HashMap<usize, Arc<RoaringTreemap>>> {
+    ) -> Result<(RoaringTreemap, Vec<RangeInclusive<u64>>)> {
         let table = self.evaluation.table.ok_or_else(|| {
             centroid_index::invalid("Centroid Bitmap search requires table context")
         })?;
-        let mut matches = bitmap.predicate.matching(table, self.group).await?;
+        let matches = bitmap.predicate.matching(table, self.group).await?;
         let source = self
             .group
             .router
@@ -495,6 +505,7 @@ impl RoutedSearch<'_> {
             .global_index_meta
             .as_ref()
             .unwrap();
+        let mut deleted = Vec::with_capacity(bitmap.deleted.len());
         for range in &bitmap.deleted {
             if range.from() < source.row_range_start
                 || range.to() > source.row_range_end
@@ -504,18 +515,12 @@ impl RoutedSearch<'_> {
                     "Invalid deletion range for centroid Bitmap task",
                 ));
             }
-            for filter in matches.values_mut() {
-                filter.remove_range(
-                    (range.from() - source.row_range_start) as u64
-                        ..=(range.to() - source.row_range_start) as u64,
-                );
-            }
+            deleted.push(
+                (range.from() - source.row_range_start) as u64
+                    ..=(range.to() - source.row_range_start) as u64,
+            );
         }
-        Ok(matches
-            .into_iter()
-            .filter(|(_, rows)| !rows.is_empty())
-            .map(|(centroid, rows)| (centroid, Arc::new(rows)))
-            .collect())
+        Ok((matches, deleted))
     }
 
     fn shard_work(

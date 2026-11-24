@@ -292,6 +292,11 @@ async fn centroid_empty_router_does_not_define_raw_scoring() {
         ))
         .await
         .unwrap());
+    let referenced = crate::table::referenced_files::collect_table_referenced_files_summary(&table)
+        .await
+        .unwrap();
+    assert_eq!(referenced[0].source, "total");
+    assert_eq!(referenced[0].index_file_count, 0);
     write_vectors(&table, vec![1, 2], vec![vec![1., 0.], vec![100., 0.]]).await;
 
     let mut search = table.new_vector_search_builder();
@@ -681,8 +686,11 @@ async fn centroid_bitmaps_prefilter_or_before_ranking_and_drop_with_the_vector_c
         crate::spec::PredicateOperator::IsNotNull,
         vec![],
     );
+    let matches = all_ids.matching(&table, group).await.unwrap();
     let mut skipped = false;
-    for (centroid, matched) in all_ids.matching(&table, group).await.unwrap() {
+    for &centroid in group.shards.keys() {
+        let matched =
+            crate::table::centroid_bitmap::rows_for_centroid(&matches, group.range_size, centroid);
         if matched.contains(3) {
             table
                 .file_io()
