@@ -594,66 +594,85 @@ async fn ordered_split_reads_do_not_wait_on_a_later_row_groups_budget_permit() {
         .collect::<Vec<_>>();
     assert_eq!(ids, [0, 1, 2]);
 
-    // With a shared memory limit, the later split must not reserve its row
-    // group before the current split has supplied the finite LIMIT.
-    let limited_order = Arc::new(DelayedFirstFile::default());
-    let limited_io = raw_io
-        .with_file_block_cache(limited_order.clone(), 64 * 1024, "data")
-        .unwrap();
-    let limited_table = Table::new(
-        limited_io,
-        table.identifier().clone(),
-        table.location().into(),
-        table.schema().clone(),
-        None,
-    );
-    let mut builder = limited_table.new_read_builder();
-    builder.with_limit(3);
-    builder.with_resources(
-        ResourceContext::builder()
-            .memory_limit(1024 * 1024)
-            .build()
-            .unwrap(),
-    );
-    let output = builder
-        .new_read()
-        .unwrap()
-        .with_parallelism(2)
-        .unwrap()
-        .with_ordered(true)
-        .with_parquet_read_budget(Arc::new(ReadBudget::new(2, 1024 * 1024).unwrap()))
-        .to_arrow(&splits)
-        .unwrap();
-    let result = tokio::spawn(async move { output.try_collect::<Vec<_>>().await });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !limited_order.first_waited.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
+    // Both limited and full reads need the current split to get memory first.
+    for limit in [Some(3), None] {
+        let order = Arc::new(DelayedFirstFile::default());
+        let budgeted_io = raw_io
+            .clone()
+            .with_file_block_cache(order.clone(), 64 * 1024, "data")
+            .unwrap();
+        let budgeted_table = Table::new(
+            budgeted_io,
+            table.identifier().clone(),
+            table.location().into(),
+            table.schema().clone(),
+            None,
+        )
+        .copy_with_options([("read.batch-size".into(), "1024".into())].into());
+        let mut builder = budgeted_table.new_read_builder();
+        if let Some(limit) = limit {
+            builder.with_limit(limit);
         }
-    })
-    .await
-    .expect("current split did not begin reading");
-    assert!(!limited_order.later_data_started.load(Ordering::SeqCst));
-    limited_order
-        .manually_released
-        .store(true, Ordering::SeqCst);
-    limited_order.release_first.notify_waiters();
-    let batches = tokio::time::timeout(std::time::Duration::from_secs(10), result)
+        builder.with_resources(
+            ResourceContext::builder()
+                .memory_limit(1024 * 1024)
+                .build()
+                .unwrap(),
+        );
+        let output = builder
+            .new_read()
+            .unwrap()
+            .with_parallelism(2)
+            .unwrap()
+            .with_ordered(true)
+            .with_parquet_read_budget(Arc::new(ReadBudget::new(2, 1024 * 1024).unwrap()))
+            .to_arrow(&splits)
+            .unwrap();
+        let result = tokio::spawn(async move { output.try_collect::<Vec<_>>().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !order.first_waited.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("current split was blocked by speculative memory admission")
-        .unwrap()
-        .unwrap();
-    let ids = batches
-        .iter()
-        .flat_map(|batch| {
+        .expect("current split did not begin reading");
+
+        // Only the later split can release the first file before we do so below.
+        let later_started = order.release_first.notified();
+        tokio::pin!(later_started);
+        later_started.as_mut().enable();
+        assert!(!order.later_data_started.load(Ordering::SeqCst));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), later_started)
+                .await
+                .is_err(),
+            "later split started before the current split was released"
+        );
+        order.manually_released.store(true, Ordering::SeqCst);
+        order.release_first.notify_waiters();
+        let batches = tokio::time::timeout(std::time::Duration::from_secs(10), result)
+            .await
+            .expect("current split was blocked by speculative memory admission")
+            .unwrap()
+            .unwrap();
+        let ids = batches.iter().flat_map(|batch| {
             batch
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .unwrap()
                 .values()
-                .to_vec()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(ids, [0, 1, 2]);
-    assert!(!limited_order.later_data_started.load(Ordering::SeqCst));
+                .iter()
+                .copied()
+        });
+        let expected = 0..(2 * GROUP_ROWS) as i32;
+        assert!(ids.eq(expected
+            .clone()
+            .chain(expected)
+            .take(limit.unwrap_or(4 * GROUP_ROWS))));
+        assert_eq!(
+            order.later_data_started.load(Ordering::SeqCst),
+            limit.is_none()
+        );
+    }
 }
