@@ -102,6 +102,33 @@ where
 }
 
 impl GlobalIndexScanner {
+    pub(super) fn coalesced_or_interval_limit(&self, children: &[Predicate]) -> Option<usize> {
+        let Predicate::And(parts) = children.first()? else {
+            return None;
+        };
+        let (
+            Some(Predicate::Leaf { column: first, .. }),
+            Some(Predicate::Leaf { column: second, .. }),
+        ) = (parts.first(), parts.get(1))
+        else {
+            return None;
+        };
+        let first_id = self
+            .schema_fields
+            .iter()
+            .find(|field| field.name() == first)?
+            .id();
+        let second_id = self
+            .schema_fields
+            .iter()
+            .find(|field| field.name() == second)?
+            .id();
+        self.composite_entries
+            .iter()
+            .any(|(ids, _)| ids.contains(&first_id) && ids.contains(&second_id))
+            .then_some(MAX_INTERVALS)
+    }
+
     // (a = 1 AND b IN S) OR (a = 2 AND b IN S) is exactly
     // (a IN (1, 2) AND b IN S). Leave uneven locator sets untouched.
     pub(super) fn coalesce_equal_or_arms(
@@ -321,7 +348,7 @@ impl GlobalIndexScanner {
                         if let Predicate::Or(arms) = child {
                             if let Some(coalesced) = Self::coalesce_equal_or_arms(
                                 arms,
-                                (!self.composite_entries.is_empty()).then_some(MAX_INTERVALS),
+                                self.coalesced_or_interval_limit(arms),
                             ) {
                                 changed = true;
                                 return coalesced;
@@ -337,7 +364,7 @@ impl GlobalIndexScanner {
             if let Predicate::Or(children) = predicate {
                 if let Some(coalesced) = Self::coalesce_equal_or_arms(
                     children,
-                    (!self.composite_entries.is_empty()).then_some(MAX_INTERVALS),
+                    self.coalesced_or_interval_limit(children),
                 ) {
                     return self.evaluate(&coalesced).await;
                 }

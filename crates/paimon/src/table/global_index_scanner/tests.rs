@@ -950,7 +950,7 @@ async fn test_rectangular_or_keeps_composite_point_lookups_above_interval_limit(
     let io = crate::io::FileIOBuilder::new("file").build().unwrap();
     let path = format!("file://{}", tmp.path().display());
     // A non-point composite plan is rejected even for this tiny index file.
-    let scanner = GlobalIndexScanner::create(&io, &path, 2, 0, 0, &[entry], &fields)
+    let scanner = GlobalIndexScanner::create(&io, &path, 2, 0, 0, &[entry.clone()], &fields)
         .unwrap()
         .unwrap();
     let b = crate::spec::PredicateBuilder::new(&fields);
@@ -976,6 +976,50 @@ async fn test_rectangular_or_keeps_composite_point_lookups_above_interval_limit(
         .unwrap()
         .unwrap();
     assert_eq!(result.row_ranges, vec![RowRange::new(0, 1)]);
+
+    let at_limit = b
+        .is_in("value", (1..=128).map(Datum::Int).collect())
+        .unwrap();
+    let arms = vec![
+        Predicate::and(vec![int_eq("id", 0, 0), at_limit.clone()]),
+        Predicate::and(vec![int_eq("id", 0, 1), at_limit]),
+    ];
+    assert!(GlobalIndexScanner::coalesce_equal_or_arms(
+        &arms,
+        scanner.coalesced_or_interval_limit(&arms)
+    )
+    .is_some());
+    let result = scanner
+        .evaluate(&Predicate::or(arms))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.row_ranges, vec![RowRange::new(0, 1)]);
+
+    // An unrelated composite definition must not disable the scalar-only
+    // rectangular rewrite, even when the rectangle exceeds 256 cells.
+    let mut extended_fields = fields.clone();
+    extended_fields.push(DataField::new(
+        3,
+        "step".into(),
+        fields[0].data_type().clone(),
+    ));
+    let unrelated = GlobalIndexScanner::create(&io, &path, 2, 0, 0, &[entry], &extended_fields)
+        .unwrap()
+        .unwrap();
+    let step = Predicate::Leaf {
+        column: "step".into(),
+        index: 2,
+        data_type: fields[0].data_type().clone(),
+        op: PredicateOperator::In,
+        literals: (1..=129).map(Datum::Int).collect(),
+    };
+    let arms = vec![
+        Predicate::and(vec![int_eq("id", 0, 0), step.clone()]),
+        Predicate::and(vec![int_eq("id", 0, 1), step]),
+    ];
+    assert!(unrelated.coalesced_or_interval_limit(&arms).is_none());
+    assert!(GlobalIndexScanner::coalesce_equal_or_arms(&arms, None).is_some());
 }
 
 #[tokio::test]
