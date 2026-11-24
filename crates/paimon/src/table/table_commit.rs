@@ -2722,6 +2722,10 @@ impl TableCommit {
                 Ok(snapshot) => snapshot,
                 Err(_) => return Ok(None),
             };
+            // A metadata-only overwrite can replace the base manifests with an empty delta.
+            if snapshot.commit_kind() == &CommitKind::OVERWRITE {
+                return Ok(None);
+            }
             entries.extend(
                 self.read_delta_entries(partition_filter.as_ref(), &snapshot)
                     .await?,
