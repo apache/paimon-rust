@@ -122,6 +122,15 @@ async fn reads_java_centroid_manifest_and_field_bitmaps_across_schema_evolution(
         .find(|file| descriptor(file)[9] == b'R' && file.file_size == 0)
         .unwrap();
     assert_eq!(&descriptor(empty_router)[10..], b"\0\0\0\0l2");
+    assert!(!table
+        .file_io()
+        .exists(&format!(
+            "{}/index/{}",
+            table.location().trim_end_matches('/'),
+            empty_router.file_name
+        ))
+        .await
+        .unwrap());
     let router = files
         .iter()
         .find(|file| descriptor(file)[9] == b'R' && file.file_size > 0)

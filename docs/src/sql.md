@@ -2978,6 +2978,8 @@ CALL sys.create_global_index(
 Each maximal contiguous row-ID range in a partition has a routing model and one
 local index per populated centroid. Centroids without a shard entry in the
 manifest count toward the probe width and produce no candidates.
+An all-null range records its row-ID bounds in a manifest-only router entry
+with `nlist=0`.
 The build replaces the previous indexes of the same type on the column in the
 selected partitions. Refresh routed indexes
 explicitly with the build procedure. A Rust build plan also exposes

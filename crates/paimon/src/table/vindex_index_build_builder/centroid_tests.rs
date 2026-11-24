@@ -284,6 +284,14 @@ async fn centroid_empty_router_does_not_define_raw_scoring() {
     };
     assert_eq!(empty.descriptor.role, Role::Router(0));
     assert_eq!(empty.router.index_file.file_size, 0);
+    assert!(!table
+        .file_io()
+        .exists(&format!(
+            "{path}/index/{}",
+            empty.router.index_file.file_name
+        ))
+        .await
+        .unwrap());
     write_vectors(&table, vec![1, 2], vec![vec![1., 0.], vec![100., 0.]]).await;
 
     let mut search = table.new_vector_search_builder();

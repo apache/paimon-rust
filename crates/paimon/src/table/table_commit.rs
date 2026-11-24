@@ -1146,6 +1146,12 @@ impl TableCommit {
                 .iter()
                 .chain(&message.compact_new_index_files)
             {
+                if file.file_size == 0
+                    && file.row_count == 0
+                    && super::centroid_index::Descriptor::is_empty_router(file).unwrap_or(false)
+                {
+                    continue;
+                }
                 let path = committed_index_file_path(
                     table_path,
                     &bucket_path,
