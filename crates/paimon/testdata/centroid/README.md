@@ -38,8 +38,8 @@ The Rust test publishes the files at row range [2, 5] to verify label rebasing.
 `warehouse/test.db` contains two Data Evolution tables written by the Spark
 centroid fixture test in [apache/paimon#11350](https://github.com/apache/paimon/pull/11350).
 `centroid_bitmap` has Bitmap files for `id` and `status` built at schema 1,
-a populated range with an empty shard, and an all-null range. Spark builds this table
-with U+00A0 around `l2`. `centroid_metrics` has L2 IVF-PQ with 64 local lists,
+a populated range with two centroids and one shard file, and an all-null range.
+Spark builds this table with U+00A0 around `l2`. `centroid_metrics` has L2 IVF-PQ with 64 local lists,
 cosine IVF-FLAT, and inner product IVF-FLAT.
 
 To regenerate the Java tables, run the Spark suite in the Java checkout.

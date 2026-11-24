@@ -28,7 +28,6 @@ use std::collections::BTreeMap;
 const META_MAGIC: &[u8; 8] = b"PAIMCENT";
 const META_HEADER: usize = 14;
 const META_VERSION: u8 = 1;
-pub(super) const EMPTY_SHARD: &[u8] = b"PCEMPTY1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Role {
@@ -235,11 +234,14 @@ pub(super) fn group<'a>(
                         }
                     }
                     Role::Shard(id) => {
-                        if file.file_size == 0 || id >= nlist || shards.insert(id, *entry).is_some()
+                        if file.file_size == 0
+                            || file.row_count == 0
+                            || id >= nlist
+                            || shards.insert(id, *entry).is_some()
                         {
                             return Err(invalid());
                         }
-                        if has_local_nlist && file.row_count > 0 {
+                        if has_local_nlist {
                             local_nlists.insert(id, desc.local_nlist()?);
                         } else if desc.payload.is_some() {
                             return Err(invalid());
@@ -259,11 +261,7 @@ pub(super) fn group<'a>(
                     }
                 }
             }
-            if router_count != 1
-                || shards.len() != nlist
-                || vector_count > range_len
-                || (nlist != 0 && vector_count == 0)
-            {
+            if router_count != 1 || vector_count > range_len {
                 return Err(invalid());
             }
             let expected_bitmaps = if vector_count == 0 { 0 } else { extra.len() };

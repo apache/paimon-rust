@@ -207,10 +207,16 @@ async fn centroid_partition_replacement_requires_valid_matching_partitions() {
     assert_eq!(replacements.len(), 1);
     assert_eq!(replacements[0].deleted_index_files.len(), 2);
     assert_ne!(replacements[0].partition, untouched.partition);
-    assert_eq!(builder.execute().await.unwrap(), 6);
+    assert_eq!(builder.execute().await.unwrap(), 4);
     let mut indexed = active_entries(&table).await;
     assert!(indexed.contains(untouched));
-    assert_eq!(centroid_index::group(&indexed).unwrap().len(), 2);
+    let groups = centroid_index::group(&indexed).unwrap();
+    assert_eq!(groups.len(), 2);
+    assert!(groups
+        .iter()
+        .all(|group| group.descriptor.role == Role::Router(2)
+            && group.shards.len() == 1
+            && group.vector_count == 2));
 
     // An undecodable partition cannot be scheduled for a filtered deletion.
     indexed
@@ -429,15 +435,15 @@ async fn centroid_query_reads_java_model_and_native_shards_with_rebased_labels()
             }),
         });
     }
-    let mut partial = message.clone();
-    partial.new_index_files.pop();
-    let error = TableCommit::new(table.clone(), "centroid-incomplete".into())
-        .commit(vec![partial])
+    let mut without_router = message.clone();
+    without_router.new_index_files.remove(0);
+    let error = TableCommit::new(table.clone(), "centroid-without-router".into())
+        .commit(vec![without_router])
         .await
         .unwrap_err();
     assert!(error
         .to_string()
-        .contains("Incomplete or conflicting centroid generation"));
+        .contains("Centroid generation has no routing model"));
     TableCommit::new(table.clone(), "java-centroid-generation".into())
         .commit(vec![message])
         .await

@@ -23,7 +23,7 @@ use crate::spec::{
     DataEvolutionIndexSourceMeta, FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry,
     ROW_ID_FIELD_NAME,
 };
-use crate::table::centroid_index::{self, Descriptor, Role, EMPTY_SHARD};
+use crate::table::centroid_index::{self, Descriptor, Role};
 use crate::table::global_index_build_common::{vector::VectorIndexShard, GlobalIndexBuildView};
 use crate::table::index_build::{
     vector::{serialize_writer, VectorSpill},
@@ -299,42 +299,37 @@ impl VindexIndexBuildBuilder<'_> {
                     .map_err(task_error)??;
                 routed = next_routed;
                 bitmap_rows = next_bitmap_rows;
-                let (count, index, local_nlist) = match rows {
-                    Some(rows) => {
-                        let count = rows.vector_count();
-                        let mut local = options.clone();
-                        local
-                            .native_options
-                            .insert("expected-vector-count".into(), count.to_string());
-                        if let Some(nlist) = local.native_options.get_mut("nlist") {
-                            if let Ok(requested) = nlist.trim().parse::<usize>() {
-                                let samples =
-                                    checked_training_vector_count(count, local.train_sample_ratio)?;
-                                *nlist = requested.min(samples).to_string();
-                            }
-                        }
-                        let writer = rows.train(&local, false).await?.writer;
-                        let local_nlist = if stores_local_nlist {
-                            let nlist = match &writer {
-                                VectorIndexWriter::IvfFlat(index) => index.nlist,
-                                VectorIndexWriter::IvfPq(index) => index.nlist,
-                                _ => unreachable!(
-                                    "local nlist is stored only for IVF-FLAT and IVF-PQ"
-                                ),
-                            };
-                            Some(
-                                i32::try_from(nlist)
-                                    .map_err(|_| {
-                                        centroid_index::invalid("Centroid shard nlist is too large")
-                                    })?
-                                    .to_be_bytes(),
-                            )
-                        } else {
-                            None
-                        };
-                        (count as i64, Some(writer), local_nlist)
+                let Some(rows) = rows else {
+                    continue;
+                };
+                let count = rows.vector_count();
+                let mut local = options.clone();
+                local
+                    .native_options
+                    .insert("expected-vector-count".into(), count.to_string());
+                if let Some(nlist) = local.native_options.get_mut("nlist") {
+                    if let Ok(requested) = nlist.trim().parse::<usize>() {
+                        let samples =
+                            checked_training_vector_count(count, local.train_sample_ratio)?;
+                        *nlist = requested.min(samples).to_string();
                     }
-                    None => (0, None, None),
+                }
+                let writer = rows.train(&local, false).await?.writer;
+                let local_nlist = if stores_local_nlist {
+                    let nlist = match &writer {
+                        VectorIndexWriter::IvfFlat(index) => index.nlist,
+                        VectorIndexWriter::IvfPq(index) => index.nlist,
+                        _ => unreachable!("local nlist is stored only for IVF-FLAT and IVF-PQ"),
+                    };
+                    Some(
+                        i32::try_from(nlist)
+                            .map_err(|_| {
+                                centroid_index::invalid("Centroid shard nlist is too large")
+                            })?
+                            .to_be_bytes(),
+                    )
+                } else {
+                    None
                 };
                 files.push(
                     self.write_centroid_file(
@@ -345,9 +340,9 @@ impl VindexIndexBuildBuilder<'_> {
                             role: Role::Shard(id),
                             payload: local_nlist.as_ref().map(|bytes| bytes.as_slice()),
                         },
-                        count,
-                        index,
-                        Bytes::from_static(EMPTY_SHARD),
+                        count as i64,
+                        Some(writer),
+                        Bytes::new(),
                     )
                     .await?,
                 );

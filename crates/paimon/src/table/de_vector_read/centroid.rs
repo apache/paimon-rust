@@ -196,7 +196,7 @@ pub(super) async fn execute_work(
     let Role::Router(nlist) = group.descriptor.role else {
         unreachable!()
     };
-    if nlist == 0 {
+    if group.vector_count == 0 {
         return Ok((
             vec![ScoredRowIds::empty(); work.queries.len()],
             IndexSearchTiming::default(),
@@ -406,7 +406,7 @@ impl RoutedSearch<'_> {
             let mut queries_by_centroid = BTreeMap::<_, Vec<_>>::new();
             for (index, route) in routes.iter_mut().enumerate() {
                 for &centroid in &route.nearest[route.visited..route.width] {
-                    if group.shards[&centroid].index_file.row_count > 0 {
+                    if group.shards.contains_key(&centroid) {
                         let probe = if route.joint {
                             Probe::Joint
                         } else {
@@ -547,9 +547,10 @@ impl RoutedSearch<'_> {
                 continue;
             }
             let compatible = route.nearest[..JOINT_OUTER_PROBES].iter().all(|id| {
-                self.group.shards[id].index_file.row_count
-                    >= (JOINT_INNER_PROBES * query.limit) as i64
-                    && self.group.local_nlists.get(id) == Some(&SHARD_LISTS)
+                self.group.shards.get(id).is_some_and(|entry| {
+                    entry.index_file.row_count >= (JOINT_INNER_PROBES * query.limit) as i64
+                        && self.group.local_nlists.get(id) == Some(&SHARD_LISTS)
+                })
             });
             if compatible {
                 route.width = JOINT_OUTER_PROBES;

@@ -116,22 +116,21 @@ async fn reads_java_centroid_manifest_and_field_bitmaps_across_schema_evolution(
     let identifier = Identifier::new("test", "centroid_bitmap");
     let table = catalog.get_table(&identifier).await.unwrap();
     let files = index_files(&table, "v").await;
-    assert_eq!(files.len(), 6);
+    assert_eq!(files.len(), 5);
     let empty_router = files
         .iter()
         .find(|file| descriptor(file)[9] == b'R' && file.file_size == 0)
         .unwrap();
     assert_eq!(&descriptor(empty_router)[10..], b"\0\0\0\0l2");
-    let empty_shard = files
+    let router = files
         .iter()
-        .find(|file| descriptor(file)[9] == b'S' && file.row_count == 0)
+        .find(|file| descriptor(file)[9] == b'R' && file.file_size > 0)
         .unwrap();
-    assert_eq!(descriptor(empty_shard).len(), 14);
-    assert_eq!(empty_shard.file_size, 8);
-    let shard = files
-        .iter()
-        .find(|file| descriptor(file)[9] == b'S' && file.row_count > 0)
-        .unwrap();
+    assert_eq!(&descriptor(router)[10..14], &2i32.to_be_bytes());
+    let mut shards = files.iter().filter(|file| descriptor(file)[9] == b'S');
+    let shard = shards.next().unwrap();
+    assert!(shards.next().is_none());
+    assert_eq!(shard.row_count, 4);
     assert_eq!(&descriptor(shard)[14..], &1i32.to_be_bytes());
     let bitmaps = files
         .iter()
@@ -216,7 +215,7 @@ async fn reads_java_centroid_manifest_and_field_bitmaps_across_schema_evolution(
             .execute()
             .await
             .unwrap(),
-        6
+        5
     );
 }
 
