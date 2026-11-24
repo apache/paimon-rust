@@ -41,7 +41,7 @@ arrow-select@59.3.3		X
 arrow-string@59.3.2		X																	
 async-channel@2.5.0		X										X							
 async-compression@0.4.42		X										X							
-async-executor@1.14.0		X										X							
+async-executor@1.14.1		X										X							
 async-ffi@0.5.0												X							
 async-fs@2.2.0		X										X							
 async-io@2.6.0		X										X							
