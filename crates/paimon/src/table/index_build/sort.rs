@@ -22,18 +22,21 @@ use super::scalar::SortedIndexKeyRow;
 use crate::btree::key_serde::{DynKeyComparator, KeyComparator};
 use crate::{Error, Result};
 use std::cmp::Ordering;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use tempfile::NamedTempFile;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::Path;
+use tempfile::{NamedTempFile, TempDir, TempPath};
 use tokio::io::AsyncReadExt;
 
-/// One run per binary level bounds open files during merging to two inputs.
+/// Each binary level holds a closed run. Merging opens two inputs and one output.
 /// Temporary files are private scratch state and are removed on failure or cancellation.
 pub(in crate::table) struct IndexSorter {
     rows: Vec<SortedIndexKeyRow>,
     bytes: usize,
     budget: usize,
     cmp: KeyComparator,
-    runs: Vec<Option<NamedTempFile>>,
+    runs: Vec<Option<TempPath>>,
+    spill_dir: Option<TempDir>,
 }
 
 impl IndexSorter {
@@ -44,6 +47,7 @@ impl IndexSorter {
             budget,
             cmp,
             runs: Vec::new(),
+            spill_dir: None,
         }
     }
 
@@ -82,9 +86,25 @@ impl IndexSorter {
             return Ok(());
         }
         sort_index_rows(&mut self.rows, &self.cmp)?;
-        let mut run = NamedTempFile::new().map_err(io_error)?;
+        if self.spill_dir.is_none() {
+            let mut directory = tempfile::Builder::new();
+            directory.prefix("paimon-index-sort-");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                // Runs are reopened by path, so keep the directory private.
+                directory.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            self.spill_dir = Some(directory.tempdir().map_err(io_error)?);
+        }
+        let directory = self
+            .spill_dir
+            .as_ref()
+            .expect("spill directory initialized");
+        let mut file = NamedTempFile::new_in(directory.path()).map_err(io_error)?;
         {
-            let mut output = BufWriter::new(run.as_file_mut());
+            let mut output = BufWriter::new(file.as_file_mut());
             for row in self.rows.drain(..) {
                 write_row(&mut output, &row)?;
             }
@@ -93,13 +113,14 @@ impl IndexSorter {
         // Release the buffer before merging so old capacity cannot escape the budget.
         self.rows = Vec::new();
         self.bytes = 0;
+        let mut run = file.into_temp_path();
         let mut level = 0;
         loop {
             if level == self.runs.len() {
                 self.runs.push(None);
             }
             match self.runs[level].take() {
-                Some(previous) => run = merge(previous, run, &self.cmp)?,
+                Some(previous) => run = merge(directory.path(), previous, run, &self.cmp)?,
                 None => {
                     self.runs[level] = Some(run);
                     return Ok(());
@@ -115,27 +136,31 @@ impl IndexSorter {
             return Ok(SortedRows::Memory(self.rows.into_iter()));
         }
         self.spill()?;
+        let directory = self.spill_dir.take().expect("disk runs have a directory");
         let mut runs = self.runs.into_iter().flatten();
         let mut run = runs
             .next()
             .ok_or_else(|| io_error(std::io::Error::other("missing index sort run")))?;
         for other in runs {
-            run = merge(run, other, &self.cmp)?;
+            run = merge(directory.path(), run, other, &self.cmp)?;
         }
-        run.as_file_mut()
-            .seek(SeekFrom::Start(0))
-            .map_err(io_error)?;
-        let reader =
-            tokio::io::BufReader::new(tokio::fs::File::from_std(run.reopen().map_err(io_error)?));
-        Ok(SortedRows::Disk { _run: run, reader })
+        let reader = tokio::io::BufReader::new(tokio::fs::File::from_std(
+            File::open(&run).map_err(io_error)?,
+        ));
+        // Let the directory remove the final run, including if an async read is cancelled.
+        run.disable_cleanup(true);
+        Ok(SortedRows::Disk {
+            reader,
+            _spill_dir: directory,
+        })
     }
 }
 
 pub(in crate::table) enum SortedRows {
     Memory(std::vec::IntoIter<SortedIndexKeyRow>),
     Disk {
-        _run: NamedTempFile,
         reader: tokio::io::BufReader<tokio::fs::File>,
+        _spill_dir: TempDir,
     },
 }
 
@@ -224,22 +249,16 @@ pub(in crate::table) fn compare_rows(
 }
 
 fn merge(
-    mut left: NamedTempFile,
-    mut right: NamedTempFile,
+    directory: &Path,
+    left: TempPath,
+    right: TempPath,
     cmp: &DynKeyComparator<'_>,
-) -> Result<NamedTempFile> {
-    left.as_file_mut()
-        .seek(SeekFrom::Start(0))
-        .map_err(io_error)?;
-    right
-        .as_file_mut()
-        .seek(SeekFrom::Start(0))
-        .map_err(io_error)?;
-    let mut output = NamedTempFile::new().map_err(io_error)?;
+) -> Result<TempPath> {
+    let mut output = NamedTempFile::new_in(directory).map_err(io_error)?;
     {
         let mut output = BufWriter::new(output.as_file_mut());
-        let mut left = BufReader::new(left.as_file_mut());
-        let mut right = BufReader::new(right.as_file_mut());
+        let mut left = BufReader::new(File::open(&left).map_err(io_error)?);
+        let mut right = BufReader::new(File::open(&right).map_err(io_error)?);
         let mut a = read_row(&mut left)?;
         let mut b = read_row(&mut right)?;
         while a.is_some() || b.is_some() {
@@ -258,7 +277,7 @@ fn merge(
         }
         output.flush().map_err(io_error)?;
     }
-    Ok(output)
+    Ok(output.into_temp_path())
 }
 
 #[cfg(test)]
@@ -283,17 +302,17 @@ mod tests {
             sorter.push(row).unwrap();
         }
         let mut rows = sorter.finish().unwrap();
-        let SortedRows::Disk { _run, .. } = &rows else {
+        let SortedRows::Disk { _spill_dir, .. } = &rows else {
             panic!("test must spill")
         };
-        let path = _run.path().to_owned();
+        let directory = _spill_dir.path().to_path_buf();
         let mut actual = Vec::new();
         while let Some(row) = rows.next().await.unwrap() {
             actual.push(row);
         }
         assert_eq!(actual, expected);
         drop(rows);
-        assert!(!path.exists());
+        assert!(!directory.exists());
     }
 
     #[tokio::test]
@@ -320,24 +339,61 @@ mod tests {
         assert_eq!(ids, [7, 3, 1, 4, 2, 5, 0, 6]);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spilling_multiple_sorters_keeps_descriptors_bounded() {
+        const CHILD: &str = "PAIMON_INDEX_SORT_LIMIT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut sorters: Vec<_> = (0..32)
+                .map(|_| IndexSorter::new(128, comparator()))
+                .collect();
+            for id in (0..8).rev() {
+                for sorter in &mut sorters {
+                    sorter.push((Some(vec![1; 16]), id)).unwrap();
+                }
+            }
+            for sorter in sorters {
+                let mut rows = sorter.finish().unwrap();
+                for id in 0..8 {
+                    assert_eq!(rows.next().await.unwrap(), Some((Some(vec![1; 16]), id)));
+                }
+                assert_eq!(rows.next().await.unwrap(), None);
+            }
+            return;
+        }
+
+        // Limit descriptors for this child only, leaving other tests unaffected.
+        let output = std::process::Command::new("sh")
+            .args(["-c", "ulimit -n 64 && exec \"$@\"", "sh"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "table::index_build::sort::tests::spilling_multiple_sorters_keeps_descriptors_bounded",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{stderr}"
+        );
+    }
+
     #[test]
     fn oversized_keys_fail_and_dropping_sorter_removes_runs() {
         let mut sorter = IndexSorter::new(128, comparator());
         for id in 0..10 {
             sorter.push((Some(vec![1; 16]), id)).unwrap();
         }
-        let paths = sorter
-            .runs
-            .iter()
-            .flatten()
-            .map(|run| run.path().to_owned())
-            .collect::<Vec<_>>();
-        assert!(!paths.is_empty());
+        let directory = sorter.spill_dir.as_ref().unwrap().path().to_path_buf();
+        assert!(directory.exists());
         assert!(matches!(
             sorter.push((Some(vec![0; 129]), 11)),
             Err(Error::ResourceExhausted { .. })
         ));
         drop(sorter);
-        assert!(paths.iter().all(|path| !path.exists()));
+        assert!(!directory.exists());
     }
 }
