@@ -52,7 +52,7 @@ pub(crate) struct SnapshotRelationPlanner {
 
 impl SnapshotRelationPlanner {
     pub(crate) fn try_new(
-        mut bindings: HashMap<String, (TableReference, Arc<dyn TableProvider>)>,
+        bindings: HashMap<String, (TableReference, Arc<dyn TableProvider>)>,
         statement: &mut ast::Statement,
         defaults: &CatalogOptions,
         normalize: bool,
@@ -61,7 +61,7 @@ impl SnapshotRelationPlanner {
             bindings: &bindings,
             defaults,
             normalize,
-            private_bindings: HashSet::new(),
+            display_qualifiers: HashMap::new(),
             cte_names: HashSet::new(),
             physical_tables: physical_table_references(statement, normalize)?,
             scopes: Vec::new(),
@@ -75,13 +75,11 @@ impl SnapshotRelationPlanner {
                 "Ambiguous snapshot qualifier '{qualifier}'. Use distinct aliases for the snapshot scans"
             ));
         }
-        let cte_names = qualifiers.cte_names;
-        let mut display_qualifiers = HashMap::new();
-        for name in qualifiers.private_bindings {
-            let (table, _) = bindings.get_mut(&name).unwrap();
-            display_qualifiers.insert(name.clone(), table.to_string());
-            *table = TableReference::bare(name);
-        }
+        let SnapshotQualifiers {
+            display_qualifiers,
+            cte_names,
+            ..
+        } = qualifiers;
         Ok(Self {
             bindings,
             display_qualifiers,
@@ -182,14 +180,14 @@ fn physical_table_references(
     }
 }
 
-/// DataFusion matches a bare qualifier against the last component of a full
-/// table name. Bind colliding snapshots privately and resolve SQL qualifiers
-/// within their original scope before DataFusion plans the join.
+/// DataFusion can match a scan qualifier as a suffix before it tries nested
+/// field access. Bind unaliased snapshots privately and rewrite exact SQL
+/// qualifiers within their original scope.
 struct SnapshotQualifiers<'a> {
     bindings: &'a HashMap<String, (TableReference, Arc<dyn TableProvider>)>,
     defaults: &'a CatalogOptions,
     normalize: bool,
-    private_bindings: HashSet<String>,
+    display_qualifiers: HashMap<String, String>,
     cte_names: HashSet<String>,
     // Node addresses distinguish tables from same-named CTEs. Moving a FROM
     // vector for traversal leaves its elements at their original addresses.
@@ -201,10 +199,6 @@ struct SnapshotQualifiers<'a> {
 }
 
 impl<'binding> SnapshotQualifiers<'binding> {
-    fn factors(group: &ast::TableWithJoins) -> impl DoubleEndedIterator<Item = &TableFactor> {
-        std::iter::once(&group.relation).chain(group.joins.iter().map(|join| &join.relation))
-    }
-
     fn visible_factors<'a>(
         relation: &'a TableFactor,
         joins: &'a [ast::Join],
@@ -236,11 +230,9 @@ impl<'binding> SnapshotQualifiers<'binding> {
     }
 
     fn relation_scope<'relation>(
-        &mut self,
+        &self,
         factors: impl DoubleEndedIterator<Item = &'relation TableFactor>,
-        visible_only: bool,
     ) -> HashMap<TableReference, ScopedQualifier<'binding>> {
-        let mut sources = Vec::new();
         let mut snapshots = Vec::new();
         let mut scope = HashMap::new();
         let mut pending: Vec<_> = factors.rev().collect();
@@ -253,7 +245,7 @@ impl<'binding> SnapshotQualifiers<'binding> {
                 } => {
                     if let Some((binding, (table, _))) = self.bindings.get_key_value(&binding.value)
                     {
-                        snapshots.push((table.clone(), Some(binding.as_str())));
+                        snapshots.push((table, binding.as_str()));
                     }
                     continue;
                 }
@@ -274,7 +266,7 @@ impl<'binding> SnapshotQualifiers<'binding> {
                                     .map(|qualifier| (qualifier, ScopedQualifier::Original)),
                             );
                         }
-                        sources.push((table, None));
+                        scope.insert(table, ScopedQualifier::Original);
                     }
                     continue;
                 }
@@ -282,17 +274,10 @@ impl<'binding> SnapshotQualifiers<'binding> {
                     table_with_joins,
                     alias: None,
                 } => {
-                    if visible_only {
-                        pending.extend(
-                            Self::visible_factors(
-                                &table_with_joins.relation,
-                                &table_with_joins.joins,
-                            )
+                    pending.extend(
+                        Self::visible_factors(&table_with_joins.relation, &table_with_joins.joins)
                             .rev(),
-                        );
-                    } else {
-                        pending.extend(Self::factors(table_with_joins).rev());
-                    }
+                    );
                     continue;
                 }
                 TableFactor::NestedJoin { alias, .. }
@@ -304,43 +289,23 @@ impl<'binding> SnapshotQualifiers<'binding> {
                 _ => continue,
             };
             if let Some(alias) = alias {
-                sources.push((
+                scope.insert(
                     TableReference::bare(normalizer.normalize(alias.name.clone())),
-                    None,
-                ));
+                    ScopedQualifier::Original,
+                );
             }
         }
 
         // Live relations reserve their qualifiers before any implicit snapshot names.
-        sources.extend(snapshots);
-        let mut reserved = HashMap::<&str, Vec<&TableReference>>::new();
-        for (table, binding) in &sources {
-            let names = reserved.entry(table.table()).or_default();
-            if let Some(binding) = *binding {
-                let qualifiers = self.table_qualifiers(table);
-                // Private snapshot bindings protect outer references during decorrelation.
-                let overlaps_existing = qualifiers.iter().any(|qualifier| {
-                    matches!(scope.get(qualifier), Some(ScopedQualifier::Original))
-                        || self
-                            .scopes
-                            .iter()
-                            .any(|scope| scope.contains_key(qualifier))
-                });
-                if overlaps_existing || names.iter().any(|name| name.resolved_eq(table)) {
-                    self.private_bindings.insert(binding.to_owned());
+        for (table, binding) in snapshots {
+            for qualifier in self.table_qualifiers(table) {
+                if let ScopedQualifier::Snapshots(bindings) = scope
+                    .entry(qualifier)
+                    .or_insert_with(|| ScopedQualifier::Snapshots(Vec::new()))
+                {
+                    bindings.push(binding);
                 }
-                for qualifier in qualifiers {
-                    if let ScopedQualifier::Snapshots(bindings) = scope
-                        .entry(qualifier)
-                        .or_insert_with(|| ScopedQualifier::Snapshots(Vec::new()))
-                    {
-                        bindings.push(binding);
-                    }
-                }
-            } else {
-                scope.insert(table.clone(), ScopedQualifier::Original);
             }
-            names.push(table);
         }
         scope
     }
@@ -353,8 +318,7 @@ impl<'binding> SnapshotQualifiers<'binding> {
             let left = || Self::visible_factors(&group.relation, previous);
             self.visit_factor(&mut join.relation, preceding.iter().copied().chain(left()));
             // The ON clause can see its join inputs and enclosing queries.
-            let join_scope =
-                self.relation_scope(left().chain(std::iter::once(&join.relation)), true);
+            let join_scope = self.relation_scope(left().chain(std::iter::once(&join.relation)));
             self.scopes.push(join_scope);
             let _ = join.join_operator.visit(self);
             self.scopes.pop();
@@ -370,13 +334,12 @@ impl<'binding> SnapshotQualifiers<'binding> {
             TableFactor::NestedJoin {
                 table_with_joins, ..
             } => {
-                self.relation_scope(Self::factors(table_with_joins), false);
                 self.visit_joins(table_with_joins, &preceding.collect::<Vec<_>>());
             }
             TableFactor::Derived { lateral: true, .. }
             | TableFactor::Function { lateral: true, .. }
             | TableFactor::UNNEST { .. } => {
-                let scope = self.relation_scope(preceding, true);
+                let scope = self.relation_scope(preceding);
                 self.scopes.push(scope);
                 let _ = factor.visit(self);
                 self.scopes.pop();
@@ -432,10 +395,7 @@ impl<'binding> SnapshotQualifiers<'binding> {
                                 .get_or_insert_with(|| table.clone());
                             return None;
                         };
-                        return self
-                            .private_bindings
-                            .contains(*binding)
-                            .then(|| (*len, ast::Ident::new(*binding)));
+                        return Some((*len, ast::Ident::new(*binding)));
                     }
                     None => {}
                 }
@@ -486,8 +446,6 @@ impl VisitorMut for SnapshotQualifiers<'_> {
 
     fn pre_visit_select(&mut self, select: &mut ast::Select) -> ControlFlow<()> {
         let mut sources = std::mem::take(&mut select.from);
-        // Reserve private bindings before visiting inputs in SQL visibility order.
-        self.relation_scope(sources.iter().flat_map(Self::factors), false);
         for index in 0..sources.len() {
             let (previous, rest) = sources.split_at_mut(index);
             let preceding = previous
@@ -500,7 +458,6 @@ impl VisitorMut for SnapshotQualifiers<'_> {
             sources
                 .iter()
                 .flat_map(|group| Self::visible_factors(&group.relation, &group.joins)),
-            true,
         );
         self.scopes.push(scope);
         self.select_sources.push(sources);
@@ -522,6 +479,20 @@ impl VisitorMut for SnapshotQualifiers<'_> {
         if self.query_has_select.last() == Some(&true) {
             // ORDER BY belongs to Query and is visited after its SELECT.
             *self.scopes.last_mut().unwrap() = scope;
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
+        if let TableFactor::TableFunction {
+            expr: ast::Expr::Identifier(binding),
+            alias: None,
+        } = factor
+        {
+            if let Some((table, _)) = self.bindings.get(&binding.value) {
+                self.display_qualifiers
+                    .insert(binding.value.clone(), table.to_string());
+            }
         }
         ControlFlow::Continue(())
     }
@@ -564,7 +535,12 @@ impl RelationPlanner for SnapshotRelationPlanner {
         } = &relation
         {
             if let Some((table, provider)) = self.bindings.get(&binding.value) {
-                return plan_scan(alias.clone(), table.clone(), provider.clone());
+                let qualifier = if alias.is_none() {
+                    TableReference::bare(binding.value.clone())
+                } else {
+                    table.clone()
+                };
+                return plan_scan(alias.clone(), qualifier, provider.clone());
             }
         }
         if let Some(marker) = self.display_qualifiers.keys().next() {

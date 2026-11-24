@@ -604,6 +604,37 @@ async fn time_travel_source_is_materialized_as_a_persistent_table() {
 }
 
 #[tokio::test]
+async fn ctas_resolves_nested_fields_next_to_snapshot_scans() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog.clone()).await;
+    exec(
+        &ctx,
+        "CREATE TABLE t AS SELECT id FROM (VALUES (1), (2), (3)) AS rows(id)",
+    )
+    .await;
+    let fresh = create_sql_context(catalog).await;
+
+    for (table, snapshot) in [
+        ("copied", "t VERSION AS OF 1"),
+        ("copied_aliased", "t VERSION AS OF 1 AS s"),
+    ] {
+        exec(
+            &ctx,
+            &format!(
+                "CREATE TABLE {table} AS SELECT x.t.id AS nested_id FROM {snapshot}
+                 CROSS JOIN (SELECT named_struct('id', 999) AS t) AS x"
+            ),
+        )
+        .await;
+        assert_eq!(
+            query_ids(&fresh, &format!("SELECT nested_id FROM {table}")).await,
+            [999, 999, 999],
+            "{snapshot}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn inferred_nested_types_and_repeated_source_field_ids() {
     let (_tmp, catalog) = create_test_env();
     let ctx = create_sql_context(catalog.clone()).await;
