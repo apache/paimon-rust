@@ -495,12 +495,15 @@ async fn authorized_pinned_snapshots_must_match_the_tables_snapshot() {
 #[tokio::test]
 async fn authorized_pinned_snapshot_can_verify_a_retained_tag_after_expiry_or_id_reuse() {
     for replaced in [false, true] {
-        let g = written(
+        let mut g = written(
             "pinned_tag",
             people,
             vec![people_rows(1..=1), people_rows(2..=2)],
         )
         .await;
+        // This fixture retains the tag through the REST catalog.
+        g.ctx.server.set_table_external("default", "pinned_tag", false);
+        g.table = g.ctx.catalog.get_table(&g.identifier).await.unwrap();
         let snapshot = g.table.snapshot_manager().get_snapshot(1).await.unwrap();
         g.ctx
             .catalog
