@@ -22,9 +22,23 @@ use crate::DataSplit;
 use arrow_array::RecordBatch;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
+
+const OUTPUT_BYTE_UNIT: u64 = 1024 * 1024;
+
+fn budget_permits(max_bytes: u64) -> u32 {
+    (max_bytes / OUTPUT_BYTE_UNIT).clamp(1, u32::MAX as u64) as u32
+}
+
+pub(super) struct BlobOutputBudget {
+    pub max_bytes: u64,
+    pub fields: HashSet<String>,
+    pub unknown_external: bool,
+    pub serialize_unknown: bool,
+}
 
 pub(super) type SplitReader =
     Arc<dyn Fn(&[DataSplit], Option<usize>) -> crate::Result<ArrowRecordBatchStream> + Send + Sync>;
@@ -112,18 +126,104 @@ pub(super) fn execute(
     ordered: bool,
     limit: Option<usize>,
     read: SplitReader,
+    blob_output_budget: Option<BlobOutputBudget>,
 ) -> ArrowRecordBatchStream {
+    // Finite LIMIT uses the existing executor to cancel speculative splits at
+    // the global row quota; the output budget is for unbounded reads.
     if ordered && parallelism > 1 {
+        if limit.is_none() {
+            if let Some(budget) = &blob_output_budget {
+                let costs = splits
+                    .iter()
+                    .map(|split| blob_group_cost(std::slice::from_ref(split), budget))
+                    .collect::<Option<Vec<_>>>();
+                if let Some(costs) = costs {
+                    let streams = splits
+                        .into_iter()
+                        .map(|split| read_group(vec![split], Arc::clone(&read), limit))
+                        .collect();
+                    return merge_streams_budgeted(
+                        streams,
+                        costs,
+                        budget_permits(budget.max_bytes) as usize,
+                        ordered,
+                        parallelism,
+                    );
+                }
+            }
+        }
         // Keep unscheduled splits as data; create a stream only when a slot opens.
         return merge_items_bounded(splits, true, limit, parallelism, move |split| {
             read_group(vec![split], Arc::clone(&read), limit)
         });
     }
-    let streams = split_groups(splits, parallelism)
+    let groups = split_groups(splits, parallelism);
+    if limit.is_none() && groups.len() > 1 {
+        if let Some(budget) = &blob_output_budget {
+            let costs = groups
+                .iter()
+                .map(|group| blob_group_cost(group, budget))
+                .collect::<Option<Vec<_>>>();
+            if let Some(costs) = costs {
+                let streams = groups
+                    .into_iter()
+                    .map(|group| read_group(group, Arc::clone(&read), limit))
+                    .collect();
+                return merge_streams_budgeted(
+                    streams,
+                    costs,
+                    budget_permits(budget.max_bytes) as usize,
+                    ordered,
+                    parallelism,
+                );
+            }
+        }
+    }
+    let streams = groups
         .into_iter()
         .map(|group| read_group(group, Arc::clone(&read), limit))
         .collect();
     merge_streams(streams, ordered, limit)
+}
+
+/// Estimate decoded bytes from managed BLOB files; unknown sizes need opt-in.
+fn blob_group_cost(group: &[DataSplit], budget: &BlobOutputBudget) -> Option<u32> {
+    let permits = budget_permits(budget.max_bytes);
+    if budget.unknown_external {
+        return budget.serialize_unknown.then_some(permits);
+    }
+    let mut file_bytes = 0_u64;
+    for split in group {
+        let mut bytes = 0_u64;
+        let mut unknown = false;
+        for file in split.data_files() {
+            if file.file_name.ends_with(".blob") {
+                bytes = bytes.saturating_add(u64::try_from(file.file_size).unwrap_or(0));
+            } else if file
+                .write_cols
+                .as_ref()
+                .is_none_or(|cols| cols.iter().any(|col| budget.fields.contains(col)))
+            {
+                unknown = true;
+            }
+        }
+        if unknown || bytes == 0 {
+            return budget.serialize_unknown.then_some(permits);
+        }
+        file_bytes = file_bytes.max(bytes);
+    }
+    Some(
+        file_bytes
+            .max(1)
+            .div_ceil(OUTPUT_BYTE_UNIT)
+            .min(permits as u64) as u32,
+    )
+}
+
+pub(super) fn blob_budget_covers_splits(splits: &[DataSplit], budget: &BlobOutputBudget) -> bool {
+    splits
+        .iter()
+        .all(|split| blob_group_cost(std::slice::from_ref(split), budget).is_some())
 }
 
 fn read_group(
@@ -153,6 +253,166 @@ fn next_batch(index: usize, mut stream: ArrowRecordBatchStream) -> BoxFuture<'st
         (index, batch, stream)
     }
     .boxed()
+}
+
+struct BudgetedRead {
+    index: usize,
+    stream: ArrowRecordBatchStream,
+    cost: u32,
+}
+
+struct BudgetedBatch {
+    read: BudgetedRead,
+    batch: Option<crate::Result<RecordBatch>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+fn schedule_budgeted(
+    waiting: &mut VecDeque<BudgetedRead>,
+    pending: &mut JoinSet<BudgetedBatch>,
+    permits: &Arc<Semaphore>,
+    handle: &tokio::runtime::Handle,
+    max_workers: usize,
+    buffered: usize,
+) {
+    while pending.len() + buffered < max_workers {
+        let Some(read) = waiting.front() else {
+            break;
+        };
+        let Ok(permit) = Arc::clone(permits).try_acquire_many_owned(read.cost) else {
+            break;
+        };
+        let BudgetedRead {
+            index,
+            mut stream,
+            cost,
+        } = waiting.pop_front().unwrap();
+        pending.spawn_on(
+            async move {
+                let batch = stream.next().await;
+                BudgetedBatch {
+                    read: BudgetedRead {
+                        index,
+                        stream,
+                        cost,
+                    },
+                    batch,
+                    _permit: permit,
+                }
+            },
+            handle,
+        );
+    }
+}
+
+/// Hold a permit through decoding and until the caller resumes the stream.
+fn merge_streams_budgeted(
+    streams: Vec<ArrowRecordBatchStream>,
+    costs: Vec<u32>,
+    permits: usize,
+    ordered: bool,
+    parallelism: usize,
+) -> ArrowRecordBatchStream {
+    debug_assert_eq!(streams.len(), costs.len());
+    debug_assert!(costs
+        .iter()
+        .all(|cost| *cost > 0 && *cost as usize <= permits));
+    Box::pin(async_stream::try_stream! {
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(streams);
+                Err(crate::Error::UnexpectedError {
+                    message: "Parallel table reads require a Tokio runtime".into(),
+                    source: Some(Box::new(error)),
+                })?;
+                return;
+            }
+        };
+        let count = streams.len();
+        let permits = Arc::new(Semaphore::new(permits));
+        let mut waiting = streams.into_iter().zip(costs).enumerate()
+            .map(|(index, (stream, cost))| BudgetedRead { index, stream, cost })
+            .collect::<VecDeque<_>>();
+        let mut pending = JoinSet::new();
+        let mut ready = BTreeMap::new();
+        let mut completed = BTreeSet::new();
+        let mut current = 0;
+        schedule_budgeted(&mut waiting, &mut pending, &permits, &handle, parallelism, ready.len());
+        while current < count {
+            if ordered && completed.remove(&current) {
+                current += 1;
+                continue;
+            }
+            let next = if ordered {
+                if let Some(next) = ready.remove(&current) {
+                    Ok(Some(next))
+                } else {
+                    pending.join_next().await.transpose().map_err(worker_error)
+                }
+            } else {
+                pending.join_next().await.transpose().map_err(worker_error)
+            };
+            let next = match next {
+                Ok(Some(next)) => next,
+                Ok(None) => break,
+                Err(error) => {
+                    drop(ready);
+                    waiting.clear();
+                    pending.shutdown().await;
+                    Err(error)?;
+                    break;
+                }
+            };
+            let index = next.read.index;
+            if next.batch.is_none() {
+                drop(next);
+                if ordered {
+                    completed.insert(index);
+                } else {
+                    current += 1;
+                }
+                schedule_budgeted(&mut waiting, &mut pending, &permits, &handle, parallelism, ready.len());
+                continue;
+            }
+            if ordered && index != current {
+                if next.batch.as_ref().is_some_and(Result::is_err) {
+                    let BudgetedBatch { read, batch, _permit } = next;
+                    let error = batch.unwrap().unwrap_err();
+                    drop(read);
+                    drop(_permit);
+                    drop(ready);
+                    waiting.clear();
+                    pending.shutdown().await;
+                    Err(error)?;
+                    break;
+                }
+                ready.insert(index, next);
+                continue;
+            }
+            let BudgetedBatch { read, batch, _permit } = next;
+            match batch.unwrap() {
+                Err(error) => {
+                    drop(read);
+                    drop(_permit);
+                    drop(ready);
+                    waiting.clear();
+                    pending.shutdown().await;
+                    Err(error)?;
+                    break;
+                }
+                Ok(batch) => {
+                    if batch.num_rows() > 0 {
+                        yield batch;
+                    }
+                    // A paused caller keeps the permit and the current batch.
+                    drop(_permit);
+                    if ordered { waiting.push_front(read); } else { waiting.push_back(read); }
+                    schedule_budgeted(&mut waiting, &mut pending, &permits, &handle, parallelism, ready.len());
+                }
+            }
+        }
+    })
 }
 
 /// Every group has one pending read or one ready batch. Multiple groups run
@@ -389,12 +649,14 @@ fn limit_single_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::BinaryRow;
+    use crate::spec::stats::BinaryTableStats;
+    use crate::spec::{BinaryRow, DataFileMeta};
     use crate::table::DataSplitBuilder;
     use arrow_array::Int32Array;
     use futures::channel::oneshot;
     use futures::TryStreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     async fn wait_for_count(count: &AtomicUsize, expected: usize) {
@@ -422,6 +684,178 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap()
             .value(0)
+    }
+
+    fn split_file(name: &str, bytes: i64, columns: Option<Vec<&str>>) -> DataFileMeta {
+        DataFileMeta {
+            file_name: name.into(),
+            file_size: bytes,
+            row_count: 1,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::empty(),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: columns.map(|columns| columns.into_iter().map(str::to_string).collect()),
+            column_max_sequence_numbers: None,
+        }
+    }
+
+    fn budget_split(files: Vec<DataFileMeta>) -> DataSplit {
+        DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("memory:/blob-budget".into())
+            .with_total_buckets(1)
+            .with_data_files(files)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn blob_output_reservation_requires_opt_in_for_unknown_sizes() {
+        let mut budget = BlobOutputBudget {
+            max_bytes: 64 * OUTPUT_BYTE_UNIT,
+            fields: HashSet::from(["image".to_string()]),
+            unknown_external: false,
+            serialize_unknown: false,
+        };
+        let managed = budget_split(vec![
+            split_file("key.parquet", 1024, Some(vec!["clip_id"])),
+            split_file(
+                "image.blob",
+                17 * OUTPUT_BYTE_UNIT as i64,
+                Some(vec!["image"]),
+            ),
+        ]);
+        assert_eq!(
+            blob_group_cost(std::slice::from_ref(&managed), &budget),
+            Some(17)
+        );
+        let descriptor = budget_split(vec![
+            split_file("refs.parquet", 1024, Some(vec!["image"])),
+            split_file(
+                "image.blob",
+                17 * OUTPUT_BYTE_UNIT as i64,
+                Some(vec!["image"]),
+            ),
+        ]);
+        assert_eq!(
+            blob_group_cost(std::slice::from_ref(&descriptor), &budget),
+            None
+        );
+        budget.unknown_external = true;
+        assert_eq!(
+            blob_group_cost(std::slice::from_ref(&managed), &budget),
+            None
+        );
+        budget.serialize_unknown = true;
+        assert_eq!(blob_group_cost(&[managed], &budget), Some(64));
+        budget.unknown_external = false;
+        assert_eq!(blob_group_cost(&[descriptor], &budget), Some(64));
+    }
+
+    #[tokio::test]
+    async fn unknown_pk_blob_splits_remain_parallel_by_default() {
+        let (release, wait) = oneshot::channel();
+        let wait = Arc::new(Mutex::new(Some(wait)));
+        let read: SplitReader = Arc::new(move |splits, _| {
+            let first = splits[0].data_files()[0].file_name == "first.parquet";
+            let wait = if first {
+                wait.lock().unwrap().take()
+            } else {
+                None
+            };
+            Ok(controlled_stream(
+                vec![if first { 1 } else { 2 }],
+                wait,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ))
+        });
+        let splits = ["first.parquet", "second.parquet"]
+            .into_iter()
+            .map(|name| budget_split(vec![split_file(name, 1024, None)]))
+            .collect();
+        let mut output = execute(
+            splits,
+            2,
+            false,
+            None,
+            read,
+            Some(BlobOutputBudget {
+                max_bytes: 64 * OUTPUT_BYTE_UNIT,
+                fields: HashSet::from(["image".to_string()]),
+                unknown_external: false,
+                serialize_unknown: false,
+            }),
+        );
+        let ready = tokio::time::timeout(Duration::from_secs(2), output.next())
+            .await
+            .expect("second PK split did not run concurrently")
+            .unwrap()
+            .unwrap();
+        assert_eq!(value(&ready), 2);
+        release.send(()).unwrap();
+        assert_eq!(value(&output.next().await.unwrap().unwrap()), 1);
+    }
+
+    #[tokio::test]
+    async fn fractional_budget_does_not_admit_groups_over_budget() {
+        let max_bytes = OUTPUT_BYTE_UNIT * 3 / 2;
+        let splits = (0..2)
+            .map(|_| {
+                budget_split(vec![split_file(
+                    "image.blob",
+                    (OUTPUT_BYTE_UNIT * 4 / 5) as i64,
+                    Some(vec!["image"]),
+                )])
+            })
+            .collect();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let read: SplitReader = {
+            let reads = reads.clone();
+            let drops = drops.clone();
+            Arc::new(move |_, _| {
+                Ok(controlled_stream(
+                    vec![1],
+                    None,
+                    reads.clone(),
+                    drops.clone(),
+                ))
+            })
+        };
+        let mut output = execute(
+            splits,
+            2,
+            false,
+            None,
+            read,
+            Some(BlobOutputBudget {
+                max_bytes,
+                fields: HashSet::from(["image".to_string()]),
+                unknown_external: false,
+                serialize_unknown: false,
+            }),
+        );
+        assert!(output.next().await.unwrap().is_ok());
+        tokio::task::yield_now().await;
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(output.try_collect::<Vec<_>>().await.unwrap().len(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     struct DropGuard(Arc<AtomicUsize>);
@@ -656,7 +1090,7 @@ mod tests {
                 }
                 _ => Ok(Box::pin(futures::stream::empty())),
             });
-            let mut output = execute(splits, 2, true, Some(1), read);
+            let mut output = execute(splits, 2, true, Some(1), read, None);
             assert!(output.next().now_or_never().is_none());
             wait_for_count(&failed, 1).await;
             assert!(
@@ -717,6 +1151,167 @@ mod tests {
                 ));
             }
             assert!(output.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_output_budget_stops_decoding_while_consumer_is_paused() {
+        for ordered in [false, true] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let streams = (0..32)
+                .map(|value| controlled_stream(vec![value], None, reads.clone(), drops.clone()))
+                .collect();
+            let mut output = merge_streams_budgeted(streams, vec![1; 32], 2, ordered, 32);
+            assert!(output.next().await.unwrap().is_ok());
+            // The returned batch and at most one later batch have reservations.
+            tokio::task::yield_now().await;
+            assert!(reads.load(Ordering::SeqCst) <= 2);
+            let rest = output.try_collect::<Vec<_>>().await.unwrap();
+            assert_eq!(rest.len(), 31);
+            assert_eq!(reads.load(Ordering::SeqCst), 32);
+            assert_eq!(drops.load(Ordering::SeqCst), 32);
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_output_budget_keeps_ordered_head_admitted() {
+        let (release, wait) = oneshot::channel();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let streams = vec![
+            controlled_stream(vec![1, 2], Some(wait), reads.clone(), drops.clone()),
+            controlled_stream(vec![3], None, reads.clone(), drops.clone()),
+            controlled_stream(vec![4], None, reads.clone(), drops.clone()),
+        ];
+        let mut output = merge_streams_budgeted(streams, vec![1, 1, 1], 2, true, 3);
+        assert!(output.next().now_or_never().is_none());
+        release.send(()).unwrap();
+        let values = tokio::time::timeout(Duration::from_secs(5), async {
+            output
+                .map_ok(|batch| value(&batch))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("ordered BLOB output stalled");
+        assert_eq!(values, vec![1, 2, 3, 4]);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn blob_output_budget_keeps_ordered_prefetch_bounded() {
+        let (release, wait) = oneshot::channel();
+        let reads = (0..4)
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect::<Vec<_>>();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut first = Some(wait);
+        let streams = reads
+            .iter()
+            .enumerate()
+            .map(|(index, count)| {
+                controlled_stream(
+                    vec![index as i32],
+                    if index == 0 { first.take() } else { None },
+                    count.clone(),
+                    drops.clone(),
+                )
+            })
+            .collect();
+        let mut output = merge_streams_budgeted(streams, vec![1; 4], 4, true, 2);
+        assert!(output.next().now_or_never().is_none());
+        wait_for_count(&reads[1], 1).await;
+        assert_eq!(reads[2].load(Ordering::SeqCst), 0);
+        assert_eq!(reads[3].load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        let values = output
+            .map_ok(|batch| value(&batch))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(values, vec![0, 1, 2, 3]);
+        assert_eq!(drops.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn blob_output_budget_preserves_global_limit() {
+        let splits = (0..4)
+            .map(|index| {
+                DataSplitBuilder::new()
+                    .with_snapshot(1)
+                    .with_partition(BinaryRow::new(0))
+                    .with_bucket(index)
+                    .with_bucket_path(format!("memory:/blob-budget-{index}"))
+                    .with_total_buckets(4)
+                    .with_data_files(vec![split_file(
+                        "image.blob",
+                        OUTPUT_BYTE_UNIT as i64,
+                        Some(vec!["image"]),
+                    )])
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let read: SplitReader = Arc::new(|splits, _| {
+            let value = splits[0].bucket();
+            Ok(Box::pin(futures::stream::iter(vec![Ok(batch(value))])))
+        });
+        let output = execute(
+            splits,
+            2,
+            true,
+            Some(1),
+            read,
+            Some(BlobOutputBudget {
+                max_bytes: 4 * OUTPUT_BYTE_UNIT,
+                fields: HashSet::from(["image".to_string()]),
+                unknown_external: false,
+                serialize_unknown: false,
+            }),
+        );
+        let values = output
+            .map_ok(|batch| value(&batch))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(values, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn blob_output_budget_releases_failed_readers_before_yielding_error() {
+        for (ordered, failing_index) in [(false, 0), (true, 0), (true, 1)] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (_release, wait) = oneshot::channel();
+            let blocked = controlled_stream(
+                vec![1],
+                Some(wait),
+                Arc::new(AtomicUsize::new(0)),
+                drops.clone(),
+            );
+            let guard = DropGuard(drops.clone());
+            let failing = Box::pin(async_stream::stream! {
+                let _guard = guard;
+                yield Err(crate::Error::DataInvalid {
+                    message: "BLOB read failed".into(),
+                    source: None,
+                });
+                futures::future::pending::<()>().await;
+            }) as ArrowRecordBatchStream;
+            let streams = if failing_index == 0 {
+                vec![failing, blocked]
+            } else {
+                vec![blocked, failing]
+            };
+            let mut output = merge_streams_budgeted(streams, vec![1, 1], 2, ordered, 2);
+            let error = tokio::time::timeout(Duration::from_secs(5), output.next())
+                .await
+                .expect("BLOB error was not returned")
+                .unwrap()
+                .unwrap_err();
+            assert!(error.to_string().contains("BLOB read failed"));
+            wait_for_count(&drops, 2).await;
         }
     }
 

@@ -600,10 +600,10 @@ impl<'a> PaimonTableRead<'a> {
         };
         // Captured masks and row policies may introduce hidden BLOB operands.
         // View descriptors still require REST resolution in descriptor mode.
-        let resolves_blob = (!options.blob_as_descriptor() && uses(&blob_fields))
-            || (self.table.rest_env().is_some()
-                && options.blob_view_resolve_enabled()
-                && uses(&views));
+        let resolves_view =
+            self.table.rest_env().is_some() && options.blob_view_resolve_enabled() && uses(&views);
+        let resolves_blob = (!options.blob_as_descriptor() && uses(&blob_fields)) || resolves_view;
+        let resolves_blob_payload = resolves_blob && !options.blob_as_descriptor();
         let parallelism = execution_parallelism(
             parallelism,
             self.limit,
@@ -618,11 +618,24 @@ impl<'a> PaimonTableRead<'a> {
             parallelism
         };
         let workers = parallelism.min(splits.len()).max(1);
-        // A later ordered group may retain its ready batch while the current
-        // group is still reading. Background prefetch must not keep a shared
-        // scheduling permit in that retained decoder and block the current
-        // group forever. Foreground reads retain shared memory admission.
-        let budget = if ordered && workers > 1 {
+        let blob_output_budget = resolves_blob_payload
+            .then(|| {
+                options.blob_output_max_buffered_bytes().map(|max_bytes| {
+                    super::read_execution::BlobOutputBudget {
+                        max_bytes,
+                        fields: blob_fields,
+                        unknown_external: resolves_view,
+                        serialize_unknown: options.blob_output_budget_serializes_unknown(),
+                    }
+                })
+            })
+            .transpose()?;
+        let output_budget_active = self.limit.is_none()
+            && blob_output_budget.as_ref().is_some_and(|budget| {
+                super::read_execution::blob_budget_covers_splits(&splits, budget)
+            });
+        // Prefetch slots must not be held across split output-budget waits.
+        let budget = if workers > 1 && (ordered || output_budget_active) {
             Arc::new(budget.without_prefetch())
         } else {
             budget
@@ -637,6 +650,7 @@ impl<'a> PaimonTableRead<'a> {
             ordered,
             self.limit,
             factory,
+            blob_output_budget,
         ))
     }
 

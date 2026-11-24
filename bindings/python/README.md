@@ -188,6 +188,12 @@ print(f"\nRead: {batches_tt[0].num_rows} rows")
 print(batches_tt[0])
 ```
 
+Parallel BLOB reads with known sizes share a `read.blob.output.max-buffered-bytes`
+budget (default `256mb`). Reads with unknown sizes retain split concurrency unless
+this option is explicitly set, which makes unknown-size groups run alone. Oversized
+groups also run alone. Decoder memory and caller-held batches are excluded;
+descriptor reads are unaffected.
+
 ### Scan statistics
 
 Every scan collects lightweight counters during ordinary metadata planning:
