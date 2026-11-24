@@ -878,6 +878,43 @@ fn int_eq(column: &str, index: usize, value: i32) -> Predicate {
     }
 }
 
+#[test]
+fn test_coalesce_equal_or_arms_only_for_identical_other_predicate() {
+    let steps = Predicate::Leaf {
+        column: "step".into(),
+        index: 1,
+        data_type: DataType::Int(crate::spec::IntType::new()),
+        op: PredicateOperator::In,
+        literals: vec![Datum::Int(9), Datum::Int(10)],
+    };
+    let branch =
+        |episode, steps: Predicate| Predicate::and(vec![int_eq("episode", 0, episode), steps]);
+    let complete = vec![branch(0, steps.clone()), branch(1, steps.clone())];
+    let expected = Predicate::and(vec![
+        Predicate::Leaf {
+            column: "episode".into(),
+            index: 0,
+            data_type: DataType::Int(crate::spec::IntType::new()),
+            op: PredicateOperator::In,
+            literals: vec![Datum::Int(0), Datum::Int(1)],
+        },
+        steps.clone(),
+    ]);
+    assert_eq!(
+        GlobalIndexScanner::coalesce_equal_or_arms(&complete),
+        Some(expected)
+    );
+
+    let mut uneven = steps.clone();
+    if let Predicate::Leaf { literals, .. } = &mut uneven {
+        literals.pop();
+    }
+    assert_eq!(
+        GlobalIndexScanner::coalesce_equal_or_arms(&[branch(0, steps), branch(1, uneven)]),
+        None
+    );
+}
+
 #[tokio::test]
 async fn test_btree_all_match_without_index_io() {
     let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
