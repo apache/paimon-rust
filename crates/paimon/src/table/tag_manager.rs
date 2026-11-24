@@ -40,8 +40,9 @@ const TAG_READ_CONCURRENCY: usize = 32;
 /// Tags without retention use Snapshot JSON. Retained tags also include Java-compatible
 /// creation time and retention metadata.
 ///
-/// For a table managed by a REST catalog, the catalog owns tags: reads go to
-/// the catalog and storage writes are refused.
+/// Catalog-managed REST tables read tags through the catalog. REST-registered
+/// external tables read tags from storage. Tag mutations for REST-registered
+/// tables use the catalog API.
 ///
 /// Reference: [org.apache.paimon.utils.TagManager](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/TagManager.java)
 #[derive(Debug, Clone)]
@@ -51,7 +52,7 @@ pub struct TagManager {
     rest: Option<RestTags>,
 }
 
-/// The catalog that owns a REST table's tags, and the branch they belong to.
+/// The REST table's catalog environment and tag branch.
 #[derive(Debug, Clone)]
 struct RestTags {
     env: RESTEnv,
@@ -75,11 +76,17 @@ impl TagManager {
         self
     }
 
+    fn catalog_tags_for_read(&self) -> Option<&RestTags> {
+        self.rest
+            .as_ref()
+            .filter(|rest| rest.env.catalog_owns_snapshots())
+    }
+
     fn ensure_storage_owned(&self, action: &str) -> crate::Result<()> {
         if self.rest.is_some() {
             return Err(crate::Error::Unsupported {
                 message: format!(
-                    "cannot {action} a tag in table storage: the REST catalog owns this table's tags"
+                    "cannot {action} a tag in table storage for a REST-registered table"
                 ),
             });
         }
@@ -92,7 +99,7 @@ impl TagManager {
     /// set, such as referenced-file collection, fail rather than undercount.
     async fn list_readable_names(&self) -> crate::Result<Vec<String>> {
         let mut names = self.list_all_names().await?;
-        if let Some(rest) = &self.rest {
+        if let Some(rest) = self.catalog_tags_for_read() {
             names.retain(|name| {
                 if is_dot_path_segment(name) {
                     log::warn!(
@@ -135,7 +142,7 @@ impl TagManager {
 
     /// Check if a tag exists.
     pub async fn tag_exists(&self, tag_name: &str) -> crate::Result<bool> {
-        if let Some(rest) = &self.rest {
+        if let Some(rest) = self.catalog_tags_for_read() {
             return Ok(rest.env.get_tag(&rest.branch, tag_name).await?.is_some());
         }
         validate_tag_name(tag_name)?;
@@ -146,10 +153,10 @@ impl TagManager {
 
     /// Get the snapshot for a tag, or None if the tag does not exist.
     ///
-    /// REST tables resolve the tag through the catalog. Filesystem tables read
-    /// snapshot JSON directly, catching NotFound without an exists() IO round-trip.
+    /// Catalog-managed REST tables resolve the tag through the catalog. Storage
+    /// tags are read directly, catching NotFound without an exists() IO round-trip.
     pub async fn get(&self, tag_name: &str) -> crate::Result<Option<Snapshot>> {
-        if let Some(rest) = &self.rest {
+        if let Some(rest) = self.catalog_tags_for_read() {
             let tag = rest.env.get_tag(&rest.branch, tag_name).await?;
             return Ok(tag.map(|tag| tag.snapshot));
         }
@@ -204,7 +211,7 @@ impl TagManager {
             Option<serde_json::Number>,
         )>,
     > {
-        if let Some(rest) = &self.rest {
+        if let Some(rest) = self.catalog_tags_for_read() {
             let Some(tag) = rest.env.get_tag(&rest.branch, tag_name).await? else {
                 return Ok(None);
             };
@@ -273,12 +280,11 @@ impl TagManager {
             .await
     }
 
-    /// List all tag names sorted ascending, from the catalog for REST tables
-    /// or from tag files otherwise. For filesystem tables, a missing tag directory
-    /// yields an empty list. REST names are returned even if an older client
-    /// created a dot-segment tag that cannot be read through the REST API.
+    /// List all tag names sorted ascending. Catalog-managed REST tables list tags
+    /// through the catalog. For storage tags, a missing directory yields an empty
+    /// list. Catalog listings retain dot-segment names from older clients.
     pub async fn list_all_names(&self) -> crate::Result<Vec<String>> {
-        if let Some(rest) = &self.rest {
+        if let Some(rest) = self.catalog_tags_for_read() {
             return rest.env.list_tag_names(&rest.branch).await;
         }
         let tag_dir = self.tag_directory();

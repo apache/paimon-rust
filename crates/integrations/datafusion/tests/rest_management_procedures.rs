@@ -159,6 +159,7 @@ async fn setup_rest_tag_rollback() -> (tempfile::TempDir, RESTServer, Arc<RESTCa
             .unwrap(),
         location.to_str().unwrap(),
     );
+    server.set_table_external(DATABASE, TABLE, false);
     server.add_tag(DATABASE, TABLE, "release");
     let (catalog, context) = connect(&server).await;
     let identifier = Identifier::new(DATABASE, TABLE);
@@ -1359,6 +1360,7 @@ async fn rest_table_with_two_snapshots() -> (
     let root = tmp.path().join(format!("{DATABASE}.db/{TABLE}"));
     let server = start_server(tmp.path()).await;
     server.add_table_with_schema(DATABASE, TABLE, schema, &location);
+    server.set_table_external(DATABASE, TABLE, false);
     let (catalog, context) = connect(&server).await;
     (tmp, server, catalog, context, root)
 }
@@ -1647,6 +1649,7 @@ async fn test_referenced_files_size_counts_catalog_only_branch_tags() {
         schema,
         &format!("file://{}", root.display()),
     );
+    server.set_table_external(DATABASE, &branch_table, false);
     for name in ["dev", "main", "dev"] {
         server.add_branch(DATABASE, TABLE, name);
     }
@@ -1724,6 +1727,7 @@ async fn test_referenced_files_size_counts_catalog_only_current_snapshots() {
         schema,
         &format!("file://{}", root.display()),
     );
+    server.set_table_external(DATABASE, &branch_table, false);
     server.add_branch(DATABASE, TABLE, "dev");
     server.set_catalog_snapshot(DATABASE, TABLE, first);
     server.set_catalog_snapshot(DATABASE, &branch_table, second);
@@ -1832,6 +1836,7 @@ async fn test_rest_tag_metadata_uses_local_timestamp_and_branch() {
 
     let (tmp, server, _) = setup().await;
     let root = register_rest_table(&tmp, &server, &[]);
+    server.set_table_external(DATABASE, TABLE, false);
     let schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .build()
@@ -1843,6 +1848,7 @@ async fn test_rest_tag_metadata_uses_local_timestamp_and_branch() {
         schema,
         &format!("file://{}", root.display()),
     );
+    server.set_table_external(DATABASE, &branch_table, false);
     let (catalog, context) = connect(&server).await;
     for (table_name, only_tag, epoch_millis, retention, seconds) in [
         (TABLE, "main_only", 1_704_067_200_000, "PT24H", 86_400.0),
@@ -1932,6 +1938,7 @@ async fn test_rest_tag_metadata_uses_local_timestamp_and_branch() {
 async fn test_tag_catalog_errors_do_not_fall_back_to_storage() {
     let (tmp, server, context) = setup().await;
     let root = register_rest_table(&tmp, &server, &[]);
+    server.set_table_external(DATABASE, TABLE, false);
     server.add_tag(DATABASE, TABLE, "release");
     let tag_path = root.join("tag/tag-release");
     std::fs::create_dir_all(tag_path.parent().unwrap()).unwrap();

@@ -49,8 +49,8 @@ async fn stale_rest_committer_auto_indexes_with_catalog_schema_and_recovers() {
         }
         builder.build().unwrap()
     };
-    ctx.server.add_table_with_schema(
-        "default",
+    add_internal_table_with_schema(
+        &ctx.server,
         name,
         index_schema(false),
         temp.path().to_str().unwrap(),
@@ -94,8 +94,7 @@ async fn catalog_only_tables(name: &str) -> (TestContext, tempfile::TempDir, Tab
     let ctx = setup_catalog(vec!["default"]).await;
     let temp = tempfile::tempdir().unwrap();
     let location = temp.path().to_str().unwrap();
-    ctx.server
-        .add_table_with_schema("default", name, schema(false), location);
+    add_internal_table_with_schema(&ctx.server, name, schema(false), location);
     let identifier = Identifier::new("default", name);
     let stale = ctx.catalog.get_table(&identifier).await.unwrap();
     assert_eq!(stale.schema().id(), 0);

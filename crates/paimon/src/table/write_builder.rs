@@ -302,7 +302,7 @@ pub(super) fn ensure_table_write_authorized(table: &Table) -> crate::Result<()> 
         && (table.snapshot_rest_env().is_none() || table.query_auth_session().is_none())
     {
         return Err(crate::Error::Unsupported {
-            message: "Writing a table with 'query-auth.enabled' = true requires a catalog-loaded table with REST snapshot publication".into(),
+            message: "Writing a table with 'query-auth.enabled' = true requires a catalog-loaded REST table with its resolved schema and REST snapshot publication".into(),
         });
     }
     Ok(())

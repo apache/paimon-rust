@@ -104,7 +104,7 @@ fn format_table_schema(options: &[(&str, &str)]) -> Schema {
     builder.build().unwrap()
 }
 
-/// Catalog-managed partitions require an internal table, and the mock serves external ones.
+/// Register a fixture whose metadata belongs to the REST catalog.
 fn add_internal_table_with_schema(
     server: &RESTServer,
     table: &str,
@@ -5842,16 +5842,14 @@ async fn test_rest_catalog_manages_policies_end_to_end() {
 async fn test_branch_write_copy_loads_catalog_schema_with_distinct_identity() {
     let ctx = setup_catalog(vec!["default"]).await;
     let path = "memory:/branch-write";
-    ctx.server
-        .add_table_with_schema("default", "t", test_schema(), path);
+    add_internal_table_with_schema(&ctx.server, "t", test_schema(), path);
     let branch_schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("value", DataType::Int(IntType::new()))
         .option("target-file-row-num", "2")
         .build()
         .unwrap();
-    ctx.server
-        .add_table_with_schema("default", "t$branch_dev", branch_schema.clone(), path);
+    add_internal_table_with_schema(&ctx.server, "t$branch_dev", branch_schema.clone(), path);
     ctx.server
         .set_table_schema_id("default", "t$branch_dev", branch_schema, 7);
     ctx.server

@@ -202,7 +202,7 @@ def test_catalog_schema_copy_validates_branch_and_structure(resolved_source):
 
 @pytest.mark.parametrize("external", [False, True])
 @pytest.mark.parametrize("object_name", ["t", "t$branch_main", "t$branch_dev"])
-def test_resolved_rest_response_keeps_snapshot_and_token_refresh(
+def test_resolved_rest_response_uses_snapshot_owner_and_refreshes_managed_tokens(
     resolved_source, external, object_name
 ):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -210,6 +210,11 @@ def test_resolved_rest_response_keeps_snapshot_and_token_refresh(
 
     root, schema = resolved_source
     snapshot = json.loads((root / "snapshot" / "snapshot-1").read_text())
+    expected_branch = object_name.partition("$branch_")[2] or "main"
+    if external and expected_branch == "dev":
+        branch_snapshots = root / "branch" / "branch-dev" / "snapshot"
+        branch_snapshots.mkdir(parents=True)
+        shutil.copy(root / "snapshot" / "snapshot-1", branch_snapshots / "snapshot-1")
     requests = []
     token_requests = []
 
@@ -222,7 +227,7 @@ def test_resolved_rest_response_keeps_snapshot_and_token_refresh(
                 response = {"token": {}, "expiresAtMillis": (
                     0 if len(token_requests) == 1 else 4102444800000)}
             elif self.path.endswith('/snapshot'):
-                # Disk has snapshot 2; REST snapshot 1 must remain authoritative.
+                # The catalog serves snapshot 1 for managed tables.
                 response = {"snapshot": {"snapshot": snapshot}}
             else:
                 self.send_error(500, "Unexpected metadata request")
@@ -254,26 +259,30 @@ def test_resolved_rest_response_keeps_snapshot_and_token_refresh(
                 'data-token.enabled': 'true',
             },
         )
-        expected_branch = (
-            object_name.split('$branch_', 1)[-1]
-            if '$branch_' in object_name else 'main'
-        )
         assert table.branch() == expected_branch
         builder = table.new_batch_write_builder()
         builder.new_write().close()
         builder.new_commit().close()
         assert len(token_requests) == (0 if external else 1)
         assert all(path.endswith('/token') for path in requests)
-        assert _read(table) == (1, [{'id': 1, 'name': 'a'}])
-        assert all(path.endswith(('/token', '/snapshot')) for path in requests)
-        # Java switchToBranch uses the base identifier for main, including an
-        # explicitly supplied $branch_main alias.
-        encoded_name = 't' if expected_branch == 'main' else object_name.replace('$', '%24')
-        snapshot_paths = [path for path in requests if path.endswith('/snapshot')]
-        assert snapshot_paths
-        assert all(path.endswith(
-            f'/databases/db/tables/{encoded_name}/snapshot') for path in snapshot_paths)
-        assert len(token_requests) == (0 if external else 2)
+        rows = [{'id': 1, 'name': 'a'}]
+        if external:
+            if expected_branch == "dev":
+                assert _read(table) == (1, rows)
+            else:
+                assert _read(table) == (2, rows + [{'id': 2, 'name': 'b'}])
+            assert requests == []
+        else:
+            assert _read(table) == (1, rows)
+            assert all(path.endswith(('/token', '/snapshot')) for path in requests)
+            # Java switchToBranch uses the base identifier for main, including an
+            # explicitly supplied $branch_main alias.
+            encoded_name = 't' if expected_branch == 'main' else object_name.replace('$', '%24')
+            snapshot_paths = [path for path in requests if path.endswith('/snapshot')]
+            assert snapshot_paths
+            assert all(path.endswith(
+                f'/databases/db/tables/{encoded_name}/snapshot') for path in snapshot_paths)
+            assert len(token_requests) == 2
     finally:
         server.shutdown()
         server.server_close()

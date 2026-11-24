@@ -1380,14 +1380,27 @@ impl TableCommit {
         commit_identifier: i64,
     ) -> Result<CommitAttemptResult> {
         let mut created_files = Vec::new();
-        let prepared = self
-            .prepare_snapshot(
-                &mut resolved,
-                latest_snapshot,
-                commit_identifier,
-                &mut created_files,
-            )
-            .await;
+        let prepared = async {
+            let prepared = self
+                .prepare_snapshot(
+                    &mut resolved,
+                    latest_snapshot,
+                    commit_identifier,
+                    &mut created_files,
+                )
+                .await?;
+            if let Some(env) = self
+                .table
+                .rest_env()
+                .filter(|env| !env.catalog_owns_snapshots())
+            {
+                // Filesystem publication does not validate the REST registration.
+                env.check_external_snapshot_target(self.table.branch(), self.table.location())
+                    .await?;
+            }
+            Ok(prepared)
+        }
+        .await;
         let (snapshot, statistics) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {

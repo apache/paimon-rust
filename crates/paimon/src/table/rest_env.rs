@@ -233,15 +233,19 @@ impl RESTEnv {
 
     /// Refused unless the identifier still resolves to this catalog entity.
     pub(crate) async fn current_table_identity_checked(&self) -> Result<GetTableResponse> {
-        let response = self.api.get_table(&self.identifier).await?;
-        let name = self.identifier.full_name();
+        self.table_identity_checked(&self.identifier).await
+    }
+
+    async fn table_identity_checked(&self, identifier: &Identifier) -> Result<GetTableResponse> {
+        let response = self.api.get_table(identifier).await?;
         match response.id.as_deref() {
             Some(uuid) if uuid == self.uuid => {}
             uuid => {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
-                        "table '{name}' now resolves to uuid {}, not the {} this handle was loaded \
-                         with; re-load the table before reading it",
+                        "table '{}' now resolves to uuid {}, not the {} this handle was loaded \
+                         with; re-load the table",
+                        identifier.full_name(),
                         uuid.unwrap_or("nothing the server reports"),
                         self.uuid
                     ),
@@ -250,6 +254,39 @@ impl RESTEnv {
             }
         }
         Ok(response)
+    }
+
+    pub(super) async fn check_external_snapshot_target(
+        &self,
+        branch: &str,
+        path: &str,
+    ) -> Result<()> {
+        let identifier = self.identifier.with_branch(branch)?;
+        let response = self.table_identity_checked(&identifier).await?;
+        response_identifier(&identifier, &response)?;
+        if response.is_external != Some(true) || response.path.as_deref() != Some(path) {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "table '{}' no longer resolves to the loaded external snapshot location; \
+                     re-load the table before committing",
+                    identifier.full_name()
+                ),
+                source: None,
+            });
+        }
+        if response
+            .schema
+            .as_ref()
+            .is_some_and(|schema| CoreOptions::new(schema.options()).query_auth_enabled())
+        {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "table '{}' has 'query-auth.enabled' = true and requires REST snapshot publication",
+                    identifier.full_name()
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Get the table identifier.

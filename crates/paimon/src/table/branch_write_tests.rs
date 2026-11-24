@@ -683,8 +683,23 @@ async fn rest_branch_copy_retains_bound_file_io_and_loads_branch_identity() {
 #[tokio::test]
 async fn rest_external_table_reads_and_publishes_filesystem_snapshots() {
     use crate::catalog::{Catalog, RESTCatalog};
-    use axum::{extract::Path, http::StatusCode, routing::get, Json, Router};
+    use axum::{
+        extract::Path,
+        http::StatusCode,
+        routing::{get, post},
+        Json, Router,
+    };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy)]
+    enum Registration {
+        Original,
+        ReRegistered,
+        Relocated,
+        CatalogManaged,
+        Guarded,
+    }
 
     let (_dir, filesystem) = table(false, &[]).await;
     append(&filesystem, "seed", batch(vec![1], vec![10])).await;
@@ -695,25 +710,69 @@ async fn rest_external_table_reads_and_publishes_filesystem_snapshots() {
     let schema = serde_json::to_value(filesystem.schema()).unwrap();
     let identity_only = Arc::new(AtomicBool::new(false));
     let omit_schema = identity_only.clone();
+    let registration = Arc::new(Mutex::new(Registration::Original));
+    let current_registration = registration.clone();
+    let deny_query = Arc::new(AtomicBool::new(false));
+    let denied = deny_query.clone();
+    let commit_before_publish = Arc::new(AtomicBool::new(false));
+    let concurrent_commit = commit_before_publish.clone();
+    let concurrent_filesystem = filesystem.clone();
     let unexpected = Arc::new(AtomicUsize::new(0));
     let requests = unexpected.clone();
     let app = Router::new()
         .route(
             "/v1/databases/:db/tables/:table",
             get(move |Path((database, name)): Path<(String, String)>| {
-                let mut schema = if name == "t" && omit_schema.load(Ordering::Relaxed) {
+                let registration = if name == "t" {
+                    *current_registration.lock().unwrap()
+                } else {
+                    Registration::Original
+                };
+                let guarded = name == "guarded" || matches!(registration, Registration::Guarded);
+                let mut schema = if name == "t" && !guarded && omit_schema.load(Ordering::Relaxed) {
                     serde_json::Value::Null
                 } else {
                     schema.clone()
                 };
-                if name == "guarded" {
+                if guarded {
                     schema["options"]["query-auth.enabled"] = serde_json::json!("true");
                 }
+                let (uuid, path, is_external) = match registration {
+                    Registration::Original | Registration::Guarded => {
+                        (format!("uuid-{name}"), location.clone(), true)
+                    }
+                    Registration::ReRegistered => ("uuid-t-new".into(), location.clone(), true),
+                    Registration::Relocated => {
+                        (format!("uuid-{name}"), format!("{location}-moved"), true)
+                    }
+                    Registration::CatalogManaged => {
+                        (format!("uuid-{name}"), location.clone(), false)
+                    }
+                };
                 let response = serde_json::json!({
-                    "database": database, "name": name, "id": format!("uuid-{name}"),
-                    "path": location, "isExternal": true, "schemaId": 0, "schema": schema
+                    "database": database, "name": name, "id": uuid,
+                    "path": path, "isExternal": is_external, "schemaId": 0, "schema": schema
                 });
-                async move { Json(response) }
+                let concurrent_table = (name == "t"
+                    && concurrent_commit.swap(false, Ordering::Relaxed))
+                .then(|| concurrent_filesystem.clone());
+                async move {
+                    if let Some(table) = concurrent_table {
+                        append(&table, "concurrent", batch(vec![7], vec![70])).await;
+                    }
+                    Json(response)
+                }
+            }),
+        )
+        .route(
+            "/v1/databases/db/tables/guarded/auth",
+            post(move || {
+                let status = if denied.load(Ordering::Relaxed) {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::OK
+                };
+                async move { (status, Json(serde_json::json!({}))) }
             }),
         )
         .fallback(move || async move {
@@ -793,15 +852,134 @@ async fn rest_external_table_reads_and_publishes_filesystem_snapshots() {
         vec![(1, 10), (4, 40)]
     );
 
+    let branch_snapshot = filesystem_branch
+        .snapshot_manager()
+        .get_snapshot(1)
+        .await
+        .unwrap();
+    filesystem_branch
+        .tag_manager()
+        .create_with_retention("branch_base", &branch_snapshot, Some("1 d"))
+        .await
+        .unwrap();
+    let main_tags = external.tag_manager();
+    let branch_tags = external_branch.tag_manager();
+    assert_eq!(main_tags.list_all_names().await.unwrap(), ["base"]);
+    assert!(!main_tags.tag_exists("branch_base").await.unwrap());
+    assert!(branch_tags.tag_exists("branch_base").await.unwrap());
+    let (snapshot, created, retained) = branch_tags
+        .get_with_metadata("branch_base")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.id(), 1);
+    assert!(created.is_some());
+    assert_eq!(retained, Some(86_400.0));
+    for (table, tag) in [(&external, "base"), (&external_branch, "branch_base")] {
+        let historical = table
+            .copy_with_time_travel_strict(HashMap::from([("scan.tag-name".into(), tag.into())]))
+            .await
+            .unwrap();
+        assert_eq!(
+            table_write::tests::read_id_value_rows(&historical).await,
+            vec![(1, 10)]
+        );
+    }
+    assert!(matches!(
+        branch_tags.create("blocked", &branch_snapshot).await,
+        Err(crate::Error::Unsupported { .. })
+    ));
+
     let guarded = catalog
         .get_table(&Identifier::new("db", "guarded"))
         .await
         .unwrap();
     assert!(guarded.query_auth_session().is_some());
+    assert_eq!(
+        table_write::tests::read_id_value_rows(&guarded).await,
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
+    deny_query.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        guarded.new_read_builder().new_scan().plan().await,
+        Err(crate::Error::RestApi {
+            source: crate::api::RestError::Forbidden { .. }
+        })
+    ));
+    assert!(matches!(
+        guarded.new_write_builder().new_write(),
+        Err(crate::Error::Unsupported { message }) if message.contains("query-auth.enabled")
+    ));
     assert!(matches!(
         guarded.new_write_builder().try_new_commit(),
         Err(crate::Error::Unsupported { message }) if message.contains("query-auth.enabled")
     ));
+
+    let builder = external
+        .new_write_builder()
+        .with_commit_user("stale-registration")
+        .unwrap();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&batch(vec![5], vec![50]))
+        .await
+        .unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    let commit = builder.try_new_commit().unwrap();
+    let files_before = filesystem
+        .file_io()
+        .list_status_recursive(filesystem.location())
+        .await
+        .unwrap()
+        .len();
+    // Unregistering and registering the same external location leaves existing
+    // filesystem snapshots in place but creates a new catalog identity.
+    for (state, expected) in [
+        (Registration::ReRegistered, "uuid-t-new"),
+        (Registration::Relocated, "external snapshot location"),
+        (Registration::CatalogManaged, "external snapshot location"),
+    ] {
+        *registration.lock().unwrap() = state;
+        let error = commit.commit(messages.clone()).await.unwrap_err();
+        assert!(
+            matches!(&error, crate::Error::DataInvalid { message, .. } if message.contains(expected)),
+            "{error:?}"
+        );
+    }
+    *registration.lock().unwrap() = Registration::Guarded;
+    assert!(matches!(
+        commit.commit(messages).await,
+        Err(crate::Error::Unsupported { message }) if message.contains("query-auth.enabled")
+    ));
+    assert_eq!(
+        filesystem
+            .file_io()
+            .list_status_recursive(filesystem.location())
+            .await
+            .unwrap()
+            .len(),
+        files_before
+    );
+    assert_eq!(latest(&filesystem).await.id(), 3);
+    assert_eq!(
+        table_write::tests::read_id_value_rows(&filesystem).await,
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
+    *registration.lock().unwrap() = Registration::ReRegistered;
+    identity_only.store(false, Ordering::Relaxed);
+    let replacement = catalog.get_table(filesystem.identifier()).await.unwrap();
+    assert_eq!(replacement.rest_env().unwrap().uuid(), "uuid-t-new");
+    // Let a filesystem writer claim the prepared snapshot id before the REST
+    // writer can publish it. The latter must retry from the new snapshot.
+    commit_before_publish.store(true, Ordering::Relaxed);
+    append(&replacement, "after-registration", batch(vec![6], vec![60])).await;
+    let latest_snapshot = latest(&filesystem).await;
+    assert_eq!(latest_snapshot.id(), 5);
+    assert_eq!(latest_snapshot.commit_user(), "after-registration");
+    assert_eq!(
+        table_write::tests::read_id_value_rows(&filesystem).await,
+        vec![(1, 10), (2, 20), (3, 30), (6, 60), (7, 70)]
+    );
     assert_eq!(unexpected.load(Ordering::Relaxed), 0);
     server.abort();
 }

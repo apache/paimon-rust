@@ -224,10 +224,10 @@ pub async fn collect_referenced_files_summary_with_options(
 
 /// Collect referenced sizes for a table with its data-directory and partition options.
 ///
-/// For a table managed by a REST catalog, branches, tags and each branch's current
-/// snapshot come from the catalog, together with the snapshot files in storage.
-/// REST metadata failures propagate: unknown metadata must not be reported as an
-/// empty set of references. Other tables read table storage only.
+/// REST catalogs supply branch names for their registered tables. For
+/// catalog-managed tables, tags and the current snapshot of each branch come
+/// from the catalog alongside the snapshot history in storage. External tables
+/// take their snapshots and tags from storage. Catalog metadata failures propagate.
 pub async fn collect_table_referenced_files_summary(
     table: &Table,
 ) -> crate::Result<Vec<ReferencedFilesSummary>> {
@@ -309,8 +309,8 @@ async fn collect_summary(
         let branch_sm = sm.with_branch(branch_name);
         let branch_tm = tm.with_branch(branch_name);
 
-        // Historical snapshot files use the branch path; current snapshots and
-        // tags also consult the catalog for REST tables. Manifest paths use the
+        // Historical snapshot files use the branch path. Catalog-managed tables
+        // also read current snapshots and tags from the catalog. Manifest paths use the
         // table root. Process one branch at a time so completed file sets can
         // be summarized and released.
         let (mut branch_files, branch_tag_files) = tokio::try_join!(

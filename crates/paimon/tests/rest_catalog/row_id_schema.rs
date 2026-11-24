@@ -32,8 +32,8 @@ async fn row_id_updates_validate_catalog_fields_without_current_schema_files() {
                     ("write-only", "true"),
                 ],
             );
-            ctx.server.add_table_with_schema(
-                "default",
+            add_internal_table_with_schema(
+                &ctx.server,
                 &name,
                 schema.clone(),
                 directory.path().to_str().unwrap(),
