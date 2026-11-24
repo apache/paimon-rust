@@ -165,6 +165,7 @@ pub(crate) struct VariantMetadataValidation<'a> {
     extracted_residual: Option<VariantRef<'a>>,
     #[cfg(test)]
     extraction_validations: usize,
+    key_offsets: Option<&'a [u32]>,
 }
 
 impl<'a> VariantMetadataValidation<'a> {
@@ -172,6 +173,18 @@ impl<'a> VariantMetadataValidation<'a> {
         Self {
             bytes,
             validated,
+            extracted_residual: None,
+            #[cfg(test)]
+            extraction_validations: 0,
+            key_offsets: None,
+        }
+    }
+
+    fn from_rebuild_metadata(metadata: &'a RebuildMetadata) -> Self {
+        Self {
+            bytes: &metadata.bytes,
+            validated: true,
+            key_offsets: Some(&metadata.key_offsets),
             extracted_residual: None,
             #[cfg(test)]
             extraction_validations: 0,
@@ -215,7 +228,12 @@ impl<'a> VariantRef<'a> {
             validate_metadata(metadata.bytes)?;
             metadata.validated = true;
         }
-        let root_size = validate_value(value, metadata.bytes, 0, depth)?;
+        let keys = metadata
+            .key_offsets
+            .map_or(MetadataKeys::Encoded(metadata.bytes), |offsets| {
+                MetadataKeys::Indexed(metadata.bytes, offsets)
+            });
+        let root_size = validate_value_with_keys(value, keys, 0, depth)?;
         if root_size != value.len() {
             return data_invalid("Malformed Variant root size");
         }
@@ -610,7 +628,52 @@ fn validate_metadata(metadata: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// Indexed keys belong to the exact, validated dictionary retained by the
+// bounded rebuild cache. Value structure and key IDs still require validation.
+#[derive(Clone, Copy)]
+enum MetadataKeys<'a> {
+    Encoded(&'a [u8]),
+    Indexed(&'a [u8], &'a [u32]),
+}
+
+impl<'a> MetadataKeys<'a> {
+    fn get(self, id: usize) -> Result<&'a str> {
+        match self {
+            Self::Encoded(bytes) => get_metadata_key_ref(bytes, id),
+            Self::Indexed(bytes, offsets) => {
+                let next = id.checked_add(1).ok_or_else(|| Error::DataInvalid {
+                    message: "Malformed Variant metadata dictionary id".to_string(),
+                    source: None,
+                })?;
+                let (Some(&start), Some(&end)) = (offsets.get(id), offsets.get(next)) else {
+                    return data_invalid("Malformed Variant metadata dictionary id");
+                };
+                let key =
+                    bytes
+                        .get(start as usize..end as usize)
+                        .ok_or_else(|| Error::DataInvalid {
+                            message: "Malformed Variant metadata offsets".to_string(),
+                            source: None,
+                        })?;
+                std::str::from_utf8(key).map_err(|e| Error::DataInvalid {
+                    message: "Malformed Variant metadata UTF-8".to_string(),
+                    source: Some(Box::new(e)),
+                })
+            }
+        }
+    }
+}
+
 fn validate_value(value: &[u8], metadata: &[u8], pos: usize, depth: usize) -> Result<usize> {
+    validate_value_with_keys(value, MetadataKeys::Encoded(metadata), pos, depth)
+}
+
+fn validate_value_with_keys(
+    value: &[u8],
+    metadata: MetadataKeys<'_>,
+    pos: usize,
+    depth: usize,
+) -> Result<usize> {
     if depth > MAX_NESTING_DEPTH {
         return data_invalid("Malformed Variant nesting depth");
     }
@@ -662,7 +725,12 @@ fn validate_sized_value(value: &[u8], pos: usize, size: usize) -> Result<usize> 
     Ok(size)
 }
 
-fn validate_object(value: &[u8], metadata: &[u8], pos: usize, depth: usize) -> Result<usize> {
+fn validate_object(
+    value: &[u8],
+    metadata: MetadataKeys<'_>,
+    pos: usize,
+    depth: usize,
+) -> Result<usize> {
     let layout = object_layout(value, pos)?;
     let data_size = read_unsigned(
         value,
@@ -684,7 +752,7 @@ fn validate_object(value: &[u8], metadata: &[u8], pos: usize, depth: usize) -> R
     let mut previous_key: Option<&str> = None;
     for i in 0..layout.size {
         let id = read_unsigned(value, layout.id_start + layout.id_size * i, layout.id_size)?;
-        let key = get_metadata_key_ref(metadata, id)?;
+        let key = metadata.get(id)?;
         if previous_key
             .is_some_and(|previous| java_string_cmp(previous, key) != std::cmp::Ordering::Less)
         {
@@ -719,7 +787,12 @@ fn validate_object(value: &[u8], metadata: &[u8], pos: usize, depth: usize) -> R
     Ok(layout.data_start - pos + data_size)
 }
 
-fn validate_array(value: &[u8], metadata: &[u8], pos: usize, depth: usize) -> Result<usize> {
+fn validate_array(
+    value: &[u8],
+    metadata: MetadataKeys<'_>,
+    pos: usize,
+    depth: usize,
+) -> Result<usize> {
     let layout = array_layout(value, pos)?;
     let data_size = read_unsigned(
         value,
@@ -774,7 +847,7 @@ fn validate_array(value: &[u8], metadata: &[u8], pos: usize, depth: usize) -> Re
 
 fn validate_child_value(
     value: &[u8],
-    metadata: &[u8],
+    metadata: MetadataKeys<'_>,
     data_start: usize,
     data_size: usize,
     offset: usize,
@@ -790,7 +863,7 @@ fn validate_child_value(
             message: "Malformed Variant offsets".to_string(),
             source: None,
         })?;
-    let child_size = validate_value(value, metadata, child_pos, depth)?;
+    let child_size = validate_value_with_keys(value, metadata, child_pos, depth)?;
     if child_size != next_offset - offset {
         return data_invalid("Malformed Variant child size");
     }
@@ -799,7 +872,7 @@ fn validate_child_value(
 
 fn validate_child_range(
     value: &[u8],
-    metadata: &[u8],
+    metadata: MetadataKeys<'_>,
     data_start: usize,
     data_size: usize,
     offset: usize,
@@ -814,7 +887,7 @@ fn validate_child_range(
             message: "Malformed Variant offsets".to_string(),
             source: None,
         })?;
-    let child_size = validate_value(value, metadata, child_pos, depth)?;
+    let child_size = validate_value_with_keys(value, metadata, child_pos, depth)?;
     let end = offset
         .checked_add(child_size)
         .ok_or_else(|| Error::DataInvalid {
@@ -1455,6 +1528,7 @@ struct FieldEntry<K = String> {
 struct RebuildMetadata {
     bytes: Vec<u8>,
     key_ids: HashMap<String, usize>,
+    key_offsets: Vec<u32>,
     estimated_bytes: usize,
 }
 
@@ -1466,21 +1540,35 @@ impl RebuildMetadata {
         validate_metadata(bytes)?;
         let offset_size = metadata_offset_size(bytes)?;
         let dict_size = read_unsigned(bytes, 1, offset_size)?;
+        let offset_start = 1 + offset_size;
+        let string_start = offset_start + (dict_size + 1) * offset_size;
         let mut key_ids = HashMap::with_capacity(dict_size);
+        let mut key_offsets = Vec::with_capacity(dict_size + 1);
         for id in 0..dict_size {
-            key_ids.insert(get_metadata_key(bytes, id)?, id);
+            let offset = read_unsigned(bytes, offset_start + id * offset_size, offset_size)?;
+            key_offsets.push((string_start + offset) as u32);
+            key_ids.insert(get_metadata_key_ref(bytes, id)?.to_string(), id);
         }
+        key_offsets.push(bytes.len() as u32);
         let estimated_bytes = key_ids.keys().fold(
-            bytes.len().saturating_add(
-                key_ids
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<(String, usize)>() + 1),
-            ),
+            bytes
+                .len()
+                .saturating_add(
+                    key_ids
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<(String, usize)>() + 1),
+                )
+                .saturating_add(
+                    key_offsets
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<u32>()),
+                ),
             |bytes, key| bytes.saturating_add(key.capacity()),
         );
         Ok(Self {
             bytes: bytes.to_vec(),
             key_ids,
+            key_offsets,
             estimated_bytes,
         })
     }
@@ -1672,7 +1760,12 @@ impl VariantBuilder {
                             "Variant value or metadata exceeds constructor size limit",
                         );
                     }
-                    let root_size = validate_value(&self.value, &metadata.bytes, 0, 0)?;
+                    let root_size = validate_value_with_keys(
+                        &self.value,
+                        MetadataKeys::Indexed(&metadata.bytes, &metadata.key_offsets),
+                        0,
+                        0,
+                    )?;
                     if root_size != self.value.len() {
                         return data_invalid("Malformed Variant root size");
                     }
@@ -3148,7 +3241,11 @@ fn rebuild_shredded_with_metadata<'a>(
     } else {
         VariantBuilder::with_source_metadata(cache.get_or_parse(metadata)?)
     };
-    let mut validation = VariantMetadataValidation::new(metadata, true);
+    let source_metadata = builder.source_metadata.clone();
+    let mut validation = source_metadata.as_deref().map_or_else(
+        || VariantMetadataValidation::new(metadata, true),
+        VariantMetadataValidation::from_rebuild_metadata,
+    );
     rebuild_shredded_into(row, &mut validation, schema, &mut builder, 0)?;
     builder.result_from_validated_inputs()
 }
@@ -5585,6 +5682,140 @@ mod tests {
     fn parse_json_rejects_duplicate_object_keys() {
         let err = GenericVariant::parse_json(r#"{"a":1,"a":2}"#).unwrap_err();
         assert!(err.to_string().contains("VARIANT_DUPLICATE_KEY"));
+    }
+
+    #[test]
+    fn indexed_metadata_validation_matches_encoded_for_corrupt_values() {
+        let original = GenericVariant::parse_json(
+            r#"{"a":[{"nested":1},null,"text"],"cold":{"x":true},"热":3,"😀":4}"#,
+        )
+        .unwrap();
+        let metadata = RebuildMetadata::parse(original.metadata()).unwrap();
+        let check = |value: &[u8]| {
+            let mut encoded = VariantMetadataValidation::new(original.metadata(), false);
+            let mut indexed = VariantMetadataValidation::from_rebuild_metadata(&metadata);
+            let raw = VariantRef::new_with_cached_metadata(value, 0, &mut encoded)
+                .map(|v| v.value.len())
+                .map_err(|e| e.to_string());
+            let cached = VariantRef::new_with_cached_metadata(value, 0, &mut indexed)
+                .map(|v| v.value.len())
+                .map_err(|e| e.to_string());
+            assert_eq!(raw, cached);
+        };
+        check(original.value());
+        // Exercise truncated headers, invalid IDs, child offsets and value tags
+        // through both validators, including nested objects inside arrays.
+        for length in 0..original.value().len() {
+            check(&original.value()[..length]);
+        }
+        for index in 0..original.value().len() {
+            for replacement in [0, 0x7f, 0xff] {
+                let mut value = original.value().to_vec();
+                value[index] = replacement;
+                check(&value);
+            }
+        }
+        let mut trailing = original.value().to_vec();
+        trailing.push(0);
+        check(&trailing);
+        assert!(validate_value_with_keys(
+            original.value(),
+            MetadataKeys::Indexed(&metadata.bytes, &metadata.key_offsets),
+            0,
+            MAX_NESTING_DEPTH + 1
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn indexed_metadata_keys_follow_dictionary_identity_and_validate_utf8() {
+        let first = GenericVariant::parse_json(r#"{"a":1,"z":2}"#).unwrap();
+        let second = GenericVariant::parse_json(r#"{"b":1,"y":2}"#).unwrap();
+        assert_eq!(first.metadata().len(), second.metadata().len());
+        let mut cache = RebuildMetadataCache::default();
+        let a = cache.get_or_parse(first.metadata()).unwrap();
+        let b = cache.get_or_parse(second.metadata()).unwrap();
+        assert_eq!(
+            MetadataKeys::Indexed(&a.bytes, &a.key_offsets)
+                .get(0)
+                .unwrap(),
+            "a"
+        );
+        assert_eq!(
+            MetadataKeys::Indexed(&b.bytes, &b.key_offsets)
+                .get(0)
+                .unwrap(),
+            "b"
+        );
+        assert!(MetadataKeys::Indexed(&a.bytes, &a.key_offsets)
+            .get(a.key_ids.len())
+            .is_err());
+        assert!(Arc::ptr_eq(
+            &a,
+            &cache.get_or_parse(first.metadata()).unwrap()
+        ));
+        let mut malformed = first.metadata().to_vec();
+        *malformed.last_mut().unwrap() = 0xff;
+        assert!(cache.get_or_parse(&malformed).is_err());
+        assert!(cache.bytes <= MAX_REBUILD_METADATA_BYTES);
+        assert!(
+            a.estimated_bytes >= a.bytes.len() + a.key_offsets.len() * std::mem::size_of::<u32>()
+        );
+    }
+
+    #[test]
+    fn rebuild_metadata_cache_keeps_rotating_wide_dictionaries() {
+        const DICTIONARY_COUNT: usize = 8;
+        const KEY_COUNT: usize = 9_501;
+        let mut cache = RebuildMetadataCache::default();
+        let mut dictionaries = Vec::with_capacity(DICTIONARY_COUNT);
+        let mut cached = Vec::with_capacity(DICTIONARY_COUNT);
+
+        for dictionary in 0..DICTIONARY_COUNT {
+            let keys = (0..KEY_COUNT)
+                .map(|id| format!("wide_dict_{dictionary:02}_key_{id:05}"))
+                .collect::<Vec<_>>();
+            let string_size = keys.iter().map(String::len).sum::<usize>();
+            let offset_size = 3;
+            let offset_start = 1 + offset_size;
+            let string_start = offset_start + (KEY_COUNT + 1) * offset_size;
+            let mut metadata = vec![0; string_start + string_size];
+            metadata[0] = VERSION | (((offset_size - 1) as u8) << 6);
+            write_le_at(&mut metadata, 1, KEY_COUNT, offset_size);
+            let mut offset = 0;
+            for (id, key) in keys.iter().enumerate() {
+                write_le_at(
+                    &mut metadata,
+                    offset_start + id * offset_size,
+                    offset,
+                    offset_size,
+                );
+                metadata[string_start + offset..string_start + offset + key.len()]
+                    .copy_from_slice(key.as_bytes());
+                offset += key.len();
+            }
+            write_le_at(
+                &mut metadata,
+                offset_start + KEY_COUNT * offset_size,
+                offset,
+                offset_size,
+            );
+            cached.push(cache.get_or_parse(&metadata).unwrap());
+            dictionaries.push(metadata);
+        }
+
+        assert_eq!(cache.entries.len(), DICTIONARY_COUNT);
+        assert!(cache.bytes <= MAX_REBUILD_METADATA_BYTES);
+        for (dictionary, (metadata, original)) in dictionaries.iter().zip(&cached).enumerate() {
+            let entry = cache.get_or_parse(metadata).unwrap();
+            assert!(Arc::ptr_eq(&entry, original));
+            assert_eq!(
+                MetadataKeys::Indexed(&entry.bytes, &entry.key_offsets)
+                    .get(1_500)
+                    .unwrap(),
+                format!("wide_dict_{dictionary:02}_key_01500")
+            );
+        }
     }
 
     #[test]

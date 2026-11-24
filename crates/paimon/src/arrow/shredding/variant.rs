@@ -2083,6 +2083,40 @@ mod tests {
             assert_eq!(first.to_json().unwrap(), original.to_json().unwrap());
             std::hint::black_box(assembled);
         }
+
+        // Eight wide dictionaries fit the rebuild cache on the compact path.
+        // Rotating them exposes repeated parsing if per-key indexing pushes
+        // their combined size over the cache budget.
+        let populated = (0..1_501)
+            .map(|index| format!("\"field_{index:04}\":0"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let expected = GenericVariant::parse_json(&format!("{{{populated}}}")).unwrap();
+        let sources = (0..8)
+            .map(|dictionary| {
+                let extra = (0..8_000)
+                    .map(|index| format!("\"wide_dict_{dictionary:02}_key_{index:05}\":0"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let wide = GenericVariant::parse_json(&format!("{{{populated},{extra}}}")).unwrap();
+                GenericVariant::from_parts(expected.value().to_vec(), wide.metadata().to_vec())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input =
+            variant_array((0..64).map(|row| Some(sources[row % 8].clone())).collect()).unwrap();
+        let shredded = shred_variant_array(input.as_ref(), &physical).unwrap();
+        for _ in 0..7 {
+            let start = std::time::Instant::now();
+            let assembled = assemble_shredded_variant_array(shredded.as_ref()).unwrap();
+            eprintln!(
+                "64 rows x 8 rotating 9501-key dictionaries: {:?}",
+                start.elapsed()
+            );
+            let first = variant_from_array(assembled.as_ref(), 0).unwrap().unwrap();
+            assert_eq!(first.to_json().unwrap(), expected.to_json().unwrap());
+            std::hint::black_box(assembled);
+        }
     }
 
     #[test]
