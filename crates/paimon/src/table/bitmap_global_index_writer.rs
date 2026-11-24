@@ -239,13 +239,13 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BitmapIndexBuilder<F> {
     }
 }
 
-/// Write one complete section to a shared centroid file, using section-relative offsets.
+/// Write a complete Bitmap file using file-relative offsets.
 /// The input is sorted by key, so only the current key's posting needs to be retained.
-pub(super) async fn write_sorted_bitmap_section(
+pub(super) async fn write_sorted_bitmap_file(
     writer: &mut dyn FileWrite,
     mut rows: SortedRows,
     options: &SortedIndexWriteOptions,
-) -> crate::Result<(usize, BitmapWriteResult)> {
+) -> crate::Result<BitmapWriteResult> {
     const FLUSH_BYTES: usize = 1024 * 1024;
     let mut section = BitmapSectionWriter::new(
         options.block_size,
@@ -288,15 +288,11 @@ pub(super) async fn write_sorted_bitmap_section(
     let nulls = write_bitmap_block(&mut section.output, &null_rows).map_err(error)?;
     let non_nulls = write_bitmap_block(&mut section.output, &non_null_rows).map_err(error)?;
     section.finish(nulls, non_nulls).map_err(error)?;
-    let length = usize::try_from(section.output.position()).map_err(error)?;
     section.output.flush_to(writer).await?;
-    Ok((
-        length,
-        BitmapWriteResult {
-            meta: BTreeIndexMeta::new(first_key, current_key, !null_rows.is_empty()),
-            row_count,
-        },
-    ))
+    Ok(BitmapWriteResult {
+        meta: BTreeIndexMeta::new(first_key, current_key, !null_rows.is_empty()),
+        row_count,
+    })
 }
 
 #[derive(Clone)]
@@ -556,7 +552,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[tokio::test]
-    async fn streamed_bitmap_section_preserves_offsets_across_flushes() {
+    async fn streamed_bitmap_file_preserves_offsets_across_flushes() {
         let data_type = DataType::VarChar(VarCharType::string_type());
         let suffix = "x".repeat(16 * 1024);
         let key = |id| format!("{id:03}{suffix}");
@@ -573,15 +569,15 @@ mod tests {
         let io = FileIOBuilder::new("memory").build().unwrap();
         let path = "memory:/streamed-bitmap-offsets";
         let mut output = io.new_output(path).unwrap().writer().await.unwrap();
-        let (length, written) =
-            write_sorted_bitmap_section(output.as_mut(), sorter.finish().unwrap(), &options)
-                .await
-                .unwrap();
+        let written = write_sorted_bitmap_file(output.as_mut(), sorter.finish().unwrap(), &options)
+            .await
+            .unwrap();
         output.close().await.unwrap();
-        assert!(length > 1024 * 1024);
         assert_eq!(written.row_count, 97);
-        let input = io.new_input(path).unwrap().reader().await.unwrap();
-        let reader = BitmapGlobalIndexReader::open(Box::new(input), length as u64)
+        let input = io.new_input(path).unwrap();
+        let length = input.metadata().await.unwrap().size;
+        assert!(length > 1024 * 1024);
+        let reader = BitmapGlobalIndexReader::open(Box::new(input.reader().await.unwrap()), length)
             .await
             .unwrap();
         for id in [0, 48, 95] {

@@ -146,8 +146,9 @@ pub(super) struct Generation<'a> {
     pub(super) descriptor: Descriptor<'a>,
     pub(super) shards: BTreeMap<usize, &'a IndexManifestEntry>,
     pub(super) local_nlists: BTreeMap<usize, usize>,
-    pub(super) bitmaps: BTreeMap<usize, &'a IndexManifestEntry>,
+    pub(super) bitmaps: BTreeMap<i32, &'a IndexManifestEntry>,
     pub(super) bitmap_schema_id: Option<i64>,
+    pub(super) range_size: u64,
     pub(super) vector_count: u64,
     pub(super) files: Vec<&'a IndexManifestEntry>,
 }
@@ -248,10 +249,10 @@ pub(super) fn group<'a>(
                             .ok_or_else(invalid)?;
                     }
                     Role::Bitmap(id) => {
-                        if extra.is_empty()
+                        let field = id as i32;
+                        if !extra.contains(&field)
                             || file.file_size == 0
-                            || id >= nlist
-                            || bitmaps.insert(id, *entry).is_some()
+                            || bitmaps.insert(field, *entry).is_some()
                         {
                             return Err(invalid());
                         }
@@ -265,12 +266,11 @@ pub(super) fn group<'a>(
             {
                 return Err(invalid());
             }
-            if !extra.is_empty()
-                && shards.iter().any(|(id, shard)| {
-                    let count = shard.index_file.row_count;
-                    bitmaps.get(id).map(|entry| entry.index_file.row_count)
-                        != (count > 0).then_some(count)
-                })
+            let expected_bitmaps = if vector_count == 0 { 0 } else { extra.len() };
+            if bitmaps.len() != expected_bitmaps
+                || bitmaps
+                    .values()
+                    .any(|entry| entry.index_file.row_count as u64 != vector_count)
             {
                 return Err(invalid());
             }
@@ -292,6 +292,7 @@ pub(super) fn group<'a>(
                 local_nlists,
                 bitmaps,
                 bitmap_schema_id,
+                range_size: range_len,
                 vector_count,
                 files: files.into_iter().map(|(entry, _)| entry).collect(),
             })

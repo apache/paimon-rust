@@ -251,7 +251,7 @@ impl VindexIndexBuildBuilder<'_> {
         options: &VindexVectorIndexOptions,
         centroid: CentroidBuildOptions,
         spill: VectorSpill,
-        mut bitmap_spill: Option<BitmapSpillReader>,
+        bitmap_spill: Option<BitmapSpillReader>,
         files: &mut Vec<IndexFileMeta>,
     ) -> Result<()> {
         let extra_fields = centroid
@@ -261,7 +261,9 @@ impl VindexIndexBuildBuilder<'_> {
             .unwrap_or_default();
         let metric = options.native_options["metric"].as_bytes();
         let (nlist, model_file) = if let Some(mut spill) = spill.finish().await? {
-            let config = centroid.router_config(options, spill.vector_count())?;
+            let vector_count = spill.vector_count();
+            let range_size = shard.row_range_end - shard.row_range_start + 1;
+            let config = centroid.router_config(options, vector_count)?;
             let stores_local_nlist =
                 centroid_index::stores_local_nlist(&self.index_type, config.resolved().metric);
             let ratio = options.train_sample_ratio;
@@ -277,41 +279,26 @@ impl VindexIndexBuildBuilder<'_> {
             })
             .await
             .map_err(task_error)??;
+            let mut bitmap_rows =
+                bitmap_spill.zip(centroid.bitmap.as_ref().map(BitmapBuild::sorters));
             for id in 0..router.nlist() {
-                let bitmap = centroid.bitmap.clone();
-                let (next_routed, next_bitmap_spill, rows, sorted) =
+                let (next_routed, next_bitmap_rows, rows) =
                     tokio::task::spawn_blocking(move || {
                         let mut rows = routed.partition(id)?;
-                        let sorted = match (rows.as_mut(), bitmap.as_ref(), bitmap_spill.as_mut()) {
-                            (Some(rows), Some(bitmap), Some(spill)) => {
-                                Some(spill.sort(bitmap, rows.local_row_ids()?)?)
-                            }
-                            _ => None,
-                        };
-                        Ok::<_, Error>((routed, bitmap_spill, rows, sorted))
+                        if let (Some(rows), Some((spill, sorters))) =
+                            (rows.as_mut(), bitmap_rows.as_mut())
+                        {
+                            let base = (id as i64).checked_mul(range_size).ok_or_else(|| {
+                                centroid_index::invalid("Centroid Bitmap position overflow")
+                            })?;
+                            spill.add_rows(sorters, rows.local_row_ids()?, base)?;
+                        }
+                        Ok::<_, Error>((routed, bitmap_rows, rows))
                     })
                     .await
                     .map_err(task_error)??;
                 routed = next_routed;
-                bitmap_spill = next_bitmap_spill;
-                if let (Some(bitmap), Some(sorted), Some(rows)) = (&centroid.bitmap, sorted, &rows)
-                {
-                    let row_count = rows.vector_count() as i64;
-                    let file = self
-                        .centroid_file_writer(
-                            shard,
-                            field_id,
-                            &extra_fields,
-                            new_global_index_file_name("centroid-bitmap"),
-                        )
-                        .await?
-                        .write(self.table, |output| async move {
-                            bitmap.write(output, sorted, row_count, id).await.map(Some)
-                        })
-                        .await?
-                        .expect("centroid bitmap always writes a payload");
-                    files.push(file);
-                }
+                bitmap_rows = next_bitmap_rows;
                 let (count, index, local_nlist) = match rows {
                     Some(rows) => {
                         let count = rows.vector_count();
@@ -364,6 +351,30 @@ impl VindexIndexBuildBuilder<'_> {
                     )
                     .await?,
                 );
+            }
+            if let (Some(bitmap), Some((_, sorters))) = (&centroid.bitmap, bitmap_rows) {
+                for (field, sorter) in bitmap.fields().zip(sorters) {
+                    let sorted = tokio::task::spawn_blocking(move || sorter.finish())
+                        .await
+                        .map_err(task_error)??;
+                    let file = self
+                        .centroid_file_writer(
+                            shard,
+                            field_id,
+                            &extra_fields,
+                            new_global_index_file_name("bitmap"),
+                        )
+                        .await?
+                        .write(self.table, |output| async move {
+                            bitmap
+                                .write(output, sorted, vector_count as i64, field.id())
+                                .await
+                                .map(Some)
+                        })
+                        .await?
+                        .expect("centroid bitmap always writes a payload");
+                    files.push(file);
+                }
             }
             (router.nlist(), Bytes::from(router.serialize()))
         } else {

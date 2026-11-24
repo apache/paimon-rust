@@ -631,7 +631,11 @@ async fn centroid_bitmaps_prefilter_or_before_ranking_and_drop_with_the_vector_c
     let entries = active_entries(&table).await;
     let groups = centroid_index::group(&entries).unwrap();
     let group = &groups[0];
-    assert_eq!(group.bitmaps.len(), 2);
+    assert_eq!(group.bitmaps.keys().copied().collect::<Vec<_>>(), [0, 2]);
+    assert!(group
+        .bitmaps
+        .values()
+        .all(|entry| entry.index_file.row_count == 5));
     let router_id = group
         .router
         .index_file
@@ -644,7 +648,7 @@ async fn centroid_bitmaps_prefilter_or_before_ranking_and_drop_with_the_vector_c
         let id = entry
             .index_file
             .file_name
-            .strip_prefix("centroid-bitmap-global-index-")
+            .strip_prefix("bitmap-global-index-")
             .and_then(|name| name.strip_suffix(".index"))
             .unwrap();
         assert!(uuid::Uuid::parse_str(id).is_ok());
@@ -664,8 +668,7 @@ async fn centroid_bitmaps_prefilter_or_before_ranking_and_drop_with_the_vector_c
         vec![],
     );
     let mut skipped = false;
-    for (&centroid, entry) in &group.bitmaps {
-        let matched = all_ids.matching(&table, &entry.index_file).await.unwrap();
+    for (centroid, matched) in all_ids.matching(&table, group).await.unwrap() {
         if matched.contains(3) {
             table
                 .file_io()
@@ -743,9 +746,10 @@ async fn centroid_bitmaps_prefilter_or_before_ranking_and_drop_with_the_vector_c
 
     options.insert("extra_fields".into(), r#"{"status":"bitmap"}"#.into());
     build.with_options(options);
-    assert_eq!(build.execute().await.unwrap(), 5);
+    assert_eq!(build.execute().await.unwrap(), 4);
     let rebuilt = active_entries(&table).await;
     let rebuilt_groups = centroid_index::group(&rebuilt).unwrap();
+    assert_eq!(rebuilt_groups[0].bitmaps.len(), 1);
     assert_eq!(
         rebuilt_groups[0]
             .router
@@ -764,7 +768,7 @@ async fn centroid_bitmaps_prefilter_or_before_ranking_and_drop_with_the_vector_c
     drop_index
         .with_index_column("embedding")
         .with_index_type("ivf-flat");
-    assert_eq!(drop_index.execute().await.unwrap(), 5);
+    assert_eq!(drop_index.execute().await.unwrap(), 4);
 }
 
 #[tokio::test]
@@ -1066,67 +1070,6 @@ async fn centroid_bitmaps_check_referenced_fields_after_schema_changes() {
         .await
         .unwrap();
     assert_eq!(result.row_ids().unwrap().row_ids, [1]);
-}
-
-#[tokio::test]
-async fn centroid_bitmaps_read_java_sparse_sections() {
-    use crate::spec::{DataEvolutionIndexSourceMeta, Datum, PredicateOperator};
-    use crate::table::centroid_bitmap::BitmapPredicate;
-    let path = "memory:/centroid_java_bitmap";
-    let table = vindex_e2e_table(path, "8");
-    let fixture = java_fixture::unpack();
-    let bytes = fs::read(fixture.path().join("bitmap.index")).unwrap();
-    let file_size = bytes.len() as i64;
-    let metadata = fs::read(fixture.path().join("bitmap.meta")).unwrap();
-    table
-        .file_io()
-        .new_output(&format!("{path}/index/bitmap.index"))
-        .unwrap()
-        .write(bytes.into())
-        .await
-        .unwrap();
-    let file = IndexFileMeta {
-        index_type: "ivf-flat".into(),
-        file_name: "bitmap.index".into(),
-        file_size,
-        row_count: 2,
-        external_path: None,
-        deletion_vectors_ranges: None,
-        global_index_meta: Some(GlobalIndexMeta {
-            row_range_start: 10,
-            row_range_end: 14,
-            index_field_id: 1,
-            extra_field_ids: Some(vec![0, 2]),
-            index_meta: Some(metadata),
-            source_meta: Some(fs::read(fixture.path().join("source.meta")).unwrap()),
-        }),
-    };
-    let source_meta = file
-        .global_index_meta
-        .as_ref()
-        .unwrap()
-        .source_meta
-        .as_ref()
-        .unwrap();
-    assert_eq!(
-        DataEvolutionIndexSourceMeta::deserialize(source_meta)
-            .unwrap()
-            .source_schema_id(),
-        0
-    );
-    let int = DataType::Int(IntType::new());
-    let tenant = BitmapPredicate::Leaf(0, int.clone(), PredicateOperator::Eq, vec![Datum::Int(7)]);
-    let status = BitmapPredicate::Leaf(2, int, PredicateOperator::In, vec![Datum::Int(1)]);
-    let result = BitmapPredicate::Or(vec![tenant.clone(), status.clone()])
-        .matching(&table, &file)
-        .await
-        .unwrap();
-    assert_eq!(result.into_iter().collect::<Vec<_>>(), [2, 4]);
-    let result = BitmapPredicate::And(vec![tenant, status])
-        .matching(&table, &file)
-        .await
-        .unwrap();
-    assert!(result.is_empty());
 }
 
 #[tokio::test]

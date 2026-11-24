@@ -15,61 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Directory for concatenated Bitmap sections in a centroid shard.
+//! Scalar predicates over the Bitmap files of a centroid row-ID range.
 
 use super::bitmap_global_index_reader::BitmapGlobalIndexReader;
-use super::centroid_index::{self, Descriptor, Generation, Role};
+use super::centroid_index::{self, Generation};
 use crate::btree::key_serde::normalize_key_literal;
-use crate::io::FileRead;
 use crate::spec::{
-    validate_datum_matches_type, DataField, DataType, Datum, IndexFileMeta, Predicate,
+    validate_datum_matches_type, DataField, DataType, Datum, IndexManifestEntry, Predicate,
     PredicateOperator, TableSchema,
 };
 use crate::table::{index_file_path::IndexFileLocation, Table};
 use crate::{Error, Result};
-use bytes::Bytes;
 use futures::future::BoxFuture;
 use roaring::RoaringTreemap;
-use std::collections::HashMap;
-use std::ops::Range;
-use std::sync::Arc;
-
-fn directory(file: &IndexFileMeta) -> Result<HashMap<i32, Range<u64>>> {
-    let invalid = || {
-        centroid_index::invalid(format!(
-            "Invalid centroid bitmap directory for '{}'",
-            file.file_name
-        ))
-    };
-    let descriptor = Descriptor::parse(file)?
-        .filter(|descriptor| matches!(descriptor.role, Role::Bitmap(_)))
-        .ok_or_else(invalid)?;
-    let (offsets, remainder) = descriptor.payload.unwrap_or_default().as_chunks::<8>();
-    let field_ids = file
-        .global_index_meta
-        .as_ref()
-        .and_then(|meta| meta.extra_field_ids.as_ref())
-        .filter(|fields| !fields.is_empty())
-        .ok_or_else(invalid)?;
-    if !remainder.is_empty() || offsets.len() != field_ids.len() - 1 {
-        return Err(invalid());
-    }
-    let size = u64::try_from(file.file_size).map_err(|_| invalid())?;
-    let ends = offsets
-        .iter()
-        .copied()
-        .map(u64::from_be_bytes)
-        .chain(std::iter::once(size));
-    let mut offset = 0u64;
-    let mut sections = HashMap::with_capacity(field_ids.len());
-    for (&field, end) in field_ids.iter().zip(ends) {
-        if end <= offset || end > size || sections.insert(field, offset..end).is_some() {
-            return Err(invalid());
-        }
-        offset = end;
-    }
-    Ok(sections)
-}
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) enum BitmapPredicate {
@@ -215,34 +174,34 @@ impl BitmapPredicate {
     pub(super) async fn matching(
         &self,
         table: &Table,
-        file: &IndexFileMeta,
-    ) -> Result<RoaringTreemap> {
-        let sections = directory(file)?;
-        let path = IndexFileLocation::Global {
-            table_path: table.location().trim_end_matches('/'),
-        }
-        .resolve(&file.file_name, file.external_path.as_deref());
-        let input: Arc<dyn FileRead> = Arc::new(table.file_io().new_input(&path)?.reader().await?);
+        group: &Generation<'_>,
+    ) -> Result<HashMap<usize, RoaringTreemap>> {
         let rows = self
-            .evaluate(&input, &sections, &mut HashMap::new())
+            .evaluate(table, &group.bitmaps, &mut HashMap::new())
             .await?;
-        let meta = file.global_index_meta.as_ref().unwrap();
-        if rows
-            .max()
-            .is_some_and(|id| id > (meta.row_range_end - meta.row_range_start) as u64)
-            || rows.len() > file.row_count as u64
-        {
+        if rows.len() > group.vector_count {
             return Err(centroid_index::invalid(
                 "Centroid bitmap contains invalid row IDs",
             ));
         }
-        Ok(rows)
+        let mut matches = HashMap::<_, RoaringTreemap>::new();
+        for row in rows {
+            let centroid = (row / group.range_size) as usize;
+            if row > i64::MAX as u64 || !group.shards.contains_key(&centroid) {
+                return Err(centroid_index::invalid("Invalid centroid Bitmap position"));
+            }
+            matches
+                .entry(centroid)
+                .or_default()
+                .insert(row % group.range_size);
+        }
+        Ok(matches)
     }
 
     fn evaluate<'a>(
         &'a self,
-        input: &'a Arc<dyn FileRead>,
-        sections: &'a HashMap<i32, Range<u64>>,
+        table: &'a Table,
+        files: &'a BTreeMap<i32, &IndexManifestEntry>,
         readers: &'a mut HashMap<i32, BitmapGlobalIndexReader>,
     ) -> BoxFuture<'a, Result<RoaringTreemap>> {
         Box::pin(async move {
@@ -251,18 +210,24 @@ impl BitmapPredicate {
                     let reader = match readers.entry(*field) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::hash_map::Entry::Vacant(entry) => {
-                            let section = sections.get(field).ok_or_else(|| {
-                                centroid_index::invalid("Missing centroid bitmap field")
-                            })?;
-                            let size = section.end - section.start;
-                            let reader = SectionRead {
-                                input: Arc::clone(input),
-                                section: section.clone(),
-                            };
+                            let file = &files
+                                .get(field)
+                                .ok_or_else(|| {
+                                    centroid_index::invalid("Missing centroid bitmap field")
+                                })?
+                                .index_file;
+                            let path = IndexFileLocation::Global {
+                                table_path: table.location().trim_end_matches('/'),
+                            }
+                            .resolve(&file.file_name, file.external_path.as_deref());
+                            let input = table.file_io().new_input(&path)?.reader().await?;
                             entry.insert(
-                                BitmapGlobalIndexReader::open(Box::new(reader), size)
-                                    .await
-                                    .map_err(bitmap_error)?,
+                                BitmapGlobalIndexReader::open(
+                                    Box::new(input),
+                                    file.file_size as u64,
+                                )
+                                .await
+                                .map_err(bitmap_error)?,
                             )
                         }
                     };
@@ -275,16 +240,16 @@ impl BitmapPredicate {
                     let (first, rest) = children.split_first().ok_or_else(|| {
                         centroid_index::invalid("Empty centroid bitmap predicate")
                     })?;
-                    let mut rows = first.evaluate(input, sections, readers).await?;
+                    let mut rows = first.evaluate(table, files, readers).await?;
                     let intersection = matches!(self, Self::And(_));
                     for child in rest {
                         if intersection {
                             if rows.is_empty() {
                                 break;
                             }
-                            rows &= child.evaluate(input, sections, readers).await?;
+                            rows &= child.evaluate(table, files, readers).await?;
                         } else {
-                            rows |= child.evaluate(input, sections, readers).await?;
+                            rows |= child.evaluate(table, files, readers).await?;
                         }
                     }
                     Ok(rows)
@@ -312,25 +277,6 @@ fn equality_literals(data_type: &DataType, literals: &[Datum]) -> Option<Vec<Dat
         }
     }
     Some(normalized)
-}
-
-struct SectionRead {
-    input: Arc<dyn FileRead>,
-    section: Range<u64>,
-}
-
-#[async_trait::async_trait]
-impl FileRead for SectionRead {
-    async fn read(&self, range: Range<u64>) -> Result<Bytes> {
-        if range.start > range.end || range.end > self.section.end - self.section.start {
-            return Err(centroid_index::invalid(
-                "Read outside centroid bitmap section",
-            ));
-        }
-        self.input
-            .read(self.section.start + range.start..self.section.start + range.end)
-            .await
-    }
 }
 
 fn bitmap_error(error: std::io::Error) -> crate::Error {

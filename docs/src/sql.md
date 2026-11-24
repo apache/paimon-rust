@@ -2999,10 +2999,10 @@ Automatic inner-product routing searches all centroids. The layout is stored
 in the index manifest and is available when searching Java-built indexes.
 The current native DiskANN reader supports up to 1,024 dimensions.
 
-### Bitmap Filters in Centroid Shards
+### Bitmap Filters for Centroid Indexes
 
-Supply a JSON object named `extra_fields` when building a centroid index to
-index scalar columns alongside each populated vector shard:
+Supply a JSON object named `extra_fields` when building a centroid index.
+Each row-ID range with indexed vectors gets one Bitmap file per scalar column.
 
 ```sql
 CALL sys.create_global_index(

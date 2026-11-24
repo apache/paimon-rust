@@ -401,6 +401,7 @@ impl RoutedSearch<'_> {
             self.resolve_joint_routes(queries, &mut routes);
         }
 
+        let mut bitmap_matches = None;
         loop {
             let mut queries_by_centroid = BTreeMap::<_, Vec<_>>::new();
             for (index, route) in routes.iter_mut().enumerate() {
@@ -423,37 +424,16 @@ impl RoutedSearch<'_> {
                 let (indices, probes): (Vec<_>, Vec<_>) = pending.into_iter().unzip();
                 let mut shard = self.shard_work(queries, centroid, &indices);
                 if let Some(bitmap) = self.bitmap {
-                    let table = self.evaluation.table.ok_or_else(|| {
-                        centroid_index::invalid("Centroid Bitmap search requires table context")
-                    })?;
-                    let file = &group
-                        .bitmaps
-                        .get(&centroid)
-                        .ok_or_else(|| centroid_index::invalid("Missing centroid Bitmap file"))?
-                        .index_file;
-                    let source = file.global_index_meta.as_ref().unwrap();
-                    let mut filter = bitmap.predicate.matching(table, file).await?;
-                    for range in &bitmap.deleted {
-                        if range.from() < source.row_range_start
-                            || range.to() > source.row_range_end
-                            || range.from() > range.to()
-                        {
-                            return Err(centroid_index::invalid(
-                                "Invalid deletion range for centroid Bitmap task",
-                            ));
-                        }
-                        filter.remove_range(
-                            (range.from() - source.row_range_start) as u64
-                                ..=(range.to() - source.row_range_start) as u64,
-                        );
-                    }
-                    if filter.is_empty() {
+                    let matches = match &bitmap_matches {
+                        Some(matches) => matches,
+                        None => bitmap_matches.insert(self.load_bitmap_matches(bitmap).await?),
+                    };
+                    let Some(filter) = matches.get(&centroid) else {
                         continue;
-                    }
-                    let filter = Arc::new(filter);
+                    };
                     for query in &mut shard.queries {
                         let eligible = query.effective_include_row_ids().map_or_else(
-                            || Arc::clone(&filter),
+                            || Arc::clone(filter),
                             |include| Arc::new(include & filter.as_ref()),
                         );
                         query.set_shared_include_row_ids(eligible);
@@ -498,6 +478,44 @@ impl RoutedSearch<'_> {
             }
         }
         Ok(routes.into_iter().map(|route| route.hits).collect())
+    }
+
+    async fn load_bitmap_matches(
+        &self,
+        bitmap: &BitmapWork,
+    ) -> Result<HashMap<usize, Arc<RoaringTreemap>>> {
+        let table = self.evaluation.table.ok_or_else(|| {
+            centroid_index::invalid("Centroid Bitmap search requires table context")
+        })?;
+        let mut matches = bitmap.predicate.matching(table, self.group).await?;
+        let source = self
+            .group
+            .router
+            .index_file
+            .global_index_meta
+            .as_ref()
+            .unwrap();
+        for range in &bitmap.deleted {
+            if range.from() < source.row_range_start
+                || range.to() > source.row_range_end
+                || range.from() > range.to()
+            {
+                return Err(centroid_index::invalid(
+                    "Invalid deletion range for centroid Bitmap task",
+                ));
+            }
+            for filter in matches.values_mut() {
+                filter.remove_range(
+                    (range.from() - source.row_range_start) as u64
+                        ..=(range.to() - source.row_range_start) as u64,
+                );
+            }
+        }
+        Ok(matches
+            .into_iter()
+            .filter(|(_, rows)| !rows.is_empty())
+            .map(|(centroid, rows)| (centroid, Arc::new(rows)))
+            .collect())
     }
 
     fn shard_work(
