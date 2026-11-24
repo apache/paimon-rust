@@ -110,23 +110,15 @@ pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
         let (op, relative_path) = self.create(path).await?;
         Ok((op, relative_path, None))
     }
-
-    /// Whether opening a file for writing requires calling `create_dir` on its
-    /// parent directory first.
-    ///
-    /// Defaults to `true` for compatibility with hierarchical backends that
-    /// require parent directories to exist before writing. Providers backed by
-    /// object stores or operators that create missing parent directories on
-    /// write may return `false` to avoid extra directory marker requests.
-    fn requires_parent_dir_for_write(&self) -> bool {
-        true
-    }
 }
 
 #[derive(Clone, Debug)]
 enum FileIOBackend {
     Storage(Arc<Storage>),
-    Provider(Arc<dyn FileIOProvider>),
+    Provider {
+        provider: Arc<dyn FileIOProvider>,
+        requires_parent_dir: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -472,8 +464,19 @@ impl FileIO {
     ///
     /// Resolution is deferred to async operations, including for file handles
     /// subsequently created by [`Self::new_input`] and [`Self::new_output`].
-    pub fn with_provider(mut self, provider: Arc<dyn FileIOProvider>) -> Self {
-        self.backend = FileIOBackend::Provider(provider);
+    pub fn with_provider(self, provider: Arc<dyn FileIOProvider>) -> Self {
+        self.with_internal_provider(provider, true)
+    }
+
+    pub(crate) fn with_internal_provider(
+        mut self,
+        provider: Arc<dyn FileIOProvider>,
+        requires_parent_dir: bool,
+    ) -> Self {
+        self.backend = FileIOBackend::Provider {
+            provider,
+            requires_parent_dir,
+        };
         self
     }
 
@@ -483,9 +486,12 @@ impl FileIO {
             (FileIOBackend::Storage(left), FileIOBackend::Storage(right)) => {
                 Arc::ptr_eq(left, right)
             }
-            (FileIOBackend::Provider(left), FileIOBackend::Provider(right)) => {
-                Arc::ptr_eq(left, right)
-            }
+            (
+                FileIOBackend::Provider { provider: left, .. },
+                FileIOBackend::Provider {
+                    provider: right, ..
+                },
+            ) => Arc::ptr_eq(left, right),
             _ => false,
         }
     }
@@ -517,7 +523,9 @@ impl FileIO {
 
     async fn create(&self, path: &str) -> crate::Result<(Operator, String)> {
         match &self.backend {
-            FileIOBackend::Provider(provider) => resolve_provider(provider.as_ref(), path).await,
+            FileIOBackend::Provider { provider, .. } => {
+                resolve_provider(provider.as_ref(), path).await
+            }
             FileIOBackend::Storage(_) => self.create_static(path),
         }
     }
@@ -527,7 +535,7 @@ impl FileIO {
         path: &str,
     ) -> crate::Result<(Operator, String, Option<String>)> {
         match &self.backend {
-            FileIOBackend::Provider(provider) => {
+            FileIOBackend::Provider { provider, .. } => {
                 let (op, relative_path, namespace) =
                     resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
                 Ok((op, relative_path, namespace))
@@ -553,17 +561,25 @@ impl FileIO {
         Ok((op, relative_path, cache_path))
     }
 
-    #[cfg(feature = "storage-fs")]
     pub(crate) fn requires_parent_dir_for_write(&self) -> bool {
         match &self.backend {
             FileIOBackend::Storage(storage) => storage.requires_parent_dir_for_write(),
-            FileIOBackend::Provider(provider) => provider.requires_parent_dir_for_write(),
+            FileIOBackend::Provider {
+                requires_parent_dir,
+                ..
+            } => *requires_parent_dir,
         }
     }
 
     fn file_source(&self, path: &str) -> crate::Result<FileSource> {
         match &self.backend {
-            FileIOBackend::Provider(provider) => Ok(FileSource::Provider(provider.clone())),
+            FileIOBackend::Provider {
+                provider,
+                requires_parent_dir,
+            } => Ok(FileSource::Provider {
+                provider: provider.clone(),
+                requires_parent_dir: *requires_parent_dir,
+            }),
             FileIOBackend::Storage(storage) => {
                 let (op, relative_path) = self.create_static(path)?;
                 let namespace = self.cache_namespace_for_path(path)?;
@@ -753,7 +769,7 @@ impl FileIO {
         let list_path_normalized = list_path.trim_start_matches('/');
         for entry in entries {
             let entry_path = entry.path();
-            if matches!(self.backend, FileIOBackend::Provider(_)) {
+            if matches!(self.backend, FileIOBackend::Provider { .. }) {
                 validate_provider_path(path, entry_path)?;
             }
             if entry_path.trim_start_matches('/') == list_path_normalized {
@@ -800,7 +816,7 @@ impl FileIO {
 
         let (op, relative_path) = self.create(path).await?;
         let base_path = listing_base_path(path, &relative_path)?;
-        let has_provider = matches!(self.backend, FileIOBackend::Provider(_));
+        let has_provider = matches!(self.backend, FileIOBackend::Provider { .. });
         let list_path = normalize_root(relative_path.as_ref());
 
         let entries = op
@@ -967,7 +983,7 @@ impl FileIO {
         path: &str,
         bytes: Bytes,
     ) -> Result<bool> {
-        if let FileIOBackend::Provider(provider) = &self.backend {
+        if let FileIOBackend::Provider { provider, .. } = &self.backend {
             if let Some(published) = provider
                 .write_atomic_if_not_exists(path, bytes.clone())
                 .await?
@@ -1127,7 +1143,7 @@ impl FileIO {
     pub async fn rename(&self, src: &str, dst: &str) -> Result<()> {
         let (op_src, relative_path_src, cache_path_src) = self.create_with_cache_path(src).await?;
         let (op_dst, relative_path_dst, cache_path_dst) = self.create_with_cache_path(dst).await?;
-        if matches!(self.backend, FileIOBackend::Provider(_))
+        if matches!(self.backend, FileIOBackend::Provider { .. })
             && !Arc::ptr_eq(op_src.service(), op_dst.service())
         {
             return Err(Error::IoUnsupported {
@@ -1403,7 +1419,10 @@ impl FileIOBuilder {
                     message: "with_provider and with_fs_operator cannot be combined".to_string(),
                 });
             }
-            FileIOBackend::Provider(provider)
+            FileIOBackend::Provider {
+                provider,
+                requires_parent_dir: true,
+            }
         } else {
             FileIOBackend::Storage(Arc::new(Storage::build(self)?))
         };
@@ -1767,13 +1786,16 @@ enum FileSource {
         local_fs: bool,
         requires_parent_dir: bool,
     },
-    Provider(Arc<dyn FileIOProvider>),
+    Provider {
+        provider: Arc<dyn FileIOProvider>,
+        requires_parent_dir: bool,
+    },
 }
 
 impl FileSource {
     async fn resolve(&self, path: &str) -> crate::Result<(Operator, String, Option<String>)> {
         match self {
-            Self::Provider(provider) => {
+            Self::Provider { provider, .. } => {
                 let (op, relative_path, resolved_namespace) =
                     resolve_provider_with_cache_namespace(provider.as_ref(), path).await?;
                 let cache_path = resolved_namespace
@@ -1803,7 +1825,10 @@ impl FileSource {
                 .trim_end_matches('/')
                 .rsplit_once('/')
                 .map(|(parent, _)| (op.clone(), parent.to_string())),
-            Self::Provider(provider) if provider.requires_parent_dir_for_write() => {
+            Self::Provider {
+                provider,
+                requires_parent_dir: true,
+            } => {
                 let path = path.trim_end_matches('/');
                 match path.rsplit_once('/') {
                     Some((parent, _)) if !parent.is_empty() && !parent.ends_with(":/") => {
