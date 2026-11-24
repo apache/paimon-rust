@@ -458,6 +458,23 @@ impl SnapshotManager {
         Ok(result)
     }
 
+    async fn first_available_snapshot(
+        &self,
+        ids: &[i64],
+    ) -> crate::Result<Option<(usize, Snapshot)>> {
+        for (offset, &id) in ids.iter().enumerate() {
+            // Expiration can remove the file before the existence check or before the read.
+            match self.get_snapshot(id).await {
+                Ok(snapshot) => return Ok(Some((offset, snapshot))),
+                Err(crate::Error::SnapshotNotExist { .. }) => {}
+                Err(crate::Error::IoUnexpected { source, .. })
+                    if source.kind() == opendal::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
     /// Returns the snapshot whose commit time is earlier than or equal to the given
     /// `timestamp_millis`. If no such snapshot exists, returns None.
     ///
@@ -469,29 +486,29 @@ impl SnapshotManager {
         timestamp_millis: i64,
     ) -> crate::Result<Option<Snapshot>> {
         let ids = self.list_all_ids().await?;
-        if ids.is_empty() {
+        let Some((mut lo, earliest_snapshot)) = self.first_available_snapshot(&ids).await? else {
             return Ok(None);
-        }
-
-        let earliest_snapshot = self.get_snapshot(ids[0]).await?;
+        };
         if (earliest_snapshot.time_millis() as i64) > timestamp_millis {
             return Ok(None);
         }
 
-        let mut lo: usize = 0;
-        let mut hi: usize = ids.len() - 1;
-        let mut result: Option<Snapshot> = None;
-        while lo <= hi {
-            let mid = lo + (hi - lo) / 2;
-            let snapshot = self.get_snapshot(ids[mid]).await?;
+        let mut hi = ids.len();
+        let mut result = None;
+        while lo < hi {
+            let mid = lo + (hi - lo - 1) / 2;
+            // Expired probes carry no timestamp. Start at the midpoint and use
+            // the first surviving snapshot in the right half for comparison.
+            let Some((offset, snapshot)) = self.first_available_snapshot(&ids[mid..hi]).await?
+            else {
+                hi = mid;
+                continue;
+            };
             let commit_time = snapshot.time_millis() as i64;
             if commit_time > timestamp_millis {
-                if mid == 0 {
-                    break;
-                }
-                hi = mid - 1;
+                hi = mid;
             } else if commit_time < timestamp_millis {
-                lo = mid + 1;
+                lo = mid + offset + 1;
                 result = Some(snapshot);
             } else {
                 result = Some(snapshot);
@@ -746,6 +763,79 @@ mod tests {
                 "timestamp {timestamp}"
             );
         }
+    }
+
+    #[derive(Debug)]
+    struct SnapshotExpiryProvider {
+        op: opendal::Operator,
+        expired_path: String,
+        accesses_before_expiry: usize,
+        accesses: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::io::FileIOProvider for SnapshotExpiryProvider {
+        async fn create(&self, path: &str) -> crate::Result<(opendal::Operator, String)> {
+            let relative = path.strip_prefix("memory:/").unwrap();
+            if relative == self.expired_path
+                && self
+                    .accesses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    == self.accesses_before_expiry
+            {
+                self.op.delete(relative).await?;
+            }
+            Ok((self.op.clone(), relative.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_earlier_or_equal_time_millis_skips_expired_snapshot_files() {
+        // The first path resolution precedes the existence check. The second precedes the read.
+        for (expired, accesses_before_expiry, timestamp, expected) in [
+            (1, 0, 2500, Some(2)),
+            (1, 1, 2500, Some(2)),
+            (1, 1, 1500, None),
+            (2, 1, 2500, Some(1)),
+        ] {
+            let op =
+                opendal::Operator::from_config(opendal::services::MemoryConfig::default()).unwrap();
+            for id in [1, 2, 4] {
+                let path = format!("expiry/snapshot/snapshot-{id}");
+                let json = serde_json::to_vec(&test_snapshot(id)).unwrap();
+                op.write(&path, json).await.unwrap();
+            }
+            let expired_path = format!("expiry/snapshot/snapshot-{expired}");
+            let io = FileIOBuilder::new("memory")
+                .with_provider(std::sync::Arc::new(SnapshotExpiryProvider {
+                    op: op.clone(),
+                    expired_path: expired_path.clone(),
+                    accesses_before_expiry,
+                    accesses: std::sync::atomic::AtomicUsize::new(0),
+                }))
+                .build()
+                .unwrap();
+            let sm = SnapshotManager::new(io, "memory:/expiry".into());
+            let result = sm.earlier_or_equal_time_millis(timestamp).await;
+            assert!(!op.exists(&expired_path).await.unwrap());
+            assert_eq!(result.unwrap().map(|snapshot| snapshot.id()), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_earlier_or_equal_time_millis_reports_corrupt_snapshot() {
+        let (io, sm) = setup("memory:/corrupt-snapshot").await;
+        sm.commit_snapshot(&test_snapshot(2)).await.unwrap();
+        io.new_output(&sm.snapshot_path(1))
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"invalid JSON"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            sm.earlier_or_equal_time_millis(2500).await,
+            Err(crate::Error::DataInvalid { message, .. }) if message.contains("snapshot JSON invalid")
+        ));
     }
 
     fn test_snapshot_with_watermark(id: i64, watermark: Option<i64>) -> Snapshot {
