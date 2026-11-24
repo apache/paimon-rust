@@ -347,6 +347,7 @@ impl Catalog for RESTCatalog {
         creation: Schema,
         ignore_if_exists: bool,
     ) -> Result<()> {
+        identifier.validate_new_table_name()?;
         let request = match RESTApi::prepare_create_table(identifier, creation) {
             Ok(request) => request,
             Err(error) if ignore_if_exists => {
@@ -393,6 +394,7 @@ impl Catalog for RESTCatalog {
         to: &Identifier,
         ignore_if_not_exists: bool,
     ) -> Result<()> {
+        to.validate_new_table_name()?;
         let result = self
             .api
             .rename_table(from, to)
@@ -1523,5 +1525,52 @@ mod tests {
             map_rest_error_for_table(table_missing, &identifier),
             Error::TableNotExist { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_rest_rejects_reserved_table_names_before_sending_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::spec::{DataType, IntType};
+        use axum::{http::StatusCode, Router};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&requests);
+        let app = Router::new().fallback(move || async move {
+            captured.fetch_add(1, Ordering::Relaxed);
+            StatusCode::BAD_REQUEST
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut options = Options::new();
+        options.set(CatalogOptions::URI, format!("http://{address}"));
+        options.set(CatalogOptions::WAREHOUSE, "test-warehouse");
+        options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+        options.set(CatalogOptions::TOKEN, "test-token");
+        let catalog = RESTCatalog::new(options, false).await.unwrap();
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let source = Identifier::new("default", "events");
+
+        for name in ["events$branch_dev", "events$snapshots"] {
+            let destination = Identifier::new("default", name);
+            let creation = catalog
+                .create_table(&destination, schema.clone(), true)
+                .await;
+            let rename = catalog.rename_table(&source, &destination, true).await;
+            assert!(
+                matches!(creation, Err(Error::IdentifierInvalid { .. })),
+                "{creation:?}"
+            );
+            assert!(
+                matches!(rename, Err(Error::IdentifierInvalid { .. })),
+                "{rename:?}"
+            );
+        }
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        server.abort();
     }
 }

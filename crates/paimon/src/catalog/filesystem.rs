@@ -441,6 +441,7 @@ impl Catalog for FileSystemCatalog {
         ignore_if_exists: bool,
     ) -> Result<()> {
         identifier.validate()?;
+        identifier.validate_new_table_name()?;
         // Never persist a type nothing can load.
         let declared = CoreOptions::new(creation.options()).table_type()?;
 
@@ -504,6 +505,7 @@ impl Catalog for FileSystemCatalog {
     ) -> Result<()> {
         from.validate()?;
         to.validate()?;
+        to.validate_new_table_name()?;
 
         let from_path = self.table_path(from);
         let to_path = self.table_path(to);
@@ -2175,6 +2177,87 @@ mod tests {
         assert!(matches!(result, Err(Error::IdentifierInvalid { .. })));
         assert!(!escaped_path.exists());
         assert!(catalog.get_table(&source).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_table_rejects_reserved_table_names() {
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+
+        for name in [
+            "events$branch_dev",
+            "events$branch_main",
+            "events$snapshots",
+            "events$branch_dev$snapshots",
+            "events$malformed$snapshots",
+        ] {
+            let identifier = Identifier::new("db1", name);
+            let result = catalog
+                .create_table(&identifier, testing_schema(), true)
+                .await;
+            assert!(
+                matches!(result, Err(Error::IdentifierInvalid { .. })),
+                "{result:?}"
+            );
+            assert!(!catalog.table_exists(&identifier).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_rejects_reserved_table_names_at_destination() {
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let source = Identifier::new("db1", "events");
+        catalog
+            .create_table(&source, testing_schema(), false)
+            .await
+            .unwrap();
+
+        for name in ["events$branch_dev", "events$snapshots"] {
+            let destination = Identifier::new("db1", name);
+            let result = catalog.rename_table(&source, &destination, true).await;
+            assert!(
+                matches!(result, Err(Error::IdentifierInvalid { .. })),
+                "{result:?}"
+            );
+            assert!(!catalog.table_exists(&destination).await.unwrap());
+            assert!(catalog.table_exists(&source).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_legacy_reserved_table_names_can_be_renamed_or_dropped() {
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let rename_source = Identifier::new("db1", "events$branch_dev");
+        let drop_source = Identifier::new("db1", "events$snapshots");
+        let schema = TableSchema::new(0, &testing_schema());
+        for identifier in [&rename_source, &drop_source] {
+            catalog
+                .save_table_schema(&catalog.table_path(identifier), &schema)
+                .await
+                .unwrap();
+        }
+
+        let destination = Identifier::new("db1", "events_from_legacy");
+        catalog
+            .rename_table(&rename_source, &destination, false)
+            .await
+            .unwrap();
+        catalog.drop_table(&drop_source, false).await.unwrap();
+        assert!(catalog.get_table(&destination).await.is_ok());
+        for identifier in [&rename_source, &drop_source] {
+            assert!(!catalog.table_exists(identifier).await.unwrap());
+        }
     }
 
     #[tokio::test]
