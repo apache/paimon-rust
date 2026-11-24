@@ -4250,9 +4250,13 @@ the normal physical format without wrapping the writer.
 | `'deletion-vectors.merge-on-read' = 'true'` | Include and key-merge uncompacted level-0 files in DV-enabled deduplicate batch reads |
 | `'changelog-producer' = 'input'` | Changelog producer; primary-key tables support reads and writes in this mode |
 
-The filesystem catalog rejects disabling deletion vectors on a table with snapshots,
-including tables with `'deletion-vectors.modifiable' = 'true'`. Existing snapshots
-can still depend on deletion vectors even after the latest data files are rewritten.
+For primary-key tables in the filesystem catalog, choose
+`deletion-vectors.enabled` at `CREATE TABLE`. You can enable deletion vectors
+on existing Data Evolution append tables. Reload the table handle after enabling
+the option before reading or deleting rows. The filesystem catalog rejects
+disabling or resetting an enabled mode even before the first snapshot and when
+`deletion-vectors.modifiable=true`. Historical snapshots can still depend on
+deletion vectors after the latest data files are rewritten.
 
 Manifest sidecars use the Java-compatible `<manifest-name>.avro.sidecar`
 format and are published through the manifest metadata's `_EXTRA_FILES` list.

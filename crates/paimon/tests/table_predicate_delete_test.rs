@@ -136,35 +136,21 @@ async fn altering_deletion_vectors_mode_does_not_resurrect_deleted_rows() {
     const DV_MODE: &str = "deletion-vectors.enabled";
     let set_mode = |value: &str| SchemaChange::set_option(DV_MODE.into(), value.into());
     let reset_mode = || SchemaChange::remove_option(DV_MODE.into());
-    let mut options = Options::new();
-    options.set(CatalogOptions::WAREHOUSE, "memory:/warehouse");
-    let catalog = FileSystemCatalog::new(options).unwrap();
-    catalog
-        .create_database("db", false, HashMap::new())
-        .await
-        .unwrap();
-    let identifier = Identifier::new("db", "events");
     let schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .option("data-evolution.enabled", "true")
         .option("row-tracking.enabled", "true")
-        .option(DV_MODE, "true")
         .build()
         .unwrap();
+    let (catalog, identifier) = filesystem_table(schema).await;
     catalog
-        .create_table(&identifier, schema, false)
+        .alter_table(&identifier, vec![set_mode("FALSE"), reset_mode()], false)
         .await
         .unwrap();
-    catalog
-        .alter_table(&identifier, vec![reset_mode()], false)
-        .await
-        .unwrap();
-    let table = catalog.get_table(&identifier).await.unwrap();
-    assert!(!table.schema().core_options().deletion_vectors_enabled());
-    let batch =
-        RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef)])
-            .unwrap();
-    write_batch(&table, &batch).await;
+    let original = catalog.get_table(&identifier).await.unwrap();
+    assert!(!original.schema().core_options().deletion_vectors_enabled());
+    write_batch(&original, &id_batch(&[1, 2, 3])).await;
+    let before_delete = snapshot_id(&original).await;
     catalog
         .alter_table(&identifier, vec![set_mode("true")], false)
         .await
@@ -182,16 +168,19 @@ async fn altering_deletion_vectors_mode_does_not_resurrect_deleted_rows() {
         .unwrap();
     commit(&table, messages).await;
     assert_eq!(ids(&table).await, [1, 3]);
+    let after_delete = snapshot_id(&table).await;
 
+    // An append from an already-open writer must preserve the newly written vectors.
+    write_batch(&original, &id_batch(&[4])).await;
     catalog
-        .alter_table(&identifier, vec![set_mode("TRUE")], false)
+        .alter_table(&identifier, vec![reset_mode(), set_mode("TRUE")], false)
         .await
         .unwrap();
     let table = catalog.get_table(&identifier).await.unwrap();
     for change in [set_mode("false"), reset_mode()] {
         let result = catalog.alter_table(&identifier, vec![change], false).await;
         let reloaded = catalog.get_table(&identifier).await.unwrap();
-        assert_eq!(ids(&reloaded).await, [1, 3]);
+        assert_eq!(ids(&reloaded).await, [1, 3, 4]);
         assert!(matches!(result, Err(Error::Unsupported { message }) if message.contains(DV_MODE)));
         assert_eq!(reloaded.schema().id(), table.schema().id());
     }
@@ -205,6 +194,147 @@ async fn altering_deletion_vectors_mode_does_not_resurrect_deleted_rows() {
         .alter_table(&identifier, vec![reset_mode()], false)
         .await;
     assert!(matches!(result, Err(Error::Unsupported { .. })));
+
+    let current = catalog.get_table(&identifier).await.unwrap();
+    for (id, expected) in [(before_delete, vec![1, 2, 3]), (after_delete, vec![1, 3])] {
+        let historical = current
+            .copy_with_time_travel_strict(HashMap::from([(
+                "scan.snapshot-id".into(),
+                id.to_string(),
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(ids(&historical).await, expected);
+    }
+}
+
+async fn filesystem_table(schema: Schema) -> (FileSystemCatalog, Identifier) {
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, "memory:/warehouse");
+    let catalog = FileSystemCatalog::new(options).unwrap();
+    catalog
+        .create_database("db", false, HashMap::new())
+        .await
+        .unwrap();
+    let identifier = Identifier::new("db", "events");
+    catalog
+        .create_table(&identifier, schema, false)
+        .await
+        .unwrap();
+    (catalog, identifier)
+}
+
+fn id_batch(ids: &[i32]) -> RecordBatch {
+    RecordBatch::try_from_iter([(
+        "id",
+        Arc::new(Int32Array::from_iter_values(ids.iter().copied())) as ArrayRef,
+    )])
+    .unwrap()
+}
+
+#[tokio::test]
+async fn cached_writer_cannot_publish_an_invisible_deletion_vector() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .option("data-evolution.enabled", "true")
+        .option("row-tracking.enabled", "true")
+        .option("deletion-vectors.enabled", "true")
+        .build()
+        .unwrap();
+    let (catalog, identifier) = filesystem_table(schema).await;
+    let original = catalog.get_table(&identifier).await.unwrap();
+    let alter = catalog
+        .alter_table(
+            &identifier,
+            vec![SchemaChange::remove_option(
+                "deletion-vectors.enabled".into(),
+            )],
+            false,
+        )
+        .await;
+    let current = catalog.get_table(&identifier).await.unwrap();
+    write_batch(&current, &id_batch(&[1, 2, 3])).await;
+
+    let predicate = PredicateBuilder::new(original.schema().fields())
+        .equal("id", Datum::Int(2))
+        .unwrap();
+    let builder = original.new_write_builder();
+    let messages = builder
+        .new_update()
+        .unwrap()
+        .delete_by_predicate(Some(predicate))
+        .await
+        .unwrap();
+    assert!(!messages.is_empty());
+    builder.new_commit().commit(messages).await.unwrap();
+    let current = catalog.get_table(&identifier).await.unwrap();
+    assert_eq!(ids(&current).await, [1, 3], "ALTER result {alter:?}");
+    assert!(matches!(alter, Err(Error::Unsupported { .. })));
+    assert_eq!(current.schema().id(), original.schema().id());
+}
+
+#[tokio::test]
+async fn enabling_pk_deletion_vectors_cannot_hide_uncompacted_rows() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("write-only", "true")
+        .build()
+        .unwrap();
+    let (catalog, identifier) = filesystem_table(schema).await;
+    let table = catalog.get_table(&identifier).await.unwrap();
+    write_batch(&table, &id_batch(&[1, 2, 3])).await;
+    assert_eq!(ids(&table).await, [1, 2, 3]);
+
+    let result = catalog
+        .alter_table(
+            &identifier,
+            vec![SchemaChange::set_option(
+                "deletion-vectors.enabled".into(),
+                "true".into(),
+            )],
+            false,
+        )
+        .await;
+    let current = catalog.get_table(&identifier).await.unwrap();
+    assert_eq!(ids(&current).await, [1, 2, 3], "ALTER result {result:?}");
+    assert!(matches!(result, Err(Error::Unsupported { .. })));
+}
+
+#[tokio::test]
+async fn enabling_pk_deletion_vectors_cannot_hide_the_first_in_flight_write() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("write-only", "true")
+        .build()
+        .unwrap();
+    let (catalog, identifier) = filesystem_table(schema).await;
+    let original = catalog.get_table(&identifier).await.unwrap();
+    let builder = original.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&id_batch(&[1, 2, 3]))
+        .await
+        .unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+
+    let alter = catalog
+        .alter_table(
+            &identifier,
+            vec![SchemaChange::set_option(
+                "deletion-vectors.enabled".into(),
+                "true".into(),
+            )],
+            false,
+        )
+        .await;
+    builder.new_commit().commit(messages).await.unwrap();
+    let current = catalog.get_table(&identifier).await.unwrap();
+    assert_eq!(ids(&current).await, [1, 2, 3], "ALTER result {alter:?}");
+    assert!(matches!(alter, Err(Error::Unsupported { .. })));
 }
 
 async fn read_ids(table: &Table, filter: Predicate) -> Vec<i32> {

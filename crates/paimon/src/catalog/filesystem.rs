@@ -580,18 +580,26 @@ impl Catalog for FileSystemCatalog {
         let new_schema = current
             .apply_changes(changes)
             .map_err(|e| fill_table_name(e, identifier))?;
-        // Historical snapshot reads use the current mode to load deletion vectors.
-        if current.core_options().deletion_vectors_enabled()
-            && !new_schema.core_options().deletion_vectors_enabled()
-            && crate::table::SnapshotManager::new(self.file_io.clone(), table_path.clone())
-                .get_latest_snapshot()
-                .await?
-                .is_some()
-        {
-            return Err(Error::Unsupported {
-                message: "Cannot disable 'deletion-vectors.enabled' on a table with snapshots"
-                    .into(),
-            });
+        let current_mode = current.core_options().deletion_vectors_enabled();
+        let new_mode = new_schema.core_options().deletion_vectors_enabled();
+        // Reads use the current mode even for historical snapshots. A cached
+        // writer can publish under the old mode before the first snapshot exists.
+        match (current_mode, new_mode) {
+            (true, false) => {
+                return Err(Error::Unsupported {
+                    message: "Cannot disable 'deletion-vectors.enabled' after creating the table"
+                        .into(),
+                });
+            }
+            // Level-0 files prepared without deletion vectors may become
+            // invisible when the current mode is enabled.
+            (false, true) if !current.primary_keys().is_empty() => {
+                return Err(Error::Unsupported {
+                    message: "Set 'deletion-vectors.enabled' when creating a primary-key table"
+                        .into(),
+                });
+            }
+            _ => {}
         }
         self.save_table_schema(&table_path, &new_schema).await
     }
