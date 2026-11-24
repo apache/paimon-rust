@@ -35,7 +35,7 @@ use super::row_ranges::{bitmap_to_ranges, intersect_sorted_ranges};
 use super::GlobalIndexScanner;
 use crate::btree::key_serde::normalize_key_literal;
 use crate::btree::query::extract_between;
-use crate::btree::{make_key_comparator, serialize_datum};
+use crate::btree::{make_key_comparator, serialize_datum, MAX_INTERVALS};
 #[cfg(test)]
 use crate::spec::GlobalIndexSearchMode;
 use crate::spec::{DataType, Datum, Predicate, PredicateOperator};
@@ -104,7 +104,10 @@ where
 impl GlobalIndexScanner {
     // (a = 1 AND b IN S) OR (a = 2 AND b IN S) is exactly
     // (a IN (1, 2) AND b IN S). Leave uneven locator sets untouched.
-    pub(super) fn coalesce_equal_or_arms(children: &[Predicate]) -> Option<Predicate> {
+    pub(super) fn coalesce_equal_or_arms(
+        children: &[Predicate],
+        max_intervals: Option<usize>,
+    ) -> Option<Predicate> {
         if children.len() < 2 {
             return None;
         }
@@ -158,6 +161,21 @@ impl GlobalIndexScanner {
             equalities.push(literals[0].clone());
         }
         let (column, index, data_type, other) = common?;
+        let Predicate::Leaf {
+            literals: other_values,
+            ..
+        } = &other
+        else {
+            unreachable!();
+        };
+        // A composite plan drops the second key column if the Cartesian
+        // product exceeds its interval cap. Keep the original point lookups
+        // so a small fallback-scan budget cannot discard that index entirely.
+        if max_intervals.is_some_and(|limit| {
+            !other_values.is_empty() && equalities.len() > limit / other_values.len()
+        }) {
+            return None;
+        }
         Some(Predicate::and(vec![
             Predicate::Leaf {
                 column,
@@ -301,7 +319,10 @@ impl GlobalIndexScanner {
                     .iter()
                     .map(|child| {
                         if let Predicate::Or(arms) = child {
-                            if let Some(coalesced) = Self::coalesce_equal_or_arms(arms) {
+                            if let Some(coalesced) = Self::coalesce_equal_or_arms(
+                                arms,
+                                (!self.composite_entries.is_empty()).then_some(MAX_INTERVALS),
+                            ) {
                                 changed = true;
                                 return coalesced;
                             }
@@ -314,7 +335,10 @@ impl GlobalIndexScanner {
                 }
             }
             if let Predicate::Or(children) = predicate {
-                if let Some(coalesced) = Self::coalesce_equal_or_arms(children) {
+                if let Some(coalesced) = Self::coalesce_equal_or_arms(
+                    children,
+                    (!self.composite_entries.is_empty()).then_some(MAX_INTERVALS),
+                ) {
                     return self.evaluate(&coalesced).await;
                 }
             }
