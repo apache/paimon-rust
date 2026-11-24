@@ -1248,7 +1248,12 @@ impl TableCommit {
                 }
 
                 let result = self
-                    .try_commit_once(resolved, &latest_snapshot, commit_identifier)
+                    .try_commit_once(
+                        resolved,
+                        &latest_snapshot,
+                        commit_identifier,
+                        matches!(plan, CommitEntriesPlan::Overwrite { .. }),
+                    )
                     .await?;
 
                 match result {
@@ -1378,6 +1383,7 @@ impl TableCommit {
         mut resolved: ResolvedCommit,
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
+        partition_overwrite: bool,
     ) -> Result<CommitAttemptResult> {
         let mut created_files = Vec::new();
         let prepared = self
@@ -1385,6 +1391,7 @@ impl TableCommit {
                 &mut resolved,
                 latest_snapshot,
                 commit_identifier,
+                partition_overwrite,
                 &mut created_files,
             )
             .await;
@@ -1465,9 +1472,17 @@ impl TableCommit {
         resolved: &mut ResolvedCommit,
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
+        partition_overwrite: bool,
         created_files: &mut Vec<String>,
     ) -> Result<(Snapshot, Vec<PartitionStatistics>)> {
         let new_snapshot_id = latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1);
+
+        let overwrite_schema_id = if partition_overwrite && self.deletion_vectors_enabled {
+            self.prepare_lookup_overwrite(resolved, latest_snapshot, new_snapshot_id, created_files)
+                .await?
+        } else {
+            None
+        };
 
         // Capture existing-row updates before assigning IDs to new appends.
         // A mixed update/delete can be an OVERWRITE through deletion vectors.
@@ -1657,6 +1672,14 @@ impl TableCommit {
                 .await?;
             schema.id()
         };
+        if overwrite_schema_id.is_some_and(|id| id != schema_id) {
+            return Err(crate::Error::DataInvalid {
+                message:
+                    "Table schema changed while preparing the lookup overwrite; retry the overwrite"
+                        .into(),
+                source: None,
+            });
+        }
         let statistics_file = self
             .inherited_statistics(latest_snapshot.as_ref(), schema_id)
             .await?;

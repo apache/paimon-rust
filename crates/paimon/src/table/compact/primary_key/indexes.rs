@@ -22,7 +22,6 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
-use super::super::CompactTask;
 use crate::resource::ResourceContext;
 use crate::spec::{DataFileMeta, FileKind, IndexManifestEntry, ManifestEntry};
 use crate::table::pk_index_maintenance::{
@@ -37,7 +36,6 @@ use std::sync::Arc;
 #[allow(clippy::too_many_arguments)]
 pub(in crate::table::compact) async fn prepare(
     table: &Table,
-    task: &CompactTask,
     split: &DataSplit,
     indexes: &[IndexManifestEntry],
     active: &[ManifestEntry],
@@ -47,15 +45,16 @@ pub(in crate::table::compact) async fn prepare(
     round: &MaintenanceRound,
 ) -> Result<Vec<IndexManifestEntry>> {
     let defs = definitions(table.schema())?;
-    let changes = task
-        .files
+    let partition = split.partition().to_serialized_bytes();
+    let changes = split
+        .data_files()
         .iter()
         .map(|f| {
             ManifestEntry::new(
                 FileKind::Delete,
-                task.partition.clone(),
-                task.bucket,
-                task.total_buckets,
+                partition.clone(),
+                split.bucket(),
+                split.total_buckets(),
                 f.clone(),
                 2,
             )
@@ -63,15 +62,15 @@ pub(in crate::table::compact) async fn prepare(
         .chain(files.iter().map(|f| {
             ManifestEntry::new(
                 FileKind::Add,
-                task.partition.clone(),
-                task.bucket,
-                task.total_buckets,
+                partition.clone(),
+                split.bucket(),
+                split.total_buckets(),
                 f.clone(),
                 2,
             )
         }))
         .collect::<Vec<_>>();
-    let after = levels(active, &changes, &task.partition, task.bucket);
+    let after = levels(active, &changes, &partition, split.bucket());
     let unsupported = unsupported_scalar_units(table, &after, &defs).await;
     let maintenance = plan(
         table,
@@ -79,7 +78,7 @@ pub(in crate::table::compact) async fn prepare(
         &after,
         &defs,
         &unsupported,
-        (&task.partition, task.bucket),
+        (&partition, split.bucket()),
         round,
     )
     .await?;
@@ -120,8 +119,8 @@ pub(in crate::table::compact) async fn prepare(
         {
             Ok(Some(index_file)) => entries.push(IndexManifestEntry {
                 kind: FileKind::Add,
-                partition: task.partition.clone(),
-                bucket: task.bucket,
+                partition: partition.clone(),
+                bucket: split.bucket(),
                 index_file,
                 version: 1,
             }),

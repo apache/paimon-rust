@@ -20,6 +20,66 @@ use crate::table::compact::{CompactBuckets, CompactPlan};
 use sha2::{Digest, Sha256};
 
 impl TableCommit {
+    pub(super) async fn prepare_lookup_overwrite(
+        &self,
+        resolved: &mut ResolvedCommit,
+        latest: &Option<Snapshot>,
+        snapshot_id: i64,
+        created: &mut Vec<String>,
+    ) -> Result<Option<i64>> {
+        use crate::spec::ChangelogProducer;
+
+        let schema = self.table.schema();
+        if schema.primary_keys().is_empty()
+            || schema.core_options().try_changelog_producer()? != ChangelogProducer::Lookup
+            || !self.auto_compaction_enabled(
+                resolved
+                    .entries
+                    .iter()
+                    .any(|entry| *entry.kind() == FileKind::Add && entry.file().level == 0),
+            )?
+        {
+            return Ok(None);
+        }
+        let table = self.post_commit_table(latest.as_ref()).await?;
+        let options = table.schema().core_options();
+        if !options.deletion_vectors_enabled()
+            || options.write_only()?
+            || options.try_changelog_producer()? != ChangelogProducer::Lookup
+        {
+            return Ok(None);
+        }
+        match crate::table::compact::ensure_supported(&table) {
+            Ok(()) => {}
+            Err(crate::Error::Unsupported { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let mut indexes = match &resolved.new_index_manifest_entries {
+            Some(entries) => entries.clone(),
+            None => {
+                Self::read_prev_index_entries(
+                    table.file_io(),
+                    &self.snapshot_manager.manifest_dir(),
+                    latest,
+                )
+                .await?
+            }
+        };
+        if crate::table::compact::primary_key::overwrite::materialize(
+            &table,
+            snapshot_id,
+            &mut resolved.entries,
+            &mut indexes,
+            created,
+        )
+        .await?
+        {
+            resolved.new_index_manifest_entries = Some(indexes);
+            resolved.index_manifest_changed = true;
+        }
+        Ok(Some(table.schema().id()))
+    }
+
     pub(super) fn auto_compaction_enabled(&self, has_new_files: bool) -> Result<bool> {
         if self.table.schema().core_options().write_only()? || !has_new_files {
             return Ok(false);
