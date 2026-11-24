@@ -123,6 +123,11 @@ impl<'a> FormatTableScan<'a> {
                 .await?;
                 let mut splits = Vec::new();
                 for status in files {
+                    // Java ORC treats Hive's zero-byte outputs as empty files.
+                    // The listing helper has already statted entries with a reported size of zero.
+                    if format_extension == ".orc" && status.size == 0 {
+                        continue;
+                    }
                     if let Some(split) = self.status_to_split(
                         status,
                         table_path,

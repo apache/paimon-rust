@@ -1147,6 +1147,43 @@ async fn java_format_table_formats_round_trip() {
 }
 
 #[tokio::test]
+async fn orc_format_table_reads_hive_empty_files_as_empty() {
+    let table = memory_table("format_orc_hive_empty", true, &[("file.format", "orc")]);
+    append(&table, &batch(&[("a", 1), ("b", 2)])).await;
+    table
+        .file_io()
+        .new_output(&format!("{}/dt=a/empty.orc", table.location()))
+        .unwrap()
+        .write(Bytes::new())
+        .await
+        .unwrap();
+    assert_eq!(ids(&table).await, [1, 2]);
+}
+
+#[tokio::test]
+async fn orc_format_table_reports_corrupt_nonempty_files() {
+    let table = memory_table("format_orc_corrupt", false, &[("file.format", "orc")]);
+    table
+        .file_io()
+        .new_output(&format!("{}/corrupt.orc", table.location()))
+        .unwrap()
+        .write(Bytes::from_static(b"invalid ORC data"))
+        .await
+        .unwrap();
+    let reader = table.new_read_builder();
+    let plan = reader.new_scan().plan().await.unwrap();
+    let error = reader
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Failed to open ORC file"));
+}
+
+#[tokio::test]
 async fn csv_and_json_format_tables_read_unterminated_final_rows() {
     for format in ["csv", "json"] {
         for rows in [1, 2050] {
