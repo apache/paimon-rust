@@ -314,11 +314,35 @@ mod pk_dv_retry {
         }
     }
 
-    #[tokio::test]
-    async fn lookup_overwrite_reclaims_rejected_outputs_and_preserves_published_files() {
+    async fn read_ids(table: &Table) -> Vec<i32> {
         use arrow_array::{cast::AsArray, types::Int32Type};
         use futures::TryStreamExt;
 
+        let read = table.new_read_builder();
+        let plan = read.new_scan().plan().await.unwrap();
+        let batches: Vec<_> = read
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn lookup_overwrite_reclaims_rejected_outputs_and_preserves_published_files() {
         for publish_first in [false, true] {
             let raw = retry_table().await;
             let table = raw.copy_with_options(HashMap::from([
@@ -381,29 +405,99 @@ mod pk_dv_retry {
                     "missing staged input: {path}"
                 );
             }
-            let read = table.new_read_builder();
-            let plan = read.new_scan().plan().await.unwrap();
-            let batches: Vec<_> = read
-                .new_read()
-                .unwrap()
-                .to_arrow(plan.splits())
-                .unwrap()
-                .try_collect()
+            assert_eq!(read_ids(&table).await, [1, 2, 3]);
+        }
+    }
+
+    #[cfg(feature = "storage-oss")]
+    #[tokio::test]
+    async fn lookup_overwrite_recovers_after_oss_replays_a_published_put() {
+        use axum::extract::State;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::{routing::put, Router};
+
+        async fn put_snapshot(
+            State((manager, puts)): State<(SnapshotManager, Arc<AtomicUsize>)>,
+            headers: HeaderMap,
+            body: bytes::Bytes,
+        ) -> (StatusCode, &'static str) {
+            assert_eq!(headers["x-oss-forbid-overwrite"], "true");
+            puts.fetch_add(1, Ordering::SeqCst);
+            let stored = manager
+                .file_io()
+                .write_atomic_if_not_exists(&manager.snapshot_path(1), body)
                 .await
                 .unwrap();
-            let ids: Vec<_> = batches
-                .iter()
-                .flat_map(|batch| {
-                    batch
-                        .column(0)
-                        .as_primitive::<Int32Type>()
-                        .values()
-                        .iter()
-                        .copied()
-                })
-                .collect();
-            assert_eq!(ids, [1, 2, 3]);
+            if stored {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "<Error><Code>QpsLimitExceeded</Code><Message>retry</Message></Error>",
+                )
+            } else {
+                (
+                    StatusCode::CONFLICT,
+                    "<Error><Code>FileAlreadyExists</Code><Message>exists</Message></Error>",
+                )
+            }
         }
+
+        let table = retry_table().await.copy_with_options(HashMap::from([
+            ("write-only".into(), "false".into()),
+            ("pk-bitmap.index.columns".into(), "value".into()),
+            ("write.parquet-buffer-size".into(), "1 B".into()),
+        ]));
+        // Only the snapshot PUT goes through OSS. Serve it from the same storage
+        // that the table uses for recovery and subsequent reads.
+        let puts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/bucket/table/snapshot/snapshot-1", put(put_snapshot))
+            .with_state((table.snapshot_manager(), puts.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = opendal_service_oss::OssConfig::default();
+        config.endpoint = Some(format!("http://{}", listener.local_addr().unwrap()));
+        config.bucket = "bucket".into();
+        config.addressing_style = Some("path".into());
+        config.skip_signature = true;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let transport = opendal::HttpTransporter::new(
+            opendal_http_transport_reqwest::ReqwestTransport::default(),
+        );
+        let operator = opendal::Operator::from_config(config)
+            .unwrap()
+            .with_context(opendal::OperationContext::new().with_http_transport(transport))
+            .layer(opendal_layer_retry::RetryLayer::default().with_max_times(1));
+        let io = FileIOBuilder::new("file")
+            .with_fs_operator(operator)
+            .build()
+            .unwrap();
+        let builder = table.new_write_builder().with_overwrite();
+        let mut writer = builder.new_write().unwrap();
+        writer
+            .write_arrow_batch(&batch(vec![1, 2], 0))
+            .await
+            .unwrap();
+        writer
+            .write_arrow_batch(&batch(vec![2, 3], 0))
+            .await
+            .unwrap();
+        let inputs = writer.prepare_commit().await.unwrap();
+        assert_eq!(inputs[0].new_files.len(), 2);
+        let mut commit = builder.new_commit();
+        commit.snapshot_commit = Arc::new(crate::table::RenamingSnapshotCommit::new(
+            SnapshotManager::new(io, "/table".into()),
+        ));
+        commit
+            .overwrite_with_identifier(inputs, None, 7)
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(puts.load(Ordering::SeqCst), 2);
+        assert_eq!(read_ids(&table).await, [1, 2, 3]);
+        let snapshot = table.snapshot_manager().get_snapshot(1).await.unwrap();
+        let indexes = index_paths(&table, &snapshot, "bitmap").await;
+        assert_eq!(indexes.len(), 1);
+        assert!(table.file_io().exists(&indexes[0]).await.unwrap());
     }
 
     #[tokio::test]

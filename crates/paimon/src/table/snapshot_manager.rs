@@ -266,7 +266,7 @@ impl SnapshotManager {
     /// Atomically commit a snapshot.
     ///
     /// Writes the snapshot JSON to the target path. Returns `false` if the
-    /// target already exists (another writer won the race).
+    /// target already exists, including after a replay of the same write.
     ///
     /// Uses atomic no-replace publication: a staged file on the local filesystem,
     /// conditional rename, or a conditional object write. Backends without a

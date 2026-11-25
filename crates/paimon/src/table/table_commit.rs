@@ -1427,10 +1427,12 @@ impl TableCommit {
                 return Ok(CommitAttemptResult::Success(Box::new(snapshot)));
             }
             Ok(false) => {
-                // Only payloads written for this attempt can be discarded.
-                // The retry still needs the caller's staged inputs.
-                for path in created_payloads {
-                    let _ = self.table.file_io().delete_file(&path).await;
+                // A replay of our own successful conditional PUT also reports a conflict.
+                // Reclaim payloads only if another attempt published this snapshot ID.
+                if !created_payloads.is_empty() && self.another_attempt_published(&snapshot).await {
+                    for path in created_payloads {
+                        let _ = self.table.file_io().delete_file(&path).await;
+                    }
                 }
                 None
             }
@@ -1441,6 +1443,22 @@ impl TableCommit {
             base_data_files: resolved.base_data_files.take(),
             publication_error,
         })))
+    }
+
+    async fn another_attempt_published(&self, attempt: &Snapshot) -> bool {
+        let published = if let Some(env) = self.table.rest_env() {
+            // After a catalog rollback the same ID can still name an older snapshot on disk.
+            env.load_snapshot(self.table.branch()).await.ok().flatten()
+        } else {
+            self.snapshot_manager.get_snapshot(attempt.id()).await.ok()
+        };
+        published.is_some_and(|snapshot| {
+            snapshot.id() == attempt.id()
+                && snapshot
+                    .uuid()
+                    .zip(attempt.uuid())
+                    .is_some_and(|(winner, attempt)| winner != attempt)
+        })
     }
 
     async fn prepare_snapshot(

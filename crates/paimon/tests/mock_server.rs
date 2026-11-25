@@ -31,6 +31,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use paimon::api::{
@@ -66,7 +67,7 @@ fn resource_name_from_uri(uri: &Uri, marker: &str) -> String {
     RESTUtil::decode_string(suffix.split('/').next().unwrap())
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 struct MockState {
     databases: HashMap<String, GetDatabaseResponse>,
     tables: HashMap<String, GetTableResponse>,
@@ -76,6 +77,7 @@ struct MockState {
     tags: HashMap<String, GetTagResponse>,
     tags_replaced_after_read: HashMap<String, (usize, Snapshot)>,
     catalog_snapshots: HashMap<String, Snapshot>,
+    next_commit_pause: Option<(oneshot::Sender<Snapshot>, oneshot::Receiver<()>)>,
     omit_next_commit_success: bool,
     rollback_snapshots: HashMap<(String, i64), Snapshot>,
     create_tag_calls: Vec<(String, String, CreateTagRequest)>,
@@ -895,7 +897,7 @@ impl RESTServer {
         }
     }
 
-    /// Publish a snapshot against the catalog identity and filesystem head.
+    /// Publish against the catalog identity and its registered or filesystem head.
     pub async fn commit_snapshot(
         Path((db, table)): Path<(String, String)>,
         Extension(state): Extension<Arc<RESTServer>>,
@@ -933,8 +935,24 @@ impl RESTServer {
             .unwrap();
         let manager = paimon::table::SnapshotManager::new(file_io, location)
             .with_branch(parsed.branch_or_default());
-        let published = async {
-            let latest = manager.get_latest_snapshot().await?;
+        let pause = state.inner.lock().unwrap().next_commit_pause.take();
+        if let Some((ready, resume)) = pause {
+            ready.send(snapshot.clone()).unwrap();
+            resume.await.unwrap();
+        }
+        let key = format!("{db}.{table}");
+        let catalog_head = state
+            .inner
+            .lock()
+            .unwrap()
+            .catalog_snapshots
+            .get(&key)
+            .cloned();
+        let published: paimon::Result<bool> = async {
+            let latest = match &catalog_head {
+                Some(head) => Some(head.clone()),
+                None => manager.get_latest_snapshot().await?,
+            };
             if latest.as_ref().and_then(Snapshot::uuid)
                 != request
                     .get("baseSnapshotUuid")
@@ -943,7 +961,11 @@ impl RESTServer {
             {
                 return Ok(false);
             }
-            manager.commit_snapshot(&snapshot).await
+            let committed = manager.commit_snapshot(&snapshot).await?;
+            if committed && catalog_head.is_some() {
+                state.set_catalog_snapshot(&db, &table, snapshot);
+            }
+            Ok(committed)
         }
         .await;
         match published {
@@ -963,6 +985,13 @@ impl RESTServer {
 
     pub fn omit_next_commit_success(&self) {
         self.inner.lock().unwrap().omit_next_commit_success = true;
+    }
+
+    pub fn pause_next_commit(&self) -> (oneshot::Receiver<Snapshot>, oneshot::Sender<()>) {
+        let (submitted, snapshot) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        self.inner.lock().unwrap().next_commit_pause = Some((submitted, paused));
+        (snapshot, resume)
     }
 
     /// Handle GET /databases/:db/tables/:table - get a specific table.
