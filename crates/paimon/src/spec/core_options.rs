@@ -387,7 +387,7 @@ pub(crate) enum TimeTravelSelector<'a> {
 }
 
 fn default_blob_output_max_buffered_bytes(available_cores: usize) -> i64 {
-    (available_cores.clamp(1, 4) as i64) * BLOB_OUTPUT_BYTES_PER_CORE
+    (available_cores.clamp(1, 8) as i64) * BLOB_OUTPUT_BYTES_PER_CORE
 }
 
 impl<'a> CoreOptions<'a> {
@@ -2569,7 +2569,14 @@ mod tests {
                     .unwrap_or(1)
             ) as u64
         );
-        for (cores, mib) in [(0, 512), (1, 512), (2, 1024), (4, 2048), (8, 2048)] {
+        for (cores, mib) in [
+            (0, 512),
+            (1, 512),
+            (2, 1024),
+            (4, 2048),
+            (8, 4096),
+            (16, 4096),
+        ] {
             assert_eq!(
                 default_blob_output_max_buffered_bytes(cores),
                 mib * 1024 * 1024
