@@ -1325,6 +1325,327 @@ async fn test_read_complex_type_table_via_datafusion() {
 }
 
 #[tokio::test]
+async fn test_data_evolution_wildcards_hide_row_id() {
+    let (_warehouse, ctx) = create_context().await;
+    let table = "paimon.default.data_evolution_table";
+
+    let plain = ctx.sql(&format!("SELECT * FROM {table}")).await.unwrap();
+    assert!(plain
+        .schema()
+        .field_with_unqualified_name("_ROW_ID")
+        .is_err());
+    for (projection, predicate, expected) in [
+        ("*", "", vec!["id", "name", "value"]),
+        ("d.*", "", vec!["id", "name", "value"]),
+        (
+            r#"*, d."_ROW_ID""#,
+            r#"WHERE d."_ROW_ID" = 0"#,
+            vec!["id", "name", "value", "_ROW_ID"],
+        ),
+    ] {
+        let sql = format!("SELECT {projection} FROM {table} AS d {predicate}");
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        assert!(!batches.is_empty(), "{sql}");
+        for batch in &batches {
+            let schema = batch.schema();
+            let names = schema.fields().iter().map(|field| field.name().as_str());
+            assert!(names.eq(expected.iter().copied()), "{sql}: {schema:?}");
+            if !predicate.is_empty() {
+                let ids = batch
+                    .column_by_name("_ROW_ID")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    .unwrap();
+                assert!(ids.iter().all(|id| id == Some(0)));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_data_evolution_wildcards_preserve_explicit_exports() {
+    let (_warehouse, ctx) = create_context().await;
+    let table = "paimon.default.data_evolution_table";
+    for (sql, expected) in [
+        (
+            format!(r#"SELECT * FROM {table} d CROSS JOIN (SELECT 42 AS "_ROW_ID") u"#),
+            vec!["id", "name", "value", "_ROW_ID"],
+        ),
+        (
+            format!(r#"WITH d AS (SELECT *, "_ROW_ID" FROM {table}) SELECT * FROM d"#),
+            vec!["id", "name", "value", "_ROW_ID"],
+        ),
+        (
+            format!(
+                r#"SELECT j.* FROM ({table} d CROSS JOIN (SELECT "_ROW_ID" AS exported FROM {table} LIMIT 1) e) j"#
+            ),
+            vec!["id", "name", "value", "exported"],
+        ),
+        (
+            format!(
+                r#"SELECT j.* FROM ((SELECT "_ROW_ID" FROM {table}) e LEFT SEMI JOIN {table} d ON e."_ROW_ID" = d."_ROW_ID") j"#
+            ),
+            vec!["_ROW_ID"],
+        ),
+        (
+            format!("SELECT j.* FROM ({table} a JOIN {table} b USING (id)) j"),
+            vec!["id", "name", "value", "id:1", "name:1", "value:1"],
+        ),
+        (
+            format!("SELECT d.* FROM {table} d(i, n, v, hidden)"),
+            vec!["i", "n", "v"],
+        ),
+        (
+            format!(
+                r#"SELECT j.* FROM ({table} d CROSS JOIN (SELECT "_ROW_ID" AS exported FROM {table}) e) AS j(i, n, v, hidden, "_ROW_ID")"#
+            ),
+            vec!["i", "n", "v", "_ROW_ID"],
+        ),
+        (
+            format!(
+                r#"SELECT * FROM {table} a JOIN (SELECT "_ROW_ID" FROM {table}) z USING ("_ROW_ID")"#
+            ),
+            vec!["id", "name", "value", "_ROW_ID"],
+        ),
+        (
+            format!(
+                r#"SELECT * FROM {table} z JOIN (SELECT "_ROW_ID" FROM {table}) a USING ("_ROW_ID")"#
+            ),
+            vec!["id", "name", "value", "_ROW_ID"],
+        ),
+        (
+            format!(
+                r#"SELECT * FROM {table} m JOIN {table} a USING ("_ROW_ID")
+                   JOIN (SELECT "_ROW_ID" FROM {table}) z USING ("_ROW_ID")"#
+            ),
+            vec!["id", "name", "value", "id", "name", "value", "_ROW_ID"],
+        ),
+    ] {
+        let df = ctx.sql(&sql).await.unwrap();
+        let names = df
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str());
+        assert!(
+            names.eq(expected.iter().copied()),
+            "{sql}: {:?}",
+            df.schema()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_data_evolution_wildcards_preserve_replacements() {
+    let (_warehouse, ctx) = create_context().await;
+    let table = "paimon.default.data_evolution_table";
+    for from in [
+        format!("{table} d"),
+        format!("{table} d CROSS JOIN (VALUES (1)) a(n)"),
+    ] {
+        let sql = format!(
+            r#"SELECT d.* EXCLUDE (name, value) REPLACE (42 AS "_ROW_ID")
+               FROM {from} WHERE d.id = 1"#
+        );
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(collect_rows(&batches), [["1", "42"]], "{sql}");
+    }
+    for (expression, group) in [
+        ("SUM(d.id)", "GROUP BY ALL"),
+        ("SUM(d.id) OVER (PARTITION BY a.n)", ""),
+    ] {
+        let sql = format!(
+            "SELECT * REPLACE ({expression} AS id)
+             FROM {table} d CROSS JOIN (VALUES (1)) a(n)
+             WHERE d.id = 1 {group}"
+        );
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        let rows = collect_rows(&batches);
+        assert_eq!(rows.len(), 1, "{sql}");
+        assert_eq!(rows[0].len(), 4, "{sql}");
+        assert_eq!(rows[0][0], "1", "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn test_data_evolution_wildcards_in_recursive_cte() {
+    let (_warehouse, ctx) = create_context().await;
+    let table = "paimon.default.data_evolution_table";
+    let sql = format!(
+        "WITH RECURSIVE r(rid, rname, rvalue, n) AS (
+             SELECT * FROM {table} d CROSS JOIN (VALUES (1)) a(n) WHERE d.id = 1
+             UNION ALL
+             SELECT * EXCLUDE (rid, rname, rvalue) REPLACE (r.n + 1 AS n)
+             FROM {table} d JOIN r ON d.id = r.rid WHERE n < 2
+         )
+         SELECT rid, n FROM r ORDER BY n"
+    );
+    let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(collect_rows(&batches), [["1", "1"], ["1", "2"]]);
+}
+
+#[tokio::test]
+async fn test_data_evolution_wildcards_in_nested_cte_scopes() {
+    let (_warehouse, ctx) = create_context().await;
+    let table = "paimon.default.data_evolution_table";
+    let recursive = format!(
+        "WITH c(a, b) AS (SELECT 1 AS a UNION ALL BY NAME SELECT 2 AS b)
+         SELECT q.a, q.b, q.n FROM (
+             WITH RECURSIVE r(n) AS (
+                 SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2
+             )
+             SELECT * FROM {table} d CROSS JOIN c CROSS JOIN r WHERE d.id = 1
+         ) q ORDER BY n, a NULLS LAST"
+    );
+    let batches = ctx.sql(&recursive).await.unwrap().collect().await.unwrap();
+    assert_eq!(
+        collect_rows(&batches),
+        [
+            ["1", "NULL", "1"],
+            ["NULL", "2", "1"],
+            ["1", "NULL", "2"],
+            ["NULL", "2", "2"]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_data_evolution_wildcards_with_postgresql_dialect() {
+    let (_warehouse, ctx) = create_context().await;
+    let table = "paimon.default.data_evolution_table";
+    common::exec(&ctx, "SET datafusion.sql_parser.dialect = 'postgresql'").await;
+    let sql = format!("WITH q AS (SELECT * FROM {table}) SELECT * FROM q CROSS JOIN {table} d");
+    let df = ctx.sql(&sql).await.unwrap();
+    let columns = df.schema().fields();
+    assert_eq!(columns.len(), 6);
+    assert!(columns.iter().all(|column| column.name() != "_ROW_ID"));
+}
+
+#[tokio::test]
+async fn test_data_evolution_wildcards_in_correlated_join() {
+    let (_warehouse, ctx) = create_context().await;
+    let table = "paimon.default.data_evolution_table";
+    for (projection, join) in [
+        ("*", String::new()),
+        ("d.*", String::new()),
+        ("*", format!("JOIN {table} e ON e.id = q.n")),
+    ] {
+        let sql = format!(
+            "SELECT o.x FROM (VALUES (1),(-42)) AS o(x)
+             WHERE EXISTS (
+                 SELECT {projection} FROM {table} d
+                 JOIN (SELECT a.n FROM (VALUES (1)) AS a(n) WHERE a.n = o.x) q
+                     ON d.id = q.n
+                 {join}
+             )"
+        );
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(collect_rows(&batches), [["1"]], "{sql}");
+    }
+    let cte = format!(
+        "SELECT o.x FROM (VALUES (1),(-42)) AS o(x)
+         WHERE EXISTS (
+             WITH q AS (SELECT a.n FROM (VALUES (1)) AS a(n) WHERE a.n = o.x)
+             SELECT * FROM {table} d JOIN q ON d.id = q.n JOIN {table} e ON e.id = q.n
+         )"
+    );
+    let batches = ctx.sql(&cte).await.unwrap().collect().await.unwrap();
+    assert_eq!(collect_rows(&batches), [["1"]]);
+}
+
+#[tokio::test]
+async fn test_data_evolution_wildcards_in_positional_insert() {
+    let (_tmp, ctx) = common::setup_sql_context().await;
+    common::exec(
+        &ctx,
+        "CREATE TABLE source (id INT) WITH ('data-evolution.enabled' = 'true', 'row-tracking.enabled' = 'true')",
+    )
+    .await;
+    common::exec(
+        &ctx,
+        "CREATE TABLE target (id INT) WITH ('data-evolution.enabled' = 'true', 'row-tracking.enabled' = 'true')",
+    )
+    .await;
+    common::exec(&ctx, "INSERT INTO source (id) VALUES (42)").await;
+    let insert = "INSERT INTO target SELECT * FROM source";
+    common::exec(&ctx, &format!("EXPLAIN {insert}")).await;
+    let before = ctx
+        .sql("SELECT id FROM target")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert!(collect_rows(&before).is_empty());
+    common::exec(&ctx, insert).await;
+    common::exec(&ctx, &format!("PREPARE copy_source AS {insert}")).await;
+    common::exec(&ctx, "EXECUTE copy_source").await;
+    common::exec(&ctx, "ALTER TABLE source ADD COLUMN extra INT").await;
+    for statement in [
+        insert.to_string(),
+        format!("EXPLAIN {insert}"),
+        format!("PREPARE invalid_copy AS {insert}"),
+    ] {
+        let error = ctx.sql(&statement).await.unwrap_err().to_string();
+        assert!(
+            error.contains("Column count doesn't match insert query!"),
+            "{statement}: {error}"
+        );
+    }
+    common::exec(
+        &ctx,
+        "INSERT INTO target SELECT id, CAST(0 AS BIGINT) FROM source WHERE EXISTS (SELECT * FROM source)",
+    )
+    .await;
+    common::exec(
+        &ctx,
+        "PREPARE legacy_values AS INSERT INTO target WITH unused AS (SELECT * FROM source) VALUES (42, $1)",
+    )
+    .await;
+    common::exec(&ctx, "EXECUTE legacy_values (0)").await;
+    let batches = ctx
+        .sql("SELECT * FROM target")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(collect_rows(&batches), vec![vec!["42".to_string()]; 4]);
+}
+
+#[tokio::test]
+async fn test_data_evolution_wildcards_in_mutation_predicates() {
+    let (_tmp, ctx) = common::setup_sql_context().await;
+    common::exec(
+        &ctx,
+        "CREATE TABLE source (id INT) WITH ('data-evolution.enabled' = 'true', 'row-tracking.enabled' = 'true')",
+    )
+    .await;
+    common::exec(&ctx, "INSERT INTO source (id) VALUES (2)").await;
+    for table in [
+        "target (id INT, value INT)",
+        "target (id INT, value INT) WITH ('data-evolution.enabled' = 'true', 'row-tracking.enabled' = 'true', 'deletion-vectors.enabled' = 'true')",
+        "target (id INT, value INT, PRIMARY KEY (id))",
+    ] {
+        common::exec(&ctx, &format!("CREATE TABLE {table}")).await;
+        common::exec(&ctx, "INSERT INTO target (id, value) VALUES (1, 10), (2, 20)").await;
+        common::exec(
+            &ctx,
+            "UPDATE target SET value = value + 1 WHERE id IN (SELECT * FROM source)",
+        )
+        .await;
+        let read = "SELECT id, value FROM target ORDER BY id";
+        let updated = ctx.sql(read).await.unwrap().collect().await.unwrap();
+        assert_eq!(collect_rows(&updated), [["1", "10"], ["2", "21"]], "{table}");
+        common::exec(&ctx, "DELETE FROM target WHERE id IN (SELECT * FROM source)").await;
+        let deleted = ctx.sql(read).await.unwrap().collect().await.unwrap();
+        assert_eq!(collect_rows(&deleted), [["1", "10"]], "{table}");
+        common::exec(&ctx, "DROP TABLE target").await;
+    }
+}
+
+#[tokio::test]
 async fn test_select_row_id_from_data_evolution_table() {
     use datafusion::arrow::array::Int64Array;
 

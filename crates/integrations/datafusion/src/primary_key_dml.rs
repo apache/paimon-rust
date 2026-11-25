@@ -38,6 +38,7 @@ use crate::error::to_datafusion_error;
 use crate::merge_into::ok_result;
 use crate::physical_plan::sink::to_paimon_batch;
 use crate::sql_context::SQLContext;
+use crate::sql_projection;
 use crate::table::PaimonTableProvider;
 
 pub(crate) fn validate_table(table: &Table, operation: &str) -> DFResult<()> {
@@ -140,12 +141,12 @@ pub(crate) async fn plan_input(
     let where_clause = selection
         .map(|predicate| format!(" WHERE {predicate}"))
         .unwrap_or_default();
-    let matched = ctx
-        .ctx()
-        .sql(&format!(
-            "SELECT {projection} FROM {table_ref}{where_clause}"
-        ))
-        .await?;
+    let matched = sql_projection::sql(
+        ctx.ctx(),
+        &format!("SELECT {projection} FROM {table_ref}{where_clause}"),
+        Default::default(),
+    )
+    .await?;
     let is_live_target = |provider: &PaimonTableProvider| {
         let source = provider.table();
         source.identifier() == table.identifier()

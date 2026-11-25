@@ -57,6 +57,7 @@ use paimon::table::{CopyOnWriteMergeWriter, DataEvolutionDeleteWriter, DataSplit
 
 use crate::error::to_datafusion_error;
 use crate::sql_context::SQLContext;
+use crate::sql_projection;
 use crate::table::PaimonTableProvider;
 
 mod normalize;
@@ -1219,7 +1220,10 @@ pub(crate) async fn build_partition_set_from_where(
         None => String::new(),
     };
     let sql = format!("SELECT DISTINCT {cols} FROM {table_ref}{where_part}");
-    let batches = ctx.ctx().sql(&sql).await?.collect().await?;
+    let batches = sql_projection::sql(ctx.ctx(), &sql, Default::default())
+        .await?
+        .collect()
+        .await?;
 
     build_partition_set_from_batches(table, &batches)
 }

@@ -45,6 +45,7 @@ use crate::merge_into::{
 };
 use crate::primary_key_dml;
 use crate::sql_context::{normalize_schema_identifier, SQLContext};
+use crate::sql_projection;
 
 /// Execute an UPDATE statement on a Paimon table.
 pub(crate) async fn execute_update(
@@ -226,10 +227,21 @@ async fn execute_update_once(
 
     let alias = dml_table_alias(ctx.ctx(), &table_ref);
     let select_clause = select_parts.join(", ");
+    let input_columns = table
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| quote_identifier(field.name()))
+        .chain(std::iter::once(quote_identifier("_ROW_ID")))
+        .collect::<Vec<_>>()
+        .join(", ");
     let query_sql = format!(
-        "SELECT {select_clause} FROM (SELECT * FROM {table_ref}{selection_clause}) AS {alias}"
+        "SELECT {select_clause} FROM (SELECT {input_columns} FROM {table_ref}{selection_clause}) AS {alias}"
     );
-    let batches = ctx.ctx().sql(&query_sql).await?.collect().await?;
+    let batches = sql_projection::sql(ctx.ctx(), &query_sql, Default::default())
+        .await?
+        .collect()
+        .await?;
 
     // 4. Project update columns (rename __upd_X → X)
     let total_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -355,7 +367,10 @@ async fn execute_cow_update_inner(
         "SELECT {select_clause} FROM \
          (SELECT * FROM {cow_table_name} AS {alias}{selection_clause}) AS {alias}"
     );
-    let join_result = ctx.sql(&query_sql).await?.collect().await?;
+    let join_result = sql_projection::sql(ctx, &query_sql, Default::default())
+        .await?
+        .collect()
+        .await?;
 
     let mut update_value_batches: Vec<RecordBatch> = Vec::new();
     let mut batch_counter: usize = 0;

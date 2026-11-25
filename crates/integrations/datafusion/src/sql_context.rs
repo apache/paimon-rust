@@ -90,6 +90,7 @@ use paimon::spec::{
     VarBinaryType, VarCharType, VariantType,
 };
 
+use crate::catalog::{view_hides_row_id_in_wildcard, VIEW_HIDE_ROW_ID_IN_WILDCARD_OPTION};
 use crate::error::to_datafusion_error;
 use crate::table::PaimonTableProvider;
 use crate::{BlobReaderRegistry, DynamicOptions};
@@ -786,7 +787,7 @@ impl SQLContext {
                             .map_err(|error| {
                                 DataFusionError::Plan(format!("Invalid view SQL: {error}"))
                             })?;
-                        crate::read_files::sql(
+                        crate::sql_projection::sql(
                             &self.ctx,
                             &Statement::CreateView(bound_view).to_string(),
                             options,
@@ -962,9 +963,9 @@ impl SQLContext {
                     &current_database,
                 )
                 .await?;
-                crate::read_files::sql(&self.ctx, &expanded.to_string(), options).await
+                crate::sql_projection::sql(&self.ctx, &expanded.to_string(), options).await
             }
-            _ => crate::read_files::sql(&self.ctx, sql, options).await,
+            _ => crate::sql_projection::sql(&self.ctx, sql, options).await,
         }
     }
 
@@ -1056,7 +1057,7 @@ impl SQLContext {
             &current_database,
         )
         .await?;
-        crate::read_files::sql(&self.ctx, &expanded, sql_options).await
+        crate::sql_projection::sql(&self.ctx, &expanded, sql_options).await
     }
 
     async fn time_travel_provider(
@@ -1342,7 +1343,7 @@ impl SQLContext {
         if let Some(query) = &ct.query {
             // CREATE TEMPORARY TABLE ... AS SELECT ...
             let query_sql = query.to_string();
-            let df = crate::read_files::sql(&self.ctx, &query_sql, sql_options).await?;
+            let df = crate::sql_projection::sql(&self.ctx, &query_sql, sql_options).await?;
             let schema = df.schema().inner().clone();
             // Derive the result schema before execution so a query that returns
             // no batches still exposes its declared names and logical types.
@@ -1541,6 +1542,12 @@ impl SQLContext {
             .iter()
             .map(|field| field.name().to_string())
             .collect::<Vec<_>>();
+        let legacy_wildcard = !view_hides_row_id_in_wildcard(&view)?
+            && (view.query_for("datafusion").contains('*')
+                || view
+                    .schema()
+                    .options()
+                    .contains_key(VIEW_HIDE_ROW_ID_IN_WILDCARD_OPTION));
         let definition = view_definition(
             &catalog_name,
             identifier.database(),
@@ -1548,6 +1555,7 @@ impl SQLContext {
             &columns,
             &typed_view_query(&view)?,
             false,
+            legacy_wildcard,
         );
         self.show_create_result(
             catalog_name,
@@ -1603,7 +1611,7 @@ impl SQLContext {
                     self.ctx.enable_ident_normalization(),
                 )?;
                 Ok(view_definition(
-                    &catalog, &database, &view, &columns, &query_sql, temporary,
+                    &catalog, &database, &view, &columns, &query_sql, temporary, false,
                 ))
             })
             .transpose()?;
@@ -1992,7 +2000,7 @@ impl SQLContext {
 
     async fn handle_merge_into(&self, merge: &Merge, options: SQLOptions) -> DFResult<DataFrame> {
         let merge = self.normalize_merge_into(merge).await?;
-        crate::read_files::sql(&self.ctx, &merge.to_string(), options).await
+        crate::sql_projection::sql(&self.ctx, &merge.to_string(), options).await
     }
 
     async fn normalize_merge_into(&self, merge: &Merge) -> DFResult<Merge> {
@@ -2154,7 +2162,7 @@ impl SQLContext {
         let source = insert.source.as_ref().ok_or_else(|| {
             DataFusionError::Plan("INSERT OVERWRITE requires a source query".into())
         })?;
-        let df = crate::read_files::sql(&self.ctx, &source.to_string(), sql_options).await?;
+        let df = crate::sql_projection::sql(&self.ctx, &source.to_string(), sql_options).await?;
 
         let all_fields = table.schema().fields();
         let non_static_fields: Vec<&PaimonDataField> = all_fields
@@ -2373,7 +2381,7 @@ impl SQLContext {
                     &state.config_options().catalog.default_schema,
                 )
                 .await?;
-                crate::read_files::sql(&self.ctx, &expanded_query, sql_options).await
+                crate::sql_projection::sql(&self.ctx, &expanded_query, sql_options).await
             })
             .await?;
             let logical_plan = df.logical_plan().clone();
@@ -2396,7 +2404,7 @@ impl SQLContext {
             self.register_temp_table(table_ref, view_table)?;
             ok_result(&self.ctx)
         } else {
-            validate_persistent_create_view(create_view)?;
+            let hide_row_id = validate_persistent_create_view(create_view)?;
             let (catalog, catalog_name, identifier) =
                 self.resolve_catalog_and_table(&create_view.name)?;
             let mut state = self.ctx.state();
@@ -2411,7 +2419,12 @@ impl SQLContext {
                 identifier.database(),
             )
             .await?;
-            let logical_plan = state.create_logical_plan(&expanded_query).await?;
+            let logical_plan = crate::sql_projection::view_plan(
+                &SessionContext::new_with_state(state),
+                &expanded_query,
+                hide_row_id,
+            )
+            .await?;
             let mut arrow_fields = logical_plan
                 .schema()
                 .as_arrow()
@@ -2452,7 +2465,10 @@ impl SQLContext {
                 query_sql.clone(),
                 HashMap::from([("datafusion".to_string(), query_sql)]),
                 None,
-                HashMap::new(),
+                HashMap::from([(
+                    VIEW_HIDE_ROW_ID_IN_WILDCARD_OPTION.to_string(),
+                    hide_row_id.to_string(),
+                )]),
             );
             catalog
                 .create_view(&identifier, schema, create_view.if_not_exists)
@@ -2992,6 +3008,7 @@ fn view_definition(
     columns: &[String],
     query: &str,
     temporary: bool,
+    legacy_wildcard: bool,
 ) -> String {
     let quote = |name: &str| Ident::with_quote('"', name).to_string();
     let name = [catalog, database, view].map(quote).join(".");
@@ -3008,7 +3025,12 @@ fn view_definition(
         )
     };
     let modifier = if temporary { "TEMPORARY " } else { "" };
-    format!("CREATE {modifier}VIEW {name}{columns} AS {query}")
+    let options = if legacy_wildcard {
+        format!(" WITH ('{VIEW_HIDE_ROW_ID_IN_WILDCARD_OPTION}' = FALSE)")
+    } else {
+        String::new()
+    };
+    format!("CREATE {modifier}VIEW {name}{columns}{options} AS {query}")
 }
 
 /// DDL from the engine provider of an external table.
@@ -3256,7 +3278,7 @@ fn parse_alter_column_comment(sql: &str) -> DFResult<Option<Statement>> {
     parse().map_err(|e| DataFusionError::Plan(format!("SQL parse error: {e}")))
 }
 
-fn validate_persistent_create_view(create_view: &CreateView) -> DFResult<()> {
+fn validate_persistent_create_view(create_view: &CreateView) -> DFResult<bool> {
     let unsupported = if create_view.or_alter {
         Some("CREATE OR ALTER VIEW is not supported")
     } else if create_view.or_replace {
@@ -3268,12 +3290,7 @@ fn validate_persistent_create_view(create_view: &CreateView) -> DFResult<()> {
     } else if create_view.name_before_not_exists {
         Some("CREATE VIEW with the name before IF NOT EXISTS is not supported")
     } else {
-        match &create_view.options {
-            CreateTableOptions::None => None,
-            CreateTableOptions::With(_) => Some("CREATE VIEW WITH options are not supported"),
-            CreateTableOptions::Options(_) => Some("CREATE VIEW OPTIONS are not supported"),
-            _ => Some("CREATE VIEW options are not supported"),
-        }
+        None
     };
     if let Some(message) = unsupported {
         return Err(DataFusionError::Plan(message.to_string()));
@@ -3321,7 +3338,32 @@ fn validate_persistent_create_view(create_view: &CreateView) -> DFResult<()> {
             "CREATE VIEW column options are not supported".to_string(),
         ));
     }
-    Ok(())
+    match &create_view.options {
+        CreateTableOptions::None => Ok(true),
+        CreateTableOptions::With(options) => match options.as_slice() {
+            [SqlOption::KeyValue { key, value }]
+                if key.value == VIEW_HIDE_ROW_ID_IN_WILDCARD_OPTION =>
+            {
+                if let SqlExpr::Value(value) = value {
+                    if let SqlValue::Boolean(hide_row_id) = value.value {
+                        return Ok(hide_row_id);
+                    }
+                }
+                Err(plan_datafusion_err!(
+                    "CREATE VIEW option '{VIEW_HIDE_ROW_ID_IN_WILDCARD_OPTION}' requires a boolean literal"
+                ))
+            }
+            _ => Err(plan_datafusion_err!(
+                "CREATE VIEW WITH options are not supported"
+            )),
+        },
+        CreateTableOptions::Options(_) => Err(plan_datafusion_err!(
+            "CREATE VIEW OPTIONS are not supported"
+        )),
+        _ => Err(plan_datafusion_err!(
+            "CREATE VIEW options are not supported"
+        )),
+    }
 }
 
 /// Quick check whether the SQL looks like a CREATE TABLE statement.
@@ -5557,6 +5599,147 @@ mod tests {
                 "cycle {cycle}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn persistent_wildcard_views_preserve_row_id_visibility() {
+        let warehouse = tempfile::tempdir().unwrap();
+        let mut options = paimon::Options::new();
+        options.set(
+            paimon::CatalogOptions::WAREHOUSE,
+            warehouse.path().to_string_lossy(),
+        );
+        let storage = Arc::new(paimon::FileSystemCatalog::new(options).unwrap());
+        let catalog = Arc::new(MockCatalog::new());
+        let mut ctx = make_sql_context(Arc::clone(&catalog)).await;
+        ctx.register_catalog("storage", storage).await.unwrap();
+        ctx.sql(
+            "CREATE TABLE storage.default.evolution_rows (id BIGINT) \
+             WITH ('data-evolution.enabled' = 'true', 'row-tracking.enabled' = 'true')",
+        )
+        .await
+        .unwrap();
+        ctx.sql("INSERT INTO storage.default.evolution_rows (id) VALUES (42)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let legacy = Identifier::new("default", "legacy_rows");
+        let query = "SELECT * FROM storage.default.evolution_rows";
+        let fields = vec![
+            PaimonDataField::new(
+                0,
+                "payload".into(),
+                PaimonDataType::BigInt(BigIntType::new()),
+            ),
+            PaimonDataField::new(
+                1,
+                "tracking_id".into(),
+                PaimonDataType::BigInt(BigIntType::new()),
+            ),
+        ];
+        catalog.add_view(paimon::catalog::View::new(
+            legacy,
+            paimon::catalog::ViewSchema::new(
+                fields,
+                query.into(),
+                HashMap::new(),
+                None,
+                HashMap::new(),
+            ),
+        ));
+        let assert_legacy_rows = || async {
+            let batches = ctx
+                .sql("SELECT payload, tracking_id FROM legacy_rows")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(batches[0].num_rows(), 1);
+            assert_eq!(
+                ScalarValue::try_from_array(batches[0].column(0), 0).unwrap(),
+                ScalarValue::Int64(Some(42))
+            );
+            assert_eq!(
+                ScalarValue::try_from_array(batches[0].column(1), 0).unwrap(),
+                ScalarValue::Int64(Some(0))
+            );
+        };
+        assert_legacy_rows().await;
+
+        // Equal widths under the opposite visibility mode must not make an
+        // altered business column bind to a view's row-ID position, or vice versa.
+        let add_audit = "ALTER TABLE storage.default.evolution_rows ADD COLUMN audit BIGINT";
+        ctx.sql(add_audit).await.unwrap();
+        let error = ctx
+            .sql("SELECT * FROM legacy_rows")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("declares 2 fields but its query returns 3"),
+            "{error}"
+        );
+        let legacy_ddl = shown_view_definition(&ctx, "legacy_rows").await;
+        assert!(
+            legacy_ddl.contains(&format!(
+                "WITH ('{VIEW_HIDE_ROW_ID_IN_WILDCARD_OPTION}' = FALSE)"
+            )),
+            "{legacy_ddl}"
+        );
+
+        let current = Identifier::new("default", "current_rows");
+        ctx.sql(&format!(
+            "CREATE VIEW current_rows (payload, audit_value) AS {query}"
+        ))
+        .await
+        .unwrap();
+        let view = catalog.get_view(&current).await.unwrap();
+        assert!(view_hides_row_id_in_wildcard(&view).unwrap());
+        assert_eq!(view.query_for("datafusion"), query);
+        let current_ddl = shown_view_definition(&ctx, "current_rows").await;
+        assert_eq!(
+            ctx.sql("SELECT * FROM current_rows")
+                .await
+                .unwrap()
+                .schema()
+                .fields()
+                .len(),
+            2
+        );
+
+        ctx.sql("ALTER TABLE storage.default.evolution_rows DROP COLUMN audit")
+            .await
+            .unwrap();
+        let error = ctx
+            .sql("SELECT * FROM current_rows")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("declares 2 fields but its query returns 1"),
+            "{error}"
+        );
+        ctx.sql("DROP VIEW legacy_rows").await.unwrap();
+        ctx.sql(&legacy_ddl).await.unwrap();
+        assert_legacy_rows().await;
+        let canonical = |ddl: &str| parse_sql_statements(ddl).unwrap().0[0].to_string();
+        assert_eq!(
+            canonical(&shown_view_definition(&ctx, "legacy_rows").await),
+            canonical(&legacy_ddl),
+        );
+
+        ctx.sql(add_audit).await.unwrap();
+        ctx.sql("DROP VIEW current_rows").await.unwrap();
+        ctx.sql(&current_ddl).await.unwrap();
+        assert_eq!(
+            canonical(&shown_view_definition(&ctx, "current_rows").await),
+            canonical(&current_ddl),
+        );
+        assert!(view_hides_row_id_in_wildcard(&catalog.get_view(&current).await.unwrap()).unwrap());
     }
 
     #[tokio::test]
@@ -8398,6 +8581,80 @@ mod tests {
             .await
             .is_err());
         assert_eq!(catalog.get_count(), 1);
+    }
+
+    fn table_with_int64_value(value: i64) -> Arc<dyn TableProvider> {
+        let batch = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int64Array::from(vec![value])) as ArrayRef,
+        )])
+        .unwrap();
+        Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap())
+    }
+
+    #[tokio::test]
+    async fn wildcard_query_reuses_catalog_schema_for_one_statement() {
+        let catalog = Arc::new(ProbeTrackingCatalog::new());
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog_with_default_db("paimon", catalog.clone(), None)
+            .await
+            .unwrap();
+        ctx.register_temp_table("paimon.analytics.t", table_with_int64_value(42))
+            .unwrap();
+
+        for expected_lookups in [1, 2] {
+            let batches = ctx
+                .sql("SELECT * FROM paimon.analytics.t")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert_eq!(batches[0].num_rows(), 1);
+            assert_eq!(catalog.get_count(), expected_lookups);
+        }
+    }
+
+    #[tokio::test]
+    async fn wildcard_query_keeps_independent_catalog_mounts_separate() {
+        let catalog: Arc<dyn Catalog> = Arc::new(ProbeTrackingCatalog::new());
+        let ctx = SQLContext::new();
+        for (name, value) in [("left_mount", 1), ("right_mount", 2)] {
+            let provider = crate::PaimonCatalogProvider::new(
+                None,
+                catalog.clone(),
+                Default::default(),
+                Default::default(),
+                None,
+            );
+            provider
+                .register_temp_table("analytics", "t", table_with_int64_value(value))
+                .unwrap();
+            ctx.ctx().register_catalog(name, Arc::new(provider));
+        }
+
+        let batches = ctx
+            .sql(
+                "SELECT * FROM left_mount.analytics.t AS l
+                 CROSS JOIN right_mount.analytics.t AS r",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let actual: Vec<_> = batches[0]
+            .columns()
+            .iter()
+            .map(|column| {
+                column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .collect();
+        assert_eq!(actual, [1, 2]);
     }
 
     fn assert_sql_type_to_paimon(

@@ -52,6 +52,7 @@ mod object;
 pub(crate) use object::ObjectTableProvider;
 
 const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
+pub(crate) const VIRTUAL_ROW_ID_METADATA: &str = "paimon.virtual_row_id";
 
 pub(crate) fn datafusion_read_fields(table: &Table) -> Vec<DataField> {
     let mut fields = table.schema().fields().to_vec();
@@ -74,9 +75,13 @@ pub(crate) fn datafusion_arrow_schema(
     let fields = paimon_schema
         .fields()
         .iter()
-        .map(|field| {
+        .zip(fields)
+        .map(|(field, paimon_field)| {
             let mut metadata = field.metadata().clone();
             metadata.remove(PARQUET_FIELD_ID_META_KEY);
+            if paimon_field.id() == ROW_ID_FIELD_ID {
+                metadata.insert(VIRTUAL_ROW_ID_METADATA.to_string(), "true".to_string());
+            }
             let data_type = match field.data_type() {
                 ArrowDataType::Utf8 if schema_force_view_types => ArrowDataType::Utf8View,
                 data_type => data_type.clone(),
