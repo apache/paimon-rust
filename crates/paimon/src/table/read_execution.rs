@@ -183,11 +183,8 @@ pub(super) fn execute(
 /// Estimate decoded bytes from managed BLOB files; unknown sizes need opt-in.
 fn blob_group_cost(group: &[DataSplit], budget: &BlobOutputBudget) -> Option<u32> {
     let permits = budget_permits(budget.max_bytes);
-    if budget.unknown_external {
-        return budget.serialize_unknown.then_some(permits);
-    }
     let mut file_bytes = 0_u64;
-    let mut has_unknown = false;
+    let mut has_unknown = budget.unknown_external;
     for split in group {
         let mut bytes = 0_u64;
         let mut unknown = false;
@@ -826,13 +823,23 @@ mod tests {
             blob_group_cost(&[managed.clone(), descriptor.clone()], &budget),
             Some(17)
         );
+        let with_view = budget_split(vec![
+            split_file("view.parquet", 1024, Some(vec!["preview"])),
+            split_file(
+                "image.blob",
+                17 * OUTPUT_BYTE_UNIT as i64,
+                Some(vec!["image"]),
+            ),
+        ]);
         budget.unknown_external = true;
         assert_eq!(
-            blob_group_cost(std::slice::from_ref(&managed), &budget),
-            None
+            blob_group_cost(std::slice::from_ref(&with_view), &budget),
+            Some(17)
         );
+        assert_eq!(blob_group_cost(&[mixed.clone()], &budget), Some(17));
+        assert_eq!(blob_group_cost(&[descriptor.clone()], &budget), None);
         budget.serialize_unknown = true;
-        assert_eq!(blob_group_cost(&[managed], &budget), Some(64));
+        assert_eq!(blob_group_cost(&[with_view], &budget), Some(64));
         budget.unknown_external = false;
         assert_eq!(blob_group_cost(&[descriptor], &budget), Some(64));
         assert_eq!(blob_group_cost(&[mixed], &budget), Some(64));
