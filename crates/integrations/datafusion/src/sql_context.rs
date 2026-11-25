@@ -46,6 +46,7 @@
 //! - `TRUNCATE TABLE db.t PARTITION (col = val, ...)`
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -55,6 +56,10 @@ use datafusion::arrow::array::{
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use datafusion::catalog::{
+    CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList,
+    MemorySchemaProvider, SchemaProvider,
+};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{plan_datafusion_err, DFSchema, ScalarValue, TableReference};
 use datafusion::datasource::{MemTable, TableProvider};
@@ -65,15 +70,16 @@ use datafusion::execution::session_state::SessionState;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::{ColumnarValue, Expr as LogicalExpr, LogicalPlan, Volatility};
 use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::planner::{object_name_to_table_reference, IdentNormalizer};
 use datafusion::sql::sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, BinaryLength, CharacterLength, ColumnDef,
     ColumnOption, CommentDef, CommentObject, CreateFunction, CreateFunctionBody, CreateTable,
-    CreateTableOptions, CreateView, DataType as SqlDataType, Delete, Expr as SqlExpr,
-    ExprWithAlias, FromTable, FunctionBehavior, FunctionReturnType, Ident, Insert, Merge,
-    ObjectName, ObjectType, RenameTableNameKind, Reset, ResetStatement, Set, SetExpr,
-    ShowCreateObject, SqlOption, Statement, TableFactor, TableObject, Truncate, Update, Use,
-    Value as SqlValue,
+    CreateTableOptions, CreateView, DataType as SqlDataType, Delete, ExcludeSelectItem,
+    Expr as SqlExpr, ExprWithAlias, FromTable, FunctionBehavior, FunctionReturnType, Ident, Insert,
+    Merge, ObjectName, ObjectType, Query, RenameTableNameKind, Reset, ResetStatement, SelectItem,
+    Set, SetExpr, ShowCreateObject, SqlOption, Statement, TableFactor, TableObject, Truncate,
+    Update, Use, Value as SqlValue, Visit, Visitor, WildcardAdditionalOptions,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
@@ -87,9 +93,10 @@ use paimon::spec::{
     CoreOptions, DataField as PaimonDataField, DataType as PaimonDataType, DateType, Datum,
     DecimalType, DoubleType, FloatType, IntType, LocalZonedTimestampType, MapType as PaimonMapType,
     RowType as PaimonRowType, SchemaChange, SmallIntType, TimestampType, TinyIntType,
-    VarBinaryType, VarCharType, VariantType,
+    VarBinaryType, VarCharType, VariantType, ROW_ID_FIELD_NAME,
 };
 
+use crate::catalog::{PaimonCatalogProvider, PaimonSchemaProvider};
 use crate::error::to_datafusion_error;
 use crate::table::PaimonTableProvider;
 use crate::{BlobReaderRegistry, DynamicOptions};
@@ -962,7 +969,16 @@ impl SQLContext {
                     &current_database,
                 )
                 .await?;
-                crate::read_files::sql(&self.ctx, &expanded.to_string(), options).await
+                let sql = expanded.to_string();
+                if let Statement::Query(query) = &expanded {
+                    if let Some(plan) =
+                        Box::pin(plan_single_table_wildcard(&self.ctx, query, &sql)).await?
+                    {
+                        options.verify_plan(&plan)?;
+                        return self.ctx.execute_logical_plan(plan).await;
+                    }
+                }
+                crate::read_files::sql(&self.ctx, &sql, options).await
             }
             _ => crate::read_files::sql(&self.ctx, sql, options).await,
         }
@@ -2909,6 +2925,147 @@ impl SQLContext {
         let (_catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
         Ok(identifier)
     }
+}
+
+/// Plan a direct single-table SELECT against the same provider used to decide
+/// whether to hide the row ID.
+async fn plan_single_table_wildcard(
+    ctx: &SessionContext,
+    query: &Query,
+    sql: &str,
+) -> DFResult<Option<LogicalPlan>> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    if !matches!(select.from.as_slice(), [from] if from.joins.is_empty()
+        && matches!(from.relation, TableFactor::Table { args: None, .. }))
+        || !select.projection.iter().any(|item| {
+            matches!(item, SelectItem::Wildcard(options) | SelectItem::QualifiedWildcard(_, options)
+                if *options == WildcardAdditionalOptions::default())
+        })
+    {
+        return Ok(None);
+    }
+
+    // Resolve names from the configured dialect's AST. Inject EXCLUDE after
+    // parsing so the caller's dialect need not support its syntax.
+    let mut state = ctx.state();
+    let config = state.config_options();
+    let Ok(DataFusionStatement::Statement(mut statement)) =
+        state.sql_to_statement(sql, &config.sql_parser.dialect)
+    else {
+        return Ok(None);
+    };
+    let Statement::Query(query) = statement.as_mut() else {
+        return Ok(None);
+    };
+
+    // The planning catalog below contains a single binding.
+    #[derive(Default)]
+    struct MultipleSources(bool);
+    impl Visitor for MultipleSources {
+        type Break = ();
+
+        fn pre_visit_table_factor(&mut self, _: &TableFactor) -> ControlFlow<()> {
+            if std::mem::replace(&mut self.0, true) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    if query.with.is_some()
+        || !query.pipe_operators.is_empty()
+        || query.visit(&mut MultipleSources::default()).is_break()
+    {
+        return Ok(None);
+    }
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return Ok(None);
+    };
+    let [from] = select.from.as_slice() else {
+        return Ok(None);
+    };
+    let TableFactor::Table {
+        name,
+        alias,
+        args: None,
+        version: None,
+        sample: None,
+        ..
+    } = &from.relation
+    else {
+        return Ok(None);
+    };
+    if select.into.is_some()
+        || alias
+            .as_ref()
+            .is_some_and(|alias| !alias.columns.is_empty())
+    {
+        return Ok(None);
+    }
+
+    let reference =
+        object_name_to_table_reference(name.clone(), config.sql_parser.enable_ident_normalization)?;
+    let reference = reference.resolve(
+        &config.catalog.default_catalog,
+        &config.catalog.default_schema,
+    );
+    if !state
+        .catalog_list()
+        .catalog(&reference.catalog)
+        .is_some_and(|catalog| catalog.is::<PaimonCatalogProvider>())
+    {
+        return Ok(None);
+    }
+    let table = match state.schema_for_ref(reference.clone()) {
+        Ok(schema) if schema.is::<PaimonSchemaProvider>() => schema.table(&reference.table).await?,
+        Ok(_) => return Ok(None),
+        Err(_) => None,
+    };
+    if table.as_ref().is_some_and(|table| {
+        table
+            .downcast_ref::<PaimonTableProvider>()
+            .is_some_and(|provider| {
+                provider
+                    .table()
+                    .schema()
+                    .core_options()
+                    .row_tracking_enabled()
+                    && provider
+                        .schema()
+                        .column_with_name(ROW_ID_FIELD_NAME)
+                        .is_some()
+            })
+    }) {
+        for item in &mut select.projection {
+            match item {
+                SelectItem::Wildcard(options) | SelectItem::QualifiedWildcard(_, options)
+                    if *options == WildcardAdditionalOptions::default() =>
+                {
+                    options.opt_exclude = Some(ExcludeSelectItem::Single(
+                        vec![Ident::with_quote('"', ROW_ID_FIELD_NAME)].into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Keep the resolved provider local to this plan, under its original name.
+    let schema = Arc::new(MemorySchemaProvider::new());
+    if let Some(table) = table {
+        schema.register_table(reference.table.to_string(), table)?;
+    }
+    let catalog = Arc::new(MemoryCatalogProvider::new());
+    catalog.register_schema(&reference.schema, schema)?;
+    let catalogs = Arc::new(MemoryCatalogProviderList::new());
+    catalogs.register_catalog(reference.catalog.to_string(), catalog);
+    state.register_catalog_list(catalogs);
+    state
+        .statement_to_plan(DataFusionStatement::Statement(statement))
+        .await
+        .map(Some)
 }
 
 fn typed_view_query(view: &paimon::catalog::View) -> DFResult<String> {
@@ -8398,6 +8555,24 @@ mod tests {
             .await
             .is_err());
         assert_eq!(catalog.get_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn single_table_wildcard_resolves_database_once() {
+        let catalog = Arc::new(ProbeTrackingCatalog::new());
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog_with_default_db("paimon", catalog.clone(), None)
+            .await
+            .unwrap();
+        ctx.sql("CREATE TEMPORARY TABLE paimon.analytics.source AS SELECT 1 AS id")
+            .await
+            .unwrap();
+
+        let before = catalog.get_count();
+        ctx.sql("SELECT * FROM paimon.analytics.source")
+            .await
+            .unwrap();
+        assert_eq!(catalog.get_count(), before + 1);
     }
 
     fn assert_sql_type_to_paimon(
