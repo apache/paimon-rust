@@ -25,7 +25,8 @@ use paimon::arrow::ReadBudget;
 use paimon::io::FileBlockCache;
 use paimon::resource::ResourceContext;
 use paimon::spec::{
-    BinaryRow, BlobType, DataType, Datum, IntType, PredicateBuilder, Schema, TableSchema,
+    BinaryRow, BlobType, DataType, Datum, IntType, PredicateBuilder, Schema, SchemaChange,
+    TableSchema,
 };
 use paimon::table::{DataSplitBuilder, Table};
 use parquet::arrow::ArrowWriter;
@@ -865,47 +866,118 @@ impl FileBlockCache for ConcurrentPkFiles {
     async fn invalidate_prefix(&self, _prefix: &str) {}
 }
 
-#[tokio::test]
-async fn managed_pk_blob_splits_read_concurrently_by_default() {
-    let schema = Schema::builder()
+async fn write_partitioned_blobs(
+    mode: &str,
+    partitions: i32,
+    payloads: &[&[u8]],
+    batch_size: usize,
+    output_budget: Option<&str>,
+) -> (paimon::io::FileIO, Table) {
+    let mut schema = Schema::builder()
         .column("p", DataType::Int(IntType::new()))
         .column("id", DataType::Int(IntType::new()))
         .column("payload", DataType::Blob(BlobType::new()))
         .partition_keys(["p"])
-        .primary_key(["p", "id"])
-        .option("bucket", "1")
-        .build()
-        .unwrap();
-    let (io, table) = memory_table("memory:/concurrent_pk_blobs", TableSchema::new(0, &schema));
+        .option("read.batch-size", batch_size.to_string());
+    if mode == "pk" {
+        schema = schema.primary_key(["p", "id"]).option("bucket", "1");
+    } else {
+        schema = schema
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.write-cols-optimization.enabled", "true");
+    }
+    if let Some(output_budget) = output_budget {
+        schema = schema.option("read.blob.output.max-buffered-bytes", output_budget);
+    }
+    let schema = schema.build().unwrap();
+    let (io, table) = memory_table(
+        &format!("memory:/parallel_blobs_{mode}"),
+        TableSchema::new(0, &schema),
+    );
     setup_dirs(&io, table.location()).await;
     persist_table_schema(&io, table.location(), table.schema()).await;
     let builder = table.new_write_builder();
     let mut writer = builder.new_write().unwrap();
-    let batch = RecordBatch::try_from_iter([
-        ("p", Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef),
-        ("id", Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef),
-        (
-            "payload",
-            Arc::new(LargeBinaryArray::from(vec![b"hello".as_slice(), b"world!"])) as ArrayRef,
-        ),
-    ])
-    .unwrap();
-    writer.write_arrow_batch(&batch).await.unwrap();
+    for partition in 0..partitions {
+        let batch = RecordBatch::try_from_iter([
+            (
+                "p",
+                Arc::new(Int32Array::from(vec![partition; payloads.len()])) as ArrayRef,
+            ),
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(0..payloads.len() as i32)) as ArrayRef,
+            ),
+            (
+                "payload",
+                Arc::new(LargeBinaryArray::from(payloads.to_vec())) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+    }
     builder
         .new_commit()
         .commit(writer.prepare_commit().await.unwrap())
         .await
         .unwrap();
+    (io, table)
+}
+
+#[tokio::test]
+async fn managed_pk_blob_splits_read_concurrently_by_default() {
+    check_parallel_blob_reads("pk", None).await;
+}
+
+#[tokio::test]
+async fn optimized_de_blob_splits_read_concurrently_with_explicit_budget() {
+    check_parallel_blob_reads("de", Some("4mb")).await;
+}
+
+async fn check_parallel_blob_reads(mode: &str, output_budget: Option<&str>) {
+    let (io, table) =
+        write_partitioned_blobs(mode, 2, &[b"hello", b"world!"], 2048, output_budget).await;
     let plan = table.new_read_builder().new_scan().plan().await.unwrap();
     let splits = plan.splits();
     assert_eq!(splits.len(), 2);
-    assert!(splits
+    let parquet_names = splits
         .iter()
-        .flat_map(|s| s.data_files())
-        .all(|f| f.write_cols.is_none() && f.file_name.ends_with(".parquet")));
-    for ordered in [false, true] {
+        .map(|split| {
+            let file = split
+                .data_files()
+                .iter()
+                .find(|f| f.file_name.ends_with(".parquet"))
+                .unwrap();
+            assert!(file.write_cols.is_none());
+            file.file_name.clone()
+        })
+        .collect::<Vec<_>>();
+    if mode == "de" {
+        assert!(splits.iter().all(|split| split
+            .data_files()
+            .iter()
+            .any(|file| file.file_name.ends_with(".blob") && file.file_size < 1024 * 1024)));
+    }
+    let mut read_cases = vec![
+        (table.schema().clone(), false),
+        (table.schema().clone(), true),
+    ];
+    if mode == "de" {
+        let evolved = table
+            .schema()
+            .apply_changes(vec![SchemaChange::add_column(
+                "new_value".into(),
+                DataType::Int(IntType::new()),
+            )])
+            .unwrap();
+        assert_ne!(evolved.id(), table.schema().id());
+        persist_table_schema(&io, table.location(), &evolved).await;
+        read_cases.push((evolved, false));
+    }
+    for (schema, ordered) in read_cases {
         let gate = Arc::new(ConcurrentPkFiles {
-            first_file: splits[0].data_files()[0].file_name.clone(),
+            first_file: parquet_names[0].clone(),
             first_waited: AtomicBool::new(false),
             later_started: AtomicBool::new(false),
             release: Notify::new(),
@@ -918,7 +990,7 @@ async fn managed_pk_blob_splits_read_concurrently_by_default() {
             io,
             table.identifier().clone(),
             table.location().into(),
-            table.schema().clone(),
+            schema,
             None,
         );
         let output = read_table
@@ -935,7 +1007,7 @@ async fn managed_pk_blob_splits_read_concurrently_by_default() {
             output.try_collect::<Vec<_>>(),
         )
         .await
-        .expect("a small PK BLOB split serialized the other partition")
+        .expect("a small BLOB split serialized the other partition")
         .unwrap();
         assert!(gate.first_waited.load(Ordering::SeqCst));
         assert!(gate.later_started.load(Ordering::SeqCst));
@@ -953,6 +1025,92 @@ async fn managed_pk_blob_splits_read_concurrently_by_default() {
             })
             .collect::<Vec<_>>();
         payloads.sort();
-        assert_eq!(payloads, vec![b"hello".to_vec(), b"world!".to_vec()]);
+        assert_eq!(
+            payloads,
+            vec![
+                b"hello".to_vec(),
+                b"hello".to_vec(),
+                b"world!".to_vec(),
+                b"world!".to_vec()
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn ordered_single_blob_split_runs_without_tokio() {
+    let (_, table) = write_partitioned_blobs("de", 1, &[b"one", b"two"], 2048, Some("4mb")).await;
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    assert_eq!(plan.splits().len(), 1);
+    let output = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .with_parallelism(8)
+        .unwrap()
+        .with_ordered(true)
+        .to_arrow(plan.splits())
+        .unwrap();
+    let batches =
+        std::thread::spawn(move || futures::executor::block_on(output.try_collect::<Vec<_>>()))
+            .join()
+            .unwrap()
+            .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+}
+
+#[tokio::test]
+async fn unordered_de_keeps_reservation_between_source_batch_slices() {
+    use futures::StreamExt;
+
+    let large = vec![42; 1536 * 1024];
+    let mut payloads = vec![b"x".as_slice(); 1024];
+    payloads.push(&large);
+    let (_, table) = write_partitioned_blobs("de", 3, &payloads, 2048, Some("2mb")).await;
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    assert_eq!(plan.splits().len(), 3);
+    for split in plan.splits() {
+        let blob = split
+            .data_files()
+            .iter()
+            .find(|f| f.file_name.ends_with(".blob"))
+            .unwrap();
+        assert!((1024 * 1024..2 * 1024 * 1024).contains(&blob.file_size));
+    }
+    let output = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .with_parallelism(3)
+        .unwrap()
+        .with_ordered(false)
+        .to_arrow(plan.splits())
+        .unwrap();
+    let (partitions, batch_sizes) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut output = output;
+            let mut partitions = Vec::new();
+            let mut batch_sizes = Vec::new();
+            while let Some(batch) = output.next().await {
+                let batch = batch.unwrap();
+                let partition = batch
+                    .column_by_name("p")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                partitions.push(partition.value(0));
+                batch_sizes.push(batch.num_rows());
+            }
+            (partitions, batch_sizes)
+        })
+        .await
+        .expect("a reader stalled while holding the BLOB reservation");
+    assert_eq!(batch_sizes, vec![1024, 1, 1024, 1, 1024, 1]);
+    for pair in partitions.chunks_exact(2) {
+        assert_eq!(
+            pair[0], pair[1],
+            "another split started while the first still held BLOBs"
+        );
     }
 }

@@ -17,7 +17,10 @@
 
 //! Bounded split execution shared by table readers and language bindings.
 
-use super::{read_limit::take_limited_batch, ArrowRecordBatchStream};
+use super::{
+    read_limit::take_limited_batch, schema_manager::SchemaManager, ArrowRecordBatchStream,
+};
+use crate::spec::TableSchema;
 use crate::DataSplit;
 use arrow_array::RecordBatch;
 use futures::future::BoxFuture;
@@ -36,8 +39,37 @@ fn budget_permits(max_bytes: u64) -> u32 {
 pub(super) struct BlobOutputBudget {
     pub max_bytes: u64,
     pub fields: HashSet<String>,
+    pub field_ids: HashSet<i32>,
     pub unknown_external: bool,
     pub serialize_unknown: bool,
+    pub file_schema_manager: Option<SchemaManager>,
+    pub implicit_blob_columns: HashMap<i64, bool>,
+}
+
+impl BlobOutputBudget {
+    pub(super) fn register_file_schema(&mut self, schema: &TableSchema) {
+        let contains_blob = schema.data_file_fields(None).iter().any(|field| {
+            self.field_ids.contains(&field.id()) || self.fields.contains(field.name())
+        });
+        self.implicit_blob_columns
+            .insert(schema.id(), contains_blob);
+    }
+
+    fn unresolved_file_schemas(&self, splits: &[DataSplit]) -> BTreeSet<i64> {
+        if !self.serialize_unknown || self.fields.is_empty() {
+            return BTreeSet::new();
+        }
+        splits
+            .iter()
+            .flat_map(|split| split.data_files())
+            .filter(|file| {
+                file.write_cols.is_none()
+                    && !file.file_name.ends_with(".blob")
+                    && !self.implicit_blob_columns.contains_key(&file.schema_id)
+            })
+            .map(|file| file.schema_id)
+            .collect()
+    }
 }
 
 pub(super) type SplitReader =
@@ -128,9 +160,53 @@ pub(super) fn execute(
     read: SplitReader,
     blob_output_budget: Option<BlobOutputBudget>,
 ) -> ArrowRecordBatchStream {
+    let mut blob_output_budget = blob_output_budget;
+    if limit.is_none() && parallelism > 1 && splits.len() > 1 {
+        if let Some(budget) = &mut blob_output_budget {
+            if let Some(manager) = budget.file_schema_manager.take() {
+                let ids = budget.unresolved_file_schemas(&splits);
+                if !ids.is_empty() {
+                    let mut budget = blob_output_budget.unwrap();
+                    return Box::pin(async_stream::try_stream! {
+                        for id in ids {
+                            // A size estimate is optional. If schema I/O fails,
+                            // keep the conservative reservation and let the
+                            // reader handle the schema as it normally would.
+                            if let Ok(schema) = manager.schema(id).await {
+                                budget.register_file_schema(&schema);
+                            }
+                        }
+                        let mut stream =
+                            execute_resolved(splits, parallelism, ordered, limit, read, Some(budget));
+                        while let Some(batch) = stream.next().await {
+                            yield batch?;
+                        }
+                    });
+                }
+            }
+        }
+    }
+    execute_resolved(
+        splits,
+        parallelism,
+        ordered,
+        limit,
+        read,
+        blob_output_budget,
+    )
+}
+
+fn execute_resolved(
+    splits: Vec<DataSplit>,
+    parallelism: usize,
+    ordered: bool,
+    limit: Option<usize>,
+    read: SplitReader,
+    blob_output_budget: Option<BlobOutputBudget>,
+) -> ArrowRecordBatchStream {
     // Finite LIMIT uses the existing executor to cancel speculative splits at
     // the global row quota; the output budget is for unbounded reads.
-    if ordered && parallelism > 1 {
+    if ordered && parallelism > 1 && splits.len() > 1 {
         if limit.is_none() {
             if let Some(budget) = &blob_output_budget {
                 let costs = splits
@@ -195,18 +271,21 @@ fn blob_group_cost(group: &[DataSplit], budget: &BlobOutputBudget) -> Option<u32
                     .as_ref()
                     .is_none_or(|cols| cols.iter().any(|col| budget.fields.contains(col)))
             {
-                bytes = bytes.saturating_add(u64::try_from(file.file_size).unwrap_or(0));
-            } else if file
-                .write_cols
-                .as_ref()
-                .is_none_or(|cols| cols.iter().any(|col| budget.fields.contains(col)))
-            {
-                unknown = true;
+                let size = u64::try_from(file.file_size).unwrap_or(0);
+                unknown |= size == 0;
+                bytes = bytes.saturating_add(size);
+            } else if !file.file_name.ends_with(".blob") {
+                unknown |= match &file.write_cols {
+                    Some(cols) => cols.iter().any(|col| budget.fields.contains(col)),
+                    None => budget
+                        .implicit_blob_columns
+                        .get(&file.schema_id)
+                        .copied()
+                        .unwrap_or(true),
+                };
             }
         }
-        if unknown || bytes == 0 {
-            has_unknown = true;
-        }
+        has_unknown |= unknown;
         file_bytes = file_bytes.max(bytes);
     }
     if has_unknown && budget.serialize_unknown {
@@ -261,26 +340,37 @@ fn next_batch(index: usize, mut stream: ArrowRecordBatchStream) -> BoxFuture<'st
     .boxed()
 }
 
-enum BudgetedState<T> {
-    Waiting(T),
-    Open(ArrowRecordBatchStream),
-}
-
-struct BudgetedRead<T> {
+struct BudgetedBatch {
     index: usize,
-    state: BudgetedState<T>,
-    cost: Option<u32>,
+    stream: ArrowRecordBatchStream,
+    batch: Option<crate::Result<RecordBatch>>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
-struct BudgetedBatch<T> {
-    read: BudgetedRead<T>,
-    batch: Option<crate::Result<RecordBatch>>,
-    _permit: Option<OwnedSemaphorePermit>,
+fn poll_budgeted(
+    index: usize,
+    mut stream: ArrowRecordBatchStream,
+    permit: Option<OwnedSemaphorePermit>,
+    pending: &mut JoinSet<BudgetedBatch>,
+    handle: &tokio::runtime::Handle,
+) {
+    pending.spawn_on(
+        async move {
+            let batch = stream.next().await;
+            BudgetedBatch {
+                index,
+                stream,
+                batch,
+                permit,
+            }
+        },
+        handle,
+    );
 }
 
 fn schedule_budgeted<T, F>(
-    waiting: &mut VecDeque<BudgetedRead<T>>,
-    pending: &mut JoinSet<BudgetedBatch<T>>,
+    waiting: &mut VecDeque<(usize, T, Option<u32>)>,
+    pending: &mut JoinSet<BudgetedBatch>,
     permits: &Arc<Semaphore>,
     handle: &tokio::runtime::Handle,
     max_workers: usize,
@@ -291,10 +381,10 @@ fn schedule_budgeted<T, F>(
     F: Fn(T) -> ArrowRecordBatchStream,
 {
     while pending.len() + buffered < max_workers {
-        let Some(read) = waiting.front() else {
+        let Some((_, _, cost)) = waiting.front() else {
             break;
         };
-        let permit = match read.cost {
+        let permit = match *cost {
             Some(cost) => {
                 let Ok(permit) = Arc::clone(permits).try_acquire_many_owned(cost) else {
                     break;
@@ -303,30 +393,12 @@ fn schedule_budgeted<T, F>(
             }
             None => None,
         };
-        let BudgetedRead { index, state, cost } = waiting.pop_front().unwrap();
-        let mut stream = match state {
-            BudgetedState::Waiting(item) => make_stream(item),
-            BudgetedState::Open(stream) => stream,
-        };
-        pending.spawn_on(
-            async move {
-                let batch = stream.next().await;
-                BudgetedBatch {
-                    read: BudgetedRead {
-                        index,
-                        state: BudgetedState::Open(stream),
-                        cost,
-                    },
-                    batch,
-                    _permit: permit,
-                }
-            },
-            handle,
-        );
+        let (index, item, _) = waiting.pop_front().unwrap();
+        poll_budgeted(index, make_stream(item), permit, pending, handle);
     }
 }
 
-/// Hold a permit through decoding and until the caller resumes the stream.
+/// Hold a reservation until its reader stops retaining decoded output.
 fn merge_items_budgeted<T, F>(
     items: Vec<T>,
     costs: Vec<Option<u32>>,
@@ -359,11 +431,7 @@ where
         let count = items.len();
         let permits = Arc::new(Semaphore::new(permits));
         let mut waiting = items.into_iter().zip(costs).enumerate()
-            .map(|(index, (item, cost))| BudgetedRead {
-                index,
-                state: BudgetedState::Waiting(item),
-                cost,
-            })
+            .map(|(index, (item, cost))| (index, item, cost))
             .collect::<VecDeque<_>>();
         let mut pending = JoinSet::new();
         let mut ready = BTreeMap::new();
@@ -395,7 +463,7 @@ where
                     break;
                 }
             };
-            let index = next.read.index;
+            let index = next.index;
             if next.batch.is_none() {
                 drop(next);
                 if ordered {
@@ -408,10 +476,10 @@ where
             }
             if ordered && index != current {
                 if next.batch.as_ref().is_some_and(Result::is_err) {
-                    let BudgetedBatch { read, batch, _permit } = next;
+                    let BudgetedBatch { stream, batch, permit, .. } = next;
                     let error = batch.unwrap().unwrap_err();
-                    drop(read);
-                    drop(_permit);
+                    drop(stream);
+                    drop(permit);
                     drop(ready);
                     waiting.clear();
                     pending.shutdown().await;
@@ -421,11 +489,11 @@ where
                 ready.insert(index, next);
                 continue;
             }
-            let BudgetedBatch { read, batch, _permit } = next;
+            let BudgetedBatch { stream, batch, permit, .. } = next;
             match batch.unwrap() {
                 Err(error) => {
-                    drop(read);
-                    drop(_permit);
+                    drop(stream);
+                    drop(permit);
                     drop(ready);
                     waiting.clear();
                     pending.shutdown().await;
@@ -436,10 +504,9 @@ where
                     if batch.num_rows() > 0 {
                         yield batch;
                     }
-                    // A paused caller keeps the permit and the current batch.
-                    drop(_permit);
-                    if ordered { waiting.push_front(read); } else { waiting.push_back(read); }
-                    schedule_budgeted(&mut waiting, &mut pending, &permits, &handle, parallelism, ready.len(), &make_stream);
+                    // The DE reader can retain the rest of a decoded source batch
+                    // across yields. Continue the admitted stream with its permit.
+                    poll_budgeted(index, stream, permit, &mut pending, &handle);
                 }
             }
         }
@@ -778,8 +845,11 @@ mod tests {
         let mut budget = BlobOutputBudget {
             max_bytes: 64 * OUTPUT_BYTE_UNIT,
             fields: HashSet::from(["image".to_string()]),
+            field_ids: HashSet::new(),
             unknown_external: false,
             serialize_unknown: false,
+            file_schema_manager: None,
+            implicit_blob_columns: HashMap::new(),
         };
         let managed = budget_split(vec![
             split_file("key.parquet", 1024, Some(vec!["clip_id"])),
@@ -897,8 +967,11 @@ mod tests {
             let budget = BlobOutputBudget {
                 max_bytes: 2 * OUTPUT_BYTE_UNIT,
                 fields: HashSet::from(["image".to_string()]),
+                field_ids: HashSet::new(),
                 unknown_external: false,
                 serialize_unknown: false,
+                file_schema_manager: None,
+                implicit_blob_columns: HashMap::new(),
             };
             assert_eq!(blob_group_cost(&splits[..1], &budget), Some(1));
             assert_eq!(blob_group_cost(&splits[1..], &budget), Some(1));
@@ -955,8 +1028,11 @@ mod tests {
             Some(BlobOutputBudget {
                 max_bytes: 64 * OUTPUT_BYTE_UNIT,
                 fields: HashSet::from(["image".to_string()]),
+                field_ids: HashSet::new(),
                 unknown_external: false,
                 serialize_unknown: false,
+                file_schema_manager: None,
+                implicit_blob_columns: HashMap::new(),
             }),
         );
         let ready = tokio::time::timeout(Duration::from_secs(2), output.next())
@@ -1017,8 +1093,11 @@ mod tests {
             let budget = BlobOutputBudget {
                 max_bytes: 2 * OUTPUT_BYTE_UNIT,
                 fields: HashSet::from(["image".to_string()]),
+                field_ids: HashSet::new(),
                 unknown_external: false,
                 serialize_unknown: false,
+                file_schema_manager: None,
+                implicit_blob_columns: HashMap::new(),
             };
             assert!(blob_budget_applies_to_splits(&splits, &budget));
             let mut output = execute(splits, 3, ordered, None, read, Some(budget));
@@ -1080,8 +1159,11 @@ mod tests {
             Some(BlobOutputBudget {
                 max_bytes,
                 fields: HashSet::from(["image".to_string()]),
+                field_ids: HashSet::new(),
                 unknown_external: false,
                 serialize_unknown: false,
+                file_schema_manager: None,
+                implicit_blob_columns: HashMap::new(),
             }),
         );
         assert!(output.next().await.unwrap().is_ok());
@@ -1532,8 +1614,11 @@ mod tests {
             Some(BlobOutputBudget {
                 max_bytes: 4 * OUTPUT_BYTE_UNIT,
                 fields: HashSet::from(["image".to_string()]),
+                field_ids: HashSet::new(),
                 unknown_external: false,
                 serialize_unknown: false,
+                file_schema_manager: None,
+                implicit_blob_columns: HashMap::new(),
             }),
         );
         let values = output
