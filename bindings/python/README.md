@@ -189,10 +189,10 @@ print(batches_tt[0])
 ```
 
 Parallel BLOB reads with known sizes share a `read.blob.output.max-buffered-bytes`
-budget (default 512 MiB per available core, capped at 4 GiB). Unknown-size
+budget (default 512 MiB per available core, capped at 4 GiB). Pure unknown-size
 groups retain split concurrency unless this option is explicitly set, which
-makes them run alone. Known-size groups remain budgeted when mixed with
-unknown-size groups. Oversized groups also run alone. Decoder memory and
+makes them run alone. Known-size BLOBs remain budgeted when grouped with
+unknown-size splits. Oversized groups also run alone. Decoder memory and
 caller-held batches are excluded; descriptor reads are unaffected.
 
 ### Scan statistics

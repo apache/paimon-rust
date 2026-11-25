@@ -187,6 +187,7 @@ fn blob_group_cost(group: &[DataSplit], budget: &BlobOutputBudget) -> Option<u32
         return budget.serialize_unknown.then_some(permits);
     }
     let mut file_bytes = 0_u64;
+    let mut has_unknown = false;
     for split in group {
         let mut bytes = 0_u64;
         let mut unknown = false;
@@ -202,9 +203,16 @@ fn blob_group_cost(group: &[DataSplit], budget: &BlobOutputBudget) -> Option<u32
             }
         }
         if unknown || bytes == 0 {
-            return budget.serialize_unknown.then_some(permits);
+            has_unknown = true;
+            continue;
         }
         file_bytes = file_bytes.max(bytes);
+    }
+    if has_unknown && budget.serialize_unknown {
+        return Some(permits);
+    }
+    if file_bytes == 0 {
+        return None;
     }
     Some(
         file_bytes
@@ -795,6 +803,10 @@ mod tests {
         assert_eq!(
             blob_group_cost(std::slice::from_ref(&descriptor), &budget),
             None
+        );
+        assert_eq!(
+            blob_group_cost(&[managed.clone(), descriptor.clone()], &budget),
+            Some(17)
         );
         budget.unknown_external = true;
         assert_eq!(
