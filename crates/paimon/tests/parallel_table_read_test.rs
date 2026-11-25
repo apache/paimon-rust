@@ -1107,9 +1107,9 @@ async fn unordered_de_keeps_reservation_between_source_batch_slices() {
         .await
         .expect("a reader stalled while holding the BLOB reservation");
     assert_eq!(batch_sizes, vec![1024, 1, 1024, 1, 1024, 1]);
-    for pair in partitions.chunks_exact(2) {
+    for [first, second] in partitions.as_chunks::<2>().0 {
         assert_eq!(
-            pair[0], pair[1],
+            first, second,
             "another split started while the first still held BLOBs"
         );
     }
