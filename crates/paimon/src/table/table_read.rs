@@ -632,7 +632,7 @@ impl<'a> PaimonTableRead<'a> {
             .transpose()?;
         let output_budget_active = self.limit.is_none()
             && blob_output_budget.as_ref().is_some_and(|budget| {
-                super::read_execution::blob_budget_covers_splits(&splits, budget)
+                super::read_execution::blob_budget_applies_to_splits(&splits, budget)
             });
         // Prefetch slots must not be held across split output-budget waits.
         let budget = if workers > 1 && (ordered || output_budget_active) {

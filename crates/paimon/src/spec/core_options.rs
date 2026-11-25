@@ -535,8 +535,8 @@ impl<'a> CoreOptions<'a> {
     }
 
     /// Bytes reserved for BLOB batches waiting at the parallel split executor.
-    /// The default scales from 512 MiB on one core to 2 GiB on four or more
-    /// available cores; an explicit option always overrides it.
+    /// The default is 512 MiB per available core, capped at 4 GiB;
+    /// an explicit option always overrides it.
     pub fn blob_output_max_buffered_bytes(&self) -> crate::Result<u64> {
         let value = match self.options.get(BLOB_OUTPUT_MAX_BUFFERED_BYTES_OPTION) {
             Some(raw) => parse_memory_size(raw).ok_or_else(|| crate::Error::DataInvalid {
