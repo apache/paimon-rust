@@ -29,6 +29,14 @@ from test_blob_consumer import _table
 from pypaimon_rust.datafusion import MergeAssignment, PaimonCatalog, SQLContext, WhenMatched
 
 
+def test_http_blob_retry_capability_is_exported_from_native_module():
+    import pypaimon_rust
+    from pypaimon_rust import pypaimon_rust as native
+
+    assert native.HTTP_BLOB_RETRY_SUPPORTED is True
+    assert pypaimon_rust.HTTP_BLOB_RETRY_SUPPORTED is native.HTTP_BLOB_RETRY_SUPPORTED
+
+
 def descriptor(offset, length):
     uri = b'custom://source'
     return struct.pack('<BQi', 2, 0x424C4F4244455343, len(uri)) + uri + struct.pack('<qq', offset, length)
