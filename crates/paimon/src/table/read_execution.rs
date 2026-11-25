@@ -209,7 +209,6 @@ fn blob_group_cost(group: &[DataSplit], budget: &BlobOutputBudget) -> Option<u32
         }
         if unknown || bytes == 0 {
             has_unknown = true;
-            continue;
         }
         file_bytes = file_bytes.max(bytes);
     }
@@ -797,7 +796,12 @@ mod tests {
             blob_group_cost(std::slice::from_ref(&managed), &budget),
             Some(17)
         );
-        let descriptor = budget_split(vec![
+        let descriptor = budget_split(vec![split_file("refs.parquet", 1024, Some(vec!["image"]))]);
+        assert_eq!(
+            blob_group_cost(std::slice::from_ref(&descriptor), &budget),
+            None
+        );
+        let mixed = budget_split(vec![
             split_file("refs.parquet", 1024, Some(vec!["image"])),
             split_file(
                 "image.blob",
@@ -806,8 +810,17 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            blob_group_cost(std::slice::from_ref(&descriptor), &budget),
-            None
+            blob_group_cost(std::slice::from_ref(&mixed), &budget),
+            Some(17)
+        );
+        let smaller = budget_split(vec![split_file(
+            "other.blob",
+            OUTPUT_BYTE_UNIT as i64,
+            Some(vec!["image"]),
+        )]);
+        assert_eq!(
+            blob_group_cost(&[mixed.clone(), smaller], &budget),
+            Some(17)
         );
         assert_eq!(
             blob_group_cost(&[managed.clone(), descriptor.clone()], &budget),
@@ -822,6 +835,7 @@ mod tests {
         assert_eq!(blob_group_cost(&[managed], &budget), Some(64));
         budget.unknown_external = false;
         assert_eq!(blob_group_cost(&[descriptor], &budget), Some(64));
+        assert_eq!(blob_group_cost(&[mixed], &budget), Some(64));
     }
 
     #[tokio::test]
