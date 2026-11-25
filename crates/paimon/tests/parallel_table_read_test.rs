@@ -220,6 +220,77 @@ async fn parallel_reads_preserve_requested_order_and_enforce_one_global_limit() 
 }
 
 #[tokio::test]
+async fn independent_data_evolution_files_preserve_filtered_rows_and_limit() {
+    let table = table("de").await;
+    for start in [4, 7] {
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        let batch = RecordBatch::try_from_iter([
+            ("p", Arc::new(Int32Array::from(vec![0; 3])) as ArrayRef),
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![start, start + 1, start + 2])) as ArrayRef,
+            ),
+            ("value", Arc::new(Int32Array::from(vec![0; 3])) as ArrayRef),
+        ])
+        .unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        builder
+            .new_commit()
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+    }
+    let predicates = PredicateBuilder::new(table.schema().fields());
+    let mut builder = table.new_read_builder();
+    builder.with_filter(predicates.equal("p", Datum::Int(0)).unwrap());
+    let plan = builder.new_scan().plan().await.unwrap();
+    let splits = plan.splits();
+    assert_eq!(splits.len(), 1);
+    assert_eq!(splits[0].data_files().len(), 3);
+    builder.with_filter(predicates.greater_than("id", Datum::Int(1)).unwrap());
+    for parallelism in [1, 3] {
+        for ordered in [false, true] {
+            for limit in [None, Some(5)] {
+                let mut selected = builder.clone();
+                if let Some(limit) = limit {
+                    selected.with_limit(limit);
+                }
+                let result = selected
+                    .new_read()
+                    .unwrap()
+                    .with_parallelism(parallelism)
+                    .unwrap()
+                    .with_ordered(ordered)
+                    .to_arrow(splits)
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let result = rows(&result);
+                assert_eq!(result.len(), limit.unwrap_or(8));
+                if ordered || parallelism == 1 {
+                    assert_eq!(
+                        result,
+                        (2..2 + result.len() as i32)
+                            .map(|id| (0, id, 0))
+                            .collect::<Vec<_>>()
+                    );
+                } else {
+                    let mut unique = result.clone();
+                    unique.sort_unstable();
+                    unique.dedup();
+                    assert_eq!(unique.len(), result.len());
+                    assert!(result
+                        .iter()
+                        .all(|&(p, id, value)| p == 0 && (2..10).contains(&id) && value == 0));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn data_evolution_streaming_splits_preserve_order_and_limit() {
     let table = table("de").await;
     let mut planned = table

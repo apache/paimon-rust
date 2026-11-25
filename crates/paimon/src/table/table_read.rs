@@ -617,6 +617,11 @@ impl<'a> PaimonTableRead<'a> {
         } else {
             parallelism
         };
+        let splits = if options.data_evolution_enabled() && !self.update_read {
+            super::read_execution::independent_file_splits(splits.into_owned(), parallelism)
+        } else {
+            splits.into_owned()
+        };
         let workers = parallelism.min(splits.len()).max(1);
         // A later ordered group may retain its ready batch while the current
         // group is still reading. Background prefetch must not keep a shared
@@ -632,7 +637,7 @@ impl<'a> PaimonTableRead<'a> {
             .min((MAX_TOTAL_BLOB_READS / workers).max(1));
         let factory = self.execution_factory(include_row_kind, budget, blob_parallelism);
         Ok(super::read_execution::execute(
-            splits.into_owned(),
+            splits,
             parallelism,
             ordered,
             self.limit,
@@ -2978,7 +2983,7 @@ fn pk_split_needs_merge(split: &DataSplit, dv_enabled: bool) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -3034,7 +3039,11 @@ mod tests {
         );
     }
 
-    pub(super) fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
+    pub(in crate::table) fn file(
+        name: &str,
+        level: i32,
+        delete_row_count: Option<i64>,
+    ) -> DataFileMeta {
         DataFileMeta {
             file_name: name.to_string(),
             file_size: 128,
@@ -3060,7 +3069,7 @@ mod tests {
         }
     }
 
-    pub(super) fn split(files: Vec<DataFileMeta>, raw_convertible: bool) -> DataSplit {
+    pub(in crate::table) fn split(files: Vec<DataFileMeta>, raw_convertible: bool) -> DataSplit {
         DataSplitBuilder::new()
             .with_snapshot(1)
             .with_partition(BinaryRow::new(0))

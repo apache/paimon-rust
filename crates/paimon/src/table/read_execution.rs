@@ -106,6 +106,50 @@ fn group_ranges(weights: &[u64], parallelism: usize) -> Vec<(usize, usize)> {
     ranges
 }
 
+/// Expose independent DE files as bounded execution work, without changing the plan.
+pub(super) fn independent_file_splits(
+    splits: Vec<DataSplit>,
+    parallelism: usize,
+) -> Vec<DataSplit> {
+    let mut spare = parallelism.saturating_sub(splits.len());
+    if spare == 0 {
+        return splits;
+    }
+    let mut work = Vec::with_capacity(splits.len());
+    for split in splits {
+        let files = split.data_files();
+        // Range coordinates and scores belong to the original selection. Updates
+        // and overlapping column versions must retain their reconstruction group.
+        if spare == 0
+            || files.len() < 2
+            || split.is_streaming()
+            || split.row_ranges().is_some()
+            || split.scores().is_some()
+            || !files.iter().all(|file| {
+                file.row_count > 0
+                    && file
+                        .first_row_id
+                        .and_then(|start| start.checked_add(file.row_count))
+                        .is_some()
+            })
+            || !super::data_evolution_reader::is_raw_convertible(files)
+        {
+            work.push(split);
+            continue;
+        }
+        let weights = files
+            .iter()
+            .map(|file| u64::try_from(file.file_size).unwrap_or(0).max(1))
+            .collect::<Vec<_>>();
+        let groups = group_ranges(&weights, spare + 1);
+        spare -= groups.len() - 1;
+        for (start, end) in groups {
+            work.push(split.for_data_evolution_files(files[start..end].to_vec()));
+        }
+    }
+    work
+}
+
 pub(super) fn execute(
     splits: Vec<DataSplit>,
     parallelism: usize,
@@ -446,6 +490,61 @@ mod tests {
                 yield batch(item);
             }
         })
+    }
+
+    fn independent_split() -> DataSplit {
+        use super::super::table_read::tests::{file, split};
+        let files = (0..5)
+            .map(|i| {
+                let mut f = file(&format!("{i}.parquet"), 0, None);
+                f.first_row_id = Some(i * 10);
+                f
+            })
+            .collect();
+        split(files, true)
+    }
+
+    #[tokio::test]
+    async fn independent_files_run_concurrently_with_order_and_global_limit() {
+        let split = independent_split();
+        let work = independent_file_splits(vec![split], 3);
+        let started = Arc::new(AtomicUsize::new(0));
+        let workers = started.clone();
+        let read: SplitReader = Arc::new(move |group, _| {
+            let workers = workers.clone();
+            let values = group
+                .iter()
+                .flat_map(|s| s.data_files())
+                .map(|f| (f.first_row_id.unwrap() / 10) as i32)
+                .collect::<Vec<_>>();
+            Ok(Box::pin(async_stream::try_stream! {
+                workers.fetch_add(1, Ordering::SeqCst);
+                wait_for_count(&workers, 3).await;
+                for v in values { yield batch(v); }
+            }))
+        });
+        let output = execute(work, 3, true, Some(4), read)
+            .map_ok(|b| value(&b))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(output, vec![0, 1, 2, 3]);
+        assert_eq!(started.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn independent_file_work_preserves_merge_groups_and_selections() {
+        let original = independent_split();
+        assert_eq!(independent_file_splits(vec![original.clone()], 1).len(), 1);
+        let work = independent_file_splits(vec![original.clone()], 3);
+        assert_eq!(work.len(), 3);
+        assert_eq!(work.iter().map(|s| s.data_files().len()).sum::<usize>(), 5);
+        let mut files = original.data_files().to_vec();
+        files[1].first_row_id = Some(0); // overlapping column versions need merging
+        let overlap = original.for_data_evolution_files(files);
+        assert_eq!(independent_file_splits(vec![overlap], 8).len(), 1);
+        let selected = original.with_selected_row_ranges(vec![]);
+        assert_eq!(independent_file_splits(vec![selected], 8).len(), 1);
     }
 
     #[test]
