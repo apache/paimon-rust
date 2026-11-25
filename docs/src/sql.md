@@ -47,10 +47,10 @@ Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Pai
 
 For the exact delegated SQL grammar, see the [DataFusion SQL Reference](https://datafusion.apache.org/user-guide/sql/index.html).
 
-For a top-level `SELECT` directly from one data-evolution table in a Paimon
-catalog, `SQLContext::sql` expands plain `*` and `t.*` to the data columns.
-Select `"_ROW_ID"` explicitly to read it, including with
-`SELECT *, "_ROW_ID" FROM t`.
+For a top-level `SELECT` directly from one row-tracking table in a Paimon
+catalog, `SQLContext::sql` excludes the virtual `_ROW_ID` from plain `*` and
+`t.*` when the table provider exposes it. Data-evolution tables expose
+`_ROW_ID` for explicit reads such as `SELECT *, "_ROW_ID" FROM t`.
 
 ### SQL compatibility
 

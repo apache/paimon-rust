@@ -3031,7 +3031,11 @@ async fn plan_single_table_wildcard(
                     .table()
                     .schema()
                     .core_options()
-                    .data_evolution_enabled()
+                    .row_tracking_enabled()
+                    && provider
+                        .schema()
+                        .column_with_name(ROW_ID_FIELD_NAME)
+                        .is_some()
             })
     }) {
         for item in &mut select.projection {

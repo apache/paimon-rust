@@ -1370,6 +1370,25 @@ async fn test_single_data_evolution_table_wildcards_hide_row_id() {
 }
 
 #[tokio::test]
+async fn test_single_table_wildcard_with_only_row_tracking_enabled() {
+    let (_warehouse, ctx) = create_context().await;
+    common::exec(
+        &ctx,
+        "CREATE TABLE row_tracked (id INT) WITH ('row-tracking.enabled' = 'true')",
+    )
+    .await;
+    common::exec(&ctx, "INSERT INTO row_tracked VALUES (7)").await;
+
+    for sql in [
+        "SELECT * FROM row_tracked",
+        "SELECT t.* FROM row_tracked AS t",
+    ] {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(collect_rows(&batches), [["7"]], "{sql}");
+    }
+}
+
+#[tokio::test]
 async fn test_single_table_wildcard_keeps_row_id_from_other_sources() {
     let (_warehouse, ctx) = create_context().await;
     let df = ctx
