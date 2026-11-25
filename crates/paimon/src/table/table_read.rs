@@ -604,6 +604,23 @@ impl<'a> PaimonTableRead<'a> {
             self.table.rest_env().is_some() && options.blob_view_resolve_enabled() && uses(&views);
         let resolves_blob = (!options.blob_as_descriptor() && uses(&blob_fields)) || resolves_view;
         let resolves_blob_payload = resolves_blob && !options.blob_as_descriptor();
+        // A managed .blob file belongs to its write column. Reserve output
+        // bytes only for BLOB fields this read can consume. Restricted reads
+        // may add hidden mask or row-policy inputs, so keep all fields there.
+        let read_blob_fields = if grant.is_some() {
+            blob_fields.clone()
+        } else {
+            blob_fields
+                .iter()
+                .filter(|name| {
+                    self.read_type
+                        .iter()
+                        .any(|field| field.name() == name.as_str())
+                        || operands.contains(*name)
+                })
+                .cloned()
+                .collect()
+        };
         let parallelism = execution_parallelism(
             parallelism,
             self.limit,
@@ -623,7 +640,7 @@ impl<'a> PaimonTableRead<'a> {
                 options.blob_output_max_buffered_bytes().map(|max_bytes| {
                     super::read_execution::BlobOutputBudget {
                         max_bytes,
-                        fields: blob_fields,
+                        fields: read_blob_fields,
                         unknown_external: resolves_view,
                         serialize_unknown: options.blob_output_budget_serializes_unknown(),
                     }

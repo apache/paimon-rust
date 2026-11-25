@@ -192,7 +192,12 @@ fn blob_group_cost(group: &[DataSplit], budget: &BlobOutputBudget) -> Option<u32
         let mut bytes = 0_u64;
         let mut unknown = false;
         for file in split.data_files() {
-            if file.file_name.ends_with(".blob") {
+            if file.file_name.ends_with(".blob")
+                && file
+                    .write_cols
+                    .as_ref()
+                    .is_none_or(|cols| cols.iter().any(|col| budget.fields.contains(col)))
+            {
                 bytes = bytes.saturating_add(u64::try_from(file.file_size).unwrap_or(0));
             } else if file
                 .write_cols
@@ -817,6 +822,79 @@ mod tests {
         assert_eq!(blob_group_cost(&[managed], &budget), Some(64));
         budget.unknown_external = false;
         assert_eq!(blob_group_cost(&[descriptor], &budget), Some(64));
+    }
+
+    #[tokio::test]
+    async fn projected_blob_column_does_not_reserve_unread_blob_files() {
+        for ordered in [false, true] {
+            let (release, wait) = oneshot::channel();
+            let wait = Arc::new(Mutex::new(Some(wait)));
+            let second_reads = Arc::new(AtomicUsize::new(0));
+            let read: SplitReader = {
+                let second_reads = second_reads.clone();
+                Arc::new(move |splits, _| {
+                    let first = splits[0].data_files()[0].file_name == "first-image.blob";
+                    Ok(controlled_stream(
+                        vec![if first { 1 } else { 2 }],
+                        if first {
+                            wait.lock().unwrap().take()
+                        } else {
+                            None
+                        },
+                        if first {
+                            Arc::new(AtomicUsize::new(0))
+                        } else {
+                            second_reads.clone()
+                        },
+                        Arc::new(AtomicUsize::new(0)),
+                    ))
+                })
+            };
+            let splits = ["first", "second"]
+                .into_iter()
+                .map(|name| {
+                    budget_split(vec![
+                        split_file(
+                            &format!("{name}-image.blob"),
+                            OUTPUT_BYTE_UNIT as i64,
+                            Some(vec!["image"]),
+                        ),
+                        split_file(
+                            &format!("{name}-thumbnail.blob"),
+                            2 * 1024 * OUTPUT_BYTE_UNIT as i64,
+                            Some(vec!["thumbnail"]),
+                        ),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            let budget = BlobOutputBudget {
+                max_bytes: 2 * OUTPUT_BYTE_UNIT,
+                fields: HashSet::from(["image".to_string()]),
+                unknown_external: false,
+                serialize_unknown: false,
+            };
+            assert_eq!(blob_group_cost(&splits[..1], &budget), Some(1));
+            assert_eq!(blob_group_cost(&splits[1..], &budget), Some(1));
+            let mut output = execute(splits, 2, ordered, None, read, Some(budget));
+            if ordered {
+                assert!(output.next().now_or_never().is_none());
+                wait_for_count(&second_reads, 1).await;
+            } else {
+                let batch = tokio::time::timeout(Duration::from_secs(2), output.next())
+                    .await
+                    .expect("the second projected BLOB split was serialized")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(value(&batch), 2);
+            }
+            release.send(()).unwrap();
+            let remaining = output
+                .map_ok(|batch| value(&batch))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(remaining, if ordered { vec![1, 2] } else { vec![1] });
+        }
     }
 
     #[tokio::test]
