@@ -116,6 +116,19 @@ pub(crate) trait FieldAggregator: Send + Sync + std::fmt::Debug {
 
     /// Materialize the current accumulator as a 1-row Arrow array.
     fn result(&self) -> crate::Result<ArrayRef>;
+
+    /// Start from the accumulator before any input instead of NULL, for a
+    /// non-nullable field whose merge starts with a retraction. Returns false
+    /// when the aggregator has no such accumulator.
+    fn start_empty(&mut self) -> bool {
+        false
+    }
+
+    /// The cell of a retract result built only from retractions. A later merge
+    /// retracts this value again, so it must undo the accumulated retractions.
+    fn retraction_result(&self) -> crate::Result<ArrayRef> {
+        self.result()
+    }
 }
 
 /// Construct an aggregator by `name` for a column of type `data_type`.
@@ -255,6 +268,9 @@ impl FieldAggregator for IgnoreRetractAgg {
     }
     fn result(&self) -> crate::Result<ArrayRef> {
         self.0.result()
+    }
+    fn start_empty(&mut self) -> bool {
+        self.0.start_empty()
     }
 }
 

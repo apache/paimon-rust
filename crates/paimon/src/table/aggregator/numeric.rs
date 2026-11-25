@@ -294,6 +294,52 @@ impl FieldAggregator for SumAgg {
             }
         })
     }
+
+    fn start_empty(&mut self) -> bool {
+        match &mut self.state {
+            SumState::I8(acc) => *acc = Some(0),
+            SumState::I16(acc) => *acc = Some(0),
+            SumState::I32(acc) => *acc = Some(0),
+            SumState::I64(acc) => *acc = Some(0),
+            SumState::F32(acc) => *acc = Some(0.0),
+            SumState::F64(acc) => *acc = Some(0.0),
+            SumState::Decimal128 { acc, .. } => *acc = Some(0),
+        }
+        true
+    }
+
+    fn retraction_result(&self) -> crate::Result<ArrayRef> {
+        macro_rules! negate_integer {
+            ($acc:expr) => {
+                match $acc {
+                    Some(value) if self.fail_on_overflow => Some(
+                        value
+                            .checked_neg()
+                            .ok_or_else(|| overflow_error("sum", &self.field_name))?,
+                    ),
+                    other => other.map(|value| value.wrapping_neg()),
+                }
+            };
+        }
+        Ok(match &self.state {
+            SumState::I8(acc) => Arc::new(Int8Array::from(vec![negate_integer!(*acc)])),
+            SumState::I16(acc) => Arc::new(Int16Array::from(vec![negate_integer!(*acc)])),
+            SumState::I32(acc) => Arc::new(Int32Array::from(vec![negate_integer!(*acc)])),
+            SumState::I64(acc) => Arc::new(Int64Array::from(vec![negate_integer!(*acc)])),
+            SumState::F32(acc) => Arc::new(Float32Array::from(vec![acc.map(|value| -value)])),
+            SumState::F64(acc) => Arc::new(Float64Array::from(vec![acc.map(|value| -value)])),
+            SumState::Decimal128 {
+                precision,
+                scale,
+                acc,
+            } => {
+                let fitted = acc
+                    .and_then(i128::checked_neg)
+                    .filter(|v| decimal_fits_precision(*v, *precision));
+                decimal_array(*precision, *scale, fitted, "sum", &self.field_name)?
+            }
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

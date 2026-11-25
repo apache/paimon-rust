@@ -504,6 +504,49 @@ impl PartialUpdateMergeFunction {
         Ok(())
     }
 
+    /// Seeds a merge that starts with a retraction under sequence groups:
+    /// required fields take the row's values, required aggregates start empty
+    /// when they can, and nullable fields stay NULL.
+    #[allow(clippy::too_many_arguments)]
+    fn init_from_retraction(
+        &self,
+        selected_by_col: &mut [Option<(usize, usize)>],
+        mut aggregators: Option<&mut [Option<Box<dyn FieldAggregator>>]>,
+        group_sequence_rows: &mut [Option<(usize, usize)>],
+        row: &MergeRow,
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<()> {
+        let source = Some((row.batch_idx, row.row_idx));
+        for (index, field) in output_schema.fields().iter().enumerate() {
+            let aggregator = aggregators
+                .as_mut()
+                .and_then(|aggregators| aggregators.get_mut(index))
+                .and_then(Option::as_mut);
+            let nullable = field.is_nullable();
+            selected_by_col[index] = if nullable { None } else { source };
+            if let Some(aggregator) = aggregator {
+                aggregator.reset();
+                if !nullable && !aggregator.start_empty() {
+                    aggregator.agg(
+                        batch_buffer[row.batch_idx]
+                            .column_for_output(index, source_output_col_indices),
+                        row.row_idx,
+                    )?;
+                }
+            }
+        }
+        for (group, current) in self.sequence_groups.iter().zip(group_sequence_rows) {
+            let required = group
+                .sequence_indices
+                .iter()
+                .all(|&index| !output_schema.field(index).is_nullable());
+            *current = if required { source } else { None };
+        }
+        Ok(())
+    }
+
     /// Java `updateNonNullFields`: ungrouped fields take the row's non-null
     /// values, or feed their aggregator.
     fn update_non_null_fields(
@@ -784,18 +827,34 @@ impl PartialUpdateMergeFunction {
                     continue;
                 }
                 if !initialized {
-                    // Java initializes the row from the first retract before
-                    // checking ignore-delete or applying sequence-group
-                    // retractions. Keep that payload for later sparse updates.
-                    Self::replace_with_source(
-                        &mut selected_by_col,
-                        aggregators.as_mut().map(|guard| guard.as_mut_slice()),
-                        row.batch_idx,
-                        row.row_idx,
-                        batch_buffer,
-                        source_output_col_indices,
-                    )?;
-                    group_sequence_rows.fill(Some((row.batch_idx, row.row_idx)));
+                    if self.sequence_group_enabled && !self.ignore_delete {
+                        // The retraction is applied to the groups below, so
+                        // seed only the required fields, with aggregates
+                        // empty: seeding the retracted value would let the
+                        // retraction cancel it and keep the old value.
+                        self.init_from_retraction(
+                            &mut selected_by_col,
+                            aggregators.as_mut().map(|guard| guard.as_mut_slice()),
+                            &mut group_sequence_rows,
+                            row,
+                            batch_buffer,
+                            source_output_col_indices,
+                            output_schema,
+                        )?;
+                    } else {
+                        // Java initializes the row from the first retract before
+                        // checking ignore-delete. Keep that payload for later
+                        // sparse updates.
+                        Self::replace_with_source(
+                            &mut selected_by_col,
+                            aggregators.as_mut().map(|guard| guard.as_mut_slice()),
+                            row.batch_idx,
+                            row.row_idx,
+                            batch_buffer,
+                            source_output_col_indices,
+                        )?;
+                        group_sequence_rows.fill(Some((row.batch_idx, row.row_idx)));
+                    }
                     initialized = true;
                 }
                 if self.ignore_delete {
@@ -1032,6 +1091,8 @@ impl PartialUpdateMergeFunction {
             }));
         }
 
+        let only_retractions =
+            self.sequence_group_enabled && !saw_add && !current_delete_row && !self.ignore_delete;
         let output_columns: Vec<ArrayRef> = output_schema
             .fields()
             .iter()
@@ -1045,6 +1106,8 @@ impl PartialUpdateMergeFunction {
                     .and_then(|aggregators| aggregators.get(output_col_idx))
                     .and_then(Option::as_ref)
                 {
+                    // A later merge retracts this result again.
+                    Some(aggregator) if only_retractions => aggregator.retraction_result()?,
                     Some(aggregator) => aggregator.result()?,
                     None => match selected_by_col[output_col_idx] {
                         Some((batch_idx, row_idx)) => batch_buffer[batch_idx]

@@ -387,7 +387,8 @@ async fn partial_update_ignore_retract_first_value_preserves_uninitialized_state
     .await;
     write_batch(&table, &partial_update_batch(3, Some(20), 3)).await;
     write_batch(&table, &partial_update_batch(2, Some(5), 0)).await;
-    assert_eq!(scan_single_version_value(&table).await, (3, Some(20)));
+    // The DELETE advances the group to version 3 without seeding its value.
+    assert_eq!(scan_single_version_value(&table).await, (3, None));
 }
 
 #[tokio::test]
