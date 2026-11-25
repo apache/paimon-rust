@@ -836,8 +836,14 @@ mod tests {
             blob_group_cost(std::slice::from_ref(&with_view), &budget),
             Some(17)
         );
-        assert_eq!(blob_group_cost(&[mixed.clone()], &budget), Some(17));
-        assert_eq!(blob_group_cost(&[descriptor.clone()], &budget), None);
+        assert_eq!(
+            blob_group_cost(std::slice::from_ref(&mixed), &budget),
+            Some(17)
+        );
+        assert_eq!(
+            blob_group_cost(std::slice::from_ref(&descriptor), &budget),
+            None
+        );
         budget.serialize_unknown = true;
         assert_eq!(blob_group_cost(&[with_view], &budget), Some(64));
         budget.unknown_external = false;
