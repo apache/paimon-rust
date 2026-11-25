@@ -47,11 +47,10 @@ Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Pai
 
 For the exact delegated SQL grammar, see the [DataFusion SQL Reference](https://datafusion.apache.org/user-guide/sql/index.html).
 
-For data-evolution tables, `SQLContext::sql` expands `SELECT *` and `alias.*` to
-the table's data columns. Select the virtual column explicitly with
-`SELECT "_ROW_ID" FROM table_name` or include it alongside data columns with
-`SELECT *, "_ROW_ID" FROM table_name`. A raw DataFusion `SessionContext`
-expands wildcards using the full table provider schema.
+For a top-level `SELECT` directly from one data-evolution table in a Paimon
+catalog, `SQLContext::sql` expands plain `*` and `t.*` to the data columns.
+Select `"_ROW_ID"` explicitly to read it, including with
+`SELECT *, "_ROW_ID" FROM t`.
 
 ### SQL compatibility
 
@@ -282,14 +281,6 @@ the new view's owning catalog and database, not the session's current database.
 The canonical query is stored as both the default query and the `datafusion`
 dialect definition.
 
-New persistent views record the current wildcard behavior for data-evolution
-tables. Older views use the full provider schema. When an older definition
-contains a wildcard, `SHOW CREATE VIEW` includes
-`WITH ('datafusion.hide-row-id-in-wildcard' = FALSE)` to preserve its projection
-when recreated. Reading a newly created wildcard view over a data-evolution
-table requires a Rust DataFusion client that understands this option. Explicit
-output column lists work with older readers.
-
 `SHOW CREATE VIEW view_name` returns the owning catalog, database, view name,
 and a fully qualified `CREATE VIEW` definition with its declared column names
 and types. The exported query includes the same type casts as view reads.
@@ -311,9 +302,9 @@ Catalog. `DROP VIEW` sends a direct delete request; `IF EXISTS` ignores only a
 missing-view response. Bare, two-part, and three-part names are supported, but
 only one target may be dropped per statement. Other catalog implementations may
 return `Unsupported`. `CREATE OR REPLACE VIEW`, materialized/secure views, view
-comments and other view options, vendor-specific create modifiers, persistent
-`ALTER VIEW`, and `DROP VIEW` modifiers such as `CASCADE`, `RESTRICT`, or
-`PURGE` are not supported.
+comments or options, vendor-specific create modifiers, persistent `ALTER VIEW`,
+and `DROP VIEW` modifiers such as `CASCADE`, `RESTRICT`, or `PURGE` are not
+supported.
 
 Persistent views resolve through the normal DataFusion catalog path, so they
 can be queried wherever a table can be used:

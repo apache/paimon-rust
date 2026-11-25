@@ -116,7 +116,7 @@ impl MetadataView {
                     &self.database,
                 )
                 .await?;
-                let plan = crate::sql_projection::sql(
+                let plan = crate::read_files::sql(
                     &datafusion::prelude::SessionContext::new_with_state(state),
                     &query,
                     datafusion::execution::context::SQLOptions::new(),

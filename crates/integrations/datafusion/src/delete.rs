@@ -35,7 +35,6 @@ use crate::merge_into::{
 };
 use crate::primary_key_dml;
 use crate::sql_context::SQLContext;
-use crate::sql_projection;
 
 /// Execute a DELETE statement on a Paimon table.
 ///
@@ -171,10 +170,7 @@ async fn execute_data_evolution_delete_once(
         delete.limit.as_ref(),
     );
     let query_sql = format!("SELECT \"_ROW_ID\" FROM {table_ref}{selection_clause}");
-    let batches = sql_projection::sql(ctx.ctx(), &query_sql, Default::default())
-        .await?
-        .collect()
-        .await?;
+    let batches = ctx.ctx().sql(&query_sql).await?.collect().await?;
 
     let total_count: u64 = batches.iter().map(|batch| batch.num_rows() as u64).sum();
     if total_count == 0 {
@@ -274,10 +270,7 @@ async fn execute_cow_delete_inner(
         "SELECT \"__paimon_file_idx\", \"__paimon_row_offset\" \
          FROM {cow_table_name} AS {alias}{selection_clause}"
     );
-    let batches = sql_projection::sql(ctx, &query_sql, Default::default())
-        .await?
-        .collect()
-        .await?;
+    let batches = ctx.sql(&query_sql).await?.collect().await?;
 
     let mut total_count: u64 = 0;
     for batch in &batches {

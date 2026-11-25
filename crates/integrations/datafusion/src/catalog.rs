@@ -19,8 +19,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
-use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -46,37 +44,6 @@ use crate::table::{ObjectTableProvider, PaimonTableProvider};
 use crate::{BlobReaderRegistry, DynamicOptions};
 
 pub(crate) type SessionStateProvider = Arc<dyn Fn() -> Option<SessionState> + Send + Sync>;
-
-pub(crate) const VIEW_HIDE_ROW_ID_IN_WILDCARD_OPTION: &str = "datafusion.hide-row-id-in-wildcard";
-
-fn next_provider_id() -> u64 {
-    static NEXT_PROVIDER_ID: AtomicU64 = AtomicU64::new(0);
-    NEXT_PROVIDER_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-type Bindings<T> = HashMap<(u64, String), Option<Arc<T>>>;
-
-#[derive(Default)]
-struct PlanningBindings {
-    schemas: Bindings<dyn SchemaProvider>,
-    tables: Bindings<dyn TableProvider>,
-}
-
-/// Reuse database and table bindings across wildcard resolution and final SQL planning.
-#[derive(Clone, Default)]
-pub(crate) struct PlanningTables {
-    bindings: Arc<RwLock<PlanningBindings>>,
-}
-
-tokio::task_local! {
-    static PLANNING_TABLES: PlanningTables;
-}
-
-impl PlanningTables {
-    pub(crate) async fn scope<F: Future>(&self, future: F) -> F::Output {
-        PLANNING_TABLES.scope(self.clone(), future).await
-    }
-}
 
 /// Engine registry shared between the catalog provider and its schema
 /// providers, so registrations stay visible to schemas obtained earlier.
@@ -415,7 +382,6 @@ pub fn register_catalog_table_engine(
 /// tables directly must install it with
 /// `ctx.register_relation_planner(Arc::new(PaimonRelationPlanner::new()))`.
 pub struct PaimonCatalogProvider {
-    provider_id: u64,
     catalog_name: Option<String>,
     /// Reference to the Paimon catalog.
     catalog: Arc<dyn Catalog>,
@@ -453,7 +419,6 @@ impl PaimonCatalogProvider {
         session_state: Option<SessionStateProvider>,
     ) -> Self {
         PaimonCatalogProvider {
-            provider_id: next_provider_id(),
             catalog_name,
             catalog,
             dynamic_options,
@@ -603,21 +568,7 @@ impl CatalogProvider for PaimonCatalogProvider {
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        let Ok(planning) = PLANNING_TABLES.try_with(Clone::clone) else {
-            return self.paimon_schema(name);
-        };
-        let key = (self.provider_id, name.to_string());
-        if let Some(schema) = planning.bindings.read().unwrap().schemas.get(&key) {
-            return schema.clone();
-        }
-        let schema = self.paimon_schema(name);
-        planning
-            .bindings
-            .write()
-            .unwrap()
-            .schemas
-            .insert(key, schema.clone());
-        schema
+        self.paimon_schema(name)
     }
 
     fn register_schema(
@@ -836,7 +787,6 @@ impl PaimonCatalogProvider {
 ///
 /// Tables are loaded lazily when accessed via the `table()` method.
 pub struct PaimonSchemaProvider {
-    provider_id: u64,
     catalog_name: Option<String>,
     /// Reference to the Paimon catalog.
     catalog: Arc<dyn Catalog>,
@@ -876,7 +826,6 @@ impl PaimonSchemaProvider {
         session_state: Option<SessionStateProvider>,
     ) -> Self {
         PaimonSchemaProvider {
-            provider_id: next_provider_id(),
             catalog_name,
             catalog,
             database,
@@ -1154,11 +1103,11 @@ impl PaimonSchemaProvider {
                         identifier.database(),
                     )
                     .await?;
-                    let plan = crate::sql_projection::view_plan(
+                    let plan = crate::read_files::sql(
                         &datafusion::prelude::SessionContext::new_with_state(state),
                         &query,
-                        view_hides_row_id_in_wildcard(&view)?,
-                    ).await?;
+                        datafusion::execution::context::SQLOptions::new(),
+                    ).await?.into_unoptimized_plan();
                     let plan = enforce_view_schema(plan, &view)?;
                     Ok(Some(Arc::new(datafusion::datasource::ViewTable::new(
                         plan,
@@ -1232,21 +1181,7 @@ impl SchemaProvider for PaimonSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let Ok(planning) = PLANNING_TABLES.try_with(Clone::clone) else {
-            return self.table_with_views(name, true).await;
-        };
-        let key = (self.provider_id, name.to_string());
-        if let Some(table) = planning.bindings.read().unwrap().tables.get(&key) {
-            return Ok(table.clone());
-        }
-        let loaded = self.table_with_views(name, true).await?;
-        planning
-            .bindings
-            .write()
-            .unwrap()
-            .tables
-            .insert(key, loaded.clone());
-        Ok(loaded)
+        self.table_with_views(name, true).await
     }
 
     async fn table_type(&self, name: &str) -> DFResult<Option<TableType>> {
@@ -1438,23 +1373,6 @@ impl SchemaProvider for PaimonSchemaProvider {
             "paimon catalog access thread panicked",
         )
     }
-}
-
-pub(crate) fn view_hides_row_id_in_wildcard(view: &View) -> DFResult<bool> {
-    let Some(value) = view
-        .schema()
-        .options()
-        .get(VIEW_HIDE_ROW_ID_IN_WILDCARD_OPTION)
-    else {
-        // Views persisted before the option was introduced used the full provider schema.
-        return Ok(false);
-    };
-    value.parse().map_err(|_| {
-        plan_datafusion_err!(
-            "Invalid value '{value}' for view option '{VIEW_HIDE_ROW_ID_IN_WILDCARD_OPTION}' on '{}'",
-            view.full_name()
-        )
-    })
 }
 
 fn enforce_view_schema(plan: LogicalPlan, view: &View) -> DFResult<LogicalPlan> {

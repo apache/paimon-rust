@@ -18,6 +18,7 @@
 mod glob;
 mod options;
 mod parquet;
+mod projection;
 mod raw;
 mod scoped;
 pub(crate) mod store;
@@ -49,8 +50,9 @@ use futures::TryStreamExt;
 use url::Url;
 
 use options::{Format, Options};
+pub(crate) use projection::sql;
 
-pub(crate) const GENERATED_METADATA: &str = "paimon.read_files.generated_metadata";
+const GENERATED_METADATA: &str = "paimon.read_files.generated_metadata";
 
 fn metadata_expr(file: &File) -> Result<datafusion::logical_expr::Expr> {
     Ok(lit(metadata(file)?).alias_with_metadata(
@@ -61,11 +63,11 @@ fn metadata_expr(file: &File) -> Result<datafusion::logical_expr::Expr> {
     ))
 }
 
-pub(crate) fn error(message: impl std::fmt::Display) -> DataFusionError {
+fn error(message: impl std::fmt::Display) -> DataFusionError {
     DataFusionError::Plan(format!("read_files: {message}"))
 }
 
-pub(crate) fn is_read_files(name: &ObjectName) -> bool {
+fn is_read_files(name: &ObjectName) -> bool {
     name.0.len() == 1
         && name.0[0]
             .as_ident()

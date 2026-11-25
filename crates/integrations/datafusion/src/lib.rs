@@ -81,7 +81,6 @@ mod show_metadata;
 mod spark_functions;
 mod sql_context;
 mod sql_function;
-mod sql_projection;
 mod system_tables;
 mod table;
 mod table_function_args;
