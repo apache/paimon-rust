@@ -116,6 +116,7 @@ const PARQUET_ROW_GROUP_PARALLELISM_OPTION: &str = "read.parquet.row-group.paral
 pub(crate) const PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION: &str =
     "read.parquet.row-group.max-inflight-bytes";
 const BLOB_OUTPUT_MAX_BUFFERED_BYTES_OPTION: &str = "read.blob.output.max-buffered-bytes";
+const BLOB_OUTPUT_BYTES_PER_CORE: i64 = 512 * 1024 * 1024;
 const MOSAIC_READ_PREFETCH_ROW_GROUPS_OPTION: &str = "mosaic.read.prefetch-row-groups";
 pub(crate) const MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION: &str = "mosaic.read.prefetch-max-bytes";
 pub(crate) const TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION: &str =
@@ -385,6 +386,10 @@ pub(crate) enum TimeTravelSelector<'a> {
     },
 }
 
+fn default_blob_output_max_buffered_bytes(available_cores: usize) -> i64 {
+    (available_cores.clamp(1, 4) as i64) * BLOB_OUTPUT_BYTES_PER_CORE
+}
+
 impl<'a> CoreOptions<'a> {
     pub fn new(options: &'a HashMap<String, String>) -> Self {
         Self { options }
@@ -530,6 +535,8 @@ impl<'a> CoreOptions<'a> {
     }
 
     /// Bytes reserved for BLOB batches waiting at the parallel split executor.
+    /// The default scales from 512 MiB on one core to 2 GiB on four or more
+    /// available cores; an explicit option always overrides it.
     pub fn blob_output_max_buffered_bytes(&self) -> crate::Result<u64> {
         let value = match self.options.get(BLOB_OUTPUT_MAX_BUFFERED_BYTES_OPTION) {
             Some(raw) => parse_memory_size(raw).ok_or_else(|| crate::Error::DataInvalid {
@@ -538,7 +545,11 @@ impl<'a> CoreOptions<'a> {
                 ),
                 source: None,
             })?,
-            None => 256 * 1024 * 1024,
+            None => default_blob_output_max_buffered_bytes(
+                std::thread::available_parallelism()
+                    .map(|value| value.get())
+                    .unwrap_or(1),
+            ),
         };
         u64::try_from(value)
             .ok()
@@ -2552,8 +2563,18 @@ mod tests {
             CoreOptions::new(&options)
                 .blob_output_max_buffered_bytes()
                 .unwrap(),
-            256 * 1024 * 1024
+            default_blob_output_max_buffered_bytes(
+                std::thread::available_parallelism()
+                    .map(|value| value.get())
+                    .unwrap_or(1)
+            ) as u64
         );
+        for (cores, mib) in [(0, 512), (1, 512), (2, 1024), (4, 2048), (8, 2048)] {
+            assert_eq!(
+                default_blob_output_max_buffered_bytes(cores),
+                mib * 1024 * 1024
+            );
+        }
         assert!(!CoreOptions::new(&options).blob_output_budget_serializes_unknown());
         let options = HashMap::from([(
             BLOB_OUTPUT_MAX_BUFFERED_BYTES_OPTION.to_string(),
