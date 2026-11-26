@@ -360,6 +360,43 @@ async fn update_before_only_merge_keeps_older_fields() {
 }
 
 #[tokio::test]
+async fn mixed_delete_add_and_update_before_keeps_other_writer_fields() {
+    // Java PR 11178: over a committed right_value = 20 from another writer, an
+    // add after DELETE clears the DELETE state, so -D, +I/+U, -U in one commit
+    // persists UPDATE_BEFORE instead of DELETE and matches flushing after the
+    // add.
+    let options = &[("partial-update.remove-record-on-delete", "true")];
+    let expected = Some([Some(1), None, Some(11), None, Some(20), None]);
+
+    for add_kind in [RowKind::Insert, RowKind::UpdateAfter] {
+        // Layout 1: -D, +I/+U, -U pre-merged in one commit, then +U.
+        let combined = table(options).await;
+        write(&combined, &[OTHER_WRITER]).await;
+        write(
+            &combined,
+            &[
+                left(RowKind::Delete, 5),
+                left(add_kind, 10),
+                left(RowKind::UpdateBefore, 10),
+            ],
+        )
+        .await;
+        assert_projections(&combined, None, 0b00).await;
+        write(&combined, &[left(RowKind::UpdateAfter, 11)]).await;
+        assert_projections(&combined, expected, 0b00).await;
+
+        // Layout 2: flushed after +I/+U, then -U, then +U.
+        let split = table(options).await;
+        write(&split, &[OTHER_WRITER]).await;
+        write(&split, &[left(RowKind::Delete, 5), left(add_kind, 10)]).await;
+        write(&split, &[left(RowKind::UpdateBefore, 10)]).await;
+        assert_projections(&split, None, 0b10).await;
+        write(&split, &[left(RowKind::UpdateAfter, 11)]).await;
+        assert_projections(&split, expected, 0b10).await;
+    }
+}
+
+#[tokio::test]
 async fn accepted_group_updates_restore_all_fields_across_merge_boundaries() {
     let other = event(RowKind::Insert, (None, None), (Some(3), Some(30)), None);
     for composite in [false, true] {

@@ -771,7 +771,8 @@ impl PartialUpdateMergeFunction {
         }
         let mut saw_add = false;
         let mut current_delete_row = false;
-        // Whether a DELETE re-initialized the row, see the result kind below.
+        // Whether a DELETE re-initialized the row and no later add cleared it,
+        // see the result kind below.
         let mut meet_delete = false;
         let mut initialized = false;
         let mut latest_row = None;
@@ -906,6 +907,7 @@ impl PartialUpdateMergeFunction {
             initialized = true;
             if !self.sequence_group_enabled {
                 current_delete_row = false;
+                meet_delete = false;
             }
             latest_row = Some(row);
 
@@ -980,9 +982,10 @@ impl PartialUpdateMergeFunction {
         if !initialized {
             return Ok(PickedMerge::Result(MergeResult::Omit));
         }
-        // A row removed only by UPDATE_BEFORE stays UPDATE_BEFORE, so merging
-        // a pre-merged result again does not re-initialize the row like a
-        // DELETE would. This also covers keys with only UPDATE_BEFORE rows.
+        // A row removed only by UPDATE_BEFORE since the last add stays
+        // UPDATE_BEFORE, so merging a pre-merged result again does not
+        // re-initialize the row like a DELETE would. This also covers keys
+        // with only UPDATE_BEFORE rows.
         let result_kind = if current_delete_row {
             if meet_delete {
                 RowKind::Delete
@@ -4551,6 +4554,88 @@ mod tests {
             // non-null fields and keeps the DELETE result kind.
             "before"
         );
+    }
+
+    #[test]
+    fn test_partial_update_add_clears_delete_state_before_update_before() {
+        let schema = make_schema();
+        let options = HashMap::from([
+            ("merge-engine".into(), "partial-update".into()),
+            (
+                "partial-update.remove-record-on-delete".into(),
+                "true".into(),
+            ),
+        ]);
+        let merge = PartialUpdateMergeFunction::new(&options, "test_table").unwrap();
+
+        for add_kind in [RowKind::Insert, RowKind::UpdateAfter] {
+            let kinds = [
+                RowKind::Delete.to_value(),
+                add_kind.to_value(),
+                RowKind::UpdateBefore.to_value(),
+            ];
+            let batch = make_batch_with_kind(
+                &schema,
+                vec![1, 1, 1],
+                vec![10, 11, 12],
+                kinds.to_vec(),
+                vec![Some("deleted"), Some("added"), Some("before")],
+            );
+            let rows = kinds
+                .into_iter()
+                .enumerate()
+                .map(|(row_idx, value_kind)| MergeRow {
+                    batch_idx: 0,
+                    row_idx,
+                    sequence_number: 10 + row_idx as i64,
+                    value_kind,
+                    user_sequence: None,
+                })
+                .collect::<Vec<_>>();
+            let result = merge
+                .merge(
+                    &rows,
+                    &[BufferedBatch::Source(batch)],
+                    &[0, 1, 2, 3],
+                    &schema,
+                )
+                .unwrap();
+            // Java PR 11178: without sequence groups, an add after a DELETE
+            // clears the DELETE state, so a trailing UPDATE_BEFORE stays
+            // UPDATE_BEFORE instead of emitting DELETE and re-initializing
+            // older files on read.
+            let MergeResult::MaterializedRetractRow(retracted, RowKind::UpdateBefore) = result
+            else {
+                panic!("expected a materialized update-before row for add_kind={add_kind:?}");
+            };
+            assert_eq!(
+                retracted
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                12
+            );
+            assert_eq!(
+                retracted
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .unwrap()
+                    .value(0),
+                RowKind::UpdateBefore.to_value()
+            );
+            assert_eq!(
+                retracted
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "before"
+            );
+        }
     }
 
     #[tokio::test]
