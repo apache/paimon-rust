@@ -104,7 +104,11 @@ impl RowFormatReader {
                 .fields()
                 .iter()
                 .map(|f| {
-                    if !matches!(f.data_type(), DataType::Float(_)) {
+                    // Even a non-strict cast can produce NULL (e.g. a missing
+                    // key). Building a required child here would enforce its
+                    // constraint before residual predicates discard rows.
+                    if !matches!(f.data_type(), DataType::Float(_)) || !f.data_type().is_nullable()
+                    {
                         return None;
                     }
                     let m = crate::spec::parse_variant_metadata(f.description()?).ok()?;

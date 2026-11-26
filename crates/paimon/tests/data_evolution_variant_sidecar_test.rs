@@ -249,6 +249,88 @@ async fn sparse_float_sidecar_sql_null_with_nonnullable_extraction_type() {
     assert!(parent.is_null(1));
 }
 
+#[tokio::test]
+async fn sparse_float_sidecar_filters_before_checking_required_child() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("payload", DataType::Variant(VariantType::new()))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("data-evolution.row-sidecar.enabled", "true")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table("memory:/required_child", TableSchema::new(0, &schema));
+    setup_dirs(&io, table.location()).await;
+    persist_table_schema(&io, table.location(), table.schema()).await;
+    let values = (0..100)
+        .map(|id| {
+            Some(GenericVariant::parse_json(if id == 6 { r#"{}"# } else { r#"{"x":5}"# }).unwrap())
+        })
+        .collect::<Vec<_>>();
+    let input = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..100)) as ArrayRef,
+        ),
+        ("payload", Arc::new(variants(&values)) as ArrayRef),
+    ])
+    .unwrap();
+    let msgs = append(&table, &input).await;
+    let mut scan = table.new_read_builder();
+    scan.with_row_ranges(vec![paimon::table::RowRange::new(5, 6)]);
+    let plan = scan.new_scan().plan().await.unwrap();
+    let f = &msgs[0].new_files[0];
+    assert_eq!(f.extra_files, vec![format!("{}.row", f.file_name)]);
+    io.delete_file(&f.data_file_path(&format!("{}/bucket-0", table.location())))
+        .await
+        .unwrap();
+    for keep in [5, 6] {
+        let fields = table.schema().fields();
+        let mut read = table.new_read_builder();
+        let child = DataType::Float(paimon::spec::FloatType::with_nullable(false));
+        read.with_read_type(vec![DataField::new(
+            fields[1].id(),
+            "payload".into(),
+            DataType::Row(
+                variant_extraction_row(true, [(child, "$.x".into(), false, "UTC".into())]).unwrap(),
+            ),
+        )]);
+        read.with_filter(
+            PredicateBuilder::new(fields)
+                .equal("id", Datum::Int(keep))
+                .unwrap(),
+        );
+        let result = read
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await;
+        if keep == 6 {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("non-nullable"), "{error}");
+        } else {
+            let batches = result.unwrap();
+            let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+            assert_eq!(batch.num_rows(), 1);
+            let row = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            assert_eq!(
+                row.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float32Array>()
+                    .unwrap()
+                    .value(0),
+                5.
+            );
+        }
+    }
+}
+
 async fn query(table: &Table, extraction: bool) -> RecordBatch {
     let fields = table.schema().fields();
     let mut builder = table.new_read_builder();
