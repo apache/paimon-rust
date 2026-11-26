@@ -85,11 +85,18 @@ impl RowFormatReader {
             if !matches!(source.data_type(), DataType::Variant(_)) {
                 continue;
             }
-            let Some(target) = projected.iter().find(|f| {
-                f.id() == source.id() && crate::spec::is_variant_extraction_row_type(f.data_type())
-            }) else {
+            // One physical slot cannot carry two different extracted structs (or
+            // an extracted struct and the raw Variant). Check the logical request
+            // before read_data_fields collapses it to one entry per physical ID.
+            let mut uses = projected.iter().filter(|f| f.id() == source.id());
+            let Some(target) = uses.next() else {
                 continue;
             };
+            if uses.next().is_some()
+                || !crate::spec::is_variant_extraction_row_type(target.data_type())
+            {
+                continue;
+            }
             let DataType::Row(row) = target.data_type() else {
                 continue;
             };
@@ -114,7 +121,12 @@ impl RowFormatReader {
                     DataField::new(
                         source.id(),
                         source.name().to_string(),
-                        target.data_type().clone(),
+                        // The synthetic extraction type describes the request, not
+                        // the source's validity bitmap. Preserve SQL NULL parents.
+                        DataType::Row(crate::spec::RowType::with_nullable(
+                            target.data_type().is_nullable() || source.data_type().is_nullable(),
+                            row.fields().to_vec(),
+                        )),
                     ),
                     keys,
                     flags,

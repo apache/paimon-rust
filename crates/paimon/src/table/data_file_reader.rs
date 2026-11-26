@@ -753,7 +753,7 @@ impl DataFileReader {
                 configured_reader
             } else if read_path.ends_with(".row") {
                 crate::arrow::format::row::RowFormatReader::for_sidecar(
-                    &table_options, &data_schema_fields, &projected_read_fields,
+                    &table_options, &data_schema_fields, &read_type,
                 )
             } else {
                 create_format_reader_with_budget(
