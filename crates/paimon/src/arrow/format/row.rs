@@ -54,12 +54,14 @@ use std::sync::Arc;
 
 pub(crate) struct RowFormatReader {
     metadata_cache_enabled: bool,
+    projections: Vec<(usize, DataField, Vec<String>, Vec<bool>)>,
 }
 
 impl Default for RowFormatReader {
     fn default() -> Self {
         Self {
             metadata_cache_enabled: true,
+            projections: Vec::new(),
         }
     }
 }
@@ -69,7 +71,63 @@ impl RowFormatReader {
         Self {
             // Format-table files may be replaced in place, even with the same size.
             metadata_cache_enabled: !CoreOptions::new(options).is_format_table(),
+            projections: Vec::new(),
         }
+    }
+
+    pub(crate) fn for_sidecar(
+        options: &HashMap<String, String>,
+        physical: &[DataField],
+        projected: &[DataField],
+    ) -> super::ConfiguredFormatReader {
+        let mut reader = Self::with_options(options);
+        for (idx, source) in physical.iter().enumerate() {
+            if !matches!(source.data_type(), DataType::Variant(_)) {
+                continue;
+            }
+            let Some(target) = projected.iter().find(|f| {
+                f.id() == source.id() && crate::spec::is_variant_extraction_row_type(f.data_type())
+            }) else {
+                continue;
+            };
+            let DataType::Row(row) = target.data_type() else {
+                continue;
+            };
+            let spec: Option<Vec<_>> = row
+                .fields()
+                .iter()
+                .map(|f| {
+                    if !matches!(f.data_type(), DataType::Float(_)) {
+                        return None;
+                    }
+                    let m = crate::spec::parse_variant_metadata(f.description()?).ok()?;
+                    Some((
+                        crate::variant::top_level_path_key(m.path()).ok()??,
+                        m.fail_on_error(),
+                    ))
+                })
+                .collect();
+            if let Some(spec) = spec {
+                let (keys, flags) = spec.into_iter().unzip();
+                reader.projections.push((
+                    idx,
+                    DataField::new(
+                        source.id(),
+                        source.name().to_string(),
+                        target.data_type().clone(),
+                    ),
+                    keys,
+                    flags,
+                ));
+            }
+        }
+        super::configure_format_reader(
+            Box::new(reader),
+            super::FormatReadFields {
+                data_schema: physical,
+                projected,
+            },
+        )
     }
 }
 
@@ -336,7 +394,25 @@ impl FormatFileReader for RowFormatReader {
         // once so every block can seek directly to its overlapping window.
         let row_selection = row_selection.map(crate::table::merge_row_ranges);
 
-        let schema = build_target_arrow_schema(read_fields)?;
+        let mut output_fields = read_fields.to_vec();
+        let mut predicate_fields = std::collections::HashSet::new();
+        if let Some(fp) = predicates {
+            for p in &fp.predicates {
+                p.collect_leaf_field_indices(&mut predicate_fields);
+            }
+        }
+        let mut projections = HashMap::new();
+        for (idx, field, keys, strict) in &self.projections {
+            if predicate_fields.contains(idx) || (predicates.is_some() && strict.contains(&true)) {
+                continue;
+            }
+            output_fields[*idx] = field.clone();
+            projections.insert(
+                *idx,
+                FloatProjectionState::new(keys.clone(), strict.clone()),
+            );
+        }
+        let schema = build_target_arrow_schema(&output_fields)?;
         let row_type = read_fields.to_vec();
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
 
@@ -367,7 +443,7 @@ impl FormatFileReader for RowFormatReader {
                 }
 
                 for chunk in selected.chunks(batch_size) {
-                    let batch = decode_row_block(&data, &row_type, schema.clone(), chunk)?;
+                    let batch = decode_row_block_projected(&data, &row_type, &output_fields, schema.clone(), chunk, &mut projections)?;
                     let batch = match predicates.as_ref() {
                         Some(fp) => crate::arrow::residual::filter_record_batch_by_predicates(
                             batch, fp, &row_type,
@@ -1077,11 +1153,84 @@ fn write_timestamp(
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_row_block(
     data: &[u8],
     fields: &[DataField],
     schema: SchemaRef,
     positions: &[usize],
+) -> crate::Result<RecordBatch> {
+    decode_row_block_projected(data, fields, fields, schema, positions, &mut HashMap::new())
+}
+
+struct FloatProjectionState {
+    root_ids: crate::variant::RootIdOrder,
+    keys: Vec<String>,
+    strict: Vec<bool>,
+    last: Option<(Vec<u8>, crate::variant::VariantFloat32Projection)>,
+    offsets: Vec<usize>,
+    values: Vec<Option<f32>>,
+}
+impl FloatProjectionState {
+    fn new(keys: Vec<String>, strict: Vec<bool>) -> Self {
+        Self {
+            values: vec![None; keys.len()],
+            root_ids: Default::default(),
+            keys,
+            strict,
+            last: None,
+            offsets: Vec::new(),
+        }
+    }
+    fn append(
+        &mut self,
+        input: &mut BlockInput<'_>,
+        builder: &mut ColumnBuilder,
+    ) -> crate::Result<()> {
+        let value = input.read_slice()?;
+        let metadata = input.read_slice()?;
+        self.root_ids.validate(value, metadata)?;
+        if self.last.as_ref().is_none_or(|(m, _)| m != metadata) {
+            self.last = Some((
+                metadata.to_vec(),
+                crate::variant::VariantFloat32Projection::new(metadata, &self.keys)?,
+            ));
+        }
+        self.last.as_mut().unwrap().1.extract_float32_cast(
+            value,
+            metadata,
+            &self.strict,
+            &mut self.offsets,
+            &mut self.values,
+        )?;
+        let ColumnBuilder::Row {
+            columns,
+            validities,
+            len,
+            ..
+        } = builder
+        else {
+            unreachable!()
+        };
+        for (c, v) in columns.iter_mut().zip(&self.values) {
+            let ColumnBuilder::F32(b) = c else {
+                unreachable!()
+            };
+            b.append_option(*v);
+        }
+        validities.push(true);
+        *len += 1;
+        Ok(())
+    }
+}
+
+fn decode_row_block_projected(
+    data: &[u8],
+    fields: &[DataField],
+    output_fields: &[DataField],
+    schema: SchemaRef,
+    positions: &[usize],
+    projections: &mut HashMap<usize, FloatProjectionState>,
 ) -> crate::Result<RecordBatch> {
     if fields.is_empty() {
         return RecordBatch::try_new_with_options(
@@ -1103,7 +1252,7 @@ fn decode_row_block(
                 message: ".row block is too small for row offsets".to_string(),
                 source: None,
             })?;
-    let mut builders = fields
+    let mut builders = output_fields
         .iter()
         .map(|f| ColumnBuilder::new(f.data_type(), positions.len()))
         .collect::<crate::Result<Vec<_>>>()?;
@@ -1136,6 +1285,8 @@ fn decode_row_block(
         for (field_idx, field) in fields.iter().enumerate() {
             if (data[offset + field_idx / 8] & (1 << (field_idx % 8))) != 0 {
                 builders[field_idx].append_null();
+            } else if let Some(proj) = projections.get_mut(&field_idx) {
+                proj.append(&mut input, &mut builders[field_idx])?;
             } else {
                 builders[field_idx].read_append(&mut input, field.data_type())?;
             }
@@ -1185,7 +1336,7 @@ struct BlockInput<'a> {
     data_end: usize,
 }
 
-impl BlockInput<'_> {
+impl<'a> BlockInput<'a> {
     fn read_exact<const N: usize>(&mut self) -> crate::Result<[u8; N]> {
         let end = self.position + N;
         if end > self.data_end {
@@ -1261,6 +1412,9 @@ impl BlockInput<'_> {
     }
 
     fn read_bytes(&mut self) -> crate::Result<Vec<u8>> {
+        self.read_slice().map(<[u8]>::to_vec)
+    }
+    fn read_slice(&mut self) -> crate::Result<&'a [u8]> {
         let len = self.read_var_u32()? as usize;
         let end = self.position + len;
         if end > self.data_end {
@@ -1272,7 +1426,7 @@ impl BlockInput<'_> {
                 source: None,
             });
         }
-        let value = self.data[self.position..end].to_vec();
+        let value = &self.data[self.position..end];
         self.position = end;
         Ok(value)
     }
@@ -3566,6 +3720,57 @@ mod tests {
         assert_eq!(names.value(0), "seven");
         assert!(names.is_null(1));
         assert_eq!(names.value(2), "nine");
+    }
+
+    #[test]
+    fn direct_row_numeric_projection_validates_unselected_fields() {
+        use crate::spec::{FloatType, RowType};
+        use crate::variant::GenericVariant;
+        let keys = ["b", "missing", "a"];
+        let fields = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                DataField::new(i as i32, k.to_string(), DataType::Float(FloatType::new()))
+            })
+            .collect();
+        let ty = DataType::Row(RowType::new(fields));
+        let mut projection =
+            FloatProjectionState::new(keys.map(String::from).to_vec(), vec![false; 3]);
+        let var = GenericVariant::parse_json(r#"{"a":2,"b":3,"ignored":"unselected"}"#).unwrap();
+        let decode = |v: &[u8], p: &mut FloatProjectionState| -> crate::Result<ArrayRef> {
+            let mut buf = Vec::new();
+            write_bytes(&mut buf, v);
+            write_bytes(&mut buf, var.metadata());
+            let mut input = BlockInput {
+                data: &buf,
+                position: 0,
+                data_end: buf.len(),
+            };
+            let mut b = ColumnBuilder::new(&ty, 2)?;
+            b.append_null();
+            p.append(&mut input, &mut b)?;
+            b.finish()
+        };
+        let result = decode(var.value(), &mut projection).unwrap();
+        let row = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(row.is_null(0));
+        for (i, expected) in [Some(3.), None, Some(2.)].iter().enumerate() {
+            let a = row
+                .column(i)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
+            assert_eq!(a.iter().nth(1).unwrap(), *expected);
+        }
+        let mut corrupted = var.value().to_vec();
+        let key = corrupted
+            .windows(10)
+            .position(|s| s == b"unselected")
+            .unwrap();
+        // Invalid primitive tag in the unrequested child, not its object offset.
+        corrupted[key - 1] = 0xfc;
+        assert!(decode(&corrupted, &mut projection).is_err());
     }
 
     #[test]
