@@ -132,6 +132,7 @@ arrow-data = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-cast = { workspace = true }
+arrow-data = { workspace = true }
 arrow-json = "59.2"
 arrow-ipc = "59.2"
 arrow-ord = { workspace = true }
