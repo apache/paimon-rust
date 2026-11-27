@@ -617,12 +617,26 @@ impl<'a> PaimonTableRead<'a> {
         } else {
             parallelism
         };
-        let workers = parallelism.min(splits.len()).max(1);
+        // File groups within a supplied split must emit in order even when
+        // splits may emit unordered. Shared memory cannot be held by a later
+        // file while its earlier file waits for admission, so keep those files
+        // serial when the read uses shared resources.
+        let file_groups =
+            if options.data_evolution_enabled() && !self.update_read && !budget.has_resources() {
+                super::read_execution::independent_file_groups(&splits, parallelism)
+            } else {
+                None
+            };
+        let work_count = file_groups
+            .as_ref()
+            .map(|groups| groups.iter().map(Vec::len).sum())
+            .unwrap_or(splits.len());
+        let workers = parallelism.min(work_count).max(1);
         // A later ordered group may retain its ready batch while the current
         // group is still reading. Background prefetch must not keep a shared
         // scheduling permit in that retained decoder and block the current
         // group forever. Foreground reads retain shared memory admission.
-        let budget = if ordered && workers > 1 {
+        let budget = if (ordered || file_groups.is_some()) && workers > 1 {
             Arc::new(budget.without_prefetch())
         } else {
             budget
@@ -631,13 +645,18 @@ impl<'a> PaimonTableRead<'a> {
             .blob_parallelism
             .min((MAX_TOTAL_BLOB_READS / workers).max(1));
         let factory = self.execution_factory(include_row_kind, budget, blob_parallelism);
-        Ok(super::read_execution::execute(
-            splits.into_owned(),
-            parallelism,
-            ordered,
-            self.limit,
-            factory,
-        ))
+        Ok(match file_groups {
+            Some(groups) => {
+                super::read_execution::execute_file_groups(groups, ordered, self.limit, factory)
+            }
+            None => super::read_execution::execute(
+                splits.into_owned(),
+                parallelism,
+                ordered,
+                self.limit,
+                factory,
+            ),
+        })
     }
 
     fn execution_factory(
@@ -2978,7 +2997,7 @@ fn pk_split_needs_merge(split: &DataSplit, dv_enabled: bool) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -3034,7 +3053,11 @@ mod tests {
         );
     }
 
-    pub(super) fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
+    pub(in crate::table) fn file(
+        name: &str,
+        level: i32,
+        delete_row_count: Option<i64>,
+    ) -> DataFileMeta {
         DataFileMeta {
             file_name: name.to_string(),
             file_size: 128,
@@ -3060,7 +3083,7 @@ mod tests {
         }
     }
 
-    pub(super) fn split(files: Vec<DataFileMeta>, raw_convertible: bool) -> DataSplit {
+    pub(in crate::table) fn split(files: Vec<DataFileMeta>, raw_convertible: bool) -> DataSplit {
         DataSplitBuilder::new()
             .with_snapshot(1)
             .with_partition(BinaryRow::new(0))
