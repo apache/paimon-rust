@@ -17,6 +17,7 @@
 
 #![cfg(all(feature = "storage-fs", not(windows)))]
 
+use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, Int32Array, RecordBatch, StringArray, StructArray,
 };
@@ -28,14 +29,19 @@ use paimon::arrow::variant_arrow_type;
 use paimon::catalog::{Catalog, Identifier};
 use paimon::common::Options;
 use paimon::spec::{
-    variant_extraction_row, DataField, DataType, IntType, RowType, Schema, VarCharType, VariantType,
+    variant_extraction_row, DataField, DataType, IntType, PredicateBuilder, RowType, Schema,
+    SchemaChange, VarCharType, VariantType,
 };
+use paimon::table::ReadBuilder;
 use paimon::variant::GenericVariant;
 use paimon::{CatalogOptions, FileSystemCatalog, Table};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-async fn create_table(kind: &str) -> (tempfile::TempDir, Table) {
+async fn create_table(
+    kind: &str,
+    variant_options: &[(&str, &str)],
+) -> (tempfile::TempDir, FileSystemCatalog, Table) {
     let temp = tempfile::tempdir().unwrap();
     let mut options = Options::new();
     options.set(
@@ -63,6 +69,9 @@ async fn create_table(kind: &str) -> (tempfile::TempDir, Table) {
             ])),
         )
         .option("file.format", "row");
+    for &(key, value) in variant_options {
+        schema = schema.option(key, value);
+    }
     if kind == "primary_key" {
         schema = schema.primary_key(["id"]).option("bucket", "1");
     } else if kind == "data_evolution" {
@@ -76,7 +85,7 @@ async fn create_table(kind: &str) -> (tempfile::TempDir, Table) {
         .await
         .unwrap();
     let table = catalog.get_table(&identifier).await.unwrap();
-    (temp, table)
+    (temp, catalog, table)
 }
 
 fn variants(values: &[Option<GenericVariant>]) -> StructArray {
@@ -151,7 +160,7 @@ fn input_batch() -> (RecordBatch, Vec<Option<GenericVariant>>) {
     (batch, values)
 }
 
-async fn write_and_commit(table: &Table, batch: &RecordBatch) {
+async fn write_and_commit(table: &Table, batch: &RecordBatch, expected_version: u8) {
     let builder = table.new_write_builder();
     let mut writer = builder.new_write().unwrap();
     writer.write_arrow_batch(batch).await.unwrap();
@@ -167,7 +176,7 @@ async fn write_and_commit(table: &Table, batch: &RecordBatch) {
             .read()
             .await
             .unwrap();
-        assert_eq!(bytes[bytes.len() - 8], 1, "ordinary Variant keeps ROW v1");
+        assert_eq!(bytes[bytes.len() - 8], expected_version, "ROW file version");
     }
     writer.close().await;
     builder.new_commit().commit(messages).await.unwrap();
@@ -176,6 +185,10 @@ async fn write_and_commit(table: &Table, batch: &RecordBatch) {
 async fn read(table: &Table, projection: &[&str]) -> RecordBatch {
     let mut builder = table.new_read_builder();
     builder.with_projection(projection).unwrap();
+    read_batches(&builder).await
+}
+
+async fn read_batches(builder: &ReadBuilder<'_>) -> RecordBatch {
     let plan = builder.new_scan().plan().await.unwrap();
     let batches = builder
         .new_read()
@@ -184,11 +197,11 @@ async fn read(table: &Table, projection: &[&str]) -> RecordBatch {
         .unwrap()
         .try_collect::<Vec<_>>()
         .await
-        .unwrap_or_else(|err| panic!("reading {} with {projection:?}: {err}", table.location()));
+        .unwrap();
     concat_batches(&batches[0].schema(), &batches).unwrap()
 }
 
-fn assert_variants(column: &ArrayRef, expected: &[Option<GenericVariant>]) {
+fn variant_values(column: &ArrayRef) -> Vec<Option<GenericVariant>> {
     let column = column.as_any().downcast_ref::<StructArray>().unwrap();
     let values = column
         .column(0)
@@ -200,48 +213,48 @@ fn assert_variants(column: &ArrayRef, expected: &[Option<GenericVariant>]) {
         .as_any()
         .downcast_ref::<BinaryArray>()
         .unwrap();
-    assert_eq!(column.len(), expected.len());
-    for (row, expected) in expected.iter().enumerate() {
-        if let Some(expected) = expected {
-            assert!(column.is_valid(row));
-            let actual = GenericVariant::from_parts(
-                values.value(row).to_vec(),
-                metadata.value(row).to_vec(),
-            )
-            .unwrap();
-            assert_eq!(&actual, expected, "row {row}");
-            assert_eq!(actual.to_json().unwrap(), expected.to_json().unwrap());
-        } else {
-            assert!(column.is_null(row), "row {row}");
-        }
-    }
+    (0..column.len())
+        .map(|row| {
+            column.is_valid(row).then(|| {
+                GenericVariant::from_parts(values.value(row).to_vec(), metadata.value(row).to_vec())
+                    .unwrap()
+            })
+        })
+        .collect()
+}
+
+fn json_values(values: &[Option<GenericVariant>]) -> Vec<Option<String>> {
+    values
+        .iter()
+        .map(|value| value.as_ref().map(|value| value.to_json().unwrap()))
+        .collect()
 }
 
 #[tokio::test]
 async fn ordinary_variant_row_tables_preserve_values_and_reordered_projection() {
     for kind in ["append", "primary_key", "data_evolution"] {
-        let (_temp, table) = create_table(kind).await;
+        let (_temp, _catalog, table) = create_table(kind, &[]).await;
         let (input, values) = input_batch();
-        write_and_commit(&table, &input).await;
+        write_and_commit(&table, &input, 1).await;
 
         let payload_only = read(&table, &["id", "payload"]).await;
-        assert_variants(payload_only.column(1), &values);
+        assert_eq!(variant_values(payload_only.column(1)), values);
         let result = read(&table, &["id", "payload", "nested"]).await;
         assert_eq!(result.num_rows(), 5);
         assert_eq!(result.column(0).to_data(), input.column(0).to_data());
-        assert_variants(result.column(1), &values);
+        assert_eq!(variant_values(result.column(1)), values);
         assert_eq!(result.column(2).to_data(), input.column(2).to_data());
 
         let projected = read(&table, &["payload", "id"]).await;
         assert_eq!(projected.schema().field(0).name(), "payload");
         assert_eq!(projected.schema().field(1).name(), "id");
-        assert_variants(projected.column(0), &values);
+        assert_eq!(variant_values(projected.column(0)), values);
         assert_eq!(projected.column(1).to_data(), input.column(0).to_data());
 
         if kind == "primary_key" {
             // Overlapping key ranges must use the KV merge reader rather than
             // the single-file raw shortcut exercised above.
-            write_and_commit(&table, &input).await;
+            write_and_commit(&table, &input, 1).await;
             let plan = table.new_read_builder().new_scan().plan().await.unwrap();
             assert!(!plan.splits().is_empty());
             assert!(plan.splits().iter().all(|split| !split.raw_convertible()));
@@ -249,13 +262,13 @@ async fn ordinary_variant_row_tables_preserve_values_and_reordered_projection() 
             let merged = read(&table, &["id", "payload", "nested"]).await;
             assert_eq!(merged.num_rows(), 5);
             assert_eq!(merged.column(0).to_data(), input.column(0).to_data());
-            assert_variants(merged.column(1), &values);
+            assert_eq!(variant_values(merged.column(1)), values);
             assert_eq!(merged.column(2).to_data(), input.column(2).to_data());
 
             let projected = read(&table, &["payload", "id"]).await;
             assert_eq!(projected.schema().field(0).name(), "payload");
             assert_eq!(projected.schema().field(1).name(), "id");
-            assert_variants(projected.column(0), &values);
+            assert_eq!(variant_values(projected.column(0)), values);
             assert_eq!(projected.column(1).to_data(), input.column(0).to_data());
         }
     }
@@ -278,12 +291,17 @@ fn extraction_type() -> DataType {
     )
 }
 
-async fn assert_variant_extraction_read_type(kind: &str, force_merge: bool) {
-    let (_temp, table) = create_table(kind).await;
+async fn assert_variant_extraction_read_type(
+    kind: &str,
+    force_merge: bool,
+    variant_options: &[(&str, &str)],
+    expected_version: u8,
+) {
+    let (_temp, _catalog, table) = create_table(kind, variant_options).await;
     let (input, _) = input_batch();
-    write_and_commit(&table, &input).await;
+    write_and_commit(&table, &input, expected_version).await;
     if force_merge {
-        write_and_commit(&table, &input).await;
+        write_and_commit(&table, &input, expected_version).await;
     }
     let fields = table.schema().fields();
     let payload = &fields[1];
@@ -306,20 +324,12 @@ async fn assert_variant_extraction_read_type(kind: &str, force_merge: bool) {
         fields[0].clone(),
         DataField::new(payload.id(), payload.name().into(), extraction_type()),
     ]);
-    let plan = builder.new_scan().plan().await.unwrap();
     if force_merge {
+        let plan = builder.new_scan().plan().await.unwrap();
         assert!(!plan.splits().is_empty());
         assert!(plan.splits().iter().all(|split| !split.raw_convertible()));
     }
-    let batches = builder
-        .new_read()
-        .unwrap()
-        .to_arrow(plan.splits())
-        .unwrap()
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
-    let result = concat_batches(&batches[0].schema(), &batches).unwrap();
+    let result = read_batches(&builder).await;
     assert_eq!(result.schema().field(0).name(), "nested");
     assert_eq!(result.schema().field(1).name(), "id");
     let payload = result
@@ -372,6 +382,111 @@ async fn ordinary_variant_row_read_type_extracts_top_level_and_nested_fields() {
         ("primary_key", false),
         ("primary_key", true),
     ] {
-        assert_variant_extraction_read_type(kind, force_merge).await;
+        assert_variant_extraction_read_type(kind, force_merge, &[], 1).await;
     }
+}
+
+#[tokio::test]
+async fn shredded_variant_row_tables_restore_values_and_extractions() {
+    let configured = [(
+        "variant.shreddingSchema",
+        r#"{"type":"ROW","fields":[{"name":"payload","type":{"type":"ROW","fields":[{"name":"x","type":"INT"}]}}]}"#,
+    )];
+    let inferred = [
+        ("variant.inferShreddingSchema", "true"),
+        ("variant.shredding.maxInferBufferRow", "1"),
+    ];
+    for (kind, options) in [
+        ("append", configured.as_slice()),
+        ("data_evolution", inferred.as_slice()),
+    ] {
+        let (_temp, _catalog, table) = create_table(kind, options).await;
+        let (input, values) = input_batch();
+        write_and_commit(&table, &input, 2).await;
+        let actual = read(&table, &["payload", "id", "nested"]).await;
+        assert_eq!(
+            json_values(&variant_values(actual.column(0))),
+            json_values(&values)
+        );
+        assert_eq!(actual.column(1).to_data(), input.column(0).to_data());
+        let actual_nested = actual.column(2).as_struct();
+        let expected_nested = input.column(2).as_struct();
+        assert_eq!(actual_nested.nulls(), expected_nested.nulls());
+        let actual_variants = json_values(&variant_values(actual_nested.column(0)));
+        let expected_variants = json_values(&variant_values(expected_nested.column(0)));
+        for row in 0..actual_nested.len() {
+            if expected_nested.is_valid(row) {
+                assert_eq!(actual_variants[row], expected_variants[row]);
+                assert_eq!(
+                    actual_nested.column(1).slice(row, 1).to_data(),
+                    expected_nested.column(1).slice(row, 1).to_data(),
+                );
+            }
+        }
+
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["id"]).unwrap();
+        builder.with_filter(
+            PredicateBuilder::new(table.schema().fields())
+                .is_null("payload")
+                .unwrap(),
+        );
+        assert_eq!(
+            read_batches(&builder).await.column(0).to_data(),
+            Int32Array::from(vec![3]).to_data()
+        );
+    }
+    assert_variant_extraction_read_type("primary_key", true, &inferred, 2).await;
+}
+
+#[tokio::test]
+async fn reads_each_row_file_schema_after_variant_options_and_column_rename() {
+    let (_temp, catalog, table) = create_table(
+        "append",
+        &[
+            ("variant.inferShreddingSchema", "true"),
+            ("variant.shredding.maxInferBufferRow", "1"),
+        ],
+    )
+    .await;
+    let (input, expected) = input_batch();
+    write_and_commit(&table, &input.slice(2, 1), 1).await;
+    write_and_commit(&table, &input.slice(0, 2), 2).await;
+    write_and_commit(&table, &input.slice(4, 1), 2).await;
+
+    catalog
+        .alter_table(
+            table.identifier(),
+            vec![
+                SchemaChange::remove_option("variant.inferShreddingSchema".into()),
+                SchemaChange::rename_column("payload".into(), "renamed_payload".into()),
+            ],
+            false,
+        )
+        .await
+        .unwrap();
+    let table = catalog.get_table(table.identifier()).await.unwrap();
+    let result = read(&table, &["id", "renamed_payload"]).await;
+    let ids = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let mut actual = ids
+        .values()
+        .iter()
+        .copied()
+        .zip(json_values(&variant_values(result.column(1))))
+        .collect::<Vec<_>>();
+    actual.sort_by_key(|(id, _)| *id);
+    let expected = [0, 1, 2, 4]
+        .into_iter()
+        .map(|id| {
+            (
+                id as i32,
+                expected[id].as_ref().map(|value| value.to_json().unwrap()),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
 }

@@ -466,7 +466,7 @@ pub(crate) fn create_format_reader_with_budget(
     } else if lower.ends_with(".avro") {
         Box::new(avro::AvroFormatReader)
     } else if lower.ends_with(".row") {
-        Box::new(row::RowFormatReader::with_options(table_options))
+        return Ok(row::RowFormatReader::with_options(table_options).configure(fields.data_schema));
     } else if lower.ends_with(".mosaic") {
         Box::new(mosaic::MosaicFormatReader::with_prefetch(mosaic_prefetch))
     } else {
@@ -583,7 +583,20 @@ pub(crate) fn create_format_writer_factory(
             format_options.cloned().unwrap_or_default(),
             stats_fields.map(<[_]>::to_vec),
         ));
-        return shredding::wrap_writer_factory(raw, write_fields, format_options);
+        return shredding::wrap_writer_factory(raw, write_fields, format_options, file_format);
+    }
+    if file_format.eq_ignore_ascii_case("row") {
+        let raw = Arc::new(row::RowWriterFactory::new(
+            schema,
+            write_fields,
+            zstd_level,
+        )?);
+        return shredding::wrap_writer_factory(
+            raw.clone(),
+            Some(raw.fields()),
+            format_options,
+            file_format,
+        );
     }
     // Direct format writers can bypass table-schema validation. Never silently
     // drop a requested MAP layout when selecting an unsupported format.
@@ -699,14 +712,6 @@ impl FormatWriterFactory for PlainFormatWriterFactory {
                     format_options,
                 )
                 .await?,
-            ))
-        } else if lower.ends_with(".row") {
-            let row_type = match write_fields {
-                Some(fields) => fields.to_vec(),
-                None => row::row_type_from_arrow_schema(&schema)?,
-            };
-            Ok(Box::new(
-                row::RowFormatWriter::new(output, schema, row_type, zstd_level).await?,
             ))
         } else if lower.ends_with(".mosaic") {
             Ok(Box::new(

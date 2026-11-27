@@ -616,9 +616,9 @@ bytes.
 `VARIANT` stores semi-structured data using the same logical value + metadata binary shape as Paimon Java. Use it for JSON-like fields whose schema may differ row by row.
 
 Parquet and ROW files support ordinary `VARIANT` reads and writes. Set
-`'file.format' = 'row'` to use ROW storage. ROW preserves the value and metadata
-buffers in the Java-compatible v1 layout; extracting a path still reads the
-containing compressed row block. The shredding options below apply to Parquet.
+`'file.format' = 'row'` to use ROW storage. An ordinary ROW file preserves the
+value and metadata buffers in the Java-compatible v1 layout. A path extraction
+reads the containing compressed row block.
 
 Create `VARIANT` columns like ordinary table columns:
 
@@ -753,10 +753,9 @@ Dictionary-encoded string columns have the same JSON text semantics.
 ### Variant Shredding
 
 Variant shredding stores selected fields from a `VARIANT` column as typed
-physical fields in Parquet files while keeping the logical table schema as
-`VARIANT`. Reads are automatic: when a projected `VARIANT` column is stored in
-shredded physical form, Paimon Rust assembles it back into the normal
-value + metadata representation before returning the batch.
+physical fields in Parquet or ROW files while keeping the logical table schema
+as `VARIANT`. When a query reads a full shredded `VARIANT`, Paimon Rust
+rebuilds its value and metadata buffers.
 
 Use a configured shredding schema when the hot fields are known in advance:
 
@@ -795,8 +794,13 @@ CREATE TABLE paimon.my_db.inferred_events (
 ```
 
 When both configured and inferred shredding are set, the configured schema takes
-precedence. Shredding currently applies to Parquet data-file writes; ordinary
-non-shredded `VARIANT` files continue to read normally.
+precedence. The same examples work with `'file.format' = 'row'`.
+
+ROW files with a changed physical layout use version 2. Each file stores its
+physical fields as a UTF-8 JSON array between the block index and the footer.
+Paimon Rust can read v1 and v2 files together, including files written with
+different inferred schemas. Reading v2 requires a reader that supports this ROW
+version. Java and Python readers limited to v1 can read ordinary ROW files.
 
 Current limitations:
 
@@ -4225,7 +4229,7 @@ limit for Vindex range reads during search. The new option defaults to `64`.
 
 ### Variant Shredding Options
 
-Set these as table options when writing `VARIANT` columns to Parquet. The
+Set these as table options when writing `VARIANT` columns to Parquet or ROW. The
 logical table schema remains `VARIANT`; the options only affect the physical
 file layout and automatic read-time assembly.
 

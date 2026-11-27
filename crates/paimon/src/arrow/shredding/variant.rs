@@ -440,6 +440,15 @@ struct AdaptiveVariantState {
 }
 
 impl VariantShreddingWritePlanFactory {
+    pub(crate) fn for_row(
+        logical_fields: Vec<DataField>,
+        mut options: HashMap<String, String>,
+    ) -> Result<Self> {
+        options.remove(PARQUET_VARIANT_SHREDDING_SCHEMA_OPTION);
+        options.remove(PARQUET_VARIANT_INFER_SHREDDING_SCHEMA_OPTION);
+        Self::new(logical_fields, options)
+    }
+
     pub(crate) fn new(
         logical_fields: Vec<DataField>,
         options: HashMap<String, String>,

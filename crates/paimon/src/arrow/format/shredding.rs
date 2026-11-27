@@ -52,12 +52,20 @@ pub(crate) fn wrap_writer_factory(
     delegate: Arc<dyn PhysicalFormatWriterFactory>,
     fields: Option<&[DataField]>,
     options: Option<&HashMap<String, String>>,
+    file_format: &str,
 ) -> crate::Result<Arc<dyn FormatWriterFactory>> {
     let (Some(fields), Some(options)) = (fields, options) else {
         return Ok(delegate);
     };
-    let variant_factory = VariantShreddingWritePlanFactory::new(fields.to_vec(), options.clone())?;
     let map_configs = detect_map_shredding_fields(fields, options)?;
+    if !map_configs.is_empty() {
+        crate::spec::map_shredding::validate_format("file.format", file_format)?;
+    }
+    let variant_factory = if file_format.eq_ignore_ascii_case("row") {
+        VariantShreddingWritePlanFactory::for_row(fields.to_vec(), options.clone())?
+    } else {
+        VariantShreddingWritePlanFactory::new(fields.to_vec(), options.clone())?
+    };
     if variant_factory.should_create_write_plan() && !map_configs.is_empty() {
         return Err(crate::Error::Unsupported {
             message:
@@ -477,9 +485,14 @@ mod tests {
                 "shared-shredding".to_string(),
             ),
         ]);
-        let err = wrap_writer_factory(Arc::new(NoopWriterFactory), Some(&fields), Some(&options))
-            .err()
-            .expect("conflicting shredding plans must be rejected");
+        let err = wrap_writer_factory(
+            Arc::new(NoopWriterFactory),
+            Some(&fields),
+            Some(&options),
+            "parquet",
+        )
+        .err()
+        .expect("conflicting shredding plans must be rejected");
         assert!(
             matches!(err, crate::Error::Unsupported { .. }),
             "unexpected error: {err}"
@@ -495,9 +508,13 @@ mod tests {
             "fields.tags.map.storage-layout".to_string(),
             "shared-shredding".to_string(),
         )]);
-        let factory =
-            wrap_writer_factory(Arc::new(NoopWriterFactory), Some(&fields), Some(&options))
-                .unwrap();
+        let factory = wrap_writer_factory(
+            Arc::new(NoopWriterFactory),
+            Some(&fields),
+            Some(&options),
+            "parquet",
+        )
+        .unwrap();
         let err = factory
             .create_writer(&test_output(), "snappy")
             .await

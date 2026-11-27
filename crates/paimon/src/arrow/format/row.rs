@@ -15,13 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java-compatible `.row` file format.
+//! Paimon `.row` file format with optional Variant shredding.
 //!
-//! Layout reference:
+//! V1 layout reference:
 //! `org.apache.paimon.format.row.RowFormatWriter` in paimon-java.
 
 use super::metadata_cache::FileMetadataCache;
-use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
+use super::shredding::PhysicalFormatWriterFactory;
+use super::{
+    ConfiguredFormatReader, FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult,
+    FormatWriterFactory,
+};
+use crate::arrow::shredding::variant::assemble_shredded_variant_batch;
 use crate::arrow::{
     build_target_arrow_schema, convert_arrow_fields, is_variant_arrow_fields, paimon_type_to_arrow,
     paimon_type_to_arrow_field, variant_arrow_type,
@@ -49,6 +54,7 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -72,6 +78,13 @@ impl RowFormatReader {
             // Format-table files may be replaced in place, even with the same size.
             metadata_cache_enabled: !CoreOptions::new(options).is_format_table(),
             projections: Vec::new(),
+        }
+    }
+
+    pub(super) fn configure(self, data_schema_fields: &[DataField]) -> ConfiguredFormatReader {
+        ConfiguredFormatReader {
+            reader: Box::new(self),
+            read_fields: data_schema_fields.to_vec(),
         }
     }
 
@@ -137,19 +150,84 @@ impl RowFormatReader {
                 ));
             }
         }
-        super::configure_format_reader(
-            Box::new(reader),
-            super::FormatReadFields {
-                data_schema: physical,
-                projected,
-            },
-        )
+        reader.configure(physical)
+    }
+}
+
+pub(super) struct RowWriterFactory {
+    schema: SchemaRef,
+    fields: Vec<DataField>,
+    zstd_level: i32,
+}
+
+impl RowWriterFactory {
+    pub(super) fn new(
+        schema: SchemaRef,
+        fields: Option<&[DataField]>,
+        zstd_level: i32,
+    ) -> crate::Result<Self> {
+        let fields = match fields {
+            Some(fields) => fields.to_vec(),
+            None => row_type_from_arrow_schema(&schema)?,
+        };
+        Ok(Self {
+            schema,
+            fields,
+            zstd_level,
+        })
+    }
+
+    pub(super) fn fields(&self) -> &[DataField] {
+        &self.fields
+    }
+}
+
+#[async_trait]
+impl FormatWriterFactory for RowWriterFactory {
+    async fn create_writer(
+        &self,
+        output: &OutputFile,
+        _compression: &str,
+    ) -> crate::Result<Box<dyn FormatFileWriter>> {
+        Ok(Box::new(
+            RowFormatWriter::new(
+                output,
+                self.schema.clone(),
+                self.fields.clone(),
+                self.zstd_level,
+            )
+            .await?,
+        ))
+    }
+}
+
+#[async_trait]
+impl PhysicalFormatWriterFactory for RowWriterFactory {
+    async fn create_physical_writer(
+        &self,
+        output: &OutputFile,
+        _compression: &str,
+        schema: SchemaRef,
+        write_fields: Option<&[DataField]>,
+    ) -> crate::Result<Box<dyn FormatFileWriter>> {
+        let fields = write_fields.ok_or_else(|| Error::DataInvalid {
+            message: "Shredded .row writer requires physical fields".into(),
+            source: None,
+        })?;
+        let physical_schema = serde_json::to_vec(fields).map_err(row_physical_schema_error)?;
+        validate_physical_schema_size(physical_schema.len() as u64)?;
+        validate_physical_schema_depth(&physical_schema)?;
+        let mut writer =
+            RowFormatWriter::new(output, schema, fields.to_vec(), self.zstd_level).await?;
+        writer.physical_schema = Some(Bytes::from(physical_schema));
+        Ok(Box::new(writer))
     }
 }
 
 pub(crate) struct RowFormatWriter {
     writer: Box<dyn FileWrite>,
     row_type: Vec<DataField>,
+    physical_schema: Option<Bytes>,
     block_size_threshold: usize,
     zstd_level: i32,
     block_writer: RowBlockWriter,
@@ -166,6 +244,11 @@ const ROW_BLOCK_READ_CONCURRENCY: usize = 8;
 const FOOTER_SIZE: u64 = 32;
 const ROW_MAGIC: i32 = 0x524F5753;
 const ROW_VERSION: u8 = 1;
+// V2 puts the Paimon physical field list (UTF-8 JSON) between the index and footer.
+const SHREDDED_ROW_VERSION: u8 = 2;
+// Shredding adds two physical ROW layers per nested Variant object. This bound
+// accommodates the default inference depth (50) and limits decoding recursion.
+const MAX_PHYSICAL_SCHEMA_JSON_DEPTH: usize = 512;
 const ROW_METADATA_CACHE_MAX_ENTRIES: usize = 4096;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -177,6 +260,7 @@ struct RowMetadataCacheKey {
 struct RowFileMetadata {
     index: RowBlockIndex,
     total_rows: usize,
+    physical_schema: Option<Bytes>,
 }
 
 struct RowMetadataCache {
@@ -212,6 +296,7 @@ impl RowMetadataCache {
                 |metadata| {
                     std::mem::size_of::<RowFileMetadata>()
                         .saturating_add(metadata.index.heap_bytes())
+                        .saturating_add(metadata.physical_schema.as_ref().map_or(0, Bytes::len))
                 },
             )
             .await
@@ -231,6 +316,7 @@ impl RowFormatWriter {
         Ok(Self {
             writer: output.writer().await?,
             row_type,
+            physical_schema: None,
             block_size_threshold: DEFAULT_BLOCK_SIZE,
             zstd_level,
             block_writer: RowBlockWriter::new(),
@@ -337,8 +423,16 @@ impl FormatFileWriter for RowFormatWriter {
         let index_length = index_bytes.len();
         self.writer.write(Bytes::from(index_bytes)).await?;
         self.bytes_written += index_length as u64;
+        let version = if let Some(schema) = self.physical_schema.take() {
+            self.bytes_written += schema.len() as u64;
+            self.writer.write(schema).await?;
+            SHREDDED_ROW_VERSION
+        } else {
+            ROW_VERSION
+        };
 
         let footer = RowFileFooter {
+            version,
             total_row_count: self.total_row_count,
             block_count: i32::try_from(block_count).map_err(|e| Error::DataInvalid {
                 message: "Too many row blocks".to_string(),
@@ -367,14 +461,6 @@ pub(super) fn row_type_from_arrow_schema(schema: &SchemaRef) -> crate::Result<Ve
 
 #[async_trait]
 impl FormatFileReader for RowFormatReader {
-    fn select_read_fields(
-        &self,
-        data_schema_fields: &[DataField],
-        _projected_fields: &[DataField],
-    ) -> Vec<DataField> {
-        data_schema_fields.to_vec()
-    }
-
     async fn read_batch_stream(
         &self,
         reader: Box<dyn FileRead>,
@@ -404,13 +490,22 @@ impl FormatFileReader for RowFormatReader {
             Some(cache) => cache.load(reader.as_ref(), file_size).await?,
             None => load_row_file_metadata(reader.as_ref(), file_size).await?,
         };
+        let stored_fields = metadata
+            .physical_schema
+            .as_deref()
+            .map(deserialize_physical_schema)
+            .transpose()?;
+        if let Some(fields) = &stored_fields {
+            validate_physical_fields(read_fields, fields)?;
+        }
+        let physical_fields = stored_fields.as_deref().unwrap_or(read_fields);
         let total_rows = metadata.total_rows;
         validate_row_selection(total_rows, row_selection.as_deref())?;
         // Public callers may supply unordered or overlapping ranges. Normalize
         // once so every block can seek directly to its overlapping window.
         let row_selection = row_selection.map(crate::table::merge_row_ranges);
 
-        let mut output_fields = read_fields.to_vec();
+        let mut output_fields = physical_fields.to_vec();
         let mut predicate_fields = std::collections::HashSet::new();
         if let Some(fp) = predicates {
             for p in &fp.predicates {
@@ -419,7 +514,10 @@ impl FormatFileReader for RowFormatReader {
         }
         let mut projections = HashMap::new();
         for (idx, field, keys, strict) in &self.projections {
-            if predicate_fields.contains(idx) || (predicates.is_some() && strict.contains(&true)) {
+            if !matches!(physical_fields[*idx].data_type(), DataType::Variant(_))
+                || predicate_fields.contains(idx)
+                || (predicates.is_some() && strict.contains(&true))
+            {
                 continue;
             }
             output_fields[*idx] = field.clone();
@@ -429,7 +527,7 @@ impl FormatFileReader for RowFormatReader {
             );
         }
         let schema = build_target_arrow_schema(&output_fields)?;
-        let row_type = read_fields.to_vec();
+        let read_fields = read_fields.to_vec();
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
 
         let blocks_to_read = blocks_to_read(&metadata.index, total_rows, row_selection.as_deref());
@@ -440,6 +538,7 @@ impl FormatFileReader for RowFormatReader {
         });
         Ok(try_stream! {
             let index = &metadata.index;
+            let row_type = stored_fields.as_deref().unwrap_or(&read_fields);
             let mut blocks = futures::stream::iter(blocks_to_read.into_iter().map(|block_idx| {
                 read_row_block(reader.as_ref(), index, block_idx)
             }))
@@ -459,10 +558,15 @@ impl FormatFileReader for RowFormatReader {
                 }
 
                 for chunk in selected.chunks(batch_size) {
-                    let batch = decode_row_block_projected(&data, &row_type, &output_fields, schema.clone(), chunk, &mut projections)?;
+                    let batch = decode_row_block_projected(&data, row_type, &output_fields, schema.clone(), chunk, &mut projections)?;
+                    let batch = if stored_fields.is_some() {
+                        assemble_shredded_variant_batch(batch, &read_fields)?
+                    } else {
+                        batch
+                    };
                     let batch = match predicates.as_ref() {
                         Some(fp) => crate::arrow::residual::filter_record_batch_by_predicates(
-                            batch, fp, &row_type,
+                            batch, fp, &read_fields,
                         )?,
                         None => batch,
                     };
@@ -505,8 +609,21 @@ async fn load_row_file_metadata(
             source: None,
         });
     }
-    let index_bytes = reader.read(index_start..index_end).await?;
-    let index = RowBlockIndex::from_bytes(index_bytes.as_ref())?;
+    let metadata_end = if footer.version == SHREDDED_ROW_VERSION {
+        validate_physical_schema_size(footer_start - index_end)?;
+        footer_start
+    } else {
+        index_end
+    };
+    let metadata_bytes = reader.read(index_start..metadata_end).await?;
+    if metadata_bytes.len() as u64 != metadata_end - index_start {
+        return Err(Error::DataInvalid {
+            message: "Truncated .row index or physical schema".into(),
+            source: None,
+        });
+    }
+    let (index_bytes, schema_bytes) = metadata_bytes.split_at(footer.index_length as usize);
+    let index = RowBlockIndex::from_bytes(index_bytes)?;
     let footer_block_count =
         usize::try_from(footer.block_count).map_err(|e| Error::DataInvalid {
             message: format!("Invalid .row footer block count {}", footer.block_count),
@@ -527,7 +644,109 @@ async fn load_row_file_metadata(
         source: Some(Box::new(e)),
     })?;
     index.validate_for_file(total_rows, index_start)?;
-    Ok(Arc::new(RowFileMetadata { index, total_rows }))
+    let physical_schema = (!schema_bytes.is_empty()).then(|| Bytes::copy_from_slice(schema_bytes));
+    Ok(Arc::new(RowFileMetadata {
+        index,
+        total_rows,
+        physical_schema,
+    }))
+}
+
+fn validate_physical_schema_size(size: u64) -> crate::Result<()> {
+    if size == 0 || size > i32::MAX as u64 {
+        return Err(Error::DataInvalid {
+            message: format!("Invalid .row physical schema length: {size}"),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+fn deserialize_physical_schema(bytes: &[u8]) -> crate::Result<Vec<DataField>> {
+    validate_physical_schema_depth(bytes)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    deserializer.disable_recursion_limit();
+    let fields = Vec::deserialize(&mut deserializer).map_err(row_physical_schema_error)?;
+    deserializer.end().map_err(row_physical_schema_error)?;
+    Ok(fields)
+}
+
+fn validate_physical_schema_depth(bytes: &[u8]) -> crate::Result<()> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut bytes = bytes.iter().copied();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'\\' if in_string => {
+                bytes.next();
+            }
+            b'"' => in_string = !in_string,
+            b'{' | b'[' if !in_string => {
+                depth += 1;
+                if depth > MAX_PHYSICAL_SCHEMA_JSON_DEPTH {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            ".row physical schema JSON exceeds nesting depth {MAX_PHYSICAL_SCHEMA_JSON_DEPTH}"
+                        ),
+                        source: None,
+                    });
+                }
+            }
+            b'}' | b']' if !in_string => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn row_physical_schema_error(error: serde_json::Error) -> Error {
+    Error::DataInvalid {
+        message: "Invalid .row physical schema JSON".into(),
+        source: Some(Box::new(error)),
+    }
+}
+
+fn validate_physical_fields(logical: &[DataField], physical: &[DataField]) -> crate::Result<()> {
+    if logical.len() != physical.len() {
+        return Err(Error::DataInvalid {
+            message: format!(
+                ".row physical schema has {} fields, expected {}",
+                physical.len(),
+                logical.len()
+            ),
+            source: None,
+        });
+    }
+    for (logical, physical) in logical.iter().zip(physical) {
+        if logical.name() == physical.name() {
+            match (logical.data_type(), physical.data_type()) {
+                (DataType::Variant(_), DataType::Row(row)) => {
+                    let schema = crate::variant::build_variant_schema(row)?;
+                    if schema.variant_idx.is_some() || schema.typed_idx.is_some() {
+                        continue;
+                    }
+                }
+                (DataType::Row(logical), DataType::Row(physical)) => {
+                    validate_physical_fields(logical.fields(), physical.fields())?;
+                    continue;
+                }
+                (logical, physical)
+                    if logical == physical || logical.equals_ignore_nullable(physical) =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Incompatible .row physical schema field '{}'",
+                physical.name()
+            ),
+            source: None,
+        });
+    }
+    Ok(())
 }
 
 struct RowBlockPayload {
@@ -2173,6 +2392,7 @@ fn read_timestamp_value(input: &mut BlockInput<'_>, unit: TimeUnit) -> crate::Re
 
 #[derive(Debug, Clone, Copy)]
 struct RowFileFooter {
+    version: u8,
     total_row_count: i64,
     block_count: i32,
     index_offset: i64,
@@ -2186,7 +2406,7 @@ impl RowFileFooter {
         buf[8..12].copy_from_slice(&self.block_count.to_le_bytes());
         buf[12..20].copy_from_slice(&self.index_offset.to_le_bytes());
         buf[20..24].copy_from_slice(&self.index_length.to_le_bytes());
-        buf[24] = ROW_VERSION;
+        buf[24] = self.version;
         buf[28..32].copy_from_slice(&ROW_MAGIC.to_le_bytes());
         buf
     }
@@ -2208,13 +2428,14 @@ impl RowFileFooter {
             });
         }
         let version = buf[24];
-        if version != ROW_VERSION {
+        if !matches!(version, ROW_VERSION | SHREDDED_ROW_VERSION) {
             return Err(Error::DataInvalid {
                 message: format!("Unsupported .row version: {version}"),
                 source: None,
             });
         }
         Ok(Self {
+            version,
             total_row_count: read_i64_le(buf, 0)?,
             block_count: read_i32_le(buf, 8)?,
             index_offset: read_i64_le(buf, 12)?,
@@ -2727,6 +2948,7 @@ mod tests {
         VariantType,
     };
     use crate::variant::GenericVariant;
+    use arrow_array::{cast::AsArray, types::Int32Type};
     use futures::TryStreamExt;
     use std::collections::HashMap;
     use std::ops::Range;
@@ -3243,6 +3465,105 @@ mod tests {
         assert_eq!(metadata.value(0), first_variant.metadata());
         assert_eq!(value.value(1), second_variant.value());
         assert_eq!(metadata.value(1), second_variant.metadata());
+    }
+
+    #[tokio::test]
+    async fn row_shredding_persists_typed_fields_and_residual() {
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/row-variant/shredded.row";
+        let fields = [DataField::new(
+            0,
+            "payload".into(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let ArrowDataType::Struct(children) = variant_arrow_type() else {
+            unreachable!();
+        };
+        let value = GenericVariant::parse_json(r#"{"x":7,"extra":"residual"}"#).unwrap();
+        let column = StructArray::new(
+            children,
+            vec![
+                Arc::new(BinaryArray::from_iter_values([value.value()])),
+                Arc::new(BinaryArray::from_iter_values([value.metadata()])),
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(column)]).unwrap();
+        let options = HashMap::from([(
+            "variant.shreddingSchema".into(),
+            r#"{"type":"ROW","fields":[{"name":"payload","type":{"type":"ROW","fields":[{"name":"x","type":"INT"}]}}]}"#.into(),
+        )]);
+        let mut writer = super::super::create_format_writer(
+            &io.new_output(path).unwrap(),
+            schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        let result = writer.close().await.unwrap();
+        let bytes = io.new_input(path).unwrap().read().await.unwrap();
+        assert_eq!(result.file_size, bytes.len() as u64);
+
+        let reader = BytesFileRead(bytes);
+        let metadata = load_row_file_metadata(&reader, result.file_size)
+            .await
+            .unwrap();
+        let physical =
+            deserialize_physical_schema(metadata.physical_schema.as_deref().unwrap()).unwrap();
+        let block = read_row_block(&reader, &metadata.index, 0).await.unwrap();
+        let schema = build_target_arrow_schema(&physical).unwrap();
+        let batch = decode_row_block(&block.data, &physical, schema, &[0]).unwrap();
+        let payload = batch.column(0).as_struct();
+        let typed = payload.column_by_name("typed_value").unwrap().as_struct();
+        let x = typed.column_by_name("x").unwrap().as_struct();
+        assert!(x.column_by_name("value").unwrap().is_null(0));
+        assert_eq!(
+            x.column_by_name("typed_value")
+                .unwrap()
+                .as_primitive::<Int32Type>()
+                .value(0),
+            7
+        );
+        let residual = payload.column_by_name("value").unwrap().as_binary::<i32>();
+        let metadata = payload
+            .column_by_name("metadata")
+            .unwrap()
+            .as_binary::<i32>();
+        let residual =
+            GenericVariant::from_parts(residual.value(0).to_vec(), metadata.value(0).to_vec())
+                .unwrap();
+        assert_eq!(residual.to_json().unwrap(), r#"{"extra":"residual"}"#);
+    }
+
+    #[test]
+    fn row_physical_schema_round_trips_default_inference_depth() {
+        let mut configured = DataType::Int(IntType::new());
+        for level in 0..50 {
+            configured = DataType::Row(RowType::new(vec![DataField::new(
+                0,
+                format!(r#"nested[]\"{level}"#),
+                configured,
+            )]));
+        }
+        let physical = [DataField::new(
+            0,
+            "payload".into(),
+            crate::variant::variant_shredding_type(&configured).unwrap(),
+        )];
+        let bytes = serde_json::to_vec(&physical).unwrap();
+        assert_eq!(deserialize_physical_schema(&bytes).unwrap(), physical);
+        let error = expect_data_invalid(deserialize_physical_schema(&vec![
+            b'[';
+            MAX_PHYSICAL_SCHEMA_JSON_DEPTH
+                + 1
+        ]));
+        assert!(error.contains("exceeds nesting depth"), "{error}");
     }
 
     #[test]
@@ -4009,6 +4330,7 @@ mod tests {
         .to_bytes()
         .unwrap();
         let footer = RowFileFooter {
+            version: ROW_VERSION,
             total_row_count: 1,
             block_count: 1,
             index_offset: compressed.len() as i64,
@@ -4018,6 +4340,41 @@ mod tests {
         file.extend_from_slice(&index);
         file.extend_from_slice(&footer.to_bytes());
         Bytes::from(file)
+    }
+
+    #[tokio::test]
+    async fn shredded_row_rejects_missing_or_invalid_physical_schema() {
+        let v1 = one_string_row_file("value");
+        let footer_start = v1.len() - FOOTER_SIZE as usize;
+        let mut footer = RowFileFooter::from_bytes(&v1[footer_start..]).unwrap();
+        footer.version = SHREDDED_ROW_VERSION;
+        let fields = [DataField::new(
+            0,
+            "value".into(),
+            DataType::Int(IntType::new()),
+        )];
+        for (schema, expected_error) in [
+            (&b""[..], "physical schema length"),
+            (&b"{"[..], "physical schema JSON"),
+            (&b"[]"[..], "physical schema has 0 fields"),
+        ] {
+            let mut bytes = v1[..footer_start].to_vec();
+            bytes.extend_from_slice(schema);
+            bytes.extend_from_slice(&footer.to_bytes());
+            let size = bytes.len() as u64;
+            let result = RowFormatReader::default()
+                .read_batch_stream(
+                    Box::new(BytesFileRead(Bytes::from(bytes))),
+                    size,
+                    &fields,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            let message = expect_data_invalid(result);
+            assert!(message.contains(expected_error), "{message}");
+        }
     }
 
     #[tokio::test]
