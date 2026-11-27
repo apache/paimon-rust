@@ -164,10 +164,10 @@ pub(crate) struct RowFormatWriter {
 const DEFAULT_BLOCK_SIZE: usize = 65_536;
 const DEFAULT_BATCH_SIZE: usize = 1024;
 const ROW_BLOCK_READ_CONCURRENCY: usize = 8;
-const ROW_READ_MAX_BLOCKS: usize = 8;
-const ROW_READ_MAX_COMPRESSED_BYTES: i64 = 256 * 1024;
+const ROW_READ_MAX_COMPRESSED_BYTES: i64 = 1024 * 1024;
 const FOOTER_SIZE: u64 = 32;
-const ROW_METADATA_TAIL_SIZE: u64 = 4096;
+// The block index is delta-encoded. A small tail limits I/O on cold sparse reads.
+const ROW_METADATA_TAIL_SIZE: u64 = 4 * 1024;
 const ROW_MAGIC: i32 = 0x524F5753;
 const ROW_VERSION: u8 = 1;
 const ROW_METADATA_CACHE_MAX_ENTRIES: usize = 4096;
@@ -554,13 +554,12 @@ fn coalesce_block_reads(
         let offset = index.block_offset(start);
         let mut end = start + 1;
         // A large block can still be read on its own. Never bridge a skipped block.
-        while end - start < ROW_READ_MAX_BLOCKS
-            && blocks
-                .next_if(|&next| {
-                    next == end
-                        && index.block_end_offset(next) - offset <= ROW_READ_MAX_COMPRESSED_BYTES
-                })
-                .is_some()
+        while blocks
+            .next_if(|&next| {
+                next == end
+                    && index.block_end_offset(next) - offset <= ROW_READ_MAX_COMPRESSED_BYTES
+            })
+            .is_some()
         {
             end += 1;
         }
@@ -3404,22 +3403,13 @@ mod tests {
     }
 
     #[test]
-    fn row_block_reads_respect_group_size_limits() {
-        let limit = ROW_READ_MAX_COMPRESSED_BYTES;
-        let index = RowBlockIndex::new(
-            vec![limit - 1, 1, 1, limit + 1, 1],
-            vec![1; 5],
-            (0..5).collect(),
-        )
-        .unwrap();
-        let ranges = coalesce_block_reads(&index, (0..5).collect()).collect::<Vec<_>>();
-        assert_eq!(ranges, [0..2, 2..3, 3..4, 4..5]);
-
-        let count = ROW_READ_MAX_BLOCKS + 1;
-        let index = RowBlockIndex::new(vec![1; count], vec![1; count], (0..count as i64).collect())
-            .unwrap();
+    fn row_block_reads_respect_compressed_size_limit() {
+        let mut sizes = vec![64 * 1024; 17];
+        sizes.extend([1024 * 1024 + 1, 1]);
+        let count = sizes.len();
+        let index = RowBlockIndex::new(sizes, vec![1; count], (0..count as i64).collect()).unwrap();
         let ranges = coalesce_block_reads(&index, (0..count).collect()).collect::<Vec<_>>();
-        assert_eq!(ranges, [0..ROW_READ_MAX_BLOCKS, ROW_READ_MAX_BLOCKS..count]);
+        assert_eq!(ranges, [0..16, 16..17, 17..18, 18..19]);
     }
 
     #[test]
