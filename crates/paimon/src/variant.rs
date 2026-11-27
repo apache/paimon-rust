@@ -732,6 +732,58 @@ fn validate_object(
     depth: usize,
 ) -> Result<usize> {
     let layout = object_layout(value, pos)?;
+    validate_object_layout::<false>(value, metadata, pos, depth, layout)
+}
+
+/// Proof for one root object's ID sequence under one exact dictionary. No offsets,
+/// child types, child lengths or values are trusted between calls.
+#[derive(Default)]
+pub(crate) struct RootIdOrder {
+    dictionary: Vec<u8>,
+    header_and_ids: Vec<u8>,
+}
+
+impl RootIdOrder {
+    pub(crate) fn validate(&mut self, value: &[u8], metadata: &[u8]) -> Result<()> {
+        if value.first().is_none_or(|b| b & BASIC_TYPE_MASK != OBJECT)
+            || value.len() > SIZE_LIMIT
+            || metadata.len() > MAX_CACHED_VARIANT_METADATA_BYTES
+        {
+            return validate_payload(value, metadata);
+        }
+        let layout = object_layout(value, 0)?;
+        let ids = &value[..layout.offset_start];
+        if ids == self.header_and_ids && metadata == self.dictionary {
+            let root_size = validate_object_layout::<true>(
+                value,
+                MetadataKeys::Encoded(metadata),
+                0,
+                0,
+                layout,
+            )?;
+            if root_size != value.len() {
+                return data_invalid("Malformed Variant root size");
+            }
+            return Ok(());
+        }
+        validate_payload(value, metadata)?;
+        if ids.len() <= MAX_CACHED_VARIANT_METADATA_BYTES {
+            self.header_and_ids.clear();
+            self.header_and_ids.extend_from_slice(ids);
+            self.dictionary.clear();
+            self.dictionary.extend_from_slice(metadata);
+        }
+        Ok(())
+    }
+}
+
+fn validate_object_layout<const KNOWN_ID_ORDER: bool>(
+    value: &[u8],
+    metadata: MetadataKeys<'_>,
+    pos: usize,
+    depth: usize,
+    layout: ObjectLayout,
+) -> Result<usize> {
     let data_size = read_unsigned(
         value,
         layout.offset_start + layout.size * layout.offset_size,
@@ -751,14 +803,16 @@ fn validate_object(
     let mut ranges = Vec::with_capacity(layout.size);
     let mut previous_key: Option<&str> = None;
     for i in 0..layout.size {
-        let id = read_unsigned(value, layout.id_start + layout.id_size * i, layout.id_size)?;
-        let key = metadata.get(id)?;
-        if previous_key
-            .is_some_and(|previous| java_string_cmp(previous, key) != std::cmp::Ordering::Less)
-        {
-            return data_invalid("Malformed Variant object key order");
+        if !KNOWN_ID_ORDER {
+            let id = read_unsigned(value, layout.id_start + layout.id_size * i, layout.id_size)?;
+            let key = metadata.get(id)?;
+            if previous_key
+                .is_some_and(|previous| java_string_cmp(previous, key) != std::cmp::Ordering::Less)
+            {
+                return data_invalid("Malformed Variant object key order");
+            }
+            previous_key = Some(key);
         }
-        previous_key = Some(key);
 
         let offset = read_unsigned(
             value,
@@ -4306,6 +4360,45 @@ fn build_object_value(mut fields: Vec<FieldEntry>, data: Vec<u8>) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_id_order_reuse_never_trusts_offsets_children_or_changed_keys() {
+        let original = GenericVariant::parse_json(r#"{"a":1,"b":{"c":"unselected"}}"#).unwrap();
+        let value = original.value();
+        let md = original.metadata();
+        let layout = object_layout(value, 0).unwrap();
+        assert_eq!(layout.id_size, 1);
+        assert_eq!(layout.offset_size, 1);
+        let mut cache = RootIdOrder::default();
+        cache.validate(value, md).unwrap();
+        assert_eq!(cache.header_and_ids, &value[..layout.offset_start]);
+        let mut wrong_id = value.to_vec();
+        wrong_id.swap(layout.id_start, layout.id_start + 1);
+        let mut overlap = value.to_vec();
+        overlap[layout.offset_start + 1] = overlap[layout.offset_start];
+        let mut bad_child = value.to_vec();
+        let text = bad_child
+            .windows(10)
+            .position(|s| s == b"unselected")
+            .unwrap();
+        bad_child[text - 1] = 0xfc;
+        let mut tail = value.to_vec();
+        tail.push(0);
+        let mut wrong_dictionary = md.to_vec();
+        let a = wrong_dictionary.iter().rposition(|b| *b == b'a').unwrap();
+        wrong_dictionary[a] = b'z';
+        for (v, m) in [
+            (&wrong_id[..], md),
+            (&overlap, md),
+            (&bad_child, md),
+            (&tail, md),
+            (value, &wrong_dictionary),
+        ] {
+            assert!(validate_payload(v, m).is_err());
+            assert!(cache.validate(v, m).is_err());
+            cache.validate(value, md).unwrap();
+        }
+    }
     use crate::spec::{BigIntType, BooleanType, TimeType, VarCharType};
 
     fn empty_metadata() -> Vec<u8> {
