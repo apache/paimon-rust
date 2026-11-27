@@ -23,7 +23,7 @@ use paimon::resource::ResourceContext;
 use paimon::spec::{DataField, Predicate};
 use paimon::table::{
     CommitMessage, PostponeBucketPlan, PostponeFixedBucketTableCommit,
-    PostponeFixedBucketTableWrite, Table, TableCommit, TableWrite,
+    PostponeFixedBucketTableWrite, Table, TableCommit, TableRead, TableWrite,
 };
 
 /// C-compatible key-value pair for options.
@@ -269,6 +269,7 @@ pub(crate) struct ReadBuilderState {
     pub resources: Option<ResourceContext>,
     pub projected_columns: Option<Vec<String>>,
     pub read_type: Option<Vec<DataField>>,
+    pub index_score_name: Option<String>,
     pub filter: Option<Predicate>,
     pub case_sensitive: bool,
     pub limit: Option<usize>,
@@ -292,12 +293,27 @@ pub struct paimon_table_read {
     pub inner: *mut c_void,
 }
 
-/// Internal state for TableRead that stores table, projected read type, and data predicates.
+/// Owned state for reconstructing a table read over planned or imported splits.
 pub(crate) struct TableReadState {
     pub table: Table,
     pub resources: Option<ResourceContext>,
     pub read_type: Vec<DataField>,
-    pub data_predicates: Vec<Predicate>,
+    pub filter: Option<Predicate>,
+    pub index_score_name: Option<String>,
+}
+
+impl TableReadState {
+    pub(crate) fn table_read(&self, fields: Vec<DataField>) -> TableRead<'_> {
+        let mut read = TableRead::new(&self.table, fields, Vec::new());
+        // Imported splits have not passed through this builder's partition pruning.
+        if let Some(filter) = &self.filter {
+            read = read.with_filter(filter.clone());
+        }
+        if let Some(resources) = &self.resources {
+            read = read.with_resources(resources.clone());
+        }
+        read
+    }
 }
 
 #[repr(C)]

@@ -152,6 +152,72 @@ fn group_ranges(weights: &[u64], parallelism: usize) -> Vec<(usize, usize)> {
     ranges
 }
 
+/// Divide independent DE files while retaining each supplied split's boundary.
+/// Return no plan when the existing splits already use the budget or cannot split.
+pub(super) fn independent_file_groups(
+    splits: &[DataSplit],
+    parallelism: usize,
+) -> Option<Vec<Vec<DataSplit>>> {
+    let initial_spare = parallelism.saturating_sub(splits.len());
+    let mut spare = initial_spare;
+    if spare == 0 {
+        return None;
+    }
+    let mut work = Vec::with_capacity(splits.len());
+    for split in splits {
+        let files = split.data_files();
+        // Range coordinates and scores belong to the original selection. Updates
+        // and overlapping column versions must retain their reconstruction group.
+        if spare == 0
+            || files.len() < 2
+            || split.is_streaming()
+            || split.row_ranges().is_some()
+            || split.scores().is_some()
+            || !files.iter().all(|file| {
+                file.row_count > 0
+                    && file
+                        .first_row_id
+                        .and_then(|start| start.checked_add(file.row_count))
+                        .is_some()
+            })
+            || !super::data_evolution_reader::is_raw_convertible(files)
+        {
+            work.push(vec![split.clone()]);
+            continue;
+        }
+        let weights = files
+            .iter()
+            .map(|file| u64::try_from(file.file_size).unwrap_or(0).max(1))
+            .collect::<Vec<_>>();
+        let groups = group_ranges(&weights, spare + 1);
+        spare -= groups.len() - 1;
+        work.push(
+            groups
+                .into_iter()
+                .map(|(start, end)| split.for_data_evolution_files(files[start..end].to_vec()))
+                .collect(),
+        );
+    }
+    (spare < initial_spare).then_some(work)
+}
+
+/// Files can read concurrently, but only original splits may emit out of order.
+pub(super) fn execute_file_groups(
+    groups: Vec<Vec<DataSplit>>,
+    ordered: bool,
+    limit: Option<usize>,
+    read: SplitReader,
+) -> ArrowRecordBatchStream {
+    let streams = groups
+        .into_iter()
+        .map(|files| {
+            let parallelism = files.len();
+            execute(files, parallelism, true, limit, Arc::clone(&read), None)
+        })
+        .collect();
+    merge_streams(streams, ordered, limit)
+}
+
 pub(super) fn execute(
     splits: Vec<DataSplit>,
     parallelism: usize,
@@ -1195,6 +1261,122 @@ mod tests {
                 yield batch(item);
             }
         })
+    }
+
+    fn independent_split() -> DataSplit {
+        use super::super::table_read::tests::{file, split};
+        let files = (0..5)
+            .map(|i| {
+                let mut f = file(&format!("{i}.parquet"), 0, None);
+                f.first_row_id = Some(i * 10);
+                f
+            })
+            .collect();
+        split(files, true)
+    }
+
+    #[tokio::test]
+    async fn independent_files_run_concurrently_with_order_and_global_limit() {
+        let split = independent_split();
+        let work = independent_file_groups(&[split], 3).unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let workers = started.clone();
+        let read: SplitReader = Arc::new(move |group, _| {
+            let workers = workers.clone();
+            let values = group
+                .iter()
+                .flat_map(|s| s.data_files())
+                .map(|f| (f.first_row_id.unwrap() / 10) as i32)
+                .collect::<Vec<_>>();
+            Ok(Box::pin(async_stream::try_stream! {
+                workers.fetch_add(1, Ordering::SeqCst);
+                wait_for_count(&workers, 3).await;
+                for v in values { yield batch(v); }
+            }))
+        });
+        let output = execute_file_groups(work, false, Some(4), read)
+            .map_ok(|b| value(&b))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(output, vec![0, 1, 2, 3]);
+        assert_eq!(started.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn unordered_original_splits_keep_ordered_file_groups() {
+        let first = independent_split();
+        let mut files = first.data_files().to_vec();
+        for file in &mut files {
+            file.first_row_id = file.first_row_id.map(|id| id + 100);
+        }
+        let second = first.for_data_evolution_files(files);
+        let work = independent_file_groups(&[first, second], 4).unwrap();
+        assert_eq!(work.len(), 2);
+        assert_eq!(work.iter().map(Vec::len).sum::<usize>(), 4);
+        let (release, wait) = oneshot::channel();
+        let wait = std::sync::Mutex::new(Some(wait));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let dropped = drops.clone();
+        let read: SplitReader = Arc::new(move |group, _| {
+            let values = group
+                .iter()
+                .flat_map(|s| s.data_files())
+                .map(|f| (f.first_row_id.unwrap() / 10) as i32)
+                .collect::<Vec<_>>();
+            let blocked = if values[0] == 0 {
+                wait.lock().unwrap().take()
+            } else {
+                None
+            };
+            Ok(controlled_stream(
+                values,
+                blocked,
+                reads.clone(),
+                drops.clone(),
+            ))
+        });
+        let mut output = execute_file_groups(work, false, None, read);
+        let early = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut values = Vec::new();
+            for _ in 0..5 {
+                values.push(value(&output.next().await.unwrap().unwrap()));
+            }
+            values
+        })
+        .await;
+        release.send(()).unwrap();
+        assert_eq!(
+            early.expect("a later original split must not wait for the first"),
+            vec![10, 11, 12, 13, 14]
+        );
+        let rest = output
+            .map_ok(|batch| value(&batch))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(rest, vec![0, 1, 2, 3, 4]);
+        assert_eq!(dropped.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn independent_file_work_preserves_merge_groups_and_selections() {
+        let original = independent_split();
+        assert!(independent_file_groups(std::slice::from_ref(&original), 1).is_none());
+        let work = independent_file_groups(std::slice::from_ref(&original), 3).unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].len(), 3);
+        assert_eq!(
+            work[0].iter().map(|s| s.data_files().len()).sum::<usize>(),
+            5
+        );
+        let mut files = original.data_files().to_vec();
+        files[1].first_row_id = Some(0); // overlapping column versions need merging
+        let overlap = original.for_data_evolution_files(files);
+        assert!(independent_file_groups(&[overlap], 8).is_none());
+        let selected = original.with_selected_row_ranges(vec![]);
+        assert!(independent_file_groups(&[selected], 8).is_none());
     }
 
     #[test]

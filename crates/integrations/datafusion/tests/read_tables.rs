@@ -1325,6 +1325,88 @@ async fn test_read_complex_type_table_via_datafusion() {
 }
 
 #[tokio::test]
+async fn test_single_data_evolution_table_wildcards_hide_row_id() {
+    let (_warehouse, ctx) = create_context().await;
+    for (sql, expected) in [
+        (
+            "SELECT * FROM data_evolution_table",
+            vec!["id", "name", "value"],
+        ),
+        (
+            "SELECT d.* FROM paimon.default.data_evolution_table AS d",
+            vec!["id", "name", "value"],
+        ),
+        (
+            r#"SELECT *, d."_ROW_ID" FROM paimon.default.data_evolution_table AS d
+               WHERE d."_ROW_ID" = 0"#,
+            vec!["id", "name", "value", "_ROW_ID"],
+        ),
+    ] {
+        let df = ctx.sql(sql).await.unwrap();
+        assert!(
+            df.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .eq(expected),
+            "{sql}"
+        );
+        assert!(!df.collect().await.unwrap().is_empty(), "{sql}");
+    }
+
+    common::exec(&ctx, "SET datafusion.sql_parser.dialect = 'postgresql'").await;
+    let df = ctx
+        .sql(r#"SELECT "D".* FROM data_evolution_table AS "D""#)
+        .await
+        .unwrap();
+    assert_eq!(df.schema().fields().len(), 3);
+
+    common::exec(&ctx, "SET datafusion.sql_parser.dialect = 'bigquery'").await;
+    let df = ctx
+        .sql("SELECT * FROM `paimon.default.data_evolution_table`")
+        .await
+        .unwrap();
+    assert_eq!(df.schema().fields().len(), 3);
+}
+
+#[tokio::test]
+async fn test_single_table_wildcard_with_only_row_tracking_enabled() {
+    let (_warehouse, ctx) = create_context().await;
+    common::exec(
+        &ctx,
+        "CREATE TABLE row_tracked (id INT) WITH ('row-tracking.enabled' = 'true')",
+    )
+    .await;
+    common::exec(&ctx, "INSERT INTO row_tracked VALUES (7)").await;
+
+    for sql in [
+        "SELECT * FROM row_tracked",
+        "SELECT t.* FROM row_tracked AS t",
+    ] {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(collect_rows(&batches), [["7"]], "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn test_single_table_wildcard_keeps_row_id_from_other_sources() {
+    let (_warehouse, ctx) = create_context().await;
+    let df = ctx
+        .sql("SELECT * FROM data_evolution_table CROSS JOIN (SELECT 1 AS marker) q")
+        .await
+        .unwrap();
+    assert!(df.schema().field_with_unqualified_name("_ROW_ID").is_ok());
+
+    common::exec(
+        &ctx,
+        r#"CREATE TEMPORARY TABLE data_evolution_table AS SELECT 42 AS "_ROW_ID""#,
+    )
+    .await;
+    let df = ctx.sql("SELECT * FROM data_evolution_table").await.unwrap();
+    assert_eq!(collect_rows(&df.collect().await.unwrap()), [["42"]]);
+}
+
+#[tokio::test]
 async fn test_select_row_id_from_data_evolution_table() {
     use datafusion::arrow::array::Int64Array;
 

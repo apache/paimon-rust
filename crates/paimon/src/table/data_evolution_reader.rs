@@ -59,7 +59,7 @@ fn is_vector_store_file_name(file_name: &str) -> bool {
 }
 
 /// Whether the files in a split can be read independently (no column-wise merge needed).
-fn is_raw_convertible(files: &[DataFileMeta]) -> bool {
+pub(super) fn is_raw_convertible(files: &[DataFileMeta]) -> bool {
     // A split containing a dedicated vector file must go through the column-merge
     // path so vector columns are routed to their VectorBunch source. Check this
     // BEFORE the single-file early-return.

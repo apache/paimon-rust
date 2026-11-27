@@ -45,6 +45,9 @@ use std::cmp::Ordering;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
+#[path = "scored_split_read.rs"]
+mod scored_split;
+
 #[path = "audit_log_table/read.rs"]
 mod audit;
 pub use audit::AuditLogRead;
@@ -630,7 +633,6 @@ impl<'a> PaimonTableRead<'a> {
         } else {
             parallelism
         };
-        let workers = parallelism.min(splits.len()).max(1);
         let blob_output_budget = resolves_blob_payload
             .then(|| {
                 options.blob_output_max_buffered_bytes().map(|max_bytes| {
@@ -666,8 +668,25 @@ impl<'a> PaimonTableRead<'a> {
             && blob_output_budget.as_ref().is_some_and(|budget| {
                 super::read_execution::blob_budget_applies_to_splits(&splits, budget)
             });
-        // Prefetch slots must not be held across split output-budget waits.
-        let budget = if workers > 1 && (ordered || output_budget_active) {
+        // Independent file groups have separate schedulers. Keep all BLOB
+        // reservations in one scheduler when the output budget applies.
+        let file_groups = if options.data_evolution_enabled()
+            && !self.update_read
+            && !budget.has_resources()
+            && !output_budget_active
+        {
+            super::read_execution::independent_file_groups(&splits, parallelism)
+        } else {
+            None
+        };
+        let work_count = file_groups
+            .as_ref()
+            .map(|groups| groups.iter().map(Vec::len).sum())
+            .unwrap_or(splits.len());
+        let workers = parallelism.min(work_count).max(1);
+        // Prefetch slots must not be held across output-budget waits or
+        // while ordered groups wait for an earlier group to finish.
+        let budget = if workers > 1 && (ordered || output_budget_active || file_groups.is_some()) {
             Arc::new(budget.without_prefetch())
         } else {
             budget
@@ -676,14 +695,19 @@ impl<'a> PaimonTableRead<'a> {
             .blob_parallelism
             .min((MAX_TOTAL_BLOB_READS / workers).max(1));
         let factory = self.execution_factory(include_row_kind, budget, blob_parallelism);
-        Ok(super::read_execution::execute(
-            splits.into_owned(),
-            parallelism,
-            ordered,
-            self.limit,
-            factory,
-            blob_output_budget,
-        ))
+        Ok(match file_groups {
+            Some(groups) => {
+                super::read_execution::execute_file_groups(groups, ordered, self.limit, factory)
+            }
+            None => super::read_execution::execute(
+                splits.into_owned(),
+                parallelism,
+                ordered,
+                self.limit,
+                factory,
+                blob_output_budget,
+            ),
+        })
     }
 
     fn execution_factory(
@@ -3024,7 +3048,7 @@ fn pk_split_needs_merge(split: &DataSplit, dv_enabled: bool) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -3080,7 +3104,11 @@ mod tests {
         );
     }
 
-    pub(super) fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
+    pub(in crate::table) fn file(
+        name: &str,
+        level: i32,
+        delete_row_count: Option<i64>,
+    ) -> DataFileMeta {
         DataFileMeta {
             file_name: name.to_string(),
             file_size: 128,
@@ -3106,7 +3134,7 @@ mod tests {
         }
     }
 
-    pub(super) fn split(files: Vec<DataFileMeta>, raw_convertible: bool) -> DataSplit {
+    pub(in crate::table) fn split(files: Vec<DataFileMeta>, raw_convertible: bool) -> DataSplit {
         DataSplitBuilder::new()
             .with_snapshot(1)
             .with_partition(BinaryRow::new(0))

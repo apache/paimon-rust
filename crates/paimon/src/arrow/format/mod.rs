@@ -24,7 +24,7 @@ mod mosaic;
 mod mosaic_write;
 mod orc;
 pub(crate) mod parquet;
-mod row;
+pub(crate) mod row;
 mod shredding;
 pub(crate) mod text;
 mod variant_projection;

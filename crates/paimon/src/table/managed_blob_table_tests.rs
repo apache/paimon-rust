@@ -435,6 +435,45 @@ async fn primary_key_blob_is_externalized_and_read_back() {
             (3, None),
         ]
     );
+
+    let builder = table.new_read_builder();
+    let plan = builder.new_scan().plan().await.unwrap();
+    let split = plan.splits()[0]
+        .clone()
+        .with_selected_row_ranges(vec![super::RowRange::new(1, 1)])
+        .with_scores(vec![0.75])
+        .unwrap();
+    let batches: Vec<_> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow_with_index_score(&split, "similarity")
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch
+            .column_by_name("payload")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap()
+            .value(0),
+        b"world"
+    );
+    assert_eq!(
+        batch
+            .column_by_name("similarity")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Float32Array>()
+            .unwrap()
+            .value(0),
+        0.75
+    );
 }
 
 #[tokio::test]

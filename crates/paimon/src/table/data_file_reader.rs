@@ -751,6 +751,10 @@ impl DataFileReader {
             ).await?;
             let configured_reader = if read_path == path_to_read {
                 configured_reader
+            } else if read_path.ends_with(".row") {
+                crate::arrow::format::row::RowFormatReader::for_sidecar(
+                    &table_options, &data_schema_fields, &read_type,
+                )
             } else {
                 create_format_reader_with_budget(
                     &read_path, blob_as_descriptor,
