@@ -4690,6 +4690,258 @@ fn plan_from_split_bytes_round_trips() {
 }
 
 #[test]
+fn plan_from_raw_indexed_split_bytes_round_trips() {
+    let framed = include_bytes!("../../../crates/paimon/src/table/goldens/split_v1_indexed.bin");
+    let scores_len = 1 + 4 + 3 * 4;
+    let mut raw = framed[16..framed.len() - scores_len].to_vec();
+    raw.push(0); // BTree IndexedSplit has no scores.
+
+    let result = unsafe { paimon_plan_from_split_bytes(raw.as_ptr(), raw.len()) };
+    assert!(result.error.is_null());
+    assert_eq!(unsafe { paimon_plan_num_splits(result.plan) }, 1);
+    unsafe { paimon_plan_free(result.plan) };
+}
+
+fn raw_scored_split(table: &Table, ranges: &[(i64, i64)], input_scores: &[f32]) -> Vec<u8> {
+    let split = crate::runtime().block_on(async {
+        table
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .unwrap()
+            .splits()[0]
+            .clone()
+    });
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&(-938472394838495695i64).to_be_bytes());
+    raw.extend_from_slice(&1i32.to_be_bytes());
+    raw.extend_from_slice(&split.serialize().unwrap());
+    raw.extend_from_slice(&(ranges.len() as i32).to_be_bytes());
+    for (from, to) in ranges {
+        raw.extend_from_slice(&from.to_be_bytes());
+        raw.extend_from_slice(&to.to_be_bytes());
+    }
+    raw.push(1);
+    raw.extend_from_slice(&(input_scores.len() as i32).to_be_bytes());
+    for score in input_scores {
+        raw.extend_from_slice(&score.to_be_bytes());
+    }
+    raw
+}
+
+#[test]
+fn imported_scored_split_respects_partition_and_row_filters() {
+    let io = memory_file_io();
+    let path = "memory:/partitioned_scored_split";
+    setup_table_dirs(&io, path);
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("pt", DataType::Int(IntType::new()))
+        .partition_keys(["pt"])
+        .option("row-tracking.enabled", "true")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        io,
+        Identifier::new("default", "partitioned_scored_split"),
+        path.into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    let batch = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int32Array::from(vec![3, 1, 2])) as ArrayRef),
+        ("pt", Arc::new(Int32Array::from(vec![0, 0, 0])) as ArrayRef),
+    ])
+    .unwrap();
+    write_data_rust(&table, &[batch]);
+    let raw = raw_scored_split(&table, &[(0, 2)], &[0.9, 0.8, 0.7]);
+
+    unsafe {
+        let table = wrap_table(table);
+        let plan = paimon_plan_from_split_bytes(raw.as_ptr(), raw.len());
+        assert!(plan.error.is_null());
+        for (min_partition, expected) in [(1, vec![]), (0, vec![(2, 0.7_f32), (3, 0.9)])] {
+            let builder = paimon_table_new_read_builder(table);
+            assert!(builder.error.is_null());
+            let rb = builder.read_builder;
+            let score = CString::new("similarity").unwrap();
+            assert!(paimon_read_builder_with_index_score(rb, score.as_ptr()).is_null());
+            let filter = paimon_predicate_and(
+                build_predicate_ge(table, "pt", min_partition),
+                build_predicate_ge(table, "id", 2),
+            );
+            assert!(!filter.is_null());
+            assert!(paimon_read_builder_with_filter(rb, filter).is_null());
+            let read = paimon_read_builder_new_read(rb);
+            assert!(read.error.is_null());
+            paimon_read_builder_free(rb);
+            let result = paimon_table_read_to_arrow(read.read, plan.plan, 0, 1);
+            assert!(result.error.is_null());
+            let mut actual = Vec::new();
+            loop {
+                let next = paimon_record_batch_reader_next(result.reader);
+                assert!(next.error.is_null());
+                if next.batch.array.is_null() {
+                    break;
+                }
+                let batch = import_batch(&next.batch);
+                paimon_arrow_batch_free(next.batch);
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let scores = batch
+                    .column_by_name("similarity")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap();
+                actual.extend(
+                    ids.values()
+                        .iter()
+                        .copied()
+                        .zip(scores.values().iter().copied()),
+                );
+            }
+            actual.sort_by_key(|(id, _)| *id);
+            assert_eq!(actual, expected);
+            paimon_record_batch_reader_free(result.reader);
+            paimon_table_read_free(read.read);
+        }
+        paimon_plan_free(plan.plan);
+        unwrap_table(table);
+    }
+}
+
+#[test]
+fn raw_scored_indexed_split_materializes_index_score() {
+    check_scored_indexed_split(false, &[(0, 2)], &[0.9, 0.8, 0.7]);
+}
+
+#[test]
+fn filtered_scored_indexed_split_joins_scores_by_row_id() {
+    check_scored_indexed_split(true, &[(0, 2)], &[0.9, 0.8, 0.7]);
+}
+
+#[test]
+fn reordered_indexed_split_ranges_keep_scores_with_their_rows() {
+    for tracked in [false, true] {
+        check_scored_indexed_split(tracked, &[(2, 2), (0, 1)], &[0.7, 0.9, 0.8]);
+    }
+}
+
+fn check_scored_indexed_split(tracked: bool, ranges: &[(i64, i64)], input_scores: &[f32]) {
+    let path = "memory:/test_scored_indexed_split";
+    let user_score = if tracked {
+        "_INDEX_SCORE"
+    } else {
+        "__paimon_search_score"
+    };
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(user_score, DataType::VarChar(VarCharType::string_type()))
+        .option(
+            "row-tracking.enabled",
+            if tracked { "true" } else { "false" },
+        )
+        .build()
+        .unwrap();
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(vec![3, 1, 2])) as ArrayRef),
+        (
+            user_score,
+            Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    write_data_rust(&table, &[batch]);
+
+    let raw = raw_scored_split(&table, ranges, input_scores);
+    let handle = unsafe { wrap_table(table) };
+    unsafe {
+        let rb_result = paimon_table_new_read_builder(handle);
+        assert!(rb_result.error.is_null());
+        let name = CString::new(user_score).unwrap();
+        let score = CString::new("similarity").unwrap();
+        let id = CString::new("id").unwrap();
+        let projection = [name.as_ptr(), id.as_ptr(), ptr::null()];
+        let error =
+            paimon_read_builder_with_projection(rb_result.read_builder, projection.as_ptr());
+        assert!(error.is_null());
+
+        assert!(
+            paimon_read_builder_with_index_score(rb_result.read_builder, score.as_ptr()).is_null()
+        );
+        if tracked {
+            let predicate = build_predicate_ge(handle, "id", 2);
+            assert!(paimon_read_builder_with_filter(rb_result.read_builder, predicate).is_null());
+        }
+        let read_result = paimon_read_builder_new_read(rb_result.read_builder);
+        assert!(read_result.error.is_null());
+        let plan_result = paimon_plan_from_split_bytes(raw.as_ptr(), raw.len());
+        assert!(plan_result.error.is_null());
+        let reader_result = paimon_table_read_to_arrow(read_result.read, plan_result.plan, 0, 1);
+        assert!(reader_result.error.is_null());
+
+        let mut batches = Vec::new();
+        loop {
+            let next = paimon_record_batch_reader_next(reader_result.reader);
+            assert!(next.error.is_null());
+            if next.batch.array.is_null() {
+                break;
+            }
+            batches.push(import_batch(&next.batch));
+            paimon_arrow_batch_free(next.batch);
+        }
+        assert!(!batches.is_empty());
+        let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+
+        assert_eq!(batch.schema().fields().len(), 3);
+        assert_eq!(batch.schema().field(0).name(), user_score);
+        assert_eq!(batch.schema().field(1).name(), "id");
+        assert_eq!(batch.schema().field(2).name(), "similarity");
+        let scores = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let physical = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        if tracked {
+            assert_eq!(scores.values(), &[0.9, 0.7]);
+            assert_eq!(physical.iter().collect::<Vec<_>>(), [Some("a"), Some("c")]);
+        } else {
+            assert_eq!(scores.values(), &[0.9, 0.8, 0.7]);
+            assert_eq!(
+                physical.iter().collect::<Vec<_>>(),
+                [Some("a"), Some("b"), Some("c")]
+            );
+        }
+
+        paimon_record_batch_reader_free(reader_result.reader);
+        paimon_plan_free(plan_result.plan);
+        paimon_table_read_free(read_result.read);
+        paimon_read_builder_free(rb_result.read_builder);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
 fn plan_from_split_bytes_rejects_null_and_empty() {
     let r = unsafe { paimon_plan_from_split_bytes(std::ptr::null(), 0) };
     assert!(r.plan.is_null());

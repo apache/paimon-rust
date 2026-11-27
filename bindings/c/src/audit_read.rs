@@ -20,7 +20,7 @@
 use std::ffi::c_void;
 
 use arrow_array::ffi::FFI_ArrowSchema;
-use paimon::table::{AuditLogRead, AuditLogTable, Table, TableRead};
+use paimon::table::{AuditLogRead, AuditLogTable, Table};
 use paimon::Plan;
 
 use crate::error::{check_non_null, paimon_error, PaimonErrorCode};
@@ -163,11 +163,7 @@ pub unsafe extern "C" fn paimon_table_read_to_audit_log_arrow(
                 fields.push(field.clone());
             }
         }
-        let mut table_read = TableRead::new(&state.table, fields, state.data_predicates.clone());
-        if let Some(resources) = &state.resources {
-            table_read = table_read.with_resources(resources.clone());
-        }
-        AuditLogRead::new(table_read)?.to_arrow(&plan.splits()[start..end])
+        AuditLogRead::new(state.table_read(fields))?.to_arrow(&plan.splits()[start..end])
     })();
     match stream {
         Ok(stream) => paimon_result_record_batch_reader {

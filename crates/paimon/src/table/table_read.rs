@@ -45,6 +45,9 @@ use std::cmp::Ordering;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
+#[path = "scored_split_read.rs"]
+mod scored_split;
+
 #[path = "audit_log_table/read.rs"]
 mod audit;
 pub use audit::AuditLogRead;

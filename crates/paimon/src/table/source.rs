@@ -23,6 +23,7 @@ use crate::spec::{BinaryRow, DataFileMeta, DataFileMetaRowLayout};
 use crate::table::query_auth::QueryAuthGrant;
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::sync::Arc;
 
 fn is_vector_store_file_name(file_name: &str) -> bool {
@@ -621,11 +622,62 @@ impl DataSplit {
         self.scores.as_deref()
     }
 
-    /// Attach scores in ascending expanded-range order, as in Java IndexedSplit.
+    /// Attach scores in the order of the supplied ranges, ascending within each range, as in Java IndexedSplit.
     pub fn with_scores(mut self, scores: Vec<f32>) -> crate::Result<Self> {
         validate_scores(self.row_ranges(), &scores)?;
         self.scores = Some(scores.into());
         Ok(self)
+    }
+
+    pub(super) fn ordered_for_score_projection(&self) -> crate::Result<Cow<'_, Self>> {
+        let (Some(ranges), Some(scores)) = (self.row_ranges(), self.scores()) else {
+            return Ok(Cow::Borrowed(self));
+        };
+        validate_scores(Some(ranges), scores)?;
+        if ranges
+            .iter()
+            .any(|range| range.from() < 0 || range.to() < range.from())
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Scored ranges must be nonnegative and nonempty".into(),
+                source: None,
+            });
+        }
+        if ranges.windows(2).all(|pair| pair[0].to() < pair[1].from()) {
+            return Ok(Cow::Borrowed(self));
+        }
+
+        // Java assigns scores in wire order. Move each range together with its
+        // score slice before handing the selection to position-ordered readers.
+        let mut remaining = scores;
+        let mut spans: Vec<_> = ranges
+            .iter()
+            .map(|range| {
+                let (span, rest) = remaining.split_at(range.count() as usize);
+                remaining = rest;
+                (range, span)
+            })
+            .collect();
+        spans.sort_unstable_by_key(|(range, _)| range.from());
+        if spans
+            .windows(2)
+            .any(|pair| pair[0].0.to() >= pair[1].0.from())
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Scored ranges must be disjoint".into(),
+                source: None,
+            });
+        }
+        let mut ordered_ranges = Vec::with_capacity(ranges.len());
+        let mut ordered_scores = Vec::with_capacity(scores.len());
+        for (range, span) in spans {
+            ordered_ranges.push(range.clone());
+            ordered_scores.extend_from_slice(span);
+        }
+        let mut ordered = self.clone();
+        ordered.row_ranges = Some(ordered_ranges.into());
+        ordered.scores = Some(ordered_scores.into());
+        Ok(Cow::Owned(ordered))
     }
 
     /// Narrow an already planned split without rebuilding or copying its file
@@ -906,12 +958,18 @@ impl DataSplit {
         Ok(out)
     }
 
-    /// Reverse of [`DataSplit::serialize`]: parse a raw `DataSplit#serialize` body.
+    /// Parse a Java DataSplit or IndexedSplit body, or a SplitSerializer v1 frame.
     /// Both the current version and the legacy v8 layout are accepted.
     /// Consumes the entire buffer; trailing bytes are an error.
     pub fn deserialize(data: &[u8]) -> crate::Result<DataSplit> {
         let mut cur = data;
-        let split = Self::read_body(&mut cur)?;
+        let split = if data.starts_with(&INDEXED_SPLIT_MAGIC.to_be_bytes()) {
+            Self::read_indexed_body(&mut cur)?
+        } else if data.starts_with(&SPLIT_SER_MAGIC.to_be_bytes()) {
+            return Self::deserialize_split_v1(data);
+        } else {
+            Self::read_body(&mut cur)?
+        };
         if !cur.is_empty() {
             return Err(crate::Error::DataInvalid {
                 message: format!("{} trailing bytes after DataSplit", cur.len()),
@@ -1043,7 +1101,7 @@ impl DataSplit {
     }
 
     /// Serialize aligned vector scores using Java's IndexedSplit wire format.
-    /// Scores belong to the selection, in ascending expanded-range order.
+    /// Scores belong to the selection, in the order of the supplied ranges, ascending within each range.
     pub fn serialize_split_v1_with_scores(&self, scores: Option<&[f32]>) -> crate::Result<Vec<u8>> {
         if self.query_auth_required {
             let response = self
@@ -1154,59 +1212,7 @@ impl DataSplit {
                 split
             }
             SPLIT_SER_TYPE_DATA_SPLIT => Self::read_body(cur)?,
-            SPLIT_SER_TYPE_INDEXED_SPLIT => {
-                let im = read_i64(cur)?;
-                if im != INDEXED_SPLIT_MAGIC {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!("invalid IndexedSplit magic: {im:#018x}"),
-                        source: None,
-                    });
-                }
-                let iv = read_i32(cur)?;
-                if iv != INDEXED_SPLIT_VERSION {
-                    return Err(crate::Error::Unsupported {
-                        message: format!("IndexedSplit version {iv} not supported"),
-                    });
-                }
-                let body = Self::read_body(cur)?;
-                let ranges_n = read_i32(cur)?;
-                if ranges_n < 0 {
-                    return Err(crate::Error::DataInvalid {
-                        message: "negative row_ranges count".into(),
-                        source: None,
-                    });
-                }
-                // Bound the eager reservation by the remaining bytes: each RowRange is
-                // 16 bytes (two i64), so a crafted huge count cannot over-reserve.
-                let mut ranges = Vec::with_capacity((ranges_n as usize).min(cur.len() / 16));
-                for _ in 0..ranges_n {
-                    let from = read_i64(cur)?;
-                    let to = read_i64(cur)?;
-                    if from > to {
-                        return Err(crate::Error::DataInvalid {
-                            message: format!("row range from {from} > to {to}"),
-                            source: None,
-                        });
-                    }
-                    ranges.push(RowRange::new(from, to));
-                }
-                let mut body = body;
-                body.row_ranges = Some(ranges.into());
-                if read_u8(cur)? != 0 {
-                    let count = read_i32(cur)?;
-                    if count < 0 || count as usize > cur.len() / 4 {
-                        return Err(crate::Error::DataInvalid {
-                            message: "Invalid IndexedSplit scores count".into(),
-                            source: None,
-                        });
-                    }
-                    let scores = (0..count)
-                        .map(|_| read_i32(cur).map(|bits| f32::from_bits(bits as u32)))
-                        .collect::<crate::Result<Vec<_>>>()?;
-                    body = body.with_scores(scores)?;
-                }
-                body
-            }
+            SPLIT_SER_TYPE_INDEXED_SPLIT => Self::read_indexed_body(cur)?,
             other => {
                 return Err(crate::Error::Unsupported {
                     message: format!("unsupported split type id: {other}"),
@@ -1214,6 +1220,60 @@ impl DataSplit {
             }
         };
         Ok(split)
+    }
+
+    fn read_indexed_body(cur: &mut &[u8]) -> crate::Result<DataSplit> {
+        let im = read_i64(cur)?;
+        if im != INDEXED_SPLIT_MAGIC {
+            return Err(crate::Error::DataInvalid {
+                message: format!("invalid IndexedSplit magic: {im:#018x}"),
+                source: None,
+            });
+        }
+        let iv = read_i32(cur)?;
+        if iv != INDEXED_SPLIT_VERSION {
+            return Err(crate::Error::Unsupported {
+                message: format!("IndexedSplit version {iv} not supported"),
+            });
+        }
+        let body = Self::read_body(cur)?;
+        let ranges_n = read_i32(cur)?;
+        if ranges_n < 0 {
+            return Err(crate::Error::DataInvalid {
+                message: "negative row_ranges count".into(),
+                source: None,
+            });
+        }
+        // Bound the eager reservation by the remaining bytes: each RowRange is
+        // 16 bytes (two i64), so a crafted huge count cannot over-reserve.
+        let mut ranges = Vec::with_capacity((ranges_n as usize).min(cur.len() / 16));
+        for _ in 0..ranges_n {
+            let from = read_i64(cur)?;
+            let to = read_i64(cur)?;
+            if from > to {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("row range from {from} > to {to}"),
+                    source: None,
+                });
+            }
+            ranges.push(RowRange::new(from, to));
+        }
+        let mut body = body;
+        body.row_ranges = Some(ranges.into());
+        if read_u8(cur)? != 0 {
+            let count = read_i32(cur)?;
+            if count < 0 || count as usize > cur.len() / 4 {
+                return Err(crate::Error::DataInvalid {
+                    message: "Invalid IndexedSplit scores count".into(),
+                    source: None,
+                });
+            }
+            let scores = (0..count)
+                .map(|_| read_i32(cur).map(|bits| f32::from_bits(bits as u32)))
+                .collect::<crate::Result<Vec<_>>>()?;
+            body = body.with_scores(scores)?;
+        }
+        Ok(body)
     }
 }
 
@@ -2882,6 +2942,30 @@ mod tests {
     }
 
     #[test]
+    fn raw_and_framed_indexed_split_decode_the_same_selection() {
+        // The Java fixture deliberately has three scores for seven positions.
+        let malformed = include_bytes!("goldens/split_v1_indexed.bin");
+        assert!(DataSplit::deserialize(malformed).is_err());
+        assert!(DataSplit::deserialize(&malformed[16..]).is_err());
+        let expected = v1_data_split_builder()
+            .with_row_ranges(vec![RowRange::new(1, 3)])
+            .build()
+            .unwrap()
+            .with_scores(vec![0.2, 0.4, 0.6])
+            .unwrap();
+        let framed = expected.serialize_split_v1().unwrap();
+        for bytes in [framed.as_slice(), &framed[16..]] {
+            let decoded = DataSplit::deserialize(bytes).unwrap();
+            assert_eq!(decoded.row_ranges(), expected.row_ranges());
+            assert_eq!(decoded.scores(), expected.scores());
+            assert!(DataSplit::deserialize(&bytes[..bytes.len() - 1]).is_err());
+            let mut trailing = bytes.to_vec();
+            trailing.push(0);
+            assert!(DataSplit::deserialize(&trailing).is_err());
+        }
+    }
+
+    #[test]
     fn serialize_indexed_scores_match_java_wire_layout() {
         let split = v1_data_split_builder()
             .with_row_ranges(vec![RowRange::new(1, 4), RowRange::new(11, 13)])
@@ -2948,6 +3032,19 @@ mod tests {
         );
         // Round-trips back to the same bytes.
         assert_eq!(split.serialize_split_v1().unwrap(), frame);
+    }
+
+    #[test]
+    fn score_projection_rejects_overlapping_ranges_even_out_of_order() {
+        let split = DataSplit::deserialize_split_v1(&indexed_split_v1_no_scores())
+            .unwrap()
+            .with_selected_row_ranges(vec![RowRange::new(2, 3), RowRange::new(0, 2)])
+            .with_scores(vec![0.0; 5])
+            .unwrap();
+        assert!(matches!(
+            split.ordered_for_score_projection(),
+            Err(crate::Error::DataInvalid { .. })
+        ));
     }
 
     #[test]
