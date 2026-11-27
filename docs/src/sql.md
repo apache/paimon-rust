@@ -796,8 +796,10 @@ CREATE TABLE paimon.my_db.inferred_events (
 When both configured and inferred shredding are set, the configured schema takes
 precedence. The same examples work with `'file.format' = 'row'`.
 
-ROW files with a changed physical layout use version 2. Each file stores its
-physical fields as a UTF-8 JSON array between the block index and the footer.
+ROW files with a changed physical layout use version 2. Each file stores its physical fields
+between the block index and the 32-byte footer. The schema block contains a 4-byte little-endian
+uncompressed length and a Zstd frame containing a UTF-8 JSON array of Paimon fields. The encoded
+and decoded payloads are limited to 64 MiB each.
 Paimon Rust can read v1 and v2 files together, including files written with
 different inferred schemas. Reading v2 requires a reader that supports this ROW
 version. Java and Python readers limited to v1 can read ordinary ROW files.
@@ -4236,7 +4238,7 @@ file layout and automatic read-time assembly.
 | Option | Default | Description |
 |---|---:|---|
 | `variant.shreddingSchema` | unset | Configured shredding schema as a Paimon `ROW` type JSON string. Top-level field names match `VARIANT` column names, and their nested types describe the typed fields to extract. |
-| `parquet.variant.shreddingSchema` | unset | Parquet-scoped alias for `variant.shreddingSchema`. |
+| `parquet.variant.shreddingSchema` | unset | Legacy alias for `variant.shreddingSchema`. |
 | `variant.inferShreddingSchema` | `false` | Enables per-writer schema inference for `VARIANT` columns when no configured shredding schema is set. |
 | `parquet.variant.inferShreddingSchema` | `false` | Parquet-scoped alias for `variant.inferShreddingSchema`. |
 | `variant.shredding.maxInferBufferRow` | `4096` | Number of initial rows buffered per data-file writer before inferring the shredding schema. If fewer rows are written, inference runs when the writer is flushed or closed. |

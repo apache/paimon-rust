@@ -214,9 +214,7 @@ impl PhysicalFormatWriterFactory for RowWriterFactory {
             message: "Shredded .row writer requires physical fields".into(),
             source: None,
         })?;
-        let physical_schema = serde_json::to_vec(fields).map_err(row_physical_schema_error)?;
-        validate_physical_schema_size(physical_schema.len() as u64)?;
-        validate_physical_schema_depth(&physical_schema)?;
+        let physical_schema = serialize_physical_schema(fields, self.zstd_level)?;
         let mut writer =
             RowFormatWriter::new(output, schema, fields.to_vec(), self.zstd_level).await?;
         writer.physical_schema = Some(Bytes::from(physical_schema));
@@ -244,8 +242,11 @@ const ROW_BLOCK_READ_CONCURRENCY: usize = 8;
 const FOOTER_SIZE: u64 = 32;
 const ROW_MAGIC: i32 = 0x524F5753;
 const ROW_VERSION: u8 = 1;
-// V2 puts the Paimon physical field list (UTF-8 JSON) between the index and footer.
+// V2 puts a little-endian length followed by Zstd-compressed DataField[] JSON
+// between the index and footer.
 const SHREDDED_ROW_VERSION: u8 = 2;
+const SCHEMA_HEADER_SIZE: usize = size_of::<u32>();
+const MAX_PHYSICAL_SCHEMA_SIZE: usize = 64 * 1024 * 1024;
 // Shredding adds two physical ROW layers per nested Variant object. This bound
 // accommodates the default inference depth (50) and limits decoding recursion.
 const MAX_PHYSICAL_SCHEMA_JSON_DEPTH: usize = 512;
@@ -610,7 +611,15 @@ async fn load_row_file_metadata(
         });
     }
     let metadata_end = if footer.version == SHREDDED_ROW_VERSION {
-        validate_physical_schema_size(footer_start - index_end)?;
+        let size = footer_start - index_end;
+        if size <= SCHEMA_HEADER_SIZE as u64
+            || size > (SCHEMA_HEADER_SIZE + MAX_PHYSICAL_SCHEMA_SIZE) as u64
+        {
+            return Err(Error::DataInvalid {
+                message: format!("Invalid .row physical schema length: {size}"),
+                source: None,
+            });
+        }
         footer_start
     } else {
         index_end
@@ -652,8 +661,24 @@ async fn load_row_file_metadata(
     }))
 }
 
-fn validate_physical_schema_size(size: u64) -> crate::Result<()> {
-    if size == 0 || size > i32::MAX as u64 {
+fn serialize_physical_schema(fields: &[DataField], zstd_level: i32) -> crate::Result<Vec<u8>> {
+    let json = serde_json::to_vec(fields).map_err(row_physical_schema_error)?;
+    validate_physical_schema_size(json.len())?;
+    validate_physical_schema_depth(&json)?;
+    let compressed =
+        zstd::bulk::compress(&json, zstd_level).map_err(|e| Error::UnexpectedError {
+            message: "Failed to compress .row physical schema".into(),
+            source: Some(Box::new(e)),
+        })?;
+    validate_physical_schema_size(compressed.len())?;
+    let mut block = Vec::with_capacity(SCHEMA_HEADER_SIZE + compressed.len());
+    block.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    block.extend_from_slice(&compressed);
+    Ok(block)
+}
+
+fn validate_physical_schema_size(size: usize) -> crate::Result<()> {
+    if size == 0 || size > MAX_PHYSICAL_SCHEMA_SIZE {
         return Err(Error::DataInvalid {
             message: format!("Invalid .row physical schema length: {size}"),
             source: None,
@@ -663,8 +688,27 @@ fn validate_physical_schema_size(size: u64) -> crate::Result<()> {
 }
 
 fn deserialize_physical_schema(bytes: &[u8]) -> crate::Result<Vec<DataField>> {
-    validate_physical_schema_depth(bytes)?;
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let (header, compressed) =
+        bytes
+            .split_at_checked(SCHEMA_HEADER_SIZE)
+            .ok_or_else(|| Error::DataInvalid {
+                message: "Missing .row physical schema length".into(),
+                source: None,
+            })?;
+    let raw_size = u32::from_le_bytes(header.try_into().unwrap()) as usize;
+    validate_physical_schema_size(raw_size)?;
+    let json = zstd::bulk::decompress(compressed, raw_size).map_err(|e| Error::DataInvalid {
+        message: "Invalid .row compressed physical schema".into(),
+        source: Some(Box::new(e)),
+    })?;
+    if json.len() != raw_size {
+        return Err(Error::DataInvalid {
+            message: ".row physical schema length does not match its header".into(),
+            source: None,
+        });
+    }
+    validate_physical_schema_depth(&json)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&json);
     deserializer.disable_recursion_limit();
     let fields = Vec::deserialize(&mut deserializer).map_err(row_physical_schema_error)?;
     deserializer.end().map_err(row_physical_schema_error)?;
@@ -3556,9 +3600,9 @@ mod tests {
             "payload".into(),
             crate::variant::variant_shredding_type(&configured).unwrap(),
         )];
-        let bytes = serde_json::to_vec(&physical).unwrap();
+        let bytes = serialize_physical_schema(&physical, 1).unwrap();
         assert_eq!(deserialize_physical_schema(&bytes).unwrap(), physical);
-        let error = expect_data_invalid(deserialize_physical_schema(&vec![
+        let error = expect_data_invalid(validate_physical_schema_depth(&vec![
             b'[';
             MAX_PHYSICAL_SCHEMA_JSON_DEPTH
                 + 1
@@ -4353,13 +4397,22 @@ mod tests {
             "value".into(),
             DataType::Int(IntType::new()),
         )];
+        let compress = |json: &[u8]| {
+            let mut block = (json.len() as u32).to_le_bytes().to_vec();
+            block.extend(zstd::bulk::compress(json, 1).unwrap());
+            block
+        };
+        let mut wrong_length = compress(b"[]");
+        wrong_length[0] = 3;
         for (schema, expected_error) in [
-            (&b""[..], "physical schema length"),
-            (&b"{"[..], "physical schema JSON"),
-            (&b"[]"[..], "physical schema has 0 fields"),
+            (vec![], "physical schema length"),
+            (vec![2, 0, 0, 0, 0], "compressed physical schema"),
+            (wrong_length, "length does not match its header"),
+            (compress(b"{}"), "physical schema JSON"),
+            (compress(b"[]"), "physical schema has 0 fields"),
         ] {
             let mut bytes = v1[..footer_start].to_vec();
-            bytes.extend_from_slice(schema);
+            bytes.extend_from_slice(&schema);
             bytes.extend_from_slice(&footer.to_bytes());
             let size = bytes.len() as u64;
             let result = RowFormatReader::default()

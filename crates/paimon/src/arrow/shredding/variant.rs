@@ -444,7 +444,6 @@ impl VariantShreddingWritePlanFactory {
         logical_fields: Vec<DataField>,
         mut options: HashMap<String, String>,
     ) -> Result<Self> {
-        options.remove(PARQUET_VARIANT_SHREDDING_SCHEMA_OPTION);
         options.remove(PARQUET_VARIANT_INFER_SHREDDING_SCHEMA_OPTION);
         Self::new(logical_fields, options)
     }
@@ -1931,7 +1930,7 @@ fn value_at(array: &dyn Array, row: usize, data_type: &DataType) -> Result<Optio
             downcast_array::<Date32Array>(array, "Date")?.value(row),
         )),
         DataType::Timestamp(_) | DataType::LocalZonedTimestamp(_) => {
-            Some(ShreddedValue::Timestamp(timestamp_value_at(array, row)?))
+            Some(ShreddedValue::Timestamp(timestamp_micros_at(array, row)?))
         }
         DataType::Row(row_type) => {
             let struct_array = downcast_array::<StructArray>(array, "Struct")?;
@@ -1970,25 +1969,37 @@ fn value_at(array: &dyn Array, row: usize, data_type: &DataType) -> Result<Optio
     })
 }
 
-fn timestamp_value_at(array: &dyn Array, row: usize) -> Result<i64> {
-    match array.data_type() {
+fn timestamp_micros_at(array: &dyn Array, row: usize) -> Result<i64> {
+    let micros = match array.data_type() {
         ArrowDataType::Timestamp(TimeUnit::Second, _) => {
-            Ok(downcast_array::<TimestampSecondArray>(array, "TimestampS")?.value(row))
+            downcast_array::<TimestampSecondArray>(array, "TimestampS")?
+                .value(row)
+                .checked_mul(1_000_000)
         }
         ArrowDataType::Timestamp(TimeUnit::Millisecond, _) => {
-            Ok(downcast_array::<TimestampMillisecondArray>(array, "TimestampMs")?.value(row))
+            downcast_array::<TimestampMillisecondArray>(array, "TimestampMs")?
+                .value(row)
+                .checked_mul(1_000)
         }
         ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => {
-            Ok(downcast_array::<TimestampMicrosecondArray>(array, "TimestampUs")?.value(row))
+            Some(downcast_array::<TimestampMicrosecondArray>(array, "TimestampUs")?.value(row))
         }
         ArrowDataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            Ok(downcast_array::<TimestampNanosecondArray>(array, "TimestampNs")?.value(row))
+            let nanos =
+                downcast_array::<TimestampNanosecondArray>(array, "TimestampNs")?.value(row);
+            (nanos % 1_000 == 0).then_some(nanos / 1_000)
         }
-        other => Err(Error::DataInvalid {
-            message: format!("Unsupported Variant shredded timestamp array: {other:?}"),
-            source: None,
-        }),
-    }
+        other => {
+            return Err(Error::DataInvalid {
+                message: format!("Unsupported Variant shredded timestamp array: {other:?}"),
+                source: None,
+            });
+        }
+    };
+    micros.ok_or_else(|| Error::DataInvalid {
+        message: "Shredded Variant timestamp cannot be represented in microseconds".into(),
+        source: None,
+    })
 }
 
 fn downcast_array<'a, T: 'static>(array: &'a dyn Array, name: &str) -> Result<&'a T> {
@@ -3472,6 +3483,8 @@ mod tests {
                         result.data_type(),
                         &paimon_type_to_arrow(&dtype(precision)).unwrap()
                     );
+                    let raw = arrow_cast::cast(result.as_ref(), &ArrowDataType::Int64).unwrap();
+                    let raw = downcast_array::<Int64Array>(raw.as_ref(), "Int64").unwrap();
                     for (row, value) in micros.iter().enumerate() {
                         let expected = match precision {
                             0 => Some(value.div_euclid(1_000_000)),
@@ -3482,10 +3495,7 @@ mod tests {
                         match expected {
                             Some(value) => {
                                 assert!(!result.is_null(row));
-                                assert_eq!(
-                                    timestamp_value_at(result.as_ref(), row).unwrap(),
-                                    value
-                                );
+                                assert_eq!(raw.value(row), value);
                             }
                             None => assert!(result.is_null(row)),
                         }
