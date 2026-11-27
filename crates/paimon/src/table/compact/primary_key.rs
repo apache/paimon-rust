@@ -62,17 +62,23 @@ impl PrimaryKeyCompactPlanner {
         context: &CompactContext,
     ) -> Result<Vec<CompactTask>> {
         let mut tasks = Vec::new();
-        let options = context.schema.core_options();
-        let force_level_zero = !self.automatic
-            || options.compaction_force_up_level0()?
-            || options.try_changelog_producer()? == ChangelogProducer::Lookup
-            || options.merge_engine()? == MergeEngine::FirstRow
-            || options.deletion_vectors_enabled();
+        let force_level_zero = planner::force_level_zero(&context.schema, self.automatic)?;
+        // Freeze expire evaluation at plan time so execute/validation agree.
+        let expire_now_secs = if context
+            .schema
+            .options()
+            .contains_key("record-level.expire-time")
+        {
+            Some(crate::table::record_level_expire::current_epoch_secs())
+        } else {
+            None
+        };
         for ((partition, bucket, total_buckets), files) in split_files_by_bucket(source) {
             for file in &files {
                 validate_file(file, true)?;
             }
             if planner::enabled(&context.schema)? {
+                let bucket_files = files.clone();
                 if let Some((files, output_level)) = planner::select_with_force_level_zero(
                     files,
                     context.schema.options(),
@@ -86,6 +92,29 @@ impl PrimaryKeyCompactPlanner {
                         total_buckets,
                         files,
                         output_level: Some(output_level),
+                        force_level_zero,
+                        expire_now_secs,
+                        blob_field_id: None,
+                        vector_field_ids: None,
+                    });
+                } else if let Some((files, output_level)) = planner::select_expired_max_level(
+                    &bucket_files,
+                    &context.schema,
+                    expire_now_secs
+                        .unwrap_or_else(crate::table::record_level_expire::current_epoch_secs),
+                )? {
+                    // Max-level files that UniversalCompaction would skip still
+                    // need a rewrite when value stats prove every record expired.
+                    tasks.push(CompactTask {
+                        context: context.clone(),
+                        task_id: tasks.len(),
+                        partition,
+                        bucket,
+                        total_buckets,
+                        files,
+                        output_level: Some(output_level),
+                        force_level_zero,
+                        expire_now_secs,
                         blob_field_id: None,
                         vector_field_ids: None,
                     });
@@ -120,6 +149,8 @@ impl PrimaryKeyCompactPlanner {
                     total_buckets,
                     files,
                     output_level: None,
+                    force_level_zero,
+                    expire_now_secs,
                     blob_field_id: None,
                     vector_field_ids: None,
                 });
@@ -142,10 +173,10 @@ impl MergeFunction for CompactDeduplicate {
         _columns: &[usize],
         _schema: &SchemaRef,
     ) -> Result<MergeResult> {
-        let row = rows
-            .iter()
-            .max_by(|a, b| compare_sequence_order(a, b))
-            .expect("merge called with empty key group");
+        let Some(row) = rows.iter().max_by(|a, b| compare_sequence_order(a, b)) else {
+            // Expire may remove every version before the engine runs.
+            return Ok(MergeResult::Omit);
+        };
         RowKind::from_value(row.value_kind)?;
         Ok(MergeResult::SourceRow {
             batch_idx: row.batch_idx,
@@ -390,13 +421,42 @@ pub(super) async fn execute(
     let lookup_changelog = options.try_changelog_producer()? == ChangelogProducer::Lookup;
     let output_level = task.output_level();
     let drop_delete = options.deletion_vectors_enabled() && output_level > 0;
-    let reader = new_reader(table, resources.clone())?.with_lookup(lookup);
+    // Java wraps compact input readers with RecordLevelExpire. For first-row
+    // Lookup, history uses an unwrapped existence-only reader (PersistEmpty /
+    // FirstRowMergeFunctionWrapper), so expired retained history must still be
+    // visible until that key is retired. Other Lookup engines filter history.
+    let expire = crate::table::record_level_expire::RecordLevelExpire::create(schema)?;
+    let now_secs = task
+        .expire_now_secs()
+        .unwrap_or_else(crate::table::record_level_expire::current_epoch_secs);
+    let first_row = options.merge_engine()? == MergeEngine::FirstRow;
+    let lookup = match (lookup, &expire) {
+        (Some(provider), Some(expire)) if !first_row => {
+            Some(crate::table::record_level_expire::ExpiringLookup::wrap(
+                provider,
+                expire.clone(),
+                now_secs,
+            ))
+        }
+        (provider, _) => provider,
+    };
+    let reader = new_reader(table, resources.clone())?
+        .with_lookup(lookup)
+        .with_input_expire(expire.clone().map(|expire| (expire, now_secs)));
     let mut batches =
         reader.read_with_merge_function(std::slice::from_ref(split), move |config, fields| {
+            let engine = new_merge_function(config, fields, output_level)?;
             if lookup_changelog {
-                lookup::new_merge_function(config, fields, output_level)
+                // Input expire filtering happens before Lookup.add; first-row
+                // history is intentionally not expire-wrapped above.
+                lookup::wrap(engine, config, fields)
             } else {
-                new_merge_function(config, fields, output_level)
+                Ok(match expire.clone() {
+                    Some(expire) => crate::table::record_level_expire::wrap_expire_with_now(
+                        engine, expire, now_secs,
+                    ),
+                    None => engine,
+                })
             }
         })?;
     let keys = schema.trimmed_primary_keys();

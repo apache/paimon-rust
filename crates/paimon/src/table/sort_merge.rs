@@ -1647,6 +1647,10 @@ pub(crate) struct SortMergeReaderBuilder {
     merge_function: Box<dyn MergeFunction>,
     batch_size: usize,
     lookup: Option<Arc<dyn LookupProvider>>,
+    /// When set, drop expired compact-input rows before lookup/merge (Java
+    /// RecordLevelExpire reader wrap). Lookup history is filtered separately
+    /// by [`crate::table::record_level_expire::ExpiringLookup`].
+    input_expire: Option<(crate::table::record_level_expire::RecordLevelExpire, i64)>,
 }
 
 impl SortMergeReaderBuilder {
@@ -1675,11 +1679,20 @@ impl SortMergeReaderBuilder {
             merge_function,
             batch_size: 1024,
             lookup: None,
+            input_expire: None,
         }
     }
 
     pub(crate) fn with_lookup(mut self, lookup: Option<Arc<dyn LookupProvider>>) -> Self {
         self.lookup = lookup;
+        self
+    }
+
+    pub(crate) fn with_input_expire(
+        mut self,
+        expire: Option<(crate::table::record_level_expire::RecordLevelExpire, i64)>,
+    ) -> Self {
+        self.input_expire = expire;
         self
     }
 
@@ -1747,6 +1760,7 @@ impl SortMergeReaderBuilder {
             self.merge_function,
             self.batch_size,
             self.lookup.map(|lookup| (lookup, self.input_schema)),
+            self.input_expire,
         )
     }
 }
@@ -1821,6 +1835,7 @@ fn sort_merge_stream(
     merge_function: Box<dyn MergeFunction>,
     batch_size: usize,
     lookup: Option<(Arc<dyn LookupProvider>, SchemaRef)>,
+    input_expire: Option<(crate::table::record_level_expire::RecordLevelExpire, i64)>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let num_streams = streams.len();
     if num_streams == 0 {
@@ -1965,6 +1980,37 @@ fn sort_merge_stream(
 
                 // Update loser tree after advancing.
                 tree.update(|a, b| compare_cursors(&cursors, a, b).then_with(|| a.cmp(&b)).is_gt());
+            }
+
+            // Filter expired compact-input rows before lookup inject / merge
+            // (Java RecordLevelExpire wraps the compact reader so Lookup never
+            // sees expired L0). Historical LevelLookup rows are filtered by
+            // ExpiringLookup when a surviving L0 key still needs before-state.
+            if let Some((expire, now_secs)) = &input_expire {
+                let mut kept = Vec::with_capacity(same_key_rows.len());
+                for row in same_key_rows.drain(..) {
+                    if expire.keeps_merge_row(
+                        &batch_buffer,
+                        &row,
+                        &source_output_col_indices,
+                        &output_schema,
+                        *now_secs,
+                    )? {
+                        kept.push(row);
+                    }
+                }
+                same_key_rows = kept;
+            }
+
+            // Java reader wrap means a fully-expired key never enters merge, so
+            // Lookup is not consulted and history is left untouched.
+            if same_key_rows.is_empty() {
+                // Same cleanup as omit/no-output keys: release batches that are
+                // no longer referenced by cursors or pending output indices.
+                if output_indices.is_empty() {
+                    compact_batch_buffer(&mut batch_buffer, &mut stream_batch_idx, &cursors);
+                }
+                continue;
             }
 
             if let Some((lookup, schema)) = &lookup {
@@ -2221,6 +2267,8 @@ fn compact_batch_buffer(
     stream_batch_idx: &mut [Option<usize>],
     cursors: &[Option<SortMergeCursor>],
 ) {
+    #[cfg(test)]
+    tests::note_batch_buffer_len(batch_buffer.len());
     // Collect which buffer indices are still alive (referenced by a cursor).
     let mut alive: Vec<bool> = vec![false; batch_buffer.len()];
     for (i, cursor) in cursors.iter().enumerate() {
@@ -2265,8 +2313,22 @@ mod tests {
     use arrow_array::{Array, Int32Array, Int64Array, Int8Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    thread_local! {
+        static TRACK_BATCH_BUFFER: Cell<bool> = const { Cell::new(false) };
+        static BATCH_BUFFER_PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note_batch_buffer_len(len: usize) {
+        TRACK_BATCH_BUFFER.with(|track| {
+            if track.get() {
+                BATCH_BUFFER_PEAK.with(|peak| peak.set(peak.get().max(len)));
+            }
+        });
+    }
 
     #[test]
     fn level_column_survives_concatenation_and_serialization() {
@@ -2545,6 +2607,97 @@ mod tests {
             })
             .collect();
         assert_eq!(pks, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn fully_expired_keys_release_consumed_input_batches() {
+        // Many single-row batches whose keys all expire must not retain every
+        // consumed Source batch until the stream ends.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("ts", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("ts", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batch_count = 64;
+        let streams = (0..4)
+            .map(|stream| {
+                let batches = (0..batch_count / 4)
+                    .map(|i| {
+                        let pk = stream * (batch_count / 4) + i;
+                        RecordBatch::try_new(
+                            input_schema.clone(),
+                            vec![
+                                Arc::new(Int32Array::from(vec![pk])) as ArrayRef,
+                                Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                                Arc::new(Int8Array::from(vec![0i8])) as ArrayRef,
+                                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                                Arc::new(StringArray::from(vec![Some("x")])) as ArrayRef,
+                            ],
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                stream_from_batches(batches)
+            })
+            .collect::<Vec<_>>();
+        let table_schema = crate::spec::TableSchema::new(
+            0,
+            &crate::spec::Schema::builder()
+                .column(
+                    "pk",
+                    crate::spec::DataType::Int(crate::spec::IntType::new()),
+                )
+                .column(
+                    "ts",
+                    crate::spec::DataType::Int(crate::spec::IntType::new()),
+                )
+                .column(
+                    "value",
+                    crate::spec::DataType::VarChar(crate::spec::VarCharType::string_type()),
+                )
+                .primary_key(["pk"])
+                .option("record-level.expire-time", "1 s")
+                .option("record-level.time-field", "ts")
+                .build()
+                .unwrap(),
+        );
+        let expire = crate::table::record_level_expire::RecordLevelExpire::create(&table_schema)
+            .unwrap()
+            .unwrap();
+        let now = crate::table::record_level_expire::current_epoch_secs();
+        TRACK_BATCH_BUFFER.with(|track| track.set(true));
+        BATCH_BUFFER_PEAK.with(|peak| peak.set(0));
+        let result = SortMergeReaderBuilder::new(
+            streams,
+            input_schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4],
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .with_input_expire(Some((expire, now)))
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        let peak = BATCH_BUFFER_PEAK.with(|peak| peak.get());
+        TRACK_BATCH_BUFFER.with(|track| track.set(false));
+        assert!(result.is_empty(), "all keys expire so merge emits nothing");
+        assert!(
+            peak > 0 && peak <= 8,
+            "consumed expired batches must be released; peak live buffer was {peak}"
+        );
     }
 
     #[tokio::test]

@@ -76,14 +76,20 @@ struct LookupChangelogMergeFunction {
     value_columns: Vec<usize>,
 }
 
-pub(super) fn new_merge_function(
+/// Wrap the merge engine for lookup changelog production.
+///
+/// Record-level expire filters compact inputs before this wrapper observes
+/// rows. Non-first-row Lookup also filters LevelLookup hits (Java wraps the
+/// shared compact reader factory). First-row Lookup history uses an unwrapped
+/// existence reader, so expired retained history stays visible until retired.
+pub(super) fn wrap(
+    inner: Box<dyn MergeFunction>,
     config: &KeyValueReadConfig,
     fields: &[DataField],
-    output_level: i32,
 ) -> Result<Box<dyn MergeFunction>> {
     let options = ChangelogOptions::parse(&config.table_options)?;
     Ok(Box::new(LookupChangelogMergeFunction {
-        inner: super::new_merge_function(config, fields, output_level)?,
+        inner,
         first_row: config.merge_engine == MergeEngine::FirstRow,
         value_columns: fields
             .iter()

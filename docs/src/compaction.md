@@ -870,9 +870,15 @@ and dedicated vector storage are unsupported. Primary-key managed BLOB storage
 is supported as described above; tables containing only inline BLOB descriptors
 or views remain unsupported. Query authorization, rowkind fields and
 postpone buckets are unsupported in all modes.
-Ordered bucketed append, append incremental clustering, primary-key clustering
-override (`pk-clustering-override`) and record-level expiration
-(`record-level.expire-time`) are also unsupported.
+Ordered bucketed append, append incremental clustering and primary-key clustering
+override (`pk-clustering-override`) are also unsupported.
+
+Record-level expiration (`record-level.expire-time`) is supported for primary-key
+compaction. Expired versions are filtered while rewriting files during
+compaction; ordinary queries do not automatically drop expired records.
+Append-table compaction and Data Evolution compaction do not support
+record-level expiration. Expire-only max-level rewrites are conservatively
+skipped when historical schema-id value statistics cannot be resolved.
 Snapshot index manifests may contain dynamic-bucket HASH indexes and primary-key
 deletion vectors and source-backed PK indexes, or deletion vectors and global
 indexes in Data Evolution mode.
