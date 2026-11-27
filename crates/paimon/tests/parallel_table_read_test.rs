@@ -290,6 +290,162 @@ async fn independent_data_evolution_files_preserve_filtered_rows_and_limit() {
     }
 }
 
+/// Keep the first file blocked while another file can make progress.
+#[derive(Debug)]
+struct BlockFirstIndependentFile {
+    first: String,
+    later: String,
+    first_started: AtomicBool,
+    later_started: AtomicBool,
+    released: AtomicBool,
+    release: Notify,
+}
+
+#[async_trait::async_trait]
+impl FileBlockCache for BlockFirstIndependentFile {
+    async fn get(&self, path: &str, _range: Range<u64>) -> Option<Bytes> {
+        if path.ends_with(&self.later) {
+            self.later_started.store(true, Ordering::SeqCst);
+        }
+        if path.ends_with(&self.first) {
+            let released = self.release.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            self.first_started.store(true, Ordering::SeqCst);
+            if !self.released.load(Ordering::SeqCst) {
+                released.await;
+            }
+        }
+        None
+    }
+
+    async fn put(&self, _path: &str, _offset: u64, _data: Bytes) {}
+    async fn invalidate_path(&self, _path: &str) {}
+    async fn invalidate_prefix(&self, _prefix: &str) {}
+}
+
+#[tokio::test]
+async fn independent_files_keep_supplied_split_order_in_unordered_reads() {
+    let table = table("de").await;
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(
+            &RecordBatch::try_from_iter([
+                ("p", Arc::new(Int32Array::from(vec![0; 3])) as ArrayRef),
+                ("id", Arc::new(Int32Array::from(vec![4, 5, 6])) as ArrayRef),
+                ("value", Arc::new(Int32Array::from(vec![0; 3])) as ArrayRef),
+            ])
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    builder
+        .new_commit()
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    let mut scan = table.new_read_builder();
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("p", Datum::Int(0))
+        .unwrap();
+    scan.with_filter(predicate);
+    let plan = scan.new_scan().plan().await.unwrap();
+    let splits = plan.splits();
+    assert_eq!(splits.len(), 1);
+    assert_eq!(splits[0].data_files().len(), 2);
+
+    for (limit, shared_memory) in [
+        (None, false),
+        (Some(4), false),
+        (None, true),
+        (Some(4), true),
+    ] {
+        let gate = Arc::new(BlockFirstIndependentFile {
+            first: splits[0].data_files()[0].file_name.clone(),
+            later: splits[0].data_files()[1].file_name.clone(),
+            first_started: AtomicBool::new(false),
+            later_started: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            release: Notify::new(),
+        });
+        let io = table
+            .file_io()
+            .clone()
+            .with_file_block_cache(gate.clone(), 64 * 1024, "data")
+            .unwrap();
+        let gated = Table::new(
+            io,
+            table.identifier().clone(),
+            table.location().into(),
+            table.schema().clone(),
+            None,
+        );
+        let mut builder = gated.new_read_builder();
+        if let Some(limit) = limit {
+            builder.with_limit(limit);
+        }
+        if shared_memory {
+            builder.with_resources(
+                ResourceContext::builder()
+                    .memory_limit(1024 * 1024)
+                    .build()
+                    .unwrap(),
+            );
+        }
+        // Deliberately use the default unordered mode. Only original splits,
+        // not the independent files within one split, may emit out of order.
+        let output = builder
+            .new_read()
+            .unwrap()
+            .with_parallelism(2)
+            .unwrap()
+            .to_arrow(splits)
+            .unwrap();
+        let (send, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(
+            output
+                .inspect_ok(move |batch| {
+                    send.send(rows(std::slice::from_ref(batch))).unwrap();
+                })
+                .try_collect::<Vec<_>>(),
+        );
+        let concurrent = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !gate.first_started.load(Ordering::SeqCst)
+                || (!shared_memory && !gate.later_started.load(Ordering::SeqCst))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let premature =
+            tokio::time::timeout(std::time::Duration::from_millis(100), received.recv()).await;
+        let later_started = gate.later_started.load(Ordering::SeqCst);
+        gate.released.store(true, Ordering::SeqCst);
+        gate.release.notify_waiters();
+        let batches = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(concurrent.is_ok(), "expected readers did not start");
+        assert_eq!(
+            later_started, !shared_memory,
+            "shared memory must not be held by a later ordered file"
+        );
+        assert_eq!(
+            rows(&batches),
+            (1..=limit.unwrap_or(6) as i32)
+                .map(|id| (0, id, 0))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            premature.is_err(),
+            "later file emitted before the first file was released"
+        );
+    }
+}
+
 #[tokio::test]
 async fn data_evolution_streaming_splits_preserve_order_and_limit() {
     let table = table("de").await;

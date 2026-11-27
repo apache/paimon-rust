@@ -617,17 +617,26 @@ impl<'a> PaimonTableRead<'a> {
         } else {
             parallelism
         };
-        let splits = if options.data_evolution_enabled() && !self.update_read {
-            super::read_execution::independent_file_splits(splits.into_owned(), parallelism)
-        } else {
-            splits.into_owned()
-        };
-        let workers = parallelism.min(splits.len()).max(1);
+        // File groups within a supplied split must emit in order even when
+        // splits may emit unordered. Shared memory cannot be held by a later
+        // file while its earlier file waits for admission, so keep those files
+        // serial when the read uses shared resources.
+        let file_groups =
+            if options.data_evolution_enabled() && !self.update_read && !budget.has_resources() {
+                super::read_execution::independent_file_groups(&splits, parallelism)
+            } else {
+                None
+            };
+        let work_count = file_groups
+            .as_ref()
+            .map(|groups| groups.iter().map(Vec::len).sum())
+            .unwrap_or(splits.len());
+        let workers = parallelism.min(work_count).max(1);
         // A later ordered group may retain its ready batch while the current
         // group is still reading. Background prefetch must not keep a shared
         // scheduling permit in that retained decoder and block the current
         // group forever. Foreground reads retain shared memory admission.
-        let budget = if ordered && workers > 1 {
+        let budget = if (ordered || file_groups.is_some()) && workers > 1 {
             Arc::new(budget.without_prefetch())
         } else {
             budget
@@ -636,13 +645,18 @@ impl<'a> PaimonTableRead<'a> {
             .blob_parallelism
             .min((MAX_TOTAL_BLOB_READS / workers).max(1));
         let factory = self.execution_factory(include_row_kind, budget, blob_parallelism);
-        Ok(super::read_execution::execute(
-            splits,
-            parallelism,
-            ordered,
-            self.limit,
-            factory,
-        ))
+        Ok(match file_groups {
+            Some(groups) => {
+                super::read_execution::execute_file_groups(groups, ordered, self.limit, factory)
+            }
+            None => super::read_execution::execute(
+                splits.into_owned(),
+                parallelism,
+                ordered,
+                self.limit,
+                factory,
+            ),
+        })
     }
 
     fn execution_factory(
