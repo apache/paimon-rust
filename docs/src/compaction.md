@@ -528,8 +528,8 @@ creating an output file. Key bounds, sequence bounds, delete counts and file
 indexes are regenerated, using metadata statistics options for the output level.
 Compound `partial-update` DELETE states with field aggregators are rejected.
 Compound UPDATE_BEFORE states, which `partial-update.remove-record-on-delete`
-produces when only UPDATE_BEFORE records removed the row, are compacted
-because a later merge only replays their non-null fields.
+produces when no active DELETE precedes the trailing UPDATE_BEFORE, are
+compacted because a later merge only replays their non-null fields.
 For both reducer engines, compound groups containing retracts are also rejected
 when they use `first_value`, `first_non_null_value`, `collect`, `listagg`,
 `nested_update` or `nested_partial_update`. These states may carry initialization
