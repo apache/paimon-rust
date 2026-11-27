@@ -228,6 +228,58 @@ async fn test_sql_between_records_partition_pruning_stats() {
 }
 
 #[tokio::test]
+async fn test_sql_row_id_predicates_prune_row_files() {
+    let (_tmp, catalog) = common::create_test_env();
+    let ctx = common::create_sql_context(catalog.clone()).await;
+    common::exec(&ctx, "CREATE SCHEMA paimon.test_db").await;
+    common::exec(
+        &ctx,
+        "CREATE TABLE paimon.test_db.row_lookup (id INT, value INT) WITH (
+            'file.format' = 'row',
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true'
+        )",
+    )
+    .await;
+    for values in [
+        "(10, 100), (11, 110), (12, 120)",
+        "(20, 200), (21, 210), (22, 220)",
+        "(30, 300), (31, 310), (32, 320)",
+    ] {
+        common::exec(
+            &ctx,
+            &format!("INSERT INTO paimon.test_db.row_lookup (id, value) VALUES {values}"),
+        )
+        .await;
+    }
+    let table = load_table(&catalog, "row_lookup").await;
+    let unfiltered = table.new_read_builder().new_scan().plan().await.unwrap();
+    assert_eq!(unfiltered.stats().final_files, 3);
+
+    for filter in [
+        r#""_ROW_ID" BETWEEN 1 AND 2 OR "_ROW_ID" BETWEEN 7 AND 8"#,
+        r#""_ROW_ID" IN (8, 2, 7, 1)"#,
+    ] {
+        let sql = format!("SELECT id, value FROM paimon.test_db.row_lookup WHERE {filter}");
+        let plan = ctx
+            .sql(&sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let plan_text = displayable(plan.as_ref()).indent(true).to_string();
+        let scan = plan_text
+            .lines()
+            .find(|line| line.contains("PaimonTableScan:"))
+            .unwrap();
+        assert_eq!(stats_counter(scan, "files"), 2, "{plan_text}");
+        let rows = common::collect_id_value(&ctx, &sql).await;
+        assert_eq!(rows, vec![(11, 110), (12, 120), (31, 310), (32, 320)]);
+    }
+}
+
+#[tokio::test]
 async fn test_count_star_uses_statistics_without_scan_stats() {
     let (_tmp, catalog) = setup_stats_table().await;
     let sql_context = common::create_sql_context(catalog).await;
