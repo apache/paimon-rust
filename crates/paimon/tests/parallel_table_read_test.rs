@@ -509,22 +509,37 @@ async fn finite_blob_reads_do_not_open_payloads_in_later_splits() {
 
 /// Delay the first file's footer until a later file starts reading column data.
 /// A cache miss hook supplies this ordering without changing the storage backend.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DelayedFirstFile {
+    first_file: String,
+    later_file: String,
     first_waited: AtomicBool,
     later_data_started: AtomicBool,
     manually_released: AtomicBool,
     release_first: Notify,
 }
 
+impl DelayedFirstFile {
+    fn new(first_file: &str, later_file: &str) -> Self {
+        Self {
+            first_file: first_file.into(),
+            later_file: later_file.into(),
+            first_waited: AtomicBool::new(false),
+            later_data_started: AtomicBool::new(false),
+            manually_released: AtomicBool::new(false),
+            release_first: Notify::new(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl FileBlockCache for DelayedFirstFile {
     async fn get(&self, path: &str, range: Range<u64>) -> Option<Bytes> {
-        if path.ends_with("data-later.parquet") && range.start == 0 {
+        if path.ends_with(&self.later_file) && range.start == 0 {
             self.later_data_started.store(true, Ordering::SeqCst);
             self.release_first.notify_waiters();
         }
-        if path.ends_with("data-first.parquet") {
+        if path.ends_with(&self.first_file) {
             let released = self.release_first.notified();
             tokio::pin!(released);
             released.as_mut().enable();
@@ -608,7 +623,10 @@ async fn ordered_split_reads_do_not_wait_on_a_later_row_groups_budget_permit() {
         );
     }
     let raw_io = io.clone();
-    let order = Arc::new(DelayedFirstFile::default());
+    let order = Arc::new(DelayedFirstFile::new(
+        "data-first.parquet",
+        "data-later.parquet",
+    ));
     let io = io
         .with_file_block_cache(order.clone(), 64 * 1024, "data")
         .unwrap();
@@ -657,7 +675,10 @@ async fn ordered_split_reads_do_not_wait_on_a_later_row_groups_budget_permit() {
 
     // Both limited and full reads need the current split to get memory first.
     for limit in [Some(3), None] {
-        let order = Arc::new(DelayedFirstFile::default());
+        let order = Arc::new(DelayedFirstFile::new(
+            "data-first.parquet",
+            "data-later.parquet",
+        ));
         let budgeted_io = raw_io
             .clone()
             .with_file_block_cache(order.clone(), 64 * 1024, "data")
@@ -1034,6 +1055,100 @@ async fn check_parallel_blob_reads(mode: &str, output_budget: Option<&str>) {
                 b"world!".to_vec()
             ]
         );
+    }
+}
+
+#[tokio::test]
+async fn aliased_de_blob_projection_respects_output_budget() {
+    let payload = vec![42; 1536 * 1024];
+    let (io, table) = write_partitioned_blobs("de", 2, &[&payload], 2048, Some("2mb")).await;
+    let fields = table.schema().fields();
+    let id = fields.iter().find(|field| field.name() == "id").unwrap();
+    let blob = fields
+        .iter()
+        .find(|field| field.name() == "payload")
+        .unwrap()
+        .clone()
+        .with_name("aliased_payload".into());
+    let plan = table
+        .new_read_builder()
+        .with_read_type(vec![id.clone(), blob.clone()])
+        .new_scan()
+        .plan()
+        .await
+        .unwrap();
+    let splits = plan.splits();
+    assert_eq!(splits.len(), 2);
+    let parquet_names = splits
+        .iter()
+        .map(|split| {
+            let files = split.data_files();
+            assert!(files.iter().any(|file| file.file_name.ends_with(".blob")
+                && (1024 * 1024..2 * 1024 * 1024).contains(&file.file_size)));
+            &files
+                .iter()
+                .find(|file| file.file_name.ends_with(".parquet"))
+                .unwrap()
+                .file_name
+        })
+        .collect::<Vec<_>>();
+    for ordered in [false, true] {
+        let gate = Arc::new(DelayedFirstFile::new(parquet_names[0], parquet_names[1]));
+        let read_table = Table::new(
+            io.clone()
+                .with_file_block_cache(gate.clone(), 64 * 1024, "data")
+                .unwrap(),
+            table.identifier().clone(),
+            table.location().into(),
+            table.schema().clone(),
+            None,
+        );
+        let output = read_table
+            .new_read_builder()
+            .with_read_type(vec![id.clone(), blob.clone()])
+            .new_read()
+            .unwrap()
+            .with_parallelism(2)
+            .unwrap()
+            .with_ordered(ordered)
+            .to_arrow(splits)
+            .unwrap();
+        let result = tokio::spawn(output.try_collect::<Vec<_>>());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !gate.first_waited.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first split did not open");
+        let later_started = gate.release_first.notified();
+        tokio::pin!(later_started);
+        later_started.as_mut().enable();
+        assert!(
+            !gate.later_data_started.load(Ordering::SeqCst)
+                && tokio::time::timeout(std::time::Duration::from_millis(100), later_started)
+                    .await
+                    .is_err(),
+            "second split bypassed the BLOB output budget (ordered={ordered})"
+        );
+        gate.manually_released.store(true, Ordering::SeqCst);
+        gate.release_first.notify_waiters();
+
+        let batches = tokio::time::timeout(std::time::Duration::from_secs(5), result)
+            .await
+            .expect("splits stalled after releasing the first reader")
+            .unwrap()
+            .unwrap();
+        let values = batches.iter().flat_map(|batch| {
+            batch
+                .column_by_name("aliased_payload")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap()
+                .iter()
+        });
+        assert!(values.eq([Some(payload.as_slice()); 2]));
     }
 }
 

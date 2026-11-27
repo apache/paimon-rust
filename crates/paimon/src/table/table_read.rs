@@ -20,7 +20,7 @@ use super::data_file_reader::{DataFileReadTiming, DataFileReader};
 use super::format_table_read::FormatTableRead;
 use super::incremental_scan::{IncrementalPlan, IncrementalScanMode, IncrementalSplit};
 use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
-use super::read_builder::split_scan_predicates;
+use super::read_builder::{projected_read_field_ids_from_fields, split_scan_predicates};
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::MosaicPrefetchOptions;
@@ -559,7 +559,8 @@ impl<'a> PaimonTableRead<'a> {
         ordered: bool,
         include_row_kind: bool,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        let options = self.table.schema().core_options();
+        let schema = self.table.schema();
+        let options = schema.core_options();
         // Validate the complete grant set before splitting the work. Per-worker
         // validation alone could accept incompatible restricted policies.
         let grant = self.ensure_authorized_by_splits(&options, splits)?;
@@ -578,8 +579,7 @@ impl<'a> PaimonTableRead<'a> {
         }
         let mut blob_fields = options.blob_fields();
         blob_fields.extend(
-            self.table
-                .schema()
+            schema
                 .fields()
                 .iter()
                 .filter(|field| {
@@ -590,37 +590,33 @@ impl<'a> PaimonTableRead<'a> {
         let views = options.blob_view_fields();
         blob_fields.retain(|name| !views.contains(name));
         let operands = super::query_auth::leaf_names(&self.data_predicates);
-        let uses = |fields: &std::collections::HashSet<String>| {
-            (grant.is_some() && !fields.is_empty())
+        // View descriptors still require REST resolution in descriptor mode.
+        let resolves_view = self.table.rest_env().is_some()
+            && options.blob_view_resolve_enabled()
+            && !views.is_empty()
+            && (grant.is_some()
+                || !views.is_disjoint(&operands)
                 || self
                     .read_type
                     .iter()
-                    .any(|field| fields.contains(field.name()))
-                || !fields.is_disjoint(&operands)
-        };
+                    .any(|field| views.contains(field.name())));
         // Captured masks and row policies may introduce hidden BLOB operands.
-        // View descriptors still require REST resolution in descriptor mode.
-        let resolves_view =
-            self.table.rest_env().is_some() && options.blob_view_resolve_enabled() && uses(&views);
-        let resolves_blob = (!options.blob_as_descriptor() && uses(&blob_fields)) || resolves_view;
-        let resolves_blob_payload = resolves_blob && !options.blob_as_descriptor();
-        // A managed .blob file belongs to its write column. Reserve output
-        // bytes only for BLOB fields this read can consume. Restricted reads
-        // may add hidden mask or row-policy inputs, so keep all fields there.
-        let read_blob_fields = if grant.is_some() {
-            blob_fields.clone()
-        } else {
-            blob_fields
+        if grant.is_none() && !blob_fields.is_empty() {
+            // Projection names may be aliases. The split's write columns
+            // use the table names, so resolve the projection by field ID.
+            let projected_ids = projected_read_field_ids_from_fields(&self.read_type);
+            let projected_names: std::collections::HashSet<_> = schema
+                .fields()
                 .iter()
-                .filter(|name| {
-                    self.read_type
-                        .iter()
-                        .any(|field| field.name() == name.as_str())
-                        || operands.contains(*name)
-                })
-                .cloned()
-                .collect()
-        };
+                .filter(|field| projected_ids.contains(&field.id()))
+                .map(DataField::name)
+                .collect();
+            blob_fields
+                .retain(|name| projected_names.contains(name.as_str()) || operands.contains(name));
+        }
+        let resolves_blob =
+            (!options.blob_as_descriptor() && !blob_fields.is_empty()) || resolves_view;
+        let resolves_blob_payload = resolves_blob && !options.blob_as_descriptor();
         let parallelism = execution_parallelism(
             parallelism,
             self.limit,
@@ -640,11 +636,10 @@ impl<'a> PaimonTableRead<'a> {
                 options.blob_output_max_buffered_bytes().map(|max_bytes| {
                     let serialize_unknown = options.blob_output_budget_serializes_unknown();
                     let field_ids = if serialize_unknown {
-                        self.table
-                            .schema()
+                        schema
                             .fields()
                             .iter()
-                            .filter(|field| read_blob_fields.contains(field.name()))
+                            .filter(|field| blob_fields.contains(field.name()))
                             .map(DataField::id)
                             .collect()
                     } else {
@@ -652,7 +647,7 @@ impl<'a> PaimonTableRead<'a> {
                     };
                     let mut budget = super::read_execution::BlobOutputBudget {
                         max_bytes,
-                        fields: read_blob_fields,
+                        fields: blob_fields,
                         field_ids,
                         unknown_external: resolves_view,
                         serialize_unknown,
