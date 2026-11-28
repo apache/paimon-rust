@@ -1287,16 +1287,52 @@ async fn check_parallel_blob_reads(mode: &str, output_budget: Option<&str>) {
 
 #[tokio::test]
 async fn aliased_de_blob_projection_respects_output_budget() {
+    check_de_blob_projection_budget(false).await;
+}
+
+#[tokio::test]
+async fn historical_de_blob_column_name_respects_output_budget() {
+    check_de_blob_projection_budget(true).await;
+}
+
+async fn check_de_blob_projection_budget(historical_name: bool) {
     let payload = vec![42; 1536 * 1024];
     let (io, table) = write_partitioned_blobs("de", 2, &[&payload], 2048, Some("2mb")).await;
+    let (table, source_name, output_name) = if historical_name {
+        // Model an imported schema with the original field ID and a new name,
+        // as in the BLOB compaction compatibility tests.
+        let index = table
+            .schema()
+            .fields()
+            .iter()
+            .position(|field| field.name() == "payload")
+            .unwrap();
+        let mut imported = serde_json::to_value(table.schema()).unwrap();
+        imported["fields"][index]["name"] = "renamed_payload".into();
+        let imported: TableSchema = serde_json::from_value(imported).unwrap();
+        let schema = imported
+            .apply_changes(vec![SchemaChange::add_column(
+                "extra".into(),
+                DataType::Int(IntType::new()),
+            )])
+            .unwrap();
+        persist_table_schema(&io, table.location(), &schema).await;
+        (
+            table.copy_with_resolved_schema(schema, "main").unwrap(),
+            "renamed_payload",
+            "renamed_payload",
+        )
+    } else {
+        (table, "payload", "aliased_payload")
+    };
     let fields = table.schema().fields();
     let id = fields.iter().find(|field| field.name() == "id").unwrap();
     let blob = fields
         .iter()
-        .find(|field| field.name() == "payload")
+        .find(|field| field.name() == source_name)
         .unwrap()
         .clone()
-        .with_name("aliased_payload".into());
+        .with_name(output_name.into());
     let plan = table
         .new_read_builder()
         .with_read_type(vec![id.clone(), blob.clone()])
@@ -1310,8 +1346,13 @@ async fn aliased_de_blob_projection_respects_output_budget() {
         .iter()
         .map(|split| {
             let files = split.data_files();
-            assert!(files.iter().any(|file| file.file_name.ends_with(".blob")
-                && (1024 * 1024..2 * 1024 * 1024).contains(&file.file_size)));
+            let file = files
+                .iter()
+                .find(|file| file.file_name.ends_with(".blob"))
+                .unwrap();
+            assert!((1024 * 1024..2 * 1024 * 1024).contains(&file.file_size));
+            assert_eq!(file.write_cols.as_ref().unwrap(), &["payload"]);
+            assert_eq!(file.schema_id != table.schema().id(), historical_name);
             &files
                 .iter()
                 .find(|file| file.file_name.ends_with(".parquet"))
@@ -1330,7 +1371,7 @@ async fn aliased_de_blob_projection_respects_output_budget() {
             table.schema().clone(),
             None,
         );
-        let output = read_table
+        let mut output = read_table
             .new_read_builder()
             .with_read_type(vec![id.clone(), blob.clone()])
             .new_read()
@@ -1340,7 +1381,16 @@ async fn aliased_de_blob_projection_respects_output_budget() {
             .with_ordered(ordered)
             .to_arrow(splits)
             .unwrap();
-        let result = tokio::spawn(output.try_collect::<Vec<_>>());
+        let (send_first, first_batch) = tokio::sync::oneshot::channel();
+        let (resume, wait) = tokio::sync::oneshot::channel();
+        let result = tokio::spawn(async move {
+            use futures::StreamExt;
+
+            let first = output.next().await.unwrap().unwrap();
+            send_first.send(first).unwrap();
+            wait.await.unwrap();
+            output.try_collect::<Vec<_>>().await
+        });
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !gate.first_waited.load(Ordering::SeqCst) {
                 tokio::task::yield_now().await;
@@ -1361,14 +1411,21 @@ async fn aliased_de_blob_projection_respects_output_budget() {
         gate.manually_released.store(true, Ordering::SeqCst);
         gate.release_first.notify_waiters();
 
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), first_batch)
+            .await
+            .expect("the first reader stalled")
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(!gate.later_data_started.load(Ordering::SeqCst));
+        resume.send(()).unwrap();
         let batches = tokio::time::timeout(std::time::Duration::from_secs(5), result)
             .await
             .expect("splits stalled after releasing the first reader")
             .unwrap()
             .unwrap();
-        let values = batches.iter().flat_map(|batch| {
+        let values = std::iter::once(&first).chain(&batches).flat_map(|batch| {
             batch
-                .column_by_name("aliased_payload")
+                .column_by_name(output_name)
                 .unwrap()
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()

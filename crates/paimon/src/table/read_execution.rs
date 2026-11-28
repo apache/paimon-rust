@@ -20,7 +20,7 @@
 use super::{
     read_limit::take_limited_batch, schema_manager::SchemaManager, ArrowRecordBatchStream,
 };
-use crate::spec::TableSchema;
+use crate::spec::{DataFileMeta, TableSchema};
 use crate::DataSplit;
 use arrow_array::RecordBatch;
 use futures::future::BoxFuture;
@@ -37,35 +37,100 @@ fn budget_permits(max_bytes: u64) -> u32 {
 }
 
 pub(super) struct BlobOutputBudget {
-    pub max_bytes: u64,
-    pub fields: HashSet<String>,
-    pub field_ids: HashSet<i32>,
-    pub unknown_external: bool,
-    pub serialize_unknown: bool,
-    pub file_schema_manager: Option<SchemaManager>,
-    pub implicit_blob_columns: HashMap<i64, bool>,
+    max_bytes: u64,
+    fields: HashSet<String>,
+    field_ids: HashSet<i32>,
+    unknown_external: bool,
+    serialize_unknown: bool,
+    table_schema_id: i64,
+    file_schema_manager: Option<SchemaManager>,
+    implicit_blob_columns: bool,
+    historical_schemas: HashMap<i64, (Arc<TableSchema>, bool)>,
 }
 
 impl BlobOutputBudget {
-    pub(super) fn register_file_schema(&mut self, schema: &TableSchema) {
-        let contains_blob = schema.data_file_fields(None).iter().any(|field| {
-            self.field_ids.contains(&field.id()) || self.fields.contains(field.name())
-        });
-        self.implicit_blob_columns
-            .insert(schema.id(), contains_blob);
+    pub(super) fn new(
+        max_bytes: u64,
+        fields: HashSet<String>,
+        schema: &TableSchema,
+        schema_manager: SchemaManager,
+        unknown_external: bool,
+        serialize_unknown: bool,
+    ) -> Self {
+        let field_ids = schema
+            .fields()
+            .iter()
+            .filter(|field| fields.contains(field.name()))
+            .map(|field| field.id())
+            .collect();
+        let mut budget = Self {
+            max_bytes,
+            fields,
+            field_ids,
+            unknown_external,
+            serialize_unknown,
+            table_schema_id: schema.id(),
+            file_schema_manager: Some(schema_manager),
+            implicit_blob_columns: false,
+            historical_schemas: HashMap::new(),
+        };
+        budget.implicit_blob_columns = budget.implicit_blob_columns_for(schema);
+        budget
+    }
+
+    fn implicit_blob_columns_for(&self, schema: &TableSchema) -> bool {
+        self.serialize_unknown
+            && schema
+                .data_file_fields(None)
+                .iter()
+                .any(|field| self.field_ids.contains(&field.id()))
+    }
+
+    fn register_file_schema(&mut self, schema: Arc<TableSchema>) {
+        let implicit = self.implicit_blob_columns_for(&schema);
+        self.historical_schemas
+            .insert(schema.id(), (schema, implicit));
+    }
+
+    fn writes_blob_columns(&self, file: &DataFileMeta) -> bool {
+        if self.fields.is_empty() {
+            return false;
+        }
+        if file.schema_id == self.table_schema_id {
+            return file
+                .write_cols
+                .as_ref()
+                .map_or(self.implicit_blob_columns, |cols| {
+                    cols.iter().any(|name| self.fields.contains(name))
+                });
+        }
+        // Until the historical schema is loaded, keep the file in the estimate.
+        // The same fallback protects reads if the schema lookup fails.
+        let Some((schema, implicit)) = self.historical_schemas.get(&file.schema_id) else {
+            return true;
+        };
+        if file.write_cols.is_none() {
+            return *implicit;
+        }
+        super::data_evolution_reader::resolve_field_ids(file, schema.fields())
+            .map_or(true, |ids| ids.iter().any(|id| self.field_ids.contains(id)))
     }
 
     fn unresolved_file_schemas(&self, splits: &[DataSplit]) -> BTreeSet<i64> {
-        if !self.serialize_unknown || self.fields.is_empty() {
+        if self.fields.is_empty() {
             return BTreeSet::new();
         }
         splits
             .iter()
             .flat_map(|split| split.data_files())
             .filter(|file| {
-                file.write_cols.is_none()
-                    && !file.file_name.ends_with(".blob")
-                    && !self.implicit_blob_columns.contains_key(&file.schema_id)
+                file.schema_id != self.table_schema_id
+                    && !self.historical_schemas.contains_key(&file.schema_id)
+                    && if file.file_name.ends_with(".blob") {
+                        file.write_cols.is_some()
+                    } else {
+                        self.serialize_unknown
+                    }
             })
             .map(|file| file.schema_id)
             .collect()
@@ -239,7 +304,7 @@ pub(super) fn execute(
                             // keep the conservative reservation and let the
                             // reader handle the schema as it normally would.
                             if let Ok(schema) = manager.schema(id).await {
-                                budget.register_file_schema(&schema);
+                                budget.register_file_schema(schema);
                             }
                         }
                         let mut stream =
@@ -331,24 +396,14 @@ fn blob_group_cost(group: &[DataSplit], budget: &BlobOutputBudget) -> Option<u32
         let mut bytes = 0_u64;
         let mut unknown = false;
         for file in split.data_files() {
-            if file.file_name.ends_with(".blob")
-                && file
-                    .write_cols
-                    .as_ref()
-                    .is_none_or(|cols| cols.iter().any(|col| budget.fields.contains(col)))
-            {
-                let size = u64::try_from(file.file_size).unwrap_or(0);
-                unknown |= size == 0;
-                bytes = bytes.saturating_add(size);
-            } else if !file.file_name.ends_with(".blob") {
-                unknown |= match &file.write_cols {
-                    Some(cols) => cols.iter().any(|col| budget.fields.contains(col)),
-                    None => budget
-                        .implicit_blob_columns
-                        .get(&file.schema_id)
-                        .copied()
-                        .unwrap_or(true),
-                };
+            if file.file_name.ends_with(".blob") {
+                if file.write_cols.is_none() || budget.writes_blob_columns(file) {
+                    let size = u64::try_from(file.file_size).unwrap_or(0);
+                    unknown |= size == 0;
+                    bytes = bytes.saturating_add(size);
+                }
+            } else if budget.serialize_unknown {
+                unknown |= budget.writes_blob_columns(file);
             }
         }
         has_unknown |= unknown;
@@ -923,6 +978,57 @@ mod tests {
     }
 
     #[test]
+    fn historical_blob_cost_matches_field_ids_with_default_budget() {
+        use crate::spec::{BlobType, DataType, IntType, Schema};
+
+        let schema = |id, projected, other| {
+            TableSchema::new(
+                id,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column(projected, DataType::Blob(BlobType::new()))
+                    .column(other, DataType::Blob(BlobType::new()))
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true")
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let current = schema(1, "photo", "other");
+        let old = schema(0, "image", "photo");
+        let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let mut budget = BlobOutputBudget::new(
+            4 * OUTPUT_BYTE_UNIT,
+            HashSet::from(["photo".into()]),
+            &current,
+            SchemaManager::new(io, "memory:/blob-budget".into()),
+            false,
+            false,
+        );
+        let selected = budget_split(vec![split_file(
+            "old-image.blob",
+            2 * OUTPUT_BYTE_UNIT as i64,
+            Some(vec!["image"]),
+        )]);
+        let unrelated = budget_split(vec![split_file(
+            "old-photo.blob",
+            3 * OUTPUT_BYTE_UNIT as i64,
+            Some(vec!["photo"]),
+        )]);
+        assert_eq!(
+            budget.unresolved_file_schemas(std::slice::from_ref(&selected)),
+            BTreeSet::from([0])
+        );
+        assert!(blob_budget_applies_to_splits(
+            std::slice::from_ref(&selected),
+            &budget
+        ));
+        budget.register_file_schema(Arc::new(old));
+        assert_eq!(blob_group_cost(&[selected], &budget), Some(2));
+        assert_eq!(blob_group_cost(&[unrelated], &budget), None);
+    }
+
+    #[test]
     fn blob_output_reservation_requires_opt_in_for_unknown_sizes() {
         let mut budget = BlobOutputBudget {
             max_bytes: 64 * OUTPUT_BYTE_UNIT,
@@ -930,8 +1036,10 @@ mod tests {
             field_ids: HashSet::new(),
             unknown_external: false,
             serialize_unknown: false,
+            table_schema_id: 0,
             file_schema_manager: None,
-            implicit_blob_columns: HashMap::new(),
+            implicit_blob_columns: false,
+            historical_schemas: HashMap::new(),
         };
         let managed = budget_split(vec![
             split_file("key.parquet", 1024, Some(vec!["clip_id"])),
@@ -1052,8 +1160,10 @@ mod tests {
                 field_ids: HashSet::new(),
                 unknown_external: false,
                 serialize_unknown: false,
+                table_schema_id: 0,
                 file_schema_manager: None,
-                implicit_blob_columns: HashMap::new(),
+                implicit_blob_columns: false,
+                historical_schemas: HashMap::new(),
             };
             assert_eq!(blob_group_cost(&splits[..1], &budget), Some(1));
             assert_eq!(blob_group_cost(&splits[1..], &budget), Some(1));
@@ -1113,8 +1223,10 @@ mod tests {
                 field_ids: HashSet::new(),
                 unknown_external: false,
                 serialize_unknown: false,
+                table_schema_id: 0,
                 file_schema_manager: None,
-                implicit_blob_columns: HashMap::new(),
+                implicit_blob_columns: false,
+                historical_schemas: HashMap::new(),
             }),
         );
         let ready = tokio::time::timeout(Duration::from_secs(2), output.next())
@@ -1178,8 +1290,10 @@ mod tests {
                 field_ids: HashSet::new(),
                 unknown_external: false,
                 serialize_unknown: false,
+                table_schema_id: 0,
                 file_schema_manager: None,
-                implicit_blob_columns: HashMap::new(),
+                implicit_blob_columns: false,
+                historical_schemas: HashMap::new(),
             };
             assert!(blob_budget_applies_to_splits(&splits, &budget));
             let mut output = execute(splits, 3, ordered, None, read, Some(budget));
@@ -1244,8 +1358,10 @@ mod tests {
                 field_ids: HashSet::new(),
                 unknown_external: false,
                 serialize_unknown: false,
+                table_schema_id: 0,
                 file_schema_manager: None,
-                implicit_blob_columns: HashMap::new(),
+                implicit_blob_columns: false,
+                historical_schemas: HashMap::new(),
             }),
         );
         assert!(output.next().await.unwrap().is_ok());
@@ -1864,8 +1980,10 @@ mod tests {
                 field_ids: HashSet::new(),
                 unknown_external: false,
                 serialize_unknown: false,
+                table_schema_id: 0,
                 file_schema_manager: None,
-                implicit_blob_columns: HashMap::new(),
+                implicit_blob_columns: false,
+                historical_schemas: HashMap::new(),
             }),
         );
         let values = output

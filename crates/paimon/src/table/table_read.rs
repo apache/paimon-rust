@@ -636,31 +636,14 @@ impl<'a> PaimonTableRead<'a> {
         let blob_output_budget = resolves_blob_payload
             .then(|| {
                 options.blob_output_max_buffered_bytes().map(|max_bytes| {
-                    let serialize_unknown = options.blob_output_budget_serializes_unknown();
-                    let field_ids = if serialize_unknown {
-                        schema
-                            .fields()
-                            .iter()
-                            .filter(|field| blob_fields.contains(field.name()))
-                            .map(DataField::id)
-                            .collect()
-                    } else {
-                        Default::default()
-                    };
-                    let mut budget = super::read_execution::BlobOutputBudget {
+                    super::read_execution::BlobOutputBudget::new(
                         max_bytes,
-                        fields: blob_fields,
-                        field_ids,
-                        unknown_external: resolves_view,
-                        serialize_unknown,
-                        file_schema_manager: serialize_unknown
-                            .then(|| self.table.schema_manager().clone()),
-                        implicit_blob_columns: Default::default(),
-                    };
-                    if serialize_unknown {
-                        budget.register_file_schema(self.table.schema());
-                    }
-                    budget
+                        blob_fields,
+                        schema,
+                        self.table.schema_manager().clone(),
+                        resolves_view,
+                        options.blob_output_budget_serializes_unknown(),
+                    )
                 })
             })
             .transpose()?;
