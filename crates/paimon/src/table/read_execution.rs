@@ -439,18 +439,26 @@ fn schedule_budgeted<T, F>(
     pending: &mut JoinSet<BudgetedBatch>,
     permits: &Arc<Semaphore>,
     handle: &tokio::runtime::Handle,
-    max_workers: usize,
-    buffered: usize,
+    max_pending: usize,
+    ordered: bool,
     make_stream: &F,
 ) where
     T: Send + 'static,
     F: Fn(T) -> ArrowRecordBatchStream,
 {
-    while pending.len() + buffered < max_workers {
-        let Some((_, _, cost)) = waiting.front() else {
+    while pending.len() < max_pending {
+        let available = permits.available_permits();
+        // A later ordered batch could hold the permits needed by the next
+        // split. Unordered reads can select the first group that fits instead.
+        let candidates = if ordered { 1 } else { waiting.len() };
+        let Some(position) = waiting
+            .iter()
+            .take(candidates)
+            .position(|(_, _, cost)| cost.is_none_or(|cost| cost as usize <= available))
+        else {
             break;
         };
-        let permit = match *cost {
+        let permit = match waiting[position].2 {
             Some(cost) => {
                 let Ok(permit) = Arc::clone(permits).try_acquire_many_owned(cost) else {
                     break;
@@ -459,7 +467,7 @@ fn schedule_budgeted<T, F>(
             }
             None => None,
         };
-        let (index, item, _) = waiting.pop_front().unwrap();
+        let (index, item, _) = waiting.remove(position).unwrap();
         poll_budgeted(index, make_stream(item), permit, pending, handle);
     }
 }
@@ -503,7 +511,7 @@ where
         let mut ready = BTreeMap::new();
         let mut completed = BTreeSet::new();
         let mut current = 0;
-        schedule_budgeted(&mut waiting, &mut pending, &permits, &handle, parallelism, ready.len(), &make_stream);
+        schedule_budgeted(&mut waiting, &mut pending, &permits, &handle, parallelism, ordered, &make_stream);
         while current < count {
             if ordered && completed.remove(&current) {
                 current += 1;
@@ -537,7 +545,15 @@ where
                 } else {
                     current += 1;
                 }
-                schedule_budgeted(&mut waiting, &mut pending, &permits, &handle, parallelism, ready.len(), &make_stream);
+                schedule_budgeted(
+                    &mut waiting,
+                    &mut pending,
+                    &permits,
+                    &handle,
+                    parallelism.saturating_sub(ready.len()),
+                    ordered,
+                    &make_stream,
+                );
                 continue;
             }
             if ordered && index != current {
@@ -1701,6 +1717,55 @@ mod tests {
         assert_eq!(value(&output.next().await.unwrap().unwrap()), 0);
         // A paused caller must not create or schedule the remaining readers.
         assert_eq!(created.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn blob_output_budget_admits_later_group_only_when_unordered() {
+        for ordered in [false, true] {
+            let (release, wait) = oneshot::channel();
+            let wait = Mutex::new(Some(wait));
+            let admitted = Arc::new(Mutex::new(Vec::new()));
+            let started = admitted.clone();
+            let reads = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut output = merge_items_budgeted(
+                vec![0, 1, 2],
+                vec![Some(3), Some(4), Some(1)],
+                4,
+                ordered,
+                3,
+                move |index| {
+                    started.lock().unwrap().push(index);
+                    let gate = if index == 0 {
+                        wait.lock().unwrap().take()
+                    } else {
+                        None
+                    };
+                    controlled_stream(vec![index], gate, reads.clone(), drops.clone())
+                },
+            );
+            assert!(output.next().now_or_never().is_none());
+            if ordered {
+                assert_eq!(*admitted.lock().unwrap(), vec![0]);
+            } else {
+                let batch = tokio::time::timeout(Duration::from_secs(5), output.next())
+                    .await
+                    .expect("the small group did not use the remaining permit")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(value(&batch), 2);
+                assert_eq!(*admitted.lock().unwrap(), vec![0, 2]);
+            }
+            release.send(()).unwrap();
+            let rest = tokio::time::timeout(
+                Duration::from_secs(5),
+                output.map_ok(|batch| value(&batch)).try_collect::<Vec<_>>(),
+            )
+            .await
+            .expect("a large group could not acquire its budget")
+            .unwrap();
+            assert_eq!(rest, if ordered { vec![0, 1, 2] } else { vec![0, 1] });
+        }
     }
 
     #[tokio::test]
