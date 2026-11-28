@@ -21,9 +21,10 @@
 use super::{FileIO, FileRead, InputFile};
 use crate::{Error, Result};
 use bytes::{Buf, Bytes, BytesMut};
-use reqwest::header::CONTENT_ENCODING;
+use reqwest::header::{CONTENT_ENCODING, RETRY_AFTER};
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, SystemTime};
 
 mod custom;
 pub(crate) use custom::ReusingBlobRefStreamProvider;
@@ -72,6 +73,39 @@ impl UriInput {
 
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 
+// Bound request amplification and cumulative retry sleeps, excluding network I/O time.
+const MAX_HTTP_RETRIES: usize = 3;
+const MAX_HTTP_RETRY_WAIT: Duration = Duration::from_secs(30);
+
+fn http_retry_delay(
+    retry_after: Option<&str>,
+    retries: usize,
+    waited: Duration,
+    now: SystemTime,
+) -> Option<Duration> {
+    if retries >= MAX_HTTP_RETRIES {
+        return None;
+    }
+    let server_delay = match retry_after.map(str::trim) {
+        Some(value) if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+            // Overflow is an excessive server delay, not a malformed header
+            // that permits a shorter fallback backoff.
+            Some(Duration::from_secs(value.parse::<u64>().ok()?))
+        }
+        Some(value) => httpdate::parse_http_date(value)
+            .ok()
+            .map(|date| date.duration_since(now).unwrap_or(Duration::ZERO)),
+        None => None,
+    };
+    let delay = server_delay.unwrap_or_else(|| Duration::from_millis(100 << retries));
+    // A server's requested delay is a minimum. Fail rather than cap it and
+    // retry earlier when it exceeds the remaining waiting budget.
+    waited
+        .checked_add(delay)
+        .filter(|total| *total <= MAX_HTTP_RETRY_WAIT)?;
+    Some(delay)
+}
+
 #[derive(Clone)]
 pub(crate) struct HttpReader {
     uri: String,
@@ -83,13 +117,31 @@ impl HttpReader {
     }
 
     async fn response(&self) -> Result<reqwest::Response> {
-        let response = self
-            .request()
-            .send()
-            .await
-            .map_err(http_error)?
-            .error_for_status()
-            .map_err(http_error)?;
+        let mut retries = 0;
+        let mut waited = Duration::ZERO;
+        let response = loop {
+            let response = self.request().send().await.map_err(http_error)?;
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                if let Some(delay) = http_retry_delay(
+                    response
+                        .headers()
+                        .get(RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok()),
+                    retries,
+                    waited,
+                    SystemTime::now(),
+                ) {
+                    // Release the rejected response before waiting. Only retry
+                    // before consuming a successful body, never replay its bytes.
+                    drop(response);
+                    tokio::time::sleep(delay).await;
+                    waited += delay;
+                    retries += 1;
+                    continue;
+                }
+            }
+            break response.error_for_status().map_err(http_error)?;
+        };
         if response.status() != reqwest::StatusCode::OK {
             return Err(invalid(&format!(
                 "Unexpected HTTP Blob status: {}",
@@ -267,6 +319,113 @@ mod tests {
     use axum::Router;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn http_blob_retries_429_after_the_requested_delay() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = Router::new().route(
+            "/throttled",
+            get(move || {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Response::builder()
+                            .status(StatusCode::TOO_MANY_REQUESTS)
+                            .header("Retry-After", "1")
+                            .body(Body::empty())
+                            .unwrap()
+                    } else {
+                        Response::new(Body::from("0123456789"))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let reader = HttpReader {
+            uri: format!("http://{address}/throttled"),
+        };
+        let started = std::time::Instant::now();
+        let result = reader.read(3..7).await;
+        server.abort();
+        assert_eq!(result.unwrap().as_ref(), b"3456");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn http_retry_delay_respects_dates_and_waiting_budget() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let future = httpdate::fmt_http_date(now + Duration::from_secs(2));
+        let past = httpdate::fmt_http_date(now - Duration::from_secs(2));
+        let delay = |value, retries, waited| http_retry_delay(value, retries, waited, now);
+        assert_eq!(
+            delay(Some("2"), 0, Duration::ZERO),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            delay(Some(future.as_str()), 0, Duration::ZERO),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            delay(Some(past.as_str()), 0, Duration::ZERO),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            delay(None, 0, Duration::ZERO),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            delay(Some("invalid"), 1, Duration::ZERO),
+            Some(Duration::from_millis(200))
+        );
+        assert_eq!(delay(Some("0"), 3, Duration::ZERO), None);
+        assert_eq!(delay(Some("31"), 0, Duration::ZERO), None);
+        assert_eq!(delay(Some("2"), 1, Duration::from_secs(29)), None);
+        assert_eq!(delay(Some("18446744073709551616"), 0, Duration::ZERO), None);
+    }
+
+    #[tokio::test]
+    async fn http_blob_retries_are_bounded_and_errors_stay_sanitized() {
+        for (status, retry_after, expected_requests) in [
+            (StatusCode::TOO_MANY_REQUESTS, "0", 4),
+            (StatusCode::TOO_MANY_REQUESTS, "31", 1),
+            (StatusCode::FORBIDDEN, "0", 1),
+            (StatusCode::SERVICE_UNAVAILABLE, "0", 1),
+        ] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counter = requests.clone();
+            let app = Router::new().route(
+                "/signed",
+                get(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        Response::builder()
+                            .status(status)
+                            .header("Retry-After", retry_after)
+                            .body(Body::from("secret error body"))
+                            .unwrap()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let reader = HttpReader {
+                uri: format!("http://{address}/signed?signature=secret"),
+            };
+            let result = tokio::time::timeout(Duration::from_secs(5), reader.size()).await;
+            server.abort();
+            let error = result
+                .expect("must not sleep beyond the retry budget")
+                .unwrap_err();
+            assert!(error.to_string().contains(status.as_str()));
+            assert!(!format!("{error:?}").contains("secret"));
+            assert_eq!(requests.load(Ordering::SeqCst), expected_requests);
+        }
+    }
 
     #[test]
     fn sanitize_http_uri_context() {

@@ -58,6 +58,9 @@ mod temporal;
 
 #[pymodule]
 fn pypaimon_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Python callers can retain serial defaults with older runtimes that
+    // cannot recover from transient throttling of concurrent HTTP BLOB reads.
+    m.add("HTTP_BLOB_RETRY_SUPPORTED", true)?;
     error::register_module(py, m)?;
     context::register_module(py, m)?;
     m.add_function(wrap_pyfunction!(temporal::temporal_match, m)?)?;
