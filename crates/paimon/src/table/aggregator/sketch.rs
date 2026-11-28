@@ -204,6 +204,25 @@ impl FieldAggregator for HllSketchAgg {
     }
 }
 
+/// Test-only accessors so sibling compat tests do not widen production APIs.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub fn hll_estimate(bytes: &[u8]) -> f64 {
+        deserialize_for_union(bytes).unwrap().estimate()
+    }
+
+    pub fn theta_entries(bytes: &[u8]) -> BTreeSet<u64> {
+        parse_theta(bytes).unwrap().entries
+    }
+
+    pub fn theta_emptyish(bytes: &[u8]) -> bool {
+        let parsed = parse_theta(bytes).unwrap();
+        parsed.empty || parsed.entries.is_empty()
+    }
+}
+
 const THETA_MAX: u64 = i64::MAX as u64;
 const THETA_NOMINAL_ENTRIES: usize = 4096;
 

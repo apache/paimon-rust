@@ -22,3 +22,12 @@
 **/dist/
 docs/site/
 .qoder
+
+# Local IDE / scratch
+**/*.iml
+
+# Sketch/bitmap JVM compat tooling (resolved via goldens/pom.xml; never commit jars)
+crates/paimon/src/table/goldens/lib/
+crates/paimon/src/table/goldens/**/*.class
+crates/paimon/src/table/goldens/cp.txt
+crates/paimon/src/table/goldens/rust_written/
