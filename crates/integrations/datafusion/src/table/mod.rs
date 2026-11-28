@@ -36,7 +36,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use paimon::spec::{
     BigIntType, CoreOptions, DataField, DataType, Snapshot, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
-use paimon::table::{DataSplit, Table};
+use paimon::table::Table;
 
 use crate::physical_plan::PaimonDataSink;
 use crate::BlobReaderRegistry;
@@ -401,39 +401,6 @@ pub(crate) fn bucket_round_robin<T>(items: Vec<T>, num_buckets: usize) -> Vec<Ve
     buckets
 }
 
-pub(crate) fn data_evolution_read_limit(
-    table: &Table,
-    limit: Option<usize>,
-    filter_exact: bool,
-) -> Option<usize> {
-    limit.filter(|_| {
-        let schema = table.schema();
-        let options = schema.core_options();
-        filter_exact
-            && options.data_evolution_enabled()
-            && !options.is_format_table()
-            && !options.query_auth_enabled()
-            && schema.primary_keys().is_empty()
-    })
-}
-
-pub(crate) fn assign_scan_partitions(
-    splits: Vec<DataSplit>,
-    target_partitions: usize,
-    read_limit: Option<usize>,
-) -> Vec<Arc<[DataSplit]>> {
-    // A single-row fetch can finish in the first nonempty split. Keep its
-    // scan in one partition to avoid speculative reads in others.
-    if splits.is_empty() || read_limit == Some(1) {
-        return vec![Arc::from(splits)];
-    }
-    let num_partitions = splits.len().min(target_partitions.max(1));
-    bucket_round_robin(splits, num_partitions)
-        .into_iter()
-        .map(Arc::from)
-        .collect()
-}
-
 /// Build parameters for [`PaimonTableScan`].
 pub(crate) struct PaimonScanBuilder<'a> {
     pub(crate) table: &'a Table,
@@ -480,9 +447,16 @@ impl PaimonScanBuilder<'_> {
         };
 
         let scan_stats = Some(self.plan.stats().clone());
-        let read_limit = data_evolution_read_limit(self.table, self.limit, self.filter_exact);
-        let planned_partitions =
-            assign_scan_partitions(self.plan.into_splits(), self.target_partitions, read_limit);
+        let splits = self.plan.into_splits();
+        let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
+            vec![Arc::from(Vec::new())]
+        } else {
+            let num_partitions = splits.len().min(self.target_partitions.max(1));
+            bucket_round_robin(splits, num_partitions)
+                .into_iter()
+                .map(Arc::from)
+                .collect()
+        };
 
         PaimonTableScan::try_new(
             projected_schema,

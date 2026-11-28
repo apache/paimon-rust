@@ -64,32 +64,27 @@ pub(crate) fn extract_row_id_ranges(predicate: &Predicate) -> Option<Vec<RowRang
 /// Whether the extracted row ranges represent `conjunct` exactly, so it can be
 /// dropped from the residual.
 ///
-/// The conjunct must contain only convertible `_ROW_ID` conditions and
-/// extraction must produce a nonempty selection. Keep empty or mixed
-/// conjuncts available to the existing residual path.
+/// Two things must hold. The conjunct must be built entirely from convertible
+/// `_ROW_ID` conditions — extraction ignores whatever it cannot convert, so its
+/// ranges are merely a superset and anything mixed leaves a remainder they do
+/// not carry. And extraction must actually have produced ranges *for this
+/// conjunct*: an `Or` whose branches are all empty yields `None`, which the
+/// enclosing `And` silently skips, so its ranges say nothing about it.
 pub(crate) fn ranges_represent_conjunct(conjunct: &Predicate) -> bool {
-    is_row_id_range_predicate(conjunct)
+    convertible_row_id_only(conjunct)
         && extract_row_id_ranges(conjunct).is_some_and(|ranges| !ranges.is_empty())
 }
 
-/// Whether every condition can be enforced with `_ROW_ID` ranges.
-pub(crate) fn is_row_id_range_predicate(predicate: &Predicate) -> bool {
+fn convertible_row_id_only(predicate: &Predicate) -> bool {
     match predicate {
         Predicate::Leaf {
             column,
             op,
             literals,
             ..
-        } if is_row_id_column(column) => {
-            if *op == PredicateOperator::In {
-                // Check conversion without allocating and merging the literal ranges.
-                !literals.is_empty() && literals.iter().all(|value| datum_to_i64(value).is_some())
-            } else {
-                leaf_to_ranges(*op, literals).is_some()
-            }
-        }
+        } => is_row_id_column(column) && leaf_to_ranges(*op, literals).is_some(),
         Predicate::And(children) | Predicate::Or(children) => {
-            !children.is_empty() && children.iter().all(is_row_id_range_predicate)
+            children.iter().all(convertible_row_id_only)
         }
         _ => false,
     }

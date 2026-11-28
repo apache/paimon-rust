@@ -50,9 +50,7 @@ use crate::error::to_datafusion_error;
 use crate::filter_pushdown::analyze_filters;
 use crate::physical_plan::PaimonTableScan;
 use crate::runtime::await_with_runtime;
-use crate::table::{
-    assign_scan_partitions, data_evolution_read_limit, datafusion_read_fields, PaimonTableProvider,
-};
+use crate::table::{bucket_round_robin, datafusion_read_fields, PaimonTableProvider};
 
 #[derive(Debug)]
 pub(crate) struct RewriteVariantExtractions;
@@ -218,8 +216,8 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
         // planning and never reaches here. Case-insensitive matching is offered
         // only through the direct ReadBuilder API (core / C / Python), not via SQL.
         let case_sensitive = true;
-        let read_fields = datafusion_read_fields(&node.table);
-        let filter_analysis = analyze_filters(&node.filters, &read_fields, case_sensitive);
+        let filter_analysis =
+            analyze_filters(&node.filters, node.table.schema().fields(), case_sensitive);
         let mut read_builder = node.table.new_read_builder();
         read_builder.with_case_sensitive(case_sensitive);
         read_builder.with_read_type(node.read_type.clone());
@@ -236,14 +234,22 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
             .map_err(to_datafusion_error)?;
 
         let scan_stats = Some(plan.stats().clone());
+        let splits = plan.into_splits();
         let target = session_state.config_options().execution.target_partitions;
+        let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
+            vec![Arc::from(Vec::new())]
+        } else {
+            let num_partitions = splits.len().min(target.max(1));
+            bucket_round_robin(splits, num_partitions)
+                .into_iter()
+                .map(Arc::from)
+                .collect()
+        };
         let filter_exact = !filter_analysis.requires_residual
             && filter_analysis
                 .pushed_predicate
                 .as_ref()
                 .is_none_or(|p| read_builder.is_exact_filter_pushdown(p));
-        let read_limit = data_evolution_read_limit(&node.table, pushed_limit, filter_exact);
-        let planned_partitions = assign_scan_partitions(plan.into_splits(), target, read_limit);
 
         Ok(Some(Arc::new(PaimonTableScan::try_new(
             Arc::clone(&node.arrow_schema),

@@ -25,9 +25,6 @@ use super::data_file_reader::{
     DataFileReadTiming, DataFileReader,
 };
 use super::read_limit::take_limited_batch;
-use super::row_id_predicate::{
-    extract_row_id_ranges, intersect_sorted_ranges, is_row_id_range_predicate,
-};
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::FilePredicates;
 use crate::arrow::format::MosaicPrefetchOptions;
@@ -528,12 +525,6 @@ impl DataEvolutionReader {
 
         Ok(try_stream! {
             let mut remaining = self.limit;
-            // Find an exact selection even when the caller reads splits from an
-            // unfiltered plan. Other predicates need the full candidate stream.
-            let limit_row_id_ranges = self.limit
-                .filter(|_| self.predicates.iter().all(is_row_id_range_predicate))
-                .and_then(|_| extract_row_id_ranges(&Predicate::and(self.predicates.clone())));
-            let can_limit_selection = self.predicates.is_empty() || limit_row_id_ranges.is_some();
             let resolve_blob_views = !self.blob_view_read_fields().is_empty();
             let descriptor_fields = self.descriptor_fields_to_resolve(resolve_blob_views);
             let filter_before_blob_resolution =
@@ -570,8 +561,8 @@ impl DataEvolutionReader {
                 && filter_before_blob_resolution
                 && CoreOptions::new(&self.table_options).file_index_read_enabled();
             // A managed BLOB file fetches payloads as its batch is decoded.
-            // Keep batches small and apply the output quota below when the
-            // surviving physical rows are known before decoding.
+            // Keep batches small and restrict predicate-free file selections
+            // to the remaining output quota below.
             let batch_size = self.effective_batch_size();
             let raw_file_reader = DataFileReader::new(
                 self.file_io.clone(),
@@ -601,13 +592,6 @@ impl DataEvolutionReader {
                 let row_ranges = split
                     .row_ranges()
                     .map(|ranges| crate::table::merge_row_ranges(ranges.to_vec()));
-                let row_ranges = match (row_ranges, limit_row_id_ranges.as_ref()) {
-                    (Some(split_ranges), Some(filter_ranges)) => {
-                        Some(intersect_sorted_ranges(&split_ranges, filter_ranges))
-                    }
-                    (None, Some(filter_ranges)) => Some(filter_ranges.clone()),
-                    (ranges, None) => ranges,
-                };
                 // A chunk may span several disjoint row-id groups while one
                 // group still needs column-wise merging. Process each aligned
                 // group independently; treating the whole chunk as one merge
@@ -622,10 +606,6 @@ impl DataEvolutionReader {
                         for file_meta in files {
                             if remaining == Some(0) {
                                 break 'splits;
-                            }
-                            if limit_row_id_ranges.is_some() && file_meta.first_row_id.is_none() {
-                                // Legacy files synthesize NULL row IDs, which do not match ranges.
-                                continue;
                             }
                             let deletion_vector = read_file_deletion_vector(
                                 &self.file_io,
@@ -692,7 +672,7 @@ impl DataEvolutionReader {
                             } else {
                                 effective_row_ranges.clone()
                             };
-                            if can_limit_selection {
+                            if self.predicates.is_empty() {
                                 if let Some(left) = remaining {
                                     let selected = selected_absolute_row_ranges_for_file(
                                         file_meta.first_row_id.unwrap_or(0),
@@ -824,7 +804,7 @@ impl DataEvolutionReader {
                         } else {
                             indexed_row_ranges.clone()
                         };
-                        let effective_row_ranges = if can_limit_selection {
+                        let effective_row_ranges = if self.predicates.is_empty() {
                             if let Some(left) = remaining {
                                 selected_ranges = Some(prefix_row_ranges(
                                     selected_ranges,
@@ -2392,8 +2372,8 @@ fn selected_absolute_row_ranges_for_file(
     Ok(Some(absolute))
 }
 
-/// Select at most the first `limit` surviving physical rows before reading
-/// payload data, preserving gaps from row ID ranges or deletion vectors.
+/// Select at most the first `limit` surviving physical rows, preserving gaps
+/// from row-range selection or deletion vectors before any BLOB payload is read.
 fn prefix_row_ranges(
     selected: Option<Vec<RowRange>>,
     first_row_id: i64,
