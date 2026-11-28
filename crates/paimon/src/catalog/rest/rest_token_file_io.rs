@@ -99,7 +99,8 @@ impl RESTTokenFileIO {
 
     pub(crate) async fn build_file_io(self: &Arc<Self>) -> Result<FileIO> {
         let file_io = self.current_file_io().await?;
-        Ok(file_io.with_provider(self.clone()))
+        let requires_parent_dir = file_io.requires_parent_dir_for_write();
+        Ok(file_io.with_internal_provider(self.clone(), requires_parent_dir))
     }
 
     async fn current_file_io(&self) -> Result<FileIO> {

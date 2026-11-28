@@ -200,9 +200,6 @@ impl<'a> KeyValueFileOptions<'a> {
             self.file_format
         );
         let location = self.paths.new_path(&name)?;
-        self.file_io
-            .mkdirs(&format!("{}/", location.parent()))
-            .await?;
         let output = self.file_io.new_output(&location.path)?;
         let writer = match factory.create_writer(&output, self.file_compression).await {
             Ok(writer) => with_write_resources(writer, self.resources),

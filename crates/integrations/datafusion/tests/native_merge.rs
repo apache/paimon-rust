@@ -477,7 +477,7 @@ async fn failed_merge_insert_discards_prepared_cow_files() {
          USING (VALUES (1, 100, 'a'), (2, 200, 'b')) AS s(id, value, pt) \
          ON t.id = s.id WHEN MATCHED THEN UPDATE SET value = s.value \
          WHEN NOT MATCHED THEN INSERT (id, value, pt) VALUES (s.id, s.value, s.pt)",
-        "Failed to create directory",
+        "Not a directory",
     )
     .await;
     assert_eq!(

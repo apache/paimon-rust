@@ -362,9 +362,6 @@ impl ManagedBlobWriter {
 
     async fn write_value(&mut self, field_index: usize, value: &[u8]) -> Result<BlobDescriptor> {
         if self.fields[field_index].current.is_none() {
-            self.file_io
-                .mkdirs(&format!("{}/", self.bucket_dir))
-                .await?;
             let path = format!(
                 "{}/{}{}.managed.blob",
                 self.bucket_dir,

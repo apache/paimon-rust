@@ -91,7 +91,6 @@ impl ConsumerManager {
             });
         }
         let directory = format!("{}/{}", self.table_path, CONSUMER_DIR);
-        self.file_io.mkdirs(&directory).await?;
         let path = format!("{directory}/{CONSUMER_PREFIX}{consumer_id}");
         let bytes = serde_json::to_vec(&Consumer { next_snapshot }).map_err(|error| {
             crate::Error::DataInvalid {
@@ -651,10 +650,12 @@ mod tests {
             assert_eq!(branch.get("job").await.unwrap(), None);
             assert_eq!(manager.get("job").await.unwrap(), Some(1));
             assert_eq!(sibling.get("job").await.unwrap(), Some(4));
-            assert!(file_io
-                .exists_dir(&format!("{table_path}/branch/branch-dev/consumer"))
-                .await
-                .unwrap());
+            if scheme == "file" {
+                assert!(file_io
+                    .exists_dir(&format!("{table_path}/branch/branch-dev/consumer"))
+                    .await
+                    .unwrap());
+            }
 
             branch.reset("job", 5).await.unwrap();
             manager.delete("job").await.unwrap();

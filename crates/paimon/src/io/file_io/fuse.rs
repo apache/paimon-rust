@@ -92,12 +92,13 @@ impl FileIO {
             });
         }
         let mounted = super::super::fs_config_build_with_root(local)?;
+        let requires_parent_dir = self.requires_parent_dir_for_write();
         let provider = Arc::new(FuseFileIO {
             original: original.into(),
             mounted,
             fallback: self.clone(),
         });
-        Ok(self.with_provider(provider))
+        Ok(self.with_internal_provider(provider, requires_parent_dir))
     }
 }
 
