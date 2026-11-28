@@ -86,7 +86,7 @@ async fn query_pt(sql_context: &SQLContext) -> Vec<(i32, String, i32)> {
 // ======================= Basic UPDATE =======================
 
 #[tokio::test]
-async fn test_update_rejects_unsupported_row_selection_before_writing() {
+async fn test_update_rejects_unsupported_clauses_before_writing() {
     for options in [
         "",
         "WITH ('row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true')",
@@ -112,6 +112,14 @@ async fn test_update_rejects_unsupported_row_selection_before_writing() {
         let before = query(&sql_context).await;
 
         for (sql, error) in [
+            (
+                "UPDATE paimon.test_db.t SET age = 99 WHERE id = 1 RETURNING id",
+                "RETURNING is not supported in UPDATE",
+            ),
+            (
+                "UPDATE paimon.test_db.t SET age = 99 OUTPUT inserted.id WHERE id = 1",
+                "OUTPUT is not supported in UPDATE",
+            ),
             (
                 "UPDATE paimon.test_db.t SET age = 99 FROM (SELECT 1 WHERE FALSE) AS empty_source",
                 "UPDATE ... FROM is not supported",

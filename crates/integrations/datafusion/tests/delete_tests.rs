@@ -86,7 +86,7 @@ async fn query_pt(sql_context: &SQLContext) -> Vec<(i32, String, i32)> {
 // ======================= Basic DELETE =======================
 
 #[tokio::test]
-async fn test_delete_rejects_unsupported_row_selection_before_writing() {
+async fn test_delete_rejects_unsupported_clauses_before_writing() {
     for options in [
         "",
         "WITH (
@@ -118,6 +118,14 @@ async fn test_delete_rejects_unsupported_row_selection_before_writing() {
         let before = query_pt(&sql_context).await;
 
         for (suffix, error) in [
+            (
+                "WHERE id = 1 RETURNING id",
+                "RETURNING is not supported in DELETE",
+            ),
+            (
+                "OUTPUT deleted.id WHERE id = 1",
+                "OUTPUT is not supported in DELETE",
+            ),
             (
                 "USING paimon.test_db.src",
                 "DELETE ... USING is not supported",

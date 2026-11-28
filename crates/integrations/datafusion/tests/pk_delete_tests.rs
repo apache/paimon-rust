@@ -631,7 +631,7 @@ async fn primary_key_delete_rejects_extended_syntax() {
     exec(&ctx, "INSERT INTO paimon.test_db.t VALUES (1, 10)").await;
     let before = snapshot(&catalog).await;
     for (suffix, error) in [
-        ("RETURNING id", "optional WHERE"),
+        ("RETURNING id", "RETURNING is not supported in DELETE"),
         (
             "USING paimon.test_db.t other WHERE t.id = other.id",
             "DELETE ... USING is not supported",
@@ -650,7 +650,7 @@ async fn primary_key_delete_rejects_extended_syntax() {
             "TABLESAMPLE BERNOULLI (50)",
             "DELETE with TABLESAMPLE or PARTITION is not supported",
         ),
-        ("OUTPUT deleted.id", "optional WHERE"),
+        ("OUTPUT deleted.id", "OUTPUT is not supported in DELETE"),
         ("()", "DELETE on table functions is not supported"),
         ("WITH (NOLOCK)", "optional WHERE"),
         ("WITH ORDINALITY", "optional WHERE"),

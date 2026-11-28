@@ -87,6 +87,16 @@ pub(crate) async fn execute_delete(
             "DELETE with TABLESAMPLE or PARTITION is not supported".into(),
         ));
     }
+    if delete.returning.is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "RETURNING is not supported in DELETE".into(),
+        ));
+    }
+    if delete.output.is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "OUTPUT is not supported in DELETE".into(),
+        ));
+    }
 
     let schema = table.schema();
     let core_options = CoreOptions::new(schema.options());
@@ -114,9 +124,7 @@ async fn execute_primary_key_delete(
             "DELETE on primary-key tables requires ignore-delete=false".into(),
         ));
     }
-    if delete.returning.is_some()
-        || delete.output.is_some()
-        || !delete.order_by.is_empty()
+    if !delete.order_by.is_empty()
         || delete.limit.is_some()
         || !matches!(target,
             TableFactor::Table {

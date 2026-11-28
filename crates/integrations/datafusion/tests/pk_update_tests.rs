@@ -378,7 +378,7 @@ async fn primary_key_update_rejects_unsupported_targets_and_syntax() {
         ("UPDATE paimon.test_db.t AS x SET v = 1", "alias"),
         (
             "UPDATE paimon.test_db.t SET v = 1 RETURNING id",
-            "optional WHERE",
+            "RETURNING is not supported in UPDATE",
         ),
         (
             "UPDATE paimon.test_db.t SET v = 1 FROM paimon.test_db.t other WHERE t.id = other.id",
@@ -390,7 +390,7 @@ async fn primary_key_update_rejects_unsupported_targets_and_syntax() {
         ),
         (
             "UPDATE paimon.test_db.t SET v = 1 OUTPUT inserted.id",
-            "optional WHERE",
+            "OUTPUT is not supported in UPDATE",
         ),
         (
             "UPDATE OR IGNORE paimon.test_db.t SET v = 1",

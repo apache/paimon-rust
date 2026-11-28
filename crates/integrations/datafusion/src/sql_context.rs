@@ -2137,6 +2137,16 @@ impl SQLContext {
         enable_ident_normalization: bool,
         sql_options: SQLOptions,
     ) -> DFResult<DataFrame> {
+        if insert.returning.is_some() {
+            return Err(DataFusionError::NotImplemented(
+                "RETURNING is not supported in INSERT OVERWRITE PARTITION".into(),
+            ));
+        }
+        if insert.output.is_some() {
+            return Err(DataFusionError::NotImplemented(
+                "OUTPUT is not supported in INSERT OVERWRITE PARTITION".into(),
+            ));
+        }
         self.ensure_no_time_travel_for_write("INSERT OVERWRITE")?;
         let table_name = match &insert.table {
             TableObject::TableName(name) => name.clone(),
