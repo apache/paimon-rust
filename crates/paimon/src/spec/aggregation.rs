@@ -317,14 +317,18 @@ const FIELD_SCOPED_FIELD_LIST_SUFFIXES: [&str; 2] = [SEQUENCE_GROUP_SUFFIX, NEST
 /// options, values), mirroring Java `SchemaManager.applyRenameColumnsToOptions`:
 ///
 /// - case 2: `fields.<old>.<suffix>` -> `fields.<new>.<suffix>`, value kept
-/// - case 3 (`sequence-group`, `nested-key`): every comma-separated entry
-///   equal to `old` is renamed in BOTH the key's field list and the value
+/// - case 3 (`sequence-group`, `nested-key`): rename column references in the key and value;
+///   active sequence groups also recognize spacing around list entries
 /// - `sequence-group.sort-order`: rename the key's field list only
 pub(crate) fn rename_field_scoped_options(
     options: &mut HashMap<String, String>,
     old: &str,
     new: &str,
-) {
+    sequence_group_fields: Option<&[DataField]>,
+) -> crate::Result<()> {
+    if old == new {
+        return Ok(());
+    }
     for suffix in FIELD_SCOPED_RENAMEABLE_SUFFIXES {
         let old_key = format!("{FIELDS_PREFIX}{old}{suffix}");
         if let Some(value) = options.remove(&old_key) {
@@ -344,24 +348,77 @@ pub(crate) fn rename_field_scoped_options(
             continue;
         };
         let key_fields = &key[FIELDS_PREFIX.len()..key.len() - suffix.len()];
-        let new_key_fields = rename_in_field_list(key_fields, old, new);
+        let group_fields = sequence_group_fields.filter(|_| *suffix != NESTED_KEY_SUFFIX);
+        let rename_list = |list: &str| {
+            if let Some(fields) = group_fields {
+                rename_sequence_group_fields(list, key, old, new, fields)
+            } else {
+                Ok(rename_in_field_list(list, old, new))
+            }
+        };
+        let new_key_fields = rename_list(key_fields)?;
         let new_value = if *suffix == SEQUENCE_GROUP_SORT_ORDER_SUFFIX {
             value.clone()
         } else {
-            rename_in_field_list(value, old, new)
+            rename_list(value)?
         };
         if new_key_fields != key_fields || new_value != *value {
             rewritten.push((
                 key.clone(),
                 format!("{FIELDS_PREFIX}{new_key_fields}{suffix}"),
                 new_value,
+                group_fields.is_some(),
             ));
         }
     }
-    for (old_key, new_key, new_value) in rewritten {
+    for (old_key, new_key, new_value, is_sequence_group) in rewritten {
         options.remove(&old_key);
+        if is_sequence_group && options.contains_key(&new_key) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Cannot rename '{old}' to '{new}': option '{new_key}' already exists"
+                ),
+            });
+        }
         options.insert(new_key, new_value);
     }
+    Ok(())
+}
+
+/// Group reads trim list entries. When the literal and trimmed names both exist,
+/// rewriting either name could change which column an existing table protects.
+fn rename_sequence_group_fields(
+    list: &str,
+    option_key: &str,
+    old: &str,
+    new: &str,
+    fields: &[DataField],
+) -> crate::Result<String> {
+    let mut entries: Vec<_> = list.split(',').collect();
+    for entry in &mut entries {
+        let raw = *entry;
+        let trimmed = raw.trim();
+        if old != raw && old != trimmed {
+            continue;
+        }
+        let other = if old == raw { trimmed } else { raw };
+        if other != old && fields.iter().any(|field| field.name() == other) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Cannot rename '{old}': ambiguous entry '{raw}' in '{option_key}' matches both '{raw}' and '{trimmed}'"
+                ),
+            });
+        }
+        if new.is_empty() || new.trim() != new || new.contains(',') {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Cannot represent column '{new}' in sequence-group option '{option_key}'"
+                ),
+            });
+        }
+        *entry = new;
+    }
+    Ok(entries.join(","))
 }
 
 /// Rename exact matches of `old` inside a comma-separated field list,
@@ -1028,7 +1085,7 @@ mod tests {
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
 
-        rename_field_scoped_options(&mut options, "a", "b");
+        rename_field_scoped_options(&mut options, "a", "b", None).unwrap();
 
         for (suffix, value) in [
             ("aggregate-function", "sum"),
@@ -1073,7 +1130,7 @@ mod tests {
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
 
-        rename_field_scoped_options(&mut options, "g2", "g3");
+        rename_field_scoped_options(&mut options, "g2", "g3", None).unwrap();
 
         assert_eq!(
             options
