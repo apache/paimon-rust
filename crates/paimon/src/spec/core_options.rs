@@ -115,6 +115,8 @@ const PARQUET_WRITE_PAGE_INDEX_ENABLED_OPTION: &str = "parquet.write-page-index.
 const PARQUET_ROW_GROUP_PARALLELISM_OPTION: &str = "read.parquet.row-group.parallelism";
 pub(crate) const PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION: &str =
     "read.parquet.row-group.max-inflight-bytes";
+const BLOB_OUTPUT_MAX_BUFFERED_BYTES_OPTION: &str = "read.blob.output.max-buffered-bytes";
+const BLOB_OUTPUT_BYTES_PER_CORE: i64 = 512 * 1024 * 1024;
 const MOSAIC_READ_PREFETCH_ROW_GROUPS_OPTION: &str = "mosaic.read.prefetch-row-groups";
 pub(crate) const MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION: &str = "mosaic.read.prefetch-max-bytes";
 pub(crate) const TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION: &str =
@@ -384,6 +386,10 @@ pub(crate) enum TimeTravelSelector<'a> {
     },
 }
 
+fn default_blob_output_max_buffered_bytes(available_cores: usize) -> i64 {
+    (available_cores.clamp(1, 8) as i64) * BLOB_OUTPUT_BYTES_PER_CORE
+}
+
 impl<'a> CoreOptions<'a> {
     pub fn new(options: &'a HashMap<String, String>) -> Self {
         Self { options }
@@ -526,6 +532,39 @@ impl<'a> CoreOptions<'a> {
                 ),
                 source: None,
             })
+    }
+
+    /// Bytes reserved for BLOB batches waiting at the parallel split executor.
+    /// The default is 512 MiB per available core, capped at 4 GiB;
+    /// an explicit option always overrides it.
+    pub fn blob_output_max_buffered_bytes(&self) -> crate::Result<u64> {
+        let value = match self.options.get(BLOB_OUTPUT_MAX_BUFFERED_BYTES_OPTION) {
+            Some(raw) => parse_memory_size(raw).ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{BLOB_OUTPUT_MAX_BUFFERED_BYTES_OPTION}' must be a valid memory size, got: {raw}"
+                ),
+                source: None,
+            })?,
+            None => default_blob_output_max_buffered_bytes(
+                std::thread::available_parallelism()
+                    .map(|value| value.get())
+                    .unwrap_or(1),
+            ),
+        };
+        u64::try_from(value)
+            .ok()
+            .filter(|value| *value > 0 && value.div_ceil(1024 * 1024) <= u32::MAX as u64)
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{BLOB_OUTPUT_MAX_BUFFERED_BYTES_OPTION}' must be positive and fit in the read semaphore, got: {value}"
+                ),
+                source: None,
+            })
+    }
+
+    pub(crate) fn blob_output_budget_serializes_unknown(&self) -> bool {
+        self.options
+            .contains_key(BLOB_OUTPUT_MAX_BUFFERED_BYTES_OPTION)
     }
 
     /// Reject scan options whose semantics the Rust core does not yet implement.
@@ -2513,6 +2552,55 @@ mod tests {
             )]);
             assert!(CoreOptions::new(&options)
                 .parquet_row_group_max_inflight_bytes()
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn test_blob_output_buffer_budget_option() {
+        let options = HashMap::new();
+        assert_eq!(
+            CoreOptions::new(&options)
+                .blob_output_max_buffered_bytes()
+                .unwrap(),
+            default_blob_output_max_buffered_bytes(
+                std::thread::available_parallelism()
+                    .map(|value| value.get())
+                    .unwrap_or(1)
+            ) as u64
+        );
+        for (cores, mib) in [
+            (0, 512),
+            (1, 512),
+            (2, 1024),
+            (4, 2048),
+            (8, 4096),
+            (16, 4096),
+        ] {
+            assert_eq!(
+                default_blob_output_max_buffered_bytes(cores),
+                mib * 1024 * 1024
+            );
+        }
+        assert!(!CoreOptions::new(&options).blob_output_budget_serializes_unknown());
+        let options = HashMap::from([(
+            BLOB_OUTPUT_MAX_BUFFERED_BYTES_OPTION.to_string(),
+            "32 mb".to_string(),
+        )]);
+        assert_eq!(
+            CoreOptions::new(&options)
+                .blob_output_max_buffered_bytes()
+                .unwrap(),
+            32 * 1024 * 1024
+        );
+        assert!(CoreOptions::new(&options).blob_output_budget_serializes_unknown());
+        for value in ["0", "-1", "invalid", "9223372036854775807 tb"] {
+            let options = HashMap::from([(
+                BLOB_OUTPUT_MAX_BUFFERED_BYTES_OPTION.to_string(),
+                value.to_string(),
+            )]);
+            assert!(CoreOptions::new(&options)
+                .blob_output_max_buffered_bytes()
                 .is_err());
         }
     }

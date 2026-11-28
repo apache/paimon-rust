@@ -20,7 +20,7 @@ use super::data_file_reader::{DataFileReadTiming, DataFileReader};
 use super::format_table_read::FormatTableRead;
 use super::incremental_scan::{IncrementalPlan, IncrementalScanMode, IncrementalSplit};
 use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
-use super::read_builder::split_scan_predicates;
+use super::read_builder::{projected_read_field_ids_from_fields, split_scan_predicates};
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::MosaicPrefetchOptions;
@@ -562,7 +562,8 @@ impl<'a> PaimonTableRead<'a> {
         ordered: bool,
         include_row_kind: bool,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        let options = self.table.schema().core_options();
+        let schema = self.table.schema();
+        let options = schema.core_options();
         // Validate the complete grant set before splitting the work. Per-worker
         // validation alone could accept incompatible restricted policies.
         let grant = self.ensure_authorized_by_splits(&options, splits)?;
@@ -581,8 +582,7 @@ impl<'a> PaimonTableRead<'a> {
         }
         let mut blob_fields = options.blob_fields();
         blob_fields.extend(
-            self.table
-                .schema()
+            schema
                 .fields()
                 .iter()
                 .filter(|field| {
@@ -593,20 +593,33 @@ impl<'a> PaimonTableRead<'a> {
         let views = options.blob_view_fields();
         blob_fields.retain(|name| !views.contains(name));
         let operands = super::query_auth::leaf_names(&self.data_predicates);
-        let uses = |fields: &std::collections::HashSet<String>| {
-            (grant.is_some() && !fields.is_empty())
+        // View descriptors still require REST resolution in descriptor mode.
+        let resolves_view = self.table.rest_env().is_some()
+            && options.blob_view_resolve_enabled()
+            && !views.is_empty()
+            && (grant.is_some()
+                || !views.is_disjoint(&operands)
                 || self
                     .read_type
                     .iter()
-                    .any(|field| fields.contains(field.name()))
-                || !fields.is_disjoint(&operands)
-        };
+                    .any(|field| views.contains(field.name())));
         // Captured masks and row policies may introduce hidden BLOB operands.
-        // View descriptors still require REST resolution in descriptor mode.
-        let resolves_blob = (!options.blob_as_descriptor() && uses(&blob_fields))
-            || (self.table.rest_env().is_some()
-                && options.blob_view_resolve_enabled()
-                && uses(&views));
+        if grant.is_none() && !blob_fields.is_empty() {
+            // Projection names may be aliases. The split's write columns
+            // use the table names, so resolve the projection by field ID.
+            let projected_ids = projected_read_field_ids_from_fields(&self.read_type);
+            let projected_names: std::collections::HashSet<_> = schema
+                .fields()
+                .iter()
+                .filter(|field| projected_ids.contains(&field.id()))
+                .map(DataField::name)
+                .collect();
+            blob_fields
+                .retain(|name| projected_names.contains(name.as_str()) || operands.contains(name));
+        }
+        let resolves_blob =
+            (!options.blob_as_descriptor() && !blob_fields.is_empty()) || resolves_view;
+        let resolves_blob_payload = resolves_blob && !options.blob_as_descriptor();
         let parallelism = execution_parallelism(
             parallelism,
             self.limit,
@@ -620,26 +633,43 @@ impl<'a> PaimonTableRead<'a> {
         } else {
             parallelism
         };
-        // File groups within a supplied split must emit in order even when
-        // splits may emit unordered. Shared memory cannot be held by a later
-        // file while its earlier file waits for admission, so keep those files
-        // serial when the read uses shared resources.
-        let file_groups =
-            if options.data_evolution_enabled() && !self.update_read && !budget.has_resources() {
-                super::read_execution::independent_file_groups(&splits, parallelism)
-            } else {
-                None
-            };
+        let blob_output_budget = resolves_blob_payload
+            .then(|| {
+                options.blob_output_max_buffered_bytes().map(|max_bytes| {
+                    super::read_execution::BlobOutputBudget::new(
+                        max_bytes,
+                        blob_fields,
+                        schema,
+                        self.table.schema_manager().clone(),
+                        resolves_view,
+                        options.blob_output_budget_serializes_unknown(),
+                    )
+                })
+            })
+            .transpose()?;
+        let output_budget_active = self.limit.is_none()
+            && blob_output_budget.as_ref().is_some_and(|budget| {
+                super::read_execution::blob_budget_applies_to_splits(&splits, budget)
+            });
+        // Independent file groups have separate schedulers. Keep all BLOB
+        // reservations in one scheduler when the output budget applies.
+        let file_groups = if options.data_evolution_enabled()
+            && !self.update_read
+            && !budget.has_resources()
+            && !output_budget_active
+        {
+            super::read_execution::independent_file_groups(&splits, parallelism)
+        } else {
+            None
+        };
         let work_count = file_groups
             .as_ref()
             .map(|groups| groups.iter().map(Vec::len).sum())
             .unwrap_or(splits.len());
         let workers = parallelism.min(work_count).max(1);
-        // A later ordered group may retain its ready batch while the current
-        // group is still reading. Background prefetch must not keep a shared
-        // scheduling permit in that retained decoder and block the current
-        // group forever. Foreground reads retain shared memory admission.
-        let budget = if (ordered || file_groups.is_some()) && workers > 1 {
+        // Prefetch slots must not be held across output-budget waits or
+        // while ordered groups wait for an earlier group to finish.
+        let budget = if workers > 1 && (ordered || output_budget_active || file_groups.is_some()) {
             Arc::new(budget.without_prefetch())
         } else {
             budget
@@ -658,6 +688,7 @@ impl<'a> PaimonTableRead<'a> {
                 ordered,
                 self.limit,
                 factory,
+                blob_output_budget,
             ),
         })
     }

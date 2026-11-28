@@ -1022,6 +1022,34 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
         vec![(1, "Kept".to_string(), Some(b"bob".to_vec()))]
     );
 
+    let descriptor_view = rest_view.copy_with_options(HashMap::from([
+        ("blob-as-descriptor".into(), "true".into()),
+        (
+            "read.blob.output.max-buffered-bytes".into(),
+            "invalid".into(),
+        ),
+    ]));
+    let mut descriptor_builder = descriptor_view.new_read_builder();
+    descriptor_builder.with_filter(
+        PredicateBuilder::new(descriptor_view.schema().fields())
+            .equal("id", Datum::Int(1))
+            .unwrap(),
+    );
+    let descriptor_plan = descriptor_builder.new_scan().plan().await.unwrap();
+    let descriptor_batches = descriptor_builder
+        .new_read()
+        .unwrap()
+        .with_parallelism(4)
+        .unwrap()
+        .to_arrow(descriptor_plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let descriptor_rows = collect_blob_rows(&descriptor_batches);
+    assert_eq!(descriptor_rows.len(), 1);
+    paimon::spec::BlobDescriptor::deserialize(descriptor_rows[0].2.as_deref().unwrap()).unwrap();
+
     // LIMIT alone must not resolve the invalid reference in the fourth row.
     // The repeated reference is read from the lookup cache in a later batch.
     let mut limited_builder = rest_view.new_read_builder();

@@ -2233,10 +2233,14 @@ fn read_bunch_files_stream(
         for file in files {
             let deletion_vector =
                 shifted_deletion_vector_for_file(&file, anchor_deletion_vector.as_ref())?;
+            let file_fields = match &data_fields {
+                Some(fields) => Some(fields.clone()),
+                None => file_reader.derive_data_fields(&file).await?,
+            };
             let mut stream = file_reader.read_single_file_stream(
                 &split,
                 file,
-                data_fields.clone(),
+                file_fields,
                 deletion_vector,
                 row_ranges.clone(),
             )?;
@@ -2555,7 +2559,10 @@ async fn load_file_infos(
     Ok((infos, nested_enabled))
 }
 
-fn resolve_field_ids(file: &DataFileMeta, fields: &[DataField]) -> crate::Result<Vec<i32>> {
+pub(super) fn resolve_field_ids(
+    file: &DataFileMeta,
+    fields: &[DataField],
+) -> crate::Result<Vec<i32>> {
     match &file.write_cols {
         Some(write_cols) => Ok(
             super::data_evolution_fields::project_by_paths(fields, write_cols)?
