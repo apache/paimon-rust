@@ -349,17 +349,27 @@ fn execute_unordered_with_historical_schemas(
     let mut waiting = VecDeque::new();
     let preparing = BudgetPreparations::new();
     let mut loads = HashMap::new();
-
-    // There are at most parallelism groups, each with one schema lookup at a
-    // time. Share lookups for the same schema within this read.
-    for (index, group) in split_groups(splits, parallelism).into_iter().enumerate() {
-        let ids = budget.unresolved_file_schemas(&group);
+    let mut groups: Vec<_> = split_groups(splits, parallelism)
+        .into_iter()
+        .map(Vec::into_iter)
+        .collect();
+    let group_count = groups.len();
+    // Prepare only the next split in each group. A cold schema farther
+    // down the group must not delay the current split or hold its permit.
+    let mut advance = move |index: usize,
+                            waiting: &mut VecDeque<BudgetedItem<DataSplit>>,
+                            preparing: &BudgetPreparations<DataSplit>| {
+        let Some(split) = groups[index].next() else {
+            return false;
+        };
+        let ids = budget.unresolved_file_schemas(std::slice::from_ref(&split));
         if ids.is_empty() {
-            let cost = blob_group_cost(&group, &budget);
-            waiting.push_back((index, group, cost));
-            continue;
+            let cost = blob_group_cost(std::slice::from_ref(&split), &budget);
+            insert_budgeted_item(waiting, (index, split, cost));
+            return true;
         }
 
+        // Share requests for the same schema across groups and splits.
         let schemas: Vec<_> = ids
             .into_iter()
             .map(|id| {
@@ -383,11 +393,15 @@ fn execute_unordered_with_historical_schemas(
                         budget.register_file_schema(schema);
                     }
                 }
-                let cost = blob_group_cost(&group, &budget);
-                (index, group, cost)
+                let cost = blob_group_cost(std::slice::from_ref(&split), &budget);
+                (index, split, cost)
             }
             .boxed(),
         );
+        true
+    };
+    for index in 0..group_count {
+        advance(index, &mut waiting, &preparing);
     }
 
     merge_budgeted_groups(
@@ -396,7 +410,8 @@ fn execute_unordered_with_historical_schemas(
         permits,
         false,
         parallelism,
-        move |group| read_group(group, Arc::clone(&read), None),
+        move |split| read_group(vec![split], Arc::clone(&read), None),
+        advance,
     )
 }
 
@@ -544,6 +559,11 @@ struct BudgetedBatch {
 type BudgetedItem<T> = (usize, T, Option<u32>);
 type BudgetPreparations<T> = FuturesUnordered<BoxFuture<'static, BudgetedItem<T>>>;
 
+fn insert_budgeted_item<T>(waiting: &mut VecDeque<BudgetedItem<T>>, item: BudgetedItem<T>) {
+    let position = waiting.partition_point(|queued| queued.0 < item.0);
+    waiting.insert(position, item);
+}
+
 fn poll_budgeted(
     index: usize,
     mut stream: ArrowRecordBatchStream,
@@ -634,6 +654,7 @@ where
         ordered,
         parallelism,
         make_stream,
+        |_, _, _| false,
     )
 }
 
@@ -644,6 +665,9 @@ fn merge_budgeted_groups<T, F>(
     ordered: bool,
     parallelism: usize,
     make_stream: F,
+    mut advance: impl FnMut(usize, &mut VecDeque<BudgetedItem<T>>, &BudgetPreparations<T>) -> bool
+        + Send
+        + 'static,
 ) -> ArrowRecordBatchStream
 where
     T: Send + 'static,
@@ -656,6 +680,7 @@ where
             Err(error) => {
                 waiting.clear();
                 preparing.clear();
+                drop(advance);
                 Err(crate::Error::UnexpectedError {
                     message: "Parallel table reads require a Tokio runtime".into(),
                     source: Some(Box::new(error)),
@@ -686,8 +711,7 @@ where
             } else {
                 tokio::select! {
                     Some(item) = preparing.next() => {
-                        let position = waiting.partition_point(|queued| queued.0 < item.0);
-                        waiting.insert(position, item);
+                        insert_budgeted_item(&mut waiting, item);
                         schedule_budgeted(
                             &mut waiting,
                             &mut pending,
@@ -711,6 +735,7 @@ where
                     drop(ready);
                     waiting.clear();
                     preparing.clear();
+                    drop(advance);
                     pending.shutdown().await;
                     Err(error)?;
                     break;
@@ -721,7 +746,7 @@ where
                 drop(next);
                 if ordered {
                     completed.insert(index);
-                } else {
+                } else if !advance(index, &mut waiting, &preparing) {
                     current += 1;
                 }
                 schedule_budgeted(
@@ -744,6 +769,7 @@ where
                     drop(ready);
                     waiting.clear();
                     preparing.clear();
+                    drop(advance);
                     pending.shutdown().await;
                     Err(error)?;
                     break;
@@ -759,6 +785,7 @@ where
                     drop(ready);
                     waiting.clear();
                     preparing.clear();
+                    drop(advance);
                     pending.shutdown().await;
                     Err(error)?;
                     break;
@@ -2169,14 +2196,22 @@ mod tests {
             .boxed(),
         );
         let ready = VecDeque::from([(0, (), Some(1))]);
-        let mut output = merge_budgeted_groups(ready, preparing, 1, false, 2, |()| {
-            Box::pin(futures::stream::once(async {
-                Err(crate::Error::DataInvalid {
-                    message: "BLOB read failed".into(),
-                    source: None,
-                })
-            }))
-        });
+        let mut output = merge_budgeted_groups(
+            ready,
+            preparing,
+            1,
+            false,
+            2,
+            |()| {
+                Box::pin(futures::stream::once(async {
+                    Err(crate::Error::DataInvalid {
+                        message: "BLOB read failed".into(),
+                        source: None,
+                    })
+                }))
+            },
+            |_, _, _| false,
+        );
         let batch = tokio::time::timeout(Duration::from_secs(5), output.next())
             .await
             .expect("the pending schema held up a read error");

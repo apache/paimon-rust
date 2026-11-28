@@ -1438,12 +1438,22 @@ async fn check_de_blob_projection_budget(historical_name: bool) {
 
 #[tokio::test]
 async fn unordered_blob_read_starts_while_another_split_loads_its_schema() {
+    check_unordered_blob_read_with_delayed_schema(1).await;
+}
+
+#[tokio::test]
+async fn unordered_blob_read_starts_before_later_split_in_its_group_loads_schema() {
+    check_unordered_blob_read_with_delayed_schema(2).await;
+}
+
+async fn check_unordered_blob_read_with_delayed_schema(old_partitions: i32) {
     use futures::StreamExt;
     use std::time::Duration;
 
     let old_blob = vec![1; 1536 * 1024];
-    let new_blob = vec![2; 1536 * 1024];
-    let (io, table) = write_partitioned_blobs("de", 1, &[&old_blob], 2048, Some("2mb")).await;
+    let new_blob = vec![2; 64 * 1024];
+    let (io, table) =
+        write_partitioned_blobs("de", old_partitions, &[&old_blob], 2048, Some("2mb")).await;
     let schema = table
         .schema()
         .apply_changes(vec![SchemaChange::add_column(
@@ -1456,7 +1466,10 @@ async fn unordered_blob_read_starts_while_another_split_loads_its_schema() {
     let builder = table.new_write_builder();
     let mut writer = builder.new_write().unwrap();
     let batch = RecordBatch::try_from_iter([
-        ("p", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+        (
+            "p",
+            Arc::new(Int32Array::from(vec![old_partitions])) as ArrayRef,
+        ),
         ("id", Arc::new(Int32Array::from(vec![0])) as ArrayRef),
         (
             "payload",
@@ -1473,10 +1486,18 @@ async fn unordered_blob_read_starts_while_another_split_loads_its_schema() {
         .unwrap();
     let plan = table.new_read_builder().new_scan().plan().await.unwrap();
     let mut splits = plan.splits().to_vec();
-    assert_eq!(splits.len(), 2);
+    assert_eq!(splits.len(), old_partitions as usize + 1);
     splits.sort_by_key(|split| split.data_files()[0].schema_id);
     assert_eq!(splits[0].data_files()[0].schema_id, 0);
-    assert_eq!(splits[1].data_files()[0].schema_id, table.schema().id());
+    assert_eq!(
+        splits.last().unwrap().data_files()[0].schema_id,
+        table.schema().id()
+    );
+    if old_partitions == 2 {
+        // The small current split and the first big historical split form
+        // one group; the second big historical split is in the other group.
+        splits.rotate_right(1);
+    }
 
     let gate = Arc::new(DelayedFirstFile::new("/schema/schema-0", "/schema/unused"));
     let read_table = Table::new(
@@ -1496,14 +1517,19 @@ async fn unordered_blob_read_starts_while_another_split_loads_its_schema() {
         .with_ordered(false)
         .to_arrow(&splits)
         .unwrap();
-    let first = tokio::time::timeout(Duration::from_secs(2), output.next()).await;
+    let first = tokio::time::timeout(Duration::from_secs(5), output.next())
+        .await
+        .expect("the current split waited for a historical schema it does not use")
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), output.next())
+            .await
+            .is_err()
+    );
     assert!(gate.first_waited.load(Ordering::SeqCst));
     gate.manually_released.store(true, Ordering::SeqCst);
     gate.release_first.notify_waiters();
-    let first = first
-        .expect("the current split waited for an unrelated historical schema")
-        .unwrap()
-        .unwrap();
     let mut batches = vec![first];
     batches.extend(
         tokio::time::timeout(Duration::from_secs(5), output.try_collect::<Vec<_>>())
@@ -1511,8 +1537,11 @@ async fn unordered_blob_read_starts_while_another_split_loads_its_schema() {
             .unwrap()
             .unwrap(),
     );
-    assert_eq!(batches.len(), 2);
-    for (batch, expected) in batches.iter().zip([new_blob, old_blob]) {
+    assert_eq!(batches.len(), old_partitions as usize + 1);
+    for (batch, expected) in batches
+        .iter()
+        .zip(std::iter::once(new_blob.as_slice()).chain(std::iter::repeat(old_blob.as_slice())))
+    {
         assert_eq!(batch.num_rows(), 1);
         let payload = batch
             .column_by_name("payload")
@@ -1520,7 +1549,7 @@ async fn unordered_blob_read_starts_while_another_split_loads_its_schema() {
             .as_any()
             .downcast_ref::<LargeBinaryArray>()
             .unwrap();
-        assert!(payload.value(0) == expected.as_slice());
+        assert!(payload.value(0) == expected);
     }
 }
 
