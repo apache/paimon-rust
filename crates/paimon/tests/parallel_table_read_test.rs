@@ -1437,6 +1437,94 @@ async fn check_de_blob_projection_budget(historical_name: bool) {
 }
 
 #[tokio::test]
+async fn unordered_blob_read_starts_while_another_split_loads_its_schema() {
+    use futures::StreamExt;
+    use std::time::Duration;
+
+    let old_blob = vec![1; 1536 * 1024];
+    let new_blob = vec![2; 1536 * 1024];
+    let (io, table) = write_partitioned_blobs("de", 1, &[&old_blob], 2048, Some("2mb")).await;
+    let schema = table
+        .schema()
+        .apply_changes(vec![SchemaChange::add_column(
+            "extra".into(),
+            DataType::Int(IntType::new()),
+        )])
+        .unwrap();
+    persist_table_schema(&io, table.location(), &schema).await;
+    let table = table.copy_with_resolved_schema(schema, "main").unwrap();
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    let batch = RecordBatch::try_from_iter([
+        ("p", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+        ("id", Arc::new(Int32Array::from(vec![0])) as ArrayRef),
+        (
+            "payload",
+            Arc::new(LargeBinaryArray::from(vec![new_blob.as_slice()])) as ArrayRef,
+        ),
+        ("extra", Arc::new(Int32Array::from(vec![0])) as ArrayRef),
+    ])
+    .unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    builder
+        .new_commit()
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let mut splits = plan.splits().to_vec();
+    assert_eq!(splits.len(), 2);
+    splits.sort_by_key(|split| split.data_files()[0].schema_id);
+    assert_eq!(splits[0].data_files()[0].schema_id, 0);
+    assert_eq!(splits[1].data_files()[0].schema_id, table.schema().id());
+
+    let gate = Arc::new(DelayedFirstFile::new("/schema/schema-0", "/schema/unused"));
+    let read_table = Table::new(
+        io.with_file_block_cache(gate.clone(), 64 * 1024, "meta")
+            .unwrap(),
+        table.identifier().clone(),
+        table.location().into(),
+        table.schema().clone(),
+        None,
+    );
+    let mut output = read_table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .with_parallelism(2)
+        .unwrap()
+        .with_ordered(false)
+        .to_arrow(&splits)
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), output.next()).await;
+    assert!(gate.first_waited.load(Ordering::SeqCst));
+    gate.manually_released.store(true, Ordering::SeqCst);
+    gate.release_first.notify_waiters();
+    let first = first
+        .expect("the current split waited for an unrelated historical schema")
+        .unwrap()
+        .unwrap();
+    let mut batches = vec![first];
+    batches.extend(
+        tokio::time::timeout(Duration::from_secs(5), output.try_collect::<Vec<_>>())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(batches.len(), 2);
+    for (batch, expected) in batches.iter().zip([new_blob, old_blob]) {
+        assert_eq!(batch.num_rows(), 1);
+        let payload = batch
+            .column_by_name("payload")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert!(payload.value(0) == expected.as_slice());
+    }
+}
+
+#[tokio::test]
 async fn ordered_single_blob_split_runs_without_tokio() {
     let (_, table) = write_partitioned_blobs("de", 1, &[b"one", b"two"], 2048, Some("4mb")).await;
     let plan = table.new_read_builder().new_scan().plan().await.unwrap();

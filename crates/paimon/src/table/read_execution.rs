@@ -24,6 +24,7 @@ use crate::spec::{DataFileMeta, TableSchema};
 use crate::DataSplit;
 use arrow_array::RecordBatch;
 use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -36,6 +37,7 @@ fn budget_permits(max_bytes: u64) -> u32 {
     (max_bytes / OUTPUT_BYTE_UNIT).clamp(1, u32::MAX as u64) as u32
 }
 
+#[derive(Clone)]
 pub(super) struct BlobOutputBudget {
     max_bytes: u64,
     fields: HashSet<String>,
@@ -298,6 +300,15 @@ pub(super) fn execute(
                 let ids = budget.unresolved_file_schemas(&splits);
                 if !ids.is_empty() {
                     let mut budget = blob_output_budget.unwrap();
+                    if !ordered {
+                        return execute_unordered_with_historical_schemas(
+                            splits,
+                            parallelism,
+                            read,
+                            budget,
+                            manager,
+                        );
+                    }
                     return Box::pin(async_stream::try_stream! {
                         for id in ids {
                             // A size estimate is optional. If schema I/O fails,
@@ -324,6 +335,68 @@ pub(super) fn execute(
         limit,
         read,
         blob_output_budget,
+    )
+}
+
+fn execute_unordered_with_historical_schemas(
+    splits: Vec<DataSplit>,
+    parallelism: usize,
+    read: SplitReader,
+    budget: BlobOutputBudget,
+    manager: SchemaManager,
+) -> ArrowRecordBatchStream {
+    let permits = budget_permits(budget.max_bytes) as usize;
+    let mut waiting = VecDeque::new();
+    let preparing = BudgetPreparations::new();
+    let mut loads = HashMap::new();
+
+    // There are at most parallelism groups, each with one schema lookup at a
+    // time. Share lookups for the same schema within this read.
+    for (index, group) in split_groups(splits, parallelism).into_iter().enumerate() {
+        let ids = budget.unresolved_file_schemas(&group);
+        if ids.is_empty() {
+            let cost = blob_group_cost(&group, &budget);
+            waiting.push_back((index, group, cost));
+            continue;
+        }
+
+        let schemas: Vec<_> = ids
+            .into_iter()
+            .map(|id| {
+                loads
+                    .entry(id)
+                    .or_insert_with(|| {
+                        let manager = manager.clone();
+                        async move { manager.schema(id).await.ok() }
+                            .boxed()
+                            .shared()
+                    })
+                    .clone()
+            })
+            .collect();
+        let mut budget = budget.clone();
+        preparing.push(
+            async move {
+                for schema in schemas {
+                    // Failed lookups leave the conservative estimate in place.
+                    if let Some(schema) = schema.await {
+                        budget.register_file_schema(schema);
+                    }
+                }
+                let cost = blob_group_cost(&group, &budget);
+                (index, group, cost)
+            }
+            .boxed(),
+        );
+    }
+
+    merge_budgeted_groups(
+        waiting,
+        preparing,
+        permits,
+        false,
+        parallelism,
+        move |group| read_group(group, Arc::clone(&read), None),
     )
 }
 
@@ -468,6 +541,9 @@ struct BudgetedBatch {
     permit: Option<OwnedSemaphorePermit>,
 }
 
+type BudgetedItem<T> = (usize, T, Option<u32>);
+type BudgetPreparations<T> = FuturesUnordered<BoxFuture<'static, BudgetedItem<T>>>;
+
 fn poll_budgeted(
     index: usize,
     mut stream: ArrowRecordBatchStream,
@@ -490,7 +566,7 @@ fn poll_budgeted(
 }
 
 fn schedule_budgeted<T, F>(
-    waiting: &mut VecDeque<(usize, T, Option<u32>)>,
+    waiting: &mut VecDeque<BudgetedItem<T>>,
     pending: &mut JoinSet<BudgetedBatch>,
     permits: &Arc<Semaphore>,
     handle: &tokio::runtime::Handle,
@@ -545,11 +621,41 @@ where
         .iter()
         .flatten()
         .all(|cost| *cost > 0 && *cost as usize <= permits));
+    let waiting = items
+        .into_iter()
+        .zip(costs)
+        .enumerate()
+        .map(|(index, (item, cost))| (index, item, cost))
+        .collect();
+    merge_budgeted_groups(
+        waiting,
+        BudgetPreparations::new(),
+        permits,
+        ordered,
+        parallelism,
+        make_stream,
+    )
+}
+
+fn merge_budgeted_groups<T, F>(
+    mut waiting: VecDeque<BudgetedItem<T>>,
+    mut preparing: BudgetPreparations<T>,
+    permits: usize,
+    ordered: bool,
+    parallelism: usize,
+    make_stream: F,
+) -> ArrowRecordBatchStream
+where
+    T: Send + 'static,
+    F: Fn(T) -> ArrowRecordBatchStream + Send + 'static,
+{
+    debug_assert!(!ordered || preparing.is_empty());
     Box::pin(async_stream::try_stream! {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(handle) => handle,
             Err(error) => {
-                drop(items);
+                waiting.clear();
+                preparing.clear();
                 Err(crate::Error::UnexpectedError {
                     message: "Parallel table reads require a Tokio runtime".into(),
                     source: Some(Box::new(error)),
@@ -557,11 +663,8 @@ where
                 return;
             }
         };
-        let count = items.len();
+        let count = waiting.len() + preparing.len();
         let permits = Arc::new(Semaphore::new(permits));
-        let mut waiting = items.into_iter().zip(costs).enumerate()
-            .map(|(index, (item, cost))| (index, item, cost))
-            .collect::<VecDeque<_>>();
         let mut pending = JoinSet::new();
         let mut ready = BTreeMap::new();
         let mut completed = BTreeSet::new();
@@ -578,8 +681,28 @@ where
                 } else {
                     pending.join_next().await.transpose().map_err(worker_error)
                 }
-            } else {
+            } else if preparing.is_empty() {
                 pending.join_next().await.transpose().map_err(worker_error)
+            } else {
+                tokio::select! {
+                    Some(item) = preparing.next() => {
+                        let position = waiting.partition_point(|queued| queued.0 < item.0);
+                        waiting.insert(position, item);
+                        schedule_budgeted(
+                            &mut waiting,
+                            &mut pending,
+                            &permits,
+                            &handle,
+                            parallelism,
+                            false,
+                            &make_stream,
+                        );
+                        continue;
+                    }
+                    result = pending.join_next(), if !pending.is_empty() => {
+                        result.transpose().map_err(worker_error)
+                    }
+                }
             };
             let next = match next {
                 Ok(Some(next)) => next,
@@ -587,6 +710,7 @@ where
                 Err(error) => {
                     drop(ready);
                     waiting.clear();
+                    preparing.clear();
                     pending.shutdown().await;
                     Err(error)?;
                     break;
@@ -619,6 +743,7 @@ where
                     drop(permit);
                     drop(ready);
                     waiting.clear();
+                    preparing.clear();
                     pending.shutdown().await;
                     Err(error)?;
                     break;
@@ -633,6 +758,7 @@ where
                     drop(permit);
                     drop(ready);
                     waiting.clear();
+                    preparing.clear();
                     pending.shutdown().await;
                     Err(error)?;
                     break;
@@ -2028,6 +2154,34 @@ mod tests {
             assert!(error.to_string().contains("BLOB read failed"));
             wait_for_count(&drops, 2).await;
         }
+    }
+
+    #[tokio::test]
+    async fn blob_read_error_cancels_pending_schema_preparation() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guard = DropGuard(drops.clone());
+        let preparing = BudgetPreparations::new();
+        preparing.push(
+            async move {
+                let _guard = guard;
+                futures::future::pending().await
+            }
+            .boxed(),
+        );
+        let ready = VecDeque::from([(0, (), Some(1))]);
+        let mut output = merge_budgeted_groups(ready, preparing, 1, false, 2, |()| {
+            Box::pin(futures::stream::once(async {
+                Err(crate::Error::DataInvalid {
+                    message: "BLOB read failed".into(),
+                    source: None,
+                })
+            }))
+        });
+        let batch = tokio::time::timeout(Duration::from_secs(5), output.next())
+            .await
+            .expect("the pending schema held up a read error");
+        assert!(batch.unwrap().is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
