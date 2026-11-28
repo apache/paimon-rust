@@ -992,15 +992,64 @@ pub struct PyTableRead {
     include_row_kind: bool,
 }
 
+const DEFAULT_DESCRIPTOR_SPLIT_PARALLELISM: usize = 64;
+const DEFAULT_BLOB_SPLIT_PARALLELISM: usize = 32;
+
+fn default_split_parallelism(
+    split_count: usize,
+    resolves_blob: bool,
+    filtered_without_limit: bool,
+) -> usize {
+    let cap = if !filtered_without_limit {
+        1
+    } else if resolves_blob {
+        DEFAULT_BLOB_SPLIT_PARALLELISM
+    } else {
+        DEFAULT_DESCRIPTOR_SPLIT_PARALLELISM
+    };
+    split_count.min(cap).max(1)
+}
+
+fn is_managed_blob_type(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Blob(_) => true,
+        DataType::Array(array) => array.element_type().is_blob_type(),
+        DataType::Map(map) => map.value_type().is_blob_type(),
+        _ => false,
+    }
+}
+
 impl PyTableRead {
     fn read_stream(
         &self,
         py: Python<'_>,
         splits: &Bound<'_, PyAny>,
-        parallelism: usize,
+        parallelism: Option<usize>,
         ordered: bool,
     ) -> PyResult<ArrowRecordBatchStream> {
         let splits = extract_splits(splits)?;
+        let parallelism = parallelism.unwrap_or_else(|| {
+            let options = self.table.schema().core_options();
+            // Favor the payload cap whenever this table may resolve a BLOB.
+            // Projection and filters can introduce hidden BLOB operands, so a
+            // wider default is only safe for descriptor-only reads.
+            let has_blob = !options.blob_fields().is_empty()
+                || self
+                    .table
+                    .schema()
+                    .fields()
+                    .iter()
+                    .any(|field| is_managed_blob_type(field.data_type()));
+            let resolves_blob = (!options.blob_as_descriptor() && has_blob)
+                || (self.table.rest_env().is_some()
+                    && options.blob_view_resolve_enabled()
+                    && !options.blob_view_fields().is_empty());
+            default_split_parallelism(
+                splits.len(),
+                resolves_blob,
+                self.filter.is_some() && self.limit.is_none(),
+            )
+        });
         py.detach(|| {
             let mut builder = self.table.new_read_builder();
             apply_read_config(
@@ -1044,12 +1093,15 @@ impl PyTableRead {
     /// Lazily read the given splits as PyArrow RecordBatches.
     /// Core owns split scheduling, the global row limit and cancellation.
     /// ordered=True retains the supplied split order; the default emits ready groups first.
-    #[pyo3(signature = (splits, *, parallelism = 1, ordered = false))]
+    /// Without an explicit parallelism, filtered reads without a limit use up
+    /// to 64 splits for descriptors or 32 for BLOB payloads. Other reads keep
+    /// the existing single-split default.
+    #[pyo3(signature = (splits, *, parallelism = None, ordered = false))]
     fn read_arrow(
         &self,
         py: Python<'_>,
         splits: &Bound<'_, PyAny>,
-        parallelism: usize,
+        parallelism: Option<usize>,
         ordered: bool,
     ) -> PyResult<PyRecordBatchReader> {
         Ok(PyRecordBatchReader::from_stream(self.read_stream(
@@ -1061,12 +1113,12 @@ impl PyTableRead {
     }
 
     /// Read the given splits into a list of PyArrow RecordBatches.
-    #[pyo3(signature = (splits, *, parallelism = 1, ordered = false))]
+    #[pyo3(signature = (splits, *, parallelism = None, ordered = false))]
     fn read(
         &self,
         py: Python<'_>,
         splits: &Bound<'_, PyAny>,
-        parallelism: usize,
+        parallelism: Option<usize>,
         ordered: bool,
     ) -> PyResult<Vec<Py<PyAny>>> {
         let stream = self.read_stream(py, splits, parallelism, ordered)?;
@@ -1404,10 +1456,34 @@ mod tests {
 
     use paimon::catalog::Identifier;
     use paimon::io::FileIOBuilder;
-    use paimon::spec::{IntType, Schema, TableSchema};
+    use paimon::spec::{ArrayType, BlobType, IntType, MapType, Schema, TableSchema, VarCharType};
     use pyo3::types::PyList;
 
     use super::*;
+
+    #[test]
+    fn default_parallelism_follows_split_count_and_payload_cap() {
+        assert_eq!(default_split_parallelism(0, false, true), 1);
+        assert_eq!(default_split_parallelism(20, false, true), 20);
+        assert_eq!(default_split_parallelism(100, false, true), 64);
+        assert_eq!(default_split_parallelism(20, true, true), 20);
+        assert_eq!(default_split_parallelism(100, true, true), 32);
+        assert_eq!(default_split_parallelism(100, false, false), 1);
+    }
+
+    #[test]
+    fn payload_policy_includes_nested_managed_blob_fields() {
+        let blob = DataType::Blob(BlobType::new());
+        assert!(is_managed_blob_type(&blob));
+        assert!(is_managed_blob_type(&DataType::Array(ArrayType::new(
+            blob.clone()
+        ))));
+        assert!(is_managed_blob_type(&DataType::Map(MapType::new(
+            DataType::VarChar(VarCharType::string_type()),
+            blob,
+        ))));
+        assert!(!is_managed_blob_type(&DataType::Int(IntType::new())));
+    }
 
     #[test]
     fn row_id_plan_binding_routes_arrow_and_keeps_read_selection_separate() {
