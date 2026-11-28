@@ -297,33 +297,15 @@ pub(super) fn execute(
     if limit.is_none() && parallelism > 1 && splits.len() > 1 {
         if let Some(budget) = &mut blob_output_budget {
             if let Some(manager) = budget.file_schema_manager.take() {
-                let ids = budget.unresolved_file_schemas(&splits);
-                if !ids.is_empty() {
-                    let mut budget = blob_output_budget.unwrap();
-                    if !ordered {
-                        return execute_unordered_with_historical_schemas(
-                            splits,
-                            parallelism,
-                            read,
-                            budget,
-                            manager,
-                        );
-                    }
-                    return Box::pin(async_stream::try_stream! {
-                        for id in ids {
-                            // A size estimate is optional. If schema I/O fails,
-                            // keep the conservative reservation and let the
-                            // reader handle the schema as it normally would.
-                            if let Ok(schema) = manager.schema(id).await {
-                                budget.register_file_schema(schema);
-                            }
-                        }
-                        let mut stream =
-                            execute_resolved(splits, parallelism, ordered, limit, read, Some(budget));
-                        while let Some(batch) = stream.next().await {
-                            yield batch?;
-                        }
-                    });
+                if !budget.unresolved_file_schemas(&splits).is_empty() {
+                    return execute_with_historical_schemas(
+                        splits,
+                        parallelism,
+                        ordered,
+                        read,
+                        blob_output_budget.unwrap(),
+                        manager,
+                    );
                 }
             }
         }
@@ -338,9 +320,10 @@ pub(super) fn execute(
     )
 }
 
-fn execute_unordered_with_historical_schemas(
+fn execute_with_historical_schemas(
     splits: Vec<DataSplit>,
     parallelism: usize,
+    ordered: bool,
     read: SplitReader,
     budget: BlobOutputBudget,
     manager: SchemaManager,
@@ -349,18 +332,33 @@ fn execute_unordered_with_historical_schemas(
     let mut waiting = VecDeque::new();
     let preparing = BudgetPreparations::new();
     let mut loads = HashMap::new();
-    let mut groups: Vec<_> = split_groups(splits, parallelism)
-        .into_iter()
-        .map(Vec::into_iter)
-        .collect();
-    let group_count = groups.len();
-    // Prepare only the next split in each group. A cold schema farther
-    // down the group must not delay the current split or hold its permit.
+    let groups = if ordered {
+        vec![splits]
+    } else {
+        split_groups(splits, parallelism)
+    };
+    let initial_slots = if ordered {
+        parallelism.min(groups[0].len())
+    } else {
+        groups.len()
+    };
+    let mut groups: Vec<_> = groups.into_iter().map(Vec::into_iter).collect();
+    let mut next_split_index = 0;
+    // Ordered reads prepare a window of splits from one input queue.
+    // Unordered reads prepare the next split in each group.
     let mut advance = move |index: usize,
                             waiting: &mut VecDeque<BudgetedItem<DataSplit>>,
                             preparing: &BudgetPreparations<DataSplit>| {
-        let Some(split) = groups[index].next() else {
+        let group = if ordered { 0 } else { index };
+        let Some(split) = groups[group].next() else {
             return false;
+        };
+        let index = if ordered {
+            let index = next_split_index;
+            next_split_index += 1;
+            index
+        } else {
+            index
         };
         let ids = budget.unresolved_file_schemas(std::slice::from_ref(&split));
         if ids.is_empty() {
@@ -400,7 +398,7 @@ fn execute_unordered_with_historical_schemas(
         );
         true
     };
-    for index in 0..group_count {
+    for index in 0..initial_slots {
         advance(index, &mut waiting, &preparing);
     }
 
@@ -408,7 +406,7 @@ fn execute_unordered_with_historical_schemas(
         waiting,
         preparing,
         permits,
-        false,
+        ordered,
         parallelism,
         move |split| read_group(vec![split], Arc::clone(&read), None),
         advance,
@@ -591,7 +589,7 @@ fn schedule_budgeted<T, F>(
     permits: &Arc<Semaphore>,
     handle: &tokio::runtime::Handle,
     max_pending: usize,
-    ordered: bool,
+    next_admission: &mut Option<usize>,
     make_stream: &F,
 ) where
     T: Send + 'static,
@@ -599,13 +597,20 @@ fn schedule_budgeted<T, F>(
 {
     while pending.len() < max_pending {
         let available = permits.available_permits();
-        // A later ordered batch could hold the permits needed by the next
-        // split. Unordered reads can select the first group that fits instead.
-        let candidates = if ordered { 1 } else { waiting.len() };
+        // Even if schema lookups finish out of order, never let a later
+        // ordered split take a permit ahead of a split still preparing.
+        let candidates = if next_admission.is_some() {
+            1
+        } else {
+            waiting.len()
+        };
         let Some(position) = waiting
             .iter()
             .take(candidates)
-            .position(|(_, _, cost)| cost.is_none_or(|cost| cost as usize <= available))
+            .position(|(index, _, cost)| {
+                next_admission.is_none_or(|next| *index == next)
+                    && cost.is_none_or(|cost| cost as usize <= available)
+            })
         else {
             break;
         };
@@ -620,6 +625,9 @@ fn schedule_budgeted<T, F>(
         };
         let (index, item, _) = waiting.remove(position).unwrap();
         poll_budgeted(index, make_stream(item), permit, pending, handle);
+        if let Some(next) = next_admission {
+            *next += 1;
+        }
     }
 }
 
@@ -673,7 +681,6 @@ where
     T: Send + 'static,
     F: Fn(T) -> ArrowRecordBatchStream + Send + 'static,
 {
-    debug_assert!(!ordered || preparing.is_empty());
     Box::pin(async_stream::try_stream! {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(handle) => handle,
@@ -688,24 +695,21 @@ where
                 return;
             }
         };
-        let count = waiting.len() + preparing.len();
+        let mut count = waiting.len() + preparing.len();
         let permits = Arc::new(Semaphore::new(permits));
         let mut pending = JoinSet::new();
         let mut ready = BTreeMap::new();
         let mut completed = BTreeSet::new();
         let mut current = 0;
-        schedule_budgeted(&mut waiting, &mut pending, &permits, &handle, parallelism, ordered, &make_stream);
+        let mut next_admission = ordered.then_some(0);
+        schedule_budgeted(&mut waiting, &mut pending, &permits, &handle, parallelism, &mut next_admission, &make_stream);
         while current < count {
             if ordered && completed.remove(&current) {
                 current += 1;
                 continue;
             }
-            let next = if ordered {
-                if let Some(next) = ready.remove(&current) {
-                    Ok(Some(next))
-                } else {
-                    pending.join_next().await.transpose().map_err(worker_error)
-                }
+            let next = if let Some(next) = ready.remove(&current) {
+                Ok(Some(next))
             } else if preparing.is_empty() {
                 pending.join_next().await.transpose().map_err(worker_error)
             } else {
@@ -717,8 +721,8 @@ where
                             &mut pending,
                             &permits,
                             &handle,
-                            parallelism,
-                            false,
+                            parallelism.saturating_sub(ready.len()),
+                            &mut next_admission,
                             &make_stream,
                         );
                         continue;
@@ -744,9 +748,13 @@ where
             let index = next.index;
             if next.batch.is_none() {
                 drop(next);
+                let advanced = advance(index, &mut waiting, &preparing);
                 if ordered {
                     completed.insert(index);
-                } else if !advance(index, &mut waiting, &preparing) {
+                    // Unlike a continuation of an unordered group, this
+                    // split adds a new position to the ordered output.
+                    count += usize::from(advanced);
+                } else if !advanced {
                     current += 1;
                 }
                 schedule_budgeted(
@@ -755,7 +763,7 @@ where
                     &permits,
                     &handle,
                     parallelism.saturating_sub(ready.len()),
-                    ordered,
+                    &mut next_admission,
                     &make_stream,
                 );
                 continue;

@@ -1438,15 +1438,20 @@ async fn check_de_blob_projection_budget(historical_name: bool) {
 
 #[tokio::test]
 async fn unordered_blob_read_starts_while_another_split_loads_its_schema() {
-    check_unordered_blob_read_with_delayed_schema(1).await;
+    check_blob_read_with_delayed_schema(1, false).await;
 }
 
 #[tokio::test]
 async fn unordered_blob_read_starts_before_later_split_in_its_group_loads_schema() {
-    check_unordered_blob_read_with_delayed_schema(2).await;
+    check_blob_read_with_delayed_schema(2, false).await;
 }
 
-async fn check_unordered_blob_read_with_delayed_schema(old_partitions: i32) {
+#[tokio::test]
+async fn ordered_blob_read_starts_before_later_split_loads_its_schema() {
+    check_blob_read_with_delayed_schema(1, true).await;
+}
+
+async fn check_blob_read_with_delayed_schema(old_partitions: i32, ordered: bool) {
     use futures::StreamExt;
     use std::time::Duration;
 
@@ -1465,17 +1470,29 @@ async fn check_unordered_blob_read_with_delayed_schema(old_partitions: i32) {
     let table = table.copy_with_resolved_schema(schema, "main").unwrap();
     let builder = table.new_write_builder();
     let mut writer = builder.new_write().unwrap();
+    let new_partitions = if ordered { 3 } else { 1 };
     let batch = RecordBatch::try_from_iter([
         (
             "p",
-            Arc::new(Int32Array::from(vec![old_partitions])) as ArrayRef,
+            Arc::new(Int32Array::from_iter_values(
+                old_partitions..old_partitions + new_partitions,
+            )) as ArrayRef,
         ),
-        ("id", Arc::new(Int32Array::from(vec![0])) as ArrayRef),
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![0; new_partitions as usize])) as ArrayRef,
+        ),
         (
             "payload",
-            Arc::new(LargeBinaryArray::from(vec![new_blob.as_slice()])) as ArrayRef,
+            Arc::new(LargeBinaryArray::from(vec![
+                new_blob.as_slice();
+                new_partitions as usize
+            ])) as ArrayRef,
         ),
-        ("extra", Arc::new(Int32Array::from(vec![0])) as ArrayRef),
+        (
+            "extra",
+            Arc::new(Int32Array::from(vec![0; new_partitions as usize])) as ArrayRef,
+        ),
     ])
     .unwrap();
     writer.write_arrow_batch(&batch).await.unwrap();
@@ -1486,14 +1503,18 @@ async fn check_unordered_blob_read_with_delayed_schema(old_partitions: i32) {
         .unwrap();
     let plan = table.new_read_builder().new_scan().plan().await.unwrap();
     let mut splits = plan.splits().to_vec();
-    assert_eq!(splits.len(), old_partitions as usize + 1);
-    splits.sort_by_key(|split| split.data_files()[0].schema_id);
+    assert_eq!(splits.len(), (old_partitions + new_partitions) as usize);
+    splits.sort_by_key(|split| split.partition().get_int(0).unwrap());
     assert_eq!(splits[0].data_files()[0].schema_id, 0);
     assert_eq!(
         splits.last().unwrap().data_files()[0].schema_id,
         table.schema().id()
     );
-    if old_partitions == 2 {
+    if ordered {
+        // Current, historical, current, current. The second split needs the
+        // full budget; neither later split can reserve bytes ahead of it.
+        splits.swap(0, 1);
+    } else if old_partitions == 2 {
         // The small current split and the first big historical split form
         // one group; the second big historical split is in the other group.
         splits.rotate_right(1);
@@ -1512,9 +1533,9 @@ async fn check_unordered_blob_read_with_delayed_schema(old_partitions: i32) {
         .new_read_builder()
         .new_read()
         .unwrap()
-        .with_parallelism(2)
+        .with_parallelism(if ordered { 3 } else { 2 })
         .unwrap()
-        .with_ordered(false)
+        .with_ordered(ordered)
         .to_arrow(&splits)
         .unwrap();
     let first = tokio::time::timeout(Duration::from_secs(5), output.next())
@@ -1537,12 +1558,23 @@ async fn check_unordered_blob_read_with_delayed_schema(old_partitions: i32) {
             .unwrap()
             .unwrap(),
     );
-    assert_eq!(batches.len(), old_partitions as usize + 1);
-    for (batch, expected) in batches
-        .iter()
-        .zip(std::iter::once(new_blob.as_slice()).chain(std::iter::repeat(old_blob.as_slice())))
-    {
+    assert_eq!(batches.len(), splits.len());
+    let mut partitions = Vec::new();
+    for batch in &batches {
         assert_eq!(batch.num_rows(), 1);
+        let partition = batch
+            .column_by_name("p")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0);
+        partitions.push(partition);
+        let expected = if partition < old_partitions {
+            old_blob.as_slice()
+        } else {
+            new_blob.as_slice()
+        };
         let payload = batch
             .column_by_name("payload")
             .unwrap()
@@ -1550,6 +1582,15 @@ async fn check_unordered_blob_read_with_delayed_schema(old_partitions: i32) {
             .downcast_ref::<LargeBinaryArray>()
             .unwrap();
         assert!(payload.value(0) == expected);
+    }
+    assert_eq!(partitions[0], old_partitions);
+    if ordered {
+        assert_eq!(partitions, [1, 0, 2, 3]);
+    } else {
+        partitions.sort_unstable();
+        assert!(partitions
+            .into_iter()
+            .eq(0..old_partitions + new_partitions));
     }
 }
 
