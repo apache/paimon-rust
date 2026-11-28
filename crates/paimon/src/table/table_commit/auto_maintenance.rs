@@ -20,38 +20,95 @@ use crate::table::compact::{CompactBuckets, CompactPlan};
 use sha2::{Digest, Sha256};
 
 impl TableCommit {
+    pub(super) async fn prepare_lookup_overwrite(
+        &self,
+        resolved: &mut ResolvedCommit,
+        latest: &Option<Snapshot>,
+        snapshot_id: i64,
+        created: &mut Vec<String>,
+    ) -> Result<Option<i64>> {
+        use crate::spec::ChangelogProducer;
+
+        if self.table.schema().primary_keys().is_empty()
+            || !resolved
+                .entries
+                .iter()
+                .any(|entry| *entry.kind() == FileKind::Add && entry.file().level == 0)
+        {
+            return Ok(None);
+        }
+        let table = self.post_commit_table(latest.as_ref()).await?;
+        let options = table.schema().core_options();
+        if !options.deletion_vectors_enabled() {
+            return Ok(None);
+        }
+        // A stale writer inherits current options unless it explicitly overrode them.
+        // Check this schema ID at publication even when it skips materialization.
+        if options.write_only()? || options.try_changelog_producer()? != ChangelogProducer::Lookup {
+            return Ok(Some(table.schema().id()));
+        }
+        if !Self::supports_auto_compaction(&table)? {
+            return Ok(None);
+        }
+        let mut indexes = match &resolved.new_index_manifest_entries {
+            Some(entries) => entries.clone(),
+            None => {
+                Self::read_prev_index_entries(
+                    table.file_io(),
+                    &self.snapshot_manager.manifest_dir(),
+                    latest,
+                )
+                .await?
+            }
+        };
+        if crate::table::compact::primary_key::overwrite::materialize(
+            &table,
+            snapshot_id,
+            &mut resolved.entries,
+            &mut indexes,
+            created,
+        )
+        .await?
+        {
+            resolved.new_index_manifest_entries = Some(indexes);
+            resolved.index_manifest_changed = true;
+        }
+        Ok(Some(table.schema().id()))
+    }
+
     pub(super) fn auto_compaction_enabled(&self, has_new_files: bool) -> Result<bool> {
         if self.table.schema().core_options().write_only()? || !has_new_files {
             return Ok(false);
         }
+        Self::supports_auto_compaction(&self.table)
+    }
+
+    fn supports_auto_compaction(table: &Table) -> Result<bool> {
         // Modes outside the compact API retain their existing write support.
-        match crate::table::compact::ensure_supported(&self.table) {
+        match crate::table::compact::ensure_supported(table) {
             Ok(()) => {}
             Err(crate::Error::Unsupported { .. }) => return Ok(false),
             Err(error) => return Err(error),
         }
         // Validate planner configuration before publishing data. Executor
         // resources are created only when this write has eligible work.
-        let builder = self.table.new_compact_builder();
+        let builder = table.new_compact_builder();
         builder.new_planner()?;
-        self.validate_auto_compaction_policy()?;
+        Self::validate_auto_compaction_policy(table)?;
         Ok(true)
     }
 
-    fn validate_auto_compaction_policy(&self) -> Result<()> {
-        self.table
-            .schema()
-            .core_options()
-            .write_compaction_parallelism()?;
-        if !self.table.schema().primary_keys().is_empty() {
-            let options = self.table.schema().core_options();
+    fn validate_auto_compaction_policy(table: &Table) -> Result<()> {
+        let options = table.schema().core_options();
+        options.write_compaction_parallelism()?;
+        if !table.schema().primary_keys().is_empty() {
             options.compaction_force_up_level0()?;
             let lookup = options.try_changelog_producer()?
                 == crate::spec::ChangelogProducer::Lookup
                 || options.merge_engine()? == crate::spec::MergeEngine::FirstRow
                 || options.deletion_vectors_enabled();
             if lookup {
-                match self.table.schema().options().get("lookup-compact").map(|value| value.to_ascii_lowercase()).as_deref() {
+                match table.schema().options().get("lookup-compact").map(|value| value.to_ascii_lowercase()).as_deref() {
                     None | Some("radical") => {}
                     Some("gentle") => return Err(crate::Error::Unsupported {
                         message: "Automatic compaction does not support lookup-compact=gentle trigger intervals; use write-only=true with dedicated compaction".into(),
@@ -289,7 +346,7 @@ impl TableCommit {
                 Err(crate::Error::Unsupported { .. }) => return Ok(()),
                 Err(error) => return Err(error),
             }
-            compact.validate_auto_compaction_policy()?;
+            Self::validate_auto_compaction_policy(&compact.table)?;
             let builder = compact.table.new_compact_builder();
             let plan = match builder.new_planner()?.for_write(buckets).plan().await {
                 Ok(plan) => plan,

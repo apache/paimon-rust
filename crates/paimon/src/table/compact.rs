@@ -676,7 +676,7 @@ impl CompactExecutor {
             };
             let (files, changelog_files) = primary_key::execute(
                 &table,
-                task,
+                task.output_level(),
                 &split,
                 self.resources.clone(),
                 lookup,
@@ -700,7 +700,6 @@ impl CompactExecutor {
             }
             let index_entries = match primary_key::indexes::prepare(
                 &table,
-                task,
                 &split,
                 indexes,
                 active,

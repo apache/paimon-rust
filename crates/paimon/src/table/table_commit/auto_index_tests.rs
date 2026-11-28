@@ -23,6 +23,7 @@ use crate::table::global_index_build_common::GlobalIndexBuildView;
 use arrow_array::{Int32Array, RecordBatch};
 use futures::TryStreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 mod lsm;
 mod schema;
@@ -157,7 +158,10 @@ pub(super) async fn latest(table: &Table) -> Snapshot {
 }
 
 async fn indexes(table: &Table) -> Vec<IndexManifestEntry> {
-    let snapshot = latest(table).await;
+    indexes_at(table, &latest(table).await).await
+}
+
+async fn indexes_at(table: &Table, snapshot: &Snapshot) -> Vec<IndexManifestEntry> {
     match snapshot.index_manifest() {
         None => vec![],
         Some(name) => IndexManifest::read(
@@ -180,7 +184,10 @@ pub(super) async fn assert_complete(table: &Table) {
             .unwrap()
             .is_empty());
     }
-    let entries = indexes(table).await;
+    assert_index_files_exist(table, indexes(table).await).await;
+}
+
+async fn assert_index_files_exist(table: &Table, entries: Vec<IndexManifestEntry>) {
     assert!(!entries.is_empty());
     for entry in entries {
         let file = entry.index_file;
@@ -189,7 +196,7 @@ pub(super) async fn assert_complete(table: &Table) {
             .unwrap_or_else(|| format!("{}/index/{}", table.location(), file.file_name));
         assert!(
             table.file_io().exists(&path).await.unwrap(),
-            "published index file must survive recovery"
+            "missing index file: {path}"
         );
     }
 }
@@ -724,8 +731,9 @@ async fn recovery_finishes_indexing_after_data_publication_for_append_and_overwr
 }
 
 enum Publication {
-    Conflict,
+    Conflict(Arc<OnceLock<Snapshot>>),
     LoseResponse,
+    Replay,
     FailBeforePublish,
 }
 
@@ -747,20 +755,28 @@ impl SnapshotCommit for InjectIndexPublication {
         if snapshot.commit_user().contains("-auto-index-build-")
             && !self.fired.swap(true, Ordering::SeqCst)
         {
-            match self.mode {
-                Publication::Conflict => {
+            match &self.mode {
+                Publication::Conflict(submitted) => {
+                    submitted.set(snapshot.clone()).unwrap();
                     // A concurrent writer finishes the exact same coverage first.
                     let other = TableCommit::new(self.table.clone(), "competing-writer".into());
                     other.commit(messages(&self.table, vec![99]).await).await?;
                     return Ok(false);
                 }
-                Publication::LoseResponse => {
+                Publication::LoseResponse | Publication::Replay => {
                     assert!(
                         self.table
                             .snapshot_manager()
                             .commit_snapshot(snapshot)
                             .await?
                     );
+                    if matches!(self.mode, Publication::Replay) {
+                        return self
+                            .table
+                            .snapshot_manager()
+                            .commit_snapshot(snapshot)
+                            .await;
+                    }
                     return Err(crate::Error::UnexpectedError {
                         message: "lost index response".into(),
                         source: None,
@@ -782,12 +798,13 @@ impl SnapshotCommit for InjectIndexPublication {
 }
 
 #[tokio::test]
-async fn definite_conflict_replans_coverage_and_preserves_competing_indexes() {
+async fn publication_conflict_replans_coverage_and_preserves_competing_indexes() {
     let table = table(Some(true), false).await;
     let mut commit = TableCommit::new(table.clone(), "writer".into());
+    let submitted = Arc::new(OnceLock::new());
     commit.snapshot_commit = Arc::new(InjectIndexPublication {
         table: table.clone(),
-        mode: Publication::Conflict,
+        mode: Publication::Conflict(submitted.clone()),
         fired: AtomicBool::new(false),
     });
     commit
@@ -796,18 +813,7 @@ async fn definite_conflict_replans_coverage_and_preserves_competing_indexes() {
         .unwrap();
     assert_eq!(latest(&table).await.id(), 3);
     assert_complete(&table).await;
-    assert_eq!(
-        table
-            .file_io()
-            .list_status(&format!("{}/index", table.location()))
-            .await
-            .unwrap()
-            .iter()
-            .filter(|file| !file.is_dir)
-            .count(),
-        indexes(&table).await.len(),
-        "a definite conflict must clean up only its unpublished index files",
-    );
+    assert_index_files_exist(&table, indexes_at(&table, submitted.get().unwrap()).await).await;
 }
 
 #[tokio::test]
@@ -824,9 +830,10 @@ async fn conflicting_replacement_replans_instead_of_deleting_a_competitors_paylo
         .unwrap();
     let historical = indexes(&table).await;
     let mut commit = TableCommit::new(table.clone(), "writer".into());
+    let submitted = Arc::new(OnceLock::new());
     commit.snapshot_commit = Arc::new(InjectIndexPublication {
         table: table.clone(),
-        mode: Publication::Conflict,
+        mode: Publication::Conflict(submitted.clone()),
         fired: AtomicBool::new(false),
     });
     commit
@@ -838,38 +845,32 @@ async fn conflicting_replacement_replans_instead_of_deleting_a_competitors_paylo
     let current = indexes(&table).await;
     assert_eq!(current.len(), 4);
     assert!(historical.iter().all(|entry| !current.contains(entry)));
-    let physical = table
-        .file_io()
-        .list_status(&format!("{}/index", table.location()))
-        .await
-        .unwrap();
-    assert_eq!(
-        physical.iter().filter(|file| !file.is_dir).count(),
-        current.len() + historical.len(),
-        "discard only this round's private files and retain historical payloads"
-    );
+    assert_index_files_exist(&table, historical).await;
+    assert_index_files_exist(&table, indexes_at(&table, submitted.get().unwrap()).await).await;
 }
 
 #[tokio::test]
 async fn lost_index_response_is_recovered_without_deleting_published_files() {
-    let table = table(Some(true), false).await;
-    let mut commit = TableCommit::new(table.clone(), "writer".into());
-    commit.snapshot_commit = Arc::new(InjectIndexPublication {
-        table: table.clone(),
-        mode: Publication::LoseResponse,
-        fired: AtomicBool::new(false),
-    });
-    let input = messages(&table, vec![1, 2]).await;
-    commit
-        .commit_with_identifier(input.clone(), 7)
-        .await
-        .unwrap();
-    commit
-        .filter_and_commit_with_identifier(input, 7)
-        .await
-        .unwrap();
-    assert_eq!(latest(&table).await.id(), 2);
-    assert_complete(&table).await;
+    for mode in [Publication::LoseResponse, Publication::Replay] {
+        let table = table(Some(true), false).await;
+        let mut commit = TableCommit::new(table.clone(), "writer".into());
+        commit.snapshot_commit = Arc::new(InjectIndexPublication {
+            table: table.clone(),
+            mode,
+            fired: AtomicBool::new(false),
+        });
+        let input = messages(&table, vec![1, 2]).await;
+        commit
+            .commit_with_identifier(input.clone(), 7)
+            .await
+            .unwrap();
+        commit
+            .filter_and_commit_with_identifier(input, 7)
+            .await
+            .unwrap();
+        assert_eq!(latest(&table).await.id(), 2);
+        assert_complete(&table).await;
+    }
 }
 
 #[tokio::test]
@@ -999,8 +1000,8 @@ async fn simultaneous_recoveries_publish_one_index_snapshot() {
             .iter()
             .filter(|file| !file.is_dir)
             .count(),
-        indexes(&table).await.len(),
-        "the losing recovery must leave no private output behind",
+        2 * indexes(&table).await.len(),
+        "both submitted sets must survive an ambiguous conflict",
     );
 }
 

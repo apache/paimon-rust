@@ -89,7 +89,8 @@ pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
 
     /// Optionally publish a complete immutable file without replacing an existing file.
     ///
-    /// Return `Some(true)` on success or `Some(false)` for a definite conflict.
+    /// Return `Some(true)` on success or `Some(false)` if the target already exists.
+    /// An internally retried write can conflict with its own publication.
     /// Return `None` only if no publication was attempted; FileIO then uses the
     /// resolved operator's safe publication primitives. An error may have an
     /// unknown outcome and is propagated without falling back to another write.
@@ -942,8 +943,8 @@ impl FileIO {
     }
 
     /// Publish a complete immutable file only if the target does not exist.
-    /// Returns `false` only for a definite publication conflict. Other failures
-    /// may have an unknown outcome and must never trigger an unconditional write.
+    /// Returns `false` if the target already exists, including after a replay
+    /// of this write. Errors must never trigger an unconditional write.
     pub(crate) async fn write_atomic_if_not_exists(
         &self,
         path: &str,

@@ -26,11 +26,17 @@ use common::incremental_helpers::{
     make_batch, persist_table_schema, pk_schema, setup_dirs, write_batch,
 };
 use futures::TryStreamExt;
-use paimon::catalog::{FileSystemCatalog, Identifier};
-use paimon::spec::CommitKind;
-use paimon::table::{CommitCallback, CommitCallbackContext, IncrementalScanMode, Table};
+use paimon::catalog::{Catalog, FileSystemCatalog, Identifier};
+use paimon::spec::{
+    CommitKind, DataType, IndexManifest, IntType, PrimaryKeyIndexSourceMeta, Schema, SchemaChange,
+};
+use paimon::table::{CommitCallback, CommitCallbackContext, IncrementalScanMode, Plan, Table};
 
 async fn table() -> Table {
+    lookup_table(&[("write-only", "false"), ("changelog-producer", "lookup")]).await
+}
+
+async fn lookup_table(settings: &[(&str, &str)]) -> Table {
     let path = format!(
         "memory:/write_compact_overwrite_recovery/{}",
         uuid::Uuid::new_v4()
@@ -43,7 +49,7 @@ async fn table() -> Table {
         io.clone(),
         Identifier::new("default", "write_compact_overwrite_recovery"),
         path.clone(),
-        pk_schema(&[("write-only", "false"), ("changelog-producer", "lookup")]),
+        pk_schema(settings),
         None,
     );
     setup_dirs(&io, &path).await;
@@ -87,6 +93,10 @@ async fn events(table: &Table, start: i64, end: i64) -> Vec<(String, i32, i32)> 
         .plan_combined()
         .await
         .unwrap();
+    plan_events(table, &plan).await
+}
+
+async fn plan_events(table: &Table, plan: &Plan) -> Vec<(String, i32, i32)> {
     let batches: Vec<RecordBatch> = table
         .new_read_builder()
         .new_read()
@@ -123,7 +133,7 @@ async fn events(table: &Table, start: i64, end: i64) -> Vec<(String, i32, i32)> 
             )
         }));
     }
-    events.sort_unstable();
+    events.sort_by_key(|(_, id, _)| *id);
     events
 }
 
@@ -156,6 +166,278 @@ async fn rows(table: &Table) -> Vec<(i32, i32)> {
     }
     rows.sort_unstable();
     rows
+}
+
+#[tokio::test]
+async fn stale_overwrite_after_enabling_lookup_bootstraps_from_the_overwrite_snapshot() {
+    assert_eq!(
+        stale_overwrite_bootstrap("changelog-producer", "none", "lookup", None).await,
+        [("+I".into(), 7, 70)]
+    );
+}
+
+#[tokio::test]
+async fn stale_lookup_overwrite_picks_up_write_only_being_disabled() {
+    assert_eq!(
+        stale_overwrite_bootstrap("write-only", "true", "false", None).await,
+        [("+I".into(), 7, 70)]
+    );
+}
+
+#[tokio::test]
+async fn stale_lookup_overwrite_honors_explicit_write_only() {
+    assert!(
+        stale_overwrite_bootstrap("write-only", "true", "false", Some(true))
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        stale_overwrite_bootstrap("write-only", "false", "true", Some(false)).await,
+        [("+I".into(), 7, 70)]
+    );
+}
+
+async fn stale_overwrite_bootstrap(
+    option: &str,
+    before: &str,
+    after: &str,
+    write_only_override: Option<bool>,
+) -> Vec<(String, i32, i32)> {
+    let warehouse = tempfile::tempdir().unwrap();
+    let mut options = paimon::Options::new();
+    options.set("warehouse", warehouse.path().to_str().unwrap());
+    options.set("local-cache.enabled", "true");
+    let catalog = FileSystemCatalog::new(options).unwrap();
+    catalog
+        .create_database("default", false, HashMap::new())
+        .await
+        .unwrap();
+    let identifier = Identifier::new("default", "lookup_overwrite");
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("write-only", "false")
+        .option("deletion-vectors.enabled", "true")
+        .option("deletion-vectors.merge-on-read", "true")
+        .option("changelog-producer", "lookup")
+        .option(option, before)
+        .build()
+        .unwrap();
+    catalog
+        .create_table(&identifier, schema, false)
+        .await
+        .unwrap();
+    let stale = catalog.get_table(&identifier).await.unwrap();
+    let stale = match write_only_override {
+        Some(value) => {
+            stale.copy_with_options(HashMap::from([("write-only".into(), value.to_string())]))
+        }
+        None => stale,
+    };
+    let builder = stale.new_write_builder().with_overwrite();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&make_batch(vec![7], vec![70]))
+        .await
+        .unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    let commit = builder.new_commit();
+    catalog
+        .alter_table(
+            &identifier,
+            vec![SchemaChange::set_option(option.into(), after.into())],
+            false,
+        )
+        .await
+        .unwrap();
+    commit.overwrite(messages, None).await.unwrap();
+
+    let current = catalog.get_table(&identifier).await.unwrap();
+    let overwrite = current.snapshot_manager().get_snapshot(1).await.unwrap();
+    assert_eq!(overwrite.commit_kind(), &CommitKind::OVERWRITE);
+    assert_eq!(overwrite.schema_id(), current.schema().id());
+    let pinned = current.copy_with_pinned_snapshot(Some(&overwrite));
+    assert_eq!(rows(&pinned).await, [(7, 70)]);
+    let active = files(&pinned).await;
+    assert_eq!(active.len(), 1);
+
+    let selected = current.copy_with_options(HashMap::from([
+        ("scan.mode".into(), "from-snapshot-full".into()),
+        ("scan.snapshot-id".into(), overwrite.id().to_string()),
+    ]));
+    let initial = selected
+        .new_stream_scan()
+        .unwrap()
+        .plan()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(initial.snapshot_id(), Some(overwrite.id()));
+    let events = plan_events(&selected, &initial).await;
+    assert_eq!(
+        active[0].1 == 0,
+        events.is_empty(),
+        "overwrite files: {active:?}"
+    );
+    events
+}
+
+#[tokio::test]
+async fn dv_lookup_overwrite_publishes_the_before_state_for_competing_compaction() {
+    for (overlap, manual) in [(false, false), (true, false), (true, true)] {
+        let table = lookup_table(&[
+            ("write-only", "false"),
+            ("deletion-vectors.enabled", "true"),
+            ("deletion-vectors.merge-on-read", "true"),
+            ("changelog-producer", "lookup"),
+            ("scan.mode", "latest-full"),
+            ("write.parquet-buffer-size", "1 B"),
+        ])
+        .await;
+        let builder = table.new_write_builder().with_overwrite();
+        let mut writer = builder.new_write().unwrap();
+        if overlap {
+            writer
+                .write_arrow_batch(&make_batch(vec![3], vec![29]))
+                .await
+                .unwrap();
+        }
+        writer
+            .write_arrow_batch(&make_batch(vec![1, 3], vec![10, 30]))
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert_eq!(messages[0].new_files.len(), if overlap { 2 } else { 1 });
+        let mut commit = builder.new_commit();
+        commit
+            .add_commit_callback(Arc::new(FailOverwriteOnce(false.into())))
+            .unwrap();
+        let error = commit
+            .overwrite_with_identifier(messages.clone(), None, 7)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected overwrite callback failure"),
+            "{error}"
+        );
+
+        let manager = table.snapshot_manager();
+        let overwrite = manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(overwrite.commit_kind(), &CommitKind::OVERWRITE);
+        assert_eq!(rows(&table).await, vec![(1, 10), (3, 30)]);
+        let mut stream = table.new_stream_scan().unwrap();
+        let initial = stream.plan().await.unwrap().unwrap();
+        let initial_events = plan_events(&table, &initial).await;
+        let append = make_batch(vec![2, 3], vec![20, 31]);
+        if manual {
+            let write_only =
+                table.copy_with_options(HashMap::from([("write-only".into(), "true".into())]));
+            write_batch(&write_only, &append).await;
+            let compact = table.new_compact_builder();
+            let plan = compact.new_planner().unwrap().plan().await.unwrap();
+            assert_eq!(plan.tasks().len(), 1);
+            let result = compact
+                .new_executor()
+                .unwrap()
+                .execute(&plan.tasks()[0])
+                .await
+                .unwrap();
+            compact
+                .new_commit()
+                .unwrap()
+                .commit_compact(vec![result])
+                .await
+                .unwrap();
+        } else {
+            write_batch(&table, &append).await;
+        }
+        let end = manager.get_latest_snapshot_id().await.unwrap().unwrap();
+        commit
+            .overwrite_with_identifier(messages, None, 7)
+            .await
+            .unwrap();
+        assert_eq!(manager.get_latest_snapshot_id().await.unwrap(), Some(end));
+        assert_eq!(rows(&table).await, vec![(1, 10), (2, 20), (3, 31)]);
+        let changes = stream.plan().await.unwrap().unwrap();
+        let incremental = events(&table, overwrite.id(), end).await;
+        assert_eq!(plan_events(&table, &changes).await, incremental);
+        assert_eq!(
+            (initial_events, incremental),
+            (
+                vec![("+I".into(), 1, 10), ("+I".into(), 3, 30)],
+                vec![
+                    ("+I".into(), 2, 20),
+                    ("-U".into(), 3, 30),
+                    ("+U".into(), 3, 31)
+                ],
+            )
+        );
+        assert!(stream.plan().await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn indexed_dv_lookup_overwrite_publishes_its_index_with_the_data() {
+    let table = lookup_table(&[
+        ("write-only", "false"),
+        ("changelog-producer", "lookup"),
+        ("deletion-vectors.enabled", "true"),
+        ("pk-bitmap.index.columns", "value"),
+    ])
+    .await;
+    let write = table.new_write_builder().with_overwrite();
+    let mut writer = write.new_write().unwrap();
+    writer
+        .write_arrow_batch(&make_batch(vec![1], vec![10]))
+        .await
+        .unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    let commit = write.new_commit();
+    commit
+        .overwrite_with_identifier(messages, None, 7)
+        .await
+        .unwrap();
+    let manager = table.snapshot_manager();
+    let snapshot = manager.get_latest_snapshot().await.unwrap().unwrap();
+    assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
+    let index = IndexManifest::read(
+        table.file_io(),
+        &manager.manifest_path(snapshot.index_manifest().unwrap()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(index.len(), 1);
+    let source = PrimaryKeyIndexSourceMeta::from_global_index_meta(
+        index[0].index_file.global_index_meta.as_ref().unwrap(),
+    )
+    .unwrap();
+    let active = files(&table).await;
+    assert_eq!(
+        active,
+        vec![(
+            source.source_files()[0].file_name().to_string(),
+            source.data_level()
+        )]
+    );
+    assert_eq!(rows(&table).await, vec![(1, 10)]);
+
+    writer
+        .write_arrow_batch(&make_batch(vec![2], vec![20]))
+        .await
+        .unwrap();
+    let mut missing = writer.prepare_commit().await.unwrap();
+    missing[0].new_files[0].file_name = "missing.parquet".into();
+    assert!(commit.overwrite(missing, None).await.is_err());
+    assert_eq!(
+        manager.get_latest_snapshot_id().await.unwrap(),
+        Some(snapshot.id())
+    );
+    assert_eq!(files(&table).await, active);
+    assert_eq!(rows(&table).await, vec![(1, 10)]);
 }
 
 #[tokio::test]

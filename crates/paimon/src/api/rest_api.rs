@@ -1282,10 +1282,12 @@ impl RESTApi {
             "statistics": statistics,
         });
         let resp: serde_json::Value = self.client.post(&path, &request).await?;
-        Ok(resp
-            .get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false))
+        resp.get("success")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| crate::Error::UnexpectedError {
+                message: "REST commit response must contain a boolean `success` field".into(),
+                source: None,
+            })
     }
 
     /// Roll back a table through the server, optionally comparing its identity

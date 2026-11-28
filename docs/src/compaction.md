@@ -59,6 +59,19 @@ triggers. Lookup, first-row and deletion-vector compaction, or an explicit
 `compaction.force-up-level-0=true`, can advance L0 files below those triggers.
 Overwrite compaction is pinned to its own committed data snapshot, so suppressing
 overwrite changelogs cannot consume a later append's pending lookup events.
+For primary-key deletion-vector tables with lookup changelogs and automatic
+compaction, the overwrite snapshot itself publishes a positive-level sorted run
+per replacement bucket. This decision uses the current table's `write-only`
+setting unless the writer explicitly overrides it. Disjoint live files can be
+promoted in place. Overlapping runs, retracts and files requiring index
+maintenance are merged before publication.
+A lookup stream starting from that snapshot sees the replacement rows in its
+initial state. Later compaction uses those rows as the before state for updates.
+If the committer finds the snapshot ID already taken before submission, it
+discards its newly generated files and retries with the staged inputs. A conflict
+reported after submission can be a replay of a successful write. Those outputs
+and any consumed staging files are eligible for orphan-file cleanup after the
+retention window, once no branch or tag references them.
 As in Java, overwriting partitions being consumed by streaming readers is unsupported;
 lookup changelogs do not describe the overwrite operation itself.
 Automatic tasks share one captured snapshot and bucket-grouped source/index
@@ -91,7 +104,7 @@ For plain partial-update and aggregation tables, an unsupported lossless retract
 rewrite also leaves the raw source files in place. I/O, resource and data errors,
 and lookup changelog failures, are still returned to the caller.
 
-Data publication and compaction are separate transactions. A compaction failure
+Post-commit compaction runs in a separate transaction. A failure in that round
 leaves the data committed and returns an error retaining the underlying cause.
 For recoverable writes, use a stable commit user and caller-provided identifier,
 then retry with `filter_and_commit_with_identifier` (or `filter_and_commit`) for

@@ -31,6 +31,242 @@ fn schema(evolved: bool) -> Schema {
     builder.build().unwrap()
 }
 
+fn lookup_overwrite_schema() -> paimon::spec::SchemaBuilder {
+    Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("write-only", "false")
+        .option("deletion-vectors.enabled", "true")
+        .option("changelog-producer", "lookup")
+        .option("pk-bitmap.index.columns", "name")
+        .option("write.parquet-buffer-size", "1 B")
+}
+
+async fn stage_overlapping_files(builder: &paimon::table::WriteBuilder<'_>) -> Vec<CommitMessage> {
+    let mut writer = builder.new_write().unwrap();
+    writer.write_arrow_batch(&people_rows(1..=2)).await.unwrap();
+    writer.write_arrow_batch(&people_rows(2..=3)).await.unwrap();
+    let inputs = writer.prepare_commit().await.unwrap();
+    assert_eq!(inputs[0].new_files.len(), 2);
+    inputs
+}
+
+#[tokio::test]
+async fn lookup_overwrite_recovers_when_published_response_omits_success() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let name = "lookup_overwrite";
+    let schema = lookup_overwrite_schema()
+        .option("commit.max-retries", "0")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", name, schema, temp.path().to_str().unwrap());
+    let identifier = Identifier::new("default", name);
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+    let builder = table.new_write_builder().with_overwrite();
+    let messages = stage_overlapping_files(&builder).await;
+    let commit = builder.new_commit();
+    ctx.server.omit_next_commit_success();
+    let error = commit
+        .overwrite_with_identifier(messages.clone(), None, 7)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("outcome may be unknown"),
+        "{error}"
+    );
+    commit
+        .overwrite_with_identifier(messages, None, 7)
+        .await
+        .unwrap();
+
+    let reopened = ctx.catalog.get_table(&identifier).await.unwrap();
+    let snapshot = reopened
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.id(), 1);
+    assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
+    assert_eq!(
+        ids(&read_all(&reopened.new_read_builder()).await.unwrap()),
+        [1, 2, 3]
+    );
+}
+
+#[tokio::test]
+async fn lookup_overwrite_preserves_submitted_files_after_a_catalog_conflict() {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    fn files(dir: &Path) -> BTreeSet<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
+    for snapshot_file_visible in [true, false] {
+        let ctx = setup_catalog(vec!["default"]).await;
+        let temp = tempfile::tempdir().unwrap();
+        let name = "lookup_overwrite";
+        ctx.server.add_table_with_schema(
+            "default",
+            name,
+            lookup_overwrite_schema().build().unwrap(),
+            temp.path().to_str().unwrap(),
+        );
+        let table = ctx
+            .catalog
+            .get_table(&Identifier::new("default", name))
+            .await
+            .unwrap();
+        let competing =
+            table.copy_with_options(HashMap::from([("write-only".into(), "true".into())]));
+        let append = competing.new_write_builder();
+        let mut writer = append.new_write().unwrap();
+        writer.write_arrow_batch(&people_rows(4..=4)).await.unwrap();
+        let append_inputs = writer.prepare_commit().await.unwrap();
+        let builder = table.new_write_builder().with_overwrite();
+        let inputs = stage_overlapping_files(&builder).await;
+        let bucket = temp.path().join("bucket-0");
+        let staged = files(&bucket);
+
+        let (ready, resume) = ctx.server.pause_next_commit();
+        let commit = builder.new_commit();
+        let overwrite = commit.overwrite_with_identifier(inputs, None, 7);
+        tokio::pin!(overwrite);
+        tokio::select! {
+            submitted = ready => assert_eq!(submitted.unwrap().id(), 1),
+            result = &mut overwrite => panic!("overwrite finished before publication: {result:?}"),
+        }
+        let data: Vec<_> = files(&bucket).difference(&staged).cloned().collect();
+        let indexes = files(&temp.path().join("index"));
+        assert_eq!(data.len(), 1);
+        assert_eq!(indexes.len(), 1);
+
+        append.new_commit().commit(append_inputs).await.unwrap();
+        let manager = table.snapshot_manager();
+        let winner = manager.get_snapshot(1).await.unwrap();
+        assert_eq!(winner.commit_kind(), &CommitKind::APPEND);
+        ctx.server.set_catalog_snapshot("default", name, winner);
+        if !snapshot_file_visible {
+            manager.delete_snapshot(1).await.unwrap();
+        }
+        resume.send(()).unwrap();
+        overwrite.await.unwrap();
+
+        // The catalog's boolean response does not identify a previous publication.
+        assert!(data.iter().chain(&indexes).all(|path| path.is_file()));
+        assert!(staged.iter().all(|path| path.exists()));
+        let head = manager.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!((head.id(), head.commit_kind()), (2, &CommitKind::OVERWRITE));
+        assert_eq!(
+            ids(&read_all(&table.new_read_builder()).await.unwrap()),
+            [1, 2, 3]
+        );
+    }
+}
+
+#[tokio::test]
+async fn lookup_overwrite_preserves_catalog_snapshot_when_rollback_reuses_its_id() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let temp = tempfile::tempdir().unwrap();
+    let name = "lookup_overwrite";
+    ctx.server.add_table_with_schema(
+        "default",
+        name,
+        lookup_overwrite_schema()
+            .option("commit.max-retries", "0")
+            .build()
+            .unwrap(),
+        temp.path().to_str().unwrap(),
+    );
+    let identifier = Identifier::new("default", name);
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+    let seed = table.copy_with_options(HashMap::from([("write-only".into(), "true".into())]));
+    for id in [4, 5] {
+        write_batch(&seed, people_rows(id..=id), "seed").await;
+    }
+    let manager = table.snapshot_manager();
+    let old = manager.get_snapshot(2).await.unwrap();
+    ctx.server
+        .add_rollback_snapshot("default", name, manager.get_snapshot(1).await.unwrap());
+    ctx.server
+        .set_catalog_snapshot("default", name, old.clone());
+    ctx.catalog
+        .rollback_to(
+            &identifier,
+            &paimon::table::Instant::snapshot(1),
+            Some(2),
+            Some(table.rest_env().unwrap().uuid()),
+        )
+        .await
+        .unwrap();
+
+    let builder = table.new_write_builder().with_overwrite();
+    let inputs = stage_overlapping_files(&builder).await;
+    let commit = builder.new_commit();
+    let (submitted, resume) = ctx.server.pause_next_commit();
+    let overwrite = commit.overwrite_with_identifier(inputs.clone(), None, 7);
+    tokio::pin!(overwrite);
+    let snapshot = tokio::select! {
+        submitted = submitted => submitted.unwrap(),
+        result = &mut overwrite => panic!("overwrite finished before publication: {result:?}"),
+    };
+    assert_eq!(snapshot.id(), old.id());
+    assert_ne!(snapshot.uuid(), old.uuid());
+    // Publish in the catalog only. The replay sees this head and returns false.
+    ctx.server
+        .set_catalog_snapshot("default", name, snapshot.clone());
+    resume.send(()).unwrap();
+    let error = overwrite.await.unwrap_err();
+    assert!(
+        error.to_string().contains("outcome may be unknown"),
+        "{error}"
+    );
+    commit
+        .overwrite_with_identifier(inputs, None, 7)
+        .await
+        .unwrap();
+
+    let reopened = ctx.catalog.get_table(&identifier).await.unwrap();
+    assert_eq!(
+        manager.get_snapshot(snapshot.id()).await.unwrap().uuid(),
+        old.uuid()
+    );
+    assert_eq!(
+        reopened
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap()
+            .uuid(),
+        snapshot.uuid()
+    );
+    assert_eq!(
+        ids(&read_all(&reopened.new_read_builder()).await.unwrap()),
+        [1, 2, 3]
+    );
+    let indexes = paimon::spec::IndexManifest::read(
+        reopened.file_io(),
+        &manager.manifest_path(snapshot.index_manifest().unwrap()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(indexes.len(), 1);
+    assert!(temp
+        .path()
+        .join("index")
+        .join(&indexes[0].index_file.file_name)
+        .is_file());
+}
+
 #[tokio::test]
 async fn stale_rest_committer_auto_indexes_with_catalog_schema_and_recovers() {
     let ctx = setup_catalog(vec!["default"]).await;

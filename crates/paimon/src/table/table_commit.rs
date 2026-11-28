@@ -1249,7 +1249,12 @@ impl TableCommit {
                 }
 
                 let result = self
-                    .try_commit_once(resolved, &latest_snapshot, commit_identifier)
+                    .try_commit_once(
+                        resolved,
+                        &latest_snapshot,
+                        commit_identifier,
+                        matches!(plan, CommitEntriesPlan::Overwrite { .. }),
+                    )
                     .await?;
 
                 match result {
@@ -1379,80 +1384,69 @@ impl TableCommit {
         mut resolved: ResolvedCommit,
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
+        partition_overwrite: bool,
     ) -> Result<CommitAttemptResult> {
-        let mut created_files = Vec::new();
+        let mut created_payloads = Vec::new();
+        let mut created_manifests = Vec::new();
         let prepared = self
             .prepare_snapshot(
                 &mut resolved,
                 latest_snapshot,
                 commit_identifier,
-                &mut created_files,
+                partition_overwrite,
+                &mut created_payloads,
+                &mut created_manifests,
             )
             .await;
         let (snapshot, statistics) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                for path in created_files {
-                    let _ = self.snapshot_manager.file_io().delete_file(&path).await;
-                }
+                self.discard_unpublished_files(created_payloads, created_manifests)
+                    .await;
                 return Err(error);
             }
         };
-        // Once publication starts its outcome may be unknown. These files must
-        // remain available even if the response is lost or a later retry fails.
-        let base_snapshot_uuid = latest_snapshot.as_ref().and_then(Snapshot::uuid);
-        let publication_error = match self
-            .snapshot_commit
-            .commit(
-                base_snapshot_uuid,
-                &snapshot,
-                self.table.branch(),
-                &statistics,
-            )
-            .await
-        {
-            Ok(true) => {
-                if !self.commit_callbacks.is_empty() {
-                    self.notify_commit_callbacks(snapshot.clone(), resolved.entries)
-                        .await?;
-                }
-                return Ok(CommitAttemptResult::Success(Box::new(snapshot)));
-            }
-            Ok(false) => {
-                if self.deletion_vectors_enabled && resolved.kind == CommitKind::COMPACT {
-                    // Only this attempt's generated DV files are definitely
-                    // unpublished. Prepared data/changelogs and old shared
-                    // containers still belong to the caller or prior snapshots.
-                    let created = created_files
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<HashSet<_>>();
-                    for entry in resolved
-                        .new_index_manifest_entries
-                        .iter()
-                        .flatten()
-                        .filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
-                    {
-                        let Ok(bucket) = self.bucket_path(&entry.partition, entry.bucket) else {
-                            continue;
-                        };
-                        let path = committed_index_file_path(
-                            self.table.location(),
-                            &bucket,
-                            self.table
-                                .schema()
-                                .core_options()
-                                .index_file_in_data_file_dir(),
-                            &entry.index_file,
-                        );
-                        if created.contains(path.as_str()) {
-                            let _ = self.table.file_io().delete_file(&path).await;
-                        }
+        // A competing writer can claim this ID while we materialize a run or DV.
+        // If the precheck fails, let the atomic publisher handle the race.
+        let snapshot_id_taken = !created_payloads.is_empty()
+            && self
+                .snapshot_manager
+                .snapshot_id_taken(snapshot.id())
+                .await
+                .unwrap_or(false);
+        let publication_error = if snapshot_id_taken {
+            self.discard_unpublished_files(created_payloads, created_manifests)
+                .await;
+            None
+        } else {
+            match self
+                .snapshot_commit
+                .commit(
+                    latest_snapshot.as_ref().and_then(Snapshot::uuid),
+                    &snapshot,
+                    self.table.branch(),
+                    &statistics,
+                )
+                .await
+            {
+                Ok(true) => {
+                    if !self.commit_callbacks.is_empty() {
+                        self.notify_commit_callbacks(snapshot.clone(), resolved.entries)
+                            .await?;
                     }
+                    return Ok(CommitAttemptResult::Success(Box::new(snapshot)));
                 }
-                None
+                // A replay can collide after a rollback reused this ID. A branch or
+                // tag can still reference the first publication even if main moved.
+                Ok(false) => Some(crate::Error::UnexpectedError {
+                    message: format!(
+                        "Snapshot {} may have been published before the conflict was reported",
+                        snapshot.id()
+                    ),
+                    source: None,
+                }),
+                Err(error) => Some(error),
             }
-            Err(error) => Some(error),
         };
         Ok(CommitAttemptResult::Retry(Box::new(RetryState {
             latest_snapshot: latest_snapshot.clone(),
@@ -1461,14 +1455,34 @@ impl TableCommit {
         })))
     }
 
+    async fn discard_unpublished_files(&self, payloads: Vec<String>, manifests: Vec<String>) {
+        for path in payloads.into_iter().chain(manifests) {
+            let _ = self.snapshot_manager.file_io().delete_file(&path).await;
+        }
+    }
+
     async fn prepare_snapshot(
         &self,
         resolved: &mut ResolvedCommit,
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
-        created_files: &mut Vec<String>,
+        partition_overwrite: bool,
+        created_payloads: &mut Vec<String>,
+        created_manifests: &mut Vec<String>,
     ) -> Result<(Snapshot, Vec<PartitionStatistics>)> {
         let new_snapshot_id = latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1);
+
+        let overwrite_schema_id = if partition_overwrite && self.deletion_vectors_enabled {
+            self.prepare_lookup_overwrite(
+                resolved,
+                latest_snapshot,
+                new_snapshot_id,
+                created_payloads,
+            )
+            .await?
+        } else {
+            None
+        };
 
         // Capture existing-row updates before assigning IDs to new appends.
         // A mixed update/delete can be an OVERWRITE through deletion vectors.
@@ -1494,7 +1508,7 @@ impl TableCommit {
                     snapshot,
                     &resolved.entries,
                     &resolved.deletion_vector_updates,
-                    created_files,
+                    created_payloads,
                 )
                 .await?
                 {
@@ -1559,12 +1573,12 @@ impl TableCommit {
                 &manifest_dir,
                 &new_manifest_prefix,
                 &resolved.entries,
-                created_files,
+                created_manifests,
             )
             .await?;
 
         // Write delta manifest list
-        created_files.push(delta_manifest_list_path.clone());
+        created_manifests.push(delta_manifest_list_path.clone());
         ManifestList::write_with_compression(
             file_io,
             &delta_manifest_list_path,
@@ -1583,10 +1597,10 @@ impl TableCommit {
                         &manifest_dir,
                         &changelog_manifest_prefix,
                         &resolved.changelog_entries,
-                        created_files,
+                        created_manifests,
                     )
                     .await?;
-                created_files.push(changelog_manifest_list_path.clone());
+                created_manifests.push(changelog_manifest_list_path.clone());
                 ManifestList::write_with_compression(
                     file_io,
                     &changelog_manifest_list_path,
@@ -1624,7 +1638,7 @@ impl TableCommit {
             vec![]
         };
 
-        created_files.push(base_manifest_list_path.clone());
+        created_manifests.push(base_manifest_list_path.clone());
         ManifestList::write_with_compression(
             file_io,
             &base_manifest_list_path,
@@ -1645,7 +1659,7 @@ impl TableCommit {
 
         if let Some(entries) = &resolved.new_index_manifest_entries {
             resolved.index_manifest_name = self
-                .write_index_manifest(file_io, &manifest_dir, entries, created_files)
+                .write_index_manifest(file_io, &manifest_dir, entries, created_manifests)
                 .await?;
         }
         let schema_id = if update_files.is_empty() {
@@ -1658,6 +1672,14 @@ impl TableCommit {
                 .await?;
             schema.id()
         };
+        if overwrite_schema_id.is_some_and(|id| id != schema_id) {
+            return Err(crate::Error::DataInvalid {
+                message:
+                    "Table schema changed while preparing the lookup overwrite; retry the overwrite"
+                        .into(),
+                source: None,
+            });
+        }
         let statistics_file = self
             .inherited_statistics(latest_snapshot.as_ref(), schema_id)
             .await?;
@@ -4004,6 +4026,7 @@ enum CommitAttemptResult {
 struct RetryState {
     latest_snapshot: Option<Snapshot>,
     base_data_files: Option<Vec<ManifestEntry>>,
+    /// None only when this attempt was never submitted to the publisher.
     publication_error: Option<crate::Error>,
 }
 

@@ -20,6 +20,7 @@ pub(super) mod indexes;
 pub(super) mod lookup;
 pub(super) mod lookup_file;
 pub(super) mod lookup_store;
+pub(in crate::table) mod overwrite;
 pub(in crate::table) mod planner;
 
 use std::sync::Arc;
@@ -379,7 +380,7 @@ fn new_reader_with_projection(
 
 pub(super) async fn execute(
     table: &Table,
-    task: &CompactTask,
+    output_level: i32,
     split: &DataSplit,
     resources: Option<ResourceContext>,
     lookup: Option<Arc<dyn LookupProvider>>,
@@ -388,7 +389,6 @@ pub(super) async fn execute(
     let schema = table.schema();
     let options = schema.core_options();
     let lookup_changelog = options.try_changelog_producer()? == ChangelogProducer::Lookup;
-    let output_level = task.output_level();
     let drop_delete = options.deletion_vectors_enabled() && output_level > 0;
     let reader = new_reader(table, resources.clone())?.with_lookup(lookup);
     let mut batches =
@@ -429,7 +429,7 @@ pub(super) async fn execute(
     let paths = DataFilePathFactory::new(
         table.location(),
         &partition_path,
-        task.bucket,
+        split.bucket(),
         schema.options(),
     )?;
     let file_format = options.file_format();
@@ -446,7 +446,7 @@ pub(super) async fn execute(
         file_compression: options.file_compression(),
         file_compression_zstd_level: options.file_compression_zstd_level(),
         write_buffer_size: options.write_buffer_size()? as i64,
-        level: task.output_level(),
+        level: output_level,
         file_source: 1,
         is_changelog: false,
         index_options: index.as_ref(),
