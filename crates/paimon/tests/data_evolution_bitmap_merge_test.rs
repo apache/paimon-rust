@@ -383,10 +383,10 @@ async fn missing_latest_bitmap_keeps_primary_and_does_not_reuse_stale_index() {
     let table = table("missing_latest_index").await;
     append(&table, -20, 20).await;
     let mut messages = append(&table, 0, 100).await;
-    let unindexed_writer = table.copy_with_options(HashMap::from([(
-        "file-index.bitmap.columns".into(),
-        "id,a".into(),
-    )]));
+    let unindexed_writer = table.copy_with_options(HashMap::from([
+        ("file-index.bitmap.columns".into(), "id,a".into()),
+        ("parquet.page.row.count.limit".into(), "8".into()),
+    ]));
     let updated = (0..100)
         .map(|id| match id {
             5 => 999,
@@ -433,6 +433,29 @@ async fn missing_latest_bitmap_keeps_primary_and_does_not_reuse_stale_index() {
     )
     .await;
     assert_payload(&batch, &[5, 42], false);
+
+    let predicate = Predicate::and(vec![
+        predicates
+            .is_in("id", [5, 42, 43, 55, 90].map(Datum::Int).to_vec())
+            .unwrap(),
+        predicates
+            .between("b", Datum::Int(40), Datum::Int(60))
+            .unwrap(),
+    ]);
+    for enabled in [true, false] {
+        let table = table.copy_with_options(HashMap::from([
+            (
+                "data-evolution.row-sidecar.max-selected-rows".into(),
+                "1".into(),
+            ),
+            (
+                "data-evolution.merged-read.stats-pushdown.enabled".into(),
+                enabled.to_string(),
+            ),
+        ]));
+        let batch = query(&table, predicate.clone(), &["payload", "_ROW_ID"]).await;
+        assert_payload(&batch, &[43, 55], false);
+    }
 }
 
 #[tokio::test]
