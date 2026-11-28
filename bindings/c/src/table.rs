@@ -20,6 +20,7 @@ use std::ffi::{c_char, c_void};
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, StructArray};
+
 use futures::StreamExt;
 use paimon::catalog::{Identifier, DEFAULT_MAIN_BRANCH};
 use paimon::io::FileIO;
@@ -36,6 +37,9 @@ use crate::result::{
 };
 use crate::runtime;
 use crate::types::*;
+
+pub(crate) use variant::{canonicalize_read_stream, canonicalize_vector_stream};
+mod variant;
 
 // Helper to free a wrapper struct that contains a Table clone.
 unsafe fn free_table_wrapper<T>(ptr: *mut T, get_inner: impl FnOnce(&T) -> *mut c_void) {
@@ -1111,8 +1115,16 @@ pub unsafe extern "C" fn paimon_table_read_to_arrow(
 
     let table_read = state.table_read(state.read_type.clone());
 
+    let mut read_type = state.read_type.clone();
     let stream = match (state.index_score_name.as_deref(), selected) {
-        (Some(name), [split]) => table_read.to_arrow_with_index_score(split, name),
+        (Some(name), [split]) => {
+            read_type.push(DataField::new(
+                -1,
+                name.to_owned(),
+                DataType::Float(paimon::spec::FloatType::new()),
+            ));
+            table_read.to_arrow_with_index_score(split, name)
+        }
         (Some(_), [_, _, ..]) => Err(paimon::Error::DataInvalid {
             message: "Index score projection requires at most one selected split".into(),
             source: None,
@@ -1121,6 +1133,7 @@ pub unsafe extern "C" fn paimon_table_read_to_arrow(
     };
     match stream {
         Ok(stream) => {
+            let stream = canonicalize_read_stream(stream, read_type);
             let reader = Box::new(stream);
             let wrapper = Box::new(paimon_record_batch_reader {
                 inner: Box::into_raw(reader) as *mut c_void,

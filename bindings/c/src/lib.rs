@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Arrow table reads use Paimon's logical type mapping.
+//! VARIANT preserves its binary value and metadata; SQL NULL uses struct validity.
+
 // This crate is the C binding for the Paimon project.
 // So it's type node can't meet camel case.
 #![allow(non_camel_case_types)]

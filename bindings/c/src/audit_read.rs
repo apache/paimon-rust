@@ -163,7 +163,9 @@ pub unsafe extern "C" fn paimon_table_read_to_audit_log_arrow(
                 fields.push(field.clone());
             }
         }
-        AuditLogRead::new(state.table_read(fields))?.to_arrow(&plan.splits()[start..end])
+        AuditLogRead::new(state.table_read(fields.clone()))?
+            .to_arrow(&plan.splits()[start..end])
+            .map(|stream| crate::table::canonicalize_read_stream(stream, fields))
     })();
     match stream {
         Ok(stream) => paimon_result_record_batch_reader {

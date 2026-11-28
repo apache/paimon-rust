@@ -445,7 +445,13 @@ pub(crate) async fn materialize_search_result(
         let col_refs: Vec<&str> = cols.iter().map(String::as_str).collect();
         reader.with_projection(&col_refs);
     }
-    reader.read().await
+    let stream = reader.read().await?;
+    Ok(match result.table() {
+        Some(table) => {
+            crate::table::canonicalize_vector_stream(stream, table.schema().fields(), projection)
+        }
+        None => stream,
+    })
 }
 
 pub(crate) fn wrap_vector_stream(

@@ -669,7 +669,8 @@ fn visible_entries<O: OffsetSizeTrait>(
     Ok((OffsetBuffer::new(result_offsets.into()), selected))
 }
 
-fn visible_generic_list<O: OffsetSizeTrait>(
+/// Rebase the offsets and retain only elements reachable from valid rows of this list.
+pub fn visible_generic_list<O: OffsetSizeTrait>(
     list: &GenericListArray<O>,
 ) -> crate::Result<ListArray> {
     let (offsets, values) = visible_entries(list.value_offsets(), list.nulls(), list.values())?;
@@ -695,7 +696,8 @@ fn visible_list(source: &ArrayRef) -> crate::Result<ListArray> {
     visible_generic_list(&normalize_list(source)?)
 }
 
-fn visible_map(map: &MapArray) -> crate::Result<MapArray> {
+/// Rebase the offsets and retain only entries reachable from valid rows of this map.
+pub fn visible_map(map: &MapArray) -> crate::Result<MapArray> {
     let entries: ArrayRef = Arc::new(map.entries().clone());
     let (offsets, entries) = visible_entries(map.value_offsets(), map.nulls(), &entries)?;
     let entries = entries

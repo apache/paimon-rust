@@ -100,6 +100,10 @@ leave the previous selection intact. `[]` selects zero columns while retaining
 row counts, and a null pointer clears the projection. Case sensitivity applies
 to name projections; an explicit read type keeps its supplied field identities.
 
+`VARIANT` uses the binary `value` and `metadata` children of the Paimon Arrow
+struct. Its validity bitmap distinguishes SQL NULL from an encoded variant null
+in both table reads and materialized vector results.
+
 Use `paimon_plan_from_split_bytes` with a Java DataSplit body, an IndexedSplit
 body, or a SplitSerializer v1 frame. To read a split's scores, call
 `paimon_read_builder_with_index_score(builder, "similarity")` and select one

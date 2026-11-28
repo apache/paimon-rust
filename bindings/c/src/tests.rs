@@ -4248,6 +4248,147 @@ fn vector_search_factories_and_reads_reject_uninitialized_handles() {
     }
 }
 
+fn legacy_and_encoded_variant_nulls(encoded: &paimon::variant::GenericVariant) -> StructArray {
+    use arrow_array::BinaryArray;
+    let ArrowDataType::Struct(fields) = paimon::arrow::variant_arrow_type() else {
+        unreachable!()
+    };
+    // Both parent rows are physically valid. Only the first has a legacy empty payload.
+    StructArray::new(
+        fields,
+        vec![
+            Arc::new(BinaryArray::from_iter_values([&[][..], encoded.value()])),
+            Arc::new(BinaryArray::from_iter_values([&[][..], encoded.metadata()])),
+        ],
+        None,
+    )
+}
+
+#[test]
+fn vector_reads_preserve_variant_sql_null_and_encoded_null() {
+    use arrow_array::BinaryArray;
+    use paimon::spec::VariantType;
+    use paimon::variant::GenericVariant;
+
+    let file_io = memory_file_io();
+    let path = "memory:/vector_variant_nulls";
+    setup_table_dirs(&file_io, path);
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "embedding",
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        )
+        .column("v", DataType::Variant(VariantType::new()))
+        .options(append_vector_options())
+        .build()
+        .unwrap();
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "vector_variant_nulls"),
+        path.into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    let encoded = GenericVariant::parse_json("null").unwrap();
+    let variant = legacy_and_encoded_variant_nulls(&encoded);
+    let mut columns = append_vector_batch(vec![0, 1], vec![[1.0, 0.0], [0.0, 1.0]])
+        .columns()
+        .to_vec();
+    columns.push(Arc::new(variant));
+    let batch = RecordBatch::try_new(
+        paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap(),
+        columns,
+    )
+    .unwrap();
+    write_data_rust(&table, &[batch]);
+    let built = crate::runtime().block_on(async {
+        table
+            .new_global_index_build_builder()
+            .with_index_type(INDEX_TYPE)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .unwrap()
+    });
+    assert!(built > 0);
+    let query = [1.0, 0.0];
+    let expected = rust_execute_read_pairs(&table, "embedding", query.to_vec(), 2, None);
+    assert_eq!(
+        expected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        [0, 1]
+    );
+    unsafe {
+        let handle = wrap_table(table);
+        for planned in [false, true] {
+            let builder = c_vector_builder(handle, "embedding", &query, 2, ptr::null_mut());
+            let cols = [c"v".as_ptr(), c"id".as_ptr(), ptr::null()];
+            assert!(paimon_vector_search_builder_with_projection(builder, cols.as_ptr()).is_null());
+            let result = if planned {
+                let scan = paimon_vector_search_builder_new_scan(builder);
+                let read = paimon_vector_search_builder_new_read(builder);
+                assert!(scan.error.is_null() && read.error.is_null());
+                let plan = paimon_vector_scan_plan(scan.scan);
+                assert!(plan.error.is_null());
+                let result = paimon_vector_read_read(read.read, plan.plan);
+                paimon_vector_plan_free(plan.plan);
+                paimon_vector_scan_free(scan.scan);
+                paimon_vector_read_free(read.read);
+                result
+            } else {
+                paimon_vector_search_builder_execute_read(builder)
+            };
+            paimon_vector_search_builder_free(builder);
+            assert!(result.error.is_null());
+
+            let mut pairs = Vec::new();
+            loop {
+                let next = paimon_record_batch_reader_next(result.reader);
+                assert!(next.error.is_null());
+                if next.batch.array.is_null() {
+                    break;
+                }
+                let batch = import_batch(&next.batch);
+                paimon_arrow_batch_free(next.batch);
+                let names: Vec<_> = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+                assert_eq!(names, ["v", "id", SCORE_COLUMN]);
+                let variants = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                let payload = variants
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .unwrap();
+                let metadata = variants
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .unwrap();
+                for (row, (id, score)) in batch_id_score_pairs(&batch).into_iter().enumerate() {
+                    assert_eq!(variants.is_valid(row), id == 1);
+                    if id == 1 {
+                        assert_eq!(payload.value(row), encoded.value());
+                        assert_eq!(metadata.value(row), encoded.metadata());
+                    }
+                    pairs.push((id, score));
+                }
+            }
+            paimon_record_batch_reader_free(result.reader);
+            pairs.sort_by_key(|(id, _)| *id);
+            assert_eq!(pairs, expected);
+        }
+        unwrap_table(handle);
+    }
+}
+
 #[test]
 fn vector_search_append_table_read_matches_rust() {
     let path = "memory:/vsearch_append_read";
