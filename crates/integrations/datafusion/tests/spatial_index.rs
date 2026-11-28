@@ -18,6 +18,7 @@
 mod common;
 
 use common::{assert_sql_error, exec, files_under, row_count, setup_sql_context};
+use datafusion::assert_batches_eq;
 
 #[tokio::test]
 async fn bbox_intersects_uses_the_geometry_index_in_sql() {
@@ -56,6 +57,17 @@ async fn bbox_intersects_uses_the_geometry_index_in_sql() {
     .await;
     let query = format!("SELECT id FROM {table} WHERE bbox_intersects(shape, 0, 0, 1, 2)");
     assert_eq!(row_count(&ctx, &query).await, 1);
+    let between = format!("{query} AND \"_ROW_ID\" BETWEEN 0 AND 100");
+    let in_list = format!("{query} AND \"_ROW_ID\" IN (2, 0)");
+    for sql in [&between, &in_list] {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        assert_batches_eq!(
+            &["+----+", "| id |", "+----+", "| 0  |", "+----+"],
+            &batches
+        );
+    }
+    let excludes_indexed_match = format!("{query} AND \"_ROW_ID\" IN (1, 2)");
+    assert_eq!(row_count(&ctx, &excludes_indexed_match).await, 0);
     assert_eq!(
         row_count(
             &ctx,
@@ -64,6 +76,25 @@ async fn bbox_intersects_uses_the_geometry_index_in_sql() {
         .await,
         0
     );
+    for mode in ["full", "detail"] {
+        exec(
+            &ctx,
+            &format!("ALTER TABLE {table} SET TBLPROPERTIES ('scalar-index.search-mode'='{mode}')"),
+        )
+        .await;
+        assert_eq!(row_count(&ctx, &between).await, 2);
+        let batches = ctx
+            .sql(&excludes_indexed_match)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_batches_eq!(
+            &["+----+", "| id |", "+----+", "| 2  |", "+----+"],
+            &batches
+        );
+    }
     exec(
         &ctx,
         "CALL sys.drop_global_index(
@@ -72,6 +103,7 @@ async fn bbox_intersects_uses_the_geometry_index_in_sql() {
     )
     .await;
     assert_eq!(row_count(&ctx, &query).await, 2);
+    assert_eq!(row_count(&ctx, &between).await, 2);
     assert_eq!(
         row_count(
             &ctx,

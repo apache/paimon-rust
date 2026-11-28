@@ -594,15 +594,20 @@ impl<'a> PaimonReadBuilder<'a> {
         } else {
             None
         };
-        TableScan::new(
+        let scan = TableScan::new(
             self.table,
             partition_filter,
             scan_predicates,
             self.filter.bucket_predicate.clone(),
             scan_limit,
-            self.effective_row_ranges(),
-        )
-        .with_projected_read_field_ids(projected_read_field_ids_with_predicates(
+            None,
+        );
+        let scan = match self.effective_row_ranges() {
+            Some(ranges) if self.explicit_row_ranges.is_some() => scan.with_row_ranges(ranges),
+            Some(ranges) => scan.with_filter_row_ranges(ranges),
+            None => scan,
+        };
+        scan.with_projected_read_field_ids(projected_read_field_ids_with_predicates(
             &read_type,
             &data_predicates,
             self.table.schema().fields(),
