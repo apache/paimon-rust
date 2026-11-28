@@ -508,7 +508,20 @@ impl TableProvider for PaimonTableProvider {
         let case_sensitive = true;
         // Plan splits eagerly so we know partition count upfront.
         let read_fields = datafusion_read_fields(&self.table);
-        let filter_analysis = analyze_filters(filters, &read_fields, case_sensitive);
+        // Row ID lookups use range pruning. Mixed predicates keep the regular
+        // scan path and DataFusion evaluates the row ID filter on its results.
+        let filter_fields = if self.table.schema().core_options().data_evolution_enabled()
+            && filters.iter().all(|filter| {
+                filter
+                    .column_refs()
+                    .iter()
+                    .all(|column| column.name == ROW_ID_FIELD_NAME)
+            }) {
+            read_fields.as_slice()
+        } else {
+            self.table.schema().fields()
+        };
+        let filter_analysis = analyze_filters(filters, filter_fields, case_sensitive);
         let mut read_builder = self.table.new_read_builder();
         read_builder.with_case_sensitive(case_sensitive);
         if let Some(indices) = projection {

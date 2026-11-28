@@ -28,7 +28,6 @@ use super::global_index_scanner::RowRangeIndex;
 use super::global_index_types::normalize_queryable_global_index_type;
 use super::kv_file_reader::retain_primary_key_conjuncts;
 use super::partition_filter::PartitionFilter;
-use super::row_id_predicate::intersect_sorted_ranges;
 use super::row_position_selection::RowPositionSelection;
 use super::stats_filter::{
     data_evolution_group_matches_predicates_for_table, data_file_matches_predicates_for_table,
@@ -1148,7 +1147,6 @@ impl<'a> TableScan<'a> {
             limit: scan.limit,
             row_ranges: scan.row_ranges,
             split_selection: scan.split_selection,
-            row_ranges_from_filter: scan.row_ranges_from_filter,
             row_range_optimization_disabled: scan.row_range_optimization_disabled,
             scan_all_files: scan.scan_all_files,
             file_scan_options: scan.file_scan_options,
@@ -1307,14 +1305,6 @@ impl<'a> TableScan<'a> {
                 Self(TableScanKind::Format(scan.with_row_ranges(ranges)))
             }
         }
-    }
-
-    pub(super) fn with_filter_row_ranges(self, ranges: Vec<RowRange>) -> Self {
-        let mut scan = self.with_row_ranges(ranges);
-        if let TableScanKind::Paimon(scan) = &mut scan.0 {
-            scan.row_ranges_from_filter = true;
-        }
-        scan
     }
 
     /// Supply an already evaluated global-index selection. PK split results
@@ -1619,7 +1609,6 @@ impl<'a> TableScan<'a> {
             // Predicate-derived row ranges do not narrow the permission scope.
             // The requested scan retains both the ranges and exact residuals.
             scan.row_ranges = None;
-            scan.row_ranges_from_filter = false;
             scan.data_predicates.clear();
         }
         let authorization = authorization.authorize_all_files().await?;
@@ -1778,13 +1767,12 @@ struct PaimonTableScan<'a> {
     /// Optional limit on the number of rows to return.
     /// When set, the scan will try to return only enough splits to satisfy the limit.
     limit: Option<usize>,
+    /// Statistics collection is requested explicitly.
     row_ranges: Option<Vec<RowRange>>,
     /// Mutually exclusive row-position or fixed-row chunk transformation.
     /// Boxed because scans normally use neither, and keeping the cold payload
     /// out of the scan preserves the compact `TableScanKind` representation.
     split_selection: Option<Box<ScanSplitSelection>>,
-    /// Ranges derived from a `_ROW_ID` predicate also restrict scalar index candidates.
-    row_ranges_from_filter: bool,
     /// Diff compares complete logical states, so it must not accept physical
     /// row-range pruning from an explicit range or a global-index lookup.
     row_range_optimization_disabled: bool,
@@ -1932,7 +1920,6 @@ impl<'a> PaimonTableScan<'a> {
             limit,
             row_ranges,
             split_selection: None,
-            row_ranges_from_filter: false,
             row_range_optimization_disabled: false,
             scan_all_files: false,
             file_scan_options: None,
@@ -1963,13 +1950,11 @@ impl<'a> PaimonTableScan<'a> {
     /// results from global index lookups. An empty vector selects no rows.
     pub fn with_row_ranges(mut self, ranges: Vec<RowRange>) -> Self {
         self.row_ranges = Some(ranges);
-        self.row_ranges_from_filter = false;
         self
     }
 
     fn without_row_range_optimization(mut self) -> Self {
         self.row_ranges = None;
-        self.row_ranges_from_filter = false;
         self.split_selection = None;
         self.row_range_optimization_disabled = true;
         self
@@ -2217,7 +2202,8 @@ impl<'a> PaimonTableScan<'a> {
                 .flatten()
             {
                 Some(ranges) => {
-                    let mut scan = self.clone().with_row_ranges(ranges);
+                    let mut scan = self.clone();
+                    scan.row_ranges = Some(ranges);
                     // The selection is now an ordinary row-ID restriction.
                     scan.split_selection.as_mut().unwrap().global_index_result = None;
                     Cow::Owned(scan)
@@ -2618,7 +2604,7 @@ impl<'a> PaimonTableScan<'a> {
             self.table.schema().fields(),
         )?;
         let core_options = CoreOptions::new(&resolved);
-        let index_ranges = super::global_index_scanner::evaluate_global_index_with_options(
+        super::global_index_scanner::evaluate_global_index_with_options(
             super::global_index_scanner::GlobalIndexEvaluation {
                 file_io: self.table.file_io(),
                 table_path: self.table.location().trim_end_matches('/'),
@@ -2644,22 +2630,7 @@ impl<'a> PaimonTableScan<'a> {
             },
             self.table.schema().options(),
         )
-        .await?;
-        let Some(filter_ranges) = self
-            .row_ranges
-            .as_ref()
-            .filter(|_| self.row_ranges_from_filter)
-        else {
-            return Ok(index_ranges);
-        };
-        Ok(Some(match index_ranges {
-            Some(ranges) => intersect_sorted_ranges(filter_ranges, &ranges),
-            None => filter_ranges.clone(),
-        }))
-    }
-
-    fn has_preselected_row_ranges(&self) -> bool {
-        self.row_ranges.is_some() && !self.row_ranges_from_filter
+        .await
     }
 
     async fn manifest_row_ranges(
@@ -2668,20 +2639,17 @@ impl<'a> PaimonTableScan<'a> {
         index_entries: Option<&[IndexManifestEntry]>,
         settings: Option<GlobalIndexScanSettings>,
     ) -> crate::Result<Option<Vec<RowRange>>> {
-        if self.has_preselected_row_ranges() || self.row_ranges.as_ref().is_some_and(Vec::is_empty)
-        {
+        if self.row_ranges.is_some() {
             return Ok(self.row_ranges.clone());
         }
-        match (index_entries, settings) {
-            (Some(index_entries), Some(settings))
-                if settings.search_mode != GlobalIndexSearchMode::Detail =>
-            {
-                self.evaluate_global_index_row_ranges(snapshot, index_entries, settings, &[])
-                    .await
-            }
-            // Detail mode needs data-file ranges. The filter alone can prune manifests.
-            _ => Ok(self.row_ranges.clone()),
+        let (Some(index_entries), Some(settings)) = (index_entries, settings) else {
+            return Ok(None);
+        };
+        if settings.search_mode == GlobalIndexSearchMode::Detail {
+            return Ok(None);
         }
+        self.evaluate_global_index_row_ranges(snapshot, index_entries, settings, &[])
+            .await
     }
 
     async fn effective_row_ranges(
@@ -2692,22 +2660,23 @@ impl<'a> PaimonTableScan<'a> {
         settings: Option<GlobalIndexScanSettings>,
         manifest_row_ranges: Option<Vec<RowRange>>,
     ) -> crate::Result<Option<Vec<RowRange>>> {
-        match (index_entries, settings) {
-            (Some(index_entries), Some(settings))
-                if settings.search_mode == GlobalIndexSearchMode::Detail
-                    && !self.has_preselected_row_ranges() =>
-            {
-                let data_ranges = global_index_detail_data_ranges(entries);
-                self.evaluate_global_index_row_ranges(
-                    snapshot,
-                    index_entries,
-                    settings,
-                    &data_ranges,
-                )
-                .await
-            }
-            _ => Ok(manifest_row_ranges),
+        if self.row_ranges.is_some()
+            || !matches!(
+                settings,
+                Some(GlobalIndexScanSettings {
+                    search_mode: GlobalIndexSearchMode::Detail,
+                    ..
+                })
+            )
+        {
+            return Ok(manifest_row_ranges);
         }
+        let (Some(index_entries), Some(settings)) = (index_entries, settings) else {
+            return Ok(None);
+        };
+        let data_ranges = global_index_detail_data_ranges(entries);
+        self.evaluate_global_index_row_ranges(snapshot, index_entries, settings, &data_ranges)
+            .await
     }
 
     /// The predicate set that may prune WHOLE FILES by their stats.
