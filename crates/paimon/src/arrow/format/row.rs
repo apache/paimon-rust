@@ -48,8 +48,9 @@ use arrow_schema::{DataType as ArrowDataType, Field, Fields, SchemaRef, TimeUnit
 use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{stream::FuturesOrdered, StreamExt};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 pub(crate) struct RowFormatReader {
@@ -163,7 +164,10 @@ pub(crate) struct RowFormatWriter {
 const DEFAULT_BLOCK_SIZE: usize = 65_536;
 const DEFAULT_BATCH_SIZE: usize = 1024;
 const ROW_BLOCK_READ_CONCURRENCY: usize = 8;
+const ROW_READ_MAX_COMPRESSED_BYTES: i64 = 1024 * 1024;
 const FOOTER_SIZE: u64 = 32;
+const ROW_METADATA_MIN_TAIL_SIZE: u64 = 4 * 1024;
+const ROW_METADATA_MAX_TAIL_SIZE: u64 = 64 * 1024;
 const ROW_MAGIC: i32 = 0x524F5753;
 const ROW_VERSION: u8 = 1;
 const ROW_METADATA_CACHE_MAX_ENTRIES: usize = 4096;
@@ -440,33 +444,46 @@ impl FormatFileReader for RowFormatReader {
         });
         Ok(try_stream! {
             let index = &metadata.index;
-            let mut blocks = futures::stream::iter(blocks_to_read.into_iter().map(|block_idx| {
-                read_row_block(reader.as_ref(), index, block_idx)
-            }))
-            .buffered(ROW_BLOCK_READ_CONCURRENCY);
-
-            while let Some(block) = blocks.next().await {
-                let RowBlockPayload { block_idx, data } = block?;
-                let block_start = index.block_row_start(block_idx);
-                let block_end = if block_idx + 1 < index.block_count() {
-                    index.block_row_start(block_idx + 1)
-                } else {
-                    total_rows
-                };
-                let selected = selected_local_indices(block_start, block_end, row_selection.as_deref());
-                if selected.is_empty() {
-                    continue;
+            let mut block_ranges =
+                block_read_ranges(index, &blocks_to_read, row_selection.is_some()).peekable();
+            let mut reads = FuturesOrdered::new();
+            let mut buffered_blocks = 0;
+            loop {
+                // A merged request occupies one slot per block. Refill after
+                // yielding its blocks so a consumer can stop within the read-ahead window.
+                while let Some(blocks) = block_ranges.next_if(|blocks| {
+                    buffered_blocks + blocks.len() <= ROW_BLOCK_READ_CONCURRENCY
+                }) {
+                    buffered_blocks += blocks.len();
+                    reads.push_back(read_row_blocks(reader.as_ref(), index, blocks));
                 }
-
-                for chunk in selected.chunks(batch_size) {
-                    let batch = decode_row_block_projected(&data, &row_type, &output_fields, schema.clone(), chunk, &mut projections)?;
-                    let batch = match predicates.as_ref() {
-                        Some(fp) => crate::arrow::residual::filter_record_batch_by_predicates(
-                            batch, fp, &row_type,
-                        )?,
-                        None => batch,
+                let Some(read) = reads.next().await else { break; };
+                let (blocks, compressed) = read?;
+                buffered_blocks -= blocks.len();
+                // The range read already checked its length against the index.
+                let mut remaining = compressed.as_ref();
+                for block_idx in blocks {
+                    let (block, rest) = remaining.split_at(index.block_compressed_size(block_idx) as usize);
+                    remaining = rest;
+                    let data = decompress_row_block(block, index, block_idx)?;
+                    let block_start = index.block_row_start(block_idx);
+                    let block_end = if block_idx + 1 < index.block_count() {
+                        index.block_row_start(block_idx + 1)
+                    } else {
+                        total_rows
                     };
-                    yield batch;
+                    let selected = selected_local_indices(block_start, block_end, row_selection.as_deref());
+
+                    for chunk in selected.chunks(batch_size) {
+                        let batch = decode_row_block_projected(&data, &row_type, &output_fields, schema.clone(), chunk, &mut projections)?;
+                        let batch = match predicates.as_ref() {
+                            Some(fp) => crate::arrow::residual::filter_record_batch_by_predicates(
+                                batch, fp, &row_type,
+                            )?,
+                            None => batch,
+                        };
+                        yield batch;
+                    }
                 }
             }
         }
@@ -479,8 +496,13 @@ async fn load_row_file_metadata(
     file_size: u64,
 ) -> crate::Result<Arc<RowFileMetadata>> {
     let footer_start = file_size - FOOTER_SIZE;
-    let footer_bytes = reader.read(footer_start..file_size).await?;
-    let footer = RowFileFooter::from_bytes(footer_bytes.as_ref())?;
+    // Allow about 16 bytes of delta-encoded metadata per 64 KiB of file data.
+    let tail_size = file_size
+        .div_ceil(4 * 1024)
+        .clamp(ROW_METADATA_MIN_TAIL_SIZE, ROW_METADATA_MAX_TAIL_SIZE);
+    let tail_start = file_size.saturating_sub(tail_size);
+    let tail = read_row_range(reader, tail_start..file_size).await?;
+    let footer = RowFileFooter::from_bytes(&tail[(footer_start - tail_start) as usize..])?;
     if footer.index_offset < 0 || footer.index_length < 0 {
         return Err(Error::DataInvalid {
             message: format!(
@@ -505,7 +527,11 @@ async fn load_row_file_metadata(
             source: None,
         });
     }
-    let index_bytes = reader.read(index_start..index_end).await?;
+    let index_bytes = if index_start >= tail_start {
+        tail.slice((index_start - tail_start) as usize..(index_end - tail_start) as usize)
+    } else {
+        read_row_range(reader, index_start..index_end).await?
+    };
     let index = RowBlockIndex::from_bytes(index_bytes.as_ref())?;
     let footer_block_count =
         usize::try_from(footer.block_count).map_err(|e| Error::DataInvalid {
@@ -530,41 +556,72 @@ async fn load_row_file_metadata(
     Ok(Arc::new(RowFileMetadata { index, total_rows }))
 }
 
-struct RowBlockPayload {
-    block_idx: usize,
-    data: Vec<u8>,
+fn block_read_ranges<'a>(
+    index: &'a RowBlockIndex,
+    blocks: &'a [usize],
+    coalesce_adjacent: bool,
+) -> impl Iterator<Item = Range<usize>> + 'a {
+    blocks
+        .chunk_by(move |&previous, &next| coalesce_adjacent && next == previous + 1)
+        .flat_map(move |run| {
+            // Short runs fit within one read-ahead window. Read long runs one
+            // block at a time so an early stop doesn't wait on a large request.
+            let coalesce = run.len() <= ROW_BLOCK_READ_CONCURRENCY;
+            let mut blocks = run.iter().copied().peekable();
+            std::iter::from_fn(move || {
+                let start = blocks.next()?;
+                let offset = index.block_offset(start);
+                let mut end = start + 1;
+                // A large block can still be read on its own.
+                while coalesce
+                    && blocks
+                        .next_if(|&next| {
+                            index.block_end_offset(next) - offset <= ROW_READ_MAX_COMPRESSED_BYTES
+                        })
+                        .is_some()
+                {
+                    end += 1;
+                }
+                Some(start..end)
+            })
+        })
 }
 
-async fn read_row_block(
+async fn read_row_blocks(
     reader: &dyn FileRead,
     index: &RowBlockIndex,
-    block_idx: usize,
-) -> crate::Result<RowBlockPayload> {
-    let offset = index.block_offset(block_idx);
-    let compressed_size = index.block_compressed_size(block_idx);
-    let uncompressed_size = index.block_uncompressed_size(block_idx)?;
-    let offset = u64::try_from(offset).map_err(|e| Error::DataInvalid {
-        message: format!(".row block {block_idx} offset {offset} cannot fit u64"),
-        source: Some(Box::new(e)),
-    })?;
-    let compressed_size = u64::try_from(compressed_size).map_err(|e| Error::DataInvalid {
-        message: format!(".row block {block_idx} compressed size {compressed_size} cannot fit u64"),
-        source: Some(Box::new(e)),
-    })?;
-    let end = offset
-        .checked_add(compressed_size)
-        .ok_or_else(|| Error::DataInvalid {
-            message: format!(".row block {block_idx} byte range overflows u64"),
+    blocks: Range<usize>,
+) -> crate::Result<(Range<usize>, Bytes)> {
+    let start = index.block_offset(blocks.start) as u64;
+    let end = index.block_end_offset(blocks.end - 1) as u64;
+    Ok((blocks, read_row_range(reader, start..end).await?))
+}
+
+async fn read_row_range(reader: &dyn FileRead, range: Range<u64>) -> crate::Result<Bytes> {
+    let expected = range.end - range.start;
+    let bytes = reader.read(range.clone()).await?;
+    if bytes.len() as u64 != expected {
+        return Err(Error::DataInvalid {
+            message: format!(
+                ".row range {range:?} expected {expected} bytes, got {}",
+                bytes.len()
+            ),
             source: None,
-        })?;
-    let compressed = reader.read(offset..end).await?;
-    let data = zstd::bulk::decompress(compressed.as_ref(), uncompressed_size).map_err(|e| {
-        Error::DataInvalid {
-            message: format!("Failed to decompress .row block {block_idx}: {e}"),
-            source: Some(Box::new(e)),
-        }
-    })?;
-    Ok(RowBlockPayload { block_idx, data })
+        });
+    }
+    Ok(bytes)
+}
+
+fn decompress_row_block(
+    compressed: &[u8],
+    index: &RowBlockIndex,
+    block_idx: usize,
+) -> crate::Result<Vec<u8>> {
+    let uncompressed_size = index.block_uncompressed_size(block_idx)?;
+    zstd::bulk::decompress(compressed, uncompressed_size).map_err(|e| Error::DataInvalid {
+        message: format!("Failed to decompress .row block {block_idx}: {e}"),
+        source: Some(Box::new(e)),
+    })
 }
 
 fn validate_arrow_schema_for_row(schema: &SchemaRef, fields: &[DataField]) -> crate::Result<()> {
@@ -2305,6 +2362,11 @@ impl RowBlockIndex {
         self.block_compressed_sizes[idx]
     }
 
+    fn block_end_offset(&self, idx: usize) -> i64 {
+        // The index computes offsets with checked additions from nonnegative sizes.
+        self.block_offset(idx) + self.block_compressed_size(idx)
+    }
+
     fn block_uncompressed_size(&self, idx: usize) -> crate::Result<usize> {
         usize::try_from(self.block_uncompressed_sizes[idx]).map_err(|e| Error::DataInvalid {
             message: format!(
@@ -2729,8 +2791,8 @@ mod tests {
     use crate::variant::GenericVariant;
     use futures::TryStreamExt;
     use std::collections::HashMap;
-    use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     fn expect_data_invalid<T>(result: crate::Result<T>) -> String {
@@ -3277,8 +3339,7 @@ mod tests {
         assert_eq!(encoded, expected);
     }
 
-    #[tokio::test]
-    async fn row_reader_selection_across_blocks() {
+    async fn row_file_with_two_rows_per_block(block_count: usize) -> (Vec<DataField>, Bytes) {
         let fields = vec![
             DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
             DataField::new(
@@ -3288,16 +3349,13 @@ mod tests {
             ),
         ];
         let schema = build_target_arrow_schema(&fields).unwrap();
-        let payload = "x".repeat(DEFAULT_BLOCK_SIZE + 1);
+        let payload = "x".repeat(DEFAULT_BLOCK_SIZE / 2 + 1);
+        let row_count = block_count * 2;
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec![
-                    payload.as_str(),
-                    payload.as_str(),
-                    payload.as_str(),
-                ])),
+                Arc::new(Int32Array::from((0..row_count as i32).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(vec![payload.as_str(); row_count])),
             ],
         )
         .unwrap();
@@ -3311,15 +3369,30 @@ mod tests {
         writer.write(&batch).await.unwrap();
         Box::new(writer).close().await.unwrap();
 
-        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        (
+            fields,
+            file_io.new_input(path).unwrap().read().await.unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn row_reader_coalesces_only_selected_adjacent_blocks() {
+        let (fields, bytes) = row_file_with_two_rows_per_block(5).await;
+        let metadata = load_row_file_metadata(&BytesFileRead(bytes.clone()), bytes.len() as u64)
+            .await
+            .unwrap();
+        let index = &metadata.index;
+        assert_eq!(index.block_count(), 5);
+        let data_end = index.block_end_offset(4) as u64;
+        let reader = TrackingFileRead::new(bytes.clone());
         let batches = RowFormatReader::default()
             .read_batch_stream(
-                Box::new(BytesFileRead(bytes.clone())),
+                Box::new(reader.clone()),
                 bytes.len() as u64,
                 &fields,
                 None,
                 Some(8),
-                Some(vec![RowRange::new(1, 2)]),
+                Some(vec![RowRange::new(8, 8), RowRange::new(3, 5)]),
             )
             .await
             .unwrap()
@@ -3339,7 +3412,124 @@ mod tests {
                     .to_vec()
             })
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec![2, 3]);
+        assert_eq!(ids, vec![3, 4, 5, 8]);
+        let mut ranges: Vec<_> = reader
+            .ranges
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|range| range.end <= data_end)
+            .cloned()
+            .collect();
+        ranges.sort_unstable_by_key(|range| range.start);
+        assert_eq!(
+            ranges,
+            [
+                index.block_offset(1) as u64..index.block_offset(3) as u64,
+                index.block_offset(4) as u64..data_end,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn row_reader_bounds_block_prefetch_when_consumer_stops_early() {
+        let block_count = 3 * (ROW_BLOCK_READ_CONCURRENCY + 1);
+        let (fields, bytes) = row_file_with_two_rows_per_block(block_count).await;
+        let file_size = bytes.len() as u64;
+        let metadata = load_row_file_metadata(&BytesFileRead(bytes.clone()), file_size)
+            .await
+            .unwrap();
+        let index = &metadata.index;
+        assert_eq!(index.block_count(), block_count);
+        let data_end = index.block_end_offset(block_count - 1) as u64;
+        let last_row = (block_count * 2 - 1) as i64;
+        let single_block_reads = |first| {
+            (first..first + ROW_BLOCK_READ_CONCURRENCY)
+                .map(|block| block..block + 1)
+                .collect::<Vec<_>>()
+        };
+        let sparse_selection = (0..block_count).step_by(3).map(|block| {
+            let start = (block * 2) as i64;
+            RowRange::new(start, start + 3)
+        });
+        let sparse_reads = (0..ROW_BLOCK_READ_CONCURRENCY / 2).map(|group| {
+            let start = group * 3;
+            start..start + 2
+        });
+        for (case, selection, first_row, reads) in [
+            ("no selection", None, 0, single_block_reads(0)),
+            (
+                "one deleted row",
+                Some(vec![RowRange::new(1, last_row)]),
+                1,
+                single_block_reads(0),
+            ),
+            (
+                "wide selection",
+                Some(vec![RowRange::new(3, last_row - 2)]),
+                3,
+                single_block_reads(1),
+            ),
+            (
+                "sparse pairs",
+                Some(sparse_selection.collect()),
+                0,
+                sparse_reads.collect(),
+            ),
+        ] {
+            let reader = TrackingFileRead::new(bytes.clone());
+            let mut stream = RowFormatReader::default()
+                .read_batch_stream(
+                    Box::new(reader.clone()),
+                    file_size,
+                    &fields,
+                    None,
+                    Some(1),
+                    selection,
+                )
+                .await
+                .unwrap();
+            let batch = stream.try_next().await.unwrap().unwrap();
+            assert_eq!(batch.num_rows(), 1, "{case}");
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(ids.value(0), first_row, "{case}");
+            drop(stream);
+
+            let mut requested: Vec<_> = reader
+                .ranges
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|range| range.end <= data_end)
+                .cloned()
+                .collect();
+            requested.sort_unstable_by_key(|range| range.start);
+            let expected: Vec<_> = reads
+                .into_iter()
+                .map(|blocks| {
+                    index.block_offset(blocks.start) as u64
+                        ..index.block_end_offset(blocks.end - 1) as u64
+                })
+                .collect();
+            assert!(
+                !requested.is_empty() && expected.starts_with(&requested),
+                "{case} requested {requested:?}, expected a prefix of {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_block_reads_respect_compressed_size_limit() {
+        let sizes = vec![512 * 1024, 512 * 1024, 1, 1024 * 1024 + 1, 1];
+        let count = sizes.len();
+        let index = RowBlockIndex::new(sizes, vec![1; count], (0..count as i64).collect()).unwrap();
+        let blocks = (0..count).collect::<Vec<_>>();
+        let ranges = block_read_ranges(&index, &blocks, true).collect::<Vec<_>>();
+        assert_eq!(ranges, [0..2, 2..3, 3..4, 4..5]);
     }
 
     #[test]
@@ -3454,8 +3644,12 @@ mod tests {
         ];
         let schema = build_target_arrow_schema(&fields).unwrap();
         let payload = "x".repeat(DEFAULT_BLOCK_SIZE + 1);
-        let row_count = ROW_BLOCK_READ_CONCURRENCY + 4;
+        let row_count = (ROW_BLOCK_READ_CONCURRENCY + 4) * 2;
         let ids = (0..row_count as i32).collect::<Vec<_>>();
+        let selected: Vec<_> = (0..row_count as i64)
+            .step_by(2)
+            .map(|row| RowRange::new(row, row))
+            .collect();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -3483,7 +3677,7 @@ mod tests {
                 &fields,
                 None,
                 Some(row_count),
-                None,
+                Some(selected),
             )
             .await
             .unwrap()
@@ -3503,7 +3697,7 @@ mod tests {
                     .to_vec()
             })
             .collect::<Vec<_>>();
-        assert_eq!(actual, ids);
+        assert_eq!(actual, ids.into_iter().step_by(2).collect::<Vec<_>>());
         assert!(reader.max_in_flight() > 1);
         assert!(reader.max_in_flight() <= ROW_BLOCK_READ_CONCURRENCY);
     }
@@ -3953,14 +4147,14 @@ mod tests {
         let reads = Arc::new(AtomicUsize::new(0));
         let key = Some("storage-A/data.row");
         read_counted_fixture(enabled.clone(), key, reads.clone()).await;
-        assert_eq!(reads.load(Ordering::SeqCst), 3); // footer, index, block
+        assert_eq!(reads.load(Ordering::SeqCst), 2); // footer and index, then block
         read_counted_fixture(enabled.clone(), key, reads.clone()).await;
-        assert_eq!(reads.load(Ordering::SeqCst), 4); // block only
+        assert_eq!(reads.load(Ordering::SeqCst), 3); // block only
 
         let other = FileFormatMetadataCacheContext::from_props(&HashMap::new()).unwrap();
         let other_reads = Arc::new(AtomicUsize::new(0));
         read_counted_fixture(other, key, other_reads.clone()).await;
-        assert_eq!(other_reads.load(Ordering::SeqCst), 3);
+        assert_eq!(other_reads.load(Ordering::SeqCst), 2);
 
         let other_key_reads = Arc::new(AtomicUsize::new(0));
         read_counted_fixture(
@@ -3969,12 +4163,12 @@ mod tests {
             other_key_reads.clone(),
         )
         .await;
-        assert_eq!(other_key_reads.load(Ordering::SeqCst), 3);
+        assert_eq!(other_key_reads.load(Ordering::SeqCst), 2);
 
         let unkeyed_reads = Arc::new(AtomicUsize::new(0));
         read_counted_fixture(enabled.clone(), None, unkeyed_reads.clone()).await;
         read_counted_fixture(enabled, None, unkeyed_reads.clone()).await;
-        assert_eq!(unkeyed_reads.load(Ordering::SeqCst), 6);
+        assert_eq!(unkeyed_reads.load(Ordering::SeqCst), 4);
 
         let disabled = FileFormatMetadataCacheContext::from_props(&HashMap::from([(
             crate::common::options::CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE.to_string(),
@@ -3984,7 +4178,57 @@ mod tests {
         let disabled_reads = Arc::new(AtomicUsize::new(0));
         read_counted_fixture(disabled.clone(), key, disabled_reads.clone()).await;
         read_counted_fixture(disabled, key, disabled_reads.clone()).await;
-        assert_eq!(disabled_reads.load(Ordering::SeqCst), 6);
+        assert_eq!(disabled_reads.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn row_reader_sizes_metadata_prefetch_for_file() {
+        for (blocks, compressed_size, tail_size, needs_index_read) in [
+            (25, 64 * 1024, 4 * 1024, false),
+            (1024, 64 * 1024, 16 * 1024 + 2, false),
+            (4096, 64 * 1024, 64 * 1024, false),
+            (24_000, 16 * 1024, 64 * 1024, true),
+        ] {
+            let row_starts = (0..blocks as i64).map(|block| block * 80).collect();
+            let index = RowBlockIndex::new(
+                vec![compressed_size; blocks],
+                vec![DEFAULT_BLOCK_SIZE as i64; blocks],
+                row_starts,
+            )
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+            let index_start = compressed_size as u64 * blocks as u64;
+            let metadata_size = index.len() as u64 + FOOTER_SIZE;
+            let file_size = index_start + metadata_size;
+            let row_count = blocks * 80;
+            // Keep the tail in memory while using realistic file offsets.
+            let mut tail =
+                vec![0; ROW_METADATA_MAX_TAIL_SIZE.saturating_sub(metadata_size) as usize];
+            tail.extend_from_slice(&index);
+            tail.extend_from_slice(
+                &RowFileFooter {
+                    total_row_count: row_count as i64,
+                    block_count: blocks as i32,
+                    index_offset: index_start as i64,
+                    index_length: index.len() as i32,
+                }
+                .to_bytes(),
+            );
+            let reader = TrackingFileRead {
+                start_offset: file_size - tail.len() as u64,
+                ..TrackingFileRead::new(Bytes::from(tail))
+            };
+            let metadata = load_row_file_metadata(&reader, file_size).await.unwrap();
+            assert_eq!(metadata.index.block_count(), blocks);
+            assert_eq!(metadata.total_rows, row_count);
+            let mut expected = Vec::with_capacity(2);
+            expected.push(file_size - tail_size..file_size);
+            if needs_index_read {
+                expected.push(index_start..file_size - FOOTER_SIZE);
+            }
+            assert_eq!(*reader.ranges.lock().unwrap(), expected);
+        }
     }
 
     fn one_string_row_file(value: &str) -> Bytes {
@@ -4077,7 +4321,7 @@ mod tests {
                 .unwrap();
             assert_eq!(values.value(0), expected);
         }
-        assert_eq!(reads.load(Ordering::SeqCst), 6); // footer, index, block each time
+        assert_eq!(reads.load(Ordering::SeqCst), 4); // footer and index, then block each time
     }
 
     #[tokio::test]
@@ -4338,6 +4582,8 @@ mod tests {
     #[derive(Clone)]
     struct TrackingFileRead {
         bytes: Bytes,
+        start_offset: u64,
+        ranges: Arc<Mutex<Vec<Range<u64>>>>,
         in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
     }
@@ -4346,6 +4592,8 @@ mod tests {
         fn new(bytes: Bytes) -> Self {
             Self {
                 bytes,
+                start_offset: 0,
+                ranges: Arc::new(Mutex::new(Vec::new())),
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
             }
@@ -4359,11 +4607,14 @@ mod tests {
     #[async_trait::async_trait]
     impl FileRead for TrackingFileRead {
         async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            self.ranges.lock().unwrap().push(range.clone());
             let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(10)).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            Ok(self.bytes.slice(range.start as usize..range.end as usize))
+            let start = (range.start - self.start_offset) as usize;
+            let end = (range.end - self.start_offset) as usize;
+            Ok(self.bytes.slice(start..end))
         }
     }
 

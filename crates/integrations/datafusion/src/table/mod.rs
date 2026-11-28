@@ -507,12 +507,24 @@ impl TableProvider for PaimonTableProvider {
         // direct ReadBuilder API (core / C / Python), not via SQL.
         let case_sensitive = true;
         // Plan splits eagerly so we know partition count upfront.
-        let filter_analysis =
-            analyze_filters(filters, self.table.schema().fields(), case_sensitive);
+        let read_fields = datafusion_read_fields(&self.table);
+        // Row ID lookups use range pruning. Mixed predicates keep the regular
+        // scan path and DataFusion evaluates the row ID filter on its results.
+        let filter_fields = if self.table.schema().core_options().data_evolution_enabled()
+            && filters.iter().all(|filter| {
+                filter
+                    .column_refs()
+                    .iter()
+                    .all(|column| column.name == ROW_ID_FIELD_NAME)
+            }) {
+            read_fields.as_slice()
+        } else {
+            self.table.schema().fields()
+        };
+        let filter_analysis = analyze_filters(filters, filter_fields, case_sensitive);
         let mut read_builder = self.table.new_read_builder();
         read_builder.with_case_sensitive(case_sensitive);
         if let Some(indices) = projection {
-            let read_fields = datafusion_read_fields(&self.table);
             let read_type = indices
                 .iter()
                 .map(|&i| read_fields[i].clone())
@@ -552,7 +564,7 @@ impl TableProvider for PaimonTableProvider {
             filter_exact,
             case_sensitive,
         }
-        .build()
+        .build_with_read_fields(read_fields)
     }
 
     async fn insert_into(
@@ -595,7 +607,7 @@ impl TableProvider for PaimonTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        let fields = self.table.schema().fields();
+        let fields = datafusion_read_fields(&self.table);
         // SQL reads resolve columns case-sensitively (see `scan`), so classify
         // pushdown the same way.
         let case_sensitive = true;
@@ -604,7 +616,7 @@ impl TableProvider for PaimonTableProvider {
         Ok(filters
             .iter()
             .map(|filter| {
-                classify_filter_pushdown(filter, fields, case_sensitive, |predicate| {
+                classify_filter_pushdown(filter, &fields, case_sensitive, |predicate| {
                     read_builder.is_exact_filter_pushdown(predicate)
                 })
             })

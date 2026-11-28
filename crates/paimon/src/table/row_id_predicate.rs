@@ -165,18 +165,28 @@ fn leaf_to_ranges(op: PredicateOperator, literals: &[Datum]) -> Option<Vec<RowRa
             }
             Some(vec![RowRange::new(0, v - 1)])
         }
+        PredicateOperator::Between => {
+            let [low, high] = literals else {
+                return None;
+            };
+            let low = datum_to_i64(low)?.max(0);
+            let high = datum_to_i64(high)?;
+            if low > high {
+                return Some(Vec::new());
+            }
+            Some(vec![RowRange::new(low, high)])
+        }
         PredicateOperator::In => {
             // EVERY literal, or none: ranges standing for only part of the leaf
             // would still read as the whole of it and drop the conjunct.
-            let mut ranges: Vec<RowRange> = literals
+            let ranges: Vec<RowRange> = literals
                 .iter()
                 .map(|d| datum_to_i64(d).map(|v| RowRange::new(v, v)))
                 .collect::<Option<Vec<_>>>()?;
             if ranges.is_empty() {
                 return None;
             }
-            ranges.sort_by_key(|r| r.from());
-            Some(ranges)
+            Some(super::merge_row_ranges(ranges))
         }
         _ => None,
     }
@@ -274,17 +284,37 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_between() {
+        for (low, high, expected) in [
+            (10, 20, vec![RowRange::new(10, 20)]),
+            (-1, 2, vec![RowRange::new(0, 2)]),
+            (-2, -1, vec![]),
+            (20, 10, vec![]),
+            (i64::MAX, i64::MAX, vec![RowRange::new(i64::MAX, i64::MAX)]),
+        ] {
+            let predicate = row_id_leaf(
+                PredicateOperator::Between,
+                vec![Datum::Long(low), Datum::Long(high)],
+            );
+            assert_eq!(extract_row_id_ranges(&predicate), Some(expected));
+        }
+    }
+
+    #[test]
     fn test_extract_in() {
         let p = row_id_leaf(
             PredicateOperator::In,
-            vec![Datum::Long(5), Datum::Long(10), Datum::Long(15)],
+            [15, 6, 5, 15, 10, 11]
+                .into_iter()
+                .map(Datum::Long)
+                .collect(),
         );
         let ranges = extract_row_id_ranges(&p).unwrap();
         assert_eq!(
             ranges,
             vec![
-                RowRange::new(5, 5),
-                RowRange::new(10, 10),
+                RowRange::new(5, 6),
+                RowRange::new(10, 11),
                 RowRange::new(15, 15),
             ]
         );
