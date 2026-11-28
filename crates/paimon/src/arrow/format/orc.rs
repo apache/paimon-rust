@@ -23,7 +23,9 @@ use crate::spec::{
 };
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
-use arrow_array::RecordBatch;
+use arrow_array::{
+    Array, ArrayRef, LargeStringArray, ListArray, MapArray, RecordBatch, StringArray, StructArray,
+};
 use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use async_trait::async_trait;
 use base64::Engine;
@@ -412,6 +414,100 @@ impl FormatFileWriter for OrcFormatWriter {
     }
 }
 
+fn normalize_orc_char(array: &ArrayRef, logical_type: &DataType) -> crate::Result<ArrayRef> {
+    // ORC CHAR pads on disk; the Java ORC reader removes trailing ASCII spaces.
+    // Do not trim VARCHAR, Unicode whitespace, or leading spaces.
+    let invalid = || Error::DataInvalid {
+        message: format!(
+            "Unexpected ORC array {} for {logical_type:?}",
+            array.data_type()
+        ),
+        source: None,
+    };
+    let children = match logical_type {
+        DataType::Char(_) => {
+            if let Some(strings) = array.as_any().downcast_ref::<StringArray>() {
+                return Ok(Arc::new(StringArray::from_iter(
+                    strings
+                        .iter()
+                        .map(|value| value.map(|s| s.trim_end_matches(' '))),
+                )));
+            }
+            if let Some(strings) = array.as_any().downcast_ref::<LargeStringArray>() {
+                return Ok(Arc::new(LargeStringArray::from_iter(
+                    strings
+                        .iter()
+                        .map(|value| value.map(|s| s.trim_end_matches(' '))),
+                )));
+            }
+            return Err(invalid());
+        }
+        DataType::Array(ty) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(invalid)?;
+            vec![normalize_orc_char(values.values(), ty.element_type())?.to_data()]
+        }
+        DataType::Map(_) | DataType::Multiset(_) => {
+            let count_type = DataType::Int(crate::spec::IntType::new());
+            let (key_type, value_type) = match logical_type {
+                DataType::Map(ty) => (ty.key_type(), ty.value_type()),
+                DataType::Multiset(ty) => (ty.element_type(), &count_type),
+                _ => unreachable!(),
+            };
+            let values = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(invalid)?;
+            let entries = values
+                .entries()
+                .to_data()
+                .into_builder()
+                .child_data(vec![
+                    normalize_orc_char(values.keys(), key_type)?.to_data(),
+                    normalize_orc_char(values.values(), value_type)?.to_data(),
+                ])
+                .build()
+                .map_err(|e| Error::DataInvalid {
+                    message: format!("Invalid normalized ORC CHAR map: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
+            vec![entries]
+        }
+        DataType::Row(ty) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(invalid)?;
+            values
+                .fields()
+                .iter()
+                .zip(values.columns())
+                .map(|(field, column)| {
+                    match ty.fields().iter().find(|f| f.name() == field.name()) {
+                        Some(field) => {
+                            normalize_orc_char(column, field.data_type()).map(|a| a.to_data())
+                        }
+                        None => Ok(column.to_data()),
+                    }
+                })
+                .collect::<crate::Result<Vec<_>>>()?
+        }
+        _ => return Ok(Arc::clone(array)),
+    };
+    array
+        .to_data()
+        .into_builder()
+        .child_data(children)
+        .build()
+        .map(arrow_array::make_array)
+        .map_err(|e| Error::DataInvalid {
+            message: format!("Invalid normalized ORC CHAR array: {e}"),
+            source: Some(Box::new(e)),
+        })
+}
+
 #[async_trait]
 impl FormatFileReader for OrcFormatReader {
     async fn read_batch_stream(
@@ -479,6 +575,7 @@ impl FormatFileReader for OrcFormatReader {
         // columns; DataFileReader projects to the requested output by name afterwards.
         // Own the predicate context (scan_fields + cloned FilePredicates) for the
         // 'static stream.
+        let logical_fields = scan_fields.clone();
         let residual: Option<(FilePredicates, Vec<DataField>)> = predicates.map(|fp| {
             (
                 FilePredicates {
@@ -492,10 +589,33 @@ impl FormatFileReader for OrcFormatReader {
         Ok(stream
             .map(move |r| {
                 let batch = r.map_err(|error| orc_error(error, "ORC read error"))?;
-                let batch = match &map_read_plan {
+                let mut batch = match &map_read_plan {
                     Some(plan) => plan.assemble_batch(&batch)?,
                     None => batch,
                 };
+                let schema = batch.schema();
+                let columns = schema
+                    .fields()
+                    .iter()
+                    .zip(batch.columns())
+                    .map(|(field, column)| {
+                        match logical_fields.iter().find(|f| f.name() == field.name()) {
+                            Some(field) => normalize_orc_char(column, field.data_type()),
+                            None => Ok(Arc::clone(column)),
+                        }
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+                if columns
+                    .iter()
+                    .zip(batch.columns())
+                    .any(|(a, b)| !Arc::ptr_eq(a, b))
+                {
+                    batch =
+                        RecordBatch::try_new(schema, columns).map_err(|e| Error::DataInvalid {
+                            message: format!("Failed to rebuild ORC batch: {e}"),
+                            source: Some(Box::new(e)),
+                        })?;
+                }
                 match &residual {
                     Some((fp, scan_fields)) => {
                         crate::arrow::residual::filter_record_batch_by_predicates(
@@ -718,7 +838,9 @@ fn datum_to_orc_value(datum: &Datum, data_type: &DataType) -> Option<PredicateVa
         (Datum::Long(value), DataType::BigInt(_)) => Some(PredicateValue::Int64(Some(*value))),
         (Datum::Float(value), DataType::Float(_)) => Some(PredicateValue::Float32(Some(*value))),
         (Datum::Double(value), DataType::Double(_)) => Some(PredicateValue::Float64(Some(*value))),
-        (Datum::String(value), DataType::Char(_) | DataType::VarChar(_)) => {
+        // CHAR values are normalized before residual evaluation; raw padded ORC
+        // statistics must not exclude a matching unpadded value.
+        (Datum::String(value), DataType::VarChar(_)) => {
             Some(PredicateValue::Utf8(Some(value.clone())))
         }
         _ => None,
@@ -819,6 +941,30 @@ impl AsyncChunkReader for OrcFileReader {
 mod tests {
     use super::*;
     use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
+
+    #[test]
+    fn orc_char_normalization_preserves_nulls_slices_and_non_padding_whitespace() {
+        use crate::spec::{CharType, VarCharType};
+        let input: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("unused"),
+            Some(" AB  "),
+            None,
+            Some("    "),
+            Some("中\t "),
+            Some("x\u{a0} "),
+        ]));
+        let input = input.slice(1, 5);
+        let output =
+            normalize_orc_char(&input, &DataType::Char(CharType::new(8).unwrap())).unwrap();
+        let output = output.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            output.iter().collect::<Vec<_>>(),
+            vec![Some(" AB"), None, Some(""), Some("中\t"), Some("x\u{a0}")]
+        );
+        let unchanged =
+            normalize_orc_char(&input, &DataType::VarChar(VarCharType::string_type())).unwrap();
+        assert_eq!(unchanged.as_ref(), input.as_ref());
+    }
     use arrow_schema::{DataType as ArrowDataType, Field, Schema};
     use orc_rust::row_selection::RowSelector;
     use std::sync::Arc;
@@ -845,6 +991,32 @@ mod tests {
             row_filter_factory: None,
             file_fields,
         }
+    }
+
+    #[test]
+    fn orc_multiset_char_normalizes_keys_and_preserves_counts() {
+        use crate::spec::{CharType, MultisetType};
+        use arrow_array::builder::{Int32Builder, MapBuilder, StringBuilder};
+
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        builder.keys().append_value("AB  ");
+        builder.values().append_value(2);
+        builder.keys().append_value(" C  ");
+        builder.values().append_value(3);
+        builder.append(true).unwrap();
+        builder.append(false).unwrap();
+        builder.append(true).unwrap();
+        let source = builder.finish();
+        let logical_type =
+            DataType::Multiset(MultisetType::new(DataType::Char(CharType::new(4).unwrap())));
+        let input: ArrayRef = Arc::new(source.clone());
+        let result = normalize_orc_char(&input, &logical_type).unwrap();
+        let result = result.as_any().downcast_ref::<MapArray>().unwrap();
+
+        assert_eq!(result.keys().as_ref(), &StringArray::from(vec!["AB", " C"]));
+        assert_eq!(result.values().as_ref(), &Int32Array::from(vec![2, 3]));
+        assert_eq!(result.value_offsets(), source.value_offsets());
+        assert_eq!(result.nulls(), source.nulls());
     }
 
     #[test]
@@ -1598,6 +1770,65 @@ mod tests {
         }
 
         assert_eq!(ages, vec![30, 40, 50]);
+    }
+
+    #[tokio::test]
+    async fn orc_residual_checks_char_and_id_on_decoded_rows() {
+        use crate::io::FileIOBuilder;
+        use crate::spec::{CharType, PredicateBuilder};
+
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![5, 11, 15])) as ArrayRef,
+            ),
+            (
+                "code",
+                Arc::new(StringArray::from(vec!["AB  ", "CD  ", "AB  "])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let bytes = Bytes::from(write_single_stripe_orc(batch.schema(), &batch));
+        let size = bytes.len() as u64;
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/padded-char.orc";
+        io.new_output(path).unwrap().write(bytes).await.unwrap();
+        let fields = vec![
+            field(0, "id", DataType::Int(IntType::new())),
+            field(1, "code", DataType::Char(CharType::new(4).unwrap())),
+        ];
+        let pb = PredicateBuilder::new(&fields);
+        let predicates = file_predicates(
+            vec![Predicate::and(vec![
+                pb.equal("code", Datum::String("AB".into())).unwrap(),
+                pb.greater_than("id", Datum::Int(10)).unwrap(),
+            ])],
+            fields.clone(),
+        );
+        let input = io.new_input(path).unwrap().reader().await.unwrap();
+        let mut stream = OrcFormatReader
+            .read_batch_stream(
+                Box::new(input),
+                size,
+                &fields[..1],
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            let id = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.extend(id.values().iter().copied());
+        }
+        assert_eq!(ids, [15]);
     }
 
     /// Encode a single-stripe ORC file with three columns (id, name, age).

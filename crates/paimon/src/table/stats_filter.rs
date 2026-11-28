@@ -17,6 +17,7 @@
 
 //! Data-level stats predicate filtering for manifest entries and data evolution groups.
 
+use super::file_pruning::file_pruning_predicates;
 use super::Table;
 use crate::arrow::schema_evolution::create_index_mapping;
 use crate::predicate_stats::{
@@ -196,17 +197,30 @@ fn matches_file_stats(
     schema_fields: &[DataField],
     key_fields: &[String],
 ) -> bool {
-    let value_stats = FileStatsRows::from_data_file(file, schema_fields);
-    if !predicates_may_match_with_schema(predicates, &value_stats, field_mapping, schema_fields) {
-        return false;
+    let field_source = |index: usize| {
+        let file_index = (*field_mapping.get(index)?)?;
+        Some((file, schema_fields.get(file_index)?))
+    };
+    let predicates = file_pruning_predicates(predicates, field_source);
+    if !predicates.is_empty() {
+        let value_stats = FileStatsRows::from_data_file(file, schema_fields);
+        if !predicates_may_match_with_schema(
+            &predicates,
+            &value_stats,
+            field_mapping,
+            schema_fields,
+        ) {
+            return false;
+        }
     }
 
+    let key_predicates = file_pruning_predicates(key_predicates, field_source);
     if key_predicates.is_empty() {
         return true;
     }
 
     let key_stats = FileStatsRows::from_key_stats(file, schema_fields, key_fields);
-    predicates_may_match_with_schema(key_predicates, &key_stats, field_mapping, schema_fields)
+    predicates_may_match_with_schema(&key_predicates, &key_stats, field_mapping, schema_fields)
 }
 
 /// Check whether a data file *may* contain rows matching all `predicates`.
@@ -541,6 +555,16 @@ fn data_evolution_group_matches_resolved_predicates(
             usable_provider[field_idx] =
                 !tied && file.first_row_id == Some(start) && file.row_count == row_count;
         }
+    }
+
+    let predicates = file_pruning_predicates(predicates, |index| {
+        let (file_idx, _) = (*field_sources.get(index)?)?;
+        let (file, schema) = sorted_files[file_idx];
+        let old_idx = schema.field_mapping[index]?;
+        Some((file, &schema.file_fields[old_idx]))
+    });
+    if predicates.is_empty() {
+        return true;
     }
 
     let file_stats: Vec<FileStatsRows> = sorted_files
