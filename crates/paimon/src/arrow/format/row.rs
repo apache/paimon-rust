@@ -166,8 +166,8 @@ const DEFAULT_BATCH_SIZE: usize = 1024;
 const ROW_BLOCK_READ_CONCURRENCY: usize = 8;
 const ROW_READ_MAX_COMPRESSED_BYTES: i64 = 1024 * 1024;
 const FOOTER_SIZE: u64 = 32;
-// The block index is delta-encoded. A small tail limits I/O on cold sparse reads.
-const ROW_METADATA_TAIL_SIZE: u64 = 4 * 1024;
+const ROW_METADATA_MIN_TAIL_SIZE: u64 = 4 * 1024;
+const ROW_METADATA_MAX_TAIL_SIZE: u64 = 64 * 1024;
 const ROW_MAGIC: i32 = 0x524F5753;
 const ROW_VERSION: u8 = 1;
 const ROW_METADATA_CACHE_MAX_ENTRIES: usize = 4096;
@@ -488,7 +488,11 @@ async fn load_row_file_metadata(
     file_size: u64,
 ) -> crate::Result<Arc<RowFileMetadata>> {
     let footer_start = file_size - FOOTER_SIZE;
-    let tail_start = file_size.saturating_sub(ROW_METADATA_TAIL_SIZE);
+    // Allow about 16 bytes of delta-encoded metadata per 64 KiB of file data.
+    let tail_size = file_size
+        .div_ceil(4 * 1024)
+        .clamp(ROW_METADATA_MIN_TAIL_SIZE, ROW_METADATA_MAX_TAIL_SIZE);
+    let tail_start = file_size.saturating_sub(tail_size);
     let tail = read_row_range(reader, tail_start..file_size).await?;
     let footer = RowFileFooter::from_bytes(&tail[(footer_start - tail_start) as usize..])?;
     if footer.index_offset < 0 || footer.index_length < 0 {
@@ -4062,40 +4066,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn row_reader_fetches_index_that_exceeds_the_tail() {
-        let blocks = ROW_METADATA_TAIL_SIZE as usize;
-        let index = RowBlockIndex::new(
-            vec![1; blocks],
-            vec![1; blocks],
-            (0..blocks as i64).collect(),
-        )
-        .unwrap()
-        .to_bytes()
-        .unwrap();
-        assert!(index.len() as u64 > ROW_METADATA_TAIL_SIZE);
-        let mut file = vec![0; blocks];
-        file.extend_from_slice(&index);
-        file.extend_from_slice(
-            &RowFileFooter {
-                total_row_count: blocks as i64,
-                block_count: blocks as i32,
-                index_offset: blocks as i64,
-                index_length: index.len() as i32,
+    async fn row_reader_sizes_metadata_prefetch_for_file() {
+        for (blocks, compressed_size, tail_size, needs_index_read) in [
+            (25, 64 * 1024, 4 * 1024, false),
+            (1024, 64 * 1024, 16 * 1024 + 2, false),
+            (4096, 64 * 1024, 64 * 1024, false),
+            (24_000, 16 * 1024, 64 * 1024, true),
+        ] {
+            let row_starts = (0..blocks as i64).map(|block| block * 80).collect();
+            let index = RowBlockIndex::new(
+                vec![compressed_size; blocks],
+                vec![DEFAULT_BLOCK_SIZE as i64; blocks],
+                row_starts,
+            )
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+            let index_start = compressed_size as u64 * blocks as u64;
+            let metadata_size = index.len() as u64 + FOOTER_SIZE;
+            let file_size = index_start + metadata_size;
+            let row_count = blocks * 80;
+            // Keep the tail in memory while using realistic file offsets.
+            let mut tail =
+                vec![0; ROW_METADATA_MAX_TAIL_SIZE.saturating_sub(metadata_size) as usize];
+            tail.extend_from_slice(&index);
+            tail.extend_from_slice(
+                &RowFileFooter {
+                    total_row_count: row_count as i64,
+                    block_count: blocks as i32,
+                    index_offset: index_start as i64,
+                    index_length: index.len() as i32,
+                }
+                .to_bytes(),
+            );
+            let reader = TrackingFileRead {
+                start_offset: file_size - tail.len() as u64,
+                ..TrackingFileRead::new(Bytes::from(tail))
+            };
+            let metadata = load_row_file_metadata(&reader, file_size).await.unwrap();
+            assert_eq!(metadata.index.block_count(), blocks);
+            assert_eq!(metadata.total_rows, row_count);
+            let mut expected = vec![file_size - tail_size..file_size];
+            if needs_index_read {
+                expected.push(index_start..file_size - FOOTER_SIZE);
             }
-            .to_bytes(),
-        );
-        let len = file.len() as u64;
-        let reader = TrackingFileRead::new(Bytes::from(file));
-        let metadata = load_row_file_metadata(&reader, len).await.unwrap();
-        assert_eq!(metadata.index.block_count(), blocks);
-        assert_eq!(metadata.total_rows, blocks);
-        assert_eq!(
-            *reader.ranges.lock().unwrap(),
-            [
-                len - ROW_METADATA_TAIL_SIZE..len,
-                blocks as u64..len - FOOTER_SIZE
-            ]
-        );
+            assert_eq!(*reader.ranges.lock().unwrap(), expected);
+        }
     }
 
     fn one_string_row_file(value: &str) -> Bytes {
@@ -4449,6 +4465,7 @@ mod tests {
     #[derive(Clone)]
     struct TrackingFileRead {
         bytes: Bytes,
+        start_offset: u64,
         ranges: Arc<Mutex<Vec<Range<u64>>>>,
         in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
@@ -4458,6 +4475,7 @@ mod tests {
         fn new(bytes: Bytes) -> Self {
             Self {
                 bytes,
+                start_offset: 0,
                 ranges: Arc::new(Mutex::new(Vec::new())),
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -4477,7 +4495,9 @@ mod tests {
             self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(10)).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            Ok(self.bytes.slice(range.start as usize..range.end as usize))
+            let start = (range.start - self.start_offset) as usize;
+            let end = (range.end - self.start_offset) as usize;
+            Ok(self.bytes.slice(start..end))
         }
     }
 
