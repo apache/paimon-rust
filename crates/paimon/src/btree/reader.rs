@@ -81,6 +81,31 @@ pub struct BTreeIndexReader<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> {
 }
 
 impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
+    /// Approximate retained heap bytes when the reader is parked between scans.
+    /// Data blocks have a separate bounded cache and are excluded here.
+    pub(crate) fn cache_weight(&self) -> usize {
+        let null_bytes = self
+            .null_bitmap
+            .get()
+            .map_or(0, |bitmap| bitmap.serialized_size().saturating_mul(4));
+        let bloom_bytes = self
+            .bloom_filter
+            .as_ref()
+            .and_then(|bloom| bloom.filter.get())
+            .map_or(0, |filter| filter.bytes().len());
+        std::mem::size_of::<Self>()
+            .saturating_add(self.sst_reader.index_block().retained_bytes())
+            .saturating_add(self.min_key.as_ref().map_or(0, Vec::capacity))
+            .saturating_add(self.max_key.as_ref().map_or(0, Vec::capacity))
+            .saturating_add(null_bytes)
+            .saturating_add(bloom_bytes)
+            .saturating_add(self.data_block_cache_file.len())
+    }
+
+    pub(crate) fn set_data_block_cache(&mut self, cache: Arc<BTreeDataBlockCache>) {
+        self.data_block_cache = cache;
+    }
+
     /// Open a BTree index reader from a FileRead and file metadata.
     /// Only reads the footer and index block on open.
     /// Data blocks, the Bloom filter, and the null bitmap are read on demand.

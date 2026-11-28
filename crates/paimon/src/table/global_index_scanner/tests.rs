@@ -4174,7 +4174,7 @@ async fn test_compound_and_finishes_leaf_groups_before_starting_branches() {
     assert_eq!(probe.range_queries.load(TestOrdering::SeqCst), 1);
     assert_eq!(probe.predicate_queries.load(TestOrdering::SeqCst), 4);
     assert_eq!(probe.btree_opens.load(TestOrdering::SeqCst), 4);
-    assert_eq!(scanner.reader_cache.lock().unwrap().len(), 4);
+    assert_eq!(scanner.reader_cache.readers.lock().unwrap().0.len(), 4);
 }
 
 #[tokio::test]
@@ -4241,7 +4241,7 @@ async fn test_compound_and_reuses_one_reader_for_same_file() {
     assert_eq!(result.evaluated_field_ids, HashSet::from([1]));
     assert_eq!(probe.peak(), 1);
     assert_eq!(probe.btree_opens.load(TestOrdering::SeqCst), 1);
-    assert_eq!(scanner.reader_cache.lock().unwrap().len(), 1);
+    assert_eq!(scanner.reader_cache.readers.lock().unwrap().0.len(), 1);
 }
 
 #[tokio::test]
@@ -4542,4 +4542,75 @@ async fn scalar_exactness_detects_unsupported_conjunct_on_same_fm_field() {
         !exact,
         "FM must not mark a dropped startsWith conjunct exact"
     );
+}
+
+#[tokio::test]
+async fn test_btree_reader_cache_reuses_opened_shard_across_scanners() {
+    let (io, path, name, _tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
+    let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+    let entries = vec![make_global_index_entry(&name, 1, 0, 99, &meta)];
+    let fields = int_schema_fields();
+    let cache = Arc::new(SharedBTreeReaderCache::new(1024 * 1024));
+    let probe = Arc::new(QueryIoProbe::default());
+    for _ in 0..2 {
+        let mut scanner =
+            GlobalIndexScanner::create(&io, &path, 4, i64::MAX, i64::MAX, &entries, &fields)
+                .unwrap()
+                .unwrap()
+                .with_reader_cache(Arc::clone(&cache), 0);
+        scanner.query_io_probe = Some(Arc::clone(&probe));
+        let result = scanner
+            .evaluate(&int_eq("id", 0, 20))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.row_ranges, vec![RowRange::new(10, 10)]);
+    }
+    assert_eq!(probe.btree_opens.load(TestOrdering::SeqCst), 1);
+    assert_eq!(cache.readers.lock().unwrap().0.len(), 1);
+    let cached_key = cache
+        .readers
+        .lock()
+        .unwrap()
+        .0
+        .iter()
+        .next()
+        .unwrap()
+        .0
+        .clone();
+    let other_type = DataType::BigInt(crate::spec::BigIntType::new());
+    assert!(cache.take(&(cached_key.0.clone(), other_type), 0).is_none());
+    let old_reader = cache.take(&cached_key, 0).unwrap();
+    cache.set_epoch(1);
+    cache.put(cached_key, old_reader, 0);
+    assert!(cache.readers.lock().unwrap().0.is_empty());
+    let scanner = GlobalIndexScanner::create(&io, &path, 4, i64::MAX, i64::MAX, &entries, &fields)
+        .unwrap()
+        .unwrap()
+        .with_reader_cache(Arc::clone(&cache), 1);
+    scanner.evaluate(&int_eq("id", 0, 20)).await.unwrap();
+    assert_eq!(cache.readers.lock().unwrap().0.len(), 1);
+    cache.data_block_cache(1);
+    assert!(cache.readers.lock().unwrap().0.is_empty());
+}
+
+#[tokio::test]
+async fn test_btree_reader_cache_respects_byte_limit() {
+    let (io, path, name, _tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
+    let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+    let entries = vec![make_global_index_entry(&name, 1, 0, 99, &meta)];
+    let fields = int_schema_fields();
+    let cache = Arc::new(SharedBTreeReaderCache::new(0));
+    let probe = Arc::new(QueryIoProbe::default());
+    for _ in 0..2 {
+        let mut scanner =
+            GlobalIndexScanner::create(&io, &path, 4, i64::MAX, i64::MAX, &entries, &fields)
+                .unwrap()
+                .unwrap()
+                .with_reader_cache(Arc::clone(&cache), 0);
+        scanner.query_io_probe = Some(Arc::clone(&probe));
+        scanner.evaluate(&int_eq("id", 0, 20)).await.unwrap();
+    }
+    assert_eq!(probe.btree_opens.load(TestOrdering::SeqCst), 2);
+    assert!(cache.readers.lock().unwrap().0.is_empty());
 }

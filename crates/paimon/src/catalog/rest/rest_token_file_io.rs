@@ -45,6 +45,7 @@ const OSS_ENDPOINT: &str = "fs.oss.endpoint";
 struct TokenState {
     token: RESTToken,
     file_io: FileIO,
+    generation: u64,
 }
 
 pub struct RESTTokenFileIO {
@@ -121,9 +122,16 @@ impl RESTTokenFileIO {
             _ => self.refresh_token().await?,
         };
         let file_io = self.build_static_file_io(&token)?;
+        let generation = self
+            .state
+            .read()
+            .await
+            .as_ref()
+            .map_or(1, |state| state.generation.saturating_add(1));
         *self.state.write().await = Some(TokenState {
             token,
             file_io: file_io.clone(),
+            generation,
         });
         Ok(file_io)
     }
@@ -186,6 +194,16 @@ impl RESTTokenFileIO {
 
 #[async_trait::async_trait]
 impl FileIOProvider for RESTTokenFileIO {
+    async fn reader_cache_epoch(&self) -> Result<Option<u64>> {
+        self.current_file_io().await?;
+        Ok(self
+            .state
+            .read()
+            .await
+            .as_ref()
+            .map(|state| state.generation))
+    }
+
     async fn create(&self, path: &str) -> Result<(opendal::Operator, String)> {
         self.current_file_io().await?.create_static(path)
     }
@@ -358,6 +376,7 @@ mod tests {
 
         let file_io = token_file_io.build_file_io().await.unwrap();
         assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(file_io.reader_cache_epoch().await.unwrap(), Some(1));
         assert!(!file_io
             .exists(file_path.to_string_lossy().as_ref())
             .await
@@ -377,6 +396,10 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+        // The first refreshed test token is deliberately shorter than the
+        // safety margin, so checking the epoch refreshes it once more.
+        assert_eq!(file_io.reader_cache_epoch().await.unwrap(), Some(3));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
         server.abort();
     }
 

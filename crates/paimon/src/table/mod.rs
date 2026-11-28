@@ -329,6 +329,8 @@ impl ReadSnapshot {
 #[derive(Debug, Clone)]
 pub struct Table {
     file_io: FileIO,
+    /// Immutable BTree reader metadata shared by scans of this handle.
+    btree_reader_cache: Arc<global_index_scanner::SharedBTreeReaderCache>,
     identifier: Identifier,
     location: String,
     schema: TableSchema,
@@ -364,6 +366,9 @@ impl Table {
         let branch = DEFAULT_MAIN_BRANCH.to_string();
         Self {
             file_io,
+            btree_reader_cache: Arc::new(global_index_scanner::SharedBTreeReaderCache::new(
+                global_index_scanner::DEFAULT_BTREE_READER_CACHE_BYTES,
+            )),
             identifier,
             location,
             schema,
@@ -408,6 +413,9 @@ impl Table {
 
         Ok(Self {
             file_io,
+            btree_reader_cache: Arc::new(global_index_scanner::SharedBTreeReaderCache::new(
+                global_index_scanner::DEFAULT_BTREE_READER_CACHE_BYTES,
+            )),
             identifier,
             location,
             schema,
@@ -792,6 +800,7 @@ impl Table {
         });
         Self {
             file_io: self.file_io.clone(),
+            btree_reader_cache: Arc::clone(&self.btree_reader_cache),
             identifier: self.identifier.clone(),
             location: self.location.clone(),
             schema: self.schema.copy_with_options(extra),
@@ -1197,6 +1206,7 @@ impl Table {
         options.insert("branch".to_string(), branch.clone());
         Ok(Self {
             file_io: self.file_io.clone(),
+            btree_reader_cache: Arc::clone(&self.btree_reader_cache),
             identifier: self.identifier.clone(),
             location: self.location.clone(),
             schema: schema.copy_with_replaced_options(options),

@@ -220,7 +220,11 @@ impl GlobalIndexScanner {
         // Each concurrent task owns its reader. Only return it to the shared
         // cache after all predicates for this shard have completed.
         if let Some(OpenedGlobalIndexReader::BTree(reader)) = reader.take() {
-            self.return_reader(entry.resolved_path(&self.table_path), reader);
+            self.return_reader(
+                entry.resolved_path(&self.table_path),
+                data_type.clone(),
+                reader,
+            );
         }
         Ok(EntryQueryResult {
             bitmap: file_result,
@@ -240,9 +244,8 @@ impl GlobalIndexScanner {
     }
 
     /// Get a cached reader or open a new one for the given resolved path. The
-    /// cache is keyed by the resolved path (not the bare file name) so two entries
-    /// that share a file name but resolve to different locations — e.g. distinct
-    /// external paths — never reuse each other's reader.
+    /// cache uses the resolved path and key type, so distinct external paths
+    /// or comparators never reuse one another's reader.
     pub(super) async fn get_or_open_reader(
         &self,
         entry: &GlobalIndexEntry,
@@ -250,12 +253,15 @@ impl GlobalIndexScanner {
         data_type: &DataType,
     ) -> Result<OpenedGlobalIndexReader> {
         let resolved_path = entry.resolved_path(&self.table_path);
-        // Try to take from cache
-        {
-            let mut cache = self.reader_cache.lock().unwrap();
-            if let Some(reader) = cache.remove(&resolved_path) {
-                return Ok(OpenedGlobalIndexReader::BTree(reader));
-            }
+        if let Some(mut reader) = self.reader_cache.take(
+            &(resolved_path.clone(), data_type.clone()),
+            self.reader_cache_epoch,
+        ) {
+            reader.set_data_block_cache(Arc::clone(
+                self.field_options(entry)
+                    .map_or(&self.btree_data_block_cache, |s| &s.btree_cache),
+            ));
+            return Ok(OpenedGlobalIndexReader::BTree(reader));
         }
 
         #[cfg(test)]
@@ -487,8 +493,13 @@ impl GlobalIndexScanner {
     }
 
     /// Return a reader to the cache for future reuse.
-    pub(super) fn return_reader(&self, resolved_path: String, reader: BTreeIndexReader<BoxedCmp>) {
-        let mut cache = self.reader_cache.lock().unwrap();
-        cache.insert(resolved_path, reader);
+    pub(super) fn return_reader(
+        &self,
+        resolved_path: String,
+        data_type: DataType,
+        reader: BTreeIndexReader<BoxedCmp>,
+    ) {
+        self.reader_cache
+            .put((resolved_path, data_type), reader, self.reader_cache_epoch);
     }
 }

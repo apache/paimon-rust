@@ -45,9 +45,12 @@ use super::global_index_types::{
 use crate::btree::{BTreeDataBlockCache, BTreeIndexMeta, BTreeIndexReader};
 use crate::fm_index::{manifest_row_range, FMReadContext, FMReadOptions};
 use crate::io::FileIO;
-use crate::spec::{DataField, FileKind, GlobalIndexSearchMode, IndexManifestEntry, Predicate};
+use crate::spec::{
+    DataField, DataType, FileKind, GlobalIndexSearchMode, IndexManifestEntry, Predicate,
+};
 use crate::table::RowRange;
 use crate::{Error, Result};
+use lru::LruCache;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -59,6 +62,101 @@ use std::sync::atomic::{
 };
 
 type BoxedCmp = Box<dyn Fn(&[u8], &[u8]) -> Result<Ordering> + Send + Sync>;
+
+type ReaderKey = (String, DataType);
+type CachedReader = (BTreeIndexReader<BoxedCmp>, usize);
+
+pub(super) const DEFAULT_BTREE_READER_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Reuses immutable BTree index metadata between scans of a table handle.
+/// Readers are exclusive while in use. A storage credential generation change
+/// drops idle readers, and in-flight scans cannot return older readers.
+pub(super) struct SharedBTreeReaderCache {
+    readers: Mutex<(LruCache<ReaderKey, CachedReader>, usize, u64)>,
+    max_bytes: usize,
+    data_blocks: Mutex<Option<(usize, Arc<BTreeDataBlockCache>)>>,
+}
+
+impl std::fmt::Debug for SharedBTreeReaderCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedBTreeReaderCache")
+            .field("max_bytes", &self.max_bytes)
+            .finish()
+    }
+}
+
+impl SharedBTreeReaderCache {
+    pub(super) fn new(max_bytes: usize) -> Self {
+        Self {
+            readers: Mutex::new((LruCache::unbounded(), 0, 0)),
+            max_bytes,
+            data_blocks: Mutex::new(None),
+        }
+    }
+
+    fn data_block_cache(&self, max_bytes: usize) -> Arc<BTreeDataBlockCache> {
+        let mut slot = self.data_blocks.lock().unwrap();
+        if let Some((size, cache)) = slot.as_ref() {
+            if *size == max_bytes {
+                return Arc::clone(cache);
+            }
+            // Parked readers retain the previous data cache. Drop them before
+            // switching budgets so old caches cannot accumulate on a table.
+            let mut readers = self.readers.lock().unwrap();
+            readers.0.clear();
+            readers.1 = 0;
+        }
+        let cache = Arc::new(BTreeDataBlockCache::new(max_bytes));
+        *slot = Some((max_bytes, Arc::clone(&cache)));
+        cache
+    }
+
+    fn set_epoch(&self, epoch: u64) {
+        let mut state = self.readers.lock().unwrap();
+        if state.2 != epoch {
+            state.0.clear();
+            state.1 = 0;
+            state.2 = epoch;
+        }
+    }
+
+    fn take(&self, key: &ReaderKey, epoch: u64) -> Option<BTreeIndexReader<BoxedCmp>> {
+        let mut state = self.readers.lock().unwrap();
+        if state.2 != epoch {
+            return None;
+        }
+        let (reader, weight) = state.0.pop(key)?;
+        state.1 = state.1.saturating_sub(weight);
+        Some(reader)
+    }
+
+    fn put(&self, key: ReaderKey, mut reader: BTreeIndexReader<BoxedCmp>, epoch: u64) {
+        let data_blocks = self.data_blocks.lock().unwrap();
+        if let Some((_, cache)) = data_blocks.as_ref() {
+            // Never retain one scan-scoped block cache per parked reader.
+            reader.set_data_block_cache(Arc::clone(cache));
+        }
+        let weight = reader.cache_weight().saturating_add(key.0.capacity());
+        if weight > self.max_bytes {
+            return;
+        }
+        let mut state = self.readers.lock().unwrap();
+        if state.2 != epoch {
+            return;
+        }
+        if let Some((_, old_weight)) = state.0.pop(&key) {
+            state.1 = state.1.saturating_sub(old_weight);
+        }
+        state.1 = state.1.saturating_add(weight);
+        state.0.put(key, (reader, weight));
+        while state.1 > self.max_bytes {
+            let Some((_, (_, old_weight))) = state.0.pop_lru() else {
+                break;
+            };
+            state.1 = state.1.saturating_sub(old_weight);
+        }
+    }
+}
 
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 
@@ -137,8 +235,9 @@ pub(crate) struct GlobalIndexScanner {
     coverage_by_field: HashMap<i32, Vec<RowRange>>,
     /// Schema fields for field_id lookup.
     schema_fields: Vec<DataField>,
-    /// Cache of opened BTree readers, keyed by resolved path.
-    reader_cache: Mutex<HashMap<String, BTreeIndexReader<BoxedCmp>>>,
+    /// Cache of opened BTree readers, keyed by resolved path and key type.
+    reader_cache: Arc<SharedBTreeReaderCache>,
+    reader_cache_epoch: u64,
     /// Serialize use of each BTree reader across concurrent predicate branches.
     btree_file_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     #[cfg(test)]
@@ -359,11 +458,20 @@ impl GlobalIndexScanner {
             #[cfg(test)]
             coverage_by_field,
             schema_fields: schema_fields.to_vec(),
-            reader_cache: Mutex::new(HashMap::new()),
+            reader_cache: Arc::new(SharedBTreeReaderCache::new(usize::MAX)),
+            reader_cache_epoch: 0,
             btree_file_locks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             query_io_probe: None,
         }))
+    }
+
+    fn with_reader_cache(mut self, cache: Arc<SharedBTreeReaderCache>, epoch: u64) -> Self {
+        cache.set_epoch(epoch);
+        self.btree_data_block_cache = cache.data_block_cache(self.btree_data_block_cache_size);
+        self.reader_cache = cache;
+        self.reader_cache_epoch = epoch;
+        self
     }
 
     /// Bootstrap shared reader resources from effective field settings. An
@@ -651,19 +759,34 @@ pub(crate) struct GlobalIndexEvaluation<'a> {
 pub(crate) async fn evaluate_global_index(
     evaluation: GlobalIndexEvaluation<'_>,
 ) -> Result<Option<Vec<RowRange>>> {
-    evaluate_global_index_impl(evaluation, None).await
+    evaluate_global_index_impl(evaluation, None, None).await
 }
 
 pub(crate) async fn evaluate_global_index_with_options(
     evaluation: GlobalIndexEvaluation<'_>,
     options: &HashMap<String, String>,
 ) -> Result<Option<Vec<RowRange>>> {
-    evaluate_global_index_impl(evaluation, Some(options)).await
+    evaluate_global_index_impl(evaluation, Some(options), None).await
+}
+
+pub(super) async fn evaluate_global_index_with_options_cached(
+    evaluation: GlobalIndexEvaluation<'_>,
+    options: &HashMap<String, String>,
+    reader_cache: Arc<SharedBTreeReaderCache>,
+    reader_cache_epoch: u64,
+) -> Result<Option<Vec<RowRange>>> {
+    evaluate_global_index_impl(
+        evaluation,
+        Some(options),
+        Some((reader_cache, reader_cache_epoch)),
+    )
+    .await
 }
 
 async fn evaluate_global_index_impl(
     evaluation: GlobalIndexEvaluation<'_>,
     options: Option<&HashMap<String, String>>,
+    reader_cache: Option<(Arc<SharedBTreeReaderCache>, u64)>,
 ) -> Result<Option<Vec<RowRange>>> {
     let scanner = match GlobalIndexScanner::create_with_fm_options(
         evaluation.file_io,
@@ -677,10 +800,15 @@ async fn evaluate_global_index_impl(
         evaluation.fm_read_options,
     )? {
         Some(s) => {
-            if let Some(options) = options {
-                s.with_field_options(options, evaluation.index_entries)?
+            let scanner = if let Some((cache, epoch)) = reader_cache {
+                s.with_reader_cache(cache, epoch)
             } else {
                 s
+            };
+            if let Some(options) = options {
+                scanner.with_field_options(options, evaluation.index_entries)?
+            } else {
+                scanner
             }
         }
         None => return Ok(None),
