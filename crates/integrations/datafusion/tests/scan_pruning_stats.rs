@@ -280,6 +280,92 @@ async fn test_sql_row_id_predicates_prune_row_files() {
 }
 
 #[tokio::test]
+async fn test_sql_row_limit_respects_row_ranges_deletions_and_residuals() {
+    let (_tmp, ctx) = common::setup_sql_context().await;
+    let table = "paimon.test_db.row_limit";
+    common::exec(
+        &ctx,
+        &format!(
+            "CREATE TABLE {table} (id INT, value INT) WITH (
+                'file.format' = 'row',
+                'row-tracking.enabled' = 'true',
+                'data-evolution.enabled' = 'true',
+                'deletion-vectors.enabled' = 'true',
+                'write-only' = 'true'
+            )"
+        ),
+    )
+    .await;
+    common::exec(
+        &ctx,
+        &format!(
+            "INSERT INTO {table} (id, value) VALUES (10, 100), (11, 110), (12, 120), (13, 130), (14, 140)"
+        ),
+    )
+    .await;
+    common::exec(&ctx, &format!("DELETE FROM {table} WHERE id IN (10, 12)")).await;
+
+    for (suffix, expected, scan_limit) in [
+        ("LIMIT 1", (11, 110), Some(1)),
+        (
+            r#"WHERE "_ROW_ID" BETWEEN 2 AND 100 LIMIT 1"#,
+            (13, 130),
+            Some(1),
+        ),
+        (
+            r#"WHERE "_ROW_ID" BETWEEN 1 AND 100 LIMIT 1 OFFSET 1"#,
+            (13, 130),
+            Some(2),
+        ),
+        (
+            r#"WHERE "_ROW_ID" BETWEEN 1 AND 100 AND value >= 130 LIMIT 1"#,
+            (13, 130),
+            None,
+        ),
+        (
+            r#"WHERE "_ROW_ID" BETWEEN 1 AND 100 ORDER BY id DESC LIMIT 1"#,
+            (14, 140),
+            None,
+        ),
+    ] {
+        let sql = format!("SELECT id, value FROM {table} {suffix}");
+        let plan = ctx
+            .sql(&sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let plan_text = displayable(plan.as_ref()).indent(true).to_string();
+        let scan = plan_text
+            .lines()
+            .find(|line| line.contains("PaimonTableScan:"))
+            .unwrap();
+        let actual_limit = scan
+            .split(", limit=")
+            .nth(1)
+            .map(|limit| limit.split(',').next().unwrap().parse::<usize>().unwrap());
+        assert_eq!(actual_limit, scan_limit, "{plan_text}");
+        assert_eq!(common::collect_id_value(&ctx, &sql).await, vec![expected]);
+    }
+
+    let bounds = r#""_ROW_ID" BETWEEN 1 AND 3"#;
+    let batches = ctx
+        .sql(&format!("SELECT COUNT(*) FROM {table} WHERE {bounds}"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(count.value(0), 2);
+}
+
+#[tokio::test]
 async fn test_count_star_uses_statistics_without_scan_stats() {
     let (_tmp, catalog) = setup_stats_table().await;
     let sql_context = common::create_sql_context(catalog).await;

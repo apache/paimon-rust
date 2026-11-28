@@ -392,6 +392,43 @@ async fn data_evolution_row_id_survives_variant_extraction_pushdown() {
 }
 
 #[tokio::test]
+async fn variant_extraction_keeps_exact_row_id_filters() {
+    let (_tmp, ctx) = setup_data_evolution_shredded_variant_table_with_rows().await;
+    let sql = r#"
+        SELECT variant_get(payload, '$.age', 'int') AS age
+        FROM paimon.test_db.de_t
+        WHERE "_ROW_ID" BETWEEN 1 AND 100
+    "#;
+    let plan = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let plan_text = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        plan_text.contains("PushedVariants=[payload=[$.age]]"),
+        "{plan_text}"
+    );
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let ages = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ages, vec![32]);
+}
+
+#[tokio::test]
 async fn try_variant_get_invalid_path_pushdown_returns_null() {
     let (_tmp, sql_context) = setup_shredded_variant_table_with_rows().await;
     let sql = r#"

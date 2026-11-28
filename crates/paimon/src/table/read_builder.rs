@@ -24,6 +24,7 @@ use super::bucket_filter::{extract_predicate_for_keys, split_partition_and_data_
 use super::format_read_builder::FormatReadBuilder;
 use super::incremental_scan::{IncrementalScan, IncrementalScanMode};
 use super::partition_filter::PartitionFilter;
+use super::row_id_predicate::is_row_id_range_predicate;
 use super::table_read::{configured_parquet_read_budget, TableRead};
 use super::{Table, TableScan};
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
@@ -489,16 +490,26 @@ impl<'a> PaimonReadBuilder<'a> {
 
     /// Whether a translated predicate is exact at the table-provider boundary.
     ///
-    /// Exact filters are fully enforced by paimon-core scan planning, without
-    /// requiring residual filtering above the scan.
+    /// Planning enforces partition predicates. Data Evolution reads also
+    /// enforce predicates that can be expressed entirely as row ID ranges.
     pub fn is_exact_filter_pushdown(&self, filter: &Predicate) -> bool {
-        // Masked partition predicates may need a read-side residual.
-        !self.table.schema().core_options().query_auth_enabled()
-            && is_exact_filter_pushdown_for_schema(
-                self.table.schema().fields(),
-                self.table.schema().partition_keys(),
+        let schema = self.table.schema();
+        let options = schema.core_options();
+        if options.query_auth_enabled() {
+            return false;
+        }
+        if !options.data_evolution_enabled() || !schema.primary_keys().is_empty() {
+            return is_exact_filter_pushdown_for_schema(
+                schema.fields(),
+                schema.partition_keys(),
                 filter,
-            )
+            );
+        }
+        if schema.partition_keys().is_empty() {
+            return is_row_id_range_predicate(filter);
+        }
+        let (_, data_predicates) = split_scan_predicates(self.table, filter.clone());
+        data_predicates.iter().all(is_row_id_range_predicate)
     }
 
     /// Set row ID ranges `[from, to]` (inclusive). An empty vector selects no rows.

@@ -832,10 +832,10 @@ pub struct PaimonTableScan {
     planned_partitions: Vec<Arc<[DataSplit]>>,
     plan_properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
-    /// Optional limit hint pushed to paimon-core planning.
+    /// Optional limit pushed to planning and eligible Data Evolution reads.
     limit: Option<usize>,
     /// Whether the pushed predicate is exact (no residual filtering needed).
-    /// When true and all splits have known merged_row_count, statistics can be exact.
+    /// Exact row-count statistics also require exact counts from all splits.
     filter_exact: bool,
     /// Metadata-pruning statistics captured during eager scan planning.
     scan_stats: Option<ScanStats>,
@@ -1090,6 +1090,12 @@ impl PaimonTableScan {
         let case_sensitive = self.case_sensitive;
         let runtime_filters = self.runtime_filters.clone();
         let decoder_filters = self.decoder_filters.clone();
+        // Runtime expressions may still reject rows after the core reader yields them.
+        let read_limit = if runtime_filters.is_empty() && decoder_filters.is_empty() {
+            crate::table::data_evolution_read_limit(&table, self.limit, self.filter_exact)
+        } else {
+            None
+        };
         let parquet_read_budget = Arc::clone(&self.parquet_read_budget);
 
         let fut = async move {
@@ -1109,6 +1115,9 @@ impl PaimonTableScan {
             read_builder.with_read_type(read_type);
             if !paimon_predicates.is_empty() {
                 read_builder.with_filter(Predicate::and(paimon_predicates));
+            }
+            if let Some(limit) = read_limit {
+                read_builder.with_limit(limit);
             }
             read_builder.with_parquet_read_budget(parquet_read_budget);
 
@@ -1378,23 +1387,25 @@ impl ExecutionPlan for PaimonTableScan {
         };
 
         let mut total_rows: usize = 0;
-        let mut all_row_counts_known = true;
+        let mut all_row_counts_exact = true;
         for splits in partitions {
             for split in splits.iter() {
                 if let Some(row_count) = split.merged_row_count() {
                     total_rows += row_count as usize;
+                    // The range count does not subtract deletion vectors.
+                    all_row_counts_exact &= split.row_ranges().is_none();
                 } else {
-                    all_row_counts_known = false;
+                    all_row_counts_exact = false;
                     total_rows += split.row_count() as usize;
                 }
             }
         }
 
         // Return exact statistics when:
-        // 1. All splits have known merged_row_count (no deletion files with unknown cardinality)
+        // 1. All splits have exact merged row counts.
         // 2. No limit is applied (limit would make row count inexact)
         // 3. Filter is exact (no residual filtering needed above the scan)
-        let num_rows_precision = if all_row_counts_known
+        let num_rows_precision = if all_row_counts_exact
             && self.limit.is_none()
             && self.filter_exact
             && self.runtime_filters.is_empty()
@@ -1507,6 +1518,7 @@ mod tests {
         Schema as PaimonSchema, TableSchema, VarCharType,
     };
     use paimon::table::{DeletionFile, RowRange, Table};
+    use std::collections::HashMap;
     use std::fs;
     use tempfile::tempdir;
     use test_utils::{local_file_path, test_data_file, write_int_parquet_file};
@@ -3108,6 +3120,26 @@ mod tests {
 
         let filtered_scan = result.updated_node.unwrap();
         let batches = filtered_scan
+            .execute(0, SessionContext::new().task_ctx())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(&batches), vec![3, 4, 5]);
+
+        let mut limited = filtered_scan
+            .downcast_ref::<PaimonTableScan>()
+            .unwrap()
+            .clone();
+        limited.table = limited.table.copy_with_options(HashMap::from([
+            ("data-evolution.enabled".to_string(), "true".to_string()),
+            ("row-tracking.enabled".to_string(), "true".to_string()),
+        ]));
+        limited.limit = Some(1);
+        limited.filter_exact = true;
+        // Exercise a filter evaluated solely above the core reader.
+        limited.decoder_filters.clear();
+        let batches = limited
             .execute(0, SessionContext::new().task_ctx())
             .unwrap()
             .try_collect::<Vec<_>>()
