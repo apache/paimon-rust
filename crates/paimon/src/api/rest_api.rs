@@ -1261,6 +1261,8 @@ impl RESTApi {
     // ==================== Commit Operations ====================
 
     /// Commit a snapshot for a table.
+    /// Returns the server's reported `success`. An invalid response leaves
+    /// the publication outcome unknown.
     ///
     /// Corresponds to Python `RESTApi.commit_snapshot`.
     pub async fn commit_snapshot(
@@ -1282,10 +1284,12 @@ impl RESTApi {
             "statistics": statistics,
         });
         let resp: serde_json::Value = self.client.post(&path, &request).await?;
-        Ok(resp
-            .get("success")
+        resp.get("success")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false))
+            .ok_or_else(|| crate::Error::UnexpectedError {
+                message: "REST snapshot commit response is missing a boolean success field".into(),
+                source: None,
+            })
     }
 
     /// Roll back a table through the server, optionally comparing its identity

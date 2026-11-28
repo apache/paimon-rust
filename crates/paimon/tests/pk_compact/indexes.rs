@@ -782,7 +782,7 @@ async fn vector_indexes_skip_invalid_values_hidden_by_captured_and_new_deletion_
 }
 
 #[tokio::test]
-async fn retained_vector_sources_reject_restored_deletions_but_allow_repacking_and_growth() {
+async fn retained_vector_sources_reject_same_bucket_dv_overwrites() {
     use bytes::Bytes;
     use indexmap::IndexMap;
     use paimon::spec::{DeletionVectorMeta, IndexFileMeta, SchemaChange};
@@ -934,52 +934,52 @@ async fn retained_vector_sources_reject_restored_deletions_but_allow_repacking_a
             .await
             .unwrap();
         let before = latest(&current).await;
-        let published = builder
+        let error = builder
             .new_commit()
             .unwrap()
             .commit_compact(results.clone())
-            .await;
-        if matches!(change, "removed" | "shrunk") {
-            let error =
-                published.expect_err("a prepared vector payload cannot omit a restored live row");
-            assert!(
-                error.to_string().contains("source deletions were restored"),
-                "{change}: {error}"
-            );
-            assert_eq!(latest(&current).await, before, "{change}");
-            for result in &results {
-                for entry in result
-                    .index_entries()
-                    .unwrap()
-                    .iter()
-                    .filter(|entry| entry.kind == paimon::spec::FileKind::Add)
-                {
-                    assert!(
-                        current
-                            .file_io()
-                            .exists(&index_path(&current, entry))
-                            .await
-                            .unwrap(),
-                        "{change}: failed commit owns no prepared files"
-                    );
-                }
-                for file in result.files() {
-                    assert!(
-                        current
-                            .file_io()
-                            .exists(&format!(
-                                "{}/bucket-0/{}",
-                                current.location(),
-                                file.file_name
-                            ))
-                            .await
-                            .unwrap(),
-                        "{change}: prepared data must remain recoverable"
-                    );
-                }
-            }
+            .await
+            .unwrap_err();
+        let reason = if matches!(change, "removed" | "shrunk") {
+            "source deletions were restored"
         } else {
-            published.unwrap();
+            "Concurrent PK deletion-vector compaction"
+        };
+        assert!(error.to_string().contains(reason), "{change}: {error}");
+        assert_eq!(latest(&current).await, before, "{change}");
+        for result in &results {
+            for entry in result
+                .index_entries()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.kind == paimon::spec::FileKind::Add)
+            {
+                assert!(
+                    current
+                        .file_io()
+                        .exists(&index_path(&current, entry))
+                        .await
+                        .unwrap(),
+                    "{change}: failed commit owns no prepared files"
+                );
+            }
+            for file in result.files() {
+                assert!(
+                    current
+                        .file_io()
+                        .exists(&format!(
+                            "{}/bucket-0/{}",
+                            current.location(),
+                            file.file_name
+                        ))
+                        .await
+                        .unwrap(),
+                    "{change}: prepared data must remain recoverable"
+                );
+            }
+        }
+        if matches!(change, "repacked" | "grown") {
+            compact(&current).await;
             assert_eq!(latest(&current).await.id(), before.id() + 1, "{change}");
             let batches = read(&current, Some(&["id"])).await;
             let ids = batches

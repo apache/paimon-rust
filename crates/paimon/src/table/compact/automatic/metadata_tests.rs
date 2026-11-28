@@ -90,7 +90,7 @@ async fn automatic_tasks_read_captured_metadata_once_and_keep_bucket_indexes() {
         let snapshot_path = table.snapshot_manager().snapshot_path(snapshot.id());
         watched.push(snapshot_path.clone());
         counter.watch(watched);
-        let prepared = execute_auto_plan(&table, &plan, &executor, 2)
+        let (prepared, _) = execute_auto_plan(&table, &plan, &executor, 2, None)
             .await
             .unwrap();
         let counts = counter.counts();
@@ -140,7 +140,7 @@ async fn automatic_tasks_read_captured_metadata_once_and_keep_bucket_indexes() {
             error.to_string().contains("snapshot was replaced"),
             "{error}"
         );
-        let error = execute_auto_plan(&table, &plan, &executor, 2)
+        let error = execute_auto_plan(&table, &plan, &executor, 2, None)
             .await
             .err()
             .unwrap();
@@ -257,14 +257,15 @@ async fn automatic_pk_vector_header_reads_and_empty_stats_share_a_limit_across_b
                 "retained header reads and empty-segment stats exceeded one permit per round"
             );
         };
-        let executions = (0..rounds).map(|_| execute_auto_plan(&table, &plan, &executor, 2));
+        let executions = (0..rounds).map(|_| execute_auto_plan(&table, &plan, &executor, 2, None));
         let (prepared, ()) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(futures::future::join_all(executions), check_limit)
         })
         .await
         .expect("each round must start an index check while the other rounds are paused");
         for result in prepared {
-            assert_eq!(result.unwrap().index_entries.unwrap().len(), 2);
+            let (prepared, _) = result.unwrap();
+            assert_eq!(prepared.index_entries.unwrap().len(), 2);
         }
         assert!(counter
             .counts()

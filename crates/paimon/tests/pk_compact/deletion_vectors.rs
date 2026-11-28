@@ -419,7 +419,214 @@ async fn dv_filters_selected_rows_and_keeps_other_ranges_in_a_shared_container()
 }
 
 #[tokio::test]
-async fn dv_commit_accepts_concurrent_l0_but_rejects_changed_inputs_or_missing_targets() {
+async fn dv_compaction_rejects_competing_rewrite_of_unselected_runs() {
+    let table = dv_table(&[]).await;
+    seed(&table).await;
+    write_batch(
+        &table,
+        &make_batch((1000..1100).collect(), (1000..1100).collect()),
+    )
+    .await;
+    compact(&table).await;
+
+    // Select only the two existing positive levels before the next L0 arrives.
+    let competing = table.copy_with_options(std::collections::HashMap::from([
+        ("num-sorted-run.compaction-trigger".into(), "2".into()),
+        (
+            "compaction.max-size-amplification-percent".into(),
+            "0".into(),
+        ),
+    ]));
+    let builder = competing.new_compact_builder();
+    let competing_plan = builder.new_planner().unwrap().plan().await.unwrap();
+    assert_eq!(competing_plan.tasks().len(), 1);
+    assert!(competing_plan.tasks()[0]
+        .files()
+        .iter()
+        .all(|file| file.level > 0));
+    let competing_results = execute(&competing, &competing_plan).await;
+
+    write_batch(&table, &make_batch(vec![2000], vec![2000])).await;
+    let builder = table.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    assert_eq!(plan.tasks().len(), 1);
+    assert!(plan.tasks()[0].files().iter().all(|file| file.level == 0));
+    let results = execute(&table, &plan).await;
+    competing
+        .new_compact_builder()
+        .new_commit()
+        .unwrap()
+        .commit_compact(competing_results)
+        .await
+        .unwrap();
+    let before = latest(&table).await;
+    assert_eq!(*before.commit_kind(), CommitKind::COMPACT);
+    let error = builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Concurrent PK deletion-vector compaction"),
+        "{error}"
+    );
+    assert_eq!(latest(&table).await, before);
+    compact(&table).await;
+    let mut expected: Vec<_> = (0..1100).map(|id| (id, id)).collect();
+    expected.push((2000, 2000));
+    assert_eq!(rows(&table).await, expected);
+}
+
+#[tokio::test]
+async fn dv_compaction_rejects_intervening_index_only_overwrite() {
+    let table = dv_table(&[]).await;
+    let anchor = seed(&table).await;
+    write_batch(&table, &make_batch(vec![42], vec![9000])).await;
+    let builder = table.new_compact_builder();
+    let planner = builder.new_planner().unwrap();
+    let plan = planner.plan().await.unwrap();
+    set_vectors(&table, &plan.tasks()[0], &[(&anchor.file_name, &[42])]).await;
+
+    let plan = planner.plan().await.unwrap();
+    let task = &plan.tasks()[0];
+    assert!(task.files().iter().all(|file| file.level == 0));
+    let results = execute(&table, &plan).await;
+    assert_eq!(results[0].files()[0].level, 4);
+    assert!(rows(&table).await.iter().all(|(key, _)| *key != 42));
+
+    let mut removal = CommitMessage::new(task.partition().to_vec(), task.bucket(), vec![]);
+    removal.deleted_index_files = indexes(&table)
+        .await
+        .into_iter()
+        .map(|entry| entry.index_file)
+        .collect();
+    assert_eq!(removal.deleted_index_files.len(), 1);
+    table
+        .new_write_builder()
+        .new_commit()
+        .commit(vec![removal])
+        .await
+        .unwrap();
+    assert_eq!(*latest(&table).await.commit_kind(), CommitKind::OVERWRITE);
+    write_batch(&table, &make_batch(vec![2000], vec![2000])).await;
+    let appended = latest(&table).await;
+    assert_eq!(*appended.commit_kind(), CommitKind::APPEND);
+
+    let error = builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Concurrent PK deletion-vector compaction"),
+        "{error}"
+    );
+    assert_eq!(latest(&table).await.id(), appended.id());
+
+    compact(&table).await;
+    let visible: Vec<_> = rows(&table)
+        .await
+        .into_iter()
+        .filter(|(key, _)| *key == 42)
+        .collect();
+    assert_eq!(visible, vec![(42, 9000)]);
+}
+
+#[tokio::test]
+async fn dv_compaction_preserves_concurrent_compaction_in_another_bucket() {
+    independent_compactions([("p", 0), ("p", 1)]).await;
+}
+
+#[tokio::test]
+async fn dv_compaction_preserves_concurrent_compaction_in_another_partition() {
+    independent_compactions([("p", 0), ("q", 0)]).await;
+}
+
+async fn independent_compactions(locations: [(&str, i32); 2]) {
+    let schema = Schema::builder()
+        .column("pt", DataType::VarChar(VarCharType::string_type()))
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .primary_key(["pt", "id"])
+        .partition_keys(["pt"])
+        .option("bucket", "2")
+        .option("deletion-vectors.enabled", "true")
+        .option("deletion-vectors.merge-on-read", "false")
+        .build()
+        .unwrap();
+    let table = table_with_schema(TableSchema::new(0, &schema)).await;
+    for (count, value_offset) in [(1000, 0), (1, 3000)] {
+        for (index, (partition, bucket)) in locations.iter().enumerate() {
+            let offset = index as i32 * 1000;
+            let ids: Vec<_> = (offset..offset + count).collect();
+            let values = ids.iter().map(|id| id + value_offset).collect();
+            let batch = make_partitioned_batch(vec![partition; ids.len()], ids, values);
+            let writer = table.new_write_builder();
+            let mut write = writer.new_write().unwrap();
+            write.write_arrow(&[batch], Some(*bucket)).await.unwrap();
+            writer
+                .new_commit()
+                .commit(write.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+        }
+        if count == 1000 {
+            assert_eq!(compact(&table).await.len(), 2);
+        }
+    }
+
+    let first = table
+        .new_compact_builder()
+        .with_commit_user("first")
+        .unwrap();
+    let second = table
+        .new_compact_builder()
+        .with_commit_user("second")
+        .unwrap();
+    let plan = first.new_planner().unwrap().plan().await.unwrap();
+    assert_eq!(plan.tasks().len(), 2);
+    assert_eq!(
+        plan.tasks()[0].partition() == plan.tasks()[1].partition(),
+        locations[0].0 == locations[1].0
+    );
+    assert_eq!(
+        plan.tasks()[0].bucket() == plan.tasks()[1].bucket(),
+        locations[0].1 == locations[1].1
+    );
+    let mut results = execute(&table, &plan).await;
+    let pending = results.pop().unwrap();
+    first
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap();
+    let first_indexes = indexes(&table).await;
+    assert_eq!(first_indexes.len(), 1);
+    second
+        .new_commit()
+        .unwrap()
+        .commit_compact(vec![pending])
+        .await
+        .unwrap();
+
+    let final_indexes = indexes(&table).await;
+    assert_eq!(final_indexes.len(), 2);
+    assert!(final_indexes.contains(&first_indexes[0]));
+    let expected: Vec<_> = (0..2000)
+        .map(|id| (id, id + if id % 1000 == 0 { 3000 } else { 0 }))
+        .collect();
+    assert_eq!(rows(&table).await, expected);
+}
+
+#[tokio::test]
+async fn dv_commit_accepts_concurrent_l0_but_rejects_same_bucket_overwrites() {
     for change in [
         "l0",
         "unrelated-target-dv",
@@ -467,35 +674,30 @@ async fn dv_commit_accepts_concurrent_l0_but_rejects_changed_inputs_or_missing_t
         let before = latest(&table).await.id();
         let commit = builder.new_commit().unwrap();
         let result = commit.commit_compact(results.clone()).await;
-        if matches!(change, "l0" | "unrelated-target-dv") {
+        if change == "l0" {
             result.unwrap();
-            let published = latest(&table).await.id();
-            commit.commit_compact(results).await.unwrap();
-            assert_eq!(latest(&table).await.id(), published);
             assert_eq!(
                 rows(&table).await.iter().find(|(key, _)| *key == 42),
                 Some(&(42, 9000))
             );
-            if change == "l0" {
-                compact(&table).await;
-                assert_eq!(
-                    rows(&table).await.iter().find(|(key, _)| *key == 42),
-                    Some(&(42, 9001))
-                );
-            } else {
-                assert_eq!(
-                    positions(&table, &anchor_name)
-                        .await
-                        .iter()
-                        .collect::<Vec<_>>(),
-                    vec![42, 500]
-                );
-                let visible = rows(&table).await;
-                assert_eq!(visible.len(), 999);
-                assert!(!visible.iter().any(|(key, _)| *key == 500));
-            }
+            compact(&table).await;
+            assert_eq!(
+                rows(&table).await.iter().find(|(key, _)| *key == 42),
+                Some(&(42, 9001))
+            );
+            let published = latest(&table).await.id();
+            commit.commit_compact(results).await.unwrap();
+            assert_eq!(latest(&table).await.id(), published);
         } else {
-            assert!(result.is_err(), "{change}");
+            let error = result.unwrap_err();
+            let reason = match change {
+                "unrelated-target-dv" => "Concurrent PK deletion-vector compaction",
+                "target-dv" => "Lookup dependency deletion vectors changed",
+                "input-dv" => "input deletion vectors changed",
+                "missing-target" => "Lookup deletion target was removed",
+                _ => unreachable!(),
+            };
+            assert!(error.to_string().contains(reason), "{change}: {error}");
             assert_eq!(latest(&table).await.id(), before);
         }
     }

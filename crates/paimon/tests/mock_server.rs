@@ -77,6 +77,7 @@ struct MockState {
     tags_replaced_after_read: HashMap<String, (usize, Snapshot)>,
     catalog_snapshots: HashMap<String, Snapshot>,
     rollback_snapshots: HashMap<(String, i64), Snapshot>,
+    compact_commit_response: Option<(StatusCode, Option<serde_json::Value>)>,
     create_tag_calls: Vec<(String, String, CreateTagRequest)>,
     get_tag_calls: Vec<(String, String, String)>,
     delete_tag_calls: Vec<(String, String, String)>,
@@ -945,6 +946,15 @@ impl RESTServer {
             manager.commit_snapshot(&snapshot).await
         }
         .await;
+        if matches!(published, Ok(true)) && snapshot.commit_kind() == &CommitKind::COMPACT {
+            if let Some((status, body)) = state.inner.lock().unwrap().compact_commit_response.take()
+            {
+                return match body {
+                    Some(body) => (status, Json(body)).into_response(),
+                    None => status.into_response(),
+                };
+            }
+        }
         match published {
             Ok(success) => (StatusCode::OK, Json(json!({"success": success}))).into_response(),
             Err(error) => (
@@ -2290,6 +2300,10 @@ impl RESTServer {
     }
 
     /// Make the drop-view endpoint return the given status.
+    pub fn set_compact_commit_response(&self, status: StatusCode, body: Option<serde_json::Value>) {
+        self.inner.lock().unwrap().compact_commit_response = Some((status, body));
+    }
+
     pub fn set_drop_view_error_status(&self, status: Option<StatusCode>) {
         self.inner.lock().unwrap().drop_view_error_status = status;
     }

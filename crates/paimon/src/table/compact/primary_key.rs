@@ -28,7 +28,10 @@ use arrow_array::{BooleanArray, Int8Array};
 use arrow_schema::SchemaRef;
 use futures::TryStreamExt;
 
-use super::{split_files_by_bucket, validate_file, CompactContext, CompactTask};
+use super::{
+    split_files_by_bucket, validate_file, within_overwrite_l0_scope, CompactContext, CompactTask,
+    OverwriteL0Files,
+};
 use crate::resource::ResourceContext;
 use crate::spec::{
     BigIntType, ChangelogProducer, DataField, DataFileMeta, DataType, MergeEngine, RowKind,
@@ -60,6 +63,7 @@ impl PrimaryKeyCompactPlanner {
         &self,
         source: &Plan,
         context: &CompactContext,
+        overwrite_l0: Option<&OverwriteL0Files>,
     ) -> Result<Vec<CompactTask>> {
         let mut tasks = Vec::new();
         let options = context.schema.core_options();
@@ -68,7 +72,12 @@ impl PrimaryKeyCompactPlanner {
             || options.try_changelog_producer()? == ChangelogProducer::Lookup
             || options.merge_engine()? == MergeEngine::FirstRow
             || options.deletion_vectors_enabled();
-        for ((partition, bucket, total_buckets), files) in split_files_by_bucket(source) {
+        for ((partition, bucket, total_buckets), mut files) in split_files_by_bucket(source) {
+            if overwrite_l0.is_some() {
+                files.retain(|file| {
+                    within_overwrite_l0_scope(overwrite_l0, &partition, bucket, file)
+                });
+            }
             for file in &files {
                 validate_file(file, true)?;
             }

@@ -1781,6 +1781,11 @@ pub struct InputFile {
 }
 
 impl InputFile {
+    pub(crate) fn without_cache(mut self) -> Self {
+        self.cache = None;
+        self
+    }
+
     pub fn location(&self) -> &str {
         &self.path
     }
