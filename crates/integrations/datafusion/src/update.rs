@@ -84,6 +84,16 @@ pub(crate) async fn execute_update(
             "UPDATE with TABLESAMPLE or PARTITION is not supported".into(),
         ));
     }
+    if update.returning.is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "RETURNING is not supported in UPDATE".into(),
+        ));
+    }
+    if update.output.is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "OUTPUT is not supported in UPDATE".into(),
+        ));
+    }
 
     let schema = table.schema();
     let core_options = CoreOptions::new(schema.options());
@@ -104,9 +114,7 @@ async fn execute_primary_key_update(
     enable_ident_normalization: bool,
 ) -> DFResult<DataFrame> {
     primary_key_dml::validate_table(table, "UPDATE")?;
-    if update.returning.is_some()
-        || update.output.is_some()
-        || update.or.is_some()
+    if update.or.is_some()
         || !update.optimizer_hints.is_empty()
         || !update.order_by.is_empty()
         || update.limit.is_some()

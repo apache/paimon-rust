@@ -1199,6 +1199,44 @@ async fn test_alter_and_partition_overwrite_reject_shadowed_temporary_targets() 
 }
 
 #[tokio::test]
+async fn test_partition_overwrite_rejects_result_clauses_before_writing() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog).await;
+    ctx.sql("CREATE TABLE t (id INT, pt INT) PARTITIONED BY (pt)")
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO t VALUES (1, 1), (2, 2)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    for (sql, error) in [
+        (
+            "INSERT OVERWRITE t PARTITION (pt = 1) SELECT 7 RETURNING id",
+            "RETURNING is not supported in INSERT OVERWRITE PARTITION",
+        ),
+        (
+            "INSERT OVERWRITE t PARTITION (pt = 1) OUTPUT inserted.id SELECT 7",
+            "OUTPUT is not supported in INSERT OVERWRITE PARTITION",
+        ),
+    ] {
+        assert_sql_error_contains(&ctx, sql, error).await;
+        assert_eq!(
+            collect_ids(&ctx, "SELECT id FROM t WHERE pt = 1").await,
+            [1],
+            "{sql}"
+        );
+        assert_eq!(
+            collect_ids(&ctx, "SELECT id FROM t WHERE pt = 2").await,
+            [2],
+            "{sql}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_scoped_show_accepts_information_schema() {
     let (_tmp, catalog) = create_test_env();
     let ctx = create_sql_context(catalog).await;
