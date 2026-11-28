@@ -53,6 +53,18 @@ Available storage features:
 | `storage-hdfs`   | HDFS             |
 | `storage-all`    | All of the above |
 
+Paimon uses native TLS by default for REST catalog and HTTP URI requests. To use
+rustls with system certificate roots, disable default features and enable `rustls`
+along with the storage backends you need:
+
+```toml
+paimon = { version = "0.6", default-features = false, features = ["rustls", "storage-fs"] }
+```
+
+If you already disable default features and need HTTPS, select `native-tls`
+to keep the previous backend or select `rustls`. Cargo features are additive:
+another dependency can still enable native TLS for the same reqwest version.
+
 ## Reusing a storage backend
 
 On the development branch, Rust embedders can implement `paimon::io::FileIOProvider`

@@ -425,6 +425,7 @@ reqsign-huaweicloud-obs@3.0.6		X
 reqsign-tencent-cos@3.0.6		X																
 reqwest@0.12.28		X									X							
 reqwest@0.13.4		X									X							
+ring@0.17.14		X							X									
 rle-decode-fast@1.0.3		X									X							
 roaring@0.11.4		X									X							
 roxmltree@0.21.1		X									X							
@@ -615,6 +616,7 @@ windows-link@0.2.1		X									X
 windows-registry@0.6.1		X									X							
 windows-result@0.4.1		X									X							
 windows-strings@0.5.1		X									X							
+windows-sys@0.52.0		X									X							
 windows-sys@0.59.0		X									X							
 windows-sys@0.60.2		X									X							
 windows-sys@0.61.2		X									X							
