@@ -550,6 +550,15 @@ impl TableSchema {
                             column: new_name,
                         });
                     }
+                    let sequence_group_fields = (!new_schema.primary_keys.is_empty()
+                        && PartialUpdateConfig::new(&new_schema.options).is_enabled())
+                    .then_some(fields.as_slice());
+                    rename_field_scoped_options(
+                        &mut new_schema.options,
+                        name,
+                        &new_name,
+                        sequence_group_fields,
+                    )?;
                     fields[idx] = fields[idx].clone().with_name(new_name.clone());
                     rename_in_keys(&mut new_schema.primary_keys, name, &new_name);
                     rename_in_option_list(
@@ -564,12 +573,6 @@ impl TableSchema {
                         name,
                         &new_name,
                     );
-                    // Field-scoped options encode column names in the key
-                    // (`fields.<col>.aggregate-function`, `fields.<cols>.sequence-group`,
-                    // ...) and, for field-list options, in the value too, so they
-                    // must be rewritten as well, mirroring Java
-                    // `SchemaManager.applyRenameColumnsToOptions`.
-                    rename_field_scoped_options(&mut new_schema.options, name, &new_name);
                 }
                 SchemaChange::DropColumn { field_names } => {
                     let name = top_level_field(&field_names)?;
@@ -5530,11 +5533,11 @@ mod tests {
                 .primary_key(["id"])
                 .option("merge-engine", "partial-update")
                 .option(
-                    "fields.version,source_order.sequence-group",
-                    "price,quantity",
+                    "fields.version, source_order.sequence-group",
+                    "price, quantity",
                 )
                 .option(
-                    "fields.version,source_order.sequence-group.sort-order",
+                    "fields.version, source_order.sequence-group.sort-order",
                     "descending",
                 )
                 .build()
@@ -5548,7 +5551,10 @@ mod tests {
                     "source_order".to_string(),
                     "order_seq".to_string(),
                 ),
-                crate::spec::SchemaChange::rename_column("price".to_string(), "amount".to_string()),
+                crate::spec::SchemaChange::rename_column(
+                    "quantity".to_string(),
+                    "amount".to_string(),
+                ),
                 // The direction is a literal, even if a column shares its name.
                 crate::spec::SchemaChange::rename_column(
                     "descending".to_string(),
@@ -5562,12 +5568,12 @@ mod tests {
                 .options()
                 .get("fields.version,order_seq.sequence-group")
                 .map(String::as_str),
-            Some("amount,quantity")
+            Some("price,amount")
         );
         assert_eq!(
             new_schema
                 .options()
-                .get("fields.version,source_order.sequence-group"),
+                .get("fields.version, source_order.sequence-group"),
             None
         );
         assert_eq!(
@@ -5579,7 +5585,40 @@ mod tests {
         );
         assert!(!new_schema
             .options()
-            .contains_key("fields.version,source_order.sequence-group.sort-order"));
+            .contains_key("fields.version, source_order.sequence-group.sort-order"));
+    }
+
+    #[test]
+    fn test_rename_sequence_group_field_to_unrepresentable_name() {
+        let table = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("ts", DataType::Int(IntType::new()))
+                .column("price", DataType::Int(IntType::new()))
+                .column("aux", DataType::Int(IntType::new()))
+                .column("x", DataType::Int(IntType::new()))
+                .column("y", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "partial-update")
+                .option("fields.ts.sequence-group", "price")
+                .build()
+                .unwrap(),
+        );
+        for old in ["ts", "price"] {
+            for new in [" aux ", "x,y", ""] {
+                let err = table
+                    .apply_changes(vec![crate::spec::SchemaChange::rename_column(
+                        old.to_string(),
+                        new.to_string(),
+                    )])
+                    .unwrap_err();
+                assert!(
+                    err.to_string().contains("sequence-group"),
+                    "{old} -> '{new}': {err}"
+                );
+            }
+        }
     }
 
     #[test]

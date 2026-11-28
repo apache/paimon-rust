@@ -1910,6 +1910,133 @@ async fn test_alter_column_preserves_quoted_identifier() {
 }
 
 #[tokio::test]
+async fn test_alter_table_rename_spaced_sequence_group_member() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog.clone()).await;
+    for sql in [
+        "CREATE SCHEMA paimon.test_db",
+        "CREATE TABLE paimon.test_db.events (
+            id BIGINT, ts BIGINT, a BIGINT, b BIGINT, PRIMARY KEY (id)
+        ) WITH ('bucket' = '1', 'merge-engine' = 'partial-update', 'fields.ts.sequence-group' = 'a, b')",
+        "INSERT INTO paimon.test_db.events VALUES (1, 100, 3, 7)",
+        "ALTER TABLE paimon.test_db.events RENAME COLUMN b TO c",
+    ] {
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    }
+
+    let reopened = create_sql_context(catalog).await;
+    reopened
+        .sql("INSERT INTO paimon.test_db.events VALUES (1, 80, 4, 8)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let values = collect_i64_column(&reopened, "SELECT c FROM paimon.test_db.events", "c").await;
+    assert_eq!(values, vec![7]);
+}
+
+#[tokio::test]
+async fn test_alter_table_rename_ambiguous_sequence_group_field() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog.clone()).await;
+    ctx.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
+    ctx.sql(r#"CREATE TABLE paimon.test_db.events (
+        id BIGINT, ts BIGINT, " ts " BIGINT, channel STRING, " channel " STRING, PRIMARY KEY (id)
+    ) WITH (
+        'bucket' = '1', 'merge-engine' = 'partial-update', 'fields. ts .sequence-group' = ' channel '
+    )"#).await.unwrap();
+
+    ctx.sql("INSERT INTO paimon.test_db.events VALUES (1, 100, 10, 'organic', 'first')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    for name in [" channel ", "channel", " ts ", "ts"] {
+        let sql = format!(r#"ALTER TABLE paimon.test_db.events RENAME COLUMN "{name}" TO aux"#);
+        assert_sql_error_contains(&ctx, &sql, "ambiguous").await;
+    }
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "events"))
+        .await
+        .unwrap();
+    assert_eq!(table.schema().id(), 0);
+
+    ctx.sql("INSERT INTO paimon.test_db.events VALUES (1, 80, 20, 'older', 'later')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let batches = ctx
+        .sql(r#"SELECT channel, " channel " AS padded FROM paimon.test_db.events"#)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    datafusion::assert_batches_eq!(
+        [
+            "+---------+--------+",
+            "| channel | padded |",
+            "+---------+--------+",
+            "| organic | later  |",
+            "+---------+--------+",
+        ],
+        &batches
+    );
+}
+
+#[tokio::test]
+async fn test_alter_table_rename_cannot_overwrite_sequence_group() {
+    let (_tmp, catalog) = create_test_env();
+    let ctx = create_sql_context(catalog.clone()).await;
+    for sql in [
+        "CREATE SCHEMA paimon.test_db",
+        "CREATE TABLE paimon.test_db.events (
+            id BIGINT, ts BIGINT, a BIGINT, b BIGINT, PRIMARY KEY (id)
+        ) WITH ('bucket' = '1', 'merge-engine' = 'partial-update',
+                'fields.ts.sequence-group' = 'a', 'fields. ts .sequence-group' = 'b')",
+        "INSERT INTO paimon.test_db.events VALUES (1, 100, 11, 22)",
+        "INSERT INTO paimon.test_db.events VALUES (1, 80, 31, 42)",
+    ] {
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    }
+
+    let id = Identifier::new("test_db", "events");
+    let before = catalog.get_table(&id).await.unwrap();
+    assert_sql_error_contains(
+        &ctx,
+        "ALTER TABLE paimon.test_db.events RENAME COLUMN ts TO ver",
+        "option 'fields.ver.sequence-group' already exists",
+    )
+    .await;
+    let after = catalog.get_table(&id).await.unwrap();
+    assert_eq!(after.schema(), before.schema());
+
+    let reopened = create_sql_context(catalog).await;
+    let rows = reopened
+        .sql("SELECT a, b FROM paimon.test_db.events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    datafusion::assert_batches_eq!(
+        [
+            "+----+----+",
+            "| a  | b  |",
+            "+----+----+",
+            "| 11 | 22 |",
+            "+----+----+"
+        ],
+        &rows
+    );
+}
+
+#[tokio::test]
 async fn test_alter_table_rename() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;
