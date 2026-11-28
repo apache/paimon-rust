@@ -5571,6 +5571,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orc_ltz_writer_zone_bounds_keep_matching_split() {
+        let schema = PaimonSchema::builder()
+            .column(
+                "v",
+                DataType::LocalZonedTimestamp(
+                    crate::spec::LocalZonedTimestampType::new(3).unwrap(),
+                ),
+            )
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("db", "t"),
+            "memory:/orc_stats".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let pred = PredicateBuilder::new(table.schema().fields())
+            .equal(
+                "v",
+                Datum::LocalZonedTimestamp {
+                    millis: 1_705_303_800_000,
+                    nanos: 0,
+                },
+            )
+            .unwrap();
+        setup_scan_stats_dirs(&table).await;
+        let files = ["part.orc", "part.parquet"]
+            .into_iter()
+            .map(|file_name| {
+                let mut file = make_evo_file(file_name, 10, 2, 1, None);
+                let mut min = BinaryRowBuilder::new(1);
+                let mut max = BinaryRowBuilder::new(1);
+                min.write_timestamp_compact(0, 1_705_321_800_000);
+                max.write_timestamp_compact(0, 1_705_321_800_000);
+                file.value_stats = BinaryTableStats::new(
+                    min.build_serialized(),
+                    max.build_serialized(),
+                    vec![Some(0)],
+                );
+                file
+            })
+            .collect();
+        TableCommit::new(table.clone(), "orc-stats".into())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                files,
+            )])
+            .await
+            .unwrap();
+        let mut builder = table.new_read_builder();
+        builder.with_filter(pred);
+        let plan = builder.new_scan().plan().await.unwrap();
+        let kept: Vec<_> = plan
+            .splits()
+            .iter()
+            .flat_map(|split| split.data_files())
+            .map(|file| file.file_name.as_str())
+            .collect();
+        assert_eq!(kept, ["part.orc"]);
+        assert_eq!(plan.stats().manifest_entries_pruned_by_data_stats, 1);
+    }
+
+    #[tokio::test]
     async fn orc_padded_char_bounds_keep_matching_split() {
         let schema = PaimonSchema::builder()
             .column("v", DataType::Char(crate::spec::CharType::new(4).unwrap()))

@@ -252,6 +252,14 @@ fn read_compact_millis_as_utc(
 }
 
 impl DataFileMeta {
+    pub(crate) fn is_orc(&self) -> bool {
+        self.external_path
+            .as_deref()
+            .unwrap_or(&self.file_name)
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("orc"))
+    }
+
     /// Resolve the stored local creation timestamp in the system time zone,
     /// matching Java DataFileMeta.creationTimeEpochMillis().
     pub fn creation_time_epoch_millis(&self) -> crate::Result<Option<i64>> {

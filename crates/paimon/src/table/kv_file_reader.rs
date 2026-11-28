@@ -851,8 +851,9 @@ impl KeyValueFileReader {
         let config = self.config;
         let table_schema_id = config.table_schema_id;
         let pushdown_predicates = self.pushdown_predicates;
-        let file_index_read_enabled =
-            CoreOptions::new(&config.table_options).file_index_read_enabled();
+        let options = CoreOptions::new(&config.table_options);
+        let file_index_read_enabled = options.file_index_read_enabled();
+        let orc_legacy_ltz = options.orc_legacy_ltz();
         #[cfg(test)]
         let input_batch_sizes = self.input_batch_sizes;
 
@@ -977,6 +978,7 @@ impl KeyValueFileReader {
                                         &run_table_fields,
                                         file_fields,
                                         &run_index_predicates,
+                                        orc_legacy_ltz,
                                     ).await? {
                                         FileIndexResult::Skip => continue,
                                         FileIndexResult::Selection(selection)

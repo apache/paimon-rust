@@ -949,6 +949,12 @@ impl<'a> CoreOptions<'a> {
         }
     }
 
+    pub(crate) fn orc_legacy_ltz(&self) -> bool {
+        self.options
+            .get("orc.timestamp-ltz.legacy.type")
+            .is_none_or(|value| !value.eq_ignore_ascii_case("false"))
+    }
+
     /// Whether raw data-file reads use FileIndex pruning. Default is true.
     pub fn file_index_read_enabled(&self) -> bool {
         self.options

@@ -456,7 +456,7 @@ pub(crate) fn create_format_reader_with_budget(
     } else if lower.ends_with(".video") {
         Box::new(video::VideoFormatReader::new(path.to_string()))
     } else if lower.ends_with(".orc") {
-        Box::new(orc::OrcFormatReader)
+        Box::new(orc::OrcFormatReader::with_options(table_options))
     } else if let Some((kind, compression)) = text::TextKind::from_path(path) {
         Box::new(text::TextFormatReader::new(
             kind,
