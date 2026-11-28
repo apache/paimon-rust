@@ -53,6 +53,9 @@ pub(crate) struct NestedAgg {
     row_fields: Fields,
     key_indices: Vec<usize>,
     sequence_indices: Vec<usize>,
+    /// When sequence fields are configured, equal sequences overwrite iff true.
+    /// Default `true` matches Java `nested-sequence-overwrite-on-equal`.
+    overwrite_on_equal_sequence: bool,
     null_key_strategy: NullKeyStrategy,
     count_limit: usize,
     seen_input: bool,
@@ -96,6 +99,7 @@ impl NestedAgg {
         let row_fields = row_fields.clone();
         let key_option = format!("fields.{field_name}.nested-key");
         let sequence_option = format!("fields.{field_name}.nested-sequence-field");
+        let overwrite_option = format!("fields.{field_name}.nested-sequence-overwrite-on-equal");
         let strategy_option = format!("fields.{field_name}.nested-key-null-strategy");
         let key_indices =
             parse_nested_fields(options.get(&key_option), row_type.fields(), &key_option)?;
@@ -123,6 +127,24 @@ impl NestedAgg {
                 ),
             });
         }
+        if options.contains_key(&overwrite_option) && sequence_indices.is_empty() {
+            return Err(Error::ConfigInvalid {
+                message:
+                    "Option 'fields.<field-name>.nested-sequence-overwrite-on-equal' requires \
+                     'fields.<field-name>.nested-sequence-field' to be configured."
+                        .into(),
+            });
+        }
+        let overwrite_on_equal_sequence = match options.get(&overwrite_option).map(String::as_str) {
+            None => true,
+            Some(value) if value.eq_ignore_ascii_case("true") => true,
+            Some(value) if value.eq_ignore_ascii_case("false") => false,
+            Some(value) => {
+                return Err(Error::ConfigInvalid {
+                    message: format!("Invalid nested-sequence-overwrite-on-equal '{value}'"),
+                })
+            }
+        };
         let null_key_strategy = match options.get(&strategy_option).map(String::as_str) {
             None => NullKeyStrategy::Merge,
             Some(value) if value.eq_ignore_ascii_case("merge") => NullKeyStrategy::Merge,
@@ -153,6 +175,7 @@ impl NestedAgg {
             row_fields,
             key_indices,
             sequence_indices,
+            overwrite_on_equal_sequence,
             null_key_strategy,
             count_limit,
             seen_input: false,
@@ -293,6 +316,18 @@ impl NestedAgg {
         Ok(Ordering::Equal)
     }
 
+    /// Whether `new` may replace `old` for `nested_update` (Java `shouldUpdate`).
+    fn should_update(&self, new: &StructArray, old: &StructArray) -> crate::Result<bool> {
+        if self.sequence_indices.is_empty() {
+            return Ok(true);
+        }
+        match self.compare_sequence(new, old)? {
+            Ordering::Greater => Ok(true),
+            Ordering::Equal => Ok(self.overwrite_on_equal_sequence),
+            Ordering::Less => Ok(false),
+        }
+    }
+
     fn partial_update(&self, old: &StructArray, new: &StructArray) -> crate::Result<ArrayRef> {
         let columns = (0..self.row_fields.len())
             .map(|index| {
@@ -341,12 +376,7 @@ impl NestedAgg {
                 let existing = self.row(self.rows[index].as_ref())?;
                 let replacement = match self.mode {
                     NestedMode::PartialUpdate => self.partial_update(existing, row)?,
-                    NestedMode::Update
-                        if self.sequence_indices.is_empty()
-                            || self.compare_sequence(row, existing)?.is_ge() =>
-                    {
-                        incoming
-                    }
+                    NestedMode::Update if self.should_update(row, existing)? => incoming,
                     NestedMode::Update => return Ok(()),
                 };
                 self.rows[index] = replacement;
@@ -662,8 +692,8 @@ impl FieldAggregator for NestedAgg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{ArrayType, DataField, IntType, RowType, VariantType};
-    use arrow_array::{BinaryArray, Int32Array};
+    use crate::spec::{ArrayType, DataField, IntType, RowType, VarCharType, VariantType};
+    use arrow_array::{BinaryArray, Int32Array, StringArray};
     use arrow_schema::Field;
 
     fn input() -> (DataType, ListArray) {
@@ -1028,5 +1058,472 @@ mod tests {
         assert_eq!(values.values().to_vec(), vec![2]);
         agg.reset();
         assert!(agg.key_serializable);
+    }
+
+    fn optional_rows_cell(rows: &[(i32, i32, Option<i32>)]) -> (DataType, ListArray) {
+        let (data_type, input) = input();
+        let ArrowDataType::List(element) = input.data_type().clone() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(fields) = element.data_type() else {
+            unreachable!()
+        };
+        let rows_array = StructArray::try_new(
+            fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(
+                    rows.iter().map(|r| Some(r.0)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int32Array::from(
+                    rows.iter().map(|r| Some(r.1)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int32Array::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+            ],
+            None,
+        )
+        .unwrap();
+        let list = ListArray::try_new(
+            element,
+            OffsetBuffer::from_lengths([rows.len()]),
+            Arc::new(rows_array),
+            None,
+        )
+        .unwrap();
+        (data_type, list)
+    }
+
+    fn string_seq_type() -> DataType {
+        DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+            DataField::new(1, "id".into(), DataType::Int(IntType::new())),
+            DataField::new(
+                2,
+                "value".into(),
+                DataType::VarChar(VarCharType::string_type()),
+            ),
+            DataField::new(
+                3,
+                "seq".into(),
+                DataType::VarChar(VarCharType::string_type()),
+            ),
+        ]))))
+    }
+
+    fn string_seq_cell(rows: &[(i32, &str, &str)]) -> ListArray {
+        let data_type = string_seq_type();
+        let ArrowDataType::List(element) = paimon_type_to_arrow(&data_type).unwrap() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(fields) = element.data_type() else {
+            unreachable!()
+        };
+        let rows_array = StructArray::try_new(
+            fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(
+                    rows.iter().map(|r| Some(r.0)).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| Some(r.1)).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| Some(r.2)).collect::<Vec<_>>(),
+                )),
+            ],
+            None,
+        )
+        .unwrap();
+        ListArray::try_new(
+            element,
+            OffsetBuffer::from_lengths([rows.len()]),
+            Arc::new(rows_array),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn string_seq_result(agg: &NestedAgg) -> Vec<(i32, String, String)> {
+        let result = agg.result().unwrap();
+        let list = result.as_any().downcast_ref::<ListArray>().unwrap();
+        let rows = list.value(0);
+        let rows = rows.as_any().downcast_ref::<StructArray>().unwrap();
+        let ids = rows
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = rows
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let seqs = rows
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        (0..ids.len())
+            .map(|i| {
+                (
+                    ids.value(i),
+                    values.value(i).to_string(),
+                    seqs.value(i).to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn multi_seq_type() -> DataType {
+        DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+            DataField::new(1, "id".into(), DataType::Int(IntType::new())),
+            DataField::new(2, "value".into(), DataType::Int(IntType::new())),
+            DataField::new(3, "seq".into(), DataType::Int(IntType::new())),
+            DataField::new(4, "ts".into(), DataType::Int(IntType::new())),
+        ]))))
+    }
+
+    fn multi_seq_cell(rows: &[(i32, i32, Option<i32>, Option<i32>)]) -> ListArray {
+        let data_type = multi_seq_type();
+        let ArrowDataType::List(element) = paimon_type_to_arrow(&data_type).unwrap() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(fields) = element.data_type() else {
+            unreachable!()
+        };
+        let rows_array = StructArray::try_new(
+            fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(
+                    rows.iter().map(|r| Some(r.0)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int32Array::from(
+                    rows.iter().map(|r| Some(r.1)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int32Array::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int32Array::from(
+                    rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                )),
+            ],
+            None,
+        )
+        .unwrap();
+        ListArray::try_new(
+            element,
+            OffsetBuffer::from_lengths([rows.len()]),
+            Arc::new(rows_array),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn multi_seq_result(agg: &NestedAgg) -> Vec<(i32, i32, Option<i32>, Option<i32>)> {
+        let result = agg.result().unwrap();
+        let list = result.as_any().downcast_ref::<ListArray>().unwrap();
+        let rows = list.value(0);
+        let rows = rows.as_any().downcast_ref::<StructArray>().unwrap();
+        let col = |index| {
+            rows.column(index)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+        };
+        let (ids, values, seqs, tss) = (col(0), col(1), col(2), col(3));
+        (0..ids.len())
+            .map(|i| {
+                (
+                    ids.value(i),
+                    values.value(i),
+                    seqs.is_valid(i).then(|| seqs.value(i)),
+                    tss.is_valid(i).then(|| tss.value(i)),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nested_update_default_overwrite_on_equal_sequence() {
+        let options = HashMap::from([
+            ("fields.items.nested-key".into(), "id".into()),
+            ("fields.items.nested-sequence-field".into(), "seq".into()),
+        ]);
+        let (data_type, _) = input();
+        let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap();
+        assert!(agg.overwrite_on_equal_sequence);
+        agg.agg(&rows_cell(&[(1, 10, 2)]).1, 0).unwrap();
+        agg.agg(&rows_cell(&[(1, 11, 2)]).1, 0).unwrap();
+        assert_eq!(sorted_rows(&agg), vec![(1, 11, 2)]);
+        agg.agg(&rows_cell(&[(1, 12, 3)]).1, 0).unwrap();
+        assert_eq!(sorted_rows(&agg), vec![(1, 12, 3)]);
+        agg.agg(&rows_cell(&[(1, 13, 2)]).1, 0).unwrap();
+        assert_eq!(sorted_rows(&agg), vec![(1, 12, 3)]);
+    }
+
+    #[test]
+    fn nested_update_explicit_true_overwrites_on_equal_sequence() {
+        let options = HashMap::from([
+            ("fields.items.nested-key".into(), "id".into()),
+            ("fields.items.nested-sequence-field".into(), "seq".into()),
+            (
+                "fields.items.nested-sequence-overwrite-on-equal".into(),
+                "true".into(),
+            ),
+        ]);
+        let (data_type, _) = input();
+        let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap();
+        assert!(agg.overwrite_on_equal_sequence);
+        agg.agg(&rows_cell(&[(1, 10, 5)]).1, 0).unwrap();
+        agg.agg(&rows_cell(&[(1, 11, 5)]).1, 0).unwrap();
+        assert_eq!(sorted_rows(&agg), vec![(1, 11, 5)]);
+    }
+
+    #[test]
+    fn nested_update_false_keeps_equal_and_allows_greater() {
+        let options = HashMap::from([
+            ("fields.items.nested-key".into(), "id".into()),
+            ("fields.items.nested-sequence-field".into(), "seq".into()),
+            (
+                "fields.items.nested-sequence-overwrite-on-equal".into(),
+                "false".into(),
+            ),
+        ]);
+        let (data_type, _) = input();
+        let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap();
+        assert!(!agg.overwrite_on_equal_sequence);
+        agg.agg(&rows_cell(&[(1, 10, 2)]).1, 0).unwrap();
+        agg.agg(&rows_cell(&[(1, 11, 2)]).1, 0).unwrap();
+        assert_eq!(sorted_rows(&agg), vec![(1, 10, 2)]);
+        agg.agg(&rows_cell(&[(1, 12, 3)]).1, 0).unwrap();
+        assert_eq!(sorted_rows(&agg), vec![(1, 12, 3)]);
+        agg.agg(&rows_cell(&[(1, 13, 2)]).1, 0).unwrap();
+        assert_eq!(sorted_rows(&agg), vec![(1, 12, 3)]);
+    }
+
+    #[test]
+    fn nested_update_without_sequence_field_unconditionally_overwrites() {
+        let options = HashMap::from([("fields.items.nested-key".into(), "id".into())]);
+        let (data_type, _) = input();
+        let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap();
+        agg.agg(&rows_cell(&[(1, 10, 1)]).1, 0).unwrap();
+        agg.agg(&rows_cell(&[(1, 20, 1)]).1, 0).unwrap();
+        assert_eq!(sorted_rows(&agg), vec![(1, 20, 1)]);
+    }
+
+    #[test]
+    fn nested_update_overwrite_on_equal_requires_sequence_field() {
+        let options = HashMap::from([
+            ("fields.items.nested-key".into(), "id".into()),
+            (
+                "fields.items.nested-sequence-overwrite-on-equal".into(),
+                "false".into(),
+            ),
+        ]);
+        let (data_type, _) = input();
+        let err = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid { .. }));
+        assert!(err.to_string().contains(
+            "Option 'fields.<field-name>.nested-sequence-overwrite-on-equal' requires \
+             'fields.<field-name>.nested-sequence-field' to be configured."
+        ));
+    }
+
+    #[test]
+    fn nested_update_overwrite_on_equal_with_string_sequence() {
+        let data_type = string_seq_type();
+        let true_options = HashMap::from([
+            ("fields.items.nested-key".into(), "id".into()),
+            ("fields.items.nested-sequence-field".into(), "seq".into()),
+            (
+                "fields.items.nested-sequence-overwrite-on-equal".into(),
+                "true".into(),
+            ),
+        ]);
+        let mut true_agg =
+            NestedAgg::new("nested_update", "items", &data_type, &true_options).unwrap();
+        true_agg.agg(&string_seq_cell(&[(1, "A", "b")]), 0).unwrap();
+        true_agg
+            .agg(&string_seq_cell(&[(1, "A_eq", "b")]), 0)
+            .unwrap();
+        assert_eq!(
+            string_seq_result(&true_agg),
+            vec![(1, "A_eq".into(), "b".into())]
+        );
+
+        let false_options = HashMap::from([
+            ("fields.items.nested-key".into(), "id".into()),
+            ("fields.items.nested-sequence-field".into(), "seq".into()),
+            (
+                "fields.items.nested-sequence-overwrite-on-equal".into(),
+                "false".into(),
+            ),
+        ]);
+        let mut false_agg =
+            NestedAgg::new("nested_update", "items", &data_type, &false_options).unwrap();
+        false_agg
+            .agg(&string_seq_cell(&[(1, "A", "b")]), 0)
+            .unwrap();
+        false_agg
+            .agg(&string_seq_cell(&[(1, "A_eq", "b")]), 0)
+            .unwrap();
+        assert_eq!(
+            string_seq_result(&false_agg),
+            vec![(1, "A".into(), "b".into())]
+        );
+        false_agg
+            .agg(&string_seq_cell(&[(1, "A_gt", "c")]), 0)
+            .unwrap();
+        assert_eq!(
+            string_seq_result(&false_agg),
+            vec![(1, "A_gt".into(), "c".into())]
+        );
+        false_agg
+            .agg(&string_seq_cell(&[(1, "A_lt", "a")]), 0)
+            .unwrap();
+        assert_eq!(
+            string_seq_result(&false_agg),
+            vec![(1, "A_gt".into(), "c".into())]
+        );
+    }
+
+    #[test]
+    fn nested_update_overwrite_on_equal_multi_sequence_nulls_first_and_count_limit() {
+        let data_type = multi_seq_type();
+        let options = HashMap::from([
+            ("fields.items.nested-key".into(), "id".into()),
+            ("fields.items.nested-sequence-field".into(), "seq,ts".into()),
+            (
+                "fields.items.nested-sequence-overwrite-on-equal".into(),
+                "false".into(),
+            ),
+            ("fields.items.count-limit".into(), "2".into()),
+        ]);
+        let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap();
+        agg.agg(&multi_seq_cell(&[(1, 10, Some(1), Some(10))]), 0)
+            .unwrap();
+        agg.agg(&multi_seq_cell(&[(2, 20, Some(1), Some(10))]), 0)
+            .unwrap();
+        // Equal multi-field sequence must not overwrite when option is false.
+        agg.agg(&multi_seq_cell(&[(1, 11, Some(1), Some(10))]), 0)
+            .unwrap();
+        let mut rows = multi_seq_result(&agg);
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![(1, 10, Some(1), Some(10)), (2, 20, Some(1), Some(10)),]
+        );
+        // Lexicographic greater on second field overwrites.
+        agg.agg(&multi_seq_cell(&[(1, 12, Some(1), Some(11))]), 0)
+            .unwrap();
+        rows = multi_seq_result(&agg);
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![(1, 12, Some(1), Some(11)), (2, 20, Some(1), Some(10)),]
+        );
+        // New key beyond count-limit is ignored; existing key can still update.
+        agg.agg(&multi_seq_cell(&[(3, 30, Some(5), Some(1))]), 0)
+            .unwrap();
+        agg.agg(&multi_seq_cell(&[(1, 13, Some(2), Some(1))]), 0)
+            .unwrap();
+        rows = multi_seq_result(&agg);
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![(1, 13, Some(2), Some(1)), (2, 20, Some(1), Some(10)),]
+        );
+
+        // NULLS FIRST: null first field is less than non-null.
+        agg.reset();
+        agg.agg(&multi_seq_cell(&[(1, 10, Some(1), Some(10))]), 0)
+            .unwrap();
+        agg.agg(&multi_seq_cell(&[(1, 11, None, Some(99))]), 0)
+            .unwrap();
+        assert_eq!(multi_seq_result(&agg), vec![(1, 10, Some(1), Some(10))]);
+        agg.agg(&multi_seq_cell(&[(1, 12, Some(1), None)]), 0)
+            .unwrap();
+        assert_eq!(multi_seq_result(&agg), vec![(1, 10, Some(1), Some(10))]);
+        // Fully equal including nulls: false keeps.
+        agg.reset();
+        agg.agg(&multi_seq_cell(&[(1, 10, None, None)]), 0).unwrap();
+        agg.agg(&multi_seq_cell(&[(1, 11, None, None)]), 0).unwrap();
+        assert_eq!(multi_seq_result(&agg), vec![(1, 10, None, None)]);
+
+        let true_options = HashMap::from([
+            ("fields.items.nested-key".into(), "id".into()),
+            ("fields.items.nested-sequence-field".into(), "seq,ts".into()),
+            (
+                "fields.items.nested-sequence-overwrite-on-equal".into(),
+                "true".into(),
+            ),
+        ]);
+        let mut true_agg =
+            NestedAgg::new("nested_update", "items", &data_type, &true_options).unwrap();
+        true_agg
+            .agg(&multi_seq_cell(&[(1, 10, None, None)]), 0)
+            .unwrap();
+        true_agg
+            .agg(&multi_seq_cell(&[(1, 11, None, None)]), 0)
+            .unwrap();
+        assert_eq!(multi_seq_result(&true_agg), vec![(1, 11, None, None)]);
+    }
+
+    #[test]
+    fn nested_update_false_null_sequence_equality() {
+        let options = HashMap::from([
+            ("fields.items.nested-key".into(), "id".into()),
+            ("fields.items.nested-sequence-field".into(), "seq".into()),
+            (
+                "fields.items.nested-sequence-overwrite-on-equal".into(),
+                "false".into(),
+            ),
+        ]);
+        let (data_type, _) = input();
+        let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap();
+        agg.agg(&optional_rows_cell(&[(1, 10, None)]).1, 0).unwrap();
+        agg.agg(&optional_rows_cell(&[(1, 11, None)]).1, 0).unwrap();
+        assert_eq!(
+            result_rows(&agg),
+            (vec![Some(1)], vec![Some(10)], vec![None])
+        );
+        agg.agg(&optional_rows_cell(&[(1, 12, Some(1))]).1, 0)
+            .unwrap();
+        assert_eq!(
+            result_rows(&agg),
+            (vec![Some(1)], vec![Some(12)], vec![Some(1)])
+        );
+        agg.agg(&optional_rows_cell(&[(1, 13, None)]).1, 0).unwrap();
+        assert_eq!(
+            result_rows(&agg),
+            (vec![Some(1)], vec![Some(12)], vec![Some(1)])
+        );
+    }
+
+    #[test]
+    fn nested_partial_update_unaffected_by_overwrite_on_equal() {
+        let (data_type, input) = input();
+        let options = HashMap::from([
+            ("fields.items.nested-key".into(), "id".into()),
+            ("fields.items.nested-sequence-field".into(), "seq".into()),
+            (
+                "fields.items.nested-sequence-overwrite-on-equal".into(),
+                "false".into(),
+            ),
+        ]);
+        let mut agg =
+            NestedAgg::new("nested_partial_update", "items", &data_type, &options).unwrap();
+        agg.agg(&input, 0).unwrap();
+        agg.agg(&input, 1).unwrap();
+        // Same behavior as without the option: partial update merges by key,
+        // keeping non-null fields (seq from the later null-value row for id=1).
+        assert_eq!(
+            result_rows(&agg),
+            (
+                vec![Some(1), Some(2), Some(3)],
+                vec![Some(10), Some(20), Some(30)],
+                vec![Some(1), Some(1), Some(3)],
+            )
+        );
     }
 }
