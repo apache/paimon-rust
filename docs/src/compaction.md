@@ -61,12 +61,17 @@ Overwrite compaction is pinned to its own committed data snapshot, so suppressin
 overwrite changelogs cannot consume a later append's pending lookup events.
 For primary-key deletion-vector tables with lookup changelogs and automatic
 compaction, the overwrite snapshot itself publishes a positive-level sorted run
-per replacement bucket. Disjoint live files can be promoted in place. Overlapping
-runs, retracts and files requiring index maintenance are merged before publication.
+per replacement bucket. This decision uses the current table's `write-only`
+setting unless the writer explicitly overrides it. Disjoint live files can be
+promoted in place. Overlapping runs, retracts and files requiring index
+maintenance are merged before publication.
 A lookup stream starting from that snapshot sees the replacement rows in its
 initial state. Later compaction uses those rows as the before state for updates.
-Staged input files consumed by a physical rewrite remain eligible for orphan-file
-cleanup once they are unreferenced and past the retention window.
+If the committer finds the snapshot ID already taken before submission, it
+discards its newly generated files and retries with the staged inputs. A conflict
+reported after submission can be a replay of a successful write. Those outputs
+and any consumed staging files are eligible for orphan-file cleanup after the
+retention window, once no branch or tag references them.
 As in Java, overwriting partitions being consumed by streaming readers is unsupported;
 lookup changelogs do not describe the overwrite operation itself.
 Automatic tasks share one captured snapshot and bucket-grouped source/index

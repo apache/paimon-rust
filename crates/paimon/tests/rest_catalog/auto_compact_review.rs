@@ -99,7 +99,7 @@ async fn lookup_overwrite_recovers_when_published_response_omits_success() {
 }
 
 #[tokio::test]
-async fn lookup_overwrite_reclaims_rejected_files_with_or_without_a_visible_snapshot_file() {
+async fn lookup_overwrite_preserves_submitted_files_after_a_catalog_conflict() {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
@@ -160,9 +160,8 @@ async fn lookup_overwrite_reclaims_rejected_files_with_or_without_a_visible_snap
         resume.send(()).unwrap();
         overwrite.await.unwrap();
 
-        for path in data.iter().chain(&indexes) {
-            assert!(!path.exists(), "rejected payload survived: {path:?}");
-        }
+        // The catalog's boolean response does not identify a previous publication.
+        assert!(data.iter().chain(&indexes).all(|path| path.is_file()));
         assert!(staged.iter().all(|path| path.exists()));
         let head = manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!((head.id(), head.commit_kind()), (2, &CommitKind::OVERWRITE));
@@ -181,7 +180,10 @@ async fn lookup_overwrite_preserves_catalog_snapshot_when_rollback_reuses_its_id
     ctx.server.add_table_with_schema(
         "default",
         name,
-        lookup_overwrite_schema().build().unwrap(),
+        lookup_overwrite_schema()
+            .option("commit.max-retries", "0")
+            .build()
+            .unwrap(),
         temp.path().to_str().unwrap(),
     );
     let identifier = Identifier::new("default", name);
@@ -210,7 +212,7 @@ async fn lookup_overwrite_preserves_catalog_snapshot_when_rollback_reuses_its_id
     let inputs = stage_overlapping_files(&builder).await;
     let commit = builder.new_commit();
     let (submitted, resume) = ctx.server.pause_next_commit();
-    let overwrite = commit.overwrite_with_identifier(inputs, None, 7);
+    let overwrite = commit.overwrite_with_identifier(inputs.clone(), None, 7);
     tokio::pin!(overwrite);
     let snapshot = tokio::select! {
         submitted = submitted => submitted.unwrap(),
@@ -222,7 +224,15 @@ async fn lookup_overwrite_preserves_catalog_snapshot_when_rollback_reuses_its_id
     ctx.server
         .set_catalog_snapshot("default", name, snapshot.clone());
     resume.send(()).unwrap();
-    overwrite.await.unwrap();
+    let error = overwrite.await.unwrap_err();
+    assert!(
+        error.to_string().contains("outcome may be unknown"),
+        "{error}"
+    );
+    commit
+        .overwrite_with_identifier(inputs, None, 7)
+        .await
+        .unwrap();
 
     let reopened = ctx.catalog.get_table(&identifier).await.unwrap();
     assert_eq!(

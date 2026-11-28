@@ -237,7 +237,7 @@ mod pk_dv_retry {
     }
 
     #[tokio::test]
-    async fn compact_cas_loss_cleans_only_new_dv_but_publication_error_preserves_it() {
+    async fn compact_retry_preserves_submitted_dv_containers() {
         for publish_first in [false, true] {
             let (table, anchor, unrelated) = fixture().await;
             let old = table
@@ -278,11 +278,7 @@ mod pk_dv_retry {
             let attempts = publisher.paths.lock().unwrap().clone();
             assert_eq!(attempts[0].len(), 1);
             assert!(!original_paths.contains(&attempts[0][0]));
-            assert_eq!(
-                table.file_io().exists(&attempts[0][0]).await.unwrap(),
-                publish_first
-            );
-            for path in original_paths.iter().chain(attempts.last().unwrap()) {
+            for path in original_paths.iter().chain(attempts.iter().flatten()) {
                 assert!(
                     table.file_io().exists(path).await.unwrap(),
                     "deleted retained or published DV: {path}"
@@ -341,15 +337,29 @@ mod pk_dv_retry {
             .collect()
     }
 
+    fn indexed_overwrite_table(table: &Table) -> Table {
+        table.copy_with_options(HashMap::from([
+            ("write-only".into(), "false".into()),
+            ("pk-bitmap.index.columns".into(), "value".into()),
+            ("write.parquet-buffer-size".into(), "1 B".into()),
+        ]))
+    }
+
+    async fn overlapping_inputs(builder: &crate::table::WriteBuilder<'_>) -> Vec<CommitMessage> {
+        let mut writer = builder.new_write().unwrap();
+        for ids in [vec![1, 2], vec![2, 3]] {
+            writer.write_arrow_batch(&batch(ids, 0)).await.unwrap();
+        }
+        let inputs = writer.prepare_commit().await.unwrap();
+        assert_eq!(inputs[0].new_files.len(), 2);
+        inputs
+    }
+
     #[tokio::test]
-    async fn lookup_overwrite_reclaims_rejected_outputs_and_preserves_published_files() {
+    async fn lookup_overwrite_retry_preserves_submitted_files_and_staged_inputs() {
         for publish_first in [false, true] {
             let raw = retry_table().await;
-            let table = raw.copy_with_options(HashMap::from([
-                ("write-only".into(), "false".into()),
-                ("pk-bitmap.index.columns".into(), "value".into()),
-                ("write.parquet-buffer-size".into(), "1 B".into()),
-            ]));
+            let table = indexed_overwrite_table(&raw);
             let publisher = Arc::new(RacingCommit {
                 table: raw,
                 calls: AtomicUsize::new(0),
@@ -361,16 +371,7 @@ mod pk_dv_retry {
             commit.snapshot_commit = publisher.clone();
             commit.commit_min_retry_wait_ms = 0;
             commit.commit_max_retry_wait_ms = 0;
-            let mut writer = builder.new_write().unwrap();
-            writer
-                .write_arrow_batch(&batch(vec![1, 2], 0))
-                .await
-                .unwrap();
-            writer
-                .write_arrow_batch(&batch(vec![2, 3], 0))
-                .await
-                .unwrap();
-            let inputs = writer.prepare_commit().await.unwrap();
+            let inputs = overlapping_inputs(&builder).await;
             let bucket = commit.bucket_path(&inputs[0].partition, 0).unwrap();
             let staged: Vec<_> = inputs
                 .iter()
@@ -385,18 +386,14 @@ mod pk_dv_retry {
 
             let attempts = publisher.paths.lock().unwrap().clone();
             assert_eq!(attempts.len(), if publish_first { 1 } else { 2 });
-            for (i, paths) in attempts.iter().enumerate() {
+            for paths in &attempts {
                 assert_eq!(
                     paths.len(),
                     2,
                     "expected a PK index and a replacement data file: {paths:?}"
                 );
                 for path in paths {
-                    assert_eq!(
-                        table.file_io().exists(path).await.unwrap(),
-                        i + 1 == attempts.len(),
-                        "{path}"
-                    );
+                    assert!(table.file_io().exists(path).await.unwrap(), "{path}");
                 }
             }
             for path in &staged {
@@ -407,6 +404,114 @@ mod pk_dv_retry {
             }
             assert_eq!(read_ids(&table).await, [1, 2, 3]);
         }
+    }
+
+    #[tokio::test]
+    async fn lookup_overwrite_reclaims_only_unsubmitted_files_when_overtaken() {
+        async fn files(table: &Table) -> HashSet<String> {
+            table
+                .file_io()
+                .list_status_recursive(table.location())
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|file| !file.is_dir)
+                .map(|file| file.path)
+                .collect()
+        }
+
+        let raw = retry_table().await;
+        let table = indexed_overwrite_table(&raw);
+        let builder = table.new_write_builder().with_overwrite();
+        let inputs = overlapping_inputs(&builder).await;
+        let commit = builder.new_commit();
+        let mut plan = overwrite_plan(None, commit.messages_to_entries(&inputs));
+        let resolved = commit
+            .resolve_commit(&mut plan, &None, None, false)
+            .await
+            .unwrap();
+
+        // The writer planned against an empty table. Another writer claims ID 1
+        // before this attempt can submit its replacement run and bitmap.
+        write(&raw, vec![4], 0).await;
+        let before = files(&table).await;
+        let attempt = commit
+            .try_commit_once(resolved, &None, 7, true)
+            .await
+            .unwrap();
+        assert!(
+            matches!(attempt, CommitAttemptResult::Retry(state) if state.publication_error.is_none())
+        );
+        assert_eq!(files(&table).await, before);
+
+        commit
+            .overwrite_with_identifier(inputs, None, 7)
+            .await
+            .unwrap();
+        assert_eq!(read_ids(&table).await, [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn lookup_overwrite_keeps_retained_branch_readable_after_snapshot_id_reuse() {
+        struct ReplayAfterRollback(Table);
+
+        #[async_trait::async_trait]
+        impl SnapshotCommit for ReplayAfterRollback {
+            async fn commit(
+                &self,
+                _: Option<&str>,
+                snapshot: &Snapshot,
+                _: &str,
+                _: &[PartitionStatistics],
+            ) -> Result<bool> {
+                let table = &self.0;
+                let manager = table.snapshot_manager();
+                if snapshot.id() == 2 {
+                    assert!(manager.commit_snapshot(snapshot).await?);
+                    table
+                        .tag_manager()
+                        .create("before-rollback", snapshot)
+                        .await?;
+                    crate::table::BranchManager::new(
+                        table.file_io().clone(),
+                        table.location().into(),
+                    )
+                    .create_branch_from_tag("retained", "before-rollback")
+                    .await?;
+                    assert_eq!(
+                        read_ids(&table.copy_with_branch("retained").await?).await,
+                        [1, 2, 3]
+                    );
+
+                    manager.write_latest_hint(1).await?;
+                    manager.delete_snapshot(2).await?;
+                    table.tag_manager().delete("before-rollback").await?;
+                    write(table, vec![5], 0).await;
+                    assert_ne!(manager.get_snapshot(2).await?.uuid(), snapshot.uuid());
+                }
+                // Replaying the original write now collides with the reused ID.
+                manager.commit_snapshot(snapshot).await
+            }
+        }
+
+        let raw = retry_table().await;
+        write(&raw, vec![4], 0).await;
+        let table = indexed_overwrite_table(&raw);
+        let builder = table.new_write_builder().with_overwrite();
+        let mut commit = builder.new_commit();
+        commit.snapshot_commit = Arc::new(ReplayAfterRollback(raw));
+        commit
+            .overwrite_with_identifier(overlapping_inputs(&builder).await, None, 7)
+            .await
+            .unwrap();
+        assert_eq!(read_ids(&table).await, [1, 2, 3]);
+
+        let retained = table.copy_with_branch("retained").await.unwrap();
+        assert_eq!(read_ids(&retained).await, [1, 2, 3]);
+        let original = retained.snapshot_manager().get_snapshot(2).await.unwrap();
+        let indexes = index_paths(&retained, &original, "bitmap").await;
+        assert_eq!(indexes.len(), 1);
+        assert!(retained.file_io().exists(&indexes[0]).await.unwrap());
     }
 
     #[cfg(feature = "storage-oss")]
@@ -441,11 +546,7 @@ mod pk_dv_retry {
             }
         }
 
-        let table = retry_table().await.copy_with_options(HashMap::from([
-            ("write-only".into(), "false".into()),
-            ("pk-bitmap.index.columns".into(), "value".into()),
-            ("write.parquet-buffer-size".into(), "1 B".into()),
-        ]));
+        let table = indexed_overwrite_table(&retry_table().await);
         // Only the snapshot PUT goes through OSS. Serve it from the same storage
         // that the table uses for recovery and subsequent reads.
         let puts = Arc::new(AtomicUsize::new(0));
@@ -471,17 +572,7 @@ mod pk_dv_retry {
             .build()
             .unwrap();
         let builder = table.new_write_builder().with_overwrite();
-        let mut writer = builder.new_write().unwrap();
-        writer
-            .write_arrow_batch(&batch(vec![1, 2], 0))
-            .await
-            .unwrap();
-        writer
-            .write_arrow_batch(&batch(vec![2, 3], 0))
-            .await
-            .unwrap();
-        let inputs = writer.prepare_commit().await.unwrap();
-        assert_eq!(inputs[0].new_files.len(), 2);
+        let inputs = overlapping_inputs(&builder).await;
         let mut commit = builder.new_commit();
         commit.snapshot_commit = Arc::new(crate::table::RenamingSnapshotCommit::new(
             SnapshotManager::new(io, "/table".into()),

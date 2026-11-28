@@ -160,6 +160,18 @@ impl SnapshotManager {
         self.latest_snapshot_id_from_filesystem().await
     }
 
+    /// Check the publication target before submitting a newly prepared snapshot.
+    pub(crate) async fn snapshot_id_taken(&self, id: i64) -> crate::Result<bool> {
+        if let Some(env) = &self.rest_env {
+            // A catalog rollback can leave an older snapshot with this ID on disk.
+            return Ok(env
+                .load_snapshot(&self.branch)
+                .await?
+                .is_some_and(|head| head.id() >= id));
+        }
+        self.file_io.exists(&self.snapshot_path(id)).await
+    }
+
     async fn latest_snapshot_id_from_filesystem(&self) -> crate::Result<Option<i64>> {
         let hint_path = self.latest_hint_path();
         if let Some(hint_id) = self.read_hint(&hint_path).await {
@@ -870,6 +882,17 @@ mod tests {
         // Second commit to same id should return false
         let result = sm.commit_snapshot(&snap).await.unwrap();
         assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn snapshot_id_taken_checks_the_branch_file_even_with_a_stale_hint() {
+        let (_, main) = setup("memory:/snapshot-id-taken").await;
+        assert!(main.commit_snapshot(&test_snapshot(1)).await.unwrap());
+        main.write_latest_hint(2).await.unwrap();
+
+        assert!(main.snapshot_id_taken(1).await.unwrap());
+        assert!(!main.snapshot_id_taken(2).await.unwrap());
+        assert!(!main.with_branch("dev").snapshot_id_taken(1).await.unwrap());
     }
 
     #[derive(Debug)]

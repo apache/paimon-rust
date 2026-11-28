@@ -170,6 +170,39 @@ async fn rows(table: &Table) -> Vec<(i32, i32)> {
 
 #[tokio::test]
 async fn stale_overwrite_after_enabling_lookup_bootstraps_from_the_overwrite_snapshot() {
+    assert_eq!(
+        stale_overwrite_bootstrap("changelog-producer", "none", "lookup", None).await,
+        [("+I".into(), 7, 70)]
+    );
+}
+
+#[tokio::test]
+async fn stale_lookup_overwrite_picks_up_write_only_being_disabled() {
+    assert_eq!(
+        stale_overwrite_bootstrap("write-only", "true", "false", None).await,
+        [("+I".into(), 7, 70)]
+    );
+}
+
+#[tokio::test]
+async fn stale_lookup_overwrite_honors_explicit_write_only() {
+    assert!(
+        stale_overwrite_bootstrap("write-only", "true", "false", Some(true))
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        stale_overwrite_bootstrap("write-only", "false", "true", Some(false)).await,
+        [("+I".into(), 7, 70)]
+    );
+}
+
+async fn stale_overwrite_bootstrap(
+    option: &str,
+    before: &str,
+    after: &str,
+    write_only_override: Option<bool>,
+) -> Vec<(String, i32, i32)> {
     let warehouse = tempfile::tempdir().unwrap();
     let mut options = paimon::Options::new();
     options.set("warehouse", warehouse.path().to_str().unwrap());
@@ -188,7 +221,8 @@ async fn stale_overwrite_after_enabling_lookup_bootstraps_from_the_overwrite_sna
         .option("write-only", "false")
         .option("deletion-vectors.enabled", "true")
         .option("deletion-vectors.merge-on-read", "true")
-        .option("changelog-producer", "none")
+        .option("changelog-producer", "lookup")
+        .option(option, before)
         .build()
         .unwrap();
     catalog
@@ -196,37 +230,38 @@ async fn stale_overwrite_after_enabling_lookup_bootstraps_from_the_overwrite_sna
         .await
         .unwrap();
     let stale = catalog.get_table(&identifier).await.unwrap();
-    catalog
-        .alter_table(
-            &identifier,
-            vec![SchemaChange::set_option(
-                "changelog-producer".into(),
-                "lookup".into(),
-            )],
-            false,
-        )
-        .await
-        .unwrap();
+    let stale = match write_only_override {
+        Some(value) => {
+            stale.copy_with_options(HashMap::from([("write-only".into(), value.to_string())]))
+        }
+        None => stale,
+    };
     let builder = stale.new_write_builder().with_overwrite();
     let mut writer = builder.new_write().unwrap();
     writer
         .write_arrow_batch(&make_batch(vec![7], vec![70]))
         .await
         .unwrap();
-    builder
-        .new_commit()
-        .overwrite(writer.prepare_commit().await.unwrap(), None)
+    let messages = writer.prepare_commit().await.unwrap();
+    let commit = builder.new_commit();
+    catalog
+        .alter_table(
+            &identifier,
+            vec![SchemaChange::set_option(option.into(), after.into())],
+            false,
+        )
         .await
         .unwrap();
+    commit.overwrite(messages, None).await.unwrap();
 
     let current = catalog.get_table(&identifier).await.unwrap();
     let overwrite = current.snapshot_manager().get_snapshot(1).await.unwrap();
     assert_eq!(overwrite.commit_kind(), &CommitKind::OVERWRITE);
     assert_eq!(overwrite.schema_id(), current.schema().id());
-    assert_eq!(
-        rows(&current.copy_with_pinned_snapshot(Some(&overwrite))).await,
-        [(7, 70)]
-    );
+    let pinned = current.copy_with_pinned_snapshot(Some(&overwrite));
+    assert_eq!(rows(&pinned).await, [(7, 70)]);
+    let active = files(&pinned).await;
+    assert_eq!(active.len(), 1);
 
     let selected = current.copy_with_options(HashMap::from([
         ("scan.mode".into(), "from-snapshot-full".into()),
@@ -240,10 +275,13 @@ async fn stale_overwrite_after_enabling_lookup_bootstraps_from_the_overwrite_sna
         .unwrap()
         .unwrap();
     assert_eq!(initial.snapshot_id(), Some(overwrite.id()));
+    let events = plan_events(&selected, &initial).await;
     assert_eq!(
-        plan_events(&selected, &initial).await,
-        [("+I".into(), 7, 70)]
+        active[0].1 == 0,
+        events.is_empty(),
+        "overwrite files: {active:?}"
     );
+    events
 }
 
 #[tokio::test]

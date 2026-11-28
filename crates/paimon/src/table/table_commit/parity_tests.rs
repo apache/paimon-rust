@@ -594,17 +594,13 @@ async fn data_evolution_compact_retries_preserve_concurrent_changes_and_publishe
         let attempts = publisher.paths.lock().unwrap().clone();
         assert_eq!(attempts[0].len(), 1);
         assert!(!original_paths.contains(&attempts[0][0]));
-        assert_eq!(
-            io.exists(&attempts[0][0]).await.unwrap(),
-            publish_first,
-            "CAS false must remove its unpublished DV; publish-then-error must retain it"
-        );
         let current_paths = dv_paths(&table, &after).await.unwrap();
-        for path in original_paths.iter().chain(&current_paths) {
-            assert!(
-                io.exists(path).await.unwrap(),
-                "deleted old-snapshot or published DV: {path}"
-            );
+        for path in original_paths
+            .iter()
+            .chain(&current_paths)
+            .chain(attempts.iter().flatten())
+        {
+            assert!(io.exists(path).await.unwrap(), "deleted retained or submitted DV: {path}");
         }
         if conflicts {
             let error = outcome.unwrap_err();
@@ -612,12 +608,6 @@ async fn data_evolution_compact_retries_preserve_concurrent_changes_and_publishe
             assert_eq!(current_paths, original_paths);
         } else {
             let metrics = outcome.unwrap();
-            for path in attempts.last().unwrap() {
-                assert!(
-                    io.exists(path).await.unwrap(),
-                    "deleted published DV: {path}"
-                );
-            }
             assert_eq!(
                 commit.commit_compact(results.clone()).await.unwrap(),
                 metrics

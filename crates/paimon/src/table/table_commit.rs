@@ -1400,43 +1400,52 @@ impl TableCommit {
         let (snapshot, statistics) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                for path in created_payloads.into_iter().chain(created_manifests) {
-                    let _ = self.snapshot_manager.file_io().delete_file(&path).await;
-                }
+                self.discard_unpublished_files(created_payloads, created_manifests)
+                    .await;
                 return Err(error);
             }
         };
-        // Once publication starts its outcome may be unknown. These files must
-        // remain available even if the response is lost or a later retry fails.
-        let base_snapshot_uuid = latest_snapshot.as_ref().and_then(Snapshot::uuid);
-        let publication_error = match self
-            .snapshot_commit
-            .commit(
-                base_snapshot_uuid,
-                &snapshot,
-                self.table.branch(),
-                &statistics,
-            )
-            .await
-        {
-            Ok(true) => {
-                if !self.commit_callbacks.is_empty() {
-                    self.notify_commit_callbacks(snapshot.clone(), resolved.entries)
-                        .await?;
-                }
-                return Ok(CommitAttemptResult::Success(Box::new(snapshot)));
-            }
-            Ok(false) => {
-                // A replay of our own successful conditional PUT also reports a conflict.
-                // Reclaim payloads only if another attempt published this snapshot ID.
-                if !created_payloads.is_empty() && self.another_attempt_published(&snapshot).await {
-                    for path in created_payloads {
-                        let _ = self.table.file_io().delete_file(&path).await;
+        // A competing writer can claim this ID while we materialize a run or DV.
+        // If the precheck fails, let the atomic publisher handle the race.
+        let snapshot_id_taken = !created_payloads.is_empty()
+            && self
+                .snapshot_manager
+                .snapshot_id_taken(snapshot.id())
+                .await
+                .unwrap_or(false);
+        let publication_error = if snapshot_id_taken {
+            self.discard_unpublished_files(created_payloads, created_manifests)
+                .await;
+            None
+        } else {
+            match self
+                .snapshot_commit
+                .commit(
+                    latest_snapshot.as_ref().and_then(Snapshot::uuid),
+                    &snapshot,
+                    self.table.branch(),
+                    &statistics,
+                )
+                .await
+            {
+                Ok(true) => {
+                    if !self.commit_callbacks.is_empty() {
+                        self.notify_commit_callbacks(snapshot.clone(), resolved.entries)
+                            .await?;
                     }
+                    return Ok(CommitAttemptResult::Success(Box::new(snapshot)));
                 }
-                None
+                // A replay can collide after a rollback reused this ID. A branch or
+                // tag can still reference the first publication even if main moved.
+                Ok(false) => Some(crate::Error::UnexpectedError {
+                    message: format!(
+                        "Snapshot {} may have been published before the conflict was reported",
+                        snapshot.id()
+                    ),
+                    source: None,
+                }),
+                Err(error) => Some(error),
             }
-            Err(error) => Some(error),
         };
         Ok(CommitAttemptResult::Retry(Box::new(RetryState {
             latest_snapshot: latest_snapshot.clone(),
@@ -1445,20 +1454,10 @@ impl TableCommit {
         })))
     }
 
-    async fn another_attempt_published(&self, attempt: &Snapshot) -> bool {
-        let published = if let Some(env) = self.table.rest_env() {
-            // After a catalog rollback the same ID can still name an older snapshot on disk.
-            env.load_snapshot(self.table.branch()).await.ok().flatten()
-        } else {
-            self.snapshot_manager.get_snapshot(attempt.id()).await.ok()
-        };
-        published.is_some_and(|snapshot| {
-            snapshot.id() == attempt.id()
-                && snapshot
-                    .uuid()
-                    .zip(attempt.uuid())
-                    .is_some_and(|(winner, attempt)| winner != attempt)
-        })
+    async fn discard_unpublished_files(&self, payloads: Vec<String>, manifests: Vec<String>) {
+        for path in payloads.into_iter().chain(manifests) {
+            let _ = self.snapshot_manager.file_io().delete_file(&path).await;
+        }
     }
 
     async fn prepare_snapshot(
@@ -4022,6 +4021,7 @@ enum CommitAttemptResult {
 struct RetryState {
     latest_snapshot: Option<Snapshot>,
     base_data_files: Option<Vec<ManifestEntry>>,
+    /// None only when this attempt was never submitted to the publisher.
     publication_error: Option<crate::Error>,
 }
 
