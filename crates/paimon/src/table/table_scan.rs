@@ -22,6 +22,9 @@
 
 use super::bucket_filter::{compute_target_buckets, BucketSelector};
 use super::chunk_shuffle::{chunk_shuffle_splits, ChunkShuffle};
+use super::data_evolution_reader::{
+    incremental_event_groups, is_data_evolution_column_slice_group,
+};
 use super::format_table_scan::FormatTableScan;
 use super::global_index_result::GlobalIndexResult;
 use super::global_index_scanner::RowRangeIndex;
@@ -1346,6 +1349,8 @@ impl<'a> TableScan<'a> {
     /// keeps ordinary Rust integer calls ergonomic while allowing language
     /// bindings to preserve arbitrary-precision integer seeds.
     /// Only predicates on unmasked partition keys are supported.
+    /// In a data-evolution window, a chunk cannot combine distinct events
+    /// whose file ranges overlap: a split has one shared row-ID selection.
     pub fn with_chunk_shuffle(self, seed: impl ToString, chunk_size: u64) -> crate::Result<Self> {
         let config = ChunkShuffle::from_decimal_seed(&seed.to_string(), chunk_size)?;
         match self.0 {
@@ -2986,10 +2991,13 @@ impl<'a> PaimonTableScan<'a> {
             scan_stats.record_split_planning(0, false);
             return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         }
-        // Positional scans count all candidate row IDs. Pruning a preceding
-        // manifest or file here would renumber the surviving rows; intersect
-        // explicit/global-index ranges after assigning positions instead.
-        let row_range_index = if data_evolution_enabled && self.row_position_selection().is_none() {
+        // Positional scans need the preceding row IDs. Incremental evolution
+        // scans need the whole overlap group to distinguish column slices from
+        // separate writes. Apply their selections to the planned groups below.
+        let row_range_index = if data_evolution_enabled
+            && !self.is_streaming()
+            && self.row_position_selection().is_none()
+        {
             manifest_row_ranges.clone().map(RowRangeIndex::create)
         } else {
             None
@@ -3162,6 +3170,11 @@ impl<'a> PaimonTableScan<'a> {
             .index_file_in_data_file_dir();
 
         let mut data_file_field_ids_cache = DataFileFieldIdsCache::new();
+        let event_row_index = if data_evolution_enabled && self.is_streaming() {
+            effective_row_ranges.clone().map(RowRangeIndex::create)
+        } else {
+            None
+        };
         // Positional distribution precedes LIMIT. Building too few ordinary
         // append splits here could starve a later slice or shard.
         let can_push_down_limit = append_row_position_selection.is_none()
@@ -3211,20 +3224,28 @@ impl<'a> PaimonTableScan<'a> {
                 scan_stats.data_evolution_groups_pruned_by_row_ranges +=
                     groups_pruned_by_row_ranges;
 
-                // Filter groups by merged stats before splitting.
+                // An incremental group that is not made of column slices holds
+                // independent physical events. Merged-row statistics and
+                // projection can discard events before the reader classifies it.
+                let physical_event_group = |group: &[DataFileMeta]| {
+                    self.is_streaming() && !is_data_evolution_column_slice_group(group)
+                };
+
+                // Filter mergeable groups by merged stats before splitting.
                 let row_id_groups: Vec<Vec<DataFileMeta>> = if self.data_predicates.is_empty() {
                     row_id_groups
                 } else {
                     let before = row_id_groups.len();
                     let mut groups = Vec::with_capacity(before);
                     for group in row_id_groups {
-                        if data_evolution_group_matches_predicates_for_table(
-                            &self.table,
-                            &group,
-                            &self.data_predicates,
-                            &mut stats_schema_cache,
-                        )
-                        .await
+                        if physical_event_group(&group)
+                            || data_evolution_group_matches_predicates_for_table(
+                                &self.table,
+                                &group,
+                                &self.data_predicates,
+                                &mut stats_schema_cache,
+                            )
+                            .await
                         {
                             groups.push(group);
                         }
@@ -3239,18 +3260,22 @@ impl<'a> PaimonTableScan<'a> {
                     } else {
                         let mut pruned = Vec::with_capacity(row_id_groups.len());
                         for group in row_id_groups {
-                            pruned.push(
-                                prune_data_evolution_group_by_read_fields(
-                                    group,
-                                    read_field_ids,
-                                    deletion_vectors_enabled,
-                                    table_schema_id,
-                                    table_fields,
-                                    schema_manager,
-                                    &mut data_file_field_ids_cache,
-                                )
-                                .await?,
-                            );
+                            if physical_event_group(&group) {
+                                pruned.push(group);
+                            } else {
+                                pruned.push(
+                                    prune_data_evolution_group_by_read_fields(
+                                        group,
+                                        read_field_ids,
+                                        deletion_vectors_enabled,
+                                        table_schema_id,
+                                        table_fields,
+                                        schema_manager,
+                                        &mut data_file_field_ids_cache,
+                                    )
+                                    .await?,
+                                );
+                            }
                         }
                         pruned
                     }
@@ -3357,11 +3382,37 @@ impl<'a> PaimonTableScan<'a> {
                     .collect()
             };
 
+            let file_groups = if data_evolution_enabled && self.is_streaming() {
+                let mut events = Vec::with_capacity(file_groups.len());
+                for group in file_groups {
+                    if !group.raw_convertible {
+                        if let Some(groups) = incremental_event_groups(&group.files)? {
+                            events.extend(groups.into_iter().map(|files| SplitGroup {
+                                raw_convertible: files.len() == 1,
+                                files,
+                            }));
+                            continue;
+                        }
+                    }
+                    events.push(group);
+                }
+                events
+            } else {
+                file_groups
+            };
             for group in file_groups {
                 let SplitGroup {
-                    files: file_group,
+                    files: mut file_group,
                     raw_convertible,
                 } = group;
+                if let Some(index) = &event_row_index {
+                    // The event boundaries are now fixed. Drop rolled BLOB or
+                    // vector files outside the selection before creating splits.
+                    file_group.retain(|file| data_file_overlaps_row_range_index(file, index));
+                    if file_group.is_empty() {
+                        continue;
+                    }
+                }
                 let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
                     file_group
                         .iter()

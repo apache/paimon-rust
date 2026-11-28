@@ -39,7 +39,7 @@ use crate::spec::{
 };
 use crate::table::dedicated_format_file_writer::is_blob_or_video_file_name;
 use crate::table::schema_manager::SchemaManager;
-use crate::table::source::any_range_overlaps_file;
+use crate::table::source::{any_range_overlaps_file, is_data_evolution_normal_file};
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::{ArrowRecordBatchStream, RESTEnv, RowRange};
 use crate::{DataSplit, Error};
@@ -90,6 +90,95 @@ pub(super) fn is_raw_convertible(files: &[DataFileMeta]) -> bool {
         }
     }
     true
+}
+
+/// Whether the files of one row-id group are column slices of a single row range.
+///
+/// Every normal file must cover the same rows, and every dedicated (BLOB or
+/// vector) file must lie inside that range. Only such a group is merged
+/// column-wise; any other group holds files that were not written as slices of
+/// each other.
+pub(super) fn is_data_evolution_column_slice_group(files: &[DataFileMeta]) -> bool {
+    let mut normal_files = files
+        .iter()
+        .filter(|file| is_data_evolution_normal_file(file));
+    let Some((first, last)) = normal_files.next().and_then(DataFileMeta::row_id_range) else {
+        return false;
+    };
+    normal_files.all(|file| file.row_id_range() == Some((first, last)))
+        && files.iter().all(|file| {
+            file.row_id_range()
+                .is_some_and(|(from, to)| from >= first && to <= last)
+        })
+}
+
+/// Split overlapping files of a mixed-range window into readable events.
+pub(super) fn incremental_event_groups(
+    files: &[DataFileMeta],
+) -> crate::Result<Option<Vec<Vec<DataFileMeta>>>> {
+    if files.len() <= 1 || is_data_evolution_column_slice_group(files) {
+        return Ok(None);
+    }
+    let (groups, mixed) =
+        split_incremental_event_groups(group_by_overlapping_row_id(files.to_vec()))?;
+    Ok(mixed.then_some(groups))
+}
+
+/// Preserve the event boundaries in a window; report whether any overlapping
+/// row-ID group was split into distinct events.
+pub(super) fn split_incremental_event_groups(
+    groups: Vec<Vec<DataFileMeta>>,
+) -> crate::Result<(Vec<Vec<DataFileMeta>>, bool)> {
+    let mixed =
+        |group: &[DataFileMeta]| group.len() > 1 && !is_data_evolution_column_slice_group(group);
+    if !groups.iter().any(|group| mixed(group)) {
+        return Ok((groups, false));
+    }
+    let mut events = Vec::new();
+    for group in groups {
+        if !mixed(&group) {
+            events.push(group);
+        } else if group.iter().all(is_data_evolution_normal_file) {
+            events.extend(group.into_iter().map(|file| vec![file]));
+        } else {
+            // APPEND files in a row-tracked table get the snapshot sequence
+            // at commit. Row IDs alone cannot distinguish a later update from
+            // the normal and independently rolled dedicated files of an insert.
+            let mut commits = std::collections::BTreeMap::<i64, Vec<DataFileMeta>>::new();
+            for file in group {
+                if file.file_source != Some(0) || file.max_sequence_number <= 0 {
+                    return Err(Error::Unsupported {
+                        message: format!("Cannot identify the write of '{}' in a mixed-range data-evolution window", file.file_name),
+                    });
+                }
+                commits
+                    .entry(file.max_sequence_number)
+                    .or_default()
+                    .push(file);
+            }
+            for files in commits.into_values() {
+                for event in group_by_overlapping_row_id(files) {
+                    let anchors = event
+                        .iter()
+                        .filter(|file| is_data_evolution_normal_file(file))
+                        .count();
+                    if anchors != 1
+                        || (event.len() > 1
+                            && (!is_data_evolution_column_slice_group(&event)
+                                || event.iter().any(|file| {
+                                    file.min_sequence_number != file.max_sequence_number
+                                })))
+                    {
+                        return Err(Error::Unsupported {
+                            message: format!("Cannot identify dedicated-file companions at row ID {:?} in a mixed-range data-evolution window", event[0].first_row_id),
+                        });
+                    }
+                    events.push(event);
+                }
+            }
+        }
+    }
+    Ok((events, true))
 }
 
 /// Split a reader input into independently readable row-id groups.
@@ -508,7 +597,23 @@ impl DataEvolutionReader {
         if self.limit == Some(0) {
             return Ok(futures::stream::empty().boxed());
         }
-        let splits: Vec<DataSplit> = data_splits.to_vec();
+        let mut splits = Vec::with_capacity(data_splits.len());
+        for split in data_splits {
+            if split.is_streaming() && !split.raw_convertible() {
+                // Externally planned or chunk-shuffled splits may pack events
+                // back together. Row-ID based BLOB preselection must run on
+                // each event separately: different events can share a row ID.
+                if let Some(events) = incremental_event_groups(split.data_files())? {
+                    splits.extend(
+                        events
+                            .into_iter()
+                            .map(|files| split.for_data_evolution_files(files)),
+                    );
+                    continue;
+                }
+            }
+            splits.push(split.clone());
+        }
 
         if self.needs_managed_blob_preselection(&splits) {
             return Ok(try_stream! {
@@ -602,7 +707,9 @@ impl DataEvolutionReader {
                     if remaining == Some(0) {
                         break 'splits;
                     }
-                    if is_raw_convertible(&files) {
+                    if is_raw_convertible(&files)
+                        || (split.is_streaming() && files.len() == 1)
+                    {
                         for file_meta in files {
                             if remaining == Some(0) {
                                 break 'splits;
@@ -4278,6 +4385,65 @@ mod tests {
             PreparedMergeGroup::new(&groups[1]).unwrap().first_row_id,
             10
         );
+    }
+
+    #[test]
+    fn test_column_slice_groups_have_a_normal_file_covering_every_file() {
+        let slices = vec![
+            data_file("base.parquet", 0, 10, 1, Some(vec!["id"])),
+            data_file("partial.parquet", 0, 10, 2, Some(vec!["value"])),
+            data_file("payload.blob", 2, 5, 2, Some(vec!["payload"])),
+        ];
+        assert!(is_data_evolution_column_slice_group(&slices));
+
+        // A compaction merged two inserts, then an update covered the result.
+        let compacted = vec![
+            data_file("base-0.parquet", 0, 2, 1, Some(vec!["id"])),
+            data_file("base-2.parquet", 2, 2, 1, Some(vec!["id"])),
+            data_file("update.parquet", 0, 4, 2, Some(vec!["value"])),
+        ];
+        assert!(!is_data_evolution_column_slice_group(&compacted));
+
+        // A dedicated file outside the normal files' range is no slice of them.
+        let outside = vec![
+            data_file("base.parquet", 0, 10, 1, Some(vec!["id"])),
+            data_file("payload.blob", 8, 5, 2, Some(vec!["payload"])),
+        ];
+        assert!(!is_data_evolution_column_slice_group(&outside));
+
+        let only_dedicated = vec![data_file("payload.blob", 0, 5, 1, Some(vec!["payload"]))];
+        assert!(!is_data_evolution_column_slice_group(&only_dedicated));
+    }
+
+    #[test]
+    fn ambiguous_mixed_range_blob_events_are_rejected() {
+        let mut files = vec![
+            data_file("base.parquet", 0, 2, 1, Some(vec!["id"])),
+            data_file("payload.blob", 0, 2, 1, Some(vec!["payload"])),
+            data_file("update.parquet", 0, 4, 1, Some(vec!["value"])),
+        ];
+        assert!(matches!(
+            incremental_event_groups(&files),
+            Err(Error::Unsupported { .. })
+        ));
+        // A known commit still has two overlapping normal-file candidates.
+        for file in &mut files {
+            file.file_source = Some(0);
+            file.min_sequence_number = file.max_sequence_number;
+        }
+        assert!(matches!(
+            incremental_event_groups(&files),
+            Err(Error::Unsupported { .. })
+        ));
+        // Giving each file a separate commit leaves the BLOB without an anchor.
+        for (sequence, file) in (1_i64..).zip(&mut files) {
+            file.min_sequence_number = sequence;
+            file.max_sequence_number = sequence;
+        }
+        assert!(matches!(
+            incremental_event_groups(&files),
+            Err(Error::Unsupported { .. })
+        ));
     }
 
     #[test]

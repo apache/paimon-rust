@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::spec::{BinaryRow, DataField, DataFileMeta, Datum};
+use crate::table::data_evolution_reader::split_incremental_event_groups;
 use crate::table::source::{data_evolution_anchor_file, is_data_evolution_normal_file};
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::{merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, RowRange, Table};
@@ -344,9 +345,15 @@ async fn evolution_chunks(
         .collect();
     let files = group.files.iter().map(|input| input.file.clone()).collect();
     let aligned_groups = group_by_overlapping_row_id(files);
+    let (aligned_groups, mixed_events) = if group.is_streaming {
+        split_incremental_event_groups(aligned_groups)?
+    } else {
+        (aligned_groups, false)
+    };
     let mut chunks: Vec<Vec<EvolutionSegment>> = Vec::new();
     let mut current = Vec::new();
     let mut current_rows = 0;
+    let mut event_domains = BTreeMap::new();
 
     for files in aligned_groups {
         let from = files
@@ -415,10 +422,26 @@ async fn evolution_chunks(
             if current_rows == chunk_size {
                 chunks.push(std::mem::take(&mut current));
                 current_rows = 0;
+                event_domains.clear();
             }
             let Some(slice) = slicer.take(chunk_size - current_rows)? else {
                 break;
             };
+            if mixed_events {
+                // A split has one row-ID selection shared by all its files.
+                // Combining overlapping events could select the other write's
+                // rows or count two writes to the same row ID only once.
+                if event_domains
+                    .range(..=to)
+                    .next_back()
+                    .is_some_and(|(_, end)| *end >= from)
+                {
+                    return Err(crate::Error::Unsupported {
+                        message: "chunk_shuffle cannot combine overlapping incremental events in one chunk".to_string(),
+                    });
+                }
+                event_domains.insert(from, to);
+            }
             current_rows += slice.live_rows;
             current.push(EvolutionSegment {
                 files: inputs.clone(),
