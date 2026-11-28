@@ -31,9 +31,10 @@ use crate::arrow::arrow_fields_to_paimon;
 use crate::io::FileIO;
 use crate::resource::{MemoryReservation, ResourceContext};
 use crate::spec::{
-    AggregationConfig, CoreOptions, DataField, DataFileMeta, DataType, MergeEngine,
-    PartialUpdateConfig, RowKind, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
+    canonical_aggregator_name, AggregationConfig, CoreOptions, DataField, DataFileMeta, DataType,
+    MergeEngine, PartialUpdateConfig, RowKind, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
 };
+use crate::table::aggregator::validate_merge_map_with_keytime_write_values;
 use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::managed_blob_writer::ManagedBlobWriteState;
 use crate::table::prepared_files::PreparedFiles;
@@ -524,12 +525,56 @@ impl KeyValueFileWriter {
         }
     }
 
+    /// Reject NaN key-times and NULL ROW map values for every column that uses
+    /// `merge_map_with_keytime`, before singleton or multi-row flush merging.
+    fn reject_merge_map_with_keytime_write_inputs(&self, batch: &RecordBatch) -> Result<()> {
+        let config = AggregationConfig::new(&self.config.table_options);
+        let pk: std::collections::HashSet<&str> = self
+            .config
+            .primary_keys
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let sequence_fields: std::collections::HashSet<String> =
+            CoreOptions::new(&self.config.table_options)
+                .sequence_fields()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        for field in &self.config.value_fields {
+            let name = field.name();
+            if pk.contains(name) || sequence_fields.contains(name) {
+                continue;
+            }
+            let agg_name = config
+                .agg_function_for_field(name)
+                .or_else(|| config.default_agg_function())
+                .unwrap_or("last_non_null_value");
+            if canonical_aggregator_name(agg_name) != "merge_map_with_keytime" {
+                continue;
+            }
+            let Some(column) = batch.column_by_name(name) else {
+                continue;
+            };
+            validate_merge_map_with_keytime_write_values(
+                name,
+                field.data_type(),
+                &self.config.table_options,
+                column.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
     fn merge_aggregation_rows(
         &self,
         batch: &RecordBatch,
         seq_array: &dyn Array,
         sorted_indices: &UInt32Array,
     ) -> Result<(RecordBatch, Arc<dyn Array>)> {
+        // Shared write-entry checks for merge_map_with_keytime: must run before
+        // the singleton shortcut so NaN / NULL ROW cannot bypass aggregation.
+        self.reject_merge_map_with_keytime_write_inputs(batch)?;
         let schema = batch.schema();
         let value_kind_idx = schema
             .fields()

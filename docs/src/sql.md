@@ -4108,7 +4108,7 @@ Supported aggregate functions:
 | `listagg` | unbounded `STRING` (`VARCHAR` with max length) |
 | `collect` | `ARRAY` |
 | `merge_map` | `MAP` |
-| `merge_map_with_keytime` | `MAP` whose value is a `ROW` with at least two fields |
+| `merge_map_with_keytime` | `MAP` whose value is a `ROW` with at least two fields; key-time types below |
 | `nested_update`, `nested_partial_update` | `ARRAY<ROW>` |
 | `rbm32`, `rbm64`, `hll_sketch`, `theta_sketch` | `VARBINARY` |
 
@@ -4122,7 +4122,13 @@ Field-scoped options used by these functions:
   reject integer overflow instead of wrapping. Floating-point addition is
   unaffected; Decimal overflow still yields NULL as in Java.
 - `fields.<field>.ts-field` selects the key-time field for
-  `merge_map_with_keytime` (defaults to the last ROW field).
+  `merge_map_with_keytime` (defaults to the last ROW field). Supported
+  key-time types are `CHAR`/`VARCHAR`, `TINYINT`/`SMALLINT`/`INT`/`BIGINT`,
+  `FLOAT`/`DOUBLE`, `DATE`, `TIME`, `DECIMAL`, `TIMESTAMP`, and
+  `TIMESTAMP_LTZ`.
+- `fields.<field>.overwrite-on-equal-ts` (default `false`) for
+  `merge_map_with_keytime`: when `true`, an equal key-time replaces the
+  existing ROW; when `false`, the existing ROW is kept.
 - `fields.<field>.nested-key`, `fields.<field>.nested-sequence-field`,
   `fields.<field>.nested-key-null-strategy`, and `fields.<field>.count-limit`
   for nested array aggregators. `nested_partial_update` requires
@@ -4141,6 +4147,23 @@ same key are merged, including in write-buffer flushes and compaction, and the
 merged array is what gets written to data files. As in Java, a key with only
 one row keeps the array it was written with until another row of that key
 arrives or, with `changelog-producer=lookup`, until it is compacted.
+
+For `merge_map_with_keytime`, a newer key-time replaces the existing ROW for
+that map key. `CHAR`/`VARCHAR` key-times use unsigned UTF-8 byte
+lexicographical order (Java `BinaryString.compareTo`). `FLOAT`/`DOUBLE`
+compare as ordinary numbers with `+0.0` equal to `-0.0`; NaN key-times are
+rejected on write and never enter aggregation. `TIMESTAMP` / `TIMESTAMP_LTZ`
+compare by ticks under a unified time semantics (timezone metadata does not
+affect ordering). A NULL key-time ignores the incoming update and leaves any
+existing key unchanged. Writing a NULL ROW map value is rejected for
+`merge_map_with_keytime` (key tombstones are unsupported on the write path).
+`overwrite-on-equal-ts=true` cannot be combined with a global
+`sequence.field`. Rust Native supports the key-time types listed above,
+including `FLOAT`/`DOUBLE`. The Python Native eligibility gate allows the
+same Rust-supported set (and falls back only for types Rust cannot compare).
+Java still rejects `FLOAT`/`DOUBLE` key-times. In the tested Java Paimon 2.2
+snapshot, `DECIMAL` key-times are also rejected (this is a verified result
+for that snapshot, not a claim about every Java release).
 
 `DELETE` / `UPDATE_BEFORE` rows are fed to each field aggregator's retract path
 (`AggregateMergeFunction`), except that
