@@ -89,7 +89,8 @@ async fn partial_update_retract_only_aggregate_state_refuses_lossy_compaction() 
         for table in [&control, &rewritten] {
             write_batch(table, &update(Some(12), Some(3), None, 0)).await;
         }
-        assert_eq!(state(&control).await, vec![(Some(12), Some(-2), None)]);
+        // -10 - 5 + 3: the first retraction does not cancel its own payload.
+        assert_eq!(state(&control).await, vec![(Some(12), Some(-12), None)]);
         assert_eq!(state(&rewritten).await, state(&control).await);
     }
 }
