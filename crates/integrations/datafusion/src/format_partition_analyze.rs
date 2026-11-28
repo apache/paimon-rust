@@ -57,7 +57,7 @@ pub(crate) async fn execute_analyze(
             "ANALYZE TABLE requires COMPUTE STATISTICS".to_string(),
         ));
     }
-    SQLContext::ensure_partition_command_target(table_name, "ANALYZE TABLE")?;
+    SQLContext::ensure_main_branch_base_table(table_name, "ANALYZE TABLE")?;
     ctx.reject_temporary_write_target(table_name, "ANALYZE TABLE")
         .await?;
     let (catalog, _catalog_name, identifier) = ctx.resolve_catalog_and_table(table_name)?;

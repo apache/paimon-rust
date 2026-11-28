@@ -291,10 +291,15 @@ async fn wildcard_replacements_preserve_aliases_for_outer_queries_and_ctas() {
     )
     .await
     .unwrap();
-    ctx.sql("CREATE TEMPORARY TABLE replaced AS SELECT * REPLACE (upper(value) AS value) FROM read_files('memory://files/data.txt')").await.unwrap();
-    assert_eq!(columns(&ctx, "SELECT * FROM replaced").await, ["value"]);
-    let values = rows(&ctx, "SELECT value FROM replaced").await;
-    assert_eq!(values[0][0].try_as_str().flatten(), Some("HELLO"));
+    for (modifier, table) in [("TEMPORARY ", "temp_replaced"), ("", "replaced")] {
+        ctx.sql(&format!("CREATE {modifier}TABLE {table} AS SELECT * REPLACE (upper(value) AS value) FROM read_files('memory://files/data.txt')")).await.unwrap();
+        assert_eq!(
+            columns(&ctx, &format!("SELECT * FROM {table}")).await,
+            ["value"]
+        );
+        let values = rows(&ctx, &format!("SELECT value FROM {table}")).await;
+        assert_eq!(values[0][0].try_as_str().flatten(), Some("HELLO"));
+    }
 }
 
 #[tokio::test]

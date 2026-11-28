@@ -382,7 +382,7 @@ impl RESTApi {
         identifier: &Identifier,
         schema: Schema,
     ) -> Result<CreateTableRequest> {
-        validate_non_empty_multi(&[
+        validate_resource_path(&[
             (identifier.database(), "database name"),
             (identifier.object(), "table name"),
         ])?;
@@ -396,6 +396,16 @@ impl RESTApi {
             .tables(Some(request.identifier.database()));
         let _resp: serde_json::Value = self.client.post(&path, request).await?;
         Ok(())
+    }
+
+    pub(crate) async fn create_table_exclusive(
+        &self,
+        identifier: &Identifier,
+        schema: Schema,
+    ) -> Result<()> {
+        let request = Self::prepare_create_table(identifier, schema)?;
+        let path = self.resource_paths.tables(Some(identifier.database()));
+        self.client.post_for_exclusive_create(&path, &request).await
     }
 
     /// Alter a table's schema by applying a list of schema changes.
@@ -415,11 +425,23 @@ impl RESTApi {
 
     /// Get table information.
     pub async fn get_table(&self, identifier: &Identifier) -> Result<GetTableResponse> {
+        let path = self.table_metadata_path(identifier)?;
+        self.client.get(&path, None::<&[(&str, &str)]>).await
+    }
+
+    pub(crate) async fn get_table_for_existence_check(
+        &self,
+        identifier: &Identifier,
+    ) -> Result<GetTableResponse> {
+        let path = self.table_metadata_path(identifier)?;
+        self.client.get_with_confirmed_not_found(&path).await
+    }
+
+    fn table_metadata_path(&self, identifier: &Identifier) -> Result<String> {
         let database = identifier.database();
         let table = identifier.object();
-        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
-        let path = self.resource_paths.table(database, table);
-        self.client.get(&path, None::<&[(&str, &str)]>).await
+        validate_resource_path(&[(database, "database name"), (table, "table name")])?;
+        Ok(self.resource_paths.table(database, table))
     }
 
     /// Load the latest snapshot and statistics from the catalog.

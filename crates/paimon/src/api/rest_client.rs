@@ -24,13 +24,17 @@ use crate::Error;
 use crate::Result;
 use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::sync::OnceCell;
 
 /// Asynchronous HTTP client for REST API calls.
 pub struct HttpClient {
     client: reqwest::Client,
+    exclusive_create_client: OnceCell<reqwest::Client>,
+    user_agent: HeaderValue,
     base_url: String,
     auth_function: Option<RESTAuthFunction>,
 }
@@ -58,8 +62,11 @@ impl HttpClient {
         auth_function: Option<RESTAuthFunction>,
         agent: &str,
     ) -> Result<Self> {
+        let user_agent = Self::user_agent_header(agent);
         Ok(HttpClient {
-            client: Self::build_client(agent)?,
+            client: Self::build_client(&user_agent, false)?,
+            exclusive_create_client: OnceCell::new(),
+            user_agent,
             base_url: Self::normalize_uri(base_url)?,
             auth_function,
         })
@@ -67,26 +74,38 @@ impl HttpClient {
 
     /// Replace the default User-Agent, e.g. after options are merged with the server config.
     pub(crate) fn set_user_agent(&mut self, agent: &str) -> Result<()> {
-        self.client = Self::build_client(agent)?;
+        let user_agent = Self::user_agent_header(agent);
+        self.client = Self::build_client(&user_agent, false)?;
+        self.user_agent = user_agent;
+        self.exclusive_create_client = OnceCell::new();
         Ok(())
     }
 
-    fn build_client(agent: &str) -> Result<reqwest::Client> {
-        let agent = HeaderValue::from_str(agent).unwrap_or_else(|_| {
+    fn user_agent_header(agent: &str) -> HeaderValue {
+        HeaderValue::from_str(agent).unwrap_or_else(|_| {
             log::warn!("Invalid REST User-Agent {agent:?}, using the default");
             HeaderValue::from_str(&user_agent::default_rest_user_agent())
                 .expect("the default User-Agent is visible ASCII")
-        });
-        reqwest::Client::builder()
+        })
+    }
+
+    fn build_client(agent: &HeaderValue, exclusive_create: bool) -> Result<reqwest::Client> {
+        let builder = reqwest::Client::builder()
             // Java and PyPaimon allow three minutes for connection and response
             // reads. A short total deadline aborts otherwise valid REST calls.
             .connect_timeout(Duration::from_secs(180))
             .read_timeout(Duration::from_secs(180))
-            .user_agent(agent)
-            .build()
-            .map_err(|e| Error::ConfigInvalid {
-                message: format!("Failed to create HTTP client: {e}"),
-            })
+            .user_agent(agent.clone());
+        let builder = if exclusive_create {
+            builder
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+        } else {
+            builder
+        };
+        builder.build().map_err(|error| Error::ConfigInvalid {
+            message: format!("Failed to create HTTP client: {error}"),
+        })
     }
 
     /// Normalize and validate a URI.
@@ -129,6 +148,47 @@ impl HttpClient {
         path: &str,
         params: Option<&[(impl AsRef<str>, impl AsRef<str>)]>,
     ) -> Result<T> {
+        self.parse_response(self.send_get(path, params).await?)
+            .await
+    }
+
+    pub(crate) async fn get_with_confirmed_not_found<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T> {
+        let response = self.send_get(path, None::<&[(&str, &str)]>).await?;
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND
+            && reqwest::Url::parse(&self.request_url(path)).as_ref() != Ok(response.url())
+        {
+            return Err(Error::UnexpectedError {
+                message:
+                    "REST table lookup returned HTTP 404 from a different URL after a redirect"
+                        .to_string(),
+                source: None,
+            });
+        }
+        match self.parse_response(response).await {
+            Err(Error::RestApi {
+                source: RestError::NoSuchResource { message, .. },
+            }) if status != StatusCode::NOT_FOUND => {
+                let error = super::ErrorResponse::new(
+                    None,
+                    None,
+                    Some(message),
+                    Some(i32::from(status.as_u16())),
+                );
+                Err(RestError::from_error_response(error).into())
+            }
+            result => result,
+        }
+    }
+
+    async fn send_get(
+        &self,
+        path: &str,
+        params: Option<&[(impl AsRef<str>, impl AsRef<str>)]>,
+    ) -> Result<reqwest::Response> {
         let url = self.request_url(path);
 
         let params_map: HashMap<String, String> = match params {
@@ -182,7 +242,7 @@ impl HttpClient {
                 }
             };
             if attempt == 5 || !matches!(response.status().as_u16(), 429 | 503) {
-                return self.parse_response(response).await;
+                return Ok(response);
             }
             let retry_after = response
                 .headers()
@@ -230,7 +290,8 @@ impl HttpClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        self.parse_response(self.send_post(path, body).await?).await
+        self.parse_response(self.send_post(&self.client, path, body).await?)
+            .await
     }
 
     /// Send a mutation whose successful response has no defined payload.
@@ -239,12 +300,54 @@ impl HttpClient {
         path: &str,
         body: &B,
     ) -> Result<()> {
-        Self::response_text(self.send_post(path, body).await?).await?;
+        Self::response_text(self.send_post(&self.client, path, body).await?).await?;
         Ok(())
+    }
+
+    pub(crate) async fn post_for_exclusive_create<B: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<()> {
+        let client = self
+            .exclusive_create_client
+            .get_or_try_init(|| async { Self::build_client(&self.user_agent, true) })
+            .await?;
+        let response = self.send_post(client, path, body).await?;
+        let status = response.status();
+        if matches!(
+            status,
+            StatusCode::OK | StatusCode::CREATED | StatusCode::NO_CONTENT
+        ) {
+            return Ok(());
+        }
+        let unknown_outcome = || Error::UnexpectedError {
+            message: format!(
+                "REST create returned HTTP {}. The publication outcome is unknown",
+                status.as_u16()
+            ),
+            source: None,
+        };
+        if status.is_redirection() || status.is_success() {
+            return Err(unknown_outcome());
+        }
+        let result = Self::response_text(response).await;
+        if status != StatusCode::CONFLICT
+            && matches!(
+                result,
+                Err(Error::RestApi {
+                    source: RestError::AlreadyExists { .. },
+                })
+            )
+        {
+            return Err(unknown_outcome());
+        }
+        result.map(|_| ())
     }
 
     async fn send_post<B: serde::Serialize>(
         &self,
+        client: &reqwest::Client,
         path: &str,
         body: &B,
     ) -> Result<reqwest::Response> {
@@ -253,7 +356,7 @@ impl HttpClient {
         let headers = self
             .build_auth_headers("POST", path, body_str.as_deref(), HashMap::new())
             .await?;
-        let request = self.client.post(&url).json(body);
+        let request = client.post(&url).json(body);
         let request = Self::apply_headers(request, &headers)?;
         request.send().await.map_err(|e| Error::UnexpectedError {
             message: "http post failed".to_string(),

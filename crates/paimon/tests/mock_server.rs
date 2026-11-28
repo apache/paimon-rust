@@ -36,13 +36,14 @@ use tokio::task::JoinHandle;
 use paimon::api::{
     AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, AuthTableQueryResponse,
     ConfigResponse, CreateBranchRequest, CreateFunctionRequest, CreatePartitionsRequest,
-    CreateTagRequest, CreateViewRequest, DataPolicy, DropPartitionsRequest, DropPolicyRequest,
-    ErrorResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetTagResponse,
-    GetViewResponse, ListBranchesResponse, ListDatabasesResponse, ListFunctionsResponse,
-    ListPartitionsByFilterRequest, ListPartitionsByNamesRequest, ListPartitionsResponse,
-    ListPermissionsResponse, ListPoliciesResponse, ListTablesResponse, ListViewsResponse,
-    PermissionAssignment, PermissionResource, PolicyRequest, PolicyType, RESTUtil,
-    RenameTableRequest, ResourcePaths, ResourceType, RevokePermissionRequest, RollbackTableRequest,
+    CreateTableRequest, CreateTagRequest, CreateViewRequest, DataPolicy, DropPartitionsRequest,
+    DropPolicyRequest, ErrorResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse,
+    GetTagResponse, GetViewResponse, ListBranchesResponse, ListDatabasesResponse,
+    ListFunctionsResponse, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
+    ListPartitionsResponse, ListPermissionsResponse, ListPoliciesResponse, ListTablesResponse,
+    ListViewsResponse, PermissionAssignment, PermissionResource, PolicyRequest, PolicyType,
+    RESTUtil, RenameTableRequest, ResourcePaths, ResourceType, RevokePermissionRequest,
+    RollbackTableRequest,
 };
 use paimon::catalog::{Function, Identifier};
 use paimon::spec::{CommitKind, Partition, Snapshot};
@@ -220,7 +221,7 @@ fn paginate<T: Clone>(
 #[derive(Clone)]
 pub struct RESTServer {
     warehouse: String,
-    _data_path: String,
+    data_path: String,
     config: ConfigResponse,
     inner: Arc<Mutex<MockState>>,
     resource_paths: ResourcePaths,
@@ -233,7 +234,7 @@ impl RESTServer {
     /// Create a new RESTServer with initial databases.
     pub fn new(
         warehouse: String,
-        _data_path: String,
+        data_path: String,
         config: ConfigResponse,
         initial_dbs: Vec<String>,
     ) -> Self {
@@ -255,7 +256,7 @@ impl RESTServer {
             .collect();
 
         RESTServer {
-            _data_path,
+            data_path,
             config,
             warehouse,
             inner: Arc::new(Mutex::new(MockState {
@@ -784,26 +785,14 @@ impl RESTServer {
         Extension(state): Extension<Arc<RESTServer>>,
         Json(payload): Json<serde_json::Value>,
     ) -> impl IntoResponse {
-        // Extract table name from payload
-        let table_name = payload
-            .get("identifier")
-            .and_then(|id| id.get("object"))
-            .and_then(|o| o.as_str())
-            .map(|s| s.to_string());
-
-        let table_name = match table_name {
-            Some(name) => name,
-            None => {
-                let err = ErrorResponse::new(
-                    None,
-                    None,
-                    Some("Missing table name in identifier".to_string()),
-                    Some(400),
-                );
+        let request = match serde_json::from_value::<CreateTableRequest>(payload) {
+            Ok(request) => request,
+            Err(error) => {
+                let err = ErrorResponse::new(None, None, Some(error.to_string()), Some(400));
                 return (StatusCode::BAD_REQUEST, Json(err)).into_response();
             }
         };
-
+        let table_name = request.identifier.object().to_string();
         let mut s = state.inner.lock().unwrap();
 
         // Check database exists
@@ -828,15 +817,15 @@ impl RESTServer {
             return (StatusCode::CONFLICT, Json(err)).into_response();
         }
 
-        // Create table response
+        let path = format!("{}/{db}.db/{table_name}", state.data_path);
         let response = GetTableResponse::new(
-            Some(table_name.clone()),
+            Some(uuid::Uuid::new_v4().to_string()),
             Some(db.clone()),
             Some(table_name),
-            None,
+            Some(path),
             Some(true),
-            None,
-            None,
+            Some(0),
+            Some(request.schema),
             AuditRESTResponse::new(None, None, None, None, None),
         );
         s.tables.insert(key, response);

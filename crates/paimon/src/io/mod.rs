@@ -29,13 +29,12 @@ pub use storage::*;
     feature = "storage-cos",
     feature = "storage-gcs",
     feature = "storage-obs",
-    feature = "storage-oss",
-    feature = "storage-s3"
+    feature = "storage-oss"
 ))]
 fn with_http_transport(op: opendal::Operator, user_agent: &str) -> opendal::Operator {
     use opendal::{HttpTransporter, OperationContext};
 
-    let transport = HttpTransporter::new(user_agent::UserAgentTransport::new(user_agent));
+    let transport = HttpTransporter::new(user_agent::StorageHttpTransport::new(user_agent));
     op.with_context(OperationContext::new().with_http_transport(transport))
 }
 

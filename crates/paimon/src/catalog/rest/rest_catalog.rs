@@ -29,7 +29,7 @@ use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
 use crate::api::{
     DataPolicy, GetTagResponse, ListPermissionsRequest, ListPoliciesRequest, PagedList,
-    PermissionAssignment, PermissionResource, PolicyType,
+    PermissionAssignment, PermissionResource, PolicyType, ResourceType,
 };
 use crate::catalog::{
     list_partitions_from_file_system, Catalog, Database, Identifier, DB_LOCATION_PROP,
@@ -279,6 +279,10 @@ impl Catalog for RESTCatalog {
 
     // ======================= table methods ===============================
 
+    async fn check_table_exists(&self, identifier: &Identifier) -> Result<()> {
+        RESTEnv::check_table_exists(identifier, &self.api).await
+    }
+
     async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
         RESTEnv::load_table(
             identifier,
@@ -371,29 +375,22 @@ impl Catalog for RESTCatalog {
             .api
             .send_create_table(&request)
             .await
-            .map_err(|error| match error {
-                // Legacy create endpoints can omit the missing database's type.
-                Error::RestApi {
-                    source:
-                        RestError::NoSuchResource {
-                            ref resource_type, ..
-                        },
-                } if resource_type
-                    .as_deref()
-                    .is_none_or(|kind| kind.eq_ignore_ascii_case("database")) =>
-                {
-                    Error::DatabaseNotExist {
-                        database: identifier.database().to_string(),
-                    }
-                }
-                typed @ Error::RestApi {
-                    source: RestError::NoSuchResource { .. },
-                } => typed,
-                other => map_rest_error_for_table(other, identifier),
-            });
+            .map_err(|e| map_table_metadata_error(e, identifier, ResourceType::Database));
         ignore_error_if(result, |e| {
             ignore_if_exists && matches!(e, Error::TableAlreadyExist { .. })
         })
+    }
+
+    async fn create_table_exclusive(
+        &self,
+        identifier: &Identifier,
+        creation: Schema,
+    ) -> Result<()> {
+        identifier.validate_new_table_name()?;
+        self.api
+            .create_table_exclusive(identifier, creation)
+            .await
+            .map_err(|error| map_table_metadata_error(error, identifier, ResourceType::Database))
     }
 
     async fn drop_table(&self, identifier: &Identifier, ignore_if_not_exists: bool) -> Result<()> {
@@ -958,6 +955,63 @@ fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
             full_name: identifier.full_name(),
         },
         other => other,
+    }
+}
+
+/// Default an untyped 404 to a missing table on GET or a missing database on CREATE.
+pub(crate) fn map_table_metadata_error(
+    error: Error,
+    identifier: &Identifier,
+    missing_resource: ResourceType,
+) -> Error {
+    let (resource, resource_name) = match &error {
+        Error::RestApi {
+            source:
+                RestError::NoSuchResource {
+                    resource_type,
+                    resource_name,
+                    ..
+                },
+        } => {
+            let resource = resource_type
+                .as_deref()
+                .unwrap_or(missing_resource.as_str());
+            // CREATE only translates a missing database. Preserve other resource details.
+            if missing_resource == ResourceType::Database
+                && !resource.eq_ignore_ascii_case("database")
+            {
+                return error;
+            }
+            (resource, resource_name.as_deref())
+        }
+        Error::RestApi {
+            source:
+                RestError::AlreadyExists {
+                    resource_type,
+                    resource_name,
+                    ..
+                },
+        } => (
+            resource_type.as_deref().unwrap_or("table"),
+            resource_name.as_deref(),
+        ),
+        _ => return error,
+    };
+    if resource.eq_ignore_ascii_case("table")
+        && resource_name.is_some_and(|name| {
+            !name.is_empty()
+                && !name.eq_ignore_ascii_case(identifier.object())
+                && !name.eq_ignore_ascii_case(&identifier.full_name())
+        })
+    {
+        return error;
+    }
+    if resource.eq_ignore_ascii_case("database") {
+        map_rest_error_for_database(error, identifier.database())
+    } else if resource.eq_ignore_ascii_case("table") || resource.eq_ignore_ascii_case("column") {
+        map_rest_error_for_table(error, identifier)
+    } else {
+        error
     }
 }
 
@@ -1612,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn test_column_error_mapping() {
+    fn test_table_error_mapping_preserves_the_resource_type() {
         let identifier = Identifier::new("db", "table");
 
         let not_exist = Error::RestApi {
@@ -1645,9 +1699,7 @@ mod tests {
             other => panic!("expected ColumnAlreadyExist, got {other:?}"),
         }
 
-        // A table-level 404 (no `column` resource type) must still map to
-        // `TableNotExist`, not a column error.
-        let table_missing = Error::RestApi {
+        let untyped_missing = || Error::RestApi {
             source: RestError::NoSuchResource {
                 resource_type: None,
                 resource_name: None,
@@ -1655,8 +1707,25 @@ mod tests {
             },
         };
         assert!(matches!(
-            map_rest_error_for_table(table_missing, &identifier),
-            Error::TableNotExist { .. }
+            map_table_metadata_error(untyped_missing(), &identifier, ResourceType::Table),
+            Error::TableNotExist { full_name } if full_name == identifier.full_name()
+        ));
+        assert!(matches!(
+            map_table_metadata_error(untyped_missing(), &identifier, ResourceType::Database),
+            Error::DatabaseNotExist { database } if database == identifier.database()
+        ));
+        let policy_conflict = Error::RestApi {
+            source: RestError::AlreadyExists {
+                resource_type: Some("POLICY".into()),
+                resource_name: Some("readers".into()),
+                message: "policy already exists".into(),
+            },
+        };
+        assert!(matches!(
+            map_table_metadata_error(policy_conflict, &identifier, ResourceType::Database),
+            Error::RestApi {
+                source: RestError::AlreadyExists { .. }
+            }
         ));
     }
 
@@ -1693,10 +1762,17 @@ mod tests {
             let creation = catalog
                 .create_table(&destination, schema.clone(), true)
                 .await;
+            let exclusive_creation = catalog
+                .create_table_exclusive(&destination, schema.clone())
+                .await;
             let rename = catalog.rename_table(&source, &destination, true).await;
             assert!(
                 matches!(creation, Err(Error::IdentifierInvalid { .. })),
                 "{creation:?}"
+            );
+            assert!(
+                matches!(exclusive_creation, Err(Error::IdentifierInvalid { .. })),
+                "{exclusive_creation:?}"
             );
             assert!(
                 matches!(rename, Err(Error::IdentifierInvalid { .. })),

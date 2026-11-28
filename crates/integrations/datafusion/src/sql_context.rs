@@ -28,6 +28,7 @@
 //! - `DROP DATABASE [IF EXISTS] [catalog.]db [CASCADE]`
 //! - `USE [catalog.]db`
 //! - `CREATE TABLE db.t (col TYPE, ..., PRIMARY KEY (col, ...)) [PARTITIONED BY (col, ...)] [WITH ('key' = 'val')]`
+//! - `CREATE TABLE [IF NOT EXISTS] db.t [PARTITIONED BY (col, ...)] [WITH ('key' = 'val')] AS query`
 //! - `ALTER TABLE db.t ADD COLUMN col TYPE`
 //! - `ALTER TABLE db.t DROP COLUMN col`
 //! - `ALTER TABLE db.t RENAME COLUMN old TO new`
@@ -60,6 +61,7 @@ use datafusion::catalog::{
     CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList,
     MemorySchemaProvider, SchemaProvider,
 };
+use datafusion::common::config::CatalogOptions;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{plan_datafusion_err, DFSchema, ScalarValue, TableReference};
 use datafusion::datasource::{MemTable, TableProvider};
@@ -76,15 +78,16 @@ use datafusion::sql::sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, BinaryLength, CharacterLength, ColumnDef,
     ColumnOption, CommentDef, CommentObject, CreateFunction, CreateFunctionBody, CreateTable,
     CreateTableOptions, CreateView, DataType as SqlDataType, Delete, ExcludeSelectItem,
-    Expr as SqlExpr, ExprWithAlias, FromTable, FunctionBehavior, FunctionReturnType, Ident, Insert,
-    Merge, ObjectName, ObjectType, Query, RenameTableNameKind, Reset, ResetStatement, SelectItem,
-    Set, SetExpr, ShowCreateObject, SqlOption, Statement, TableFactor, TableObject, Truncate,
-    Update, Use, Value as SqlValue, Visit, Visitor, WildcardAdditionalOptions,
+    Expr as SqlExpr, ExprWithAlias, FromTable, FunctionBehavior, FunctionReturnType,
+    HiveDistributionStyle, Ident, Insert, Merge, ObjectName, ObjectType, Query,
+    RenameTableNameKind, Reset, ResetStatement, SelectItem, Set, SetExpr, ShowCreateObject,
+    SqlOption, Statement, TableFactor, TableObject, Truncate, Update, Use, Value as SqlValue,
+    Visit, Visitor, WildcardAdditionalOptions,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
-use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
+use datafusion::sql::sqlparser::tokenizer::{Location, Token, Tokenizer};
 use datafusion_spark::SessionStateBuilderSpark;
 use futures::StreamExt;
 use paimon::catalog::{parse_object_name, Catalog, Identifier, ParsedObjectName};
@@ -100,6 +103,8 @@ use crate::catalog::{PaimonCatalogProvider, PaimonSchemaProvider};
 use crate::error::to_datafusion_error;
 use crate::table::PaimonTableProvider;
 use crate::{BlobReaderRegistry, DynamicOptions};
+
+mod ctas;
 
 /// A SQL context that supports registering multiple Paimon catalogs and executing SQL.
 ///
@@ -497,17 +502,18 @@ impl SQLContext {
 
     /// Execute a SQL statement with options for statements delegated to DataFusion.
     pub async fn sql_with_options(&self, sql: &str, options: SQLOptions) -> DFResult<DataFrame> {
-        let is_create_table = looks_like_create_table(sql);
-        let enable_ident_normalization = self.ctx.enable_ident_normalization();
-        let (rewritten_sql, partition_keys) = if is_create_table {
-            extract_partition_by(sql, enable_ident_normalization)?
-        } else {
-            (sql.to_string(), vec![])
-        };
-        if contains_time_travel_keyword(&rewritten_sql) {
-            // Time-travel queries are not DDL; skip our own parsing and handle directly.
-            return self.handle_time_travel_query(&rewritten_sql, options).await;
-        }
+        // Box the dispatcher so its size does not propagate to callers' futures.
+        Box::pin(self.execute_statement(sql, options)).await
+    }
+
+    async fn execute_statement(&self, sql: &str, options: SQLOptions) -> DFResult<DataFrame> {
+        // A concurrent USE can change the session defaults during a catalog lookup.
+        let state = self.ctx.state();
+        let enable_ident_normalization =
+            state.config_options().sql_parser.enable_ident_normalization;
+        let (mut rewritten_sql, partition_keys) =
+            extract_partition_by(sql, enable_ident_normalization)?;
+        let time_travel_sources = mask_time_travel_sources(&mut rewritten_sql);
         if let Some(show_partitions) =
             crate::format_partition_ddl::parse_show_partitions(&rewritten_sql)?
         {
@@ -533,33 +539,60 @@ impl SQLContext {
             ));
         }
 
+        if !time_travel_sources.is_empty() {
+            validate_time_travel_sources(&statements[0], &time_travel_sources)?;
+        }
+        if let Statement::CreateTable(ct) = &mut statements[0] {
+            if !partition_keys.is_empty()
+                && matches!(
+                    ct.hive_distribution,
+                    HiveDistributionStyle::PARTITIONED { .. }
+                )
+            {
+                return Err(plan_datafusion_err!(
+                    "CREATE TABLE accepts only one PARTITIONED BY clause"
+                ));
+            }
+            if let Some(query) = ct.query.take_if(|_| !ct.temporary) {
+                return Box::pin(self.handle_create_table_as(
+                    ct,
+                    query,
+                    partition_keys,
+                    state,
+                    options,
+                    &time_travel_sources,
+                ))
+                .await;
+            }
+        }
+        if !time_travel_sources.is_empty()
+            || matches!(
+                statements[0],
+                Statement::Query(_) | Statement::Explain { .. }
+            )
+        {
+            return Box::pin(self.plan_query(
+                state,
+                statements.remove(0),
+                options,
+                &time_travel_sources,
+            ))
+            .await;
+        }
+
         let rewritten;
         let stored_definition = matches!(&statements[0], Statement::CreateView(view) if view.temporary || self.is_paimon_catalog_ref(&TableReference::from(view.name.to_string().as_str())))
             || matches!(&statements[0], Statement::CreateFunction(_));
         let changed = !stored_definition && {
-            let binary_changed = crate::binary_cast::rewrite(&mut statements[0])?;
-            let regex_changed = crate::regex_operators::rewrite(&mut statements[0]);
-            let lateral_changed = crate::lateral_views::rewrite(&mut statements[0])?;
-            let compat_changed =
-                crate::expression_compat::rewrite(&mut statements[0], &self.ctx.state())?;
-            let state = self.ctx.state();
-            // Queries and temporary view bodies resolve after SQL function expansion below.
-            let max_pt_changed = if matches!(
-                statements[0],
-                Statement::Query(_) | Statement::Explain { .. }
-            ) || matches!(&statements[0], Statement::CreateView(view) if view.temporary)
-            {
-                false
-            } else {
-                Box::pin(crate::partition_functions::rewrite(
-                    &mut statements[0],
-                    &state,
-                    &self.current_catalog_name(),
-                    &state.config_options().catalog.default_schema,
-                ))
-                .await?
-            };
-            binary_changed || regex_changed || lateral_changed || compat_changed || max_pt_changed
+            let expressions_changed = Self::rewrite_expressions(&mut statements[0], &state)?;
+            let partitions_changed = Box::pin(crate::partition_functions::rewrite(
+                &mut statements[0],
+                &state,
+                &state.config_options().catalog.default_catalog,
+                &state.config_options().catalog.default_schema,
+            ))
+            .await?;
+            expressions_changed || partitions_changed
         };
         let sql = if changed || vector_changed {
             rewritten = statements[0].to_string();
@@ -943,136 +976,80 @@ impl SQLContext {
                 ))
                 .await
             }
-            Statement::Query(_) | Statement::Explain { .. } => {
-                let mut statement = statements[0].clone();
-                if let Statement::Explain {
-                    statement: inner, ..
-                } = &mut statement
-                {
-                    if let Statement::Merge(merge) = inner.as_mut() {
-                        *merge = self.normalize_merge_into(merge).await?;
-                    }
-                }
-                let current_catalog = self.current_catalog_name();
-                let current_database = self
-                    .ctx
-                    .state()
-                    .config_options()
-                    .catalog
-                    .default_schema
-                    .clone();
-                let expanded = crate::sql_function::expand_statement(
-                    &self.ctx.state(),
-                    statement,
-                    &self.catalogs,
-                    &current_catalog,
-                    &current_database,
-                )
-                .await?;
-                let sql = expanded.to_string();
-                if let Statement::Query(query) = &expanded {
-                    if let Some(plan) =
-                        Box::pin(plan_single_table_wildcard(&self.ctx, query, &sql)).await?
-                    {
-                        options.verify_plan(&plan)?;
-                        return self.ctx.execute_logical_plan(plan).await;
-                    }
-                }
-                crate::read_files::sql(&self.ctx, &sql, options).await
-            }
             _ => crate::read_files::sql(&self.ctx, sql, options).await,
         }
     }
 
-    /// Rewrite time-travel references to temporary snapshot providers.
-    /// The tracker removes registrations after planning.
-    async fn handle_time_travel_query(
+    fn rewrite_expressions(statement: &mut Statement, state: &SessionState) -> DFResult<bool> {
+        let binary = crate::binary_cast::rewrite(statement)?;
+        let regex = crate::regex_operators::rewrite(statement);
+        let lateral = crate::lateral_views::rewrite(statement)?;
+        let compat = crate::expression_compat::rewrite(statement, state)?;
+        Ok(binary || regex || lateral || compat)
+    }
+
+    async fn plan_query(
         &self,
-        sql: &str,
-        sql_options: SQLOptions,
+        mut state: SessionState,
+        mut statement: Statement,
+        options: SQLOptions,
+        sources: &[TimeTravelSource],
     ) -> DFResult<DataFrame> {
-        let mut tracker = crate::merge_into::TempTableTracker::new(self);
-
-        let version_clauses = extract_all_version_as_of(sql);
-        let timestamp_clauses = extract_all_timestamp_as_of(sql);
-
-        if version_clauses.is_empty() && timestamp_clauses.is_empty() {
-            return Err(DataFusionError::Plan(
-                "Failed to parse time-travel clause in SQL".to_string(),
-            ));
+        Self::rewrite_expressions(&mut statement, &state)?;
+        if let Statement::Explain {
+            statement: inner, ..
+        } = &mut statement
+        {
+            if let Statement::Merge(merge) = inner.as_mut() {
+                *merge = self.normalize_merge_into(merge).await?;
+            }
         }
-
-        let mut replacements: Vec<((usize, usize), String)> = Vec::new();
-
-        for info in &version_clauses {
-            let table_ref: datafusion::common::TableReference = info.table_name.as_str().into();
+        let session_catalog = &state.config_options().catalog;
+        let mut bindings = HashMap::new();
+        for source in sources {
+            let table = object_name_to_table_reference(
+                source.table.clone(),
+                state.config_options().sql_parser.enable_ident_normalization,
+            )?;
             let (catalog, catalog_name, identifier) =
-                self.resolve_table_name_from_ref(&table_ref)?;
+                self.resolve_table_reference(&table, session_catalog)?;
             let provider = self
-                .time_travel_provider(
-                    &catalog,
-                    &catalog_name,
-                    &identifier,
-                    TimeTravelClause::Version(info.version.clone()),
-                )
+                .time_travel_provider(&catalog, &catalog_name, &identifier, &source.clause)
                 .await?;
-
-            let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
-            self.register_temp_table(uuid_name.as_str(), provider)?;
-            tracker.register(&uuid_name);
-            replacements.push((info.clause_range, uuid_name));
+            bindings.insert(source.binding.clone(), (table, provider));
         }
-
-        for info in &timestamp_clauses {
-            let table_ref: datafusion::common::TableReference = info.table_name.as_str().into();
-            let (catalog, catalog_name, identifier) =
-                self.resolve_table_name_from_ref(&table_ref)?;
-            let millis = Self::parse_timestamp_to_millis(&info.timestamp)?;
-            let provider = self
-                .time_travel_provider(
-                    &catalog,
-                    &catalog_name,
-                    &identifier,
-                    TimeTravelClause::TimestampMillis(millis),
-                )
-                .await?;
-
-            let uuid_name = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
-            self.register_temp_table(uuid_name.as_str(), provider)?;
-            tracker.register(&uuid_name);
-            replacements.push((info.clause_range, uuid_name));
-        }
-
-        // Replace from right to left to preserve byte offsets.
-        replacements.sort_by_key(|r| std::cmp::Reverse(r.0 .0));
-
-        let mut rewritten_sql = sql.to_string();
-        for ((start, end), uuid_name) in &replacements {
-            rewritten_sql = format!(
-                "{}{}{}",
-                &rewritten_sql[..*start],
-                uuid_name,
-                &rewritten_sql[*end..]
-            );
-        }
-
-        let current_catalog = self.current_catalog_name();
-        let current_database = self
-            .ctx
-            .state()
-            .config_options()
-            .catalog
-            .default_schema
-            .clone();
-        let expanded = crate::sql_function::expand_sql(
-            &self.ctx.state(),
-            &rewritten_sql,
+        let mut expanded = crate::sql_function::expand_statement(
+            &state,
+            statement,
             &self.catalogs,
-            &current_catalog,
-            &current_database,
+            &session_catalog.default_catalog,
+            &session_catalog.default_schema,
         )
         .await?;
-        crate::read_files::sql(&self.ctx, &expanded, sql_options).await
+        let plan = if bindings.is_empty() {
+            let sql = expanded.to_string();
+            let wildcard_plan = match &expanded {
+                Statement::Query(query) => {
+                    Box::pin(plan_single_table_wildcard(&state, query, &sql)).await?
+                }
+                _ => None,
+            };
+            match wildcard_plan {
+                Some(plan) => plan,
+                None => crate::read_files::plan_sql(&mut state, &sql).await?,
+            }
+        } else {
+            let snapshots = Arc::new(crate::relation_planner::SnapshotRelationPlanner::try_new(
+                bindings,
+                &mut expanded,
+                session_catalog,
+                state.config_options().sql_parser.enable_ident_normalization,
+            )?);
+            state.register_relation_planner(snapshots.clone())?;
+            let plan = crate::read_files::plan_sql(&mut state, &expanded.to_string()).await?;
+            snapshots.restore_output_names(plan)?
+        };
+        crate::read_files::execute_plan(&self.ctx, state, plan, options).await
     }
 
     async fn time_travel_provider(
@@ -1080,9 +1057,10 @@ impl SQLContext {
         catalog: &Arc<dyn Catalog>,
         catalog_name: &str,
         identifier: &Identifier,
-        clause: TimeTravelClause,
+        clause: &TimeTravelClause,
     ) -> DFResult<Arc<dyn TableProvider>> {
         use crate::catalog::EngineTimeTravel;
+        use crate::relation_planner::parse_timestamp_to_millis;
         use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
 
         let parsed = identifier
@@ -1112,10 +1090,10 @@ impl SQLContext {
             }
             let travel = match clause {
                 TimeTravelClause::Version(version) => {
-                    EngineTimeTravel::Snapshot(crate::catalog::parse_engine_snapshot_id(&version)?)
+                    EngineTimeTravel::Snapshot(crate::catalog::parse_engine_snapshot_id(version)?)
                 }
-                TimeTravelClause::TimestampMillis(millis) => {
-                    EngineTimeTravel::TimestampMillis(millis)
+                TimeTravelClause::Timestamp(timestamp) => {
+                    EngineTimeTravel::TimestampMillis(parse_timestamp_to_millis(timestamp)?)
                 }
             };
             let provider = self
@@ -1142,10 +1120,11 @@ impl SQLContext {
         let (table, base, system_name) =
             crate::table_loader::loaded_table_for_read(loaded, identifier).await?;
         let (option, value) = match clause {
-            TimeTravelClause::Version(version) => (SCAN_VERSION_OPTION, version),
-            TimeTravelClause::TimestampMillis(millis) => {
-                (SCAN_TIMESTAMP_MILLIS_OPTION, millis.to_string())
-            }
+            TimeTravelClause::Version(version) => (SCAN_VERSION_OPTION, version.clone()),
+            TimeTravelClause::Timestamp(timestamp) => (
+                SCAN_TIMESTAMP_MILLIS_OPTION,
+                parse_timestamp_to_millis(timestamp)?.to_string(),
+            ),
         };
         let mut options = self.dynamic_options.read().unwrap().clone();
         options.insert(option.to_string(), value);
@@ -1171,68 +1150,22 @@ impl SQLContext {
         }
     }
 
-    /// Parse a timestamp string to milliseconds since epoch (using local timezone).
-    fn parse_timestamp_to_millis(ts: &str) -> DFResult<i64> {
-        use chrono::{Local, NaiveDateTime, TimeZone};
-
-        let naive = NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").map_err(|e| {
-            DataFusionError::Plan(format!(
-                "Cannot parse time travel timestamp '{ts}': {e}. Expected format: YYYY-MM-DD HH:MM:SS"
-            ))
-        })?;
-        let local = Local.from_local_datetime(&naive).single().ok_or_else(|| {
-            DataFusionError::Plan(format!("Ambiguous or invalid local time: '{ts}'"))
-        })?;
-        Ok(local.timestamp_millis())
-    }
-
-    /// Resolve a TableReference to (catalog, catalog_name, Identifier).
-    fn resolve_table_name_from_ref(
+    fn resolve_table_reference(
         &self,
-        table_ref: &datafusion::common::TableReference,
+        table: &TableReference,
+        defaults: &CatalogOptions,
     ) -> DFResult<(Arc<dyn Catalog>, String, Identifier)> {
-        match table_ref {
-            datafusion::common::TableReference::Full {
-                catalog,
-                schema,
-                table,
-            } => {
-                let catalog_arc = self
-                    .catalogs
-                    .get(catalog.as_ref())
-                    .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog}'")))?;
-                Ok((
-                    catalog_arc.clone(),
-                    catalog.to_string(),
-                    Identifier::new(schema.as_ref(), table.as_ref()),
-                ))
-            }
-            datafusion::common::TableReference::Partial { schema, table } => {
-                let catalog = self.current_catalog()?;
-                let catalog_name = self.current_catalog_name();
-                Ok((
-                    catalog,
-                    catalog_name,
-                    Identifier::new(schema.as_ref(), table.as_ref()),
-                ))
-            }
-            datafusion::common::TableReference::Bare { table } => {
-                let catalog = self.current_catalog()?;
-                let catalog_name = self.current_catalog_name();
-                let default_schema = self
-                    .ctx
-                    .state()
-                    .config_options()
-                    .catalog
-                    .default_schema
-                    .clone();
-                Ok((
-                    catalog,
-                    catalog_name,
-                    Identifier::new(default_schema, table.as_ref()),
-                ))
-            }
-        }
+        let catalog_name = table.catalog().unwrap_or(&defaults.default_catalog);
+        let catalog = self
+            .catalogs
+            .get(catalog_name)
+            .ok_or_else(|| plan_datafusion_err!("Unknown catalog '{catalog_name}'"))?;
+        let database = table.schema().unwrap_or(&defaults.default_schema);
+        Ok((
+            catalog.clone(),
+            catalog_name.to_string(),
+            Identifier::new(database, table.table()),
+        ))
     }
 
     async fn handle_create_table(
@@ -1252,73 +1185,14 @@ impl SQLContext {
                 "LOCATION is not supported for Paimon tables. Table path is determined by the catalog warehouse.".to_string(),
             ));
         }
-        if ct.query.is_some() {
-            return Err(DataFusionError::Plan(
-                "CREATE TABLE AS SELECT is not yet supported for Paimon tables.".to_string(),
-            ));
-        }
-
         let identifier = self.resolve_table_name(&ct.name)?;
-
-        let mut builder = paimon::spec::Schema::builder();
-        let mut comments = Vec::new();
-        if let Some(comment) = &ct.comment {
-            comments.push(comment);
-        }
-        let options = match &ct.table_options {
-            CreateTableOptions::With(options)
-            | CreateTableOptions::Options(options)
-            | CreateTableOptions::TableProperties(options)
-            | CreateTableOptions::Plain(options) => options.as_slice(),
-            CreateTableOptions::None => &[],
-        };
-        for option in options {
-            if let SqlOption::Comment(comment) = option {
-                comments.push(comment);
-            }
-        }
-        if comments.len() > 1 {
-            return Err(DataFusionError::Plan("Duplicate table COMMENT".into()));
-        }
-        if let Some(CommentDef::WithEq(comment) | CommentDef::WithoutEq(comment)) =
-            comments.first().copied()
-        {
-            builder = builder.comment(Some(comment.clone()));
-        }
-        let table_options = extract_options(&ct.table_options)?;
-        let column_names: Vec<String> = ct
-            .columns
-            .iter()
-            .map(|column| normalize_schema_identifier(&column.name, enable_ident_normalization))
-            .collect();
-
-        // Columns
-        for (col, column_name) in ct.columns.iter().zip(&column_names) {
-            let paimon_type = column_def_to_paimon_type(col)?;
-            let comment = column_def_comment(col);
-            builder = builder.column_with_description(column_name.clone(), paimon_type, comment);
-        }
-
-        builder = builder.primary_key(extract_primary_keys(ct, enable_ident_normalization)?);
-
-        // Partition keys (extracted and validated before parsing)
-        if !partition_keys.is_empty() {
-            for pk in &partition_keys {
-                if !column_names.contains(pk) {
-                    return Err(DataFusionError::Plan(format!(
-                        "PARTITIONED BY column '{pk}' is not defined in the table"
-                    )));
-                }
-            }
-            builder = builder.partition_keys(partition_keys);
-        }
-
-        // Table options from WITH ('key' = 'value', ...)
-        for (k, v) in table_options {
-            builder = builder.option(k, v);
-        }
-
-        let schema = builder.build().map_err(to_datafusion_error)?;
+        let schema = create_table_schema(
+            ct,
+            partition_keys,
+            enable_ident_normalization,
+            None,
+            extract_table_properties(&ct.table_options)?,
+        )?;
 
         catalog
             .create_table(&identifier, schema, ct.if_not_exists)
@@ -1767,7 +1641,7 @@ impl SQLContext {
             )
         });
         if has_partition_operation {
-            Self::ensure_partition_command_target(name, "ALTER TABLE")?;
+            Self::ensure_main_branch_base_table(name, "ALTER TABLE")?;
         } else {
             Self::ensure_main_branch_write_target(name, "ALTER TABLE")?;
         }
@@ -2892,7 +2766,7 @@ impl SQLContext {
         Ok(())
     }
 
-    pub(crate) fn ensure_partition_command_target(
+    pub(crate) fn ensure_main_branch_base_table(
         name: &ObjectName,
         operation: &str,
     ) -> DFResult<()> {
@@ -2930,7 +2804,7 @@ impl SQLContext {
 /// Plan a direct single-table SELECT against the same provider used to decide
 /// whether to hide the row ID.
 async fn plan_single_table_wildcard(
-    ctx: &SessionContext,
+    state: &SessionState,
     query: &Query,
     sql: &str,
 ) -> DFResult<Option<LogicalPlan>> {
@@ -2949,7 +2823,6 @@ async fn plan_single_table_wildcard(
 
     // Resolve names from the configured dialect's AST. Inject EXCLUDE after
     // parsing so the caller's dialect need not support its syntax.
-    let mut state = ctx.state();
     let config = state.config_options();
     let Ok(DataFusionStatement::Statement(mut statement)) =
         state.sql_to_statement(sql, &config.sql_parser.dialect)
@@ -3061,11 +2934,77 @@ async fn plan_single_table_wildcard(
     catalog.register_schema(&reference.schema, schema)?;
     let catalogs = Arc::new(MemoryCatalogProviderList::new());
     catalogs.register_catalog(reference.catalog.to_string(), catalog);
+    let mut state = state.clone();
     state.register_catalog_list(catalogs);
     state
         .statement_to_plan(DataFusionStatement::Statement(statement))
         .await
         .map(Some)
+}
+
+fn create_table_schema(
+    ct: &CreateTable,
+    partition_keys: Vec<String>,
+    enable_ident_normalization: bool,
+    inferred_schema: Option<&Schema>,
+    table_options: HashMap<String, String>,
+) -> DFResult<paimon::spec::Schema> {
+    let mut builder = paimon::spec::Schema::builder();
+    let mut table_comment = ct.comment.as_ref();
+    for option in table_option_entries(&ct.table_options) {
+        if let SqlOption::Comment(comment) = option {
+            if table_comment.replace(comment).is_some() {
+                return Err(DataFusionError::Plan("Duplicate table COMMENT".into()));
+            }
+        }
+    }
+    if let Some(CommentDef::WithEq(comment) | CommentDef::WithoutEq(comment)) = table_comment {
+        builder = builder.comment(Some(comment.clone()));
+    }
+    let column_names: Vec<String> = if let Some(schema) = inferred_schema {
+        for field in schema.fields() {
+            let data_type =
+                paimon::arrow::arrow_field_to_paimon_type(field).map_err(to_datafusion_error)?;
+            builder = builder.column(field.name(), data_type);
+        }
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    } else {
+        let names: Vec<String> = ct
+            .columns
+            .iter()
+            .map(|column| normalize_schema_identifier(&column.name, enable_ident_normalization))
+            .collect();
+        for (col, name) in ct.columns.iter().zip(&names) {
+            builder = builder.column_with_description(
+                name.clone(),
+                column_def_to_paimon_type(col)?,
+                column_def_comment(col),
+            );
+        }
+        names
+    };
+
+    builder = builder.primary_key(extract_primary_keys(ct, enable_ident_normalization)?);
+
+    if !partition_keys.is_empty() {
+        for pk in &partition_keys {
+            if !column_names.contains(pk) {
+                return Err(DataFusionError::Plan(format!(
+                    "PARTITIONED BY column '{pk}' is not defined in the table"
+                )));
+            }
+        }
+        builder = builder.partition_keys(partition_keys);
+    }
+
+    builder
+        .options(table_options)
+        .build()
+        .map_err(to_datafusion_error)
 }
 
 fn typed_view_query(view: &paimon::catalog::View) -> DFResult<String> {
@@ -3316,6 +3255,7 @@ fn parse_sql_statements(sql: &str) -> DFResult<(Vec<Statement>, bool)> {
     let significant = tokens
         .iter()
         .enumerate()
+        .skip_while(|(_, token)| matches!(token.token, Token::Whitespace(_) | Token::SemiColon))
         .filter_map(|(index, token)| match &token.token {
             Token::Whitespace(_) => None,
             Token::Word(word) => Some((index, word.keyword)),
@@ -3358,6 +3298,19 @@ fn parse_sql_statements(sql: &str) -> DFResult<(Vec<Statement>, bool)> {
     let (mut statements, vector_changed) = crate::vector_type::parse_statements(tokens)
         .map_err(|error| DataFusionError::Plan(format!("SQL parse error: {error}")))?;
     crate::geospatial::quote_cast_types(&mut statements);
+    // sqlparser can omit OR ALTER and earlier table-options clauses from the AST.
+    if matches!(statements.first(), Some(Statement::CreateTable(ct)) if !ct.temporary && ct.query.is_some())
+    {
+        if !matches!(
+            significant.as_slice(),
+            [(_, Keyword::CREATE), (_, Keyword::TABLE), ..]
+        ) {
+            return Err(DataFusionError::NotImplemented(
+                "CREATE TABLE AS SELECT does not support modifiers before TABLE".into(),
+            ));
+        }
+        validate_ctas_option_clauses(sql)?;
+    }
     if create_function_if_not_exists {
         let Some(Statement::CreateFunction(create_function)) = statements.first_mut() else {
             return Err(DataFusionError::Plan(
@@ -3481,284 +3434,146 @@ fn validate_persistent_create_view(create_view: &CreateView) -> DFResult<()> {
     Ok(())
 }
 
-/// Quick check whether the SQL looks like a CREATE TABLE statement.
-/// Skips leading whitespace, `--` line comments, and `/* */` block comments.
-fn looks_like_create_table(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    // Skip leading whitespace and comments
-    loop {
-        while i < len && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            i += 2;
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < len {
-                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                    i += 2;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        break;
+fn create_table_parser(sql: &str) -> Option<Parser<'_>> {
+    if !matches!(
+        sql.trim_start().as_bytes().first(),
+        Some(b'c' | b'C' | b'-' | b'/' | b';')
+    ) {
+        return None;
     }
-    // Match "CREATE" then whitespace then optional "TEMPORARY"/"TEMP" then "TABLE" (all ASCII, byte-safe)
-    if i + 6 > len || !bytes[i..i + 6].eq_ignore_ascii_case(b"CREATE") {
-        return false;
+    let mut parser = Parser::new(&GenericDialect).try_with_sql(sql).ok()?;
+    while parser.consume_token(&Token::SemiColon) {}
+    if !parser.parse_keyword(Keyword::CREATE) {
+        return None;
     }
-    i += 6;
-    if i >= len || !bytes[i].is_ascii_whitespace() {
-        return false;
-    }
-    while i < len && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    // Skip optional TEMPORARY or TEMP keyword
-    if i + 9 <= len && bytes[i..i + 9].eq_ignore_ascii_case(b"TEMPORARY") {
-        i += 9;
-        while i < len && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-    } else if i + 4 <= len && bytes[i..i + 4].eq_ignore_ascii_case(b"TEMP") {
-        i += 4;
-        while i < len && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-    }
-    // After optional TEMPORARY/TEMP, reject CREATE TEMPORARY VIEW / CREATE TEMP VIEW
-    if i + 4 <= len && bytes[i..i + 4].eq_ignore_ascii_case(b"VIEW") {
-        return false;
-    }
-    i + 5 <= len && bytes[i..i + 5].eq_ignore_ascii_case(b"TABLE")
-}
-
-/// Find `PARTITIONED BY` keyword position, skipping string literals and comments.
-fn find_partitioned_by(sql: &str) -> Option<(usize, usize)> {
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    while i < len {
-        match bytes[i] {
-            b'\'' => {
-                i += 1;
-                while i < len {
-                    if bytes[i] == b'\'' {
-                        i += 1;
-                        if i < len && bytes[i] == b'\'' {
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
+    while let Token::Word(word) = parser.next_token().token {
+        match word.keyword {
+            Keyword::TABLE => {
+                let _ = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+                parser.parse_object_name(false).ok()?;
+                return Some(parser);
             }
-            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
-                i += 2;
-                while i < len && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < len {
-                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b if b.is_ascii_alphabetic() && i + 11 <= len => {
-                if bytes[i..i + 11].eq_ignore_ascii_case(b"PARTITIONED") {
-                    let rest = &bytes[i + 11..];
-                    let ws = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
-                    if ws > 0
-                        && i + 11 + ws + 2 <= len
-                        && rest[ws..ws + 2].eq_ignore_ascii_case(b"BY")
-                    {
-                        let by_end = i + 11 + ws + 2;
-                        return Some((i, by_end));
-                    }
-                }
-                i += 1;
-            }
-            _ => {
-                i += 1;
-            }
+            Keyword::OR
+            | Keyword::REPLACE
+            | Keyword::ALTER
+            | Keyword::TEMP
+            | Keyword::TEMPORARY
+            | Keyword::EXTERNAL
+            | Keyword::GLOBAL
+            | Keyword::LOCAL
+            | Keyword::TRANSIENT
+            | Keyword::VOLATILE
+            | Keyword::DYNAMIC
+            | Keyword::ICEBERG
+            | Keyword::SNAPSHOT => {}
+            _ => break,
         }
     }
     None
 }
 
-/// Parse a single partition column token, handling quoted identifiers.
-fn parse_partition_column(token: &str, enable_ident_normalization: bool) -> DFResult<String> {
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        return Err(DataFusionError::Plan(
-            "Empty column name in PARTITIONED BY".to_string(),
-        ));
-    }
-
-    let first = trimmed.as_bytes()[0];
-    if first == b'"' || first == b'`' {
-        let mut value = String::new();
-        let mut end = None;
-        let mut chars = trimmed[1..].char_indices().peekable();
-        while let Some((idx, ch)) = chars.next() {
-            if ch == first as char {
-                if chars.peek().is_some_and(|(_, next)| *next == first as char) {
-                    value.push(ch);
-                    chars.next();
-                } else {
-                    end = Some(1 + idx + ch.len_utf8());
-                    break;
+fn validate_ctas_option_clauses(sql: &str) -> DFResult<()> {
+    let Some(mut parser) = create_table_parser(sql) else {
+        return Ok(());
+    };
+    let mut depth = 0;
+    let mut seen_options = false;
+    loop {
+        match parser.next_token().token {
+            Token::EOF => return Ok(()),
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            Token::Word(word) if depth == 0 => match word.keyword {
+                Keyword::AS => return Ok(()),
+                Keyword::WITH | Keyword::TBLPROPERTIES | Keyword::OPTIONS
+                    if parser.peek_token_ref().token == Token::LParen =>
+                {
+                    if seen_options {
+                        return Err(plan_datafusion_err!(
+                            "CREATE TABLE AS SELECT accepts only one table options clause"
+                        ));
+                    }
+                    seen_options = true;
                 }
-            } else {
-                value.push(ch);
-            }
+                _ => {}
+            },
+            _ => {}
         }
-        if let Some(end) = end {
-            if trimmed[end..].trim().is_empty() {
-                return Ok(normalize_schema_identifier(
-                    &Ident::with_quote(first as char, value),
-                    enable_ident_normalization,
-                ));
-            }
-        }
-        return Err(DataFusionError::Plan(format!(
-            "Invalid quoted identifier in PARTITIONED BY: {trimmed}"
-        )));
-    }
-
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    match parts.len() {
-        1 => Ok(normalize_schema_identifier(
-            &Ident::new(parts[0]),
-            enable_ident_normalization,
-        )),
-        _ => Err(DataFusionError::Plan(format!(
-            "PARTITIONED BY column '{}' should not specify a type. \
-             Use column references only, e.g. PARTITIONED BY ({})",
-            parts[0], parts[0]
-        ))),
     }
 }
 
-fn split_partition_columns(inner: &str) -> DFResult<Vec<&str>> {
-    let mut columns = Vec::new();
-    let mut start = 0;
-    let mut quote = None;
-    let mut chars = inner.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
-        match quote {
-            Some(q) if ch == q => {
-                if chars.peek().is_some_and(|(_, next)| *next == q) {
-                    chars.next();
-                } else {
-                    quote = None;
-                }
-            }
-            Some(_) => {}
-            None if ch == '"' || ch == '`' => quote = Some(ch),
-            None if ch == ',' => {
-                columns.push(&inner[start..idx]);
-                start = idx + ch.len_utf8();
-            }
-            None => {}
+fn sql_byte_offset(sql: &str, location: Location) -> usize {
+    let mut offset = 0;
+    for (index, line) in sql.split_inclusive('\n').enumerate() {
+        if index + 1 == location.line as usize {
+            return offset
+                + line
+                    .char_indices()
+                    .nth(location.column as usize - 1)
+                    .map_or(line.len(), |(index, _)| index);
         }
+        offset += line.len();
     }
-    if quote.is_some() {
-        return Err(DataFusionError::Plan(
-            "Unterminated quoted identifier in PARTITIONED BY".to_string(),
-        ));
-    }
-    columns.push(&inner[start..]);
-    Ok(columns)
+    offset
 }
 
-/// Extract `PARTITIONED BY (col1, col2, ...)` from SQL before parsing.
-///
-/// Paimon only allows column references (no types) in PARTITIONED BY.
-/// Since sqlparser's GenericDialect requires types in column definitions,
-/// we extract and validate the clause ourselves, then strip it from the SQL
-/// so sqlparser can parse the rest.
+/// Paimon partition keys refer to output columns. GenericDialect parses the
+/// same syntax as Hive column declarations.
 fn extract_partition_by(
     sql: &str,
     enable_ident_normalization: bool,
 ) -> DFResult<(String, Vec<String>)> {
-    let Some((kw_start, by_end)) = find_partitioned_by(sql) else {
-        return Ok((sql.to_string(), vec![]));
+    let Some(mut parser) = create_table_parser(sql) else {
+        return Ok((sql.to_owned(), vec![]));
     };
-
-    let after_by = sql[by_end..].trim_start();
-    let paren_start = by_end + (sql[by_end..].len() - after_by.len());
-
-    if !after_by.starts_with('(') {
-        return Err(DataFusionError::Plan(
-            "Expected '(' after PARTITIONED BY".to_string(),
-        ));
-    }
-
-    let inner_start = paren_start + 1;
-    let mut depth = 1;
-    let mut paren_end = None;
-    let mut quote = None;
-    let mut chars = sql[inner_start..].char_indices().peekable();
-    while let Some((i, ch)) = chars.next() {
-        match quote {
-            Some(q) if ch == q => {
-                if chars.peek().is_some_and(|(_, next)| *next == q) {
-                    chars.next();
-                } else {
-                    quote = None;
-                }
+    let mut depth = 0;
+    let start = loop {
+        let token = parser.next_token();
+        match token.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            Token::Word(word) if depth == 0 && word.keyword == Keyword::AS => {
+                return Ok((sql.to_owned(), vec![]));
             }
-            Some(_) => {}
-            None if ch == '"' || ch == '`' => quote = Some(ch),
-            None if ch == '(' => depth += 1,
-            None if ch == ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    paren_end = Some(inner_start + i);
-                    break;
-                }
+            Token::Word(word)
+                if depth == 0
+                    && word.keyword == Keyword::PARTITIONED
+                    && parser.parse_keyword(Keyword::BY) =>
+            {
+                break token.span.start;
             }
-            None => {}
+            Token::EOF => return Ok((sql.to_owned(), vec![])),
+            _ => {}
         }
+    };
+    if !parser.consume_token(&Token::LParen) {
+        return Err(plan_datafusion_err!("Expected '(' after PARTITIONED BY"));
     }
-    let paren_end = paren_end.ok_or_else(|| {
-        DataFusionError::Plan("Unmatched '(' in PARTITIONED BY clause".to_string())
-    })?;
-
-    let inner = sql[inner_start..paren_end].trim();
-    if inner.is_empty() {
-        return Err(DataFusionError::Plan(
-            "PARTITIONED BY must specify at least one column".to_string(),
+    if parser.peek_token_ref().token == Token::RParen {
+        return Err(plan_datafusion_err!(
+            "PARTITIONED BY must specify at least one column"
         ));
     }
-
-    let mut partition_keys = Vec::new();
-    for token in split_partition_columns(inner)? {
-        partition_keys.push(parse_partition_column(token, enable_ident_normalization)?);
+    let keys = parser.parse_comma_separated(Parser::parse_identifier)?;
+    let end = parser.next_token();
+    match end.token {
+        Token::RParen => {}
+        Token::EOF => return Err(plan_datafusion_err!("Unmatched '(' in PARTITIONED BY clause")),
+        other => return Err(plan_datafusion_err!(
+            "Expected ',' or ')' in PARTITIONED BY, found {other}. Partition columns should not specify a type"
+        )),
     }
-
-    let clause_end = paren_end + 1;
-    let mut rewritten = String::with_capacity(sql.len());
-    rewritten.push_str(&sql[..kw_start]);
-    rewritten.push_str(&sql[clause_end..]);
-    Ok((rewritten, partition_keys))
+    let normalizer = IdentNormalizer::new(enable_ident_normalization);
+    let keys = keys
+        .into_iter()
+        .map(|key| normalizer.normalize(key))
+        .collect();
+    let mut rewritten = sql.to_owned();
+    rewritten.replace_range(
+        sql_byte_offset(sql, start)..sql_byte_offset(sql, end.span.end),
+        "",
+    );
+    Ok((rewritten, keys))
 }
 
 pub(crate) fn normalize_schema_identifier(
@@ -4157,28 +3972,30 @@ fn object_name_to_single_identifier(
     }
 }
 
-/// Extract key-value pairs from [`CreateTableOptions`].
-fn extract_options(opts: &CreateTableOptions) -> DFResult<Vec<(String, String)>> {
-    let sql_options = match opts {
+fn table_option_entries(options: &CreateTableOptions) -> &[SqlOption] {
+    match options {
         CreateTableOptions::With(options)
         | CreateTableOptions::Options(options)
         | CreateTableOptions::TableProperties(options)
         | CreateTableOptions::Plain(options) => options,
-        CreateTableOptions::None => return Ok(Vec::new()),
-    };
-    sql_options
+        CreateTableOptions::None => &[],
+    }
+}
+
+fn extract_table_properties(options: &CreateTableOptions) -> DFResult<HashMap<String, String>> {
+    table_option_entries(options)
         .iter()
         .filter(|option| !matches!(option, SqlOption::Comment(_)))
         .map(|opt| match opt {
             SqlOption::KeyValue { key, value } => {
-                let v = value.to_string();
-                // Strip surrounding quotes from the value if present.
-                let v = v
-                    .strip_prefix('\'')
-                    .and_then(|s| s.strip_suffix('\''))
-                    .unwrap_or(&v)
-                    .to_string();
-                Ok((key.value.clone(), v))
+                let value = match value {
+                    SqlExpr::Value(literal) => literal
+                        .clone()
+                        .into_string()
+                        .unwrap_or_else(|| literal.to_string()),
+                    expr => expr.to_string(),
+                };
+                Ok((key.value.clone(), value))
             }
             other => Err(DataFusionError::Plan(format!(
                 "Unsupported table option: {other}"
@@ -4602,284 +4419,125 @@ fn datum_to_constant_array(
     }
 }
 
-struct VersionAsOfInfo {
-    table_name: String,
-    version: String,
-    /// Byte range (start, end) covering "table_name VERSION AS OF n"
-    clause_range: (usize, usize),
+struct TimeTravelSource {
+    binding: String,
+    table: ObjectName,
+    clause: TimeTravelClause,
 }
 
-struct TimestampAsOfInfo {
-    table_name: String,
-    timestamp: String,
-    /// Byte range (start, end) covering "table_name TIMESTAMP AS OF 'ts'"
-    clause_range: (usize, usize),
-}
-
-/// A parsed `VERSION AS OF` or `TIMESTAMP AS OF` selector.
+#[derive(Debug, PartialEq)]
 enum TimeTravelClause {
     Version(String),
-    TimestampMillis(i64),
+    Timestamp(String),
 }
 
-/// Locate the table before a time-travel keyword without treating delimiters
-/// inside quoted identifiers as boundaries.
-fn time_travel_table_before(prefix: &str) -> (usize, &str) {
-    let prefix = prefix.trim_end();
-    let mut quote = None;
-    for (index, ch) in prefix.char_indices().rev() {
-        if let Some(delimiter) = quote {
-            if ch == delimiter {
-                quote = None;
-            }
-        } else if matches!(ch, '"' | '`') {
-            // Adjacent escaped quotes toggle the quote state twice.
-            quote = Some(ch);
-        } else if ch.is_whitespace() || matches!(ch, ',' | '(') {
-            let start = index + ch.len_utf8();
-            return (start, &prefix[start..]);
-        }
+/// Defer snapshot lookups so `IF NOT EXISTS` can skip the source query.
+fn mask_time_travel_sources(sql: &mut String) -> Vec<TimeTravelSource> {
+    let lowercase = sql.to_ascii_lowercase();
+    if !lowercase.contains("version") && !lowercase.contains("timestamp") {
+        return Vec::new();
     }
-    (0, prefix)
+    let tokens: Vec<_> = Tokenizer::new(&GenericDialect, sql)
+        .tokenize_with_location()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|token| !matches!(token.token, Token::Whitespace(_)))
+        .collect();
+    let mut sources = Vec::new();
+    for (index, clause) in tokens.windows(4).enumerate().rev() {
+        if index == 0
+            || !matches!(tokens[index - 1].token, Token::Word(_))
+            || !matches!(&clause[1].token, Token::Word(word) if word.keyword == Keyword::AS)
+            || !matches!(&clause[2].token, Token::Word(word) if word.keyword == Keyword::OF)
+        {
+            continue;
+        }
+        let Token::Word(word) = &clause[0].token else {
+            continue;
+        };
+        let selector = match (word.keyword, &clause[3].token) {
+            (Keyword::VERSION, Token::SingleQuotedString(tag)) => {
+                TimeTravelClause::Version(tag.clone())
+            }
+            (Keyword::VERSION, Token::Number(id, false))
+                if id.bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                TimeTravelClause::Version(id.clone())
+            }
+            (Keyword::TIMESTAMP, Token::SingleQuotedString(timestamp)) => {
+                TimeTravelClause::Timestamp(timestamp.clone())
+            }
+            _ => continue,
+        };
+        let mut start = index - 1;
+        while start >= 2
+            && matches!(tokens[start - 1].token, Token::Period)
+            && matches!(tokens[start - 2].token, Token::Word(_))
+        {
+            start -= 2;
+        }
+        let table_start = sql_byte_offset(sql, tokens[start].span.start);
+        let identifiers: Vec<_> = tokens[start..index]
+            .iter()
+            .filter_map(|token| match &token.token {
+                Token::Word(word) => Some(word.to_ident(token.span)),
+                _ => None,
+            })
+            .collect();
+        let end = sql_byte_offset(sql, clause[3].span.end);
+        let binding = format!("__paimon_tt_{}", uuid::Uuid::new_v4().as_simple());
+        let separator = if start > 0 && tokens[start - 1].span.end == tokens[start].span.start {
+            " "
+        } else {
+            ""
+        };
+        sql.replace_range(table_start..end, &format!("{separator}TABLE({binding})"));
+        sources.push(TimeTravelSource {
+            binding,
+            table: ObjectName::from(identifiers),
+            clause: selector,
+        });
+    }
+    sources.reverse();
+    sources
 }
 
-/// Check for a time-travel keyword outside quoted strings, identifiers, and comments.
-fn contains_time_travel_keyword(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    while i < len {
-        match bytes[i] {
-            quote @ (b'\'' | b'"' | b'`') => {
-                // Skip a quoted string or identifier, including doubled quotes.
-                i += 1;
-                while i < len {
-                    if bytes[i] == quote {
-                        i += 1;
-                        if i < len && bytes[i] == quote {
-                            i += 1; // escaped quote
-                        } else {
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
+fn validate_time_travel_sources(
+    statement: &Statement,
+    sources: &[TimeTravelSource],
+) -> DFResult<()> {
+    use datafusion::sql::sqlparser::ast::{Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    struct Bindings<'a>(HashSet<&'a str>);
+    impl Visitor for Bindings<'_> {
+        type Break = ();
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+            if let TableFactor::TableFunction {
+                expr: SqlExpr::Identifier(binding),
+                ..
+            } = factor
+            {
+                self.0.remove(binding.value.as_str());
             }
-            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
-                // Skip line comment
-                i += 2;
-                while i < len && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
-                // Skip block comment
-                i += 2;
-                while i + 1 < len {
-                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {
-                // Check for keywords
-                if i + 14 <= len && bytes[i..i + 14].eq_ignore_ascii_case(b"version as of ") {
-                    return true;
-                }
-                if i + 16 <= len && bytes[i..i + 16].eq_ignore_ascii_case(b"timestamp as of ") {
-                    return true;
-                }
-                i += 1;
-            }
+            ControlFlow::Continue(())
         }
     }
-    false
-}
-
-/// Extract **all** `VERSION AS OF <n>` or `VERSION AS OF '<tag>'` clauses from a
-/// SQL string, skipping quoted strings, identifiers, and comments.
-fn extract_all_version_as_of(sql: &str) -> Vec<VersionAsOfInfo> {
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut results = Vec::new();
-
-    while i < len {
-        match bytes[i] {
-            quote @ (b'\'' | b'"' | b'`') => {
-                // Skip a quoted string or identifier, including doubled quotes.
-                i += 1;
-                while i < len {
-                    if bytes[i] == quote {
-                        i += 1;
-                        if i < len && bytes[i] == quote {
-                            i += 1; // escaped quote
-                        } else {
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
-                // Skip line comment
-                i += 2;
-                while i < len && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
-                // Skip block comment
-                i += 2;
-                while i + 1 < len {
-                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {
-                if i + 14 <= len && bytes[i..i + 14].eq_ignore_ascii_case(b"version as of ") {
-                    let kw_start = i;
-                    let val_start = i + 14;
-                    let remaining = &sql[val_start..];
-
-                    // Parse either a quoted tag name or a numeric snapshot ID
-                    let version = if let Some(after_quote) = remaining.strip_prefix('\'') {
-                        // Tag name: VERSION AS OF 'tagname'
-                        if let Some(close_quote) = after_quote.find('\'') {
-                            after_quote[..close_quote].to_string()
-                        } else {
-                            i += 1;
-                            continue;
-                        }
-                    } else {
-                        // Numeric snapshot ID: VERSION AS OF 1
-                        let v: String = remaining
-                            .chars()
-                            .take_while(|c| c.is_ascii_digit())
-                            .collect();
-                        if v.is_empty() {
-                            i += 1;
-                            continue;
-                        }
-                        v
-                    };
-
-                    let is_quoted = remaining.starts_with('\'');
-                    let val_end = if is_quoted {
-                        val_start + version.len() + 2 // 2 quotes
-                    } else {
-                        val_start + version.len()
-                    };
-
-                    let (table_start, table_name) = time_travel_table_before(&sql[..kw_start]);
-
-                    if !table_name.is_empty() {
-                        results.push(VersionAsOfInfo {
-                            table_name: table_name.to_string(),
-                            version,
-                            clause_range: (table_start, val_end),
-                        });
-                    }
-
-                    i = val_end;
-                } else {
-                    i += 1;
-                }
-            }
+    let mut bindings = Bindings(sources.iter().map(|s| s.binding.as_str()).collect());
+    match statement {
+        Statement::CreateTable(ct) => {
+            let _ = ct.query.visit(&mut bindings);
+        }
+        _ => {
+            let _ = statement.visit(&mut bindings);
         }
     }
-
-    results
-}
-
-/// Extract all time-travel timestamp clauses outside quoted strings,
-/// identifiers, and comments.
-fn extract_all_timestamp_as_of(sql: &str) -> Vec<TimestampAsOfInfo> {
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut results = Vec::new();
-
-    while i < len {
-        match bytes[i] {
-            quote @ (b'\'' | b'"' | b'`') => {
-                // Skip a quoted string or identifier, including doubled quotes.
-                i += 1;
-                while i < len {
-                    if bytes[i] == quote {
-                        i += 1;
-                        if i < len && bytes[i] == quote {
-                            i += 1; // escaped quote
-                        } else {
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
-                // Skip line comment
-                i += 2;
-                while i < len && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
-                // Skip block comment
-                i += 2;
-                while i + 1 < len {
-                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {
-                if i + 16 <= len && bytes[i..i + 16].eq_ignore_ascii_case(b"timestamp as of ") {
-                    let kw_start = i;
-                    let val_start = i + 16;
-                    let remaining = &sql[val_start..];
-
-                    // Read the quoted timestamp string
-                    if !remaining.starts_with('\'') {
-                        i += 1;
-                        continue;
-                    }
-                    if let Some(close_quote) = remaining[1..].find('\'') {
-                        let timestamp = remaining[1..close_quote + 1].to_string();
-                        let val_end = val_start + close_quote + 2; // skip both quotes
-
-                        let (table_start, table_name) = time_travel_table_before(&sql[..kw_start]);
-
-                        if !table_name.is_empty() {
-                            results.push(TimestampAsOfInfo {
-                                table_name: table_name.to_string(),
-                                timestamp,
-                                clause_range: (table_start, val_end),
-                            });
-                        }
-
-                        i = val_end;
-                    } else {
-                        i += 1;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-        }
+    if !bindings.0.is_empty() {
+        return Err(DataFusionError::Plan(
+            "Time travel requires a source table reference".into(),
+        ));
     }
-
-    results
+    Ok(())
 }
 
 /// Return an empty DataFrame with a single "result" column containing "OK".
@@ -8906,30 +8564,6 @@ mod tests {
         }
     }
 
-    // ==================== extract_options tests ====================
-
-    #[test]
-    fn test_extract_options_none() {
-        let opts = extract_options(&CreateTableOptions::None).unwrap();
-        assert!(opts.is_empty());
-    }
-
-    #[test]
-    fn test_extract_options_with_kv() {
-        // Parse a CREATE TABLE with WITH options to get a real CreateTableOptions
-        let dialect = GenericDialect {};
-        let stmts =
-            Parser::parse_sql(&dialect, "CREATE TABLE t (id INT) WITH ('bucket' = '4')").unwrap();
-        if let Statement::CreateTable(ct) = &stmts[0] {
-            let opts = extract_options(&ct.table_options).unwrap();
-            assert_eq!(opts.len(), 1);
-            assert_eq!(opts[0].0, "bucket");
-            assert_eq!(opts[0].1, "4");
-        } else {
-            panic!("expected CreateTable");
-        }
-    }
-
     // ==================== SQLContext::sql integration tests ====================
 
     #[tokio::test]
@@ -8954,6 +8588,7 @@ mod tests {
             assert_eq!(identifier.object(), "t1");
             assert!(!ignore_if_exists);
             assert_eq!(schema.primary_keys(), &["id"]);
+            assert!(schema.options().is_empty());
         } else {
             panic!("expected CreateTable call");
         }
@@ -9089,23 +8724,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ctas_existing_target_without_catalog_listing() {
+        let catalog = Arc::new(MockCatalog::new());
+        let sql_context = make_sql_context(catalog.clone()).await;
+        for table_type in ["table", "iceberg-table"] {
+            let schema = PaimonSchema::builder()
+                .column("id", PaimonDataType::Int(IntType::new()))
+                .option("type", table_type)
+                .build()
+                .unwrap();
+            *catalog.existing_table.lock().unwrap() = Some(Table::new(
+                paimon::io::FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("mydb", "t1"),
+                "memory:/warehouse/mydb.db/t1".to_string(),
+                paimon::spec::TableSchema::new(0, &schema),
+                None,
+            ));
+            assert!(catalog.list_tables("mydb").await.unwrap().is_empty());
+            sql_context
+                .sql("CREATE TABLE IF NOT EXISTS mydb.t1 AS SELECT missing_function(id) FROM missing_source")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let error = sql_context
+                .sql("CREATE TABLE mydb.t1 AS SELECT missing_function(id) FROM missing_source")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("already exists"), "{error}");
+            assert!(catalog.take_calls().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn test_create_table_with_options() {
         let catalog = Arc::new(MockCatalog::new());
         let sql_context = make_sql_context(catalog.clone()).await;
-
-        sql_context
-            .sql("CREATE TABLE mydb.t1 (id INT) WITH ('bucket' = '4', 'file.format' = 'parquet')")
-            .await
-            .unwrap();
-
-        let calls = catalog.take_calls();
-        assert_eq!(calls.len(), 1);
-        if let CatalogCall::CreateTable { schema, .. } = &calls[0] {
-            let opts = schema.options();
-            assert_eq!(opts.get("bucket").unwrap(), "4");
-            assert_eq!(opts.get("file.format").unwrap(), "parquet");
-        } else {
-            panic!("expected CreateTable call");
+        let expected = HashMap::from([
+            ("bucket".into(), "4".into()),
+            ("file.format".into(), "parquet".into()),
+        ]);
+        for clause in ["WITH", "OPTIONS", "TBLPROPERTIES"] {
+            let sql = format!(
+                "CREATE TABLE mydb.t1 (id INT) {clause} ('bucket' = '4', 'file.format' = 'parquet')"
+            );
+            sql_context.sql(&sql).await.unwrap();
+            let calls = catalog.take_calls();
+            let [CatalogCall::CreateTable { schema, .. }] = calls.as_slice() else {
+                panic!("Expected a single create call for {sql}");
+            };
+            assert_eq!(schema.options(), &expected, "{clause}");
         }
     }
 
@@ -9755,82 +9424,51 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_partition_by_rejects_typed_column() {
-        let err = extract_partition_by(
-            "CREATE TABLE t (dt STRING) PARTITIONED BY (dt STRING)",
-            true,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("should not specify a type"));
+    fn test_extract_partition_by_rejects_invalid_columns() {
+        for (columns, expected) in [
+            ("(dt STRING)", "should not specify a type"),
+            ("()", "at least one column"),
+            ("(dt", "Unmatched '('"),
+            ("dt", "Expected '('"),
+        ] {
+            let sql = format!("CREATE TABLE t (dt STRING) PARTITIONED BY {columns}");
+            let error = extract_partition_by(&sql, true).unwrap_err().to_string();
+            assert!(error.contains(expected), "{sql}: {error}");
+        }
     }
 
     #[test]
-    fn test_extract_partition_by_empty_parens() {
-        let err =
-            extract_partition_by("CREATE TABLE t (id INT) PARTITIONED BY ()", true).unwrap_err();
-        assert!(err.to_string().contains("at least one column"));
+    fn test_extract_partition_by_ignores_literals_and_comments() {
+        for ignored in [
+            "WITH ('note' = 'PARTITIONED BY (x)')",
+            "WITH ('note' = $$PARTITIONED BY (x)$$)",
+            "WITH ('note' = $tag$PARTITIONED BY (x)$tag$)",
+            "-- PARTITIONED BY (x)",
+            "/* PARTITIONED BY (x) */",
+            "/* outer /* inner */ PARTITIONED BY (x) */",
+        ] {
+            let prefix = format!("CREATE TABLE \"中文\" (id INT) {ignored}\n");
+            let sql = format!("{prefix}PARTITIONED /* key */ BY (id)");
+            let (rewritten, keys) = extract_partition_by(&sql, true).unwrap();
+            assert_eq!(keys, ["id"], "{sql}");
+            assert_eq!(rewritten, prefix, "{sql}");
+        }
     }
 
     #[test]
-    fn test_extract_partition_by_unmatched_paren() {
-        let err =
-            extract_partition_by("CREATE TABLE t (id INT) PARTITIONED BY (dt", true).unwrap_err();
-        assert!(err.to_string().contains("Unmatched"));
-    }
-
-    #[test]
-    fn test_extract_partition_by_skips_string_literal() {
-        let sql =
-            "CREATE TABLE t (id INT) WITH ('note' = 'PARTITIONED BY (x)') PARTITIONED BY (id)";
-        let (rewritten, keys) = extract_partition_by(sql, true).unwrap();
-        assert_eq!(keys, vec!["id"]);
-        assert!(rewritten.contains("WITH"));
-        assert!(rewritten.contains("'PARTITIONED BY (x)'"));
-    }
-
-    #[test]
-    fn test_extract_partition_by_skips_line_comment() {
-        let sql = "CREATE TABLE t (id INT) -- PARTITIONED BY (x)\nPARTITIONED BY (id)";
-        let (_, keys) = extract_partition_by(sql, true).unwrap();
-        assert_eq!(keys, vec!["id"]);
-    }
-
-    #[test]
-    fn test_extract_partition_by_double_quoted_identifier() {
-        let (_, keys) = extract_partition_by(
-            "CREATE TABLE t (\"order\" INT) PARTITIONED BY (\"order\")",
-            true,
-        )
-        .unwrap();
-        assert_eq!(keys, vec!["order"]);
-    }
-
-    #[test]
-    fn test_extract_partition_by_double_quoted_identifier_with_escaped_quote_and_comma() {
-        let (_, keys) = extract_partition_by(
-            "CREATE TABLE t (\"a\"\"b,c\" INT, `d``e,f` INT) \
-             PARTITIONED BY (\"a\"\"b,c\", `d``e,f`)",
-            true,
-        )
-        .unwrap();
-        assert_eq!(keys, vec!["a\"b,c", "d`e,f"]);
-    }
-
-    #[test]
-    fn test_extract_partition_by_backtick_quoted_identifier() {
-        let (_, keys) = extract_partition_by(
-            "CREATE TABLE t (`order` INT) PARTITIONED BY (`order`)",
-            true,
-        )
-        .unwrap();
-        assert_eq!(keys, vec!["order"]);
-    }
-
-    #[test]
-    fn test_extract_partition_by_no_paren_after_by() {
-        let err =
-            extract_partition_by("CREATE TABLE t (id INT) PARTITIONED BY dt", true).unwrap_err();
-        assert!(err.to_string().contains("Expected '('"));
+    fn test_extract_partition_by_quoted_identifiers_and_comments() {
+        for (clause, expected) in [
+            (r#"("order")"#, vec!["order"]),
+            ("(`order`)", vec!["order"]),
+            (
+                "/* layout */ (\"a\"\"b,c\" /* ,) */, -- second key\n `d``e,f`)",
+                vec!["a\"b,c", "d`e,f"],
+            ),
+        ] {
+            let sql = format!("CREATE TABLE t PARTITIONED BY {clause} AS SELECT 1");
+            let (_, keys) = extract_partition_by(&sql, true).unwrap();
+            assert_eq!(keys, expected, "{clause}");
+        }
     }
 
     #[test]
@@ -9842,47 +9480,67 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_partition_by_skips_block_comment() {
-        let sql = "CREATE TABLE t (id INT) /* PARTITIONED BY (x) */ PARTITIONED BY (id)";
-        let (rewritten, keys) = extract_partition_by(sql, true).unwrap();
-        assert_eq!(keys, vec!["id"]);
-        assert!(rewritten.contains("/* PARTITIONED BY (x) */"));
-    }
-
-    #[test]
-    fn test_looks_like_create_table() {
-        assert!(looks_like_create_table("CREATE TABLE t (id INT)"));
-        assert!(looks_like_create_table("  create  table t (id INT)"));
-        assert!(looks_like_create_table(
+    fn test_create_table_parser() {
+        for sql in [
+            "CREATE TABLE t (id INT)",
+            "  create  table t (id INT)",
             "CREATE TABLE IF NOT EXISTS t (id INT)",
-        ));
-        assert!(looks_like_create_table(
             "/* note */ CREATE TABLE t (id INT)",
-        ));
-        assert!(looks_like_create_table(
             "-- comment\nCREATE TABLE t (id INT)",
-        ));
-        assert!(looks_like_create_table(
             "/* a */ /* b */ CREATE TABLE t (id INT)",
-        ));
-        assert!(!looks_like_create_table("ALTER TABLE t ADD COLUMN x INT"));
-        assert!(!looks_like_create_table("SELECT 1"));
-        assert!(!looks_like_create_table(
+            "CREATE /* note */ TABLE t AS SELECT 1",
+            "CREATE TEMP TABLE t AS SELECT 1",
+            "CREATE TEMPORARY TABLE t AS SELECT 1",
+            "CREATE OR REPLACE TABLE t AS SELECT * FROM s VERSION AS OF 1",
+            "CREATE OR ALTER TABLE t AS SELECT * FROM s VERSION AS OF 1",
+            "CREATE EXTERNAL TABLE t AS SELECT 1",
+            "CREATE GLOBAL TABLE t AS SELECT 1",
+            "CREATE TRANSIENT TABLE t AS SELECT 1",
+            "; CREATE TABLE t AS SELECT 1",
+            "/* start */ ; ; -- empty statements\n; CREATE TABLE t AS SELECT 1",
+            "; CREATE OR REPLACE TABLE t AS SELECT * FROM s VERSION AS OF 1",
+        ] {
+            assert!(create_table_parser(sql).is_some(), "{sql}");
+        }
+        for sql in [
+            "ALTER TABLE t ADD COLUMN x INT",
+            "SELECT 1",
             "SELECT aaaaaaaaaaaaaaaaaaaa中文 FROM t",
-        ));
+            "CREATE VIEW v AS SELECT 1",
+            "CREATE TEMP VIEW v AS SELECT 1",
+            "CREATE TABLE_SUFFIX t (id INT)",
+            "CREATE \"TABLE\" t (id INT)",
+            "; ; -- only empty statements\n;",
+            "; SELECT 1; CREATE TABLE t AS SELECT 1",
+        ] {
+            assert!(create_table_parser(sql).is_none(), "{sql}");
+        }
     }
 
     // ==================== partition key validation tests ====================
 
     #[tokio::test]
-    async fn test_create_table_partition_key_not_in_columns() {
+    async fn test_create_table_rejects_invalid_partition_clauses() {
         let catalog = Arc::new(MockCatalog::new());
-        let sql_context = make_sql_context(catalog).await;
-        let err = sql_context
-            .sql("CREATE TABLE mydb.t (id INT, dt STRING) PARTITIONED BY (nonexistent)")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("is not defined in the table"));
+        let sql_context = make_sql_context(catalog.clone()).await;
+        for (clause, expected_error) in [
+            (
+                "PARTITIONED BY (nonexistent)",
+                "is not defined in the table",
+            ),
+            (
+                "PARTITIONED BY (id) PARTITIONED BY (dt STRING)",
+                "only one PARTITIONED BY clause",
+            ),
+        ] {
+            let sql = format!("CREATE TABLE mydb.t (id INT, dt STRING) {clause}");
+            let Err(error) = sql_context.sql(&sql).await else {
+                panic!("Unexpectedly accepted {sql}");
+            };
+            let error = error.to_string();
+            assert!(error.contains(expected_error), "{sql}: {error}");
+        }
+        assert!(catalog.take_calls().is_empty());
     }
 
     #[tokio::test]
@@ -9890,7 +9548,7 @@ mod tests {
         let catalog = Arc::new(MockCatalog::new());
         let sql_context = make_sql_context(catalog.clone()).await;
         sql_context
-            .sql("CREATE TABLE mydb.t (id INT, dt STRING) PARTITIONED BY (dt)")
+            .sql("CREATE TABLE mydb.as (id INT, dt STRING) PARTITIONED BY (dt)")
             .await
             .unwrap();
         let calls = catalog.take_calls();
@@ -10893,212 +10551,81 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_version_as_of() {
-        let sql = "SELECT id, name FROM paimon.default.time_travel_table VERSION AS OF 1";
-        let infos = extract_all_version_as_of(sql);
-        assert_eq!(infos.len(), 1);
-        let info = &infos[0];
-        assert_eq!(info.version, "1");
-        assert_eq!(info.table_name, "paimon.default.time_travel_table");
-        let rewritten = format!(
-            "{}__uuid{}",
-            &sql[..info.clause_range.0],
-            &sql[info.clause_range.1..]
-        );
-        assert_eq!(rewritten, "SELECT id, name FROM __uuid");
+    fn test_mask_time_travel_sources() {
+        use TimeTravelClause::{Timestamp, Version};
+
+        for (selector, expected) in [
+            ("VERSION AS OF 1", Version("1".into())),
+            ("version as of 123", Version("123".into())),
+            ("VERSION AS OF 'my_tag'", Version("my_tag".into())),
+            ("VERSION AS OF 'tag''quoted'", Version("tag'quoted".into())),
+            (
+                "/* table */ VERSION\nAS /* selector */ OF 42",
+                Version("42".into()),
+            ),
+            (
+                "timestamp as of '2024-01-15 10:30:00'",
+                Timestamp("2024-01-15 10:30:00".into()),
+            ),
+            (
+                "/* table */ TIMESTAMP\nAS /* selector */ OF '2024-01-15'",
+                Timestamp("2024-01-15".into()),
+            ),
+        ] {
+            let mut sql = format!(
+                r#"SELECT 'İ' FROM paimon."my db"."with ""quote"", (space" {selector} AS s"#
+            );
+            let sources = mask_time_travel_sources(&mut sql);
+            assert_eq!(sources.len(), 1, "{selector}");
+            assert_eq!(sources[0].clause, expected);
+            assert_eq!(
+                sources[0].table.to_string(),
+                r#"paimon."my db"."with ""quote"", (space""#
+            );
+            assert_eq!(
+                sql,
+                format!("SELECT 'İ' FROM TABLE({}) AS s", sources[0].binding)
+            );
+        }
     }
 
     #[test]
-    fn test_extract_version_as_of_multi_digit() {
-        let sql = "SELECT * FROM mydb.t VERSION AS OF 42";
-        let infos = extract_all_version_as_of(sql);
-        assert_eq!(infos.len(), 1);
-        let info = &infos[0];
-        assert_eq!(info.version, "42");
-        assert_eq!(info.table_name, "mydb.t");
-        let rewritten = format!(
-            "{}__uuid{}",
-            &sql[..info.clause_range.0],
-            &sql[info.clause_range.1..]
-        );
-        assert_eq!(rewritten, "SELECT * FROM __uuid");
-    }
-
-    #[test]
-    fn test_extract_version_as_of_case_insensitive() {
-        let sql = "SELECT * FROM t version as of 5";
-        let infos = extract_all_version_as_of(sql);
-        assert_eq!(infos.len(), 1);
-        let info = &infos[0];
-        assert_eq!(info.version, "5");
-        assert_eq!(info.table_name, "t");
-        let rewritten = format!(
-            "{}__uuid{}",
-            &sql[..info.clause_range.0],
-            &sql[info.clause_range.1..]
-        );
-        assert_eq!(rewritten, "SELECT * FROM __uuid");
-    }
-
-    #[test]
-    fn test_extract_version_as_of_not_present() {
-        let sql = "SELECT * FROM t";
-        assert!(extract_all_version_as_of(sql).is_empty());
-    }
-
-    #[test]
-    fn test_extract_version_as_of_tag() {
-        let sql = "SELECT id, name FROM paimon.default.t VERSION AS OF 'snapshot1'";
-        let infos = extract_all_version_as_of(sql);
-        assert_eq!(infos.len(), 1);
-        let info = &infos[0];
-        assert_eq!(info.version, "snapshot1");
-        assert_eq!(info.table_name, "paimon.default.t");
-        let rewritten = format!(
-            "{}__uuid{}",
-            &sql[..info.clause_range.0],
-            &sql[info.clause_range.1..]
-        );
-        assert_eq!(rewritten, "SELECT id, name FROM __uuid");
-    }
-
-    #[test]
-    fn test_extract_version_as_of_tag_case_insensitive() {
-        let sql = "SELECT * FROM t version as of 'my_tag'";
-        let infos = extract_all_version_as_of(sql);
-        assert_eq!(infos.len(), 1);
-        let info = &infos[0];
-        assert_eq!(info.version, "my_tag");
-        assert_eq!(info.table_name, "t");
-        let rewritten = format!(
-            "{}__uuid{}",
-            &sql[..info.clause_range.0],
-            &sql[info.clause_range.1..]
-        );
-        assert_eq!(rewritten, "SELECT * FROM __uuid");
-    }
-
-    #[test]
-    fn test_extract_version_as_of_numeric_still_works() {
-        let sql = "SELECT * FROM t VERSION AS OF 123";
-        let infos = extract_all_version_as_of(sql);
-        assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].version, "123");
-        assert_eq!(infos[0].table_name, "t");
-    }
-
-    #[test]
-    fn test_extract_version_as_of_multiple() {
-        // JOIN two time-travel tables
-        let sql = "SELECT * FROM t1 VERSION AS OF 1 JOIN t2 VERSION AS OF 2 ON t1.id = t2.id";
-        let infos = extract_all_version_as_of(sql);
-        assert_eq!(infos.len(), 2);
-        assert_eq!(infos[0].version, "1");
-        assert_eq!(infos[0].table_name, "t1");
-        assert_eq!(infos[1].version, "2");
-        assert_eq!(infos[1].table_name, "t2");
-    }
-
-    #[test]
-    fn test_extract_version_as_of_skips_string_literal() {
-        let sql = "SELECT * FROM t WHERE note = 'version as of 1'";
-        let infos = extract_all_version_as_of(sql);
-        assert!(infos.is_empty());
-    }
-
-    #[test]
-    fn test_extract_version_as_of_skips_comment() {
-        let sql = "SELECT * FROM t -- version as of 1\n WHERE id > 0";
-        let infos = extract_all_version_as_of(sql);
-        assert!(infos.is_empty());
-    }
-
-    #[test]
-    fn test_time_travel_keeps_quoted_table_reference() {
-        let table = r#"paimon."my db"."with ""quote"", (space""#;
-        let version_sql = format!("SELECT 'İ' FROM {table} VERSION AS OF 1");
-        let versions = extract_all_version_as_of(&version_sql);
-        assert_eq!(versions.len(), 1);
-        assert_eq!(versions[0].table_name, table);
+    fn test_mask_multiple_time_travel_sources() {
+        let mut sql =
+            "SELECT * FROM t1 VERSION AS OF 1 JOIN t2 VERSION AS OF 2 ON t1.id = t2.id".to_string();
+        let sources = mask_time_travel_sources(&mut sql);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].table.to_string(), "t1");
+        assert_eq!(sources[0].clause, TimeTravelClause::Version("1".into()));
+        assert_eq!(sources[1].table.to_string(), "t2");
+        assert_eq!(sources[1].clause, TimeTravelClause::Version("2".into()));
         assert_eq!(
-            &version_sql[versions[0].clause_range.0..versions[0].clause_range.1],
-            format!("{table} VERSION AS OF 1")
-        );
-
-        let timestamp_sql = format!("SELECT 'İ' FROM {table} TIMESTAMP AS OF '2024-01-01'");
-        let timestamps = extract_all_timestamp_as_of(&timestamp_sql);
-        assert_eq!(timestamps.len(), 1);
-        assert_eq!(timestamps[0].table_name, table);
-        assert_eq!(
-            &timestamp_sql[timestamps[0].clause_range.0..timestamps[0].clause_range.1],
-            format!("{table} TIMESTAMP AS OF '2024-01-01'")
+            sql,
+            format!(
+                "SELECT * FROM TABLE({}) JOIN TABLE({}) ON t1.id = t2.id",
+                sources[0].binding, sources[1].binding
+            )
         );
     }
 
     #[test]
-    fn test_contains_time_travel_keyword() {
-        assert!(contains_time_travel_keyword(
-            "SELECT * FROM t VERSION AS OF 1"
-        ));
-        assert!(contains_time_travel_keyword(
-            "SELECT * FROM t TIMESTAMP AS OF '2024-01-01 00:00:00'"
-        ));
-        // Inside string literal — should NOT match
-        assert!(!contains_time_travel_keyword(
-            "SELECT * FROM t WHERE note = 'version as of 1'"
-        ));
-        // Inside comment — should NOT match
-        assert!(!contains_time_travel_keyword(
-            "SELECT * FROM t -- version as of 1"
-        ));
-        assert!(!contains_time_travel_keyword(
-            "SELECT * FROM t /* timestamp as of now */ WHERE id > 0"
-        ));
-        assert!(!contains_time_travel_keyword(
-            r#"SELECT * FROM "version as of 1""#
-        ));
-        assert!(!contains_time_travel_keyword(
-            "SELECT * FROM `timestamp as of now`"
-        ));
-        // No keyword at all
-        assert!(!contains_time_travel_keyword("SELECT * FROM t"));
-    }
-
-    #[test]
-    fn test_extract_timestamp_as_of() {
-        let sql = "SELECT * FROM paimon.default.t TIMESTAMP AS OF '2024-01-15 10:30:00'";
-        let infos = extract_all_timestamp_as_of(sql);
-        assert_eq!(infos.len(), 1);
-        let info = &infos[0];
-        assert_eq!(info.timestamp, "2024-01-15 10:30:00");
-        assert_eq!(info.table_name, "paimon.default.t");
-        let rewritten = format!(
-            "{}__uuid{}",
-            &sql[..info.clause_range.0],
-            &sql[info.clause_range.1..]
-        );
-        assert_eq!(rewritten, "SELECT * FROM __uuid");
-    }
-
-    #[test]
-    fn test_extract_timestamp_as_of_case_insensitive() {
-        let sql = "SELECT * FROM t timestamp as of '2024-06-01 00:00:00'";
-        let infos = extract_all_timestamp_as_of(sql);
-        assert_eq!(infos.len(), 1);
-        let info = &infos[0];
-        assert_eq!(info.timestamp, "2024-06-01 00:00:00");
-        assert_eq!(info.table_name, "t");
-        let rewritten = format!(
-            "{}__uuid{}",
-            &sql[..info.clause_range.0],
-            &sql[info.clause_range.1..]
-        );
-        assert_eq!(rewritten, "SELECT * FROM __uuid");
-    }
-
-    #[test]
-    fn test_extract_timestamp_as_of_not_present() {
-        let sql = "SELECT * FROM t";
-        assert!(extract_all_timestamp_as_of(sql).is_empty());
+    fn test_time_travel_ignores_literals_comments_and_aliases() {
+        for sql in [
+            "SELECT * FROM t",
+            "SELECT * FROM t WHERE note = 'version as of 1'",
+            "SELECT $$source VERSION AS OF 1$$ FROM t",
+            "SELECT $tag$source TIMESTAMP AS OF '2024-01-01'$tag$ FROM t",
+            "SELECT * FROM t -- version as of 1",
+            "SELECT * FROM t /* timestamp as of now */ WHERE id > 0",
+            "SELECT * FROM t /* outer /* inner */ source VERSION AS OF 1 */",
+            r#"SELECT * FROM "version as of 1""#,
+            "SELECT * FROM `timestamp as of now`",
+            "SELECT conversion AS of_value FROM t",
+            "SELECT version AS of FROM t",
+        ] {
+            let mut masked = sql.to_string();
+            assert!(mask_time_travel_sources(&mut masked).is_empty(), "{sql}");
+            assert_eq!(masked, sql);
+        }
     }
 }

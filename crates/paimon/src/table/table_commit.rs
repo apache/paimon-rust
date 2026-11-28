@@ -1100,7 +1100,9 @@ impl TableCommit {
                 .abort(commit_messages)
                 .await;
         }
-        self.delete_new_files(commit_messages).await?;
+        for failure in self.delete_new_files(commit_messages).await? {
+            log::warn!("Failed to discard uncommitted file: {failure}");
+        }
         Ok(())
     }
 

@@ -25,6 +25,37 @@ use http::{Request, Response};
 use opendal::{Buffer, HttpBody, HttpTransport};
 use opendal_http_transport_reqwest::ReqwestTransport;
 
+#[cfg(any(
+    feature = "storage-s3",
+    feature = "storage-oss",
+    feature = "storage-gcs"
+))]
+static PUBLICATION_TRANSPORT: std::sync::LazyLock<
+    std::result::Result<ReqwestTransport, reqwest_opendal::Error>,
+> = std::sync::LazyLock::new(|| {
+    use http::StatusCode;
+    use reqwest_opendal::redirect::Policy;
+
+    let default_policy = Policy::default();
+    let policy = Policy::custom(move |attempt| {
+        super::file_io::record_publication_replay();
+        // A redirected GET can return metadata without publishing the object.
+        if matches!(
+            attempt.status(),
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
+        ) {
+            attempt.stop()
+        } else {
+            default_policy.redirect(attempt)
+        }
+    });
+    reqwest_opendal::Client::builder()
+        .redirect(policy)
+        .retry(reqwest_opendal::retry::never())
+        .build()
+        .map(ReqwestTransport::new)
+});
+
 /// Replaces the default `paimon-rust/<version>` module; shared with REST requests.
 pub(crate) const USER_AGENT_MODULE: &str = "user-agent.module";
 
@@ -106,15 +137,15 @@ fn build_user_agent(props: &HashMap<String, String>, overrides: Option<[&str; 3]
     user_agent
 }
 
-/// Sends every request through the shared reqwest client with a User-Agent, unless one is set.
+/// Adds the configured User-Agent and preserves conditional publication semantics.
 #[derive(Clone)]
-pub(crate) struct UserAgentTransport {
+pub(crate) struct StorageHttpTransport {
     user_agent: HeaderValue,
     inner: ReqwestTransport,
 }
 
-impl UserAgentTransport {
-    pub(crate) fn new(user_agent: &str) -> Self {
+impl StorageHttpTransport {
+    pub(super) fn new(user_agent: &str) -> Self {
         let user_agent = HeaderValue::from_bytes(user_agent.as_bytes()).unwrap_or_else(|_| {
             log::warn!("Invalid object storage User-Agent {user_agent:?}, using the default");
             HeaderValue::from_str(&default_user_agent())
@@ -133,9 +164,25 @@ impl UserAgentTransport {
     }
 }
 
-impl HttpTransport for UserAgentTransport {
+impl HttpTransport for StorageHttpTransport {
     async fn fetch(&self, mut req: Request<Buffer>) -> opendal::Result<Response<HttpBody>> {
         self.apply(&mut req);
+        #[cfg(any(
+            feature = "storage-s3",
+            feature = "storage-oss",
+            feature = "storage-gcs"
+        ))]
+        if !req.method().is_safe() && super::file_io::is_conditional_publication() {
+            let transport = PUBLICATION_TRANSPORT.as_ref().map_err(|error| {
+                opendal::Error::new(
+                    opendal::ErrorKind::Unexpected,
+                    format!("Failed to initialize the publication HTTP transport: {error}"),
+                )
+            })?;
+            let response = transport.fetch(req).await?;
+            super::file_io::record_publication_status(response.status());
+            return Ok(response);
+        }
         self.inner.fetch(req).await
     }
 }
@@ -269,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_existing_user_agent_is_kept() {
-        let transport = UserAgentTransport::new("paimon-rust/test");
+        let transport = StorageHttpTransport::new("paimon-rust/test");
 
         let mut req = Request::new(Buffer::new());
         transport.apply(&mut req);
@@ -285,7 +332,7 @@ mod tests {
 
     #[test]
     fn test_invalid_user_agent_falls_back_to_default() {
-        let transport = UserAgentTransport::new("bad\nagent");
+        let transport = StorageHttpTransport::new("bad\nagent");
         assert_eq!(transport.user_agent, default_user_agent().as_str());
     }
 }

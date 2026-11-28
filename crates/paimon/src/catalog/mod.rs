@@ -429,6 +429,17 @@ pub trait Catalog: Send + Sync {
 
     // ======================= table methods ===============================
 
+    /// Check that a base table exists.
+    ///
+    /// The default preserves [`Catalog::load_table`] lookup behavior. Override
+    /// with a metadata lookup to avoid initializing table storage.
+    ///
+    /// # Errors
+    /// Returns [`Error::TableNotExist`] for an absent table and propagates lookup errors.
+    async fn check_table_exists(&self, identifier: &Identifier) -> Result<()> {
+        self.load_table(identifier).await.map(|_| ())
+    }
+
     /// Get table metadata for the given identifier.
     ///
     /// # Errors
@@ -494,6 +505,21 @@ pub trait Catalog: Send + Sync {
         creation: Schema,
         ignore_if_exists: bool,
     ) -> Result<()>;
+
+    /// Atomically create a table for immediate population.
+    ///
+    /// Return [`Error::TableAlreadyExist`] only for a definite conflict. If
+    /// publication may have succeeded, propagate the failure to the caller.
+    /// Catalogs without atomic creation return [`Error::Unsupported`].
+    async fn create_table_exclusive(
+        &self,
+        _identifier: &Identifier,
+        _creation: Schema,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "This catalog does not support exclusive table creation".to_string(),
+        })
+    }
 
     /// Drop a table. System tables cannot be dropped.
     ///
